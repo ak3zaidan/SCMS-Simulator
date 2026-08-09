@@ -18,3 +18,9 @@ venv/
 *.swp
 .DS_Store
 Thumbs.db
+# MOSAIC app build artifacts + generated (EPL-derived) scenario
+scms-sim/**/out/
+scms-sim/**/build/
+*.jar
+scms-sim/scenarios/scms_smoke/
+tmp/
