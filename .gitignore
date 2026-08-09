@@ -1,0 +1,19 @@
+# Generated datasets (large, reproducible from seed + config)
+/datasets/
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+# Vendored heavy toolchain (added via submodules once git/JDK/SUMO/MOSAIC exist)
+/third_party/
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

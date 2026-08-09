@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this framework or dataset, please cite it."
+title: "SCMS-aware V2X Simulation & Global Misbehavior-Authority Dataset Framework"
+version: "0.1.0"
+date-released: "2026-08-09"
+license: Apache-2.0
+type: software
+authors:
+  - given-names: ""
+    family-names: ""
+    # TODO: fill in author metadata before release
+keywords:
+  - V2X
+  - SCMS
+  - misbehavior detection
+  - misbehavior authority
+  - vehicular PKI
+  - anomaly detection dataset

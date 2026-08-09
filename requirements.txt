@@ -1,0 +1,3 @@
+cryptography>=42
+pydantic>=2
+pytest>=8
