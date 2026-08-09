@@ -1,5 +1,6 @@
 """SCMS cryptographic core: linkage values, butterfly keys, abstract signing."""
 
+from . import butterfly, ec
 from .linkage import (
     CrlLinkageEntry,
     DeviceLinkageContext,
