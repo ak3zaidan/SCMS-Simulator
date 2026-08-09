@@ -28,11 +28,16 @@ MA-visible data (features) and simulation ground truth (labels).
 | Build-breaking leakage linter | ✅ implemented + tested |
 | Closed-loop reference pipeline (attack→…→CRL→enforce) | ✅ runs + tested |
 | Determinism (same seed → byte-identical data) | ✅ verified |
-| MOSAIC + SUMO + VeReMi NextGen integration (Java) | ⛔ blocked — needs toolchain (see below) |
+| Toolchain: JDK 17 / SUMO 1.25 / MOSAIC 25.2 / git | ✅ installed under `C:\Users\Administrator\tools` |
+| VeReMi NextGen vendored (pinned submodule) | ✅ `third_party/veremi-nextgen` @ `acda994b` |
+| Custom MOSAIC app (ScmsBeaconApp) build + run | ✅ `javac` build; runs in MOSAIC 25.2 + SUMO 1.25 |
+| Wiring SCMS (signing / detection / reporting / back-end) into MOSAIC | ⏳ next |
 
-This is the **P1 vertical-slice core** implemented in Python. The mobility/radio
-layer is currently abstracted; it is replaced by **Eclipse MOSAIC + SUMO +
-VeReMi NextGen** once the toolchain is installed. See
+The Python **P1 vertical-slice core** is complete and tested. The toolchain is
+installed and a custom MOSAIC application (`ScmsBeaconApp`) has been built and run
+end-to-end in MOSAIC + SUMO — establishing the extension seam. The SCMS logic
+(signing, local detection, report emission, back-end federate) is being wired into
+that MOSAIC app next, mirroring the validated Python reference. See
 [`docs/adr/0001-stack-and-approach.md`](docs/adr/0001-stack-and-approach.md).
 
 ## Quick start
@@ -61,11 +66,24 @@ docs/adr/         architecture decision records
 scenarios/        scenario specs (P4)
 ```
 
-## Toolchain needed for the MOSAIC layer (not yet installed here)
+## MOSAIC layer — build & run the custom app
 
-- **git** (repo is not yet under version control), **JDK 17**, **Maven/Gradle**
-- **Eclipse SUMO 1.25**, **Eclipse MOSAIC 25.x**, (optional) **OMNeT++ 6.1 + INET 4.5.4**
-- **VeReMi NextGen** generator (Apache-2.0), vendored at a pinned commit
+The toolchain lives under `C:\Users\Administrator\tools` (JDK 17, SUMO 1.25.0,
+MOSAIC 25.2). Activate it, build our app with `javac` (no Maven), generate the
+scenario, and run:
+
+```powershell
+. C:\Users\Administrator\tools\env.ps1                       # JAVA_HOME, SUMO_HOME, MOSAIC_HOME, PATH
+.\scms-sim\mosaic-apps\scms-app\build.ps1                    # -> ScmsApp-0.1.0.jar (javac + jar)
+.\scms-sim\scenarios\make_scms_smoke.ps1                     # derive scms_smoke from MOSAIC HelloWorld + wire our app
+cd $env:MOSAIC_HOME
+.\mosaic.bat -c C:\Users\Administrator\SCMS-Simulator\scms-sim\scenarios\scms_smoke\scenario_config.json -w 0
+# app logs: $env:MOSAIC_HOME\logs\log-*-scms_smoke\...  (grep "SCMS beacon app")
+```
+
+`mosaic.bat` builds a relative classpath, so always run it with the MOSAIC bundle
+as the working directory. `ScmsBeaconApp` receives SUMO-driven vehicle updates —
+the hook point for signing, detection, and reporting.
 
 ## Licensing
 
