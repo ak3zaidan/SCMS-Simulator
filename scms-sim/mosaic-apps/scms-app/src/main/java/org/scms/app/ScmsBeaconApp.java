@@ -7,29 +7,29 @@ package org.scms.app;
 import org.eclipse.mosaic.fed.application.app.AbstractApplication;
 import org.eclipse.mosaic.fed.application.app.api.VehicleApplication;
 import org.eclipse.mosaic.fed.application.app.api.os.VehicleOperatingSystem;
+import org.eclipse.mosaic.lib.geo.CartesianPoint;
 import org.eclipse.mosaic.lib.objects.vehicle.VehicleData;
 import org.eclipse.mosaic.lib.util.scheduling.Event;
 
+import org.scms.backend.ScmsBackend;
+
 /**
- * Minimal SCMS-aware vehicle application: the extension seam for the MOSAIC layer.
+ * SCMS-aware vehicle application (MOSAIC layer, v1).
  *
- * <p>This first version proves the custom-application build/deploy/run path on the
- * MOSAIC 25.x toolchain. It reacts to each SUMO-driven vehicle update — which is
- * exactly where later versions will (1) select the active pseudonym certificate,
- * (2) build and sign the CAM, (3) run local plausibility detection on received
- * messages, and (4) emit ETSI TS 103 759-shaped misbehaviour reports to the SCMS
- * back-end federate. The Python reference in {@code src/scms_sim_ref} defines the
- * validated linkage/report logic this app will mirror.
+ * Registers the vehicle with the {@link ScmsBackend} (which provisions a pseudonym
+ * certificate carrying a real CAMP-SCP2 linkage value) and forwards every
+ * SUMO-driven kinematic update to the back-end, which models CAM reception + local
+ * detection, correlates misbehaviour reports, resolves identity via the two Linkage
+ * Authorities (without learning it), revokes, issues a CRL, and enforces it — writing
+ * the MA-visible + ground-truth dataset. This mirrors the validated Python reference.
  */
 public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         implements VehicleApplication {
 
-    private int vehicleUpdates = 0;
-
     @Override
     public void onStartup() {
-        getLog().infoSimTime(this, "SCMS beacon app started on unit '{}'",
-                getOperatingSystem().getId());
+        ScmsBackend.instance().register(getOperatingSystem().getId());
+        getLog().infoSimTime(this, "SCMS app active on unit '{}'", getOperatingSystem().getId());
     }
 
     @Override
@@ -37,25 +37,24 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         if (updated == null) {
             return;
         }
-        vehicleUpdates++;
-        // Log sparsely: the first update and then every 50th, to confirm the app
-        // is receiving ground-truth kinematics it will later sign into CAMs.
-        if (vehicleUpdates == 1 || vehicleUpdates % 50 == 0) {
-            getLog().infoSimTime(this,
-                    "unit '{}' update #{}: pos={} speed={} m/s heading={} deg",
-                    getOperatingSystem().getId(), vehicleUpdates,
-                    updated.getPosition(), updated.getSpeed(), updated.getHeading());
+        CartesianPoint p = updated.getProjectedPosition();
+        if (p == null) {
+            return;
         }
+        ScmsBackend.instance().onVehicleUpdate(
+                getOperatingSystem().getId(),
+                getOperatingSystem().getSimulationTime(),
+                p.getX(), p.getY(),
+                updated.getSpeed(), updated.getHeading());
     }
 
     @Override
     public void onShutdown() {
-        getLog().infoSimTime(this, "SCMS beacon app shutdown on unit '{}'; total vehicle updates = {}",
-                getOperatingSystem().getId(), vehicleUpdates);
+        // Dataset is flushed once at JVM exit by ScmsBackend's shutdown hook.
     }
 
     @Override
     public void processEvent(Event event) {
-        // No self-scheduled events yet; CAM triggering + report emission arrive next.
+        // No self-scheduled events in v1.
     }
 }
