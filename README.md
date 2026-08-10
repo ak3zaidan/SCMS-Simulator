@@ -18,24 +18,6 @@ MA-visible data (features) and simulation ground truth (labels).
 **Design document (all 27 planning deliverables, diagrams, decision matrix):**
 <https://claude.ai/code/artifact/9a391e86-95f0-421a-aadd-f2459ddb93f3>
 
-## Status
-
-| Layer | State |
-|---|---|
-| SCMS crypto core — linkage values, CRL matching (CAMP SCP2) | ✅ implemented + tested |
-| Deterministic signing (Ed25519) + IEEE 1609.2 HashedId8 | ✅ implemented |
-| Trust-separated schemas (MA-visible / ground-truth) | ✅ implemented |
-| Build-breaking leakage linter | ✅ implemented + tested |
-| Closed-loop reference pipeline (attack→…→CRL→enforce) | ✅ runs + tested |
-| Determinism (same seed → byte-identical data) | ✅ verified |
-| Toolchain: JDK 17 / SUMO 1.25 / MOSAIC 25.2 / git | ✅ installed under `C:\Users\Administrator\tools` |
-| VeReMi NextGen vendored (pinned submodule) | ✅ `third_party/veremi-nextgen` @ `acda994b` |
-| SCMS closed loop in MOSAIC (sign → detect → report → correlate → 2-LA resolve → revoke → CRL → enforce) | ✅ real ITS-G5 AdHoc; distributed detection |
-| Runs on the real InTAS (Ingolstadt) map | ✅ `run.ps1 -Scenario intas` |
-| Attacks / detectors | ✅ ConstPos + ConstPosOffset / frozen-position + ART |
-| ML featurizer + leakage-safe splitter | ✅ report + subject tables, vehicle-disjoint splits |
-| One-command end-to-end runner | ✅ `run.ps1` |
-
 The system is runnable end-to-end. On the real InTAS Ingolstadt map the generated
 dataset is **leakage-free**, with revocation **precision 1.0 / recall 0.986**, and is
 **byte-identical across runs** (deterministic). See
