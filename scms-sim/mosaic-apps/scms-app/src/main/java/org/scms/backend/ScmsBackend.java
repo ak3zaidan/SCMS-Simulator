@@ -44,15 +44,28 @@ import org.scms.crypto.LinkageEngine;
 
 public final class ScmsBackend {
 
-    static final long MASTER_SEED = Long.getLong("scms.seed", 20260809L);
+    static final long MASTER_SEED = resolveSeed();
     static final int JMAX = 20;
     static final int REPORT_THRESHOLD_K = Integer.getInteger("scms.k", 3);
     static final int ATTACKER_PCT = Integer.getInteger("scms.attackerPct", 20);
     static final int FREEZE_AFTER_UPDATES = 5;
+    static final double CONST_OFFSET_M = 1500.0;   // ConstPosOffset shift (caught by the ART detector)
     static final double REPORT_PROB = 0.9;
     static final double CRL_PROP_DELAY_S = 2.0;
-    static final String OUT_DIR = System.getProperty("scms.outDir",
-            "C:\\Users\\Administrator\\SCMS-Simulator\\datasets\\mosaic_poc");
+    static final String OUT_DIR = resolveOutDir();
+
+    // Config is read from environment variables first (no JVM "Picked up ..." banner on stderr),
+    // then -D system properties, then a default. run.ps1 sets SCMS_OUT_DIR / SCMS_SEED.
+    private static long resolveSeed() {
+        String e = System.getenv("SCMS_SEED");
+        return (e != null && !e.isBlank()) ? Long.parseLong(e.trim()) : Long.getLong("scms.seed", 20260809L);
+    }
+
+    private static String resolveOutDir() {
+        String e = System.getenv("SCMS_OUT_DIR");
+        return (e != null && !e.isBlank()) ? e
+                : System.getProperty("scms.outDir", "C:\\Users\\Administrator\\SCMS-Simulator\\datasets\\mosaic_poc");
+    }
 
     private static final ScmsBackend INSTANCE = new ScmsBackend();
 
@@ -86,6 +99,7 @@ public final class ScmsBackend {
         byte[] lv;
         LinkageEngine.Device link;
         boolean attacker;
+        String attackType = "none";   // ConstPos | ConstPosOffset
         double[] frozen = null;
     }
 
@@ -132,13 +146,15 @@ public final class ScmsBackend {
         d.certDigest = hex(sha("cert|" + MASTER_SEED + "|" + unitId), 8);
         d.requestHash = hex(sha("req|" + MASTER_SEED + "|" + unitId), 8);
         d.attacker = ((sha("role|" + MASTER_SEED + "|" + unitId)[0] & 0xff) * 100 / 256) < ATTACKER_PCT;
+        if (d.attacker) {
+            d.attackType = ((sha("atktype|" + unitId)[0] & 0xff) % 2 == 0) ? "ConstPos" : "ConstPosOffset";
+        }
         devByUnit.put(unitId, d);
         devByDigest.put(d.certDigest, d);
-        gtVeh.add(gtRow("true_vehicle_id", unitId, "is_attacker", d.attacker,
-                "attacker_role", d.attacker ? "ConstPos" : "none"));
+        gtVeh.add(gtRow("true_vehicle_id", unitId, "is_attacker", d.attacker, "attacker_role", d.attackType));
         gtId.add(gtRow("true_vehicle_id", unitId, "pseudonym_cert_digest", d.certDigest, "i_period", d.i));
         if (d.attacker) {
-            gtAtk.add(gtRow("attack_id", "atk_" + unitId, "true_vehicle_id", unitId, "attack_type", "ConstPos"));
+            gtAtk.add(gtRow("attack_id", "atk_" + unitId, "true_vehicle_id", unitId, "attack_type", d.attackType));
         }
     }
 
@@ -155,7 +171,10 @@ public final class ScmsBackend {
             register(unitId);
             d = devByUnit.get(unitId);
         }
-        if (d.attacker) {
+        if (d.attacker && "ConstPosOffset".equals(d.attackType)) {
+            return new double[] {x + CONST_OFFSET_M, y + CONST_OFFSET_M};   // claim a shifted position
+        }
+        if (d.attacker && "ConstPos".equals(d.attackType)) {
             if (updateCount == FREEZE_AFTER_UPDATES) {
                 d.frozen = new double[] {x, y};
             }
@@ -177,7 +196,8 @@ public final class ScmsBackend {
     }
 
     // -------------------------------------------------- report ingestion (MA)
-    public synchronized void onDetection(String reporterDigest, String subjectDigest, double score, double t) {
+    public synchronized void onDetection(String reporterDigest, String subjectDigest, double score, double t,
+                                         String reasonCode) {
         if (rng.nextDouble() > REPORT_PROB) {
             return; // suppression / loss on the report channel
         }
@@ -190,7 +210,7 @@ public final class ScmsBackend {
         String rid = String.format("rpt_%05d", reportCounter);
         maReports.add(maRow("report_id", rid, "ingest_time", round3(t), "detection_time", round3(t),
                 "reporter_cert_digest", rep.certDigest, "subject_cert_digest", subj.certDigest,
-                "reason_codes", List.of("constantPositionFrozen"),
+                "reason_codes", List.of(reasonCode),
                 "detector_score", round3(score), "sig_valid", true, "cert_crl_status", "active"));
         gtRepLbl.add(gtRow("report_id", rid, "reporter_true_id", rep.unitId, "subject_true_id", subj.unitId,
                 "report_correctness", subj.attacker ? "correct" : "false_positive"));

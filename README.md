@@ -30,15 +30,35 @@ MA-visible data (features) and simulation ground truth (labels).
 | Determinism (same seed → byte-identical data) | ✅ verified |
 | Toolchain: JDK 17 / SUMO 1.25 / MOSAIC 25.2 / git | ✅ installed under `C:\Users\Administrator\tools` |
 | VeReMi NextGen vendored (pinned submodule) | ✅ `third_party/veremi-nextgen` @ `acda994b` |
-| Custom MOSAIC app (ScmsBeaconApp) build + run | ✅ `javac` build; runs in MOSAIC 25.2 + SUMO 1.25 |
-| Wiring SCMS (signing / detection / reporting / back-end) into MOSAIC | ⏳ next |
+| SCMS closed loop in MOSAIC (sign → detect → report → correlate → 2-LA resolve → revoke → CRL → enforce) | ✅ real ITS-G5 AdHoc; distributed detection |
+| Runs on the real InTAS (Ingolstadt) map | ✅ `run.ps1 -Scenario intas` |
+| Attacks / detectors | ✅ ConstPos + ConstPosOffset / frozen-position + ART |
+| ML featurizer + leakage-safe splitter | ✅ report + subject tables, vehicle-disjoint splits |
+| One-command end-to-end runner | ✅ `run.ps1` |
 
-The Python **P1 vertical-slice core** is complete and tested. The toolchain is
-installed and a custom MOSAIC application (`ScmsBeaconApp`) has been built and run
-end-to-end in MOSAIC + SUMO — establishing the extension seam. The SCMS logic
-(signing, local detection, report emission, back-end federate) is being wired into
-that MOSAIC app next, mirroring the validated Python reference. See
+The system is runnable end-to-end. On the real InTAS Ingolstadt map the generated
+dataset is **leakage-free**, with revocation **precision 1.0 / recall 0.986**, and is
+**byte-identical across runs** (deterministic). See
 [`docs/adr/0001-stack-and-approach.md`](docs/adr/0001-stack-and-approach.md).
+
+## Run the full simulation (one command)
+
+```powershell
+. C:\Users\Administrator\tools\env.ps1     # once per shell (JAVA_HOME/SUMO_HOME/MOSAIC_HOME/PATH)
+.\run.ps1                                   # 'smoke' highway scenario (~50 vehicles, seconds)
+.\run.ps1 -Scenario intas                   # real Ingolstadt (InTAS) map (~333 vehicles)
+.\run.ps1 -Scenario intas -Duration 600s -Seed 42
+```
+
+`run.ps1` builds the MOSAIC app, generates the scenario, simulates in MOSAIC + SUMO,
+featurizes the output into ML-ready tables, and validates it (leakage + precision/recall).
+The dataset lands in `datasets/<name>/`:
+
+- `ma/` — Misbehavior-Authority-visible events (the only source of ML features)
+- `ground_truth/` — oracle labels (never used as features)
+- `ml/` — `report_features`/`report_labels` + `subject_features`/`subject_labels`
+  (Parquet + CSV) with vehicle-disjoint `train`/`val`/`test` splits
+- `manifest.json` — seed, config, per-file SHA-256, and a dataset digest
 
 ## Quick start
 

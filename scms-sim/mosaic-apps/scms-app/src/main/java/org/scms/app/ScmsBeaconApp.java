@@ -42,10 +42,14 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
     private static final double MOVING_SPEED_MS = 5.0;   // "claims to be moving" threshold
     private static final double FROZEN_EPS_M = 0.5;      // claimed position considered unchanged
     private static final int FROZEN_COUNT = 3;           // consecutive frozen CAMs -> suspect
+    private static final double ART_MAX_M = 1000.0;      // max plausible claimed distance from receiver
 
     private int sendCount = 0;
     private double lastSendS = Double.NEGATIVE_INFINITY;
     private String myDigest;
+    private double selfX;
+    private double selfY;
+    private boolean haveSelf = false;
     // per sender: {lastClaimedX, lastClaimedY, consecutiveFrozenCount}
     private final Map<String, double[]> senderState = new HashMap<>();
 
@@ -67,6 +71,9 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         if (p == null) {
             return;
         }
+        selfX = p.getX();
+        selfY = p.getY();
+        haveSelf = true;
         long tNs = getOperatingSystem().getSimulationTime();
         double tS = tNs / 1e9;
         if (tS - lastSendS < CAM_INTERVAL_S) {
@@ -104,6 +111,17 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         if (!cam.sigValid) {
             return;
         }
+        // Acceptance-Range-Threshold: we received a short-range CAM, so the sender's CLAIMED
+        // position must be within plausible radio range of us; a far claim (position offset /
+        // teleport) is implausible and is reported immediately.
+        if (haveSelf) {
+            double artDist = Math.hypot(cam.claimedX - selfX, cam.claimedY - selfY);
+            if (artDist > ART_MAX_M) {
+                backend.onDetection(myDigest, cam.senderCertDigest, artDist, t, "acceptanceRangeThreshold");
+                return;
+            }
+        }
+        // Constant-position: claimed position frozen across consecutive CAMs while claiming to move.
         double[] st = senderState.get(cam.senderCertDigest);
         if (st == null) {
             senderState.put(cam.senderCertDigest, new double[] {cam.claimedX, cam.claimedY, 0});
@@ -118,7 +136,7 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         }
         senderState.put(cam.senderCertDigest, new double[] {cam.claimedX, cam.claimedY, frozenCount});
         if (frozenCount >= FROZEN_COUNT) {
-            backend.onDetection(myDigest, cam.senderCertDigest, cam.claimedSpeed, t);
+            backend.onDetection(myDigest, cam.senderCertDigest, cam.claimedSpeed, t, "constantPositionFrozen");
         }
     }
 
