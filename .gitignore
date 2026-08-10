@@ -23,4 +23,5 @@ scms-sim/**/out/
 scms-sim/**/build/
 *.jar
 scms-sim/scenarios/scms_smoke/
+scms-sim/scenarios/scms_intas/
 tmp/

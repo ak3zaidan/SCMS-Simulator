@@ -1,13 +1,17 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
- * SCMS-aware vehicle application (MOSAIC layer, v2 — real AdHoc reception).
+ * SCMS-aware vehicle application (MOSAIC layer, v3 — robust ConstPos detector).
  *
- * Each vehicle broadcasts a signed CAM over ITS-G5 (AdHoc CCH); MOSAIC's radio model
- * (SNS: range + delay) decides who actually receives it. Detection is now genuinely
- * DISTRIBUTED: every receiver runs a local position-speed-consistency check on the
- * CAMs it truly received and, on a suspect, files a report with the (in-JVM) MA
- * back-end, which correlates, resolves identity via the two Linkage Authorities
- * (without learning it), revokes, and issues a CRL that receivers then enforce.
+ * Each vehicle broadcasts a signed CAM (~1 Hz) over ITS-G5 (AdHoc CCH); MOSAIC's
+ * radio model (SNS: range + delay) decides who receives it. Detection is distributed:
+ * each receiver watches, per sender, whether the CLAIMED position stays frozen across
+ * several consecutive CAMs while the sender still claims to be moving — the signature
+ * of a constant-position falsification. This is robust to real urban stop-and-go
+ * traffic (legit vehicles' claimed positions always change; a stopped legit vehicle
+ * claims ~0 speed), unlike an instantaneous speed-vs-displacement check which also
+ * flags normal braking. Suspects are reported to the (in-JVM) MA back-end, which
+ * correlates, resolves via the two Linkage Authorities (without learning the identity),
+ * revokes, and issues a CRL that receivers enforce.
  */
 package org.scms.app;
 
@@ -34,11 +38,16 @@ import org.scms.backend.ScmsBackend;
 public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         implements VehicleApplication, CommunicationApplication {
 
-    private static final double CONSISTENCY_THRESH_M = 5.0;
+    private static final double CAM_INTERVAL_S = 1.0;   // ~1 Hz beaconing
+    private static final double MOVING_SPEED_MS = 5.0;   // "claims to be moving" threshold
+    private static final double FROZEN_EPS_M = 0.5;      // claimed position considered unchanged
+    private static final int FROZEN_COUNT = 3;           // consecutive frozen CAMs -> suspect
 
-    private int updateCount = 0;
+    private int sendCount = 0;
+    private double lastSendS = Double.NEGATIVE_INFINITY;
     private String myDigest;
-    private final Map<String, double[]> lastClaimed = new HashMap<>(); // subjectDigest -> {x, y, t}
+    // per sender: {lastClaimedX, lastClaimedY, consecutiveFrozenCount}
+    private final Map<String, double[]> senderState = new HashMap<>();
 
     @Override
     public void onStartup() {
@@ -58,13 +67,18 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         if (p == null) {
             return;
         }
-        updateCount++;
+        long tNs = getOperatingSystem().getSimulationTime();
+        double tS = tNs / 1e9;
+        if (tS - lastSendS < CAM_INTERVAL_S) {
+            return; // throttle to ~1 Hz
+        }
+        lastSendS = tS;
+        sendCount++;
         String id = getOperatingSystem().getId();
         ScmsBackend backend = ScmsBackend.instance();
         ScmsBackend.Cred cred = backend.getCredential(id);
-        double[] claimed = backend.claimedPosition(id, updateCount, p.getX(), p.getY());
-        long tNs = getOperatingSystem().getSimulationTime();
-        backend.onCamSent(cred.certDigest, tNs / 1e9);
+        double[] claimed = backend.claimedPosition(id, sendCount, p.getX(), p.getY());
+        backend.onCamSent(cred.certDigest, tS);
 
         MessageRouting routing = getOperatingSystem().getAdHocModule().createMessageRouting()
                 .channel(AdHocChannel.CCH).topological().broadcast().singlehop().build();
@@ -80,7 +94,7 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         }
         SignedCam cam = (SignedCam) rx.getMessage();
         if (cam.senderCertDigest.equals(myDigest)) {
-            return; // ignore our own broadcast
+            return;
         }
         double t = getOperatingSystem().getSimulationTime() / 1e9;
         ScmsBackend backend = ScmsBackend.instance();
@@ -88,17 +102,23 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
             return; // ENFORCEMENT: drop CAMs from revoked certificates
         }
         if (!cam.sigValid) {
-            return; // invalid-signature handling is a later attack class
-        }
-        double[] prev = lastClaimed.get(cam.senderCertDigest);
-        lastClaimed.put(cam.senderCertDigest, new double[] {cam.claimedX, cam.claimedY, t});
-        if (prev == null) {
             return;
         }
-        double moved = Math.hypot(cam.claimedX - prev[0], cam.claimedY - prev[1]);
-        double inconsistency = Math.abs(moved - cam.claimedSpeed * (t - prev[2]));
-        if (inconsistency > CONSISTENCY_THRESH_M) {
-            backend.onDetection(myDigest, cam.senderCertDigest, inconsistency, t);
+        double[] st = senderState.get(cam.senderCertDigest);
+        if (st == null) {
+            senderState.put(cam.senderCertDigest, new double[] {cam.claimedX, cam.claimedY, 0});
+            return;
+        }
+        double moved = Math.hypot(cam.claimedX - st[0], cam.claimedY - st[1]);
+        double frozenCount = st[2];
+        if (cam.claimedSpeed > MOVING_SPEED_MS && moved < FROZEN_EPS_M) {
+            frozenCount += 1;                 // claims to move, but claimed position didn't change
+        } else {
+            frozenCount = 0;                  // legit motion (or genuinely stopped) resets
+        }
+        senderState.put(cam.senderCertDigest, new double[] {cam.claimedX, cam.claimedY, frozenCount});
+        if (frozenCount >= FROZEN_COUNT) {
+            backend.onDetection(myDigest, cam.senderCertDigest, cam.claimedSpeed, t);
         }
     }
 
@@ -109,7 +129,7 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
 
     @Override
     public void onCamBuilding(CamBuilder camBuilder) {
-        // we broadcast our own SignedCam; no built-in CAM assembly needed
+        // we broadcast our own SignedCam
     }
 
     @Override

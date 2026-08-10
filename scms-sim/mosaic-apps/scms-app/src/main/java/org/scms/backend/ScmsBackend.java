@@ -190,7 +190,7 @@ public final class ScmsBackend {
         String rid = String.format("rpt_%05d", reportCounter);
         maReports.add(maRow("report_id", rid, "ingest_time", round3(t), "detection_time", round3(t),
                 "reporter_cert_digest", rep.certDigest, "subject_cert_digest", subj.certDigest,
-                "reason_codes", List.of("positionSpeedConsistency"),
+                "reason_codes", List.of("constantPositionFrozen"),
                 "detector_score", round3(score), "sig_valid", true, "cert_crl_status", "active"));
         gtRepLbl.add(gtRow("report_id", rid, "reporter_true_id", rep.unitId, "subject_true_id", subj.unitId,
                 "report_correctness", subj.attacker ? "correct" : "false_positive"));
