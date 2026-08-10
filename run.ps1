@@ -8,11 +8,13 @@
     .\run.ps1                                   # 'smoke' highway scenario (fast, ~50 vehicles)
     .\run.ps1 -Scenario intas                   # real Ingolstadt (InTAS) map (~333 vehicles)
     .\run.ps1 -Scenario intas -Duration 600s -Seed 42
+    .\run.ps1 -Scenario intas -Visualize        # watch live in MOSAIC's 2D web visualizer
 #>
 param(
     [ValidateSet('smoke', 'intas')][string]$Scenario = 'smoke',
     [string]$Duration,
-    [int]$Seed
+    [int]$Seed,
+    [switch]$Visualize    # open MOSAIC's 2D web visualizer in the browser
 )
 $ErrorActionPreference = 'Stop'
 if (-not $env:MOSAIC_HOME) { . C:\Users\Administrator\tools\env.ps1 }
@@ -40,7 +42,9 @@ Push-Location $env:MOSAIC_HOME
 $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'   # MOSAIC/SUMO write progress to stderr; don't treat as fatal
 try {
-    & .\mosaic.bat -c $cfg -w 0 2>&1 | Select-Object -Last 3
+    $mosaicArgs = @('-c', $cfg, '-w', '0')
+    if ($Visualize) { $mosaicArgs += '-v' }
+    & .\mosaic.bat @mosaicArgs 2>&1 | Select-Object -Last 3
 } finally {
     $ErrorActionPreference = $prevEAP
     Pop-Location

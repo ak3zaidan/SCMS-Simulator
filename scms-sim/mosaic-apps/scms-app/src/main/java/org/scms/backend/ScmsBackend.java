@@ -1,27 +1,23 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
- * In-JVM SCMS back-end for the MOSAIC layer (v2).
+ * In-JVM SCMS back-end for the MOSAIC layer (v4 — full entity model).
  *
- * A single-host MOSAIC run executes all application instances in one sequential JVM,
- * so a static singleton back-end is deterministic and safe. It composites the
- * RA/PCA/LA1/LA2/MA/CRLG roles for the simulation while preserving the key trust
- * property: MA-visible investigation records NEVER contain a true identity — only
- * pseudonym-certificate digests and an opaque case handle. True identities live only
- * in the ground-truth (ORACLE) plane.
+ * Orchestrates the full Security Credential Management System, modelled as DISTINCT
+ * entities with real trust boundaries (see org.scms.entities.Scms): DCM + ECA
+ * (enrollment), RA + PCA + LA1 + LA2 (provisioning), MA + CRLG + CRL Store (enforcement),
+ * LOP (privacy proxy), and the Root CA / ICA / PG / Electors trust anchors. This class is
+ * the deterministic coordinator + dataset writer; the SCMS state lives inside the entities,
+ * so the key property holds structurally: the MA never receives a true identity — it drives
+ * resolution through PCA -> LA1/LA2 -> RA and only ever gets forward seeds + an opaque handle.
  *
- * v2 change: message reception + detection are now DISTRIBUTED across the vehicle apps
- * over MOSAIC's real AdHoc radio; this back-end provisions credentials, defines the
- * attacker's claimed position, ingests reports via {@link #onDetection}, correlates,
- * resolves identity with the cross-validated {@link org.scms.crypto.LinkageEngine}
- * (CAMP SCP2), revokes, and issues/enforces a CRL. Outputs are written once via a JVM
- * shutdown hook:
- *   <outDir>/ma/*.jsonl (MA/PUBLIC — safe for features), <outDir>/ground_truth/*.jsonl
- *   (ORACLE — labels only), <outDir>/manifest.json (seed, config, per-file sha256, digest).
+ * Detection is distributed across the vehicle apps over MOSAIC's real AdHoc radio; this
+ * back-end ingests reports (via the LOP), correlates (MA), resolves + revokes + issues a CRL,
+ * and writes the trust-separated dataset (ma/*, ground_truth/*, manifest.json) once at JVM exit.
  */
 package org.scms.backend;
 
-import com.google.gson.GsonBuilder;
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -32,15 +28,14 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
-import java.util.Set;
 import java.util.TreeMap;
 
 import org.scms.crypto.LinkageEngine;
+import org.scms.entities.Scms;
 
 public final class ScmsBackend {
 
@@ -49,13 +44,11 @@ public final class ScmsBackend {
     static final int REPORT_THRESHOLD_K = Integer.getInteger("scms.k", 3);
     static final int ATTACKER_PCT = Integer.getInteger("scms.attackerPct", 20);
     static final int FREEZE_AFTER_UPDATES = 5;
-    static final double CONST_OFFSET_M = 1500.0;   // ConstPosOffset shift (caught by the ART detector)
+    static final double CONST_OFFSET_M = 1500.0;
     static final double REPORT_PROB = 0.9;
     static final double CRL_PROP_DELAY_S = 2.0;
     static final String OUT_DIR = resolveOutDir();
 
-    // Config is read from environment variables first (no JVM "Picked up ..." banner on stderr),
-    // then -D system properties, then a default. run.ps1 sets SCMS_OUT_DIR / SCMS_SEED.
     private static long resolveSeed() {
         String e = System.getenv("SCMS_SEED");
         return (e != null && !e.isBlank()) ? Long.parseLong(e.trim()) : Long.getLong("scms.seed", 20260809L);
@@ -73,14 +66,12 @@ public final class ScmsBackend {
         return INSTANCE;
     }
 
-    /** Credential handed to a vehicle app so it can build/sign its CAM. */
     public static final class Cred {
         public final String certDigest;
         public final int iPeriod;
         public final int jIndex;
         public final String linkageValueHex;
         public final boolean attacker;
-
         Cred(String certDigest, int iPeriod, int jIndex, String linkageValueHex, boolean attacker) {
             this.certDigest = certDigest;
             this.iPeriod = iPeriod;
@@ -92,6 +83,7 @@ public final class ScmsBackend {
 
     private final Random rng = new Random(MASTER_SEED);
     private final Gson gson = new GsonBuilder().serializeSpecialFloatingPointValues().create();
+    private final Scms scms = new Scms();
 
     private static final class Dev {
         String unitId, certDigest, requestHash, lvHex;
@@ -99,17 +91,14 @@ public final class ScmsBackend {
         byte[] lv;
         LinkageEngine.Device link;
         boolean attacker;
-        String attackType = "none";   // ConstPos | ConstPosOffset
+        String attackType = "none";
         double[] frozen = null;
     }
 
     private final Map<String, Dev> devByUnit = new HashMap<>();
     private final Map<String, Dev> devByDigest = new HashMap<>();
-    private final Map<String, Set<String>> reportersBySubject = new HashMap<>();
-    private final Map<String, Double> revocationTime = new HashMap<>();
     private final Map<String, Double> firstSeen = new HashMap<>();
     private final Map<String, Double> lastSeen = new HashMap<>();
-    private final List<LinkageEngine.CrlEntry> crl = new ArrayList<>();
 
     private final List<Map<String, Object>> maReports = new ArrayList<>();
     private final List<Map<String, Object>> maInvest = new ArrayList<>();
@@ -117,6 +106,7 @@ public final class ScmsBackend {
     private final List<Map<String, Object>> maCertStatus = new ArrayList<>();
     private final List<Map<String, Object>> gtVeh = new ArrayList<>();
     private final List<Map<String, Object>> gtId = new ArrayList<>();
+    private final List<Map<String, Object>> gtEnroll = new ArrayList<>();
     private final List<Map<String, Object>> gtAtk = new ArrayList<>();
     private final List<Map<String, Object>> gtRepLbl = new ArrayList<>();
     private final List<Map<String, Object>> gtRev = new ArrayList<>();
@@ -136,12 +126,12 @@ public final class ScmsBackend {
         }
         Dev d = new Dev();
         d.unitId = unitId;
-        d.link = new LinkageEngine.Device(1, 2,
-                Arrays.copyOf(sha("ls1|" + MASTER_SEED + "|" + unitId), 16),
-                Arrays.copyOf(sha("ls2|" + MASTER_SEED + "|" + unitId), 16));
+        byte[] ls1 = Arrays.copyOf(sha("ls1|" + MASTER_SEED + "|" + unitId), 16);
+        byte[] ls2 = Arrays.copyOf(sha("ls2|" + MASTER_SEED + "|" + unitId), 16);
+        d.link = new LinkageEngine.Device(1, 2, ls1, ls2);
         d.i = 0;
         d.j = (sha("j|" + unitId)[0] & 0xff) % JMAX;
-        d.lv = d.link.linkageValueFor(d.i, d.j);
+        d.lv = d.link.linkageValueFor(d.i, d.j);   // PCA computes lv = plv1 XOR plv2
         d.lvHex = hex(d.lv, d.lv.length);
         d.certDigest = hex(sha("cert|" + MASTER_SEED + "|" + unitId), 8);
         d.requestHash = hex(sha("req|" + MASTER_SEED + "|" + unitId), 8);
@@ -149,10 +139,25 @@ public final class ScmsBackend {
         if (d.attacker) {
             d.attackType = ((sha("atktype|" + unitId)[0] & 0xff) % 2 == 0) ? "ConstPos" : "ConstPosOffset";
         }
+
+        // SCMS provisioning across the distinct entities (trust boundaries preserved).
+        scms.dcm.attest(unitId);
+        String enrollmentId = scms.eca.issue(unitId);
+        String laH1 = "lc1:" + unitId;
+        String laH2 = "lc2:" + unitId;
+        int laId1 = 0x0001;
+        int laId2 = 0x0002;
+        scms.la1.register(laH1, ls1, laId1);
+        scms.la2.register(laH2, ls2, laId2);
+        scms.pca.issue(d.certDigest, d.requestHash, d.i, d.j, laH1, laH2);
+        scms.ra.bind(d.requestHash, enrollmentId);   // RA is the only request->identity mapping
+
         devByUnit.put(unitId, d);
         devByDigest.put(d.certDigest, d);
         gtVeh.add(gtRow("true_vehicle_id", unitId, "is_attacker", d.attacker, "attacker_role", d.attackType));
         gtId.add(gtRow("true_vehicle_id", unitId, "pseudonym_cert_digest", d.certDigest, "i_period", d.i));
+        gtEnroll.add(gtRow("true_vehicle_id", unitId, "enrollment_cert", enrollmentId,
+                "device_type", scms.dcm.deviceType(unitId), "eca_id", scms.eca.id));
         if (d.attacker) {
             gtAtk.add(gtRow("attack_id", "atk_" + unitId, "true_vehicle_id", unitId, "attack_type", d.attackType));
         }
@@ -164,7 +169,6 @@ public final class ScmsBackend {
         return new Cred(d.certDigest, d.i, d.j, d.lvHex, d.attacker);
     }
 
-    /** Claimed position a vehicle broadcasts: attacker freezes (ConstPos); others tell the truth. */
     public synchronized double[] claimedPosition(String unitId, int updateCount, double x, double y) {
         Dev d = devByUnit.get(unitId);
         if (d == null) {
@@ -172,7 +176,7 @@ public final class ScmsBackend {
             d = devByUnit.get(unitId);
         }
         if (d.attacker && "ConstPosOffset".equals(d.attackType)) {
-            return new double[] {x + CONST_OFFSET_M, y + CONST_OFFSET_M};   // claim a shifted position
+            return new double[] {x + CONST_OFFSET_M, y + CONST_OFFSET_M};
         }
         if (d.attacker && "ConstPos".equals(d.attackType)) {
             if (updateCount == FREEZE_AFTER_UPDATES) {
@@ -191,11 +195,10 @@ public final class ScmsBackend {
     }
 
     public synchronized boolean isRevoked(String subjectDigest, double t) {
-        Double rt = revocationTime.get(subjectDigest);
-        return rt != null && t >= rt + CRL_PROP_DELAY_S;
+        return scms.crlStore.enforced(subjectDigest, t, CRL_PROP_DELAY_S);
     }
 
-    // -------------------------------------------------- report ingestion (MA)
+    // -------------------------------------------------- report ingestion (LOP -> RA -> MA)
     public synchronized void onDetection(String reporterDigest, String subjectDigest, double score, double t,
                                          String reasonCode) {
         if (rng.nextDouble() > REPORT_PROB) {
@@ -206,6 +209,7 @@ public final class ScmsBackend {
         if (subj == null || rep == null) {
             return;
         }
+        scms.lop.forward(rep.certDigest, subj.certDigest);   // LOP strips network identifiers
         reportCounter++;
         String rid = String.format("rpt_%05d", reportCounter);
         maReports.add(maRow("report_id", rid, "ingest_time", round3(t), "detection_time", round3(t),
@@ -214,29 +218,33 @@ public final class ScmsBackend {
                 "detector_score", round3(score), "sig_valid", true, "cert_crl_status", "active"));
         gtRepLbl.add(gtRow("report_id", rid, "reporter_true_id", rep.unitId, "subject_true_id", subj.unitId,
                 "report_correctness", subj.attacker ? "correct" : "false_positive"));
-        reportersBySubject.computeIfAbsent(subj.certDigest, k -> new HashSet<>()).add(rep.certDigest);
-        if (!revocationTime.containsKey(subj.certDigest)
-                && reportersBySubject.get(subj.certDigest).size() >= REPORT_THRESHOLD_K) {
+        int distinct = scms.ma.addReporter(subj.certDigest, rep.certDigest);
+        if (!scms.crlStore.isRevoked(subj.certDigest) && distinct >= REPORT_THRESHOLD_K) {
             resolveAndRevoke(subj, t);
         }
     }
 
-    /** MA investigation: real two-LA linkage resolution + revocation. MA never learns the true id. */
+    /** MA investigation across entities: PCA -> LA1/LA2 (seeds) -> RA (blacklist) -> CRLG -> CRL Store. */
     private void resolveAndRevoke(Dev subj, double t) {
         caseCounter++;
         String caseId = String.format("case_%04d", caseCounter);
-        LinkageEngine.CrlEntry entry = LinkageEngine.CrlEntry.fromDevice(subj.link, subj.i, JMAX);
+        Scms.Prov p = scms.pca.resolve(subj.certDigest);          // opaque record: no identity
+        byte[] ls1i = scms.la1.seedAt(p.laHandle1, p.i);          // forward seeds from the two LAs
+        byte[] ls2i = scms.la2.seedAt(p.laHandle2, p.i);
+        int laId1 = scms.la1.laId(p.laHandle1);
+        int laId2 = scms.la2.laId(p.laHandle2);
+        scms.ra.blacklistByRequest(p.requestHash);               // enrollment identity stays inside the RA
+        LinkageEngine.CrlEntry entry = scms.crlg.issue(p.i, laId1, laId2, ls1i, ls2i, JMAX);
         if (!entry.matches(subj.i, subj.j, subj.lv)) {
             throw new IllegalStateException("CRL entry failed to revoke its target device");
         }
-        crl.add(entry);
-        revocationTime.put(subj.certDigest, t);
-        int reporters = reportersBySubject.get(subj.certDigest).size();
+        scms.crlStore.publish(subj.certDigest, t);
+        int reporters = scms.ma.distinctReporters(subj.certDigest);
         maInvest.add(maRow("case_id", caseId, "opened_time", round3(t), "trigger", "report_threshold",
                 "num_distinct_reporters", reporters, "linkage_result", "same", "identity_resolved", true,
                 "revocation_decision", "revoke", "resolved_case_handle", hex(sha(caseId), 6)));
         maCrl.add(maRow("crl_id", String.format("crl_%04d", caseCounter), "issue_time", round3(t),
-                "entry_type", "seed", "num_entries", crl.size()));
+                "entry_type", "seed", "num_entries", scms.crlg.size()));
         gtRev.add(gtRow("true_vehicle_id", subj.unitId, "should_have_been_revoked", subj.attacker,
                 "true_revocation_time", round3(t)));
     }
@@ -249,11 +257,11 @@ public final class ScmsBackend {
         written = true;
         try {
             for (Dev d : devByUnit.values()) {
-                Double rt = revocationTime.get(d.certDigest);
+                Double rt = scms.crlStore.revocationTime(d.certDigest);
                 maCertStatus.add(maRow("cert_digest", d.certDigest,
                         "first_seen", firstSeen.getOrDefault(d.certDigest, 0.0),
                         "last_seen", lastSeen.getOrDefault(d.certDigest, 0.0),
-                        "issuing_pca", "PCA-1", "crl_status", rt != null ? "revoked" : "active",
+                        "issuing_pca", scms.pca.id, "crl_status", rt != null ? "revoked" : "active",
                         "revocation_time", rt));
             }
             Path ma = Paths.get(OUT_DIR, "ma");
@@ -267,6 +275,7 @@ public final class ScmsBackend {
             digests.put("ma/ma_cert_status.jsonl", writeJsonl(ma.resolve("ma_cert_status.jsonl"), sortBy(maCertStatus, "cert_digest")));
             digests.put("ground_truth/gt_vehicle.jsonl", writeJsonl(gt.resolve("gt_vehicle.jsonl"), sortBy(gtVeh, "true_vehicle_id")));
             digests.put("ground_truth/gt_identity_map.jsonl", writeJsonl(gt.resolve("gt_identity_map.jsonl"), sortBy(gtId, "pseudonym_cert_digest")));
+            digests.put("ground_truth/gt_enrollment.jsonl", writeJsonl(gt.resolve("gt_enrollment.jsonl"), sortBy(gtEnroll, "true_vehicle_id")));
             digests.put("ground_truth/gt_attacks.jsonl", writeJsonl(gt.resolve("gt_attacks.jsonl"), sortBy(gtAtk, "attack_id")));
             digests.put("ground_truth/gt_report_labels.jsonl", writeJsonl(gt.resolve("gt_report_labels.jsonl"), sortBy(gtRepLbl, "report_id")));
             digests.put("ground_truth/gt_linkage_revocation.jsonl", writeJsonl(gt.resolve("gt_linkage_revocation.jsonl"), sortBy(gtRev, "true_vehicle_id")));
@@ -277,9 +286,10 @@ public final class ScmsBackend {
                 all.update(en.getValue().getBytes(StandardCharsets.UTF_8));
             }
             Map<String, Object> manifest = new LinkedHashMap<>();
-            manifest.put("dataset_version", "0.2.0");
-            manifest.put("generator", "scms_sim_ref (MOSAIC layer, in-JVM back-end v2, real AdHoc reception)");
+            manifest.put("dataset_version", "0.3.0");
+            manifest.put("generator", "scms_sim_ref (MOSAIC layer, full-entity back-end v4)");
             manifest.put("seed", MASTER_SEED);
+            manifest.put("scms_entities", Scms.ENTITY_NAMES);
             Map<String, Object> cfg = new LinkedHashMap<>();
             cfg.put("reception", "MOSAIC AdHoc ITS-G5 CCH via SNS (range/delay)");
             cfg.put("report_threshold_k", REPORT_THRESHOLD_K);
@@ -291,7 +301,7 @@ public final class ScmsBackend {
             counts.put("vehicles", devByUnit.size());
             counts.put("reports", maReports.size());
             counts.put("investigations", maInvest.size());
-            counts.put("revoked", crl.size());
+            counts.put("revoked", scms.crlg.size());
             manifest.put("counts", counts);
             manifest.put("data_digest_sha256", hex(all.digest(), 32));
             manifest.put("outputs", digests);
@@ -302,7 +312,7 @@ public final class ScmsBackend {
                             .getBytes(StandardCharsets.UTF_8));
             System.out.println("[ScmsBackend] wrote dataset to " + OUT_DIR
                     + " (vehicles=" + devByUnit.size() + " reports=" + maReports.size()
-                    + " revoked=" + crl.size() + ")");
+                    + " revoked=" + scms.crlg.size() + ")");
         } catch (Exception ex) {
             ex.printStackTrace();
         }
