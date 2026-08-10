@@ -8,16 +8,6 @@ resolution → revocation → CRL → enforcement) and generates a dataset from 
 **global Misbehavior-Authority perspective** — with strict separation between
 MA-visible data (features) and simulation ground truth (labels).
 
-> **Why this exists.** Existing datasets (VeReMi family, MisbehaviorX) are
-> per-vehicle BSM observations. Only **DARE** takes an MA perspective, and it is
-> just a bag of reports — no correlation, no pseudonym→identity linkage, no CRL,
-> no revocation, no trust boundaries, and its reports leak true identities. This
-> project closes the full loop with correct SCMS privacy separation and a
-> build-breaking leakage firewall. See the design document for the full rationale.
-
-**Design document (all 27 planning deliverables, diagrams, decision matrix):**
-<https://claude.ai/code/artifact/9a391e86-95f0-421a-aadd-f2459ddb93f3>
-
 The system is runnable end-to-end. On the real InTAS Ingolstadt map the generated
 dataset is **leakage-free**, with revocation **precision 1.0 / recall 0.986**, and is
 **byte-identical across runs** (deterministic). See
