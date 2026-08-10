@@ -60,6 +60,23 @@ The dataset lands in `datasets/<name>/`:
   (Parquet + CSV) with vehicle-disjoint `train`/`val`/`test` splits
 - `manifest.json` — seed, config, per-file SHA-256, and a dataset digest
 
+## SCMS entities (all 14 modeled)
+
+All 14 SCMS entities from the design (§7) are modeled as distinct modules with real trust
+boundaries in [`org.scms.entities.Scms`](scms-sim/mosaic-apps/scms-app/src/main/java/org/scms/entities/Scms.java):
+
+- **Trust anchors (offline):** Root CA · Intermediate CA · Electors · Policy Generator
+- **Enrollment:** Device Configuration Manager · Enrollment CA
+- **Provisioning:** Registration Authority · Pseudonym CA · Linkage Authority 1 & 2
+- **Enforcement:** Misbehavior Authority · CRL Generator · CRL Store/Broadcast
+- **Privacy:** Location Obscurer Proxy
+
+The boundary is **structural, not conventional**: the Misbehavior Authority never holds a
+true identity — it resolves a suspect via PCA → LA1/LA2 (forward linkage seeds) → RA, and the
+**RA is the only entity that maps a provisioning request to an enrollment identity**. True
+identities exist only in `ground_truth/` and are never used as features. The Python reference
+(`src/scms_sim_ref/mock_pipeline/run.py`) mirrors the operational entities.
+
 ## Quick start
 
 ```powershell
