@@ -34,9 +34,14 @@ from .leakage_linter import lint_feature_frame
 
 REASON_VOCAB = [
     "constantPositionFrozen",
-    "positionSpeedConsistency",
+    "positionSpeedInconsistency",
+    "positionSpeedConsistency",   # mock-pipeline alias
     "acceptanceRangeThreshold",
-    "constantPositionOffset",
+    "positionJump",
+    "sybilCoLocation",
+    "headingInconsistency",
+    "staleOrReplay",
+    "beaconFrequency",
 ]
 
 

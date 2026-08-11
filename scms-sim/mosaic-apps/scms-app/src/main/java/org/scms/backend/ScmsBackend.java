@@ -34,6 +34,7 @@ import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
 
+import org.scms.attacks.AttackLib;
 import org.scms.crypto.LinkageEngine;
 import org.scms.entities.Scms;
 
@@ -92,18 +93,22 @@ public final class ScmsBackend {
         public final int jIndex;
         public final String linkageValueHex;
         public final boolean attacker;
-        Cred(String certDigest, int iPeriod, int jIndex, String linkageValueHex, boolean attacker) {
+        public final String attackType;
+        Cred(String certDigest, int iPeriod, int jIndex, String linkageValueHex, boolean attacker, String attackType) {
             this.certDigest = certDigest;
             this.iPeriod = iPeriod;
             this.jIndex = jIndex;
             this.linkageValueHex = linkageValueHex;
             this.attacker = attacker;
+            this.attackType = attackType;
         }
     }
 
     private final Random rng = new Random(MASTER_SEED);
     private final Gson gson = new GsonBuilder().serializeSpecialFloatingPointValues().create();
     private final Scms scms = new Scms();
+    private final List<String> attacksEnabled = AttackLib.enabled();
+    private final AttackLib.Cfg attackCfg = new AttackLib.Cfg();
 
     private static final class Dev {
         String unitId, certDigest, requestHash, lvHex;
@@ -112,7 +117,8 @@ public final class ScmsBackend {
         LinkageEngine.Device link;
         boolean attacker;
         String attackType = "none";
-        double[] frozen = null;
+        AttackLib.State atk = null;
+        List<String> ghosts = null;   // Sybil: extra identities mapped back to this device
     }
 
     private final Map<String, Dev> devByUnit = new HashMap<>();
@@ -157,7 +163,8 @@ public final class ScmsBackend {
         d.requestHash = hex(sha("req|" + MASTER_SEED + "|" + unitId), 8);
         d.attacker = ((sha("role|" + MASTER_SEED + "|" + unitId)[0] & 0xff) * 100 / 256) < ATTACKER_PCT;
         if (d.attacker) {
-            d.attackType = ((sha("atktype|" + unitId)[0] & 0xff) % 2 == 0) ? "ConstPos" : "ConstPosOffset";
+            d.attackType = AttackLib.assign(unitId, MASTER_SEED, attacksEnabled);
+            d.atk = new AttackLib.State(MASTER_SEED * 1000003L + unitId.hashCode());
         }
 
         // SCMS provisioning across the distinct entities (trust boundaries preserved).
@@ -174,6 +181,15 @@ public final class ScmsBackend {
 
         devByUnit.put(unitId, d);
         devByDigest.put(d.certDigest, d);
+        if (d.attacker && "Sybil".equals(d.attackType)) {
+            d.ghosts = new ArrayList<>();
+            for (int k = 0; k < attackCfg.sybilGhosts; k++) {
+                String g = hex(sha("ghost|" + MASTER_SEED + "|" + unitId + "|" + k), 8);
+                d.ghosts.add(g);
+                devByDigest.put(g, d);   // ghost identities resolve to the same attacker (for labeling)
+                gtId.add(gtRow("true_vehicle_id", unitId, "pseudonym_cert_digest", g, "i_period", d.i));
+            }
+        }
         gtVeh.add(gtRow("true_vehicle_id", unitId, "is_attacker", d.attacker, "attacker_role", d.attackType));
         gtId.add(gtRow("true_vehicle_id", unitId, "pseudonym_cert_digest", d.certDigest, "i_period", d.i));
         gtEnroll.add(gtRow("true_vehicle_id", unitId, "enrollment_cert", enrollmentId,
@@ -186,27 +202,29 @@ public final class ScmsBackend {
     public synchronized Cred getCredential(String unitId) {
         register(unitId);
         Dev d = devByUnit.get(unitId);
-        return new Cred(d.certDigest, d.i, d.j, d.lvHex, d.attacker);
+        return new Cred(d.certDigest, d.i, d.j, d.lvHex, d.attacker, d.attackType);
     }
 
-    public synchronized double[] claimedPosition(String unitId, int updateCount, double x, double y) {
+    /** Compute the claimed CAM (content + timing/flood/sybil flags) for one broadcast. */
+    public synchronized AttackLib.Claim claim(String unitId, int sendCount, double x, double y,
+                                              double speed, double heading, long tNs) {
         Dev d = devByUnit.get(unitId);
         if (d == null) {
             register(unitId);
             d = devByUnit.get(unitId);
         }
-        if (d.attacker && "ConstPosOffset".equals(d.attackType)) {
-            return new double[] {x + CONST_OFFSET_M, y + CONST_OFFSET_M};
+        if (!d.attacker) {
+            AttackLib.Claim c = new AttackLib.Claim();
+            c.x = x; c.y = y; c.speed = speed; c.heading = heading; c.genTimeNs = tNs;
+            return c;
         }
-        if (d.attacker && "ConstPos".equals(d.attackType)) {
-            if (updateCount == FREEZE_AFTER_UPDATES) {
-                d.frozen = new double[] {x, y};
-            }
-            if (d.frozen != null) {
-                return new double[] {d.frozen[0], d.frozen[1]};
-            }
-        }
-        return new double[] {x, y};
+        return AttackLib.compute(d.attackType, d.atk, sendCount, x, y, speed, heading, tNs, attackCfg);
+    }
+
+    /** Sybil ghost cert digests for an attacker (empty for everyone else). */
+    public synchronized List<String> ghostDigests(String unitId) {
+        Dev d = devByUnit.get(unitId);
+        return (d != null && d.ghosts != null) ? d.ghosts : java.util.Collections.emptyList();
     }
 
     public synchronized void onCamSent(String certDigest, double t) {
@@ -233,12 +251,12 @@ public final class ScmsBackend {
         reportCounter++;
         String rid = String.format("rpt_%05d", reportCounter);
         maReports.add(maRow("report_id", rid, "ingest_time", round3(t), "detection_time", round3(t),
-                "reporter_cert_digest", rep.certDigest, "subject_cert_digest", subj.certDigest,
+                "reporter_cert_digest", reporterDigest, "subject_cert_digest", subjectDigest,
                 "reason_codes", List.of(reasonCode),
                 "detector_score", round3(score), "sig_valid", true, "cert_crl_status", "active"));
         gtRepLbl.add(gtRow("report_id", rid, "reporter_true_id", rep.unitId, "subject_true_id", subj.unitId,
                 "report_correctness", subj.attacker ? "correct" : "false_positive"));
-        int distinct = scms.ma.addReporter(subj.certDigest, rep.certDigest);
+        int distinct = scms.ma.addReporter(subjectDigest, reporterDigest);
         if (!scms.crlStore.isRevoked(subj.certDigest) && distinct >= REPORT_THRESHOLD_K) {
             resolveAndRevoke(subj, t);
         }
@@ -316,6 +334,7 @@ public final class ScmsBackend {
             cfg.put("attacker_pct", ATTACKER_PCT);
             cfg.put("report_prob", REPORT_PROB);
             cfg.put("jmax", JMAX);
+            cfg.put("attacks_enabled", attacksEnabled);
             manifest.put("config", cfg);
             Map<String, Object> counts = new LinkedHashMap<>();
             counts.put("vehicles", devByUnit.size());
