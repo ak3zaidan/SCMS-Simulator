@@ -1,20 +1,29 @@
 <#
-  One-command end-to-end runner for the SCMS-aware V2X dataset framework:
-  build the MOSAIC app -> generate a scenario -> simulate (MOSAIC + SUMO) ->
-  featurize into ML-ready tables -> validate (leakage + revocation precision/recall).
+  One-command end-to-end runner: build the MOSAIC app -> generate a scenario ->
+  simulate (MOSAIC + SUMO) -> featurize into ML-ready tables -> validate.
 
   Usage:
     . C:\Users\Administrator\tools\env.ps1     # once per shell: JAVA_HOME/SUMO_HOME/MOSAIC_HOME/PATH
-    .\run.ps1                                   # 'smoke' highway scenario (fast, ~50 vehicles)
-    .\run.ps1 -Scenario intas                   # real Ingolstadt (InTAS) map (~333 vehicles)
-    .\run.ps1 -Scenario intas -Duration 600s -Seed 42
-    .\run.ps1 -Scenario intas -Visualize        # watch live in MOSAIC's 2D web visualizer
+    .\run.ps1                                   # 'smoke' synthetic highway
+    .\run.ps1 -Scenario intas_urban_rush        # real Ingolstadt, 7-9am rush
+    .\run.ps1 -Scenario highway -MaxVehicles 200 -Lanes 3
+    .\run.ps1 -Scenario barnim -Scale 1.5 -Duration 300s -Seed 42
+    .\run.ps1 -Scenario tiergarten -Visualize   # also open MOSAIC's live 2D map
+
+  Scenarios: smoke, highway, barnim, tiergarten,
+             intas_urban_low, intas_urban_rush, intas_highway_low, intas_highway_rush
 #>
 param(
-    [ValidateSet('smoke', 'intas')][string]$Scenario = 'smoke',
+    [ValidateSet('smoke', 'highway', 'barnim', 'tiergarten',
+        'intas_urban_low', 'intas_urban_rush', 'intas_highway_low', 'intas_highway_rush')]
+    [string]$Scenario = 'smoke',
     [string]$Duration,
     [int]$Seed,
-    [switch]$Visualize    # open MOSAIC's 2D web visualizer in the browser
+    [string]$Scale,          # route maps: SUMO traffic-density multiplier
+    [int]$MaxVehicles,       # flow maps: cap on concurrent vehicles
+    [int]$TargetFlow,        # flow maps: vehicles/hour
+    [int]$Lanes,             # flow maps: number of lanes used
+    [switch]$Visualize
 )
 $ErrorActionPreference = 'Stop'
 if (-not $env:MOSAIC_HOME) { . C:\Users\Administrator\tools\env.ps1 }
@@ -24,16 +33,17 @@ Write-Host "== [1/5] Build MOSAIC app (javac, no Maven) =="
 & "$repo\scms-sim\mosaic-apps\scms-app\build.ps1"
 
 Write-Host "== [2/5] Generate '$Scenario' scenario =="
-if ($Scenario -eq 'smoke') {
-    & "$repo\scms-sim\scenarios\make_scms_smoke.ps1" | Out-Null
-    $cfg = "$repo\scms-sim\scenarios\scms_smoke\scenario_config.json"
-    $out = "$repo\datasets\mosaic_poc"
-} else {
-    if ($Duration) { & "$repo\scms-sim\scenarios\make_scms_intas.ps1" -Duration $Duration | Out-Null }
-    else { & "$repo\scms-sim\scenarios\make_scms_intas.ps1" | Out-Null }
-    $cfg = "$repo\scms-sim\scenarios\scms_intas\scenario_config.json"
-    $out = "$repo\datasets\mosaic_intas"
-}
+$genArgs = @($Scenario)
+if ($Duration)    { $genArgs += @('--duration', $Duration) }
+if ($Seed)        { $genArgs += @('--seed', "$Seed") }
+if ($Scale)       { $genArgs += @('--scale', "$Scale") }
+if ($MaxVehicles) { $genArgs += @('--max-vehicles', "$MaxVehicles") }
+if ($TargetFlow)  { $genArgs += @('--target-flow', "$TargetFlow") }
+if ($Lanes)       { $genArgs += @('--lanes', "$Lanes") }
+$gen = & python "$repo\scms-sim\scenarios\gen_scenario.py" @genArgs | ConvertFrom-Json
+$cfg = $gen.scenario_config
+$out = $gen.dataset_dir
+Write-Host "   $($gen.kind) scenario -> $cfg"
 
 Write-Host "== [3/5] Simulate in MOSAIC + SUMO  ->  $out =="
 $env:SCMS_OUT_DIR = $out
@@ -59,8 +69,4 @@ Write-Host "== [5/5] Validate (leakage + revocation precision/recall) =="
 python -m scms_sim_ref.datagen.validate $out
 
 Write-Host ""
-Write-Host "DONE. Dataset at $out"
-Write-Host "  ma/            MA-visible events (the only source of ML features)"
-Write-Host "  ground_truth/  oracle labels (never used as features)"
-Write-Host "  ml/            report/subject features + labels (parquet & csv) with train/val/test splits"
-Write-Host "  manifest.json  seed, config, per-file sha256, data digest"
+Write-Host "DONE. Dataset at $out  (ma/  ground_truth/  ml/  manifest.json)"
