@@ -6,197 +6,351 @@
 <title>SCMS-Simulator — Control Panel</title>
 <style>
   :root{
-    --bg:#0d1117; --panel:#141b24; --panel2:#0f151d; --line:#243040; --ink:#e6edf5;
-    --muted:#93a4b7; --accent:#38c0ce; --accent2:#e0a83c; --good:#3fb27f; --bad:#e5534b;
-    --mono:ui-monospace,"Cascadia Code",Consolas,monospace;
-    --sans:ui-sans-serif,system-ui,"Segoe UI",Roboto,Arial,sans-serif;
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --edge:#2b3444; --edge2:#3a4658;
+    --ink:#e6edf3; --muted:#93a1b3; --accent:#3ea6ff; --accent2:#2b7fff;
+    --benign:#2dd4bf; --attacker:#ff5d5d; --reported:#ffb020; --revoked:#8892a0;
+    --ok:#3fb950; --bad:#f85149; --warn:#d29922;
   }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.45}
-  header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel2)}
-  header h1{font-size:16px;margin:0;letter-spacing:.2px;font-weight:650}
+  body{margin:0;font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+       background:var(--bg);color:var(--ink)}
+  header{display:flex;align-items:center;gap:16px;padding:12px 18px;background:var(--panel);
+         border-bottom:1px solid var(--edge);position:sticky;top:0;z-index:10}
+  header h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.2px}
   header .sub{color:var(--muted);font-size:12px}
-  .wrap{display:grid;grid-template-columns:360px 1fr;gap:16px;padding:16px;align-items:start}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
-  .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 12px}
-  label{display:block;margin:10px 0 4px;color:var(--muted);font-size:12px}
-  .field{display:flex;flex-direction:column}
-  .field .help{color:#6f8196;font-size:11px;margin-top:3px}
-  input,select{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--ink);
-    border-radius:7px;padding:7px 9px;font-family:var(--sans);font-size:13px}
-  input:focus,select:focus{outline:2px solid var(--accent);border-color:var(--accent)}
-  input[type=checkbox]{width:auto;transform:scale(1.2);margin-top:6px}
-  .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-  .btns{display:flex;gap:10px;margin-top:16px}
-  button{flex:1;border:0;border-radius:8px;padding:11px;font-weight:650;font-size:14px;cursor:pointer}
-  #start{background:var(--accent);color:#04252a}
-  #start:disabled{background:#28414a;color:#6f8196;cursor:not-allowed}
-  #stop{background:#3a2226;color:#f0b4b0;border:1px solid #5a2a2a}
-  #stop:disabled{opacity:.45;cursor:not-allowed}
-  .pill{display:inline-flex;align-items:center;gap:7px;padding:4px 11px;border-radius:999px;font-size:12px;font-weight:600}
-  .pill.idle{background:#20303c;color:var(--muted)} .pill.run{background:#123b2c;color:#7ee2b0}
-  .pill.done{background:#123240;color:#8fd3dc} .pill.err{background:#3a2226;color:#f0b4b0}
-  .dot{width:8px;height:8px;border-radius:50%;background:currentColor}
-  .pill.run .dot{animation:pulse 1s infinite}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-  .bar{height:8px;background:var(--panel2);border-radius:6px;overflow:hidden;margin:10px 0;border:1px solid var(--line)}
-  .bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));width:0%;transition:width .4s}
-  .meta{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-top:6px}
-  .meta b{color:var(--ink);font-variant-numeric:tabular-nums}
-  .tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:6px}
-  .tile{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:11px 12px}
-  .tile .k{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}
-  .tile .v{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;margin-top:3px}
-  .tile .v.good{color:var(--good)} .tile .v.bad{color:var(--bad)}
-  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-  .kv{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px dashed #1e2836;font-size:13px}
-  .kv span:last-child{font-family:var(--mono);color:var(--accent)}
-  .chips{display:flex;flex-wrap:wrap;gap:6px}
-  .chip{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:3px 8px;font-size:11px;color:var(--muted)}
-  pre#log{background:#080c11;border:1px solid var(--line);border-radius:8px;padding:11px;max-height:280px;
-    overflow:auto;font-family:var(--mono);font-size:12px;color:#9fb3c6;white-space:pre-wrap;margin:0}
-  .muted{color:var(--muted)}
-  @media(max-width:900px){.wrap{grid-template-columns:1fr}.tiles{grid-template-columns:repeat(2,1fr)}}
+  .grow{flex:1}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;
+        font-size:12px;font-weight:600;background:var(--panel2);border:1px solid var(--edge)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+  .pill.run .dot{background:var(--accent);animation:pulse 1.2s infinite}
+  .pill.done .dot{background:var(--ok)} .pill.fail .dot{background:var(--bad)}
+  @keyframes pulse{0%,100%{opacity:.35}50%{opacity:1}}
+  button{font:inherit;font-weight:600;border:1px solid var(--edge2);background:var(--panel2);
+         color:var(--ink);padding:8px 16px;border-radius:8px;cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent2);border-color:var(--accent2);color:#fff}
+  button.danger{background:#3a1d1f;border-color:#5a2a2d;color:#ffb0b0}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .wrap{display:grid;grid-template-columns:minmax(360px,440px) 1fr;gap:14px;padding:14px;
+        align-items:start}
+  @media(max-width:980px){.wrap{grid-template-columns:1fr}}
+  .panel{background:var(--panel);border:1px solid var(--edge);border-radius:12px}
+  .panel h2{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);
+            margin:0;padding:12px 14px;border-bottom:1px solid var(--edge)}
+  .body{padding:12px 14px}
+  details.group{border-bottom:1px solid var(--edge)}
+  details.group:last-child{border-bottom:none}
+  details.group>summary{cursor:pointer;padding:10px 14px;font-weight:600;font-size:13px;
+        list-style:none;display:flex;align-items:center;gap:8px}
+  details.group>summary::-webkit-details-marker{display:none}
+  details.group>summary::before{content:"▸";color:var(--muted);font-size:11px}
+  details.group[open]>summary::before{content:"▾"}
+  .fields{padding:4px 14px 12px}
+  .field{margin:10px 0}
+  .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+  .field .name{color:var(--ink);font-weight:600}
+  .field input[type=text],.field input[type=number],.field select{
+      width:100%;padding:7px 9px;background:var(--bg);color:var(--ink);
+      border:1px solid var(--edge2);border-radius:7px}
+  .field input:focus,.field select:focus{outline:none;border-color:var(--accent)}
+  .field .help{font-size:11px;color:var(--muted);margin-top:3px}
+  .row-check{display:flex;align-items:center;gap:8px}
+  .row-check input{width:16px;height:16px}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px}
+  .chip{display:inline-flex;align-items:center;gap:5px;padding:4px 8px;border-radius:6px;
+        background:var(--bg);border:1px solid var(--edge2);font-size:11px;cursor:pointer;user-select:none}
+  .chip input{width:13px;height:13px}
+  .chip.on{border-color:var(--accent);background:#12233a}
+  .mini-actions{display:flex;gap:8px;margin:2px 0 4px}
+  .mini-actions a{font-size:11px;color:var(--accent);cursor:pointer}
+  .mapwrap{position:relative}
+  #map{width:100%;height:420px;display:block;background:#0a0e14;border-radius:0 0 12px 12px}
+  .legend{position:absolute;top:10px;right:12px;background:rgba(13,17,23,.82);border:1px solid var(--edge);
+          border-radius:8px;padding:8px 10px;font-size:11px;display:grid;gap:4px}
+  .legend .lg{display:flex;align-items:center;gap:6px}
+  .legend .sw{width:10px;height:10px;border-radius:50%}
+  .mapinfo{position:absolute;top:10px;left:12px;background:rgba(13,17,23,.82);border:1px solid var(--edge);
+           border-radius:8px;padding:6px 10px;font-size:11px;color:var(--muted)}
+  .progress{height:8px;background:var(--bg);border-radius:6px;overflow:hidden;border:1px solid var(--edge2)}
+  .progress>div{height:100%;width:0;background:linear-gradient(90deg,var(--accent2),var(--accent));
+                transition:width .4s}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
+  .kpi{background:var(--panel2);border:1px solid var(--edge);border-radius:9px;padding:8px 10px}
+  .kpi .k{font-size:11px;color:var(--muted)} .kpi .v{font-size:19px;font-weight:700}
+  .bars{display:grid;gap:5px;margin-top:6px}
+  .bar{display:grid;grid-template-columns:150px 1fr 44px;align-items:center;gap:8px;font-size:11px}
+  .bar .t{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .bar .track{height:9px;background:var(--bg);border-radius:5px;overflow:hidden}
+  .bar .track>div{height:100%;background:var(--accent2)}
+  .bar .n{text-align:right;color:var(--ink)}
+  pre.log{margin:0;padding:10px 12px;background:#0a0e14;border:1px solid var(--edge);border-radius:8px;
+          max-height:220px;overflow:auto;font:12px/1.45 ui-monospace,Consolas,monospace;color:#c9d4e0;
+          white-space:pre-wrap;word-break:break-word}
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media(max-width:640px){.split{grid-template-columns:1fr}}
+  .muted{color:var(--muted)} .stack{display:grid;gap:12px}
+  .note{font-size:12px;color:var(--muted);padding:0 14px 12px}
+  .good{color:var(--ok)} .warnc{color:var(--warn)}
 </style>
 </head>
 <body>
 <header>
-  <span style="font-size:20px">🚗🔐</span>
-  <div>
-    <h1>SCMS-Simulator — Control Panel</h1>
-    <div class="sub">Configure · run · track a global Misbehavior-Authority V2X simulation</div>
-  </div>
-  <div style="margin-left:auto" id="statepill"><span class="pill idle"><span class="dot"></span>idle</span></div>
+  <h1>SCMS-Simulator <span class="sub">V2X misbehaviour dataset control panel</span></h1>
+  <div class="grow"></div>
+  <span id="pill" class="pill"><span class="dot"></span><span id="pillt">idle</span></span>
+  <button id="start" class="primary">▶ Start simulation</button>
+  <button id="stop" class="danger" disabled>■ Stop</button>
 </header>
 
 <div class="wrap">
-  <div class="card">
-    <h2>Configuration</h2>
-    <form id="form"></form>
-    <div class="btns">
-      <button id="start" type="button">▶ Start simulation</button>
-      <button id="stop" type="button" disabled>■ Stop</button>
+  <!-- LEFT: configuration -->
+  <div class="panel">
+    <h2>Configuration — every simulation variable</h2>
+    <div class="note">Blank numeric fields use the map's default. Traffic controls apply to the
+      selected map type (flow vs route density).</div>
+    <div id="form"></div>
+    <div class="body">
+      <button id="reset">Reset to defaults</button>
     </div>
   </div>
 
-  <div style="display:flex;flex-direction:column;gap:16px">
-    <div class="card">
-      <h2>Run status</h2>
-      <div id="stagetext" class="muted">No run yet. Configure on the left and press Start.</div>
-      <div class="bar"><i id="progbar"></i></div>
-      <div class="meta">
-        <span>scenario <b id="m-scn">—</b></span>
-        <span>elapsed <b id="m-el">0</b>s</span>
-        <span>progress <b id="m-pr">0</b>%</span>
-        <span>exit <b id="m-rc">—</b></span>
+  <!-- RIGHT: live map + progress + stats -->
+  <div class="stack">
+    <div class="panel">
+      <h2>Embedded live map — vehicles by SCMS state</h2>
+      <div class="mapwrap">
+        <canvas id="map"></canvas>
+        <div class="mapinfo" id="mapinfo">no live data yet</div>
+        <div class="legend">
+          <div class="lg"><span class="sw" style="background:var(--benign)"></span>benign</div>
+          <div class="lg"><span class="sw" style="background:var(--attacker)"></span>attacker</div>
+          <div class="lg"><span class="sw" style="background:var(--reported)"></span>reported</div>
+          <div class="lg"><span class="sw" style="background:var(--revoked)"></span>revoked</div>
+        </div>
       </div>
     </div>
 
-    <div class="card" id="statsCard" style="display:none">
-      <h2>Results</h2>
-      <div class="tiles" id="tiles"></div>
-      <div class="grid2" style="margin-top:14px">
-        <div><h2>Attack types</h2><div id="attacks"></div></div>
-        <div><h2>Detector reasons</h2><div id="reasons"></div></div>
+    <div class="panel">
+      <h2>Run progress</h2>
+      <div class="body">
+        <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:6px">
+          <span id="stage" class="muted">not started</span>
+          <span id="elapsed" class="muted"></span>
+        </div>
+        <div class="progress"><div id="pbar"></div></div>
+        <pre class="log" id="log" style="margin-top:10px">—</pre>
       </div>
-      <div class="grid2" style="margin-top:6px">
-        <div><h2>Splits (subjects)</h2><div id="splits"></div></div>
-        <div><h2>Run</h2><div id="runinfo"></div></div>
-      </div>
-      <h2 style="margin-top:14px">SCMS entities wired</h2>
-      <div class="chips" id="entities"></div>
     </div>
 
-    <div class="card">
-      <h2>Live log</h2>
-      <pre id="log">—</pre>
+    <div class="panel" id="statsPanel" style="display:none">
+      <h2>Dataset results</h2>
+      <div class="body stack">
+        <div class="kpis" id="kpis"></div>
+        <div class="split">
+          <div><div class="muted" style="font-size:12px;margin-bottom:4px">Attack types (ground truth)</div>
+               <div class="bars" id="attackBars"></div></div>
+          <div><div class="muted" style="font-size:12px;margin-bottom:4px">Detector reasons (MA reports)</div>
+               <div class="bars" id="reasonBars"></div></div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
 
 <script>
-const $ = s => document.querySelector(s);
-let SPEC = [], polling = null;
+const $=s=>document.querySelector(s);
+let SPEC=[], SCEN=[], ATTACKS=[], scenByKey={};
+let statusTimer=null, liveTimer=null;
 
-async function j(url, opts){ const r = await fetch(url, opts); return r.json(); }
-
-function field(c){
-  const wrap = document.createElement('div'); wrap.className='field';
-  const lab = document.createElement('label'); lab.textContent = c.label; lab.htmlFor = 'f_'+c.name;
-  let el;
-  if(c.type==='select'){ el=document.createElement('select');
-    c.options.forEach(o=>{const op=document.createElement('option');op.value=o;op.textContent=o;el.appendChild(op)}); el.value=c.default; }
-  else if(c.type==='bool'){ el=document.createElement('input'); el.type='checkbox'; el.checked=!!c.default; }
-  else { el=document.createElement('input'); el.type=(c.type==='text')?'text':'number';
-    if(c.type==='float'){el.step=c.step||'any'} if(c.type==='int'){el.step='1'}
-    if('min' in c)el.min=c.min; if('max' in c)el.max=c.max; el.value=c.default; }
-  el.id='f_'+c.name; el.dataset.name=c.name; el.dataset.type=c.type;
-  wrap.appendChild(lab); wrap.appendChild(el);
-  if(c.help){const h=document.createElement('div');h.className='help';h.textContent=c.help;wrap.appendChild(h)}
-  return wrap;
+async function boot(){
+  const d=await (await fetch('/api/defaults')).json();
+  SPEC=d.spec; SCEN=d.scenarios; ATTACKS=d.attack_types;
+  scenByKey=Object.fromEntries(SCEN.map(s=>[s.key,s]));
+  renderForm(d.defaults);
+  poll();                       // pick up an already-running or finished run
+  statusTimer=setInterval(poll,1500);
 }
+
+function renderForm(defaults){
+  const groups=[];
+  for(const c of SPEC){ if(!groups.includes(c.group)) groups.push(c.group); }
+  const form=$('#form'); form.innerHTML='';
+  groups.forEach((g,gi)=>{
+    const det=document.createElement('details'); det.className='group'; det.open = gi<2;
+    const items=SPEC.filter(c=>c.group===g);
+    det.innerHTML=`<summary>${g} <span class="muted" style="font-weight:400">(${items.length})</span></summary>`;
+    const box=document.createElement('div'); box.className='fields';
+    items.forEach(c=>box.appendChild(fieldEl(c,defaults[c.name])));
+    det.appendChild(box); form.appendChild(det);
+  });
+  syncKind();
+}
+
+function fieldEl(c,val){
+  const w=document.createElement('div'); w.className='field'; w.dataset.name=c.name;
+  if(c.kind) w.dataset.kind=c.kind;
+  const help=c.help?`<div class="help">${c.help}</div>`:'';
+  if(c.type==='bool'){
+    w.innerHTML=`<div class="row-check"><input type="checkbox" id="f_${c.name}" ${val?'checked':''}>
+                 <label for="f_${c.name}" style="margin:0"><span class="name">${c.label}</span></label></div>${help}`;
+  }else if(c.type==='scenario'){
+    const opts=SCEN.map(s=>`<option value="${s.key}" ${s.key===val?'selected':''}>${s.label}</option>`).join('');
+    w.innerHTML=`<label class="name">${c.label}</label><select id="f_${c.name}">${opts}</select>${help}`;
+    setTimeout(()=>$('#f_'+c.name).addEventListener('change',syncKind),0);
+  }else if(c.type==='multi'){
+    const isAll = (val==='all'||val==null);
+    const chips=c.options.map(o=>`<label class="chip ${isAll?'on':''}">
+        <input type="checkbox" value="${o}" ${isAll?'checked':''}>${o}</label>`).join('');
+    w.innerHTML=`<label class="name">${c.label}</label>
+      <div class="mini-actions"><a data-all="1">all</a><a data-all="0">none</a></div>
+      <div class="chips" id="f_${c.name}">${chips}</div>${help}`;
+    setTimeout(()=>{
+      const box=$('#f_'+c.name);
+      box.querySelectorAll('input').forEach(cb=>cb.addEventListener('change',()=>
+        cb.closest('.chip').classList.toggle('on',cb.checked)));
+      w.querySelectorAll('.mini-actions a').forEach(a=>a.addEventListener('click',()=>{
+        const on=a.dataset.all==='1';
+        box.querySelectorAll('input').forEach(cb=>{cb.checked=on;cb.closest('.chip').classList.toggle('on',on);});
+      }));
+    },0);
+  }else{
+    const t=c.type==='text'?'text':'number';
+    const attrs=[c.min!=null?`min="${c.min}"`:'',c.max!=null?`max="${c.max}"`:'',
+                 c.step!=null?`step="${c.step}"`:(c.type==='float'?'step="any"':'')].join(' ');
+    w.innerHTML=`<label class="name">${c.label}</label>
+      <input type="${t}" id="f_${c.name}" value="${val===''||val==null?'':val}" ${attrs}
+             placeholder="${c.default===''?'(map default)':c.default}">${help}`;
+  }
+  return w;
+}
+
+function syncKind(){
+  const kind=(scenByKey[$('#f_scenario')?.value]||{}).kind;
+  document.querySelectorAll('.field[data-kind]').forEach(f=>{
+    f.style.display = (f.dataset.kind===kind)?'':'none';
+  });
+}
+
 function collect(){
   const cfg={};
-  document.querySelectorAll('#form [data-name]').forEach(el=>{
-    const t=el.dataset.type;
-    if(t==='bool')cfg[el.dataset.name]=el.checked;
-    else if(t==='int')cfg[el.dataset.name]=parseInt(el.value,10);
-    else if(t==='float')cfg[el.dataset.name]=parseFloat(el.value);
-    else cfg[el.dataset.name]=el.value;
-  });
+  for(const c of SPEC){
+    if(c.type==='bool'){ cfg[c.name]=$('#f_'+c.name).checked; }
+    else if(c.type==='multi'){
+      const on=[...$('#f_'+c.name).querySelectorAll('input')].filter(x=>x.checked).map(x=>x.value);
+      cfg[c.name]=(on.length===0||on.length===c.options.length)?'all':on;
+    }else{
+      let v=$('#f_'+c.name).value.trim();
+      cfg[c.name]=v;
+    }
+  }
   return cfg;
 }
-function setState(kind,text){ $('#statepill').innerHTML = `<span class="pill ${kind}"><span class="dot"></span>${text}</span>`; }
-function tile(k,v,cls){ return `<div class="tile"><div class="k">${k}</div><div class="v ${cls||''}">${v}</div></div>`; }
-function kvlist(obj){ const e=Object.entries(obj||{}); if(!e.length)return '<div class="muted">—</div>';
-  return e.map(([k,v])=>`<div class="kv"><span>${k}</span><span>${v}</span></div>`).join(''); }
 
-function renderStats(s){
-  if(!s){ $('#statsCard').style.display='none'; return; }
-  $('#statsCard').style.display='block';
-  const c=s.counts||{}, v=s.validate||{};
-  $('#tiles').innerHTML =
-    tile('vehicles',c.vehicles??'—')+tile('reports',c.reports??'—')+
-    tile('investigations',c.investigations??'—')+tile('revoked',c.revoked??'—')+
-    tile('precision',(v.precision??'—'))+tile('recall',(v.recall??'—'))+
-    tile('leakage',(v.leakage_violations??'—'), (v.leakage_violations===0?'good':'bad'))+
-    tile('false revocs',(v.false_revocations??'—'), (v.false_revocations===0?'good':'bad'));
-  $('#attacks').innerHTML=kvlist(s.attack_types);
-  $('#reasons').innerHTML=kvlist(s.detector_reasons);
-  $('#splits').innerHTML=kvlist(s.splits);
-  $('#runinfo').innerHTML=kvlist({seed:s.seed, attackers:v.attackers, digest:s.data_digest});
-  $('#entities').innerHTML=(s.entities||[]).map(e=>`<span class="chip">${e}</span>`).join('');
-}
-
-function apply(st){
-  $('#m-scn').textContent=st.scenario||'—';
-  $('#m-el').textContent=st.elapsed??0;
-  $('#m-pr').textContent=(st.progress??0);
-  $('#m-rc').textContent=(st.returncode===null||st.returncode===undefined)?'—':st.returncode;
-  $('#progbar').style.width=(st.running?(st.progress||1):(st.stats?100:st.progress||0))+'%';
-  $('#stagetext').textContent=st.stage||(st.running?'starting…':'—');
-  $('#log').textContent=st.log_tail||'—'; $('#log').scrollTop=$('#log').scrollHeight;
-  if(st.running){ setState('run','running'); $('#start').disabled=true; $('#stop').disabled=false; }
-  else { $('#start').disabled=false; $('#stop').disabled=true;
-    if(st.stats){ setState(st.stats.validate && st.stats.validate.leakage_violations===0 ? 'done':'err','finished'); }
-    else if(st.stage){ setState('idle','idle'); } }
-  renderStats(st.stats);
-}
-async function poll(){ try{ apply(await j('/api/status')); }catch(e){} }
-
-$('#start').addEventListener('click', async ()=>{
-  $('#start').disabled=true; setState('run','starting');
-  const r=await j('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collect())});
-  if(!r.ok){ alert(r.error||'failed to start'); $('#start').disabled=false; setState('err','error'); return; }
-  if(!polling) polling=setInterval(poll,1500); poll();
+$('#start').addEventListener('click',async()=>{
+  $('#start').disabled=true;
+  const r=await (await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(collect())})).json();
+  if(!r.ok){ alert(r.error||'failed to start'); $('#start').disabled=false; return; }
+  $('#statsPanel').style.display='none';
+  startLive();
+  poll();
 });
-$('#stop').addEventListener('click', async ()=>{ await j('/api/stop',{method:'POST'}); poll(); });
+$('#stop').addEventListener('click',async()=>{ await fetch('/api/stop',{method:'POST'}); poll(); });
+$('#reset').addEventListener('click',async()=>{
+  const d=await (await fetch('/api/defaults')).json(); renderForm(d.defaults);
+});
 
-(async ()=>{
-  const d=await j('/api/defaults'); SPEC=d.spec;
-  const f=$('#form'); SPEC.forEach(c=>f.appendChild(field(c)));
-  polling=setInterval(poll,1500); poll();
-})();
+function setPill(state,txt){
+  const p=$('#pill'); p.className='pill '+state; $('#pillt').textContent=txt;
+}
+
+async function poll(){
+  let s; try{ s=await (await fetch('/api/status')).json(); }catch(e){ return; }
+  const running=s.running;
+  $('#start').disabled=running; $('#stop').disabled=!running;
+  $('#stage').textContent=s.stage||(running?'starting…':'not started');
+  $('#elapsed').textContent=s.elapsed?`${s.elapsed}s elapsed`:'';
+  $('#pbar').style.width=(s.progress||0)+'%';
+  $('#log').textContent=s.log_tail||'—';
+  $('#log').scrollTop=$('#log').scrollHeight;
+  if(running){ setPill('run','running · '+(s.scenario||'')); startLive(); }
+  else if(s.returncode===0||s.stats){ setPill('done','finished'); stopLive(); drawLiveOnce(); }
+  else if(s.returncode!=null){ setPill('fail','exited '+s.returncode); stopLive(); }
+  else setPill('','idle');
+  if(s.stats) renderStats(s.stats);
+}
+
+/* ---------- embedded live map ---------- */
+let lastLive={vehicles:[]};
+function startLive(){ if(!liveTimer){ liveTimer=setInterval(drawLiveOnce,1200); drawLiveOnce(); } }
+function stopLive(){ if(liveTimer){ clearInterval(liveTimer); liveTimer=null; } }
+async function drawLiveOnce(){
+  try{ lastLive=await (await fetch('/api/live')).json(); }catch(e){}
+  drawMap(lastLive);
+}
+const COLORS=['#2dd4bf','#ff5d5d','#ffb020','#8892a0'];
+function drawMap(live){
+  const cv=$('#map'), ctx=cv.getContext('2d');
+  const w=cv.clientWidth, h=cv.clientHeight, dpr=window.devicePixelRatio||1;
+  if(cv.width!==w*dpr||cv.height!==h*dpr){ cv.width=w*dpr; cv.height=h*dpr; }
+  ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,w,h);
+  const vs=(live&&live.vehicles)||[];
+  const counts=[0,0,0,0];
+  if(!vs.length){ $('#mapinfo').textContent='no live data yet'; return; }
+  let minX=1e18,minY=1e18,maxX=-1e18,maxY=-1e18;
+  for(const v of vs){ minX=Math.min(minX,v[0]);maxX=Math.max(maxX,v[0]);
+                      minY=Math.min(minY,v[1]);maxY=Math.max(maxY,v[1]); }
+  const pad=24, sx=(w-2*pad)/Math.max(1,maxX-minX), sy=(h-2*pad)/Math.max(1,maxY-minY);
+  const sc=Math.min(sx,sy);
+  const ox=pad+((w-2*pad)-(maxX-minX)*sc)/2, oy=pad+((h-2*pad)-(maxY-minY)*sc)/2;
+  // draw non-benign last so they sit on top
+  const order=[...vs].sort((a,b)=>(a[2]||0)-(b[2]||0));
+  for(const v of order){
+    const s=v[2]|0; counts[s]++;
+    const px=ox+(v[0]-minX)*sc, py=h-(oy+(v[1]-minY)*sc); // flip Y so north is up
+    ctx.beginPath(); ctx.arc(px,py,s===0?2.4:3.6,0,7); ctx.fillStyle=COLORS[s]||COLORS[0];
+    ctx.globalAlpha=s===0?0.85:1; ctx.fill(); ctx.globalAlpha=1;
+  }
+  $('#mapinfo').textContent=`t=${(live.t||0).toFixed(0)}s · ${vs.length} vehicles · `+
+    `${counts[1]} attacker · ${counts[2]} reported · ${counts[3]} revoked`;
+}
+window.addEventListener('resize',()=>drawMap(lastLive));
+
+/* ---------- stats ---------- */
+function bars(el,obj){
+  const box=$(el); box.innerHTML='';
+  const ent=Object.entries(obj||{}).sort((a,b)=>b[1]-a[1]);
+  if(!ent.length){ box.innerHTML='<span class="muted" style="font-size:11px">none</span>'; return; }
+  const mx=Math.max(...ent.map(e=>e[1]));
+  for(const [k,v] of ent){
+    const d=document.createElement('div'); d.className='bar';
+    d.innerHTML=`<span class="t" title="${k}">${k}</span>
+      <span class="track"><div style="width:${Math.round(100*v/mx)}%"></div></span>
+      <span class="n">${v}</span>`;
+    box.appendChild(d);
+  }
+}
+function renderStats(st){
+  $('#statsPanel').style.display='';
+  const va=st.validate||{}, c=st.counts||{};
+  const prec=va.precision!=null?(va.precision*100).toFixed(1)+'%':'—';
+  const rec=va.recall!=null?(va.recall*100).toFixed(1)+'%':'—';
+  const leak=va.leakage_violations!=null?va.leakage_violations:'—';
+  const kpis=[
+    ['Vehicles', c.vehicles ?? c.subjects ?? '—'],
+    ['MA reports', c.reports ?? '—'],
+    ['Revocations', c.revocations ?? c.revoked ?? '—'],
+    ['Precision', prec],['Recall', rec],
+    ['Leakage', `<span class="${leak===0?'good':'warnc'}">${leak}</span>`],
+    ['Seed', st.seed ?? '—'],
+    ['Digest', `<span class="muted" style="font-size:12px">${st.data_digest||'—'}</span>`],
+  ];
+  $('#kpis').innerHTML=kpis.map(([k,v])=>`<div class="kpi"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+  bars('#attackBars',st.attack_types);
+  bars('#reasonBars',st.detector_reasons);
+}
+
+boot();
 </script>
 </body>
 </html>

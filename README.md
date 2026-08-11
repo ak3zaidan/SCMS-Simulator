@@ -31,14 +31,17 @@ MA-visible data (features) and simulation ground truth (labels).
 | Toolchain: JDK 17 / SUMO 1.25 / MOSAIC 25.2 / git | ✅ installed under `C:\Users\Administrator\tools` |
 | VeReMi NextGen vendored (pinned submodule) | ✅ `third_party/veremi-nextgen` @ `acda994b` |
 | SCMS closed loop in MOSAIC (sign → detect → report → correlate → 2-LA resolve → revoke → CRL → enforce) | ✅ real ITS-G5 AdHoc; distributed detection |
-| Runs on the real InTAS (Ingolstadt) map | ✅ `run.ps1 -Scenario intas` |
-| Attacks / detectors | ✅ ConstPos + ConstPosOffset / frozen-position + ART |
+| Runs on the real InTAS (Ingolstadt) map | ✅ `run.ps1 -Scenario intas_urban_rush` |
+| Maps / scenarios | ✅ 8 maps: Smoke · Highway · Barnim · Tiergarten · InTAS Ingolstadt ×4 (urban/highway × off-peak/rush) |
+| Attacks / detectors | ✅ 16 attack types (position/speed/heading/replay/DoS/Sybil) / 7 detectors |
+| Traffic controls | ✅ number of vehicles, target flow, lanes (flow maps); density scale (route maps) |
 | ML featurizer + leakage-safe splitter | ✅ report + subject tables, vehicle-disjoint splits |
 | One-command end-to-end runner | ✅ `run.ps1` |
 
-The system is runnable end-to-end. On the real InTAS Ingolstadt map the generated
-dataset is **leakage-free**, with revocation **precision 1.0 / recall 0.986**, and is
-**byte-identical across runs** (deterministic). See
+The system is runnable end-to-end. On the real InTAS Ingolstadt map, with all 16 attack
+types enabled, the generated dataset is **leakage-free**, with revocation **precision ≈0.98 /
+recall ≈0.76** (recall < 1 is realistic — the hardest attacks evade the on-board detectors),
+and is **byte-identical across runs** (deterministic). See
 [`docs/adr/0001-stack-and-approach.md`](docs/adr/0001-stack-and-approach.md).
 
 ## Run the full simulation (one command)
@@ -46,9 +49,15 @@ dataset is **leakage-free**, with revocation **precision 1.0 / recall 0.986**, a
 ```powershell
 . C:\Users\Administrator\tools\env.ps1     # once per shell (JAVA_HOME/SUMO_HOME/MOSAIC_HOME/PATH)
 .\run.ps1                                   # 'smoke' highway scenario (~50 vehicles, seconds)
-.\run.ps1 -Scenario intas                   # real Ingolstadt (InTAS) map (~333 vehicles)
-.\run.ps1 -Scenario intas -Duration 600s -Seed 42
+.\run.ps1 -Scenario intas_urban_rush        # real Ingolstadt (InTAS) map, 7-9am rush (~333 vehicles)
+.\run.ps1 -Scenario highway -MaxVehicles 200 -Lanes 3     # flow map: control number of cars
+.\run.ps1 -Scenario intas_highway_low -Scale 0.4 -Seed 42 # route map: control density
 ```
+
+Scenarios: `smoke`, `highway`, `barnim`, `tiergarten`,
+`intas_urban_low`, `intas_urban_rush`, `intas_highway_low`, `intas_highway_rush`.
+Traffic controls: `-MaxVehicles` / `-TargetFlow` / `-Lanes` (flow maps), `-Scale` (route maps);
+attacks and thresholds are set via `SCMS_*` environment variables (or, more easily, the GUI).
 
 `run.ps1` builds the MOSAIC app, generates the scenario, simulates in MOSAIC + SUMO,
 featurizes the output into ML-ready tables, and validates it (leakage + precision/recall).
@@ -86,13 +95,20 @@ Prefer clicking to typing? Launch the control panel:
 .\gui.ps1        # starts a local server and opens http://127.0.0.1:8710
 ```
 
-From the browser you can set **every** configuration variable (scenario, seed, attacker %,
-reporters-to-revoke K, report probability, CRL delay, attack offset, detector thresholds, CAM
-interval, …), **Start** / **Stop** a run, watch the live **stage + progress + log**, and read the
-**results dashboard**: vehicles / reports / investigations / revoked, precision / recall, leakage,
-attack-type and detector-reason breakdowns, the train/val/test split counts, and the 14 wired SCMS
-entities. Configuration is applied through environment variables the Java layer reads, so no
-recompile is needed between runs. Tick *"Open MOSAIC 2D map"* to also watch the raw live map.
+The panel gives you **complete control of the simulation from the browser** — grouped into
+**Scenario** (map, duration, seed), **Traffic** (number of vehicles, target flow, lanes, or
+route-density scale — the relevant controls appear for the selected map type), **SCMS policy**
+(attacker %, reporters-to-revoke K, report probability, CRL delay, jmax), **Attacks** (pick any
+subset of the 16 attack types, plus every magnitude knob), and **Detectors** (all 8 thresholds).
+
+An **embedded live map** is built into the dashboard: as the run progresses it streams the
+vehicle positions from the back-end and draws them colored by SCMS state — teal *benign*,
+red *attacker*, amber *reported*, grey *revoked* — so you can watch detection and revocation
+happen. **Start** / **Stop** a run, watch the **stage + progress + log**, and when it finishes
+read the **results dashboard**: vehicles / reports / investigations / revoked, precision /
+recall, leakage, and attack-type + detector-reason breakdowns. Configuration is applied through
+environment variables the Java layer reads and run.ps1 parameters, so no recompile is needed
+between runs. Tick *"Also open MOSAIC 2D map"* to additionally launch MOSAIC's own visualizer.
 
 ## Quick start
 

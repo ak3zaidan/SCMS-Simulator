@@ -48,6 +48,7 @@ public final class ScmsBackend {
     static final double CONST_OFFSET_M = envDouble("SCMS_OFFSET_M", 1500.0);
     static final double REPORT_PROB = envDouble("SCMS_REPORT_PROB", 0.9);
     static final double CRL_PROP_DELAY_S = envDouble("SCMS_CRL_DELAY", 2.0);
+    static final double LIVE_INTERVAL_S = envDouble("SCMS_LIVE_INTERVAL", 1.0);
     static final String OUT_DIR = resolveOutDir();
 
     // Config is read from environment variables first (so the GUI can change it without a
@@ -119,6 +120,7 @@ public final class ScmsBackend {
         String attackType = "none";
         AttackLib.State atk = null;
         List<String> ghosts = null;   // Sybil: extra identities mapped back to this device
+        double lastX, lastY, lastSeenT = -1;   // true position, for the live map
     }
 
     private final Map<String, Dev> devByUnit = new HashMap<>();
@@ -140,6 +142,7 @@ public final class ScmsBackend {
     private int reportCounter = 0;
     private int caseCounter = 0;
     private boolean written = false;
+    private double lastLiveWriteT = -1e9;
 
     private ScmsBackend() {
         Runtime.getRuntime().addShutdownHook(new Thread(this::writeOutputs));
@@ -213,6 +216,9 @@ public final class ScmsBackend {
             register(unitId);
             d = devByUnit.get(unitId);
         }
+        double t = tNs / 1e9;
+        d.lastX = x; d.lastY = y; d.lastSeenT = t;   // true position for the live map
+        maybeWriteLive(t);
         if (!d.attacker) {
             AttackLib.Claim c = new AttackLib.Claim();
             c.x = x; c.y = y; c.speed = speed; c.heading = heading; c.genTimeNs = tNs;
@@ -354,6 +360,43 @@ public final class ScmsBackend {
                     + " revoked=" + scms.crlg.size() + ")");
         } catch (Exception ex) {
             ex.printStackTrace();
+        }
+    }
+
+    /** Throttled snapshot of active vehicles for the live dashboard map (state: 0 benign,
+     *  1 attacker, 2 reported, 3 revoked). Best-effort; not part of the dataset. */
+    private void maybeWriteLive(double t) {
+        if (t - lastLiveWriteT < LIVE_INTERVAL_S) {
+            return;
+        }
+        lastLiveWriteT = t;
+        try {
+            List<double[]> vs = new ArrayList<>();
+            for (Dev d : devByUnit.values()) {
+                if (d.lastSeenT < 0 || t - d.lastSeenT > 3.0) {
+                    continue;
+                }
+                int s = 0;
+                if (scms.crlStore.isRevoked(d.certDigest)) {
+                    s = 3;
+                } else if (scms.ma.distinctReporters(d.certDigest) > 0) {
+                    s = 2;
+                } else if (d.attacker) {
+                    s = 1;
+                }
+                vs.add(new double[] {round3(d.lastX), round3(d.lastY), s});
+            }
+            Map<String, Object> snap = new LinkedHashMap<>();
+            snap.put("t", round3(t));
+            snap.put("n", vs.size());
+            snap.put("vehicles", vs);
+            Files.createDirectories(Paths.get(OUT_DIR));
+            Path tmp = Paths.get(OUT_DIR, "live_state.json.tmp");
+            Files.write(tmp, gson.toJson(snap).getBytes(StandardCharsets.UTF_8));
+            Files.move(tmp, Paths.get(OUT_DIR, "live_state.json"),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } catch (Exception ex) {
+            // live view is best-effort
         }
     }
 
