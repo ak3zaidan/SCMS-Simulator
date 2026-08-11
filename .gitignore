@@ -25,3 +25,4 @@ scms-sim/**/build/
 scms-sim/scenarios/scms_smoke/
 scms-sim/scenarios/scms_intas/
 tmp/
+gui/last_run.log

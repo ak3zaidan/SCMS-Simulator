@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SCMS-Simulator — Control Panel</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#141b24; --panel2:#0f151d; --line:#243040; --ink:#e6edf5;
+    --muted:#93a4b7; --accent:#38c0ce; --accent2:#e0a83c; --good:#3fb27f; --bad:#e5534b;
+    --mono:ui-monospace,"Cascadia Code",Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,"Segoe UI",Roboto,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.45}
+  header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel2)}
+  header h1{font-size:16px;margin:0;letter-spacing:.2px;font-weight:650}
+  header .sub{color:var(--muted);font-size:12px}
+  .wrap{display:grid;grid-template-columns:360px 1fr;gap:16px;padding:16px;align-items:start}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 12px}
+  label{display:block;margin:10px 0 4px;color:var(--muted);font-size:12px}
+  .field{display:flex;flex-direction:column}
+  .field .help{color:#6f8196;font-size:11px;margin-top:3px}
+  input,select{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--ink);
+    border-radius:7px;padding:7px 9px;font-family:var(--sans);font-size:13px}
+  input:focus,select:focus{outline:2px solid var(--accent);border-color:var(--accent)}
+  input[type=checkbox]{width:auto;transform:scale(1.2);margin-top:6px}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .btns{display:flex;gap:10px;margin-top:16px}
+  button{flex:1;border:0;border-radius:8px;padding:11px;font-weight:650;font-size:14px;cursor:pointer}
+  #start{background:var(--accent);color:#04252a}
+  #start:disabled{background:#28414a;color:#6f8196;cursor:not-allowed}
+  #stop{background:#3a2226;color:#f0b4b0;border:1px solid #5a2a2a}
+  #stop:disabled{opacity:.45;cursor:not-allowed}
+  .pill{display:inline-flex;align-items:center;gap:7px;padding:4px 11px;border-radius:999px;font-size:12px;font-weight:600}
+  .pill.idle{background:#20303c;color:var(--muted)} .pill.run{background:#123b2c;color:#7ee2b0}
+  .pill.done{background:#123240;color:#8fd3dc} .pill.err{background:#3a2226;color:#f0b4b0}
+  .dot{width:8px;height:8px;border-radius:50%;background:currentColor}
+  .pill.run .dot{animation:pulse 1s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  .bar{height:8px;background:var(--panel2);border-radius:6px;overflow:hidden;margin:10px 0;border:1px solid var(--line)}
+  .bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));width:0%;transition:width .4s}
+  .meta{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-top:6px}
+  .meta b{color:var(--ink);font-variant-numeric:tabular-nums}
+  .tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:6px}
+  .tile{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:11px 12px}
+  .tile .k{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}
+  .tile .v{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;margin-top:3px}
+  .tile .v.good{color:var(--good)} .tile .v.bad{color:var(--bad)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .kv{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px dashed #1e2836;font-size:13px}
+  .kv span:last-child{font-family:var(--mono);color:var(--accent)}
+  .chips{display:flex;flex-wrap:wrap;gap:6px}
+  .chip{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:3px 8px;font-size:11px;color:var(--muted)}
+  pre#log{background:#080c11;border:1px solid var(--line);border-radius:8px;padding:11px;max-height:280px;
+    overflow:auto;font-family:var(--mono);font-size:12px;color:#9fb3c6;white-space:pre-wrap;margin:0}
+  .muted{color:var(--muted)}
+  @media(max-width:900px){.wrap{grid-template-columns:1fr}.tiles{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<header>
+  <span style="font-size:20px">🚗🔐</span>
+  <div>
+    <h1>SCMS-Simulator — Control Panel</h1>
+    <div class="sub">Configure · run · track a global Misbehavior-Authority V2X simulation</div>
+  </div>
+  <div style="margin-left:auto" id="statepill"><span class="pill idle"><span class="dot"></span>idle</span></div>
+</header>
+
+<div class="wrap">
+  <div class="card">
+    <h2>Configuration</h2>
+    <form id="form"></form>
+    <div class="btns">
+      <button id="start" type="button">▶ Start simulation</button>
+      <button id="stop" type="button" disabled>■ Stop</button>
+    </div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:16px">
+    <div class="card">
+      <h2>Run status</h2>
+      <div id="stagetext" class="muted">No run yet. Configure on the left and press Start.</div>
+      <div class="bar"><i id="progbar"></i></div>
+      <div class="meta">
+        <span>scenario <b id="m-scn">—</b></span>
+        <span>elapsed <b id="m-el">0</b>s</span>
+        <span>progress <b id="m-pr">0</b>%</span>
+        <span>exit <b id="m-rc">—</b></span>
+      </div>
+    </div>
+
+    <div class="card" id="statsCard" style="display:none">
+      <h2>Results</h2>
+      <div class="tiles" id="tiles"></div>
+      <div class="grid2" style="margin-top:14px">
+        <div><h2>Attack types</h2><div id="attacks"></div></div>
+        <div><h2>Detector reasons</h2><div id="reasons"></div></div>
+      </div>
+      <div class="grid2" style="margin-top:6px">
+        <div><h2>Splits (subjects)</h2><div id="splits"></div></div>
+        <div><h2>Run</h2><div id="runinfo"></div></div>
+      </div>
+      <h2 style="margin-top:14px">SCMS entities wired</h2>
+      <div class="chips" id="entities"></div>
+    </div>
+
+    <div class="card">
+      <h2>Live log</h2>
+      <pre id="log">—</pre>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let SPEC = [], polling = null;
+
+async function j(url, opts){ const r = await fetch(url, opts); return r.json(); }
+
+function field(c){
+  const wrap = document.createElement('div'); wrap.className='field';
+  const lab = document.createElement('label'); lab.textContent = c.label; lab.htmlFor = 'f_'+c.name;
+  let el;
+  if(c.type==='select'){ el=document.createElement('select');
+    c.options.forEach(o=>{const op=document.createElement('option');op.value=o;op.textContent=o;el.appendChild(op)}); el.value=c.default; }
+  else if(c.type==='bool'){ el=document.createElement('input'); el.type='checkbox'; el.checked=!!c.default; }
+  else { el=document.createElement('input'); el.type=(c.type==='text')?'text':'number';
+    if(c.type==='float'){el.step=c.step||'any'} if(c.type==='int'){el.step='1'}
+    if('min' in c)el.min=c.min; if('max' in c)el.max=c.max; el.value=c.default; }
+  el.id='f_'+c.name; el.dataset.name=c.name; el.dataset.type=c.type;
+  wrap.appendChild(lab); wrap.appendChild(el);
+  if(c.help){const h=document.createElement('div');h.className='help';h.textContent=c.help;wrap.appendChild(h)}
+  return wrap;
+}
+function collect(){
+  const cfg={};
+  document.querySelectorAll('#form [data-name]').forEach(el=>{
+    const t=el.dataset.type;
+    if(t==='bool')cfg[el.dataset.name]=el.checked;
+    else if(t==='int')cfg[el.dataset.name]=parseInt(el.value,10);
+    else if(t==='float')cfg[el.dataset.name]=parseFloat(el.value);
+    else cfg[el.dataset.name]=el.value;
+  });
+  return cfg;
+}
+function setState(kind,text){ $('#statepill').innerHTML = `<span class="pill ${kind}"><span class="dot"></span>${text}</span>`; }
+function tile(k,v,cls){ return `<div class="tile"><div class="k">${k}</div><div class="v ${cls||''}">${v}</div></div>`; }
+function kvlist(obj){ const e=Object.entries(obj||{}); if(!e.length)return '<div class="muted">—</div>';
+  return e.map(([k,v])=>`<div class="kv"><span>${k}</span><span>${v}</span></div>`).join(''); }
+
+function renderStats(s){
+  if(!s){ $('#statsCard').style.display='none'; return; }
+  $('#statsCard').style.display='block';
+  const c=s.counts||{}, v=s.validate||{};
+  $('#tiles').innerHTML =
+    tile('vehicles',c.vehicles??'—')+tile('reports',c.reports??'—')+
+    tile('investigations',c.investigations??'—')+tile('revoked',c.revoked??'—')+
+    tile('precision',(v.precision??'—'))+tile('recall',(v.recall??'—'))+
+    tile('leakage',(v.leakage_violations??'—'), (v.leakage_violations===0?'good':'bad'))+
+    tile('false revocs',(v.false_revocations??'—'), (v.false_revocations===0?'good':'bad'));
+  $('#attacks').innerHTML=kvlist(s.attack_types);
+  $('#reasons').innerHTML=kvlist(s.detector_reasons);
+  $('#splits').innerHTML=kvlist(s.splits);
+  $('#runinfo').innerHTML=kvlist({seed:s.seed, attackers:v.attackers, digest:s.data_digest});
+  $('#entities').innerHTML=(s.entities||[]).map(e=>`<span class="chip">${e}</span>`).join('');
+}
+
+function apply(st){
+  $('#m-scn').textContent=st.scenario||'—';
+  $('#m-el').textContent=st.elapsed??0;
+  $('#m-pr').textContent=(st.progress??0);
+  $('#m-rc').textContent=(st.returncode===null||st.returncode===undefined)?'—':st.returncode;
+  $('#progbar').style.width=(st.running?(st.progress||1):(st.stats?100:st.progress||0))+'%';
+  $('#stagetext').textContent=st.stage||(st.running?'starting…':'—');
+  $('#log').textContent=st.log_tail||'—'; $('#log').scrollTop=$('#log').scrollHeight;
+  if(st.running){ setState('run','running'); $('#start').disabled=true; $('#stop').disabled=false; }
+  else { $('#start').disabled=false; $('#stop').disabled=true;
+    if(st.stats){ setState(st.stats.validate && st.stats.validate.leakage_violations===0 ? 'done':'err','finished'); }
+    else if(st.stage){ setState('idle','idle'); } }
+  renderStats(st.stats);
+}
+async function poll(){ try{ apply(await j('/api/status')); }catch(e){} }
+
+$('#start').addEventListener('click', async ()=>{
+  $('#start').disabled=true; setState('run','starting');
+  const r=await j('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collect())});
+  if(!r.ok){ alert(r.error||'failed to start'); $('#start').disabled=false; setState('err','error'); return; }
+  if(!polling) polling=setInterval(poll,1500); poll();
+});
+$('#stop').addEventListener('click', async ()=>{ await j('/api/stop',{method:'POST'}); poll(); });
+
+(async ()=>{
+  const d=await j('/api/defaults'); SPEC=d.spec;
+  const f=$('#form'); SPEC.forEach(c=>f.appendChild(field(c)));
+  polling=setInterval(poll,1500); poll();
+})();
+</script>
+</body>
+</html>

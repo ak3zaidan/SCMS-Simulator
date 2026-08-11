@@ -77,6 +77,23 @@ true identity — it resolves a suspect via PCA → LA1/LA2 (forward linkage see
 identities exist only in `ground_truth/` and are never used as features. The Python reference
 (`src/scms_sim_ref/mock_pipeline/run.py`) mirrors the operational entities.
 
+## GUI control panel
+
+Prefer clicking to typing? Launch the control panel:
+
+```powershell
+. C:\Users\Administrator\tools\env.ps1
+.\gui.ps1        # starts a local server and opens http://127.0.0.1:8710
+```
+
+From the browser you can set **every** configuration variable (scenario, seed, attacker %,
+reporters-to-revoke K, report probability, CRL delay, attack offset, detector thresholds, CAM
+interval, …), **Start** / **Stop** a run, watch the live **stage + progress + log**, and read the
+**results dashboard**: vehicles / reports / investigations / revoked, precision / recall, leakage,
+attack-type and detector-reason breakdowns, the train/val/test split counts, and the 14 wired SCMS
+entities. Configuration is applied through environment variables the Java layer reads, so no
+recompile is needed between runs. Tick *"Open MOSAIC 2D map"* to also watch the raw live map.
+
 ## Quick start
 
 ```powershell

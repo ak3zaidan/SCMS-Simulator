@@ -38,11 +38,21 @@ import org.scms.backend.ScmsBackend;
 public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         implements VehicleApplication, CommunicationApplication {
 
-    private static final double CAM_INTERVAL_S = 1.0;   // ~1 Hz beaconing
+    private static final double CAM_INTERVAL_S = envD("SCMS_CAM_INTERVAL", 1.0);  // ~1 Hz beaconing
     private static final double MOVING_SPEED_MS = 5.0;   // "claims to be moving" threshold
     private static final double FROZEN_EPS_M = 0.5;      // claimed position considered unchanged
-    private static final int FROZEN_COUNT = 3;           // consecutive frozen CAMs -> suspect
-    private static final double ART_MAX_M = 1000.0;      // max plausible claimed distance from receiver
+    private static final int FROZEN_COUNT = envI("SCMS_FROZEN_COUNT", 3);          // consecutive frozen CAMs -> suspect
+    private static final double ART_MAX_M = envD("SCMS_ART_MAX_M", 1000.0);        // max plausible claimed distance
+
+    private static int envI(String n, int d) {
+        String e = System.getenv(n);
+        try { return (e != null && !e.isBlank()) ? Integer.parseInt(e.trim()) : d; } catch (NumberFormatException ex) { return d; }
+    }
+
+    private static double envD(String n, double d) {
+        String e = System.getenv(n);
+        try { return (e != null && !e.isBlank()) ? Double.parseDouble(e.trim()) : d; } catch (NumberFormatException ex) { return d; }
+    }
 
     private int sendCount = 0;
     private double lastSendS = Double.NEGATIVE_INFINITY;

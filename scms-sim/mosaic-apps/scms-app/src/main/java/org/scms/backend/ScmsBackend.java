@@ -40,15 +40,17 @@ import org.scms.entities.Scms;
 public final class ScmsBackend {
 
     static final long MASTER_SEED = resolveSeed();
-    static final int JMAX = 20;
-    static final int REPORT_THRESHOLD_K = Integer.getInteger("scms.k", 3);
-    static final int ATTACKER_PCT = Integer.getInteger("scms.attackerPct", 20);
-    static final int FREEZE_AFTER_UPDATES = 5;
-    static final double CONST_OFFSET_M = 1500.0;
-    static final double REPORT_PROB = 0.9;
-    static final double CRL_PROP_DELAY_S = 2.0;
+    static final int JMAX = envInt("SCMS_JMAX", 20);
+    static final int REPORT_THRESHOLD_K = envInt("SCMS_REPORT_K", Integer.getInteger("scms.k", 3));
+    static final int ATTACKER_PCT = envInt("SCMS_ATTACKER_PCT", Integer.getInteger("scms.attackerPct", 20));
+    static final int FREEZE_AFTER_UPDATES = envInt("SCMS_FREEZE_UPDATES", 5);
+    static final double CONST_OFFSET_M = envDouble("SCMS_OFFSET_M", 1500.0);
+    static final double REPORT_PROB = envDouble("SCMS_REPORT_PROB", 0.9);
+    static final double CRL_PROP_DELAY_S = envDouble("SCMS_CRL_DELAY", 2.0);
     static final String OUT_DIR = resolveOutDir();
 
+    // Config is read from environment variables first (so the GUI can change it without a
+    // recompile and with no JVM "Picked up ..." banner), then -D system properties, then defaults.
     private static long resolveSeed() {
         String e = System.getenv("SCMS_SEED");
         return (e != null && !e.isBlank()) ? Long.parseLong(e.trim()) : Long.getLong("scms.seed", 20260809L);
@@ -58,6 +60,24 @@ public final class ScmsBackend {
         String e = System.getenv("SCMS_OUT_DIR");
         return (e != null && !e.isBlank()) ? e
                 : System.getProperty("scms.outDir", "C:\\Users\\Administrator\\SCMS-Simulator\\datasets\\mosaic_poc");
+    }
+
+    private static int envInt(String name, int dflt) {
+        String e = System.getenv(name);
+        try {
+            return (e != null && !e.isBlank()) ? Integer.parseInt(e.trim()) : dflt;
+        } catch (NumberFormatException ex) {
+            return dflt;
+        }
+    }
+
+    private static double envDouble(String name, double dflt) {
+        String e = System.getenv(name);
+        try {
+            return (e != null && !e.isBlank()) ? Double.parseDouble(e.trim()) : dflt;
+        } catch (NumberFormatException ex) {
+            return dflt;
+        }
     }
 
     private static final ScmsBackend INSTANCE = new ScmsBackend();
