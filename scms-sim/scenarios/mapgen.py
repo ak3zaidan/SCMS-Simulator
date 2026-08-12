@@ -101,6 +101,11 @@ def _envf(name: str, default: float) -> float:
         return float(default)
 
 
+def sim_step_ms() -> int:
+    """SUMO/MOSAIC step in ms (SCMS_SIM_STEP seconds). 0.1 s enables up to 10 Hz ETSI CAMs."""
+    return max(50, int(round(_envf("SCMS_SIM_STEP", 0.1) * 1000)))
+
+
 def veh_params() -> dict:
     """SUMO driver-model / vehicle-type parameters from env (SCMS_VEH_*)."""
     return {
@@ -293,18 +298,19 @@ def build(key: str, dst: Path, duration=None, scale=None, seed=None, period=None
         _netgenerate(key, net)
     _random_trips(net, routes, dur_s, rng_seed, per)
 
-    # sumocfg (SUMO owns the demand) + optional density scale
+    # sumocfg (SUMO owns the demand) + fine step (ETSI CAM rate) + optional density scale
+    step_s = sim_step_ms() / 1000.0
     scale_xml = f'\n\t<processing>\n\t\t<scale value="{scale}"/>\n\t</processing>' if scale else ""
     (dst / "sumo" / "map.sumocfg").write_text(
         "<configuration>\n\t<input>\n"
         '\t\t<net-file value="map.net.xml"/>\n'
         '\t\t<route-files value="map.rou.xml"/>\n'
         "\t</input>\n\t<time>\n"
-        '\t\t<begin value="0"/>\n\t\t<end value="%d"/>\n\t</time>%s\n</configuration>\n'
-        % (int(dur_s) + 5, scale_xml), encoding="utf-8")
+        '\t\t<begin value="0"/>\n\t\t<end value="%d"/>\n\t\t<step-length value="%s"/>\n\t</time>%s\n</configuration>\n'
+        % (int(dur_s) + 5, step_s, scale_xml), encoding="utf-8")
     import json
     (dst / "sumo" / "sumo_config.json").write_text(
-        json.dumps({"sumoConfigurationFile": "map.sumocfg", "updateInterval": 1000}, indent=2),
+        json.dumps({"sumoConfigurationFile": "map.sumocfg", "updateInterval": sim_step_ms()}, indent=2),
         encoding="utf-8")
 
     # projection: cartesianOffset = net's netOffset; geo center is a dummy (unused downstream).

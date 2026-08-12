@@ -49,6 +49,25 @@ public final class ScmsBackend {
     static final double REPORT_PROB = envDouble("SCMS_REPORT_PROB", 0.9);
     static final double CRL_PROP_DELAY_S = envDouble("SCMS_CRL_DELAY", 2.0);
     static final double LIVE_INTERVAL_S = envDouble("SCMS_LIVE_INTERVAL", 1.0);
+    // On-board sensor error (realistic GNSS/odometry): a temporally-correlated bias (OU) plus
+    // per-sample white noise, so honest vehicles broadcast MEASURED, not perfect, state.
+    static final double GPS_SIGMA_M = envDouble("SCMS_GPS_SIGMA", 1.5);   // white position noise sd (m)
+    static final double GPS_BIAS_M = envDouble("SCMS_GPS_BIAS", 3.0);     // correlated bias sd (m)
+    static final double GPS_THETA = envDouble("SCMS_GPS_THETA", 0.1);     // bias mean-reversion (1/s)
+    static final double SPEED_SIGMA_MS = envDouble("SCMS_SPEED_SIGMA", 0.5);
+    static final double HEADING_SIGMA_DEG = envDouble("SCMS_HEADING_SIGMA", 2.0);
+    // Rare heavy-tailed GNSS outliers (multipath / urban canyon): occasional large position
+    // spikes, the realistic source of transient false detections. Rate is per-SECOND so it is
+    // independent of the CAM rate; a per-CAM probability is derived as rate*dt.
+    static final double GPS_OUTLIER_RATE = envDouble("SCMS_GPS_OUTLIER_RATE", 0.008);
+    static final double GPS_OUTLIER_M = envDouble("SCMS_GPS_OUTLIER_M", 45.0);
+    // MA revocation requires SUSTAINED, corroborated evidence (not a transient spike): K distinct
+    // reporters AND reports in at least this many distinct 1-second intervals spanning >= PERSIST_S.
+    // Counting distinct seconds (not raw reports) stops one multi-witness GPS spike from looking
+    // persistent; the threshold sits above the tail of the benign outlier count so honest vehicles
+    // clear it while continuously-misbehaving attackers do not.
+    static final int REVOKE_MIN_SECONDS = envInt("SCMS_MIN_SECONDS", 8);
+    static final double REVOKE_PERSIST_S = envDouble("SCMS_PERSIST_S", 5.0);
     static final String OUT_DIR = resolveOutDir();
 
     // Config is read from environment variables first (so the GUI can change it without a
@@ -121,6 +140,8 @@ public final class ScmsBackend {
         AttackLib.State atk = null;
         List<String> ghosts = null;   // Sybil: extra identities mapped back to this device
         double lastX, lastY, lastSeenT = -1;   // true position, for the live map
+        double sBiasX, sBiasY, sensorLastT = -1;   // OU-correlated sensor bias state
+        java.util.Random sRng;                     // per-vehicle sensor-noise RNG (seeded)
     }
 
     private final Map<String, Dev> devByUnit = new HashMap<>();
@@ -143,6 +164,8 @@ public final class ScmsBackend {
     private int caseCounter = 0;
     private boolean written = false;
     private double lastLiveWriteT = -1e9;
+    private final Map<String, double[]> subjAgg = new HashMap<>();   // subject -> {firstT, lastT}
+    private final Map<String, java.util.Set<Long>> subjSeconds = new HashMap<>();   // subject -> distinct report seconds
 
     private ScmsBackend() {
         Runtime.getRuntime().addShutdownHook(new Thread(this::writeOutputs));
@@ -218,14 +241,37 @@ public final class ScmsBackend {
             d = devByUnit.get(unitId);
         }
         double t = tNs / 1e9;
-        d.lastX = x; d.lastY = y; d.lastSeenT = t;   // true position for the live map
+        d.lastX = x; d.lastY = y; d.lastSeenT = t;   // TRUE position (ground truth + live map)
         maybeWriteLive(t);
-        if (!d.attacker) {
-            AttackLib.Claim c = new AttackLib.Claim();
-            c.x = x; c.y = y; c.speed = speed; c.heading = heading; c.genTimeNs = tNs;
-            return c;
+        // sensor model: what this vehicle MEASURES of its own state (GNSS/odometry error).
+        if (d.sRng == null) {
+            d.sRng = new java.util.Random(MASTER_SEED * 7919L + unitId.hashCode());
         }
-        return AttackLib.compute(d.attackType, d.atk, sendCount, x, y, speed, heading, tNs, attackCfg);
+        double dt = (d.sensorLastT < 0) ? 0.1 : Math.max(1e-3, Math.min(10.0, t - d.sensorLastT));
+        d.sensorLastT = t;
+        double a = Math.exp(-GPS_THETA * dt);                 // OU bias update over dt
+        double qv = GPS_BIAS_M * Math.sqrt(Math.max(0.0, 1 - a * a));
+        d.sBiasX = a * d.sBiasX + qv * d.sRng.nextGaussian();
+        d.sBiasY = a * d.sBiasY + qv * d.sRng.nextGaussian();
+        double mx = x + d.sBiasX + GPS_SIGMA_M * d.sRng.nextGaussian();
+        double my = y + d.sBiasY + GPS_SIGMA_M * d.sRng.nextGaussian();
+        if (d.sRng.nextDouble() < Math.min(0.5, GPS_OUTLIER_RATE * dt)) {   // rare multipath spike
+            double ang = d.sRng.nextDouble() * 2 * Math.PI;
+            double mag = GPS_OUTLIER_M * (0.5 + d.sRng.nextDouble());
+            mx += Math.cos(ang) * mag; my += Math.sin(ang) * mag;
+        }
+        double mspeed = Math.max(0.0, speed + SPEED_SIGMA_MS * d.sRng.nextGaussian());
+        double mheading = ((heading + HEADING_SIGMA_DEG * d.sRng.nextGaussian()) % 360 + 360) % 360;
+        double conf = 1.96 * Math.sqrt(GPS_SIGMA_M * GPS_SIGMA_M + GPS_BIAS_M * GPS_BIAS_M);
+        AttackLib.Claim c;
+        if (!d.attacker) {
+            c = new AttackLib.Claim();
+            c.x = mx; c.y = my; c.speed = mspeed; c.heading = mheading; c.genTimeNs = tNs;
+        } else {
+            c = AttackLib.compute(d.attackType, d.atk, sendCount, mx, my, mspeed, mheading, tNs, attackCfg);
+        }
+        c.posConf = conf;
+        return c;
     }
 
     /** Sybil ghost cert digests for an attacker (empty for everyone else). */
@@ -245,7 +291,7 @@ public final class ScmsBackend {
 
     // -------------------------------------------------- report ingestion (LOP -> RA -> MA)
     public synchronized void onDetection(String reporterDigest, String subjectDigest, double score, double t,
-                                         String reasonCode) {
+                                         String reasonCode, double subjectPosConf) {
         if (rng.nextDouble() > REPORT_PROB) {
             return; // suppression / loss on the report channel
         }
@@ -260,11 +306,17 @@ public final class ScmsBackend {
         maReports.add(maRow("report_id", rid, "ingest_time", round3(t), "detection_time", round3(t),
                 "reporter_cert_digest", reporterDigest, "subject_cert_digest", subjectDigest,
                 "reason_codes", List.of(reasonCode),
-                "detector_score", round3(score), "sig_valid", true, "cert_crl_status", "active"));
+                "detector_score", round3(score), "subject_pos_confidence", round3(subjectPosConf),
+                "sig_valid", true, "cert_crl_status", "active"));
         gtRepLbl.add(gtRow("report_id", rid, "reporter_true_id", rep.unitId, "subject_true_id", subj.unitId,
                 "report_correctness", subj.attacker ? "correct" : "false_positive"));
         int distinct = scms.ma.addReporter(subjectDigest, reporterDigest);
-        if (!scms.crlStore.isRevoked(subj.certDigest) && distinct >= REPORT_THRESHOLD_K) {
+        double[] ag = subjAgg.computeIfAbsent(subjectDigest, k -> new double[] {t, t});
+        ag[1] = t;                                               // lastT (firstT fixed)
+        java.util.Set<Long> secs = subjSeconds.computeIfAbsent(subjectDigest, k -> new java.util.HashSet<>());
+        secs.add((long) Math.floor(t));
+        boolean sustained = secs.size() >= REVOKE_MIN_SECONDS && (ag[1] - ag[0]) >= REVOKE_PERSIST_S;
+        if (!scms.crlStore.isRevoked(subj.certDigest) && distinct >= REPORT_THRESHOLD_K && sustained) {
             resolveAndRevoke(subj, t);
         }
     }

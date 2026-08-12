@@ -261,6 +261,7 @@ public final class AttackLib {
     /** The claimed content of one broadcast plus behaviour flags. */
     public static final class Claim {
         public double x, y, speed, heading;
+        public double posConf = 0;      // 95% position-confidence radius (m)
         public long genTimeNs;
         public boolean flood = false;   // DoS: bypass the 1 Hz throttle
         public int sybilGhosts = 0;     // Sybil: also emit this many ghost identities

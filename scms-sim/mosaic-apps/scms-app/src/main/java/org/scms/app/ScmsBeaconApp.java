@@ -36,14 +36,16 @@ import org.scms.backend.ScmsBackend;
 public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         implements VehicleApplication, CommunicationApplication {
 
-    private static final double CAM_INTERVAL_S = envD("SCMS_CAM_INTERVAL", 1.0);
+    private static final double CAM_INTERVAL_S = envD("SCMS_CAM_INTERVAL", 1.0);   // ETSI T_GenCamMax
+    private static final double CAM_MIN_S = envD("SCMS_CAM_MIN", 0.1);             // ETSI T_GenCamMin
+    private static final int FLOOD_BURST = envI("SCMS_FLOOD_BURST", 10);           // DoS msgs per tick
     private static final double MOVING_SPEED_MS = 5.0;
     private static final double FROZEN_EPS_M = 0.5;
     private static final int FROZEN_COUNT = envI("SCMS_FROZEN_COUNT", 3);
     private static final double ART_MAX_M = envD("SCMS_ART_MAX_M", 1000.0);
     private static final double STALE_MAX_S = envD("SCMS_STALE_MAX", 5.0);
-    private static final int FREQ_MAX = envI("SCMS_FREQ_MAX", 6);
-    private static final double SPEED_TOL_M = envD("SCMS_SPEED_TOL", 25.0);
+    private static final int FREQ_MAX = envI("SCMS_FREQ_MAX", 12);
+    private static final double SPEED_TOL_M = envD("SCMS_SPEED_TOL", 10.0);
     private static final double HEADING_DIFF = envD("SCMS_HEADING_DIFF", 120.0);
     private static final int SYBIL_MIN = envI("SCMS_SYBIL_MIN", 5);
 
@@ -59,13 +61,20 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
 
     private int sendCount = 0;
     private double lastSendS = Double.NEGATIVE_INFINITY;
+    private double lastSentX, lastSentY, lastSentHeading, lastSentSpeed;
+    private boolean haveSentBefore = false;
     private String myDigest;
     private ScmsBackend.Cred cred;
     private double selfX, selfY;
     private boolean haveSelf = false;
 
+    private static final double MIN_REF_GAP_S = 0.5;   // motion-consistency baseline (rate-independent)
+    private static final double MAX_ACCEL_MS2 = 9.0;   // physical accel/decel bound for plausibility
+
     private static final class Rx {
-        double lastX, lastY, lastT, lastHeading;
+        double lastX, lastY, lastT, lastHeading;       // most recent CAM (frequency, sybil, live)
+        double refX, refY, refT, refHeading;           // lagged >=0.5 s reference (motion checks)
+        boolean hasRef = false;
         int frozenCount;
         double winStart;
         int winCount;
@@ -99,17 +108,43 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         haveSelf = true;
         long tNs = getOperatingSystem().getSimulationTime();
         double tS = tNs / 1e9;
-        boolean flood = cred != null && ("DoS".equals(cred.attackType) || "DoSRandom".equals(cred.attackType));
-        if (!flood && tS - lastSendS < CAM_INTERVAL_S) {
-            return; // throttle genuine/normal senders to ~1 Hz; DoS floods every tick
+        boolean flood = cred != null && ("DoS".equals(AttackLib.baseOf(cred.attackType))
+                || "DoSRandom".equals(AttackLib.baseOf(cred.attackType)));
+        // ETSI EN 302 637-2 CAM generation rules: trigger on dynamics (Δpos>4 m / Δhdg>4° /
+        // Δspeed>0.5 m/s), floored at T_GenCamMin and heart-beating at T_GenCamMax. DoS floods.
+        double dtLast = tS - lastSendS;
+        boolean due;
+        if (flood) {
+            due = true;
+        } else if (dtLast < CAM_MIN_S) {
+            due = false;
+        } else if (dtLast >= CAM_INTERVAL_S || !haveSentBefore) {
+            due = true;
+        } else {
+            double dPos = Math.hypot(selfX - lastSentX, selfY - lastSentY);
+            double dHdg = angleDiff(updated.getHeading(), lastSentHeading);
+            double dSpd = Math.abs(updated.getSpeed() - lastSentSpeed);
+            due = dPos > 4.0 || dHdg > 4.0 || dSpd > 0.5;
+        }
+        if (!due) {
+            return;
         }
         lastSendS = tS;
+        lastSentX = selfX; lastSentY = selfY;
+        lastSentHeading = updated.getHeading(); lastSentSpeed = updated.getSpeed();
+        haveSentBefore = true;
         sendCount++;
         ScmsBackend backend = ScmsBackend.instance();
         AttackLib.Claim c = backend.claim(getOperatingSystem().getId(), sendCount,
-                p.getX(), p.getY(), updated.getSpeed(), updated.getHeading(), tNs);
+                selfX, selfY, updated.getSpeed(), updated.getHeading(), tNs);
         backend.onCamSent(cred.certDigest, tS);
-        send(backend, cred.certDigest, c.x, c.y, c.speed, c.heading, c.genTimeNs);
+        send(backend, cred.certDigest, c.x, c.y, c.speed, c.heading, c.posConf, c.genTimeNs);
+        if (c.flood) {   // DoS: emit a burst so receivers/channel actually see flooding
+            for (int b = 1; b < FLOOD_BURST; b++) {
+                backend.onCamSent(cred.certDigest, tS);
+                send(backend, cred.certDigest, c.x, c.y, c.speed, c.heading, c.posConf, c.genTimeNs);
+            }
+        }
 
         if (c.sybilGhosts > 0) {   // Sybil: emit ghost identities clustered near the attacker
             List<String> ghosts = backend.ghostDigests(getOperatingSystem().getId());
@@ -117,18 +152,18 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
                 double gx = c.x + ((k % 2 == 0) ? 1.0 : -1.0);   // tight cluster (~1.5 m): physically implausible
                 double gy = c.y + ((k < 2) ? 1.0 : -1.0);
                 backend.onCamSent(ghosts.get(k), tS);
-                send(backend, ghosts.get(k), gx, gy, c.speed, c.heading, tNs);
+                send(backend, ghosts.get(k), gx, gy, c.speed, c.heading, c.posConf, tNs);
             }
         }
     }
 
     private void send(ScmsBackend backend, String certDigest, double x, double y, double speed,
-                      double heading, long genTimeNs) {
+                      double heading, double posConf, long genTimeNs) {
         MessageRouting routing = getOperatingSystem().getAdHocModule().createMessageRouting()
                 .channel(AdHocChannel.CCH).topological().broadcast().singlehop().build();
         getOperatingSystem().getAdHocModule().sendV2xMessage(new SignedCam(routing,
                 certDigest, cred.iPeriod, cred.jIndex, cred.linkageValueHex,
-                x, y, speed, heading, genTimeNs, true));
+                x, y, speed, heading, posConf, genTimeNs, true));
     }
 
     @Override
@@ -151,8 +186,6 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         }
 
         Rx s = senders.get(dg);
-        double gap = (s == null) ? 0 : (t - s.lastT);
-        double moved = (s == null) ? 0 : Math.hypot(cam.claimedX - s.lastX, cam.claimedY - s.lastY);
         if (s == null) {
             s = new Rx();
             s.winStart = t;
@@ -164,11 +197,19 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         } else {
             s.winCount++;
         }
-        if (s.hasPrev) {
-            s.frozenCount = (cam.claimedSpeed > MOVING_SPEED_MS && moved < FROZEN_EPS_M) ? s.frozenCount + 1 : 0;
+
+        // Motion consistency is evaluated against a lagged reference (>= MIN_REF_GAP old) rather
+        // than the immediately-previous CAM, so detection is independent of the CAM rate (which
+        // now varies 1-10 Hz under the ETSI generation rules).
+        double gapRef = s.hasRef ? (t - s.refT) : 0;
+        double movedRef = s.hasRef ? Math.hypot(cam.claimedX - s.refX, cam.claimedY - s.refY) : 0;
+        boolean refReady = s.hasRef && gapRef >= MIN_REF_GAP_S;
+        if (refReady) {
+            s.frozenCount = (cam.claimedSpeed > MOVING_SPEED_MS && movedRef < FROZEN_EPS_M)
+                    ? s.frozenCount + 1 : 0;
         }
 
-        // Sybil co-location: many distinct identities claiming ~one 20 m cell within 3 s.
+        // Sybil co-location: many distinct identities claiming ~one 5 m cell within 1.5 s.
         String cell = ((long) Math.floor(cam.claimedX / 5)) + ":" + ((long) Math.floor(cam.claimedY / 5));
         Map<String, Double> cd = sybilGrid.computeIfAbsent(cell, k -> new HashMap<>());
         cd.put(dg, t);
@@ -186,19 +227,23 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
             reason = "beaconFrequency"; score = s.winCount;
         } else if (haveSelf && artDist > ART_MAX_M) {
             reason = "acceptanceRangeThreshold"; score = artDist;
-        } else if (s.hasPrev && gap > 0 && gap <= 5 && moved > 50 + 60 * gap) {
-            reason = "positionJump"; score = moved;
+        } else if (refReady && gapRef <= 5 && movedRef > 50 + 60 * gapRef) {
+            reason = "positionJump"; score = movedRef;
         } else if (cellDistinct >= SYBIL_MIN) {
             reason = "sybilCoLocation"; score = cellDistinct;
-        } else if (s.hasPrev && gap >= 0.5 && gap <= 3) {
-            double expected = cam.claimedSpeed * gap;
-            double diff = Math.abs(moved - expected);
-            if (diff > Math.max(SPEED_TOL_M, 0.8 * expected)) {
-                reason = "positionSpeedInconsistency"; score = diff;
+        } else if (refReady && gapRef <= 1.5) {
+            // Physical plausibility: you cannot travel FARTHER than your claimed speed allows over
+            // the gap (plus an accel + confidence margin). Moving LESS (braking, turning, a lost
+            // CAM) is legitimate, so this is one-sided — which avoids false-flagging normal urban
+            // manoeuvres while still catching teleports / random-position lies.
+            double maxDist = cam.claimedSpeed * gapRef + 0.5 * MAX_ACCEL_MS2 * gapRef * gapRef
+                    + SPEED_TOL_M + cam.posConf;
+            if (movedRef > maxDist) {
+                reason = "positionSpeedInconsistency"; score = movedRef - maxDist;
             }
         }
-        if (reason == null && s.hasPrev && moved > 10 && gap >= 0.5 && gap <= 3) {
-            double bearing = norm360(Math.toDegrees(Math.atan2(cam.claimedX - s.lastX, cam.claimedY - s.lastY)));
+        if (reason == null && refReady && movedRef > 20 && gapRef <= 1.0) {
+            double bearing = norm360(Math.toDegrees(Math.atan2(cam.claimedX - s.refX, cam.claimedY - s.refY)));
             double hd = angleDiff(cam.claimedHeading, bearing);
             if (hd > HEADING_DIFF) {
                 reason = "headingInconsistency"; score = hd;
@@ -213,9 +258,13 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         s.lastT = t;
         s.lastHeading = cam.claimedHeading;
         s.hasPrev = true;
+        if (!s.hasRef || gapRef >= MIN_REF_GAP_S) {   // advance the lagged reference
+            s.refX = cam.claimedX; s.refY = cam.claimedY; s.refT = t; s.refHeading = cam.claimedHeading;
+            s.hasRef = true;
+        }
 
         if (reason != null) {
-            backend.onDetection(myDigest, dg, score, t, reason);
+            backend.onDetection(myDigest, dg, score, t, reason, cam.posConf);
         }
     }
 

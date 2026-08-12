@@ -107,6 +107,7 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
             "sig_valid": int(sig),
             "ingest_delay": float(r.get("ingest_time", 0)) - float(r.get("detection_time", 0)),
             "crl_active_at_report": int(crl == "active"),
+            "pos_confidence": float(r.get("subject_pos_confidence", 0.0) or 0.0),
             "split": split,
         }
         for name in REASON_VOCAB:

@@ -26,12 +26,13 @@ public final class SignedCam extends V2xMessage {
     public final double claimedY;
     public final double claimedSpeed;
     public final double claimedHeading;
+    public final double posConf;    // 95% position-confidence radius (m), per ETSI CAM
     public final long genTimeNs;
     public final boolean sigValid;
 
     public SignedCam(MessageRouting routing, String senderCertDigest, int iPeriod, int jIndex,
                      String linkageValueHex, double claimedX, double claimedY, double claimedSpeed,
-                     double claimedHeading, long genTimeNs, boolean sigValid) {
+                     double claimedHeading, double posConf, long genTimeNs, boolean sigValid) {
         super(routing);
         this.senderCertDigest = senderCertDigest;
         this.iPeriod = iPeriod;
@@ -41,6 +42,7 @@ public final class SignedCam extends V2xMessage {
         this.claimedY = claimedY;
         this.claimedSpeed = claimedSpeed;
         this.claimedHeading = claimedHeading;
+        this.posConf = posConf;
         this.genTimeNs = genTimeNs;
         this.sigValid = sigValid;
         this.payload = new EncodedPayload(NOMINAL_BYTES);

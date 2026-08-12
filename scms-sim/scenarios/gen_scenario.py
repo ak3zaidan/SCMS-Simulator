@@ -160,6 +160,15 @@ def generate(key: str, duration=None, scale=None, max_vehicles=None,
                                       f'\t<processing>\n\t\t<scale value="{scale}"/>\n\t</processing>\n</configuration>', 1)
                 scfg.write_text(txt, encoding="utf-8")
 
+    # optional: honour an explicit SCMS_SIM_STEP on curated maps (finer MOSAIC<->SUMO sync
+    # so the ETSI CAM rules can trigger above 1 Hz); left untouched by default.
+    if os.environ.get("SCMS_SIM_STEP"):
+        scj = dst / "sumo" / "sumo_config.json"
+        if scj.exists():
+            sc = json.loads(scj.read_text(encoding="utf-8"))
+            sc["updateInterval"] = mapgen.sim_step_ms()
+            scj.write_text(json.dumps(sc, indent=2), encoding="utf-8")
+
     return {"scenario_config": str(cfgp), "dataset_dir": str(REPO / "datasets" / key), "kind": kind}
 
 
