@@ -67,8 +67,8 @@ ATTACK_TYPES = [
     "DataReplay", "DelayedMessages", "OutOfOrder", "DoS", "DoSRandom",
     # identity
     "Sybil",
-    # stealth (hard to detect: subtle, plausible falsifications)
-    "AlongRoadOffset", "SlowDrift", "LaggingPosition",
+    # stealth (hard to detect: subtle, plausible, detector-aware falsifications)
+    "AlongRoadOffset", "SlowDrift", "LaggingPosition", "Adaptive",
 ]
 
 # Every configurable variable, grouped for the form. `env` = the environment variable the
