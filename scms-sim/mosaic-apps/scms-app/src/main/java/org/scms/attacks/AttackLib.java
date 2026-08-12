@@ -49,6 +49,9 @@ public final class AttackLib {
     static final String[] FAM_TIMING = {
             "DataReplay", "DelayedMessages", "OutOfOrder", "DoS", "DoSRandom"};
     static final String[] FAM_IDENTITY = {"Sybil"};
+    // Stealth family: subtle, plausible falsifications designed to EVADE the on-board detectors
+    // (small on-road offsets, slow drift, lagging position with a fresh timestamp).
+    static final String[] FAM_STEALTH = {"AlongRoadOffset", "SlowDrift", "LaggingPosition"};
 
     /** Every base behaviour (for the GUI picker and family/base expansion). */
     public static final List<String> BASES = new ArrayList<>();
@@ -62,7 +65,8 @@ public final class AttackLib {
             "ConstPosOffset", "ConstPosOffsetX", "ConstPosOffsetY", "RandomPos", "RandomPosOffset",
             "ConstSpeedOffset", "RandomSpeed", "RandomSpeedOffset", "HeadingOffset",
             "PosSpeedInconsistent", "PosHeadingInconsistent", "Disruptive", "DoSRandom",
-            "Teleport", "SineWavePos"};
+            "Teleport", "SineWavePos",
+            "AlongRoadOffset", "SlowDrift", "LaggingPosition"};
     static final String[] PROFILES_MAG = {"constant", "gradual", "intermittent", "delayed"};
     static final String[] TIERS_MAG = {"small", "med", "large", "huge"};
     // Structural bases (mechanism is temporal, not a scalar): profile only, one tier.
@@ -82,7 +86,8 @@ public final class AttackLib {
     static {
         for (Object[] fam : new Object[][] {
                 {"position", FAM_POSITION}, {"speed", FAM_SPEED}, {"heading", FAM_HEADING},
-                {"combined", FAM_COMBINED}, {"timing", FAM_TIMING}, {"identity", FAM_IDENTITY}}) {
+                {"combined", FAM_COMBINED}, {"timing", FAM_TIMING}, {"identity", FAM_IDENTITY},
+                {"stealth", FAM_STEALTH}}) {
             String fname = (String) fam[0];
             List<String> bases = List.of((String[]) fam[1]);
             FAMILIES.put(fname, bases);
@@ -230,6 +235,10 @@ public final class AttackLib {
         public double dutyOnS = env("SCMS_DUTY_ON", 6.0);             // intermittent: attack-on window
         public double dutyOffS = env("SCMS_DUTY_OFF", 6.0);           // intermittent: attack-off window
         public double startDelayS = env("SCMS_START_DELAY", 15.0);   // delayed: benign lead-in
+        // stealth-family magnitudes (deliberately small, to evade detection)
+        public double alongRoadM = env("SCMS_ALONGROAD_M", 30.0);    // on-road offset along heading
+        public double driftRateM = env("SCMS_DRIFT_RATE", 0.3);      // SlowDrift: metres per CAM
+        public double lagS = env("SCMS_LAG_S", 2.0);                 // LaggingPosition: seconds behind
 
         private static double env(String n, double d) {
             String e = System.getenv(n);
@@ -252,6 +261,7 @@ public final class AttackLib {
         public double[] frozen = null;
         public double[] replay = null;   // {x, y, speed, heading}
         public long replayGenNs = -1;
+        public double driftAngle = Double.NaN;   // SlowDrift: fixed random drift direction
 
         public State(long seed) {
             this.rng = new Random(seed);
@@ -331,6 +341,32 @@ public final class AttackLib {
             case "SineWavePos": {
                 double amp = cfg.randomRadiusM * sc * 0.2;
                 c.x = x + amp * Math.sin(sendCount * 0.5); c.y = y + amp * Math.cos(sendCount * 0.5);
+                break;
+            }
+            case "AlongRoadOffset": {
+                // shift the claimed position along the direction of travel: stays plausibly on the
+                // road, moves consistently with speed, so single-receiver checks barely notice it.
+                double hr = Math.toRadians(heading);
+                double d = cfg.alongRoadM * sc;
+                c.x = x + d * Math.sin(hr); c.y = y + d * Math.cos(hr);
+                break;
+            }
+            case "SlowDrift": {
+                // a slowly-growing position error: each step is tiny (below jump/consistency
+                // thresholds), only becoming large over time.
+                if (Double.isNaN(s.driftAngle)) {
+                    s.driftAngle = s.rng.nextDouble() * 2 * Math.PI;
+                }
+                double mag = cfg.driftRateM * sc * sendCount;
+                c.x = x + Math.cos(s.driftAngle) * mag; c.y = y + Math.sin(s.driftAngle) * mag;
+                break;
+            }
+            case "LaggingPosition": {
+                // claim a position behind where the vehicle actually is (a delayed GPS), but with a
+                // FRESH timestamp — so the stale/replay detector never fires.
+                double hr = Math.toRadians(heading);
+                double d = speed * cfg.lagS * sc;
+                c.x = x - d * Math.sin(hr); c.y = y - d * Math.cos(hr);
                 break;
             }
             case "ConstSpeedZero":

@@ -35,9 +35,13 @@ def validate(dataset_dir: str) -> tuple[dict, list]:
 
     vehicles = _read(os.path.join(gt, "gt_vehicle.jsonl"))
     attackers = {v["true_vehicle_id"] for v in vehicles if v.get("is_attacker")}
+    faulty = {v["true_vehicle_id"] for v in vehicles if v.get("is_faulty")}
     revoked = {r["true_vehicle_id"] for r in _read(os.path.join(gt, "gt_linkage_revocation.jsonl"))}
     tp = attackers & revoked
-    fp = revoked - attackers
+    # A revoked faulty vehicle is a defensible removal of a malfunctioning unit, not the same as
+    # revoking an innocent benign vehicle — report the two separately.
+    faulty_rev = (revoked & faulty) - attackers
+    benign_fp = revoked - attackers - faulty
     precision = len(tp) / len(revoked) if revoked else 1.0
     recall = len(tp) / len(attackers) if attackers else 0.0
 
@@ -47,9 +51,11 @@ def validate(dataset_dir: str) -> tuple[dict, list]:
         "leakage_violations": len(leaks),
         "vehicles": len(vehicles),
         "attackers": len(attackers),
+        "faulty": len(faulty),
         "revoked": len(revoked),
         "true_attacker_revocations": len(tp),
-        "false_revocations": len(fp),
+        "faulty_revocations": len(faulty_rev),
+        "false_revocations": len(benign_fp),
         "precision": round(precision, 3),
         "recall": round(recall, 3),
     }

@@ -61,6 +61,11 @@ public final class ScmsBackend {
     // independent of the CAM rate; a per-CAM probability is derived as rate*dt.
     static final double GPS_OUTLIER_RATE = envDouble("SCMS_GPS_OUTLIER_RATE", 0.008);
     static final double GPS_OUTLIER_M = envDouble("SCMS_GPS_OUTLIER_M", 45.0);
+    // Transient GPS degradation (urban canyon / tunnel): benign vehicles occasionally enter a
+    // multi-second bad-GPS burst — a realistic source of hard, benign false positives.
+    static final double GPS_DEGRADE_RATE = envDouble("SCMS_GPS_DEGRADE_RATE", 0.004);   // per second
+    static final double GPS_DEGRADE_FACTOR = envDouble("SCMS_GPS_DEGRADE_FACTOR", 5.0);
+    static final double GPS_DEGRADE_MIN_S = 3.0, GPS_DEGRADE_MAX_S = 8.0;
     // MA revocation requires SUSTAINED, corroborated evidence (not a transient spike): K distinct
     // reporters AND reports in at least this many distinct 1-second intervals spanning >= PERSIST_S.
     // Counting distinct seconds (not raw reports) stops one multi-witness GPS spike from looking
@@ -146,6 +151,10 @@ public final class ScmsBackend {
         LinkageEngine.Device link;
         boolean attacker;
         boolean faulty;                // malfunctioning sensor (anomalous but not malicious)
+        int faultMode;                 // 0 = extra outliers, 1 = constant bias, 2 = slow drift
+        double faultAngle, faultMag;   // fault direction + magnitude
+        double driftAccum;             // slow-drift fault accumulator
+        double degradeUntil = -1;      // GPS-degradation burst end time
         String attackType = "none";
         AttackLib.State atk = null;
         List<String> ghosts = null;   // Sybil: extra identities mapped back to this device
@@ -210,6 +219,12 @@ public final class ScmsBackend {
             d.atk = new AttackLib.State(MASTER_SEED * 1000003L + unitId.hashCode());
         } else {
             d.faulty = ((sha("fault|" + MASTER_SEED + "|" + unitId)[0] & 0xff) * 100 / 256) < FAULTY_PCT;
+            if (d.faulty) {
+                byte[] fh = sha("faultmode|" + MASTER_SEED + "|" + unitId);
+                d.faultMode = (fh[0] & 0xff) % 3;
+                d.faultAngle = ((fh[1] & 0xff) / 255.0) * 2 * Math.PI;
+                d.faultMag = 20.0 + (fh[2] & 0xff) / 255.0 * 30.0;   // 20..50 m constant-bias fault
+            }
         }
         // heterogeneous GNSS quality per vehicle (0.4 good .. ~2.2 poor, skewed to typical), so the
         // broadcast position confidence VARIES and is an informative feature (not a constant).
@@ -305,20 +320,36 @@ public final class ScmsBackend {
         }
         double dt = (d.sensorLastT < 0) ? 0.1 : Math.max(1e-3, Math.min(10.0, t - d.sensorLastT));
         d.sensorLastT = t;
-        double sigma = GPS_SIGMA_M * d.gpsQ;                  // per-vehicle GNSS quality
-        double bias = GPS_BIAS_M * d.gpsQ;
+        double q = d.gpsQ;                                    // per-vehicle GNSS quality
+        // transient degradation burst (canyon/tunnel) — elevated error for a few seconds
+        if (t < d.degradeUntil) {
+            q *= GPS_DEGRADE_FACTOR;
+        } else if (d.sRng.nextDouble() < GPS_DEGRADE_RATE * dt) {
+            d.degradeUntil = t + GPS_DEGRADE_MIN_S + d.sRng.nextDouble() * (GPS_DEGRADE_MAX_S - GPS_DEGRADE_MIN_S);
+            q *= GPS_DEGRADE_FACTOR;
+        }
+        double sigma = GPS_SIGMA_M * q;
+        double bias = GPS_BIAS_M * q;
         double a = Math.exp(-GPS_THETA * dt);                 // OU bias update over dt
         double qv = bias * Math.sqrt(Math.max(0.0, 1 - a * a));
         d.sBiasX = a * d.sBiasX + qv * d.sRng.nextGaussian();
         d.sBiasY = a * d.sBiasY + qv * d.sRng.nextGaussian();
         double mx = x + d.sBiasX + sigma * d.sRng.nextGaussian();
         double my = y + d.sBiasY + sigma * d.sRng.nextGaussian();
-        // Faulty units glitch more often (a malfunctioning sensor, not an attack); poorer GNSS too.
-        double outRate = (d.faulty ? GPS_OUTLIER_RATE * 6.0 : GPS_OUTLIER_RATE) * d.gpsQ;
+        // Faulty units glitch more often (a malfunctioning sensor, not an attack).
+        double outRate = (d.faulty && d.faultMode == 0 ? GPS_OUTLIER_RATE * 6.0 : GPS_OUTLIER_RATE) * q;
         if (d.sRng.nextDouble() < Math.min(0.6, outRate * dt)) {   // rare multipath spike
             double ang = d.sRng.nextDouble() * 2 * Math.PI;
             double mag = GPS_OUTLIER_M * (0.5 + d.sRng.nextDouble());
             mx += Math.cos(ang) * mag; my += Math.sin(ang) * mag;
+        }
+        // sustained sensor faults (malfunction, not malicious): a persistent constant bias or a
+        // slowly-growing drift — anomalous but self-consistent, so hard to tell from a subtle attack.
+        if (d.faulty && d.faultMode == 1) {
+            mx += Math.cos(d.faultAngle) * d.faultMag; my += Math.sin(d.faultAngle) * d.faultMag;
+        } else if (d.faulty && d.faultMode == 2) {
+            d.driftAccum = Math.min(60.0, d.driftAccum + 0.2);   // grows ~0.2 m per CAM, capped
+            mx += Math.cos(d.faultAngle) * d.driftAccum; my += Math.sin(d.faultAngle) * d.driftAccum;
         }
         double mspeed = Math.max(0.0, speed + SPEED_SIGMA_MS * d.sRng.nextGaussian());
         double mheading = ((heading + HEADING_SIGMA_DEG * d.sRng.nextGaussian()) % 360 + 360) % 360;

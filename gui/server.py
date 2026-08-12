@@ -67,6 +67,8 @@ ATTACK_TYPES = [
     "DataReplay", "DelayedMessages", "OutOfOrder", "DoS", "DoSRandom",
     # identity
     "Sybil",
+    # stealth (hard to detect: subtle, plausible falsifications)
+    "AlongRoadOffset", "SlowDrift", "LaggingPosition",
 ]
 
 # Every configurable variable, grouped for the form. `env` = the environment variable the
@@ -105,8 +107,8 @@ CONFIG_SPEC = [
      "options": ["mixed", "car"], "env": "SCMS_FLEET",
      "help": "Generated maps: mixed = car/truck/bus/motorcycle; car = homogeneous"},
     {"group": "Traffic", "name": "demand", "label": "Demand profile", "type": "choice", "default": "uniform",
-     "options": ["uniform", "rush"], "env": "SCMS_DEMAND",
-     "help": "Generated maps: rush front-loads departures (peak then quiet)"},
+     "options": ["uniform", "rush", "night"], "env": "SCMS_DEMAND",
+     "help": "Generated maps: rush front-loads departures (peak then quiet); night is sparse (~35%)"},
 
     # --- SCMS policy ---
     {"group": "SCMS policy", "name": "attacker_pct", "label": "Attacker %", "type": "int",
@@ -183,6 +185,15 @@ CONFIG_SPEC = [
     {"group": "Attacks", "name": "start_delay", "label": "Delayed start (s)", "type": "float",
      "default": 15.0, "min": 0, "max": 300, "step": 1, "env": "SCMS_START_DELAY",
      "help": "'delayed' profile: benign lead-in before the attack begins"},
+    {"group": "Attacks", "name": "alongroad_m", "label": "Stealth on-road offset (m)", "type": "float",
+     "default": 30.0, "min": 2, "max": 300, "step": 2, "env": "SCMS_ALONGROAD_M",
+     "help": "AlongRoadOffset: subtle offset along the direction of travel (evasive)"},
+    {"group": "Attacks", "name": "drift_rate", "label": "Stealth drift (m/CAM)", "type": "float",
+     "default": 0.3, "min": 0.01, "max": 5, "step": 0.05, "env": "SCMS_DRIFT_RATE",
+     "help": "SlowDrift: metres of position error added per CAM (evasive)"},
+    {"group": "Attacks", "name": "lag_s", "label": "Stealth lag (s)", "type": "float",
+     "default": 2.0, "min": 0.2, "max": 20, "step": 0.2, "env": "SCMS_LAG_S",
+     "help": "LaggingPosition: seconds the claimed position lags behind reality (fresh timestamp)"},
 
     # --- Detectors ---
     {"group": "Detectors", "name": "cam_interval", "label": "CAM interval (s)", "type": "float",
@@ -270,6 +281,12 @@ CONFIG_SPEC = [
     {"group": "Sensors & CAM timing", "name": "gps_outlier_m", "label": "GPS outlier size (m)", "type": "float",
      "default": 45.0, "min": 5, "max": 200, "step": 5, "env": "SCMS_GPS_OUTLIER_M",
      "help": "Magnitude of a multipath spike"},
+    {"group": "Sensors & CAM timing", "name": "gps_degrade_rate", "label": "GPS degradation rate (/s)", "type": "float",
+     "default": 0.004, "min": 0, "max": 0.2, "step": 0.002, "env": "SCMS_GPS_DEGRADE_RATE",
+     "help": "Rate at which benign vehicles enter a bad-GPS burst (canyon/tunnel) — a false-positive source"},
+    {"group": "Sensors & CAM timing", "name": "gps_degrade_factor", "label": "GPS degradation factor", "type": "float",
+     "default": 5.0, "min": 1, "max": 20, "step": 0.5, "env": "SCMS_GPS_DEGRADE_FACTOR",
+     "help": "How much worse GPS error gets during a degradation burst"},
     {"group": "Sensors & CAM timing", "name": "cam_min", "label": "CAM min interval (s)", "type": "float",
      "default": 0.1, "min": 0.05, "max": 1, "step": 0.05, "env": "SCMS_CAM_MIN",
      "help": "ETSI T_GenCamMin — fastest CAM rate (paired with CAM interval = T_GenCamMax)"},

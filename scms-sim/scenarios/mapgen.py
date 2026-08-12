@@ -87,6 +87,23 @@ CITIES = {
     "philadelphia":("Philadelphia, Center",  (-75.1650, 39.9480, -75.1500, 39.9600)),
     "dallas":      ("Dallas, Downtown",      (-96.8050, 32.7780, -96.7900, 32.7880)),
     "sandiego":    ("San Diego, Downtown",   (-117.1650, 32.7100, -117.1500, 32.7200)),
+    "hongkong":    ("Hong Kong, Central",     (114.1500, 22.2780, 114.1650, 22.2880)),
+    "kualalumpur": ("Kuala Lumpur, KLCC",     (101.7100, 3.1500, 101.7250, 3.1600)),
+    "jakarta":     ("Jakarta, Menteng",       (106.8300, -6.1950, 106.8450, -6.1850)),
+    "manila":      ("Manila, Ermita",         (120.9800, 14.5750, 120.9900, 14.5850)),
+    "bogota":      ("Bogota, La Candelaria",  (-74.0800, 4.5950, -74.0700, 4.6050)),
+    "santiago":    ("Santiago, Centro",       (-70.6550, -33.4450, -70.6450, -33.4350)),
+    "buenosaires": ("Buenos Aires, Centro",   (-58.3850, -34.6100, -58.3700, -34.6000)),
+    "lima":        ("Lima, Centro",           (-77.0350, -12.0500, -77.0250, -12.0420)),
+    "capetown":    ("Cape Town, CBD",         (18.4150, -33.9250, 18.4280, -33.9150)),
+    "nairobi":     ("Nairobi, CBD",           (36.8150, -1.2870, 36.8280, -1.2780)),
+    "lagos":       ("Lagos, Island",          (3.3900, 6.4500, 3.4020, 6.4580)),
+    "tehran":      ("Tehran, Centre",         (51.4100, 35.6950, 51.4220, 35.7050)),
+    "riyadh":      ("Riyadh, Olaya",          (46.6800, 24.6900, 46.6920, 24.7000)),
+    "telaviv":     ("Tel Aviv, Centre",       (34.7700, 32.0700, 34.7820, 32.0800)),
+    "helsinki":    ("Helsinki, Kluuvi",       (24.9350, 60.1680, 24.9480, 60.1750)),
+    "oslo":        ("Oslo, Sentrum",          (10.7350, 59.9100, 10.7480, 59.9160)),
+    "kyiv":        ("Kyiv, Centre",           (30.5150, 50.4450, 30.5280, 50.4520)),
 }
 
 
@@ -169,7 +186,8 @@ def catalog() -> list[dict]:
         for s in (1, 2, 3):
             out.append({"key": f"grid_{n}x{n}_s{s}", "label": f"Grid {n}×{n} (seed {s})",
                         "family": "procedural-grid", "kind": "route"})
-    for cols, rows in ((4, 6), (6, 4), (5, 8), (8, 5), (6, 10), (10, 6), (8, 12), (12, 8)):
+    for cols, rows in ((4, 6), (6, 4), (5, 8), (8, 5), (6, 10), (10, 6), (8, 12), (12, 8),
+                       (2, 16), (16, 2), (3, 20), (20, 3), (16, 16), (20, 20)):
         for s in (1, 2):
             out.append({"key": f"grid_{cols}x{rows}_s{s}", "label": f"Grid {cols}×{rows} (seed {s})",
                         "family": "procedural-grid", "kind": "route"})
@@ -293,7 +311,12 @@ def _tag_vtype(routes: Path, seed: int):
         if profile == "rush":                       # concentrate departures early (peak then quiet)
             u = float(v.get("depart", "0")) / dmax
             v.set("depart", f"{dmax * u * u:.2f}")
-    if profile == "rush":                            # SUMO needs departures sorted
+    if profile == "night":                          # sparse traffic: keep ~35% of vehicles
+        keep = [v for v in vehs if rng.random() < 0.35]
+        for v in vehs:
+            if v not in keep:
+                root.remove(v)
+    elif profile == "rush":                          # SUMO needs departures sorted
         for v in vehs:
             root.remove(v)
         for v in sorted(vehs, key=lambda e: float(e.get("depart", "0"))):
