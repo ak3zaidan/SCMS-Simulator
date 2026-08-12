@@ -32,9 +32,9 @@ MA-visible data (features) and simulation ground truth (labels).
 | VeReMi NextGen vendored (pinned submodule) | ✅ `third_party/veremi-nextgen` @ `acda994b` |
 | SCMS closed loop in MOSAIC (sign → detect → report → correlate → 2-LA resolve → revoke → CRL → enforce) | ✅ real ITS-G5 AdHoc; distributed detection |
 | Runs on the real InTAS (Ingolstadt) map | ✅ `run.ps1 -Scenario intas_urban_rush` |
-| Maps / scenarios | ✅ 8 maps: Smoke · Highway · Barnim · Tiergarten · InTAS Ingolstadt ×4 (urban/highway × off-peak/rush) |
-| Attacks / detectors | ✅ 16 attack types (position/speed/heading/replay/DoS/Sybil) / 7 detectors |
-| Traffic controls | ✅ number of vehicles, target flow, lanes (flow maps); density scale (route maps) |
+| Maps / scenarios | ✅ 8 curated (Smoke · Highway · Barnim · Tiergarten · InTAS Ingolstadt ×4) **+ 200+ generated**: procedural `netgenerate` grid/spider/random and real-world OSM cities (`osm_manhattan` …) |
+| Attacks / detectors | ✅ **~291 attack variants** — 30 base behaviours (position/speed/heading/combined/replay/DoS/Sybil) × temporal profile × magnitude tier / 7 detectors |
+| Traffic + vehicle + radio controls | ✅ number of vehicles, flow, lanes, density; driver model (speed/accel/σ/gap); ITS-G5 radio range + packet loss |
 | ML featurizer + leakage-safe splitter | ✅ report + subject tables, vehicle-disjoint splits |
 | One-command end-to-end runner | ✅ `run.ps1` |
 
@@ -54,10 +54,19 @@ and is **byte-identical across runs** (deterministic). See
 .\run.ps1 -Scenario intas_highway_low -Scale 0.4 -Seed 42 # route map: control density
 ```
 
-Scenarios: `smoke`, `highway`, `barnim`, `tiergarten`,
-`intas_urban_low`, `intas_urban_rush`, `intas_highway_low`, `intas_highway_rush`.
-Traffic controls: `-MaxVehicles` / `-TargetFlow` / `-Lanes` (flow maps), `-Scale` (route maps);
-attacks and thresholds are set via `SCMS_*` environment variables (or, more easily, the GUI).
+```powershell
+.\run.ps1 -Scenario grid_8x8                 # procedural grid network
+.\run.ps1 -Scenario spider_10a5c -Scale 1.5  # procedural spider network
+.\run.ps1 -Scenario osm_tokyo                # real Tokyo streets (OpenStreetMap)
+```
+
+Curated scenarios: `smoke`, `highway`, `barnim`, `tiergarten`, `intas_urban_low`,
+`intas_urban_rush`, `intas_highway_low`, `intas_highway_rush`. Generated maps: any
+`grid_<c>x<r>`, `spider_<a>a<c>c`, `rand_<n>` (optionally `_s<seed>`), or `osm_<city>`
+(49 cities in [`mapgen.py`](scms-sim/scenarios/mapgen.py)) — 200+ are catalogued in the GUI
+and any well-formed key is built on demand. Traffic controls: `-MaxVehicles` / `-TargetFlow` /
+`-Lanes` (flow maps), `-Scale` (route/generated maps); attacks, detector thresholds, driver
+model, and radio are set via `SCMS_*` environment variables (or, more easily, the GUI).
 
 `run.ps1` builds the MOSAIC app, generates the scenario, simulates in MOSAIC + SUMO,
 featurizes the output into ML-ready tables, and validates it (leakage + precision/recall).
@@ -95,11 +104,13 @@ Prefer clicking to typing? Launch the control panel:
 .\gui.ps1        # starts a local server and opens http://127.0.0.1:8710
 ```
 
-The panel gives you **complete control of the simulation from the browser** — grouped into
-**Scenario** (map, duration, seed), **Traffic** (number of vehicles, target flow, lanes, or
-route-density scale — the relevant controls appear for the selected map type), **SCMS policy**
-(attacker %, reporters-to-revoke K, report probability, CRL delay, jmax), **Attacks** (pick any
-subset of the 16 attack types, plus every magnitude knob), and **Detectors** (all 8 thresholds).
+The panel gives you **complete control of the simulation from the browser** — 45 variables in
+six groups: **Scenario** (215-map catalogue + duration, seed), **Traffic** (number of vehicles,
+target flow, lanes, or route-density scale — the relevant controls appear for the selected map
+type), **SCMS policy** (attacker %, reporters-to-revoke K, report probability, CRL delay, jmax),
+**Attacks** (pick any of the 30 base behaviours — each expands to its ~291 profile×tier variants —
+plus every magnitude/temporal knob), **Detectors** (all 8 thresholds), and **Vehicle & radio**
+(SUMO driver model + ITS-G5 range/packet-loss).
 
 An **embedded live map** is built into the dashboard: as the run progresses it streams the
 vehicle positions from the back-end and draws them colored by SCMS state — teal *benign*,
