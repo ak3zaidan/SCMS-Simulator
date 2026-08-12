@@ -51,7 +51,7 @@ public final class AttackLib {
     static final String[] FAM_IDENTITY = {"Sybil"};
     // Stealth family: subtle, plausible falsifications designed to EVADE the on-board detectors
     // (small on-road offsets, slow drift, lagging position with a fresh timestamp).
-    static final String[] FAM_STEALTH = {"AlongRoadOffset", "SlowDrift", "LaggingPosition"};
+    static final String[] FAM_STEALTH = {"AlongRoadOffset", "SlowDrift", "LaggingPosition", "Adaptive"};
 
     /** Every base behaviour (for the GUI picker and family/base expansion). */
     public static final List<String> BASES = new ArrayList<>();
@@ -66,7 +66,7 @@ public final class AttackLib {
             "ConstSpeedOffset", "RandomSpeed", "RandomSpeedOffset", "HeadingOffset",
             "PosSpeedInconsistent", "PosHeadingInconsistent", "Disruptive", "DoSRandom",
             "Teleport", "SineWavePos",
-            "AlongRoadOffset", "SlowDrift", "LaggingPosition"};
+            "AlongRoadOffset", "SlowDrift", "LaggingPosition", "Adaptive"};
     static final String[] PROFILES_MAG = {"constant", "gradual", "intermittent", "delayed"};
     static final String[] TIERS_MAG = {"small", "med", "large", "huge"};
     // Structural bases (mechanism is temporal, not a scalar): profile only, one tier.
@@ -367,6 +367,17 @@ public final class AttackLib {
                 double hr = Math.toRadians(heading);
                 double d = speed * cfg.lagS * sc;
                 c.x = x - d * Math.sin(hr); c.y = y - d * Math.cos(hr);
+                break;
+            }
+            case "Adaptive": {
+                // detector-aware: a small along-road offset kept well under the acceptance-range and
+                // position-jump thresholds, plus a slight UNDER-report of speed (moving less than
+                // claimed is legitimate, so the one-sided physical check never fires). Designed to
+                // slip past the current detector suite — the adversarial hard case.
+                double hr = Math.toRadians(heading);
+                double d = cfg.alongRoadM * sc * 0.5;
+                c.x = x + d * Math.sin(hr); c.y = y + d * Math.cos(hr);
+                c.speed = Math.max(0.0, speed - 0.5 * sc);
                 break;
             }
             case "ConstSpeedZero":

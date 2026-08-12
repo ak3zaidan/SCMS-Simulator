@@ -67,6 +67,9 @@ def sample_domain(rng: random.Random, idx: int, base_seed: int, osm: bool) -> di
         "SCMS_REPORT_PROB": round(rng.uniform(0.6, 1.0), 2),
         "SCMS_REPORT_K": rng.choice([2, 3, 4]),
         "SCMS_ROTATE_PERIOD": rng.choice([0, 60, 90, 120, 300]),
+        # collusion / false-accusation threat present in ~40% of domains
+        "SCMS_COLLUDE_PCT": rng.choice([0, 0, 0, 15, 30, 45]),
+        "SCMS_VICTIM_PCT": rng.choice([2, 3, 4]),
         # traffic / fleet
         "SCMS_VEH_SPEEDFACTOR": round(rng.uniform(0.85, 1.2), 2),
         "SCMS_FLEET": rng.choice(["mixed", "car"]),

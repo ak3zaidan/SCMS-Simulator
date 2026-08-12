@@ -165,6 +165,7 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
                 send(backend, ghosts.get(k), gx, gy, c.speed, c.heading, c.posConf, tNs);
             }
         }
+        backend.maybeCollude(getOperatingSystem().getId(), tNs);   // colluders file false accusations
     }
 
     private void send(ScmsBackend backend, String certDigest, double x, double y, double speed,

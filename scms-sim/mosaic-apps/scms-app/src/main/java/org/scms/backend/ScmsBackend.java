@@ -81,6 +81,12 @@ public final class ScmsBackend {
     // sample records true-vs-claimed content for message-level benchmarks.
     static final int FAULTY_PCT = envInt("SCMS_FAULTY_PCT", 5);
     static final double EMIT_SAMPLE = envDouble("SCMS_EMIT_SAMPLE", 0.02);
+    // Collusion / false-accusation attack on the MA's integrity: a fraction of attackers coordinate
+    // to file FALSE misbehaviour reports against a small set of benign victims. Enough colluders
+    // can frame an innocent vehicle — a realistic SCMS threat the dataset must contain.
+    static final int COLLUDE_PCT = envInt("SCMS_COLLUDE_PCT", 0);    // of attackers (0 = off by default)
+    static final int VICTIM_PCT = envInt("SCMS_VICTIM_PCT", 3);      // of benign vehicles
+    static final double FALSE_REPORT_INTERVAL_S = envDouble("SCMS_FALSE_REPORT_INTERVAL", 2.0);
     static final double INGEST_DELAY_S = envDouble("SCMS_INGEST_DELAY", 0.15);   // MA report-channel latency
     static final String OUT_DIR = resolveOutDir();
 
@@ -151,6 +157,9 @@ public final class ScmsBackend {
         LinkageEngine.Device link;
         boolean attacker;
         boolean faulty;                // malfunctioning sensor (anomalous but not malicious)
+        boolean colluder;              // files false accusations against benign victims
+        boolean victim;                // benign target of a collusion campaign
+        double lastFalseReportT = -1e9;
         int faultMode;                 // 0 = extra outliers, 1 = constant bias, 2 = slow drift
         double faultAngle, faultMag;   // fault direction + magnitude
         double driftAccum;             // slow-drift fault accumulator
@@ -190,6 +199,7 @@ public final class ScmsBackend {
     private int caseCounter = 0;
     private boolean written = false;
     private double lastLiveWriteT = -1e9;
+    private final List<String> victims = new ArrayList<>();          // benign collusion targets
     private final Map<String, double[]> subjAgg = new HashMap<>();   // subject -> {firstT, lastT}
     private final Map<String, java.util.Set<Long>> subjSeconds = new HashMap<>();   // subject -> distinct report seconds
 
@@ -217,6 +227,7 @@ public final class ScmsBackend {
         if (d.attacker) {
             d.attackType = AttackLib.assign(unitId, MASTER_SEED, attacksEnabled);
             d.atk = new AttackLib.State(MASTER_SEED * 1000003L + unitId.hashCode());
+            d.colluder = ((sha("collude|" + MASTER_SEED + "|" + unitId)[0] & 0xff) * 100 / 256) < COLLUDE_PCT;
         } else {
             d.faulty = ((sha("fault|" + MASTER_SEED + "|" + unitId)[0] & 0xff) * 100 / 256) < FAULTY_PCT;
             if (d.faulty) {
@@ -224,6 +235,10 @@ public final class ScmsBackend {
                 d.faultMode = (fh[0] & 0xff) % 3;
                 d.faultAngle = ((fh[1] & 0xff) / 255.0) * 2 * Math.PI;
                 d.faultMag = 20.0 + (fh[2] & 0xff) / 255.0 * 30.0;   // 20..50 m constant-bias fault
+            }
+            d.victim = ((sha("victim|" + MASTER_SEED + "|" + unitId)[0] & 0xff) * 100 / 256) < VICTIM_PCT;
+            if (d.victim) {
+                victims.add(unitId);
             }
         }
         // heterogeneous GNSS quality per vehicle (0.4 good .. ~2.2 poor, skewed to typical), so the
@@ -396,6 +411,28 @@ public final class ScmsBackend {
         return scms.crlStore.enforced(subjectDigest, t, CRL_PROP_DELAY_S);
     }
 
+    /** Colluding attackers coordinate to file FALSE accusations against benign victims (an attack on
+     *  the MA's integrity). Enough distinct colluders on one victim can frame it. Called each beacon. */
+    public synchronized void maybeCollude(String unitId, long tNs) {
+        Dev c = devByUnit.get(unitId);
+        if (c == null || !c.colluder || victims.isEmpty()) {
+            return;
+        }
+        double t = tNs / 1e9;
+        if (t - c.lastFalseReportT < FALSE_REPORT_INTERVAL_S) {
+            return;
+        }
+        c.lastFalseReportT = t;
+        // colluders converge on the SAME victim at a given time, so K distinct colluders pile onto one.
+        int idx = (int) Math.floorMod((long) (t / FALSE_REPORT_INTERVAL_S), victims.size());
+        Dev v = devByUnit.get(victims.get(idx));
+        if (v != null) {
+            // use a PLAUSIBLE detector reason so the false report is indistinguishable from a real
+            // one at the MA level — detecting it requires behavioural/graph signals, not the reason.
+            onDetection(c.certDigest, v.certDigest, 30.0, t, "positionSpeedInconsistency", 6.5, 2.0);
+        }
+    }
+
     // -------------------------------------------------- report ingestion (LOP -> RA -> MA)
     public synchronized void onDetection(String reporterDigest, String subjectDigest, double score, double t,
                                          String reasonCode, double subjectPosConf, double scoreNorm) {
@@ -418,8 +455,11 @@ public final class ScmsBackend {
                 "detector_score", round3(score), "detector_score_norm", round3(scoreNorm),
                 "subject_pos_confidence", round3(subjectPosConf),
                 "sig_valid", true, "cert_crl_status", "active"));
+        String correctness = subj.attacker ? "correct"
+                : (rep.colluder ? "malicious_false_report"       // a coordinated false accusation
+                : (subj.faulty ? "faulty_detection" : "false_positive"));
         gtRepLbl.add(gtRow("report_id", rid, "reporter_true_id", rep.unitId, "subject_true_id", subj.unitId,
-                "report_correctness", subj.attacker ? "correct" : (subj.faulty ? "faulty_detection" : "false_positive")));
+                "report_correctness", correctness));
         int distinct = scms.ma.addReporter(subjectDigest, reporterDigest);
         double[] ag = subjAgg.computeIfAbsent(subjectDigest, k -> new double[] {t, t});
         ag[1] = t;                                               // lastT (firstT fixed)
