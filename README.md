@@ -8,51 +8,6 @@ resolution → revocation → CRL → enforcement) and generates a dataset from 
 **global Misbehavior-Authority perspective** — with strict separation between
 MA-visible data (features) and simulation ground truth (labels).
 
-> **Why this exists.** Existing datasets (VeReMi family, MisbehaviorX) are
-> per-vehicle BSM observations. Only **DARE** takes an MA perspective, and it is
-> just a bag of reports — no correlation, no pseudonym→identity linkage, no CRL,
-> no revocation, no trust boundaries, and its reports leak true identities. This
-> project closes the full loop with correct SCMS privacy separation and a
-> build-breaking leakage firewall. See the design document for the full rationale.
-
-**Design document (all 27 planning deliverables, diagrams, decision matrix):**
-<https://claude.ai/code/artifact/9a391e86-95f0-421a-aadd-f2459ddb93f3>
-
-## Status
-
-| Layer | State |
-|---|---|
-| SCMS crypto core — linkage values, CRL matching (CAMP SCP2) | ✅ implemented + tested |
-| Deterministic signing (Ed25519) + IEEE 1609.2 HashedId8 | ✅ implemented |
-| Trust-separated schemas (MA-visible / ground-truth) | ✅ implemented |
-| Build-breaking leakage linter | ✅ implemented + tested |
-| Closed-loop reference pipeline (attack→…→CRL→enforce) | ✅ runs + tested |
-| Determinism (same seed → byte-identical data) | ✅ verified |
-| Toolchain: JDK 17 / SUMO 1.25 / MOSAIC 25.2 / git | ✅ installed under `C:\Users\Administrator\tools` |
-| VeReMi NextGen vendored (pinned submodule) | ✅ `third_party/veremi-nextgen` @ `acda994b` |
-| SCMS closed loop in MOSAIC (sign → detect → report → correlate → 2-LA resolve → revoke → CRL → enforce) | ✅ real ITS-G5 AdHoc; distributed detection |
-| Runs on the real InTAS (Ingolstadt) map | ✅ `run.ps1 -Scenario intas_urban_rush` |
-| Maps / scenarios | ✅ 8 curated (Smoke · Highway · Barnim · Tiergarten · InTAS Ingolstadt ×4) **+ 200+ generated**: procedural `netgenerate` grid/spider/random and real-world OSM cities (`osm_manhattan` …) |
-| Attacks / detectors | ✅ **~291 attack variants** — 30 base behaviours (position/speed/heading/combined/replay/DoS/Sybil) × temporal profile × magnitude tier / 7 detectors |
-| Traffic + vehicle + radio controls | ✅ number of vehicles, flow, lanes, density; driver model (speed/accel/σ/gap); ITS-G5 radio range + packet loss |
-| **Sensor realism** | ✅ honest CAMs carry correlated GPS bias + white noise + rare multipath outliers, and a 95% position-confidence value (no vehicle broadcasts perfect truth) |
-| **ETSI CAM generation** | ✅ EN 302 637-2 triggering (Δpos/Δhdg/Δspeed, 1–10 Hz); rate-independent detectors; DoS bursting |
-| **Pseudonym rotation** | ✅ vehicles rotate certificates over time (privacy); LA-linked revocation covers all pseudonyms (security) |
-| **Fault vs attack** | ✅ malfunctioning-sensor vehicles (anomalous ≠ malicious) → three-way report labels + `label_is_faulty` |
-| **Channel congestion** | ✅ CSMA/CA contention loss (CBR collapse) so DoS floods degrade nearby reception |
-| **Fleet + demand** | ✅ car/truck/bus/motorcycle mix, rush/uniform demand profiles (generated maps) |
-| **Datasheet + ML benchmark** | ✅ per-dataset `DATASHEET.md` + baseline ROC-AUC/PR-AUC proving realistic (non-trivial) learnability |
-| ML featurizer + leakage-safe splitter | ✅ report + subject tables, per-message emission sample, vehicle-disjoint splits |
-| One-command end-to-end runner | ✅ `run.ps1` (build → generate → simulate → featurize → validate → datasheet) |
-
-The system is runnable end-to-end. On the real InTAS Ingolstadt map, with all attack
-variants enabled, the generated dataset is **leakage-free**, revocation is **precise**
-(≈1.0 with the sustained-evidence MA rule) at a realistic **recall ≈0.6–0.8** (the hardest
-attacks evade), the report stream carries a realistic mix of true detections, benign
-false-positives, and fault detections, and the data is **byte-identical across runs**
-(deterministic). A baseline model reaches **ROC-AUC ≈0.88–0.9** — learnable, not trivial.
-See [`docs/adr/0001-stack-and-approach.md`](docs/adr/0001-stack-and-approach.md).
-
 ## Run the full simulation (one command)
 
 ```powershell
@@ -68,67 +23,6 @@ See [`docs/adr/0001-stack-and-approach.md`](docs/adr/0001-stack-and-approach.md)
 .\run.ps1 -Scenario spider_10a5c -Scale 1.5  # procedural spider network
 .\run.ps1 -Scenario osm_tokyo                # real Tokyo streets (OpenStreetMap)
 ```
-
-Curated scenarios: `smoke`, `highway`, `barnim`, `tiergarten`, `intas_urban_low`,
-`intas_urban_rush`, `intas_highway_low`, `intas_highway_rush`. Generated maps: any
-`grid_<c>x<r>`, `spider_<a>a<c>c`, `rand_<n>` (optionally `_s<seed>`), or `osm_<city>`
-(49 cities in [`mapgen.py`](scms-sim/scenarios/mapgen.py)) — 200+ are catalogued in the GUI
-and any well-formed key is built on demand. Traffic controls: `-MaxVehicles` / `-TargetFlow` /
-`-Lanes` (flow maps), `-Scale` (route/generated maps); attacks, detector thresholds, driver
-model, and radio are set via `SCMS_*` environment variables (or, more easily, the GUI).
-
-`run.ps1` builds the MOSAIC app, generates the scenario, simulates in MOSAIC + SUMO,
-featurizes the output into ML-ready tables, and validates it (leakage + precision/recall).
-The dataset lands in `datasets/<name>/`:
-
-- `ma/` — Misbehavior-Authority-visible events (the only source of ML features)
-- `ground_truth/` — oracle labels (never used as features)
-- `ml/` — `report_features`/`report_labels` + `subject_features`/`subject_labels`
-  (Parquet + CSV) with vehicle-disjoint `train`/`val`/`test` splits
-- `manifest.json` — seed, config, per-file SHA-256, and a dataset digest
-
-## SCMS entities (all 14 modeled)
-
-All 14 SCMS entities from the design (§7) are modeled as distinct modules with real trust
-boundaries in [`org.scms.entities.Scms`](scms-sim/mosaic-apps/scms-app/src/main/java/org/scms/entities/Scms.java):
-
-- **Trust anchors (offline):** Root CA · Intermediate CA · Electors · Policy Generator
-- **Enrollment:** Device Configuration Manager · Enrollment CA
-- **Provisioning:** Registration Authority · Pseudonym CA · Linkage Authority 1 & 2
-- **Enforcement:** Misbehavior Authority · CRL Generator · CRL Store/Broadcast
-- **Privacy:** Location Obscurer Proxy
-
-The boundary is **structural, not conventional**: the Misbehavior Authority never holds a
-true identity — it resolves a suspect via PCA → LA1/LA2 (forward linkage seeds) → RA, and the
-**RA is the only entity that maps a provisioning request to an enrollment identity**. True
-identities exist only in `ground_truth/` and are never used as features. The Python reference
-(`src/scms_sim_ref/mock_pipeline/run.py`) mirrors the operational entities.
-
-## GUI control panel
-
-Prefer clicking to typing? Launch the control panel:
-
-```powershell
-. C:\Users\Administrator\tools\env.ps1
-.\gui.ps1        # starts a local server and opens http://127.0.0.1:8710
-```
-
-The panel gives you **complete control of the simulation from the browser** — 45 variables in
-six groups: **Scenario** (215-map catalogue + duration, seed), **Traffic** (number of vehicles,
-target flow, lanes, or route-density scale — the relevant controls appear for the selected map
-type), **SCMS policy** (attacker %, reporters-to-revoke K, report probability, CRL delay, jmax),
-**Attacks** (pick any of the 30 base behaviours — each expands to its ~291 profile×tier variants —
-plus every magnitude/temporal knob), **Detectors** (all 8 thresholds), and **Vehicle & radio**
-(SUMO driver model + ITS-G5 range/packet-loss).
-
-An **embedded live map** is built into the dashboard: as the run progresses it streams the
-vehicle positions from the back-end and draws them colored by SCMS state — teal *benign*,
-red *attacker*, amber *reported*, grey *revoked* — so you can watch detection and revocation
-happen. **Start** / **Stop** a run, watch the **stage + progress + log**, and when it finishes
-read the **results dashboard**: vehicles / reports / investigations / revoked, precision /
-recall, leakage, and attack-type + detector-reason breakdowns. Configuration is applied through
-environment variables the Java layer reads and run.ps1 parameters, so no recompile is needed
-between runs. Tick *"Also open MOSAIC 2D map"* to additionally launch MOSAIC's own visualizer.
 
 ## Quick start
 
