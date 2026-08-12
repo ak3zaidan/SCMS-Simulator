@@ -162,6 +162,19 @@ def build(dataset_dir: str) -> str:
              "detector suite emits mostly-true reports. Recall < 1.0 (evasive attacks) is the main "
              "realistic difficulty._\n")
 
+    edges = os.path.join(dataset_dir, "ml", "graph_edges.csv")
+    wins = os.path.join(dataset_dir, "ml", "subject_windows.csv")
+    if os.path.exists(edges) or os.path.exists(wins):
+        L.append("## Graph & sequence exports (GNN / sequence models)")
+        L.append("- `ml/graph_edges.*` — the MA's directed report graph (reporter→subject over opaque "
+                 "linked entities, with time/reason/score_norm). Pair with `vehicle_features` as node "
+                 "features + `vehicle_labels` as node labels for a GNN.")
+        L.append("- `ml/subject_windows.*` — per-entity 10 s report-activity windows for sequence/"
+                 "temporal models.")
+        L.append("- `vehicle_features.reporter_mean_indegree` — a graph feature (are you flagged by "
+                 "entities that are themselves heavily flagged? a collusion / reporter-reputation signal).")
+        L.append("")
+
     L.append("## Intended use & limitations")
     L.append("- **Intended use:** training/evaluating global Misbehaviour-Authority anomaly "
              "detection; benchmarking V2X misbehaviour detectors. Features are MA-visible only.")

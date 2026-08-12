@@ -125,6 +125,7 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         split = _split_for(split_seed, subj_true)
         feat = {
             "report_id": r["report_id"],
+            "detection_time": float(r.get("detection_time", 0)),   # for ordering per-subject sequences
             "detector_score": score,
             "detector_score_norm": float(r.get("detector_score_norm", 0.0) or 0.0),
             "sig_valid": int(sig),
@@ -236,16 +237,69 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
             "split": split,
         })
 
+    # --- graph + temporal export (for GNN / sequence models) ---
+    # The MA's global view is a directed report GRAPH (reporter -> subject) over opaque linked
+    # entities, plus a per-entity time SEQUENCE of report windows. Both are MA-visible + leakage-safe
+    # (opaque entity ids only). This is what lets downstream GNN/transformer models learn the global
+    # correlation structure, not just per-node aggregates.
+    def _ent(tv: str) -> str:
+        return "ent_" + hashlib.sha256(tv.encode()).hexdigest()[:12]
+
+    edge_rows, indeg = [], {}
+    reporters_of: dict[str, set] = {}
+    for r in reports:
+        stv = vehicle_by_digest.get(r.get("subject_cert_digest"))
+        rtv = vehicle_by_digest.get(r.get("reporter_cert_digest"))
+        if not stv or not rtv:
+            continue
+        se, re = _ent(stv), _ent(rtv)
+        indeg[se] = indeg.get(se, 0) + 1
+        reporters_of.setdefault(se, set()).add(re)
+        edge_rows.append({
+            "src_entity": re, "dst_entity": se,
+            "t": round(float(r.get("detection_time", 0)), 3),
+            "reason": (r.get("reason_codes") or ["?"])[0],
+            "score_norm": round(float(r.get("detector_score_norm", 0.0) or 0.0), 3),
+            "split": _split_for(split_seed, stv),
+        })
+    # graph node feature: mean in-degree of an entity's reporters (a collusion / reporter-reputation
+    # signal — are you flagged by entities that are themselves heavily flagged?).
+    for row in vf_rows:
+        res = reporters_of.get(row["entity_id"], set())
+        row["reporter_mean_indegree"] = (sum(indeg.get(re, 0) for re in res) / len(res)) if res else 0.0
+
+    # temporal sequence: per subject-entity, fixed WIN-second windows of report activity.
+    WIN = 10.0
+    win_acc: dict[tuple, dict] = {}
+    for r in reports:
+        stv = vehicle_by_digest.get(r.get("subject_cert_digest"))
+        if not stv:
+            continue
+        wk = (_ent(stv), int(float(r.get("detection_time", 0)) // WIN))
+        a = win_acc.setdefault(wk, {"n": 0, "sn": 0.0, "reps": set(), "reasons": set(),
+                                    "split": _split_for(split_seed, stv)})
+        a["n"] += 1
+        a["sn"] = max(a["sn"], float(r.get("detector_score_norm", 0.0) or 0.0))
+        a["reps"].add(r.get("reporter_cert_digest"))
+        a["reasons"].add((r.get("reason_codes") or ["?"])[0])
+    window_rows = [{"entity_id": e, "window": w, "n_reports": a["n"], "score_norm_max": a["sn"],
+                    "n_distinct_reporters": len(a["reps"]), "n_distinct_reasons": len(a["reasons"]),
+                    "split": a["split"]}
+                   for (e, w), a in win_acc.items()]
+
     report_features = pd.DataFrame(rf_rows)
     report_labels = pd.DataFrame(rl_rows)
     subject_features = pd.DataFrame(sf_rows)
     subject_labels = pd.DataFrame(sl_rows)
     vehicle_features = pd.DataFrame(vf_rows)
     vehicle_labels = pd.DataFrame(vl_rows)
+    graph_edges = pd.DataFrame(edge_rows)
+    subject_windows = pd.DataFrame(window_rows)
 
     # --- leakage firewall on the FEATURE tables (column-name lineage check) ---
     for name, df in (("report_features", report_features), ("subject_features", subject_features),
-                     ("vehicle_features", vehicle_features)):
+                     ("vehicle_features", vehicle_features), ("graph_edges", graph_edges),
+                     ("subject_windows", subject_windows)):
         cols = [c for c in df.columns if c != "split"]  # split is an assignment, not a feature/GT
         lint_feature_frame([dict.fromkeys(cols, 0)], context=name)
 
@@ -257,6 +311,7 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         ("report_features", report_features), ("report_labels", report_labels),
         ("subject_features", subject_features), ("subject_labels", subject_labels),
         ("vehicle_features", vehicle_features), ("vehicle_labels", vehicle_labels),
+        ("graph_edges", graph_edges), ("subject_windows", subject_windows),
     ):
         pq = os.path.join(out, f"{name}.parquet")
         csv = os.path.join(out, f"{name}.csv")
