@@ -120,6 +120,25 @@ def veh_params() -> dict:
     }
 
 
+def fleet() -> list[tuple]:
+    """Vehicle-type mix (name, spawn weight, SUMO vType attrs). SCMS_FLEET=car for homogeneous."""
+    vp = veh_params()
+    car = ("car", 0.78, {"vClass": "passenger", "accel": vp["accel"], "decel": vp["decel"],
+                         "length": vp["length"], "minGap": vp["minGap"], "tau": vp["tau"],
+                         "maxSpeed": vp["maxSpeed"], "speedFactor": vp["speedFactor"]})
+    if os.environ.get("SCMS_FLEET", "mixed").lower() == "car":
+        return [(car[0], 1.0, car[2])]
+    return [
+        car,
+        ("truck", 0.08, {"vClass": "truck", "accel": 1.3, "decel": 4.0, "length": 12.0,
+                         "minGap": 3.0, "tau": 1.4, "maxSpeed": 36.0}),
+        ("bus", 0.04, {"vClass": "bus", "accel": 1.2, "decel": 4.0, "length": 12.0,
+                       "minGap": 3.0, "tau": 1.4, "maxSpeed": 25.0}),
+        ("moto", 0.10, {"vClass": "motorcycle", "accel": 3.5, "decel": 6.0, "length": 2.2,
+                        "minGap": 1.5, "tau": 0.8, "maxSpeed": 55.0}),
+    ]
+
+
 def write_sns_config(dst: Path):
     """Per-scenario SNS radio config: SCMS_RADIO_RANGE (m) + SCMS_RADIO_LOSS (0..1)."""
     import json
@@ -249,25 +268,36 @@ def _random_trips(net: Path, routes: Path, duration_s: float, seed: int, period:
           "--seed", str(seed), "--prefix", "v", "--validate",
           "--vehicle-class", "passenger", "--fringe-factor", "5"],
          env={**os.environ, "SUMO_HOME": str(SUMO)})
-    _tag_vtype(routes)
+    _tag_vtype(routes, seed)
 
 
-def _tag_vtype(routes: Path):
-    """Give every generated vehicle a single 'car' vType so mapping can match it."""
+def _tag_vtype(routes: Path, seed: int):
+    """Assign each generated vehicle a fleet vType (weighted) and optionally reshape the demand
+    over time (SCMS_DEMAND=rush front-loads departures), so mapping can match every type."""
+    import random as _r
     tree = ET.parse(routes)
     root = tree.getroot()
-    if root.find("vType[@id='car']") is None:
-        vp = veh_params()
-        vt = ET.Element("vType", {
-            "id": "car", "vClass": "passenger",
-            "accel": str(vp["accel"]), "decel": str(vp["decel"]), "sigma": str(vp["sigma"]),
-            "length": str(vp["length"]), "minGap": str(vp["minGap"]), "tau": str(vp["tau"]),
-            "maxSpeed": str(vp["maxSpeed"]), "speedFactor": str(vp["speedFactor"])})
-        root.insert(0, vt)
-    for veh in root.iter("vehicle"):
-        veh.set("type", "car")
-    for trip in root.iter("trip"):
-        trip.set("type", "car")
+    flt = fleet()
+    existing = {vt.get("id") for vt in root.findall("vType")}
+    for name, _w, attrs in flt:
+        if name not in existing:
+            root.insert(0, ET.Element("vType", {"id": name, **{k: str(v) for k, v in attrs.items()}}))
+    rng = _r.Random((seed * 2654435761) & 0x7fffffff)
+    names = [f[0] for f in flt]
+    weights = [f[1] for f in flt]
+    vehs = [v for v in list(root) if v.tag in ("vehicle", "trip")]
+    profile = os.environ.get("SCMS_DEMAND", "uniform").lower()
+    dmax = max((float(v.get("depart", "0")) for v in vehs), default=1.0) or 1.0
+    for v in vehs:
+        v.set("type", rng.choices(names, weights=weights, k=1)[0])
+        if profile == "rush":                       # concentrate departures early (peak then quiet)
+            u = float(v.get("depart", "0")) / dmax
+            v.set("depart", f"{dmax * u * u:.2f}")
+    if profile == "rush":                            # SUMO needs departures sorted
+        for v in vehs:
+            root.remove(v)
+        for v in sorted(vehs, key=lambda e: float(e.get("depart", "0"))):
+            root.append(v)
     tree.write(routes, encoding="UTF-8", xml_declaration=True)
 
 
@@ -334,12 +364,10 @@ def build(key: str, dst: Path, duration=None, scale=None, seed=None, period=None
     }
     (dst / "scenario_config.json").write_text(json.dumps(scenario, indent=2), encoding="utf-8")
 
-    vp = veh_params()
-    mapping = {"prototypes": [{"name": "car", "applications": [OUR_APP], "weight": 1.0,
-                              "accel": vp["accel"], "decel": vp["decel"], "length": vp["length"],
-                              "maxSpeed": vp["maxSpeed"], "minGap": vp["minGap"],
-                              "sigma": vp["sigma"], "tau": vp["tau"],
-                              "deviations": {"speedFactor": 0.1}}]}
+    # one MOSAIC prototype per fleet type (matched to the SUMO vType by name); the SUMO vType in
+    # the route file carries the kinematics, so the prototype just needs name + our app.
+    mapping = {"prototypes": [{"name": name, "applications": [OUR_APP], "weight": 1.0}
+                              for name, _w, _a in fleet()]}
     (dst / "mapping" / "mapping_config.json").write_text(json.dumps(mapping, indent=2), encoding="utf-8")
     write_sns_config(dst)
 

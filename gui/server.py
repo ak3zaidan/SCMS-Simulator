@@ -101,6 +101,12 @@ CONFIG_SPEC = [
     {"group": "Traffic", "name": "sim_step", "label": "Sim step (s)", "type": "float", "default": "",
      "min": 0.05, "max": 1.0, "step": 0.05, "env": "SCMS_SIM_STEP",
      "help": "Blank = map default (generated maps 0.1 s = 10 Hz CAMs; curated stay native). Set to override both."},
+    {"group": "Traffic", "name": "fleet", "label": "Fleet mix", "type": "choice", "default": "mixed",
+     "options": ["mixed", "car"], "env": "SCMS_FLEET",
+     "help": "Generated maps: mixed = car/truck/bus/motorcycle; car = homogeneous"},
+    {"group": "Traffic", "name": "demand", "label": "Demand profile", "type": "choice", "default": "uniform",
+     "options": ["uniform", "rush"], "env": "SCMS_DEMAND",
+     "help": "Generated maps: rush front-loads departures (peak then quiet)"},
 
     # --- SCMS policy ---
     {"group": "SCMS policy", "name": "attacker_pct", "label": "Attacker %", "type": "int",

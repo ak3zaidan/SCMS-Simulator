@@ -208,6 +208,9 @@ function fieldEl(c,val){
     w.innerHTML=`<label class="name">${c.label} <span class="muted" style="font-weight:400">(${SCEN.length} maps)</span></label>
       <select id="f_${c.name}">${opts}</select>${help}`;
     setTimeout(()=>$('#f_'+c.name).addEventListener('change',syncKind),0);
+  }else if(c.type==='choice'){
+    const opts=c.options.map(o=>`<option value="${o}" ${o===val?'selected':''}>${o}</option>`).join('');
+    w.innerHTML=`<label class="name">${c.label}</label><select id="f_${c.name}">${opts}</select>${help}`;
   }else if(c.type==='multi'){
     const isAll = (val==='all'||val==null);
     const chips=c.options.map(o=>`<label class="chip ${isAll?'on':''}">
