@@ -139,6 +139,9 @@ CONFIG_SPEC = [
     {"group": "SCMS policy", "name": "rotate_period", "label": "Pseudonym lifetime (s)", "type": "float",
      "default": 90.0, "min": 0, "max": 3600, "step": 10, "env": "SCMS_ROTATE_PERIOD",
      "help": "Vehicles change pseudonym certificate this often (LA-linked); 0 disables rotation"},
+    {"group": "SCMS policy", "name": "ingest_delay", "label": "Report ingest delay (s)", "type": "float",
+     "default": 0.15, "min": 0, "max": 10, "step": 0.05, "env": "SCMS_INGEST_DELAY",
+     "help": "Mean MA report-channel latency (detection → ingest)"},
 
     # --- Attacks ---
     {"group": "Attacks", "name": "attacks", "label": "Enabled attack behaviours", "type": "multi",
@@ -203,6 +206,9 @@ CONFIG_SPEC = [
     {"group": "Detectors", "name": "sybil_min", "label": "Sybil co-location min", "type": "int",
      "default": 5, "min": 2, "max": 50, "env": "SCMS_SYBIL_MIN",
      "help": "Vehicles in one cell before the Sybil detector fires"},
+    {"group": "Detectors", "name": "min_consec", "label": "Consecutive violations", "type": "int",
+     "default": 2, "min": 1, "max": 10, "env": "SCMS_MIN_CONSEC",
+     "help": "Motion-inconsistency must repeat this many times before flagging (filters GPS outliers)"},
     {"group": "Detectors", "name": "frozen_count", "label": "Frozen CAMs to flag", "type": "int",
      "default": 3, "min": 1, "max": 50, "env": "SCMS_FROZEN_COUNT",
      "help": "Consecutive frozen CAMs before the frozen-position detector fires"},

@@ -105,8 +105,9 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         feat = {
             "report_id": r["report_id"],
             "detector_score": score,
+            "detector_score_norm": float(r.get("detector_score_norm", 0.0) or 0.0),
             "sig_valid": int(sig),
-            "ingest_delay": float(r.get("ingest_time", 0)) - float(r.get("detection_time", 0)),
+            "ingest_delay": round(float(r.get("ingest_time", 0)) - float(r.get("detection_time", 0)), 4),
             "crl_active_at_report": int(crl == "active"),
             "pos_confidence": float(r.get("subject_pos_confidence", 0.0) or 0.0),
             "split": split,
@@ -140,17 +141,23 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
     for digest in all_digests:
         rs = by_subject.get(digest, [])
         scores = [_report_fields(r)[0] for r in rs]
+        norms = [float(r.get("detector_score_norm", 0.0) or 0.0) for r in rs]
         times = [float(r.get("detection_time", 0)) for r in rs]
         reporters = {r.get("reporter_cert_digest") for r in rs}
+        n_reasons = len({(r.get("reason_codes") or ["?"])[0] for r in rs})
         subj_true = vehicle_by_digest.get(digest, "unknown")
         split = _split_for(split_seed, subj_true)
         sf_rows.append({
             "subject_cert_digest": digest,
             "n_reports": len(rs),
             "n_distinct_reporters": len(reporters),
+            "n_distinct_reasons": n_reasons,
             "score_mean": sum(scores) / len(scores) if scores else 0.0,
             "score_max": max(scores) if scores else 0.0,
+            "score_norm_mean": sum(norms) / len(norms) if norms else 0.0,
+            "score_norm_max": max(norms) if norms else 0.0,
             "report_span_s": (max(times) - min(times)) if times else 0.0,
+            "reports_per_reporter": len(rs) / max(1, len(reporters)),
             "cert_lifetime_s": float(lifetime_by_digest.get(digest, 0.0)),
             "split": split,
         })
@@ -163,13 +170,60 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
             "split": split,
         })
 
+    # --- vehicle-level tables (the MA's post-linkage decision unit) ---
+    # A vehicle's pseudonyms are linked via the LAs, so MA-visible reports are aggregated per true
+    # vehicle. Per-pseudonym subjects are ill-posed under rotation (an attacker's evasive or
+    # post-revocation pseudonyms carry no signal yet are attacker-labelled). The feature table is
+    # keyed by an OPAQUE linked-entity id (never the true id — that would be label leakage); the
+    # label table carries the true id for evaluation.
+    reports_by_vehicle: dict[str, list[dict]] = {}
+    for r in reports:
+        tv = vehicle_by_digest.get(r.get("subject_cert_digest"), "unknown")
+        if tv != "unknown":
+            reports_by_vehicle.setdefault(tv, []).append(r)
+    pseudonyms_by_vehicle: dict[str, int] = {}
+    for m in gt_idmap:
+        pseudonyms_by_vehicle[m["true_vehicle_id"]] = pseudonyms_by_vehicle.get(m["true_vehicle_id"], 0) + 1
+    vf_rows, vl_rows = [], []
+    for v in gt_vehicle:
+        tv = v["true_vehicle_id"]
+        entity_id = "ent_" + hashlib.sha256(tv.encode()).hexdigest()[:12]
+        rs = reports_by_vehicle.get(tv, [])
+        norms = [float(r.get("detector_score_norm", 0.0) or 0.0) for r in rs]
+        times = [float(r.get("detection_time", 0)) for r in rs]
+        reporters = {r.get("reporter_cert_digest") for r in rs}
+        reasons = {(r.get("reason_codes") or ["?"])[0] for r in rs}
+        split = _split_for(split_seed, tv)
+        vf_rows.append({
+            "entity_id": entity_id,
+            "n_reports": len(rs),
+            "n_distinct_reporters": len(reporters),
+            "n_pseudonyms": pseudonyms_by_vehicle.get(tv, 1),
+            "n_distinct_reasons": len(reasons) if rs else 0,
+            "score_norm_max": max(norms) if norms else 0.0,
+            "score_norm_mean": sum(norms) / len(norms) if norms else 0.0,
+            "report_span_s": (max(times) - min(times)) if times else 0.0,
+            "reports_per_reporter": len(rs) / max(1, len(reporters)),
+            "split": split,
+        })
+        vl_rows.append({
+            "entity_id": entity_id,
+            "label_is_attacker": int(attacker_by_vehicle.get(tv, False)),
+            "label_is_faulty": int(faulty_by_vehicle.get(tv, False)),
+            "true_vehicle_id": tv,
+            "split": split,
+        })
+
     report_features = pd.DataFrame(rf_rows)
     report_labels = pd.DataFrame(rl_rows)
     subject_features = pd.DataFrame(sf_rows)
     subject_labels = pd.DataFrame(sl_rows)
+    vehicle_features = pd.DataFrame(vf_rows)
+    vehicle_labels = pd.DataFrame(vl_rows)
 
     # --- leakage firewall on the FEATURE tables (column-name lineage check) ---
-    for name, df in (("report_features", report_features), ("subject_features", subject_features)):
+    for name, df in (("report_features", report_features), ("subject_features", subject_features),
+                     ("vehicle_features", vehicle_features)):
         cols = [c for c in df.columns if c != "split"]  # split is an assignment, not a feature/GT
         lint_feature_frame([dict.fromkeys(cols, 0)], context=name)
 
@@ -180,6 +234,7 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
     for name, df in (
         ("report_features", report_features), ("report_labels", report_labels),
         ("subject_features", subject_features), ("subject_labels", subject_labels),
+        ("vehicle_features", vehicle_features), ("vehicle_labels", vehicle_labels),
     ):
         pq = os.path.join(out, f"{name}.parquet")
         csv = os.path.join(out, f"{name}.csv")

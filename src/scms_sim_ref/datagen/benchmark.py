@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-_DROP = {"split", "report_id", "subject_cert_digest", "true_vehicle_id"}
+_DROP = {"split", "report_id", "subject_cert_digest", "true_vehicle_id", "entity_id"}
 
 
 def _load(dataset_dir: str, name: str) -> pd.DataFrame | None:
@@ -150,6 +150,10 @@ def run(dataset_dir: str) -> dict[str, Any]:
     rep = _task(rf, rl, "report_id", "label_subject_is_attacker")
     if rep is not None:
         out["tasks"]["report_is_true_detection"] = rep
+    vf, vl = _load(dataset_dir, "vehicle_features"), _load(dataset_dir, "vehicle_labels")
+    veh = _task(vf, vl, "entity_id", "label_is_attacker")
+    if veh is not None:
+        out["tasks"]["vehicle_is_attacker"] = veh
     return out
 
 

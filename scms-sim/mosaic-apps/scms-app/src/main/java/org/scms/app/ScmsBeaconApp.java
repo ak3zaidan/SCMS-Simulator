@@ -72,12 +72,14 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
 
     private static final double MIN_REF_GAP_S = 0.5;   // motion-consistency baseline (rate-independent)
     private static final double MAX_ACCEL_MS2 = 9.0;   // physical accel/decel bound for plausibility
+    private static final int MIN_CONSEC = envI("SCMS_MIN_CONSEC", 2);   // consecutive violations before flagging
 
     private static final class Rx {
         double lastX, lastY, lastT, lastHeading;       // most recent CAM (frequency, sybil, live)
         double refX, refY, refT, refHeading;           // lagged >=0.5 s reference (motion checks)
         boolean hasRef = false;
         int frozenCount;
+        int psiStreak, hdgStreak;    // consecutive motion-inconsistency violations
         double winStart;
         int winCount;
         boolean hasPrev = false;
@@ -241,38 +243,49 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         double staleSec = t - cam.genTimeNs / 1e9;
         double artDist = haveSelf ? Math.hypot(cam.claimedX - selfX, cam.claimedY - selfY) : 0;
 
-        String reason = null;
-        double score = 0;
-        if (staleSec > STALE_MAX_S) {
-            reason = "staleOrReplay"; score = staleSec;
-        } else if (s.winCount > FREQ_MAX) {
-            reason = "beaconFrequency"; score = s.winCount;
-        } else if (haveSelf && artDist > ART_MAX_M) {
-            reason = "acceptanceRangeThreshold"; score = artDist;
-        } else if (refReady && gapRef <= 5 && movedRef > 50 + 60 * gapRef) {
-            reason = "positionJump"; score = movedRef;
-        } else if (cellDistinct >= SYBIL_MIN) {
-            reason = "sybilCoLocation"; score = cellDistinct;
-        } else if (refReady && gapRef <= 1.5) {
-            // Physical plausibility: you cannot travel FARTHER than your claimed speed allows over
-            // the gap (plus an accel + confidence margin). Moving LESS (braking, turning, a lost
-            // CAM) is legitimate, so this is one-sided — which avoids false-flagging normal urban
-            // manoeuvres while still catching teleports / random-position lies.
-            double maxDist = cam.claimedSpeed * gapRef + 0.5 * MAX_ACCEL_MS2 * gapRef * gapRef
+        // Motion-consistency candidates on the lagged reference. Physical plausibility: you cannot
+        // travel FARTHER than your claimed speed allows over the gap (+ accel + confidence margin);
+        // moving LESS (braking, turning, a lost CAM) is legitimate, so it is one-sided.
+        double maxDist = 0, hd = 0;
+        boolean psiViol = false, hdgViol = false;
+        if (refReady && gapRef <= 1.5) {
+            maxDist = cam.claimedSpeed * gapRef + 0.5 * MAX_ACCEL_MS2 * gapRef * gapRef
                     + SPEED_TOL_M + cam.posConf;
-            if (movedRef > maxDist) {
-                reason = "positionSpeedInconsistency"; score = movedRef - maxDist;
-            }
+            psiViol = movedRef > maxDist;
         }
-        if (reason == null && refReady && movedRef > 20 && gapRef <= 1.0) {
+        if (refReady && movedRef > 20 && gapRef <= 1.0) {
             double bearing = norm360(Math.toDegrees(Math.atan2(cam.claimedX - s.refX, cam.claimedY - s.refY)));
-            double hd = angleDiff(cam.claimedHeading, bearing);
-            if (hd > HEADING_DIFF) {
-                reason = "headingInconsistency"; score = hd;
-            }
+            hd = angleDiff(cam.claimedHeading, bearing);
+            hdgViol = hd > HEADING_DIFF;
         }
-        if (reason == null && s.frozenCount >= FROZEN_COUNT) {
-            reason = "constantPositionFrozen"; score = cam.claimedSpeed;
+        // Consecutive-violation gating: a single GPS outlier / fault glitch is ONE sample, but a
+        // real kinematic attack persists across references. Requiring a streak removes the bulk of
+        // outlier- and fault-driven false positives (which otherwise dominate this detector).
+        if (refReady) {
+            s.psiStreak = psiViol ? s.psiStreak + 1 : 0;
+            s.hdgStreak = hdgViol ? s.hdgStreak + 1 : 0;
+        }
+
+        // A normalized score (~>=1 at the detector's threshold) so it is comparable across
+        // detectors, unlike the raw score whose units differ (metres / degrees / seconds / counts).
+        String reason = null;
+        double score = 0, scoreNorm = 0;
+        if (staleSec > STALE_MAX_S) {
+            reason = "staleOrReplay"; score = staleSec; scoreNorm = staleSec / STALE_MAX_S;
+        } else if (s.winCount > FREQ_MAX) {
+            reason = "beaconFrequency"; score = s.winCount; scoreNorm = (double) s.winCount / FREQ_MAX;
+        } else if (haveSelf && artDist > ART_MAX_M) {
+            reason = "acceptanceRangeThreshold"; score = artDist; scoreNorm = artDist / ART_MAX_M;
+        } else if (refReady && gapRef <= 5 && movedRef > 50 + 60 * gapRef) {
+            reason = "positionJump"; score = movedRef; scoreNorm = movedRef / (50 + 60 * gapRef);
+        } else if (cellDistinct >= SYBIL_MIN) {
+            reason = "sybilCoLocation"; score = cellDistinct; scoreNorm = (double) cellDistinct / SYBIL_MIN;
+        } else if (psiViol && s.psiStreak >= MIN_CONSEC) {
+            reason = "positionSpeedInconsistency"; score = movedRef - maxDist; scoreNorm = movedRef / maxDist;
+        } else if (hdgViol && s.hdgStreak >= MIN_CONSEC) {
+            reason = "headingInconsistency"; score = hd; scoreNorm = hd / HEADING_DIFF;
+        } else if (s.frozenCount >= FROZEN_COUNT) {
+            reason = "constantPositionFrozen"; score = cam.claimedSpeed; scoreNorm = (double) s.frozenCount / FROZEN_COUNT;
         }
 
         s.lastX = cam.claimedX;
@@ -280,13 +293,17 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         s.lastT = t;
         s.lastHeading = cam.claimedHeading;
         s.hasPrev = true;
-        if (!s.hasRef || gapRef >= MIN_REF_GAP_S) {   // advance the lagged reference
+        // Advance the reference to a CLEAN sample (not a kinematic violation), so a single GPS
+        // outlier can't pollute the reference and manufacture a second consecutive violation when
+        // the vehicle moves back. Force-advance if the reference gets stale (keeps evaluating a
+        // persistent attacker, whose every sample violates).
+        if (!s.hasRef || (gapRef >= MIN_REF_GAP_S && (!psiViol || gapRef >= 2.0))) {
             s.refX = cam.claimedX; s.refY = cam.claimedY; s.refT = t; s.refHeading = cam.claimedHeading;
             s.hasRef = true;
         }
 
         if (reason != null) {
-            backend.onDetection(myDigest, dg, score, t, reason, cam.posConf);
+            backend.onDetection(myDigest, dg, score, t, reason, cam.posConf, scoreNorm);
         }
     }
 

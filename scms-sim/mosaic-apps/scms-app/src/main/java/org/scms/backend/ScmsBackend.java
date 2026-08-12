@@ -76,6 +76,7 @@ public final class ScmsBackend {
     // sample records true-vs-claimed content for message-level benchmarks.
     static final int FAULTY_PCT = envInt("SCMS_FAULTY_PCT", 5);
     static final double EMIT_SAMPLE = envDouble("SCMS_EMIT_SAMPLE", 0.02);
+    static final double INGEST_DELAY_S = envDouble("SCMS_INGEST_DELAY", 0.15);   // MA report-channel latency
     static final String OUT_DIR = resolveOutDir();
 
     // Config is read from environment variables first (so the GUI can change it without a
@@ -153,6 +154,7 @@ public final class ScmsBackend {
         java.util.Random sRng;                     // per-vehicle sensor-noise RNG (seeded)
         double nextRotateT = Double.MAX_VALUE;     // next pseudonym rotation time
         int rotCount = 0;
+        double gpsQ = 1.0;                          // per-vehicle GNSS quality factor (heterogeneous)
         boolean revoked = false;                   // vehicle-level revocation (covers all pseudonyms)
         double revokeT = -1;
     }
@@ -209,6 +211,10 @@ public final class ScmsBackend {
         } else {
             d.faulty = ((sha("fault|" + MASTER_SEED + "|" + unitId)[0] & 0xff) * 100 / 256) < FAULTY_PCT;
         }
+        // heterogeneous GNSS quality per vehicle (0.4 good .. ~2.2 poor, skewed to typical), so the
+        // broadcast position confidence VARIES and is an informative feature (not a constant).
+        double qr = (sha("gpsq|" + MASTER_SEED + "|" + unitId)[0] & 0xff) / 255.0;
+        d.gpsQ = 0.4 + 1.8 * Math.pow(qr, 1.6);
 
         // SCMS provisioning across the distinct entities (trust boundaries preserved).
         scms.dcm.attest(unitId);
@@ -299,14 +305,16 @@ public final class ScmsBackend {
         }
         double dt = (d.sensorLastT < 0) ? 0.1 : Math.max(1e-3, Math.min(10.0, t - d.sensorLastT));
         d.sensorLastT = t;
+        double sigma = GPS_SIGMA_M * d.gpsQ;                  // per-vehicle GNSS quality
+        double bias = GPS_BIAS_M * d.gpsQ;
         double a = Math.exp(-GPS_THETA * dt);                 // OU bias update over dt
-        double qv = GPS_BIAS_M * Math.sqrt(Math.max(0.0, 1 - a * a));
+        double qv = bias * Math.sqrt(Math.max(0.0, 1 - a * a));
         d.sBiasX = a * d.sBiasX + qv * d.sRng.nextGaussian();
         d.sBiasY = a * d.sBiasY + qv * d.sRng.nextGaussian();
-        double mx = x + d.sBiasX + GPS_SIGMA_M * d.sRng.nextGaussian();
-        double my = y + d.sBiasY + GPS_SIGMA_M * d.sRng.nextGaussian();
-        // Faulty units glitch more often (a malfunctioning sensor, not an attack).
-        double outRate = d.faulty ? GPS_OUTLIER_RATE * 6.0 : GPS_OUTLIER_RATE;
+        double mx = x + d.sBiasX + sigma * d.sRng.nextGaussian();
+        double my = y + d.sBiasY + sigma * d.sRng.nextGaussian();
+        // Faulty units glitch more often (a malfunctioning sensor, not an attack); poorer GNSS too.
+        double outRate = (d.faulty ? GPS_OUTLIER_RATE * 6.0 : GPS_OUTLIER_RATE) * d.gpsQ;
         if (d.sRng.nextDouble() < Math.min(0.6, outRate * dt)) {   // rare multipath spike
             double ang = d.sRng.nextDouble() * 2 * Math.PI;
             double mag = GPS_OUTLIER_M * (0.5 + d.sRng.nextDouble());
@@ -314,7 +322,7 @@ public final class ScmsBackend {
         }
         double mspeed = Math.max(0.0, speed + SPEED_SIGMA_MS * d.sRng.nextGaussian());
         double mheading = ((heading + HEADING_SIGMA_DEG * d.sRng.nextGaussian()) % 360 + 360) % 360;
-        double conf = 1.96 * Math.sqrt(GPS_SIGMA_M * GPS_SIGMA_M + GPS_BIAS_M * GPS_BIAS_M);
+        double conf = 1.96 * Math.sqrt(sigma * sigma + bias * bias);
         AttackLib.Claim c;
         if (!d.attacker) {
             c = new AttackLib.Claim();
@@ -359,7 +367,7 @@ public final class ScmsBackend {
 
     // -------------------------------------------------- report ingestion (LOP -> RA -> MA)
     public synchronized void onDetection(String reporterDigest, String subjectDigest, double score, double t,
-                                         String reasonCode, double subjectPosConf) {
+                                         String reasonCode, double subjectPosConf, double scoreNorm) {
         if (rng.nextDouble() > REPORT_PROB) {
             return; // suppression / loss on the report channel
         }
@@ -371,10 +379,13 @@ public final class ScmsBackend {
         scms.lop.forward(rep.certDigest, subj.certDigest);   // LOP strips network identifiers
         reportCounter++;
         String rid = String.format("rpt_%05d", reportCounter);
-        maReports.add(maRow("report_id", rid, "ingest_time", round3(t), "detection_time", round3(t),
+        double ingestDelay = INGEST_DELAY_S * (0.5 + rng.nextDouble());   // realistic report-channel latency
+        maReports.add(maRow("report_id", rid, "ingest_time", round3(t + ingestDelay),
+                "detection_time", round3(t),
                 "reporter_cert_digest", reporterDigest, "subject_cert_digest", subjectDigest,
                 "reason_codes", List.of(reasonCode),
-                "detector_score", round3(score), "subject_pos_confidence", round3(subjectPosConf),
+                "detector_score", round3(score), "detector_score_norm", round3(scoreNorm),
+                "subject_pos_confidence", round3(subjectPosConf),
                 "sig_valid", true, "cert_crl_status", "active"));
         gtRepLbl.add(gtRow("report_id", rid, "reporter_true_id", rep.unitId, "subject_true_id", subj.unitId,
                 "report_correctness", subj.attacker ? "correct" : (subj.faulty ? "faulty_detection" : "false_positive")));
@@ -422,12 +433,19 @@ public final class ScmsBackend {
         }
         written = true;
         try {
-            for (Dev d : devByUnit.values()) {
-                Double rt = scms.crlStore.revocationTime(d.certDigest);
-                maCertStatus.add(maRow("cert_digest", d.certDigest,
-                        "first_seen", firstSeen.getOrDefault(d.certDigest, 0.0),
-                        "last_seen", lastSeen.getOrDefault(d.certDigest, 0.0),
-                        "issuing_pca", scms.pca.id, "crl_status", rt != null ? "revoked" : "active",
+            // one row per pseudonym the MA observed (rotation + ghosts), with vehicle-level
+            // revocation status — the LA linkage revokes every pseudonym of a caught vehicle.
+            for (Map.Entry<String, Dev> e : devByDigest.entrySet()) {
+                String dig = e.getKey();
+                Dev d = e.getValue();
+                if (!firstSeen.containsKey(dig)) {
+                    continue;   // only pseudonyms actually observed on-air are MA subjects
+                }
+                Double rt = d.revoked ? round3(d.revokeT) : null;
+                maCertStatus.add(maRow("cert_digest", dig,
+                        "first_seen", firstSeen.getOrDefault(dig, 0.0),
+                        "last_seen", lastSeen.getOrDefault(dig, 0.0),
+                        "issuing_pca", scms.pca.id, "crl_status", d.revoked ? "revoked" : "active",
                         "revocation_time", rt));
             }
             Path ma = Paths.get(OUT_DIR, "ma");

@@ -127,8 +127,12 @@ def build(dataset_dir: str) -> str:
         L.append(f"- **{name}**: ROC-AUC **{t.get('roc_auc')}**, PR-AUC **{t.get('pr_auc')}**, "
                  f"F1@0.5 {a5.get('f1')} (P {a5.get('precision')}/R {a5.get('recall')}); "
                  f"test n={t.get('n_test')}, positive rate {t.get('positive_rate_test')}")
-    L.append("\n_AUC well below 1.0 reflects realistic ambiguity (sensor noise, GPS outliers, "
-             "faults, evasive attacks) — the task is learnable but not trivial._\n")
+    L.append("\n_`vehicle_is_attacker` is the primary task — the MA's real post-linkage decision "
+             "unit (pseudonyms linked via the LAs). `subject_is_attacker` is per-pseudonym and is "
+             "deliberately hard: pseudonym rotation fragments each attacker across short-lived, often "
+             "evasive certificates. `report_is_true_detection` is near-saturated because the tuned "
+             "detector suite emits mostly-true reports. Recall < 1.0 (evasive attacks) is the main "
+             "realistic difficulty._\n")
 
     L.append("## Intended use & limitations")
     L.append("- **Intended use:** training/evaluating global Misbehaviour-Authority anomaly "
