@@ -28,6 +28,7 @@ LOG_PATH = REPO / "gui" / "last_run.log"
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "scms-sim" / "scenarios"))
 from scms_sim_ref.datagen import validate as validate_mod  # noqa: E402
+from scms_sim_ref.datagen import benchmark as benchmark_mod  # noqa: E402
 import mapgen  # noqa: E402
 
 PORT = 8710
@@ -345,7 +346,7 @@ def stop_run() -> dict:
         return {"ok": True}
 
 
-_STAGE_RE = re.compile(r"==\s*\[(\d)/5\]\s*([^=]+?)\s*==")
+_STAGE_RE = re.compile(r"==\s*\[(\d)/(\d)\]\s*([^=]+?)\s*==")
 _PROG_RE = re.compile(r"-\s*([0-9]+(?:\.[0-9]+)?)%")
 
 
@@ -360,7 +361,7 @@ def _log_tail(n: int = 40) -> tuple[str, str, float]:
     for ln in lines:
         m = _STAGE_RE.search(ln)
         if m:
-            stage = f"[{m.group(1)}/5] {m.group(2).strip()}"
+            stage = f"[{m.group(1)}/{m.group(2)}] {m.group(3).strip()}"
         p = _PROG_RE.search(ln)
         if p and "Simulating" in ln:
             progress = float(p.group(1))
@@ -403,6 +404,12 @@ def compute_stats(out_dir: Path) -> dict | None:
         with open(subj_csv, encoding="utf-8") as fh:
             for row in csv.DictReader(fh):
                 splits[row.get("split", "?")] += 1
+    correctness = Counter(r.get("report_correctness")
+                          for r in _read_jsonl(out_dir / "ground_truth" / "gt_report_labels.jsonl"))
+    try:
+        bench_tasks = benchmark_mod.run(str(out_dir)).get("tasks", {})
+    except Exception:
+        bench_tasks = {}
     return {
         "counts": man.get("counts", {}),
         "seed": man.get("seed"),
@@ -411,6 +418,8 @@ def compute_stats(out_dir: Path) -> dict | None:
         "validate": summary,
         "attack_types": dict(attacks),
         "detector_reasons": dict(reasons),
+        "report_correctness": dict(correctness),
+        "benchmark": bench_tasks,
         "splits": dict(splits),
     }
 

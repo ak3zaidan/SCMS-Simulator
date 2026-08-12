@@ -152,6 +152,8 @@
           <div><div class="muted" style="font-size:12px;margin-bottom:4px">Detector reasons (MA reports)</div>
                <div class="bars" id="reasonBars"></div></div>
         </div>
+        <div><div class="muted" style="font-size:12px;margin-bottom:4px">Report labels — attack / fault / false-positive</div>
+             <div class="bars" id="correctnessBars"></div></div>
       </div>
     </div>
   </div>
@@ -345,18 +347,23 @@ function renderStats(st){
   const prec=va.precision!=null?(va.precision*100).toFixed(1)+'%':'—';
   const rec=va.recall!=null?(va.recall*100).toFixed(1)+'%':'—';
   const leak=va.leakage_violations!=null?va.leakage_violations:'—';
+  const bm=st.benchmark||{};
+  const subjAuc=bm.subject_is_attacker&&bm.subject_is_attacker.roc_auc;
+  const repAuc=bm.report_is_true_detection&&bm.report_is_true_detection.roc_auc;
   const kpis=[
     ['Vehicles', c.vehicles ?? c.subjects ?? '—'],
     ['MA reports', c.reports ?? '—'],
     ['Revocations', c.revocations ?? c.revoked ?? '—'],
     ['Precision', prec],['Recall', rec],
     ['Leakage', `<span class="${leak===0?'good':'warnc'}">${leak}</span>`],
+    ['Subj AUC', subjAuc ?? '—'],['Report AUC', repAuc ?? '—'],
     ['Seed', st.seed ?? '—'],
     ['Digest', `<span class="muted" style="font-size:12px">${st.data_digest||'—'}</span>`],
   ];
   $('#kpis').innerHTML=kpis.map(([k,v])=>`<div class="kpi"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
   bars('#attackBars',st.attack_types);
   bars('#reasonBars',st.detector_reasons);
+  bars('#correctnessBars',st.report_correctness);
 }
 
 boot();

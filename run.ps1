@@ -29,10 +29,10 @@ $ErrorActionPreference = 'Stop'
 if (-not $env:MOSAIC_HOME) { . C:\Users\Administrator\tools\env.ps1 }
 $repo = $PSScriptRoot
 
-Write-Host "== [1/5] Build MOSAIC app (javac, no Maven) =="
+Write-Host "== [1/6] Build MOSAIC app (javac, no Maven) =="
 & "$repo\scms-sim\mosaic-apps\scms-app\build.ps1"
 
-Write-Host "== [2/5] Generate '$Scenario' scenario =="
+Write-Host "== [2/6] Generate '$Scenario' scenario =="
 $genArgs = @($Scenario)
 if ($Duration)    { $genArgs += @('--duration', $Duration) }
 if ($Seed)        { $genArgs += @('--seed', "$Seed") }
@@ -45,7 +45,7 @@ $cfg = $gen.scenario_config
 $out = $gen.dataset_dir
 Write-Host "   $($gen.kind) scenario -> $cfg"
 
-Write-Host "== [3/5] Simulate in MOSAIC + SUMO  ->  $out =="
+Write-Host "== [3/6] Simulate in MOSAIC + SUMO  ->  $out =="
 $env:SCMS_OUT_DIR = $out
 if ($Seed) { $env:SCMS_SEED = "$Seed" }
 Push-Location $env:MOSAIC_HOME
@@ -63,10 +63,12 @@ try {
 }
 
 $env:PYTHONPATH = "$repo\src"
-Write-Host "== [4/5] Featurize -> ML-ready tables =="
+Write-Host "== [4/6] Featurize -> ML-ready tables =="
 python -m scms_sim_ref.datagen.featurize $out
-Write-Host "== [5/5] Validate (leakage + revocation precision/recall) =="
+Write-Host "== [5/6] Validate (leakage + revocation precision/recall) =="
 python -m scms_sim_ref.datagen.validate $out
+Write-Host "== [6/6] Datasheet + baseline ML benchmark =="
+python -m scms_sim_ref.datagen.datasheet $out
 
 Write-Host ""
-Write-Host "DONE. Dataset at $out  (ma/  ground_truth/  ml/  manifest.json)"
+Write-Host "DONE. Dataset at $out  (ma/  ground_truth/  ml/  DATASHEET.md  manifest.json)"
