@@ -22,6 +22,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import mapgen
+
 REPO = Path(__file__).resolve().parents[2]
 MOSAIC = Path(os.environ.get("MOSAIC_HOME", r"C:\Users\Administrator\tools\mosaic"))
 NEXTGEN = REPO / "third_party" / "veremi-nextgen" / "Generator"
@@ -59,8 +61,12 @@ def _junction(link: Path, target: Path):
 
 def generate(key: str, duration=None, scale=None, max_vehicles=None,
              target_flow=None, lanes=None, seed=None) -> dict:
+    if key not in REG and mapgen.is_mapgen_key(key):
+        dst = REPO / "scms-sim" / "scenarios" / f"gen_{key}"
+        return mapgen.build(key, dst, duration=duration, scale=scale, seed=seed)
     if key not in REG:
-        raise SystemExit(f"unknown scenario '{key}'. Known: {', '.join(REG)}")
+        raise SystemExit(f"unknown scenario '{key}'. Known: {', '.join(REG)}, "
+                         f"or a procedural/osm key (grid_/spider_/rand_/osm_).")
     spec = REG[key]
     kind = spec["kind"]
     dur = duration or spec["dur"]
@@ -150,7 +156,7 @@ def generate(key: str, duration=None, scale=None, max_vehicles=None,
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="Generate a wired SCMS scenario.")
-    p.add_argument("key", choices=list(REG))
+    p.add_argument("key", help="a REG key, or a procedural/osm key (grid_/spider_/rand_/osm_)")
     p.add_argument("--duration")
     p.add_argument("--scale")
     p.add_argument("--max-vehicles")

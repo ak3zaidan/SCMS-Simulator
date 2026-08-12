@@ -25,5 +25,6 @@ scms-sim/**/build/
 scms-sim/scenarios/scms_smoke/
 scms-sim/scenarios/scms_intas/
 scms-sim/scenarios/gen_*/
+scms-sim/scenarios/_mapcache/
 tmp/
 gui/last_run.log

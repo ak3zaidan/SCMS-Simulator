@@ -194,8 +194,17 @@ function fieldEl(c,val){
     w.innerHTML=`<div class="row-check"><input type="checkbox" id="f_${c.name}" ${val?'checked':''}>
                  <label for="f_${c.name}" style="margin:0"><span class="name">${c.label}</span></label></div>${help}`;
   }else if(c.type==='scenario'){
-    const opts=SCEN.map(s=>`<option value="${s.key}" ${s.key===val?'selected':''}>${s.label}</option>`).join('');
-    w.innerHTML=`<label class="name">${c.label}</label><select id="f_${c.name}">${opts}</select>${help}`;
+    const FAMLABEL={bundled:'Curated · bundled maps',intas:'Curated · InTAS Ingolstadt',
+      'procedural-grid':'Procedural · grid networks','procedural-spider':'Procedural · spider networks',
+      'procedural-random':'Procedural · random networks','osm-city':'Real cities · OpenStreetMap'};
+    const fams=[]; SCEN.forEach(s=>{const f=s.family||'other'; if(!fams.includes(f))fams.push(f);});
+    const opts=fams.map(f=>{
+      const inner=SCEN.filter(s=>(s.family||'other')===f)
+        .map(s=>`<option value="${s.key}" ${s.key===val?'selected':''}>${s.label}</option>`).join('');
+      return `<optgroup label="${FAMLABEL[f]||f}">${inner}</optgroup>`;
+    }).join('');
+    w.innerHTML=`<label class="name">${c.label} <span class="muted" style="font-weight:400">(${SCEN.length} maps)</span></label>
+      <select id="f_${c.name}">${opts}</select>${help}`;
     setTimeout(()=>$('#f_'+c.name).addEventListener('change',syncKind),0);
   }else if(c.type==='multi'){
     const isAll = (val==='all'||val==null);

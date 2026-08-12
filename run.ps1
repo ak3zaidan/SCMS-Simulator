@@ -14,8 +14,8 @@
              intas_urban_low, intas_urban_rush, intas_highway_low, intas_highway_rush
 #>
 param(
-    [ValidateSet('smoke', 'highway', 'barnim', 'tiergarten',
-        'intas_urban_low', 'intas_urban_rush', 'intas_highway_low', 'intas_highway_rush')]
+    # Curated maps: smoke, highway, barnim, tiergarten, intas_urban_low/rush, intas_highway_low/rush.
+    # Or a generated map key: grid_6x6 / spider_8a4c / rand_150 (+_s2 seed) / osm_manhattan (see mapgen.py).
     [string]$Scenario = 'smoke',
     [string]$Duration,
     [int]$Seed,

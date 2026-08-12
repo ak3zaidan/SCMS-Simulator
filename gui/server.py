@@ -26,22 +26,27 @@ REPO = Path(__file__).resolve().parent.parent
 RUN_PS1 = REPO / "run.ps1"
 LOG_PATH = REPO / "gui" / "last_run.log"
 sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(REPO / "scms-sim" / "scenarios"))
 from scms_sim_ref.datagen import validate as validate_mod  # noqa: E402
+import mapgen  # noqa: E402
 
 PORT = 8710
 
-# The eight runnable maps (must match gen_scenario.REG / run.ps1's ValidateSet). Each entry
-# notes its kind so the GUI can show the relevant traffic controls (flow vs route density).
-SCENARIOS = [
-    {"key": "smoke",              "label": "Smoke — synthetic highway (fast)",       "kind": "flow"},
-    {"key": "highway",            "label": "Highway — 3-lane motorway",              "kind": "flow"},
-    {"key": "barnim",             "label": "Barnim — rural road network",            "kind": "flow"},
-    {"key": "tiergarten",         "label": "Tiergarten — Berlin inner city",         "kind": "flow"},
-    {"key": "intas_urban_low",    "label": "InTAS Ingolstadt — urban, off-peak",     "kind": "route"},
-    {"key": "intas_urban_rush",   "label": "InTAS Ingolstadt — urban, 7–9am rush",   "kind": "route"},
-    {"key": "intas_highway_low",  "label": "InTAS Ingolstadt — highway, off-peak",   "kind": "route"},
-    {"key": "intas_highway_rush", "label": "InTAS Ingolstadt — highway, rush",       "kind": "route"},
+# The curated maps (match gen_scenario.REG) plus the generated-map catalogue (procedural
+# netgenerate families + real-world OSM cities). Each entry notes its kind so the GUI shows
+# the relevant traffic controls (flow count vs route-density scale). Any well-formed
+# procedural/osm key works even if it is not in this list.
+CURATED = [
+    {"key": "smoke",              "label": "Smoke — synthetic highway (fast)",     "kind": "flow", "family": "bundled"},
+    {"key": "highway",            "label": "Highway — 3-lane motorway",            "kind": "flow", "family": "bundled"},
+    {"key": "barnim",             "label": "Barnim — rural road network",          "kind": "flow", "family": "bundled"},
+    {"key": "tiergarten",         "label": "Tiergarten — Berlin inner city",       "kind": "flow", "family": "bundled"},
+    {"key": "intas_urban_low",    "label": "InTAS Ingolstadt — urban, off-peak",   "kind": "route", "family": "intas"},
+    {"key": "intas_urban_rush",   "label": "InTAS Ingolstadt — urban, 7–9am rush", "kind": "route", "family": "intas"},
+    {"key": "intas_highway_low",  "label": "InTAS Ingolstadt — highway, off-peak", "kind": "route", "family": "intas"},
+    {"key": "intas_highway_rush", "label": "InTAS Ingolstadt — highway, rush",     "kind": "route", "family": "intas"},
 ]
+SCENARIOS = CURATED + mapgen.catalog()   # ~200+ generated maps appended
 
 # Every attack BASE behaviour our library can assign (must match AttackLib.BASES). Each base
 # expands to a matrix of variants (temporal profile x magnitude tier) — ~291 concrete variants
@@ -208,7 +213,7 @@ def start_run(config: dict) -> dict:
             return {"ok": False, "error": "A simulation is already running."}
         scenario = str(config.get("scenario", "smoke"))
         valid = {s["key"] for s in SCENARIOS}
-        if scenario not in valid:
+        if scenario not in valid and not mapgen.is_mapgen_key(scenario):
             return {"ok": False, "error": f"unknown scenario '{scenario}'"}
         out_dir = REPO / "datasets" / scenario
 
