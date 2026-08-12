@@ -35,14 +35,23 @@ MA-visible data (features) and simulation ground truth (labels).
 | Maps / scenarios | ✅ 8 curated (Smoke · Highway · Barnim · Tiergarten · InTAS Ingolstadt ×4) **+ 200+ generated**: procedural `netgenerate` grid/spider/random and real-world OSM cities (`osm_manhattan` …) |
 | Attacks / detectors | ✅ **~291 attack variants** — 30 base behaviours (position/speed/heading/combined/replay/DoS/Sybil) × temporal profile × magnitude tier / 7 detectors |
 | Traffic + vehicle + radio controls | ✅ number of vehicles, flow, lanes, density; driver model (speed/accel/σ/gap); ITS-G5 radio range + packet loss |
-| ML featurizer + leakage-safe splitter | ✅ report + subject tables, vehicle-disjoint splits |
-| One-command end-to-end runner | ✅ `run.ps1` |
+| **Sensor realism** | ✅ honest CAMs carry correlated GPS bias + white noise + rare multipath outliers, and a 95% position-confidence value (no vehicle broadcasts perfect truth) |
+| **ETSI CAM generation** | ✅ EN 302 637-2 triggering (Δpos/Δhdg/Δspeed, 1–10 Hz); rate-independent detectors; DoS bursting |
+| **Pseudonym rotation** | ✅ vehicles rotate certificates over time (privacy); LA-linked revocation covers all pseudonyms (security) |
+| **Fault vs attack** | ✅ malfunctioning-sensor vehicles (anomalous ≠ malicious) → three-way report labels + `label_is_faulty` |
+| **Channel congestion** | ✅ CSMA/CA contention loss (CBR collapse) so DoS floods degrade nearby reception |
+| **Fleet + demand** | ✅ car/truck/bus/motorcycle mix, rush/uniform demand profiles (generated maps) |
+| **Datasheet + ML benchmark** | ✅ per-dataset `DATASHEET.md` + baseline ROC-AUC/PR-AUC proving realistic (non-trivial) learnability |
+| ML featurizer + leakage-safe splitter | ✅ report + subject tables, per-message emission sample, vehicle-disjoint splits |
+| One-command end-to-end runner | ✅ `run.ps1` (build → generate → simulate → featurize → validate → datasheet) |
 
-The system is runnable end-to-end. On the real InTAS Ingolstadt map, with all 16 attack
-types enabled, the generated dataset is **leakage-free**, with revocation **precision ≈0.98 /
-recall ≈0.76** (recall < 1 is realistic — the hardest attacks evade the on-board detectors),
-and is **byte-identical across runs** (deterministic). See
-[`docs/adr/0001-stack-and-approach.md`](docs/adr/0001-stack-and-approach.md).
+The system is runnable end-to-end. On the real InTAS Ingolstadt map, with all attack
+variants enabled, the generated dataset is **leakage-free**, revocation is **precise**
+(≈1.0 with the sustained-evidence MA rule) at a realistic **recall ≈0.6–0.8** (the hardest
+attacks evade), the report stream carries a realistic mix of true detections, benign
+false-positives, and fault detections, and the data is **byte-identical across runs**
+(deterministic). A baseline model reaches **ROC-AUC ≈0.88–0.9** — learnable, not trivial.
+See [`docs/adr/0001-stack-and-approach.md`](docs/adr/0001-stack-and-approach.md).
 
 ## Run the full simulation (one command)
 
