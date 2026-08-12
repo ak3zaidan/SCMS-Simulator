@@ -140,6 +140,37 @@ def _task(feat: pd.DataFrame, lab: pd.DataFrame, key: str, label_col: str) -> di
     }
 
 
+def _novel_attack(vf: pd.DataFrame | None, vl: pd.DataFrame | None) -> dict | None:
+    """Leave-one-attack-family-out: train on benign + every attack family EXCEPT one, then test
+    detection of the held-out family (never seen in training). This is the real-world-relevant
+    metric — can the model flag a NOVEL attack type? Averaged over held-out families."""
+    if vf is None or vl is None or "attack_family" not in vl.columns:
+        return None
+    df = vf.merge(vl[["entity_id", "label_is_attacker", "attack_family", "split"]],
+                  on=["entity_id", "split"], how="inner")
+    fams = sorted(set(df[df.label_is_attacker == 1].attack_family) - {"none", "other"})
+    per_family = {}
+    for fam in fams:
+        tr = pd.concat([df[(df.split != "test") & (df.label_is_attacker == 0)],
+                        df[(df.split != "test") & (df.label_is_attacker == 1) & (df.attack_family != fam)]])
+        te = pd.concat([df[(df.split == "test") & (df.label_is_attacker == 0)],
+                        df[(df.split == "test") & (df.label_is_attacker == 1) & (df.attack_family == fam)]])
+        ytr = tr["label_is_attacker"].to_numpy(dtype=float)
+        yte = te["label_is_attacker"].to_numpy(dtype=float)
+        if ytr.sum() < 3 or yte.sum() < 2 or len(te) - yte.sum() < 3:
+            continue
+        w, b, mu, sd = _fit_logreg(_feature_matrix(tr)[0], ytr)
+        s = _predict(_feature_matrix(te)[0], w, b, mu, sd)
+        auc = _roc_auc(yte, s)
+        if auc is not None:
+            per_family[fam] = round(auc, 3)
+    if not per_family:
+        return None
+    return {"per_family_auc": per_family,
+            "mean_novel_attack_auc": round(sum(per_family.values()) / len(per_family), 3),
+            "note": "trained on benign + all-but-one attack family; tested on the held-out family"}
+
+
 def run(dataset_dir: str) -> dict[str, Any]:
     sf, sl = _load(dataset_dir, "subject_features"), _load(dataset_dir, "subject_labels")
     rf, rl = _load(dataset_dir, "report_features"), _load(dataset_dir, "report_labels")
@@ -154,6 +185,9 @@ def run(dataset_dir: str) -> dict[str, Any]:
     veh = _task(vf, vl, "entity_id", "label_is_attacker")
     if veh is not None:
         out["tasks"]["vehicle_is_attacker"] = veh
+    novel = _novel_attack(vf, vl)
+    if novel is not None:
+        out["generalization"] = {"vehicle_novel_attack": novel}
     return out
 
 

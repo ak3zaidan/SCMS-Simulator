@@ -226,8 +226,8 @@ CONFIG_SPEC = [
 
     # --- Vehicle dynamics & radio ---
     {"group": "Vehicle & radio", "name": "veh_maxspeed", "label": "Max speed (m/s)", "type": "float",
-     "default": 55.0, "min": 5, "max": 120, "step": 1, "env": "SCMS_VEH_MAXSPEED",
-     "help": "Vehicle type top speed"},
+     "default": 42.0, "min": 5, "max": 120, "step": 1, "env": "SCMS_VEH_MAXSPEED",
+     "help": "Vehicle type top speed (~151 km/h default)"},
     {"group": "Vehicle & radio", "name": "veh_speedfactor", "label": "Speed factor", "type": "float",
      "default": 1.0, "min": 0.2, "max": 2, "step": 0.05, "env": "SCMS_VEH_SPEEDFACTOR",
      "help": "Multiplier on edge speed limits (driver aggressiveness)"},

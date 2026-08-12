@@ -45,6 +45,24 @@ REASON_VOCAB = [
 ]
 
 
+# Attack base -> family (mirrors org.scms.attacks.AttackLib). Used only for LABELS, so a model
+# can be evaluated on attack families it never trained on (real-world novel-attack generalization).
+_ATTACK_FAMILY = {}
+for _fam, _bases in {
+    "position": ["ConstPos", "ConstPosOffset", "ConstPosOffsetX", "ConstPosOffsetY", "RandomPos",
+                 "RandomPosOffset", "Teleport", "SineWavePos"],
+    "speed": ["ConstSpeedZero", "ConstSpeedOffset", "ConstSpeedHigh", "RandomSpeed",
+              "RandomSpeedOffset", "StopAndGo"],
+    "heading": ["ReversedHeading", "RandomHeading", "PerpendicularHeading", "HeadingOffset"],
+    "combined": ["Disruptive", "PosSpeedInconsistent", "PosHeadingInconsistent", "EventualStop"],
+    "timing": ["DataReplay", "DelayedMessages", "OutOfOrder", "DoS", "DoSRandom"],
+    "identity": ["Sybil"],
+    "stealth": ["AlongRoadOffset", "SlowDrift", "LaggingPosition"],
+}.items():
+    for _b in _bases:
+        _ATTACK_FAMILY[_b] = _fam
+
+
 def _load_jsonl(path: str) -> list[dict]:
     if not os.path.exists(path):
         return []
@@ -85,8 +103,11 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
     gt_report_labels = _load_jsonl(os.path.join(gt, "gt_report_labels.jsonl"))
 
     # --- ground-truth lookups (used for LABELS + split grouping only) ---
+    gt_attacks = _load_jsonl(os.path.join(gt, "gt_attacks.jsonl"))
     attacker_by_vehicle = {v["true_vehicle_id"]: bool(v["is_attacker"]) for v in gt_vehicle}
     faulty_by_vehicle = {v["true_vehicle_id"]: bool(v.get("is_faulty", False)) for v in gt_vehicle}
+    base_by_vehicle = {a["true_vehicle_id"]: str(a.get("attack_type", "")).split("/")[0] for a in gt_attacks}
+    family_by_vehicle = {v: _ATTACK_FAMILY.get(b, "other") for v, b in base_by_vehicle.items()}
     vehicle_by_digest = {m["pseudonym_cert_digest"]: m["true_vehicle_id"] for m in gt_idmap}
     label_by_report = {r["report_id"]: r for r in gt_report_labels}
     lifetime_by_digest = {
@@ -210,6 +231,7 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
             "entity_id": entity_id,
             "label_is_attacker": int(attacker_by_vehicle.get(tv, False)),
             "label_is_faulty": int(faulty_by_vehicle.get(tv, False)),
+            "attack_family": family_by_vehicle.get(tv, "none" if not attacker_by_vehicle.get(tv) else "other"),
             "true_vehicle_id": tv,
             "split": split,
         })

@@ -126,7 +126,7 @@ def sim_step_ms() -> int:
 def veh_params() -> dict:
     """SUMO driver-model / vehicle-type parameters from env (SCMS_VEH_*)."""
     return {
-        "maxSpeed": _envf("SCMS_VEH_MAXSPEED", 55.0),
+        "maxSpeed": _envf("SCMS_VEH_MAXSPEED", 42.0),   # ~151 km/h — realistic passenger-car cap
         "accel": _envf("SCMS_VEH_ACCEL", 2.6),
         "decel": _envf("SCMS_VEH_DECEL", 4.5),
         "sigma": _envf("SCMS_VEH_SIGMA", 0.5),        # driver imperfection 0..1
@@ -152,7 +152,7 @@ def fleet() -> list[tuple]:
         ("bus", 0.04, {"vClass": "bus", "accel": 1.2, "decel": 4.0, "length": 12.0,
                        "minGap": 3.0, "tau": 1.4, "maxSpeed": 25.0}),
         ("moto", 0.10, {"vClass": "motorcycle", "accel": 3.5, "decel": 6.0, "length": 2.2,
-                        "minGap": 1.5, "tau": 0.8, "maxSpeed": 55.0}),
+                        "minGap": 1.5, "tau": 0.8, "maxSpeed": 45.0}),
     ]
 
 

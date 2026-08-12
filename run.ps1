@@ -23,6 +23,8 @@ param(
     [int]$MaxVehicles,       # flow maps: cap on concurrent vehicles
     [int]$TargetFlow,        # flow maps: vehicles/hour
     [int]$Lanes,             # flow maps: number of lanes used
+    [string]$OutDir,         # override the dataset output directory (used by the campaign generator)
+    [switch]$SkipBuild,      # skip the javac build (campaign builds once up front)
     [switch]$Visualize
 )
 $ErrorActionPreference = 'Stop'
@@ -30,7 +32,7 @@ if (-not $env:MOSAIC_HOME) { . C:\Users\Administrator\tools\env.ps1 }
 $repo = $PSScriptRoot
 
 Write-Host "== [1/6] Build MOSAIC app (javac, no Maven) =="
-& "$repo\scms-sim\mosaic-apps\scms-app\build.ps1"
+if ($SkipBuild) { Write-Host "   (skipped)" } else { & "$repo\scms-sim\mosaic-apps\scms-app\build.ps1" }
 
 Write-Host "== [2/6] Generate '$Scenario' scenario =="
 $genArgs = @($Scenario)
@@ -43,6 +45,7 @@ if ($Lanes)       { $genArgs += @('--lanes', "$Lanes") }
 $gen = & python "$repo\scms-sim\scenarios\gen_scenario.py" @genArgs | ConvertFrom-Json
 $cfg = $gen.scenario_config
 $out = $gen.dataset_dir
+if ($OutDir) { $out = $OutDir }
 Write-Host "   $($gen.kind) scenario -> $cfg"
 
 Write-Host "== [3/6] Simulate in MOSAIC + SUMO  ->  $out =="

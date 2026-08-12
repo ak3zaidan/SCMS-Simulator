@@ -60,9 +60,11 @@ def build(dataset_dir: str) -> str:
     except Exception:
         vsum = {}
     try:
-        bres = bench.run(dataset_dir).get("tasks", {})
+        bfull = bench.run(dataset_dir)
+        bres = bfull.get("tasks", {})
+        bgen = bfull.get("generalization", {})
     except Exception:
-        bres = {}
+        bres, bgen = {}, {}
 
     scores = [float(r.get("detector_score", 0) or 0) for r in reps]
     confs = [float(r.get("subject_pos_confidence", 0) or 0) for r in reps]
@@ -107,6 +109,27 @@ def build(dataset_dir: str) -> str:
                  f"({100 * falsified / len(emit):.1f}%)")
     L.append("")
 
+    # --- realism scorecard: key distributions vs published real-world reference ranges ---
+    L.append("## Realism scorecard (vs real-world reference ranges)")
+    total_rep = max(1, len(rlbl))
+    fp_rate = correctness.get("false_positive", 0) / total_rep
+    benign_speeds = [float(e.get("claimed_speed", 0) or 0) for e in emit if not e.get("is_attacker")]
+    checks = [
+        ("GNSS 95% position confidence (m)", np.median(confs) if confs else None, 2.0, 20.0,
+         "real urban GNSS horizontal accuracy"),
+        ("Benign speed p95 (m/s)", float(np.percentile(benign_speeds, 95)) if benign_speeds else None,
+         5.0, 45.0, "urban→motorway vehicle speeds"),
+        ("Attacker prevalence", (n_att / n_veh) if n_veh else None, 0.03, 0.45,
+         "misbehaviour-study attacker fractions"),
+        ("Faulty prevalence", (n_fault / n_veh) if n_veh else None, 0.0, 0.20, "sensor-fault rates"),
+        ("Report false-positive rate", fp_rate, 0.0, 0.30, "tuned MBD detector FP rates"),
+    ]
+    for name, val, lo, hi, ref in checks:
+        ok = "✅" if (val is not None and lo <= val <= hi) else "⚠️"
+        vs = f"{val:.3f}" if val is not None else "n/a"
+        L.append(f"- {ok} {name}: **{vs}** (ref {lo}–{hi}; {ref})")
+    L.append("")
+
     L.append("## Leakage-safe splits & revocation quality")
     L.append(f"- Split counts: {man.get('split_counts', vsum.get('split_counts', 'see ml/'))}")
     L.append(f"- Leakage violations: **{vsum.get('leakage_violations', 0)}** (a feature carrying a "
@@ -127,6 +150,11 @@ def build(dataset_dir: str) -> str:
         L.append(f"- **{name}**: ROC-AUC **{t.get('roc_auc')}**, PR-AUC **{t.get('pr_auc')}**, "
                  f"F1@0.5 {a5.get('f1')} (P {a5.get('precision')}/R {a5.get('recall')}); "
                  f"test n={t.get('n_test')}, positive rate {t.get('positive_rate_test')}")
+    nov = (bgen or {}).get("vehicle_novel_attack")
+    if nov:
+        L.append(f"- **Novel-attack generalization** (leave-one-attack-family-out): mean ROC-AUC "
+                 f"**{nov.get('mean_novel_attack_auc')}** — detecting attack families held out of "
+                 f"training. Per family: " + ", ".join(f"{k} {v}" for k, v in nov.get("per_family_auc", {}).items()))
     L.append("\n_`vehicle_is_attacker` is the primary task — the MA's real post-linkage decision "
              "unit (pseudonyms linked via the LAs). `subject_is_attacker` is per-pseudonym and is "
              "deliberately hard: pseudonym rotation fragments each attacker across short-lived, often "
