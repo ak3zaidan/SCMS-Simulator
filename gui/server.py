@@ -231,7 +231,10 @@ CONFIG_SPEC = [
      "help": "ITS-G5 single-hop communication radius (SNS)"},
     {"group": "Vehicle & radio", "name": "radio_loss", "label": "Packet loss", "type": "float",
      "default": 0.0, "min": 0, "max": 1, "step": 0.02, "env": "SCMS_RADIO_LOSS",
-     "help": "Single-hop transmission loss probability"},
+     "help": "Single-hop transmission loss probability (SNS, distance-independent)"},
+    {"group": "Vehicle & radio", "name": "chan_capacity", "label": "Channel capacity (CAMs/100ms)", "type": "int",
+     "default": 25, "min": 0, "max": 500, "env": "SCMS_CHAN_CAPACITY",
+     "help": "CSMA/CA contention: above this local load, frames are lost (CBR collapse). 0 disables"},
 
     # --- Sensors & CAM timing (data realism) ---
     {"group": "Sensors & CAM timing", "name": "gps_sigma", "label": "GPS noise σ (m)", "type": "float",

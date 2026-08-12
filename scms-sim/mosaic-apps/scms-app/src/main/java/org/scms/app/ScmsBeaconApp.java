@@ -48,6 +48,8 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
     private static final double SPEED_TOL_M = envD("SCMS_SPEED_TOL", 10.0);
     private static final double HEADING_DIFF = envD("SCMS_HEADING_DIFF", 120.0);
     private static final int SYBIL_MIN = envI("SCMS_SYBIL_MIN", 5);
+    private static final int CHAN_CAPACITY = envI("SCMS_CHAN_CAPACITY", 25);   // CAMs/100ms before congestion loss (0 = off)
+    private static final double CHAN_WINDOW_S = 0.1;
 
     private static int envI(String n, int d) {
         String e = System.getenv(n);
@@ -83,6 +85,9 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
 
     private final Map<String, Rx> senders = new HashMap<>();
     private final Map<String, Map<String, Double>> sybilGrid = new HashMap<>();  // cell -> (digest -> lastSeen)
+    private double chanWinStart = Double.NEGATIVE_INFINITY;
+    private int chanCount = 0, chanLoad = 0;      // local channel load (CBR proxy)
+    private java.util.Random chanRng;             // deterministic contention-loss RNG
 
     @Override
     public void onStartup() {
@@ -90,6 +95,7 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         ScmsBackend.instance().register(id);
         cred = ScmsBackend.instance().getCredential(id);
         myDigest = cred.certDigest;
+        chanRng = new java.util.Random(0x9E3779B97F4A7C15L ^ (long) id.hashCode());
         getOperatingSystem().getAdHocModule().enable(new AdHocModuleConfiguration()
                 .addRadio().channel(AdHocChannel.CCH).power(50).create());
     }
@@ -179,6 +185,20 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
             return;
         }
         double t = getOperatingSystem().getSimulationTime() / 1e9;
+        // Channel congestion (CSMA/CA contention / CBR collapse): under high local channel load a
+        // fraction of frames are lost before they can be decoded. This is the main radio realism a
+        // full 802.11p PHY/MAC (OMNeT++/ns-3) would add over SNS — it makes DoS floods actually
+        // degrade nearby reception and gives dense traffic a realistic packet-delivery ratio.
+        if (t - chanWinStart >= CHAN_WINDOW_S) {
+            chanWinStart = t; chanLoad = chanCount; chanCount = 0;
+        }
+        chanCount++;
+        if (CHAN_CAPACITY > 0 && chanLoad > CHAN_CAPACITY) {
+            double pDrop = Math.min(0.95, (double) (chanLoad - CHAN_CAPACITY) / CHAN_CAPACITY);
+            if (chanRng.nextDouble() < pDrop) {
+                return; // frame lost to channel contention
+            }
+        }
         ScmsBackend backend = ScmsBackend.instance();
         if (backend.isRevoked(dg, t)) {
             return; // ENFORCEMENT: drop revoked certificates
