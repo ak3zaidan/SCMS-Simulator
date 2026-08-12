@@ -171,6 +171,46 @@ def _novel_attack(vf: pd.DataFrame | None, vl: pd.DataFrame | None) -> dict | No
             "note": "trained on benign + all-but-one attack family; tested on the held-out family"}
 
 
+def _graph_baseline(vf: pd.DataFrame | None, vl: pd.DataFrame | None,
+                    edges: pd.DataFrame | None) -> dict | None:
+    """GCN-lite: does the report GRAPH add signal beyond per-node features? Compares a logistic
+    model on node features vs. node features augmented with a 1-hop mean of neighbours' features
+    (one message-passing step over graph_edges). numpy only (no torch)."""
+    if vf is None or vl is None or edges is None or len(edges) == 0:
+        return None
+    df = vf.merge(vl[["entity_id", "label_is_attacker", "split"]], on=["entity_id", "split"], how="inner")
+    if len(df) < 30:
+        return None
+    fcols = [c for c in vf.columns if c not in _DROP and pd.api.types.is_numeric_dtype(vf[c])]
+    x = np.nan_to_num(df[fcols].to_numpy(dtype=float))
+    idx = {e: i for i, e in enumerate(df["entity_id"])}
+    nbrs: dict[int, list] = {}
+    for s, d in zip(edges["src_entity"], edges["dst_entity"]):
+        if s in idx and d in idx:                 # undirected 1-hop neighbourhood
+            nbrs.setdefault(idx[d], []).append(idx[s])
+            nbrs.setdefault(idx[s], []).append(idx[d])
+    agg = np.zeros_like(x)
+    for i in range(len(df)):
+        ns = nbrs.get(i)
+        if ns:
+            agg[i] = x[ns].mean(axis=0)
+    xg = np.hstack([x, agg])
+    tr = (df["split"] != "test").to_numpy()
+    te = (df["split"] == "test").to_numpy()
+    ytr, yte = df["label_is_attacker"].to_numpy(float)[tr], df["label_is_attacker"].to_numpy(float)[te]
+    if ytr.sum() < 3 or yte.sum() < 2 or (len(yte) - yte.sum()) < 3:
+        return None
+
+    def _auc(m):
+        w, b, mu, sd = _fit_logreg(m[tr], ytr)
+        return _roc_auc(yte, _predict(m[te], w, b, mu, sd))
+
+    node_auc, graph_auc = _auc(x), _auc(xg)
+    return {"node_only_auc": None if node_auc is None else round(node_auc, 3),
+            "node_plus_graph_auc": None if graph_auc is None else round(graph_auc, 3),
+            "note": "1-hop mean message passing over the report graph vs node features alone"}
+
+
 def run(dataset_dir: str) -> dict[str, Any]:
     sf, sl = _load(dataset_dir, "subject_features"), _load(dataset_dir, "subject_labels")
     rf, rl = _load(dataset_dir, "report_features"), _load(dataset_dir, "report_labels")
@@ -188,6 +228,9 @@ def run(dataset_dir: str) -> dict[str, Any]:
     novel = _novel_attack(vf, vl)
     if novel is not None:
         out["generalization"] = {"vehicle_novel_attack": novel}
+    gb = _graph_baseline(vf, vl, _load(dataset_dir, "graph_edges"))
+    if gb is not None:
+        out["graph_baseline"] = gb
     return out
 
 

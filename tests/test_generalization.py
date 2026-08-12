@@ -37,6 +37,22 @@ def test_novel_attack_holds_out_each_family():
     assert res["mean_novel_attack_auc"] > 0.7
 
 
+def test_graph_baseline_returns_both_aucs():
+    vf, vl = _synthetic_vehicles()
+    # a report graph where attackers are densely inter-reported (a signal for message passing)
+    ids = vl["entity_id"].tolist()
+    atk = vl[vl.label_is_attacker == 1]["entity_id"].tolist()
+    ben = vl[vl.label_is_attacker == 0]["entity_id"].tolist()
+    edges = []
+    for i, a in enumerate(atk):
+        edges.append({"src_entity": ben[i % len(ben)], "dst_entity": a, "split": "train"})
+        edges.append({"src_entity": atk[(i + 1) % len(atk)], "dst_entity": a, "split": "train"})
+    import pandas as pd
+    res = benchmark._graph_baseline(vf, vl, pd.DataFrame(edges))
+    assert res is not None
+    assert res["node_only_auc"] is not None and res["node_plus_graph_auc"] is not None
+
+
 def test_novel_attack_none_when_no_families():
     # only benign -> nothing to hold out
     vf = pd.DataFrame([{"entity_id": f"e{i}", "score_norm_max": 0.1, "n_reports": 0,

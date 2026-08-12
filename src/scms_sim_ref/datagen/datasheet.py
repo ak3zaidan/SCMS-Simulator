@@ -62,10 +62,10 @@ def build(dataset_dir: str) -> str:
         vsum = {}
     try:
         bfull = bench.run(dataset_dir)
-        bres = bfull.get("tasks", {})
-        bgen = bfull.get("generalization", {})
     except Exception:
-        bres, bgen = {}, {}
+        bfull = {}
+    bres = bfull.get("tasks", {})
+    bgen = bfull.get("generalization", {})
 
     scores = [float(r.get("detector_score", 0) or 0) for r in reps]
     confs = [float(r.get("subject_pos_confidence", 0) or 0) for r in reps]
@@ -190,6 +190,11 @@ def build(dataset_dir: str) -> str:
                  "temporal models.")
         L.append("- `vehicle_features.reporter_mean_indegree` — a graph feature (are you flagged by "
                  "entities that are themselves heavily flagged? a collusion / reporter-reputation signal).")
+        gb = bfull.get("graph_baseline")
+        if gb:
+            L.append(f"- **Graph baseline** (1-hop message passing vs node features): node-only ROC-AUC "
+                     f"**{gb.get('node_only_auc')}** → node+graph **{gb.get('node_plus_graph_auc')}** "
+                     f"(does the report-graph topology add signal?).")
         L.append("")
 
     L.append("## Intended use & limitations")
