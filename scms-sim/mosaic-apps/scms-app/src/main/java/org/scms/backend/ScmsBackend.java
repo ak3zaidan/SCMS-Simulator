@@ -66,6 +66,21 @@ public final class ScmsBackend {
     static final double GPS_DEGRADE_RATE = envDouble("SCMS_GPS_DEGRADE_RATE", 0.004);   // per second
     static final double GPS_DEGRADE_FACTOR = envDouble("SCMS_GPS_DEGRADE_FACTOR", 5.0);
     static final double GPS_DEGRADE_MIN_S = 3.0, GPS_DEGRADE_MAX_S = 8.0;
+    // Weather (SCMS_WEATHER = clear|rain|fog|snow) degrades sensors (and radio, in the app).
+    static final double WEATHER_SENSOR_MULT = weatherSensorMult();
+
+    private static double weatherSensorMult() {
+        String w = System.getenv("SCMS_WEATHER");
+        if (w == null) {
+            return 1.0;
+        }
+        switch (w.toLowerCase()) {
+            case "rain": return 1.5;
+            case "fog":  return 2.5;
+            case "snow": return 2.0;
+            default:     return 1.0;
+        }
+    }
     // MA revocation requires SUSTAINED, corroborated evidence (not a transient spike): K distinct
     // reporters AND reports in at least this many distinct 1-second intervals spanning >= PERSIST_S.
     // Counting distinct seconds (not raw reports) stops one multi-witness GPS spike from looking
@@ -335,7 +350,7 @@ public final class ScmsBackend {
         }
         double dt = (d.sensorLastT < 0) ? 0.1 : Math.max(1e-3, Math.min(10.0, t - d.sensorLastT));
         d.sensorLastT = t;
-        double q = d.gpsQ;                                    // per-vehicle GNSS quality
+        double q = d.gpsQ * WEATHER_SENSOR_MULT;              // per-vehicle GNSS quality × weather
         // transient degradation burst (canyon/tunnel) — elevated error for a few seconds
         if (t < d.degradeUntil) {
             q *= GPS_DEGRADE_FACTOR;
@@ -368,7 +383,9 @@ public final class ScmsBackend {
         }
         double mspeed = Math.max(0.0, speed + SPEED_SIGMA_MS * d.sRng.nextGaussian());
         double mheading = ((heading + HEADING_SIGMA_DEG * d.sRng.nextGaussian()) % 360 + 360) % 360;
-        double conf = 1.96 * Math.sqrt(sigma * sigma + bias * bias);
+        // 2-D 95% position-confidence radius: sqrt(-2 ln 0.05) ≈ 2.448 × per-axis sigma
+        // (the 1-D z-score 1.96 would under-cover a 2-D error — a real calibration fix).
+        double conf = 2.448 * Math.sqrt(sigma * sigma + bias * bias);
         AttackLib.Claim c;
         if (!d.attacker) {
             c = new AttackLib.Claim();
@@ -385,6 +402,7 @@ public final class ScmsBackend {
                     "true_vehicle_id", unitId,
                     "true_x", round3(x), "true_y", round3(y),
                     "claimed_x", round3(c.x), "claimed_y", round3(c.y), "claimed_speed", round3(c.speed),
+                    "pos_conf", round3(conf),
                     "is_attacker", d.attacker, "is_faulty", d.faulty, "falsified", falsified));
         }
         return c;

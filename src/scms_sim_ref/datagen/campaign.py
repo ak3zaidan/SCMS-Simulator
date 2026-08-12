@@ -63,6 +63,8 @@ def sample_domain(rng: random.Random, idx: int, base_seed: int, osm: bool) -> di
         "SCMS_RADIO_LOSS": round(rng.uniform(0.0, 0.15), 2),
         "SCMS_CHAN_CAPACITY": rng.choice([15, 25, 40, 80]),
         "SCMS_CAM_INTERVAL": rng.choice([0.5, 1.0]),
+        "SCMS_WEATHER": rng.choice(["clear", "clear", "rain", "fog", "snow"]),
+        "SCMS_NLOS": rng.choice([0.0, 0.0, 0.3, 0.6]),
         # SCMS policy
         "SCMS_REPORT_PROB": round(rng.uniform(0.6, 1.0), 2),
         "SCMS_REPORT_K": rng.choice([2, 3, 4]),

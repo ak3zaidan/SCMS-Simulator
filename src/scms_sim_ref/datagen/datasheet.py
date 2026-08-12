@@ -15,6 +15,7 @@ import os
 import numpy as np
 
 from . import benchmark as bench
+from . import calibration as calib
 from . import validate as validate_mod
 
 
@@ -128,6 +129,22 @@ def build(dataset_dir: str) -> str:
         ok = "✅" if (val is not None and lo <= val <= hi) else "⚠️"
         vs = f"{val:.3f}" if val is not None else "n/a"
         L.append(f"- {ok} {name}: **{vs}** (ref {lo}–{hi}; {ref})")
+    # quantitative calibration vs literature reference distributions
+    try:
+        cal = calib.calibrate(dataset_dir)
+    except Exception:
+        cal = {}
+    ge = cal.get("gps_error")
+    if ge:
+        ok = "✅" if ge.get("cep_in_real_range") and ge.get("shape_is_rayleigh_like") else "⚠️"
+        L.append(f"- {ok} GNSS error fit: CEP50 **{ge['fitted_cep_m']} m** (ref {ge['ref_cep_m']} m), "
+                 f"KS vs Rayleigh core **{ge['ks_vs_fitted_rayleigh']}**, KS vs literature model "
+                 f"**{ge['ks_vs_reference_rayleigh']}**")
+    cc = cal.get("confidence_calibration")
+    if cc:
+        ok = "✅" if cc.get("well_calibrated") else "⚠️"
+        L.append(f"- {ok} Confidence calibration: 95% radius empirically covers "
+                 f"**{cc['empirical_coverage_of_95pct_radius']}** of benign error (target 0.95)")
     L.append("")
 
     L.append("## Leakage-safe splits & revocation quality")

@@ -50,6 +50,19 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
     private static final int SYBIL_MIN = envI("SCMS_SYBIL_MIN", 5);
     private static final int CHAN_CAPACITY = envI("SCMS_CHAN_CAPACITY", 25);   // CAMs/100ms before congestion loss (0 = off)
     private static final double CHAN_WINDOW_S = 0.1;
+    private static final double WEATHER_DROP = weatherDrop();                   // 802.11p attenuation by weather
+    private static final double NLOS_INTENSITY = envD("SCMS_NLOS", 0.0);        // building-obstruction loss (0 = off)
+
+    private static double weatherDrop() {
+        String w = System.getenv("SCMS_WEATHER");
+        if (w == null) { return 0.0; }
+        switch (w.toLowerCase()) {
+            case "rain": return 0.05;
+            case "fog":  return 0.03;
+            case "snow": return 0.10;
+            default:     return 0.0;
+        }
+    }
 
     private static int envI(String n, int d) {
         String e = System.getenv(n);
@@ -188,6 +201,18 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
             return;
         }
         double t = getOperatingSystem().getSimulationTime() / 1e9;
+        // Weather (rain/fog/snow) attenuates the 802.11p link — a fraction of frames are lost.
+        if (WEATHER_DROP > 0 && chanRng.nextDouble() < WEATHER_DROP) {
+            return;
+        }
+        // NLOS: buildings obstruct more-distant links in urban areas — loss grows with distance.
+        if (NLOS_INTENSITY > 0 && haveSelf) {
+            double dist = Math.hypot(cam.claimedX - selfX, cam.claimedY - selfY);
+            double pn = NLOS_INTENSITY * Math.min(1.0, Math.max(0.0, (dist - 150.0) / 300.0));
+            if (pn > 0 && chanRng.nextDouble() < pn) {
+                return;
+            }
+        }
         // Channel congestion (CSMA/CA contention / CBR collapse): under high local channel load a
         // fraction of frames are lost before they can be decoded. This is the main radio realism a
         // full 802.11p PHY/MAC (OMNeT++/ns-3) would add over SNS — it makes DoS floods actually

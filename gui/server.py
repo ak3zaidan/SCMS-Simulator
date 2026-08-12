@@ -264,6 +264,12 @@ CONFIG_SPEC = [
     {"group": "Vehicle & radio", "name": "chan_capacity", "label": "Channel capacity (CAMs/100ms)", "type": "int",
      "default": 25, "min": 0, "max": 500, "env": "SCMS_CHAN_CAPACITY",
      "help": "CSMA/CA contention: above this local load, frames are lost (CBR collapse). 0 disables"},
+    {"group": "Vehicle & radio", "name": "weather", "label": "Weather", "type": "choice", "default": "clear",
+     "options": ["clear", "rain", "fog", "snow"], "env": "SCMS_WEATHER",
+     "help": "Degrades sensors (GPS error) and attenuates the 802.11p radio"},
+    {"group": "Vehicle & radio", "name": "nlos", "label": "NLOS obstruction", "type": "float",
+     "default": 0.0, "min": 0, "max": 1, "step": 0.05, "env": "SCMS_NLOS",
+     "help": "Building-obstruction reception loss that grows with distance (urban NLOS). 0 = off"},
 
     # --- Sensors & CAM timing (data realism) ---
     {"group": "Sensors & CAM timing", "name": "gps_sigma", "label": "GPS noise σ (m)", "type": "float",
