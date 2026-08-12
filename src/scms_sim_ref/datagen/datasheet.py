@@ -51,6 +51,8 @@ def build(dataset_dir: str) -> str:
     n_veh = len(veh)
     n_att = sum(bool(v.get("is_attacker")) for v in veh)
     n_fault = sum(bool(v.get("is_faulty")) for v in veh)
+    # benign = neither attacker nor faulty (don't assume the two flags are disjoint)
+    n_benign = sum(1 for v in veh if not v.get("is_attacker") and not v.get("is_faulty"))
     pseudonyms = len(idm)
     correctness = collections.Counter(r.get("report_correctness") for r in rlbl)
     atk_types = collections.Counter(a.get("attack_type") for a in atk)
@@ -91,7 +93,7 @@ def build(dataset_dir: str) -> str:
 
     L.append("## Composition")
     L.append(f"- Vehicles: **{n_veh}**  (attackers **{n_att}**, faulty **{n_fault}**, "
-             f"benign {n_veh - n_att - n_fault})")
+             f"benign {n_benign})")
     L.append(f"- Distinct pseudonym certificates (rotation): **{pseudonyms}** "
              f"({pseudonyms / n_veh:.1f} per vehicle)" if n_veh else "")
     L.append(f"- MA reports: **{len(reps)}**")
@@ -114,7 +116,8 @@ def build(dataset_dir: str) -> str:
     L.append("## Realism scorecard (vs real-world reference ranges)")
     total_rep = max(1, len(rlbl))
     fp_rate = correctness.get("false_positive", 0) / total_rep
-    benign_speeds = [float(e.get("claimed_speed", 0) or 0) for e in emit if not e.get("is_attacker")]
+    benign_speeds = [float(e.get("claimed_speed", 0) or 0) for e in emit
+                     if not e.get("is_attacker") and not e.get("is_faulty")]
     checks = [
         ("GNSS 95% position confidence (m)", np.median(confs) if confs else None, 2.0, 20.0,
          "real urban GNSS horizontal accuracy"),

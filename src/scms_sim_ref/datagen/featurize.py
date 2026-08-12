@@ -166,7 +166,7 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         norms = [float(r.get("detector_score_norm", 0.0) or 0.0) for r in rs]
         times = [float(r.get("detection_time", 0)) for r in rs]
         reporters = {r.get("reporter_cert_digest") for r in rs}
-        n_reasons = len({(r.get("reason_codes") or ["?"])[0] for r in rs})
+        n_reasons = len({c for r in rs for c in (r.get("reason_codes") or ["?"])})
         subj_true = vehicle_by_digest.get(digest, "unknown")
         split = _split_for(split_seed, subj_true)
         sf_rows.append({
@@ -203,9 +203,6 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         tv = vehicle_by_digest.get(r.get("subject_cert_digest"), "unknown")
         if tv != "unknown":
             reports_by_vehicle.setdefault(tv, []).append(r)
-    pseudonyms_by_vehicle: dict[str, int] = {}
-    for m in gt_idmap:
-        pseudonyms_by_vehicle[m["true_vehicle_id"]] = pseudonyms_by_vehicle.get(m["true_vehicle_id"], 0) + 1
     vf_rows, vl_rows = [], []
     for v in gt_vehicle:
         tv = v["true_vehicle_id"]
@@ -214,13 +211,16 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         norms = [float(r.get("detector_score_norm", 0.0) or 0.0) for r in rs]
         times = [float(r.get("detection_time", 0)) for r in rs]
         reporters = {r.get("reporter_cert_digest") for r in rs}
-        reasons = {(r.get("reason_codes") or ["?"])[0] for r in rs}
+        reasons = {c for r in rs for c in (r.get("reason_codes") or ["?"])}
+        # MA-visible pseudonym count: distinct subject certs the MA actually linked from its OWN
+        # reports (NOT the oracle gt_identity_map, which would leak Sybil ghosts / unobserved certs).
+        n_pseudonyms = len({r.get("subject_cert_digest") for r in rs})
         split = _split_for(split_seed, tv)
         vf_rows.append({
             "entity_id": entity_id,
             "n_reports": len(rs),
             "n_distinct_reporters": len(reporters),
-            "n_pseudonyms": pseudonyms_by_vehicle.get(tv, 1),
+            "n_pseudonyms": n_pseudonyms,
             "n_distinct_reasons": len(reasons) if rs else 0,
             "score_norm_max": max(norms) if norms else 0.0,
             "score_norm_mean": sum(norms) / len(norms) if norms else 0.0,
@@ -281,7 +281,7 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         a["n"] += 1
         a["sn"] = max(a["sn"], float(r.get("detector_score_norm", 0.0) or 0.0))
         a["reps"].add(r.get("reporter_cert_digest"))
-        a["reasons"].add((r.get("reason_codes") or ["?"])[0])
+        a["reasons"].update(r.get("reason_codes") or ["?"])
     window_rows = [{"entity_id": e, "window": w, "n_reports": a["n"], "score_norm_max": a["sn"],
                     "n_distinct_reporters": len(a["reps"]), "n_distinct_reasons": len(a["reasons"]),
                     "split": a["split"]}

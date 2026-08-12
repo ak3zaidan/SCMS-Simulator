@@ -36,6 +36,7 @@ FORBIDDEN_FEATURE_KEYS = frozenset({
     "senderRealId", "reportedRealId",          # the exact F2MD leakage fields
     "true_x", "true_y", "true_speed", "true_heading", "true_accel",
     "is_attacker", "attacker_role", "attack_type", "attack_id",
+    "is_faulty", "attack_family", "falsified",  # fault/attack labels (added post-audit)
     "colluding_group_id", "true_linkage_seed", "true_revocation_time",
     "should_have_been_revoked", "report_correctness",
 })
@@ -49,6 +50,8 @@ def is_forbidden_feature_key(key: str) -> bool:
     lk = k.lower()
     return (
         lk.startswith("true_")
+        or lk.startswith("label_")   # any evaluation label
+        or lk.startswith("attack_")  # attack_type / attack_family / attack_id / ...
         or lk.endswith("_true_id")
         or lk.endswith("real_id")
         or lk in {"realid", "vehicleid_true"}

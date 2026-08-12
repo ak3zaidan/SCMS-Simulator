@@ -71,8 +71,9 @@ def calibrate(dataset_dir: str) -> dict:
 
     # confidence calibration: fraction of benign errors within the broadcast 95% confidence radius
     confs = [float(e.get("pos_conf", 0) or 0) for e in benign]
-    if any(confs):
-        covered = float(np.mean([e_ <= c_ for e_, c_ in zip(err, confs) if c_ > 0]))
+    pairs = [(e_, c_) for e_, c_ in zip(err, confs) if c_ > 0]
+    if pairs:
+        covered = float(np.mean([e_ <= c_ for e_, c_ in pairs]))
         out["confidence_calibration"] = {
             "empirical_coverage_of_95pct_radius": round(covered, 3),
             "target": 0.95,

@@ -70,18 +70,13 @@ def _roc_auc(y: np.ndarray, s: np.ndarray) -> float | None:
     pos, neg = s[y == 1], s[y == 0]
     if len(pos) == 0 or len(neg) == 0:
         return None
-    order = np.argsort(s, kind="mergesort")
-    ranks = np.empty(len(s), dtype=float)
-    ranks[order] = np.arange(1, len(s) + 1)
-    # average ranks for ties
+    # mid-rank (tie-averaged) Mann–Whitney statistic
     _, inv, counts = np.unique(s, return_inverse=True, return_counts=True)
-    csum = np.cumsum(counts)
-    avg = {}
-    start = 0
+    avg, start = {}, 0
     for i, c in enumerate(counts):
         avg[i] = (start + 1 + start + c) / 2.0
         start += c
-    ranks = np.array([avg[i] for i in inv])
+    ranks = np.array([avg[i] for i in np.asarray(inv).ravel()])
     auc = (ranks[y == 1].sum() - len(pos) * (len(pos) + 1) / 2.0) / (len(pos) * len(neg))
     return float(auc)
 

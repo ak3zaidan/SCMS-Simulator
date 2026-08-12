@@ -36,8 +36,9 @@ if ($SkipBuild) { Write-Host "   (skipped)" } else { & "$repo\scms-sim\mosaic-ap
 
 Write-Host "== [2/6] Generate '$Scenario' scenario =="
 $genArgs = @($Scenario)
+$hasSeed = $PSBoundParameters.ContainsKey('Seed')   # so -Seed 0 is honoured (0 is falsy)
 if ($Duration)    { $genArgs += @('--duration', $Duration) }
-if ($Seed)        { $genArgs += @('--seed', "$Seed") }
+if ($hasSeed)     { $genArgs += @('--seed', "$Seed") }
 if ($Scale)       { $genArgs += @('--scale', "$Scale") }
 if ($MaxVehicles) { $genArgs += @('--max-vehicles', "$MaxVehicles") }
 if ($TargetFlow)  { $genArgs += @('--target-flow', "$TargetFlow") }
@@ -53,7 +54,7 @@ Write-Host "   $($gen.kind) scenario -> $cfg"
 
 Write-Host "== [3/6] Simulate in MOSAIC + SUMO  ->  $out =="
 $env:SCMS_OUT_DIR = $out
-if ($Seed) { $env:SCMS_SEED = "$Seed" }
+if ($hasSeed) { $env:SCMS_SEED = "$Seed" }
 Push-Location $env:MOSAIC_HOME
 $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'   # MOSAIC/SUMO write progress to stderr; don't treat as fatal
@@ -65,9 +66,12 @@ try {
     $ErrorActionPreference = $prevEAP
     Pop-Location
     Remove-Item Env:\SCMS_OUT_DIR -ErrorAction SilentlyContinue
-    if ($Seed) { Remove-Item Env:\SCMS_SEED -ErrorAction SilentlyContinue }
+    if ($hasSeed) { Remove-Item Env:\SCMS_SEED -ErrorAction SilentlyContinue }
 }
 
+if (-not (Test-Path (Join-Path $out 'manifest.json'))) {
+    throw "Simulation produced no dataset (no manifest.json at $out) - MOSAIC/SUMO likely failed."
+}
 $env:PYTHONPATH = "$repo\src"
 Write-Host "== [4/6] Featurize -> ML-ready tables =="
 python -m scms_sim_ref.datagen.featurize $out

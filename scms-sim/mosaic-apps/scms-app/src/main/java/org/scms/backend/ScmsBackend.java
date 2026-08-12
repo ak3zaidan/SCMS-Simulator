@@ -41,7 +41,7 @@ import org.scms.entities.Scms;
 public final class ScmsBackend {
 
     static final long MASTER_SEED = resolveSeed();
-    static final int JMAX = envInt("SCMS_JMAX", 20);
+    static final int JMAX = Math.max(1, envInt("SCMS_JMAX", 20));   // >=1: avoids modulo-by-zero
     static final int REPORT_THRESHOLD_K = envInt("SCMS_REPORT_K", Integer.getInteger("scms.k", 3));
     static final int ATTACKER_PCT = envInt("SCMS_ATTACKER_PCT", Integer.getInteger("scms.attackerPct", 20));
     static final int FREEZE_AFTER_UPDATES = envInt("SCMS_FREEZE_UPDATES", 5);
@@ -408,7 +408,7 @@ public final class ScmsBackend {
         if (emitRng.nextDouble() < EMIT_SAMPLE) {
             boolean falsified = d.attacker && (Math.hypot(c.x - mx, c.y - my) > 1.0
                     || Math.abs(c.speed - mspeed) > 1.0 || c.genTimeNs != tNs || c.flood || c.sybilGhosts > 0);
-            gtEmit.add(gtRow("emit_id", String.format("emt_%08d", gtEmit.size()), "t", round3(t),
+            gtEmit.add(gtRow("emit_id", String.format(java.util.Locale.ROOT, "emt_%08d", gtEmit.size()), "t", round3(t),
                     "true_vehicle_id", unitId,
                     "true_x", round3(x), "true_y", round3(y),
                     "claimed_x", round3(c.x), "claimed_y", round3(c.y), "claimed_speed", round3(c.speed),
@@ -474,7 +474,7 @@ public final class ScmsBackend {
         }
         scms.lop.forward(rep.certDigest, subj.certDigest);   // LOP strips network identifiers
         reportCounter++;
-        String rid = String.format("rpt_%05d", reportCounter);
+        String rid = String.format(java.util.Locale.ROOT, "rpt_%05d", reportCounter);
         double ingestDelay = INGEST_DELAY_S * (0.5 + rng.nextDouble());   // realistic report-channel latency
         maReports.add(maRow("report_id", rid, "ingest_time", round3(t + ingestDelay),
                 "detection_time", round3(t),
@@ -514,7 +514,7 @@ public final class ScmsBackend {
     /** MA investigation across entities: PCA -> LA1/LA2 (seeds) -> RA (blacklist) -> CRLG -> CRL Store. */
     private void resolveAndRevoke(Dev subj, double t) {
         caseCounter++;
-        String caseId = String.format("case_%04d", caseCounter);
+        String caseId = String.format(java.util.Locale.ROOT, "case_%04d", caseCounter);
         Scms.Prov p = scms.pca.resolve(subj.certDigest);          // opaque record: no identity
         byte[] ls1i = scms.la1.seedAt(p.laHandle1, p.i);          // forward seeds from the two LAs
         byte[] ls2i = scms.la2.seedAt(p.laHandle2, p.i);
@@ -531,7 +531,7 @@ public final class ScmsBackend {
         maInvest.add(maRow("case_id", caseId, "opened_time", round3(t), "trigger", "report_threshold",
                 "num_distinct_reporters", reporters, "linkage_result", "same", "identity_resolved", true,
                 "revocation_decision", "revoke", "resolved_case_handle", hex(sha(caseId), 6)));
-        maCrl.add(maRow("crl_id", String.format("crl_%04d", caseCounter), "issue_time", round3(t),
+        maCrl.add(maRow("crl_id", String.format(java.util.Locale.ROOT, "crl_%04d", caseCounter), "issue_time", round3(t),
                 "entry_type", "seed", "num_entries", scms.crlg.size()));
         gtRev.add(gtRow("true_vehicle_id", subj.unitId, "should_have_been_revoked", subj.attacker,
                 "true_revocation_time", round3(t)));

@@ -355,6 +355,9 @@ def start_run(config: dict) -> dict:
             val = config.get(c["name"], "")
             if c["type"] == "multi":
                 env[c["env"]] = _attacks_env(val)
+            elif c["type"] == "choice":
+                if val in c.get("options", []):     # only accept a listed option
+                    env[c["env"]] = str(val)
             elif val != "":
                 env[c["env"]] = str(val)
 
@@ -378,6 +381,11 @@ def start_run(config: dict) -> dict:
             pass
 
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if RUN.get("logf"):                          # don't leak the previous run's handle
+            try:
+                RUN["logf"].close()
+            except Exception:
+                pass
         logf = open(LOG_PATH, "w", encoding="utf-8", errors="replace")
         proc = subprocess.Popen(cmd, cwd=str(REPO), env=env, stdout=logf,
                                 stderr=subprocess.STDOUT, text=True)
@@ -530,7 +538,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, live_state())
         return self._send(404, {"error": "not found"})
 
+    def _same_origin(self) -> bool:
+        # Reject cross-origin state-changing requests (CSRF defence): a drive-by web page must not
+        # be able to POST /api/start|stop to this localhost server from the user's browser.
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True   # non-browser client (curl/fetch w/o Origin) — allowed
+        return origin in (f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}")
+
     def do_POST(self):
+        if not self._same_origin():
+            return self._send(403, {"error": "cross-origin request refused"})
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b"{}"
         try:

@@ -175,8 +175,15 @@ def write_sns_config(dst: Path):
 # ---------------------------------------------------------------------------
 # key parsing + catalogue
 # ---------------------------------------------------------------------------
+_MAPGEN_RE = re.compile(r"^(grid_\d{1,3}x\d{1,3}|spider_\d{1,3}a\d{1,3}c|rand_\d{1,4})(_s\d{1,4})?$")
+
+
 def is_mapgen_key(key: str) -> bool:
-    return bool(re.match(r"^(grid|spider|rand)_", key) or key.startswith("osm_"))
+    """Strict, fully-anchored key grammar. Rejects anything with path separators / '..' and any
+    unknown OSM city, so a key can never escape scms-sim/scenarios/ (no path traversal)."""
+    if key.startswith("osm_"):
+        return key[len("osm_"):] in CITIES
+    return bool(_MAPGEN_RE.match(key))
 
 
 def catalog() -> list[dict]:
@@ -211,6 +218,7 @@ def catalog() -> list[dict]:
 # net generation
 # ---------------------------------------------------------------------------
 def _run(cmd: list[str], **kw):
+    kw.setdefault("timeout", 600)   # netgenerate/netconvert/randomTrips must not hang forever
     return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
 
 
@@ -331,11 +339,17 @@ def _net_offset(net: Path) -> tuple[float, float]:
 
 
 def build(key: str, dst: Path, duration=None, scale=None, seed=None, period=None) -> dict:
+    if not is_mapgen_key(key):
+        raise SystemExit(f"invalid map key {key!r}")   # guard before any filesystem op
     dur = duration or "300s"
     dur_s = float(re.sub(r"[^\d.]", "", str(dur)) or 300)
     rng_seed = int(seed) if seed else 42
     per = float(period) if period else 1.5   # smaller -> denser traffic
 
+    # defence in depth: the output dir must stay under scms-sim/scenarios/
+    base = (REPO / "scms-sim" / "scenarios").resolve()
+    if not str(dst.resolve()).startswith(str(base)):
+        raise SystemExit(f"refusing to write outside {base}: {dst}")
     if dst.exists():
         shutil.rmtree(dst)
     (dst / "sumo").mkdir(parents=True)

@@ -31,7 +31,8 @@ REPO = Path(__file__).resolve().parents[3]
 RUN_PS1 = REPO / "run.ps1"
 TABLES = ["report_features", "report_labels", "subject_features", "subject_labels",
           "vehicle_features", "vehicle_labels"]
-ID_COLS = {"report_id", "subject_cert_digest", "reporter_cert_digest", "entity_id", "true_vehicle_id"}
+ID_COLS = {"report_id", "subject_cert_digest", "reporter_cert_digest", "entity_id",
+           "true_vehicle_id", "subject_true_id", "reporter_true_id"}
 OSM_SAMPLE = ["osm_munich", "osm_manhattan", "osm_tokyo", "osm_paris", "osm_singapore"]
 
 
