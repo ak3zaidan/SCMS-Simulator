@@ -88,6 +88,13 @@ public final class ScmsBackend {
     // clear it while continuously-misbehaving attackers do not.
     static final int REVOKE_MIN_SECONDS = envInt("SCMS_MIN_SECONDS", 8);
     static final double REVOKE_PERSIST_S = envDouble("SCMS_PERSIST_S", 5.0);
+    // Collusion-robust MA: only reports from TRUSTED reporters count toward revocation. A reporter
+    // that is itself heavily reported (or revoked) is discounted — so a colluding group that also
+    // misbehaves loses its ability to frame a benign victim. On by default (a real MA weighs trust);
+    // a no-op when there is no collusion (honest reporters are never suspicious).
+    static final boolean MA_DEFENSE = envInt("SCMS_MA_DEFENSE", 1) != 0;
+    static final int REPUTATION_MAX = envInt("SCMS_REPUTATION_MAX", 6);   // reports-against before a reporter is distrusted
+    static final int REPORT_BUDGET = envInt("SCMS_REPORT_BUDGET", 25);    // reports a reporter may file before rate-limited
     // Pseudonym rotation: each vehicle changes pseudonym certificate every ROTATE_PERIOD_S (a new
     // digest under the SAME LA linkage seeds, so the MA can still link+revoke it). 0 disables.
     static final double ROTATE_PERIOD_S = envDouble("SCMS_ROTATE_PERIOD", 90.0);
@@ -175,6 +182,8 @@ public final class ScmsBackend {
         boolean colluder;              // files false accusations against benign victims
         boolean victim;                // benign target of a collusion campaign
         double lastFalseReportT = -1e9;
+        int reportsReceived;           // reports filed AGAINST this vehicle (reporter-reputation)
+        int reportsFiled;              // reports this vehicle has filed (rate-limit / spray detection)
         int faultMode;                 // 0 = extra outliers, 1 = constant bias, 2 = slow drift
         double faultAngle, faultMag;   // fault direction + magnitude
         double driftAccum;             // slow-drift fault accumulator
@@ -217,6 +226,7 @@ public final class ScmsBackend {
     private final List<String> victims = new ArrayList<>();          // benign collusion targets
     private final Map<String, double[]> subjAgg = new HashMap<>();   // subject -> {firstT, lastT}
     private final Map<String, java.util.Set<Long>> subjSeconds = new HashMap<>();   // subject -> distinct report seconds
+    private final Map<String, java.util.Set<String>> trustedReporters = new HashMap<>();  // subject veh -> trusted reporter vehs
 
     private ScmsBackend() {
         Runtime.getRuntime().addShutdownHook(new Thread(this::writeOutputs));
@@ -478,7 +488,19 @@ public final class ScmsBackend {
                 : (subj.faulty ? "faulty_detection" : "false_positive"));
         gtRepLbl.add(gtRow("report_id", rid, "reporter_true_id", rep.unitId, "subject_true_id", subj.unitId,
                 "report_correctness", correctness));
-        int distinct = scms.ma.addReporter(subjectDigest, reporterDigest);
+        int distinctAll = scms.ma.addReporter(subjectDigest, reporterDigest);
+        subj.reportsReceived++;
+        rep.reportsFiled++;
+        // reporter-reputation defense: a report only counts if the reporter is trusted — not revoked,
+        // not itself heavily reported, and not spraying accusations beyond a sane report budget
+        // (rate-limiting). This blunts collusion campaigns that flood false reports at a victim.
+        boolean repTrusted = !MA_DEFENSE || (!rep.revoked && rep.reportsReceived < REPUTATION_MAX
+                && rep.reportsFiled <= REPORT_BUDGET);
+        java.util.Set<String> trusted = trustedReporters.computeIfAbsent(subj.unitId, k -> new java.util.HashSet<>());
+        if (repTrusted) {
+            trusted.add(rep.unitId);
+        }
+        int distinct = MA_DEFENSE ? trusted.size() : distinctAll;
         double[] ag = subjAgg.computeIfAbsent(subjectDigest, k -> new double[] {t, t});
         ag[1] = t;                                               // lastT (firstT fixed)
         java.util.Set<Long> secs = subjSeconds.computeIfAbsent(subjectDigest, k -> new java.util.HashSet<>());

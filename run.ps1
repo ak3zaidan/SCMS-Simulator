@@ -45,7 +45,10 @@ if ($Lanes)       { $genArgs += @('--lanes', "$Lanes") }
 $gen = & python "$repo\scms-sim\scenarios\gen_scenario.py" @genArgs | ConvertFrom-Json
 $cfg = $gen.scenario_config
 $out = $gen.dataset_dir
-if ($OutDir) { $out = $OutDir }
+if ($OutDir) {
+    # resolve relative -OutDir against the repo (the Java back-end runs with cwd = MOSAIC_HOME)
+    $out = if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path $repo $OutDir }
+}
 Write-Host "   $($gen.kind) scenario -> $cfg"
 
 Write-Host "== [3/6] Simulate in MOSAIC + SUMO  ->  $out =="
