@@ -143,19 +143,6 @@ The run writes `datasets/poc_run/ma/*.jsonl` (MA-visible), a **separate**
 `datasets/poc_run/ground_truth/*.jsonl` (oracle-only), and `manifest.json`
 (seed, config, per-file SHA-256, data digest, standards profile).
 
-## Layout
-
-```
-src/scms_sim_ref/
-  scms_core/      linkage.py (CAMP SCP2), crypto_abstract.py (Ed25519, HashedId8)
-  schemas/        records.py (MA-visible vs ORACLE, forbidden-field registry)
-  datagen/        leakage_linter.py (build-breaking)
-  mock_pipeline/  run.py (closed-loop reference)
-tests/            test_linkage.py, test_leakage.py, test_pipeline.py
-docs/adr/         architecture decision records
-scenarios/        scenario specs (P4)
-```
-
 ## MOSAIC layer — build & run the custom app
 
 The toolchain lives under `C:\Users\Administrator\tools` (JDK 17, SUMO 1.25.0,
@@ -174,11 +161,3 @@ cd $env:MOSAIC_HOME
 `mosaic.bat` builds a relative classpath, so always run it with the MOSAIC bundle
 as the working directory. `ScmsBeaconApp` receives SUMO-driven vehicle updates —
 the hook point for signing, detection, and reporting.
-
-## Licensing
-
-Code: **Apache-2.0**. Generated datasets are intended for release under
-**CC-BY-4.0** (matching the VeReMi family). The MOSAIC/SUMO/NextGen dependencies
-are EPL-2.0 / Apache-2.0 — deliberately chosen so this project stays Apache-2.0
-(Veins/Artery/F2MD are GPL and were rejected as the base for that reason). See the
-design document's licensing section.
