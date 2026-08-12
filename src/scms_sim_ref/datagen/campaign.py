@@ -84,7 +84,8 @@ def sample_domain(rng: random.Random, idx: int, base_seed: int, osm: bool) -> di
         "SCMS_ATTACKS": "all",
     }
     return {"idx": idx, "scenario": scen, "duration": rng.choice(["120s", "150s", "180s"]),
-            "seed": base_seed + idx, "env": env}
+            # keep the per-domain seed inside Int32 (run.ps1 -Seed and MOSAIC randomSeed are 32-bit)
+            "seed": (base_seed + idx * 100003) % 2_000_000_000, "env": env}
 
 
 def run_domain(dom: dict, out_dir: Path, skip_build: bool) -> dict:
@@ -144,7 +145,7 @@ def main(argv=None) -> int:
         shutil.rmtree(base)
     base.mkdir(parents=True)
     rng = random.Random(a.seed)
-    domains = [sample_domain(rng, i, a.seed * 1000, a.osm) for i in range(a.domains)]
+    domains = [sample_domain(rng, i, a.seed, a.osm) for i in range(a.domains)]
 
     print(f"== domain-randomization campaign: {a.domains} domains, seed {a.seed} ==", flush=True)
     for i, dom in enumerate(domains):

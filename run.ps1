@@ -18,7 +18,7 @@ param(
     # Or a generated map key: grid_6x6 / spider_8a4c / rand_150 (+_s2 seed) / osm_manhattan (see mapgen.py).
     [string]$Scenario = 'smoke',
     [string]$Duration,
-    [int]$Seed,
+    [long]$Seed,
     [string]$Scale,          # route maps: SUMO traffic-density multiplier
     [int]$MaxVehicles,       # flow maps: cap on concurrent vehicles
     [int]$TargetFlow,        # flow maps: vehicles/hour
