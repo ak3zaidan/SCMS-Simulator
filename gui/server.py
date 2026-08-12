@@ -105,6 +105,9 @@ CONFIG_SPEC = [
     {"group": "SCMS policy", "name": "attacker_pct", "label": "Attacker %", "type": "int",
      "default": 20, "min": 0, "max": 100, "env": "SCMS_ATTACKER_PCT",
      "help": "Percentage of vehicles that misbehave"},
+    {"group": "SCMS policy", "name": "faulty_pct", "label": "Faulty %", "type": "int",
+     "default": 5, "min": 0, "max": 100, "env": "SCMS_FAULTY_PCT",
+     "help": "Percentage of (non-attacker) vehicles with a malfunctioning sensor (anomalous, not malicious)"},
     {"group": "SCMS policy", "name": "report_k", "label": "Reporters to revoke (K)", "type": "int",
      "default": 3, "min": 1, "max": 50, "env": "SCMS_REPORT_K",
      "help": "Distinct reporters before the MA opens an investigation / revokes"},
@@ -257,6 +260,9 @@ CONFIG_SPEC = [
     {"group": "Sensors & CAM timing", "name": "flood_burst", "label": "DoS burst (msgs/tick)", "type": "int",
      "default": 10, "min": 1, "max": 100, "env": "SCMS_FLOOD_BURST",
      "help": "How many CAMs a DoS attacker emits per simulation step"},
+    {"group": "Sensors & CAM timing", "name": "emit_sample", "label": "Per-msg GT sample rate", "type": "float",
+     "default": 0.02, "min": 0, "max": 1, "step": 0.01, "env": "SCMS_EMIT_SAMPLE",
+     "help": "Fraction of CAMs logged to gt_emissions_sample (true-vs-claimed, message-level labels)"},
 ]
 
 _LOCK = threading.Lock()

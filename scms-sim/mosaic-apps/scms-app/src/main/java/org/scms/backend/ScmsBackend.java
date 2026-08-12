@@ -71,6 +71,11 @@ public final class ScmsBackend {
     // Pseudonym rotation: each vehicle changes pseudonym certificate every ROTATE_PERIOD_S (a new
     // digest under the SAME LA linkage seeds, so the MA can still link+revoke it). 0 disables.
     static final double ROTATE_PERIOD_S = envDouble("SCMS_ROTATE_PERIOD", 90.0);
+    // A fraction of vehicles are FAULTY (malfunctioning sensor), not malicious: they look anomalous
+    // but are not attacks, so a detector must tell faults from attacks. And a per-message ground-truth
+    // sample records true-vs-claimed content for message-level benchmarks.
+    static final int FAULTY_PCT = envInt("SCMS_FAULTY_PCT", 5);
+    static final double EMIT_SAMPLE = envDouble("SCMS_EMIT_SAMPLE", 0.02);
     static final String OUT_DIR = resolveOutDir();
 
     // Config is read from environment variables first (so the GUI can change it without a
@@ -139,6 +144,7 @@ public final class ScmsBackend {
         byte[] lv;
         LinkageEngine.Device link;
         boolean attacker;
+        boolean faulty;                // malfunctioning sensor (anomalous but not malicious)
         String attackType = "none";
         AttackLib.State atk = null;
         List<String> ghosts = null;   // Sybil: extra identities mapped back to this device
@@ -166,6 +172,8 @@ public final class ScmsBackend {
     private final List<Map<String, Object>> gtAtk = new ArrayList<>();
     private final List<Map<String, Object>> gtRepLbl = new ArrayList<>();
     private final List<Map<String, Object>> gtRev = new ArrayList<>();
+    private final List<Map<String, Object>> gtEmit = new ArrayList<>();   // per-message GT sample
+    private final Random emitRng = new Random(MASTER_SEED * 104729L);
 
     private int reportCounter = 0;
     private int caseCounter = 0;
@@ -198,6 +206,8 @@ public final class ScmsBackend {
         if (d.attacker) {
             d.attackType = AttackLib.assign(unitId, MASTER_SEED, attacksEnabled);
             d.atk = new AttackLib.State(MASTER_SEED * 1000003L + unitId.hashCode());
+        } else {
+            d.faulty = ((sha("fault|" + MASTER_SEED + "|" + unitId)[0] & 0xff) * 100 / 256) < FAULTY_PCT;
         }
 
         // SCMS provisioning across the distinct entities (trust boundaries preserved).
@@ -225,7 +235,8 @@ public final class ScmsBackend {
                 gtId.add(gtRow("true_vehicle_id", unitId, "pseudonym_cert_digest", g, "i_period", d.i));
             }
         }
-        gtVeh.add(gtRow("true_vehicle_id", unitId, "is_attacker", d.attacker, "attacker_role", d.attackType));
+        gtVeh.add(gtRow("true_vehicle_id", unitId, "is_attacker", d.attacker, "is_faulty", d.faulty,
+                "attacker_role", d.attackType));
         gtId.add(gtRow("true_vehicle_id", unitId, "pseudonym_cert_digest", d.certDigest, "i_period", d.i));
         gtEnroll.add(gtRow("true_vehicle_id", unitId, "enrollment_cert", enrollmentId,
                 "device_type", scms.dcm.deviceType(unitId), "eca_id", scms.eca.id));
@@ -294,7 +305,9 @@ public final class ScmsBackend {
         d.sBiasY = a * d.sBiasY + qv * d.sRng.nextGaussian();
         double mx = x + d.sBiasX + GPS_SIGMA_M * d.sRng.nextGaussian();
         double my = y + d.sBiasY + GPS_SIGMA_M * d.sRng.nextGaussian();
-        if (d.sRng.nextDouble() < Math.min(0.5, GPS_OUTLIER_RATE * dt)) {   // rare multipath spike
+        // Faulty units glitch more often (a malfunctioning sensor, not an attack).
+        double outRate = d.faulty ? GPS_OUTLIER_RATE * 6.0 : GPS_OUTLIER_RATE;
+        if (d.sRng.nextDouble() < Math.min(0.6, outRate * dt)) {   // rare multipath spike
             double ang = d.sRng.nextDouble() * 2 * Math.PI;
             double mag = GPS_OUTLIER_M * (0.5 + d.sRng.nextDouble());
             mx += Math.cos(ang) * mag; my += Math.sin(ang) * mag;
@@ -310,6 +323,16 @@ public final class ScmsBackend {
             c = AttackLib.compute(d.attackType, d.atk, sendCount, mx, my, mspeed, mheading, tNs, attackCfg);
         }
         c.posConf = conf;
+        // per-message ground-truth sample (true vs claimed) for message-level benchmarks
+        if (emitRng.nextDouble() < EMIT_SAMPLE) {
+            boolean falsified = d.attacker && (Math.hypot(c.x - mx, c.y - my) > 1.0
+                    || Math.abs(c.speed - mspeed) > 1.0 || c.genTimeNs != tNs || c.flood || c.sybilGhosts > 0);
+            gtEmit.add(gtRow("emit_id", String.format("emt_%08d", gtEmit.size()), "t", round3(t),
+                    "true_vehicle_id", unitId,
+                    "true_x", round3(x), "true_y", round3(y),
+                    "claimed_x", round3(c.x), "claimed_y", round3(c.y), "claimed_speed", round3(c.speed),
+                    "is_attacker", d.attacker, "is_faulty", d.faulty, "falsified", falsified));
+        }
         return c;
     }
 
@@ -354,7 +377,7 @@ public final class ScmsBackend {
                 "detector_score", round3(score), "subject_pos_confidence", round3(subjectPosConf),
                 "sig_valid", true, "cert_crl_status", "active"));
         gtRepLbl.add(gtRow("report_id", rid, "reporter_true_id", rep.unitId, "subject_true_id", subj.unitId,
-                "report_correctness", subj.attacker ? "correct" : "false_positive"));
+                "report_correctness", subj.attacker ? "correct" : (subj.faulty ? "faulty_detection" : "false_positive")));
         int distinct = scms.ma.addReporter(subjectDigest, reporterDigest);
         double[] ag = subjAgg.computeIfAbsent(subjectDigest, k -> new double[] {t, t});
         ag[1] = t;                                               // lastT (firstT fixed)
@@ -422,6 +445,7 @@ public final class ScmsBackend {
             digests.put("ground_truth/gt_attacks.jsonl", writeJsonl(gt.resolve("gt_attacks.jsonl"), sortBy(gtAtk, "attack_id")));
             digests.put("ground_truth/gt_report_labels.jsonl", writeJsonl(gt.resolve("gt_report_labels.jsonl"), sortBy(gtRepLbl, "report_id")));
             digests.put("ground_truth/gt_linkage_revocation.jsonl", writeJsonl(gt.resolve("gt_linkage_revocation.jsonl"), sortBy(gtRev, "true_vehicle_id")));
+            digests.put("ground_truth/gt_emissions_sample.jsonl", writeJsonl(gt.resolve("gt_emissions_sample.jsonl"), sortBy(gtEmit, "emit_id")));
 
             MessageDigest all = MessageDigest.getInstance("SHA-256");
             for (Map.Entry<String, String> en : digests.entrySet()) {

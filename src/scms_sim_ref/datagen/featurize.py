@@ -86,6 +86,7 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
 
     # --- ground-truth lookups (used for LABELS + split grouping only) ---
     attacker_by_vehicle = {v["true_vehicle_id"]: bool(v["is_attacker"]) for v in gt_vehicle}
+    faulty_by_vehicle = {v["true_vehicle_id"]: bool(v.get("is_faulty", False)) for v in gt_vehicle}
     vehicle_by_digest = {m["pseudonym_cert_digest"]: m["true_vehicle_id"] for m in gt_idmap}
     label_by_report = {r["report_id"]: r for r in gt_report_labels}
     lifetime_by_digest = {
@@ -156,6 +157,7 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         sl_rows.append({
             "subject_cert_digest": digest,
             "label_is_attacker": int(attacker_by_vehicle.get(subj_true, False)),
+            "label_is_faulty": int(faulty_by_vehicle.get(subj_true, False)),
             "label_was_revoked": int(bool(revoked_by_digest.get(digest, False))),
             "true_vehicle_id": subj_true,
             "split": split,
