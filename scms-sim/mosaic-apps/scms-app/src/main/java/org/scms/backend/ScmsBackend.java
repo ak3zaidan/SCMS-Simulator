@@ -68,6 +68,9 @@ public final class ScmsBackend {
     // clear it while continuously-misbehaving attackers do not.
     static final int REVOKE_MIN_SECONDS = envInt("SCMS_MIN_SECONDS", 8);
     static final double REVOKE_PERSIST_S = envDouble("SCMS_PERSIST_S", 5.0);
+    // Pseudonym rotation: each vehicle changes pseudonym certificate every ROTATE_PERIOD_S (a new
+    // digest under the SAME LA linkage seeds, so the MA can still link+revoke it). 0 disables.
+    static final double ROTATE_PERIOD_S = envDouble("SCMS_ROTATE_PERIOD", 90.0);
     static final String OUT_DIR = resolveOutDir();
 
     // Config is read from environment variables first (so the GUI can change it without a
@@ -142,6 +145,10 @@ public final class ScmsBackend {
         double lastX, lastY, lastSeenT = -1;   // true position, for the live map
         double sBiasX, sBiasY, sensorLastT = -1;   // OU-correlated sensor bias state
         java.util.Random sRng;                     // per-vehicle sensor-noise RNG (seeded)
+        double nextRotateT = Double.MAX_VALUE;     // next pseudonym rotation time
+        int rotCount = 0;
+        boolean revoked = false;                   // vehicle-level revocation (covers all pseudonyms)
+        double revokeT = -1;
     }
 
     private final Map<String, Dev> devByUnit = new HashMap<>();
@@ -205,6 +212,7 @@ public final class ScmsBackend {
         scms.pca.issue(d.certDigest, d.requestHash, d.i, d.j, laH1, laH2);
         scms.ra.bind(d.requestHash, enrollmentId);   // RA is the only request->identity mapping
 
+        d.nextRotateT = (ROTATE_PERIOD_S > 0) ? ROTATE_PERIOD_S : Double.MAX_VALUE;
         devByUnit.put(unitId, d);
         devByDigest.put(d.certDigest, d);
         if (d.attacker && "Sybil".equals(AttackLib.baseOf(d.attackType))) {
@@ -230,6 +238,37 @@ public final class ScmsBackend {
         register(unitId);
         Dev d = devByUnit.get(unitId);
         return new Cred(d.certDigest, d.i, d.j, d.lvHex, d.attacker, d.attackType);
+    }
+
+    /** Current pseudonym for a vehicle's next beacon, rotating it if the lifetime has elapsed. */
+    public synchronized Cred beaconCred(String unitId, long tNs) {
+        Dev d = devByUnit.get(unitId);
+        if (d == null) {
+            register(unitId);
+            d = devByUnit.get(unitId);
+        }
+        double t = tNs / 1e9;
+        while (ROTATE_PERIOD_S > 0 && t >= d.nextRotateT) {
+            rotate(d);
+            d.nextRotateT += ROTATE_PERIOD_S;
+        }
+        return new Cred(d.certDigest, d.i, d.j, d.lvHex, d.attacker, d.attackType);
+    }
+
+    /** Roll the vehicle to a fresh pseudonym under the SAME LA linkage seeds (privacy), so the
+     *  MA can still link it on investigation; a revoked vehicle's new pseudonym stays revoked. */
+    private void rotate(Dev d) {
+        d.rotCount++;
+        d.j = (d.j + 1) % JMAX;
+        if (d.j == 0) {
+            d.i++;
+        }
+        d.lv = d.link.linkageValueFor(d.i, d.j);
+        d.lvHex = hex(d.lv, d.lv.length);
+        d.certDigest = hex(sha("cert|" + MASTER_SEED + "|" + d.unitId + "|rot" + d.rotCount), 8);
+        devByDigest.put(d.certDigest, d);   // new pseudonym resolves to the same vehicle
+        scms.pca.issue(d.certDigest, d.requestHash, d.i, d.j, "lc1:" + d.unitId, "lc2:" + d.unitId);
+        gtId.add(gtRow("true_vehicle_id", d.unitId, "pseudonym_cert_digest", d.certDigest, "i_period", d.i));
     }
 
     /** Compute the claimed CAM (content + timing/flood/sybil flags) for one broadcast. */
@@ -286,6 +325,12 @@ public final class ScmsBackend {
     }
 
     public synchronized boolean isRevoked(String subjectDigest, double t) {
+        // Vehicle-level: the CRL carries the LA linkage seed, so ALL of a revoked vehicle's
+        // pseudonyms (past and future rotations) are enforced once propagation delay has elapsed.
+        Dev d = devByDigest.get(subjectDigest);
+        if (d != null && d.revoked && t >= d.revokeT + CRL_PROP_DELAY_S) {
+            return true;
+        }
         return scms.crlStore.enforced(subjectDigest, t, CRL_PROP_DELAY_S);
     }
 
@@ -316,7 +361,7 @@ public final class ScmsBackend {
         java.util.Set<Long> secs = subjSeconds.computeIfAbsent(subjectDigest, k -> new java.util.HashSet<>());
         secs.add((long) Math.floor(t));
         boolean sustained = secs.size() >= REVOKE_MIN_SECONDS && (ag[1] - ag[0]) >= REVOKE_PERSIST_S;
-        if (!scms.crlStore.isRevoked(subj.certDigest) && distinct >= REPORT_THRESHOLD_K && sustained) {
+        if (!subj.revoked && distinct >= REPORT_THRESHOLD_K && sustained) {
             resolveAndRevoke(subj, t);
         }
     }
@@ -336,6 +381,7 @@ public final class ScmsBackend {
             throw new IllegalStateException("CRL entry failed to revoke its target device");
         }
         scms.crlStore.publish(subj.certDigest, t);
+        subj.revoked = true; subj.revokeT = t;   // vehicle-level: covers all pseudonyms (LA linkage)
         int reporters = scms.ma.distinctReporters(subj.certDigest);
         maInvest.add(maRow("case_id", caseId, "opened_time", round3(t), "trigger", "report_threshold",
                 "num_distinct_reporters", reporters, "linkage_result", "same", "identity_resolved", true,

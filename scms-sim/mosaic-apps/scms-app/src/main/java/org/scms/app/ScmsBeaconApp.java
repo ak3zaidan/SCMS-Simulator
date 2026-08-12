@@ -135,6 +135,8 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         haveSentBefore = true;
         sendCount++;
         ScmsBackend backend = ScmsBackend.instance();
+        cred = backend.beaconCred(getOperatingSystem().getId(), tNs);   // rotates pseudonym if due
+        myDigest = cred.certDigest;
         AttackLib.Claim c = backend.claim(getOperatingSystem().getId(), sendCount,
                 selfX, selfY, updated.getSpeed(), updated.getHeading(), tNs);
         backend.onCamSent(cred.certDigest, tS);

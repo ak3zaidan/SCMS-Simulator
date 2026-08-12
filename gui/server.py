@@ -126,6 +126,9 @@ CONFIG_SPEC = [
     {"group": "SCMS policy", "name": "persist_s", "label": "Revoke: min span (s)", "type": "float",
      "default": 5.0, "min": 0, "max": 120, "step": 1, "env": "SCMS_PERSIST_S",
      "help": "Reports must span at least this long before revoking (rejects transient spikes)"},
+    {"group": "SCMS policy", "name": "rotate_period", "label": "Pseudonym lifetime (s)", "type": "float",
+     "default": 90.0, "min": 0, "max": 3600, "step": 10, "env": "SCMS_ROTATE_PERIOD",
+     "help": "Vehicles change pseudonym certificate this often (LA-linked); 0 disables rotation"},
 
     # --- Attacks ---
     {"group": "Attacks", "name": "attacks", "label": "Enabled attack behaviours", "type": "multi",
