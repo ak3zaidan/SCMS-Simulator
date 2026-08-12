@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-_DROP = {"split", "report_id", "subject_cert_digest", "true_vehicle_id", "entity_id"}
+_DROP = {"split", "time_split", "report_id", "subject_cert_digest", "true_vehicle_id", "entity_id"}
 
 
 def _load(dataset_dir: str, name: str) -> pd.DataFrame | None:
@@ -101,20 +101,36 @@ def _prf(y: np.ndarray, s: np.ndarray, thr: float = 0.5) -> dict:
     tp = int(((pred == 1) & (y == 1)).sum())
     fp = int(((pred == 1) & (y == 0)).sum())
     fn = int(((pred == 0) & (y == 1)).sum())
+    tn = int(((pred == 0) & (y == 0)).sum())
     prec = tp / (tp + fp) if tp + fp else 0.0
     rec = tp / (tp + fn) if tp + fn else 0.0
     f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+    tnr = tn / (tn + fp) if tn + fp else 0.0
     return {"precision": round(prec, 3), "recall": round(rec, 3), "f1": round(f1, 3),
-            "tp": tp, "fp": fp, "fn": fn}
+            "balanced_accuracy": round(0.5 * (rec + tnr), 3), "tp": tp, "fp": fp, "fn": fn, "tn": tn}
 
 
-def _task(feat: pd.DataFrame, lab: pd.DataFrame, key: str, label_col: str) -> dict | None:
+def _recall_at_fpr(y: np.ndarray, s: np.ndarray, fpr: float = 0.01) -> float | None:
+    """Recall achievable at a fixed false-positive rate — the operating point a real MA cares about
+    (few false accusations)."""
+    neg, pos = s[y == 0], s[y == 1]
+    if len(neg) == 0 or len(pos) == 0:
+        return None
+    thr = float(np.quantile(neg, 1.0 - fpr))
+    return float((pos >= thr).mean())
+
+
+def _task(feat: pd.DataFrame, lab: pd.DataFrame, key: str, label_col: str,
+          split_col: str = "split") -> dict | None:
     if feat is None or lab is None or label_col not in lab.columns:
         return None
-    df = feat.merge(lab[[key, label_col, "split"]], on=[key, "split"], how="inner") \
-        if "split" in feat.columns else feat.merge(lab[[key, label_col]], on=key, how="inner")
-    tr = df[df["split"] == "train"] if "split" in df.columns else df
-    te = df[df["split"] == "test"] if "split" in df.columns else df
+    if split_col in feat.columns and split_col in lab.columns:
+        df = feat.merge(lab[[key, label_col, split_col]], on=[key, split_col], how="inner")
+    else:
+        df = feat.merge(lab[[key, label_col]], on=key, how="inner")
+        split_col = None
+    tr = df[df[split_col] == "train"] if split_col else df
+    te = df[df[split_col] == "test"] if split_col else df
     if len(tr) < 20 or len(te) < 5:
         return {"note": "insufficient data for a benchmark", "n_train": int(len(tr)), "n_test": int(len(te))}
     xtr, cols = _feature_matrix(tr)
@@ -130,6 +146,7 @@ def _task(feat: pd.DataFrame, lab: pd.DataFrame, key: str, label_col: str) -> di
         "positive_rate_test": round(float(yte.mean()), 3),
         "roc_auc": None if _roc_auc(yte, s) is None else round(_roc_auc(yte, s), 3),
         "pr_auc": None if _pr_auc(yte, s) is None else round(_pr_auc(yte, s), 3),
+        "recall_at_1pct_fpr": None if _recall_at_fpr(yte, s) is None else round(_recall_at_fpr(yte, s), 3),
         "at_0.5": _prf(yte, s),
         "features": cols,
     }
@@ -206,6 +223,36 @@ def _graph_baseline(vf: pd.DataFrame | None, vl: pd.DataFrame | None,
             "note": "1-hop mean message passing over the report graph vs node features alone"}
 
 
+def _oneclass(vf: pd.DataFrame | None, vl: pd.DataFrame | None) -> dict | None:
+    """UNSUPERVISED anomaly detection — the realistic MA setting where attack labels are scarce.
+    Fit a one-class Mahalanobis model on BENIGN vehicles only (train split), then score every test
+    vehicle by its Mahalanobis distance from the benign manifold. No attack label is used in
+    training; labels are used only to score the result."""
+    if vf is None or vl is None:
+        return None
+    df = vf.merge(vl[["entity_id", "label_is_attacker", "split"]], on=["entity_id", "split"], how="inner")
+    if len(df) < 40:
+        return None
+    x = np.nan_to_num(df[[c for c in vf.columns if c not in _DROP
+                          and pd.api.types.is_numeric_dtype(vf[c])]].to_numpy(dtype=float))
+    tr = (df["split"] != "test").to_numpy()
+    te = (df["split"] == "test").to_numpy()
+    y = df["label_is_attacker"].to_numpy(dtype=float)
+    benign = x[tr & (y == 0)]
+    if len(benign) < 10 or te.sum() < 5 or y[te].sum() < 2:
+        return None
+    mu = benign.mean(axis=0)
+    cov = np.atleast_2d(np.cov(benign, rowvar=False)) + 1e-6 * np.eye(x.shape[1])
+    inv = np.linalg.pinv(cov)
+    d = x[te] - mu
+    s = np.einsum("ij,jk,ik->i", d, inv, d)   # squared Mahalanobis distance = anomaly score
+    yte = y[te]
+    return {"roc_auc": None if _roc_auc(yte, s) is None else round(_roc_auc(yte, s), 3),
+            "pr_auc": None if _pr_auc(yte, s) is None else round(_pr_auc(yte, s), 3),
+            "recall_at_1pct_fpr": None if _recall_at_fpr(yte, s) is None else round(_recall_at_fpr(yte, s), 3),
+            "note": "one-class Mahalanobis trained on BENIGN vehicles only (no attack labels in training)"}
+
+
 def run(dataset_dir: str) -> dict[str, Any]:
     sf, sl = _load(dataset_dir, "subject_features"), _load(dataset_dir, "subject_labels")
     rf, rl = _load(dataset_dir, "report_features"), _load(dataset_dir, "report_labels")
@@ -223,9 +270,17 @@ def run(dataset_dir: str) -> dict[str, Any]:
     novel = _novel_attack(vf, vl)
     if novel is not None:
         out["generalization"] = {"vehicle_novel_attack": novel}
+    vt = _task(vf, vl, "entity_id", "label_is_attacker", split_col="time_split")
+    if vt is not None and vt.get("roc_auc") is not None:
+        out.setdefault("generalization", {})["vehicle_temporal"] = {
+            "roc_auc": vt["roc_auc"], "recall_at_1pct_fpr": vt.get("recall_at_1pct_fpr"),
+            "note": "train on earlier vehicles, test on later ones (forward-in-time generalization)"}
     gb = _graph_baseline(vf, vl, _load(dataset_dir, "graph_edges"))
     if gb is not None:
         out["graph_baseline"] = gb
+    oc = _oneclass(vf, vl)
+    if oc is not None:
+        out["anomaly_baseline_unsupervised"] = oc
     return out
 
 

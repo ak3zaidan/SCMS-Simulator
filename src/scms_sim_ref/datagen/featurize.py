@@ -40,6 +40,7 @@ REASON_VOCAB = [
     "positionJump",
     "sybilCoLocation",
     "headingInconsistency",
+    "implausibleAcceleration",
     "staleOrReplay",
     "beaconFrequency",
 ]
@@ -203,11 +204,20 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         tv = vehicle_by_digest.get(r.get("subject_cert_digest"), "unknown")
         if tv != "unknown":
             reports_by_vehicle.setdefault(tv, []).append(r)
+    # temporal (forward-in-time) split: each entity is placed by its FIRST report time; the latest
+    # ~30% become the temporal test set, so a model can be evaluated on whether it detects
+    # misbehaviour in the FUTURE after training on the past (the deployment question).
+    first_t = {tv: min(float(r.get("detection_time", 0)) for r in rs)
+               for tv, rs in reports_by_vehicle.items() if rs}
+    _ts_sorted = sorted(first_t.values())
+    thr_t = _ts_sorted[int(0.7 * len(_ts_sorted))] if len(_ts_sorted) > 3 else float("inf")
+
     vf_rows, vl_rows = [], []
     for v in gt_vehicle:
         tv = v["true_vehicle_id"]
         entity_id = "ent_" + hashlib.sha256(tv.encode()).hexdigest()[:12]
         rs = reports_by_vehicle.get(tv, [])
+        time_split = "test" if (tv in first_t and first_t[tv] > thr_t) else "train"
         norms = [float(r.get("detector_score_norm", 0.0) or 0.0) for r in rs]
         times = [float(r.get("detection_time", 0)) for r in rs]
         reporters = {r.get("reporter_cert_digest") for r in rs}
@@ -227,6 +237,7 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
             "report_span_s": (max(times) - min(times)) if times else 0.0,
             "reports_per_reporter": len(rs) / max(1, len(reporters)),
             "split": split,
+            "time_split": time_split,
         })
         vl_rows.append({
             "entity_id": entity_id,
@@ -235,6 +246,7 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
             "attack_family": family_by_vehicle.get(tv, "none" if not attacker_by_vehicle.get(tv) else "other"),
             "true_vehicle_id": tv,
             "split": split,
+            "time_split": time_split,
         })
 
     # --- graph + temporal export (for GNN / sequence models) ---
@@ -300,7 +312,7 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
     for name, df in (("report_features", report_features), ("subject_features", subject_features),
                      ("vehicle_features", vehicle_features), ("graph_edges", graph_edges),
                      ("subject_windows", subject_windows)):
-        cols = [c for c in df.columns if c != "split"]  # split is an assignment, not a feature/GT
+        cols = [c for c in df.columns if c not in ("split", "time_split")]  # split assignments, not features
         lint_feature_frame([dict.fromkeys(cols, 0)], context=name)
 
     # --- write outputs (parquet + csv) ---

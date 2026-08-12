@@ -36,8 +36,27 @@ def validate(dataset_dir: str) -> tuple[dict, list]:
     vehicles = _read(os.path.join(gt, "gt_vehicle.jsonl"))
     attackers = {v["true_vehicle_id"] for v in vehicles if v.get("is_attacker")}
     faulty = {v["true_vehicle_id"] for v in vehicles if v.get("is_faulty")}
-    revoked = {r["true_vehicle_id"] for r in _read(os.path.join(gt, "gt_linkage_revocation.jsonl"))}
+    rev_rows = _read(os.path.join(gt, "gt_linkage_revocation.jsonl"))
+    revoked = {r["true_vehicle_id"] for r in rev_rows}
     tp = attackers & revoked
+
+    # detection latency: time from attack ONSET (first falsified message) to revocation, for
+    # correctly-revoked attackers. The operational metric for a global MA (how fast is a real
+    # attack caught?), reported alongside precision/recall.
+    onset = {a["true_vehicle_id"]: a.get("attack_onset_time")
+             for a in _read(os.path.join(gt, "gt_attacks.jsonl"))}
+    rev_time = {r["true_vehicle_id"]: r.get("true_revocation_time") for r in rev_rows}
+    lat = []
+    for v in tp:
+        o, rt = onset.get(v), rev_time.get(v)
+        if o is not None and rt is not None and rt >= o:
+            lat.append(float(rt) - float(o))
+    lat.sort()
+    latency = {}
+    if lat:
+        latency = {"n": len(lat), "median_s": round(lat[len(lat) // 2], 2),
+                   "p90_s": round(lat[min(len(lat) - 1, int(0.9 * len(lat)))], 2),
+                   "max_s": round(lat[-1], 2)}
     # A revoked faulty vehicle is a defensible removal of a malfunctioning unit, not the same as
     # revoking an innocent benign vehicle — report the two separately.
     faulty_rev = (revoked & faulty) - attackers
@@ -58,6 +77,7 @@ def validate(dataset_dir: str) -> tuple[dict, list]:
         "false_revocations": len(benign_fp),
         "precision": round(precision, 3),
         "recall": round(recall, 3),
+        "detection_latency_s": latency,
     }
     return summary, leaks
 

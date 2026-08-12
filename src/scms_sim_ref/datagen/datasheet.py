@@ -156,7 +156,12 @@ def build(dataset_dir: str) -> str:
              "ground-truth column fails the build)")
     L.append(f"- Revocation precision **{vsum.get('precision')}** / recall **{vsum.get('recall')}** "
              f"(attackers {vsum.get('attackers')}, revoked {vsum.get('revoked')}, "
-             f"false revocations {vsum.get('false_revocations')})")
+             f"false revocations {vsum.get('false_revocations')}, faulty revocations "
+             f"{vsum.get('faulty_revocations')})")
+    dl = vsum.get("detection_latency_s") or {}
+    if dl:
+        L.append(f"- Detection latency (onset→revocation): median **{dl.get('median_s')} s**, "
+                 f"p90 {dl.get('p90_s')} s, max {dl.get('max_s')} s (n={dl.get('n')})")
     L.append("")
 
     L.append("## Baseline ML benchmark (logistic regression, train->test, vehicle-disjoint)")
@@ -168,8 +173,17 @@ def build(dataset_dir: str) -> str:
             continue
         a5 = t.get("at_0.5", {})
         L.append(f"- **{name}**: ROC-AUC **{t.get('roc_auc')}**, PR-AUC **{t.get('pr_auc')}**, "
-                 f"F1@0.5 {a5.get('f1')} (P {a5.get('precision')}/R {a5.get('recall')}); "
-                 f"test n={t.get('n_test')}, positive rate {t.get('positive_rate_test')}")
+                 f"recall@1%FPR {t.get('recall_at_1pct_fpr')}, balanced-acc {a5.get('balanced_accuracy')}, "
+                 f"F1@0.5 {a5.get('f1')}; test n={t.get('n_test')}, positive rate {t.get('positive_rate_test')}")
+    oc = bfull.get("anomaly_baseline_unsupervised")
+    if oc:
+        L.append(f"- **Unsupervised anomaly baseline** (one-class Mahalanobis, trained on BENIGN only): "
+                 f"ROC-AUC **{oc.get('roc_auc')}**, PR-AUC {oc.get('pr_auc')}, "
+                 f"recall@1%FPR {oc.get('recall_at_1pct_fpr')} — the realistic label-scarce MA setting.")
+    tmp = (bgen or {}).get("vehicle_temporal")
+    if tmp:
+        L.append(f"- **Forward-in-time generalization** (train earlier vehicles → test later): "
+                 f"ROC-AUC **{tmp.get('roc_auc')}**, recall@1%FPR {tmp.get('recall_at_1pct_fpr')}.")
     nov = (bgen or {}).get("vehicle_novel_attack")
     if nov:
         L.append(f"- **Novel-attack generalization** (leave-one-attack-family-out): mean ROC-AUC "

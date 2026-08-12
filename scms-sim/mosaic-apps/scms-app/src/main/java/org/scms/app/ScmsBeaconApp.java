@@ -86,10 +86,11 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
     private static final double MIN_REF_GAP_S = 0.5;   // motion-consistency baseline (rate-independent)
     private static final double MAX_ACCEL_MS2 = 9.0;   // physical accel/decel bound for plausibility
     private static final int MIN_CONSEC = envI("SCMS_MIN_CONSEC", 2);   // consecutive violations before flagging
+    private static final double MAX_PLAUSIBLE_ACCEL = envD("SCMS_MAX_ACCEL", 12.0);   // m/s^2 (ETSI/F2MD accel check)
 
     private static final class Rx {
         double lastX, lastY, lastT, lastHeading;       // most recent CAM (frequency, sybil, live)
-        double refX, refY, refT, refHeading;           // lagged >=0.5 s reference (motion checks)
+        double refX, refY, refT, refHeading, refSpeed;  // lagged >=0.5 s reference (motion checks)
         boolean hasRef = false;
         int frozenCount;
         int psiStreak, hdgStreak;    // consecutive motion-inconsistency violations
@@ -310,6 +311,12 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
             reason = "positionSpeedInconsistency"; score = movedRef - maxDist; scoreNorm = movedRef / maxDist;
         } else if (hdgViol && s.hdgStreak >= MIN_CONSEC) {
             reason = "headingInconsistency"; score = hd; scoreNorm = hd / HEADING_DIFF;
+        } else if (refReady && gapRef <= 3
+                && Math.abs(cam.claimedSpeed - s.refSpeed) / gapRef > MAX_PLAUSIBLE_ACCEL) {
+            // implied acceleration exceeds physical limits (ETSI/F2MD accel-plausibility check) —
+            // catches jumpy claimed-speed attacks (RandomSpeed, StopAndGo). One-sided => low FP.
+            double acc = Math.abs(cam.claimedSpeed - s.refSpeed) / gapRef;
+            reason = "implausibleAcceleration"; score = acc; scoreNorm = acc / MAX_PLAUSIBLE_ACCEL;
         } else if (s.frozenCount >= FROZEN_COUNT) {
             reason = "constantPositionFrozen"; score = cam.claimedSpeed; scoreNorm = (double) s.frozenCount / FROZEN_COUNT;
         }
@@ -325,6 +332,7 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         // persistent attacker, whose every sample violates).
         if (!s.hasRef || (gapRef >= MIN_REF_GAP_S && (!psiViol || gapRef >= 2.0))) {
             s.refX = cam.claimedX; s.refY = cam.claimedY; s.refT = t; s.refHeading = cam.claimedHeading;
+            s.refSpeed = cam.claimedSpeed;
             s.hasRef = true;
         }
 

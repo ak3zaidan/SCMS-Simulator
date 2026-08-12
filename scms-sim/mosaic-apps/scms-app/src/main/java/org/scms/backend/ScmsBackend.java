@@ -188,6 +188,7 @@ public final class ScmsBackend {
         double faultAngle, faultMag;   // fault direction + magnitude
         double driftAccum;             // slow-drift fault accumulator
         double degradeUntil = -1;      // GPS-degradation burst end time
+        double onsetT = -1;            // attack onset time (first falsified message)
         String attackType = "none";
         AttackLib.State atk = null;
         List<String> ghosts = null;   // Sybil: extra identities mapped back to this device
@@ -404,10 +405,13 @@ public final class ScmsBackend {
             c = AttackLib.compute(d.attackType, d.atk, sendCount, mx, my, mspeed, mheading, tNs, attackCfg);
         }
         c.posConf = conf;
+        boolean falsified = d.attacker && (Math.hypot(c.x - mx, c.y - my) > 1.0
+                || Math.abs(c.speed - mspeed) > 1.0 || c.genTimeNs != tNs || c.flood || c.sybilGhosts > 0);
+        if (falsified && d.onsetT < 0) {
+            d.onsetT = t;    // attack ONSET: first time this attacker actually falsified content
+        }
         // per-message ground-truth sample (true vs claimed) for message-level benchmarks
         if (emitRng.nextDouble() < EMIT_SAMPLE) {
-            boolean falsified = d.attacker && (Math.hypot(c.x - mx, c.y - my) > 1.0
-                    || Math.abs(c.speed - mspeed) > 1.0 || c.genTimeNs != tNs || c.flood || c.sybilGhosts > 0);
             gtEmit.add(gtRow("emit_id", String.format(java.util.Locale.ROOT, "emt_%08d", gtEmit.size()), "t", round3(t),
                     "true_vehicle_id", unitId,
                     "true_x", round3(x), "true_y", round3(y),
@@ -544,6 +548,11 @@ public final class ScmsBackend {
         }
         written = true;
         try {
+            // stamp each attacker's onset time (first falsified message) for detection-latency eval
+            for (Map<String, Object> row : gtAtk) {
+                Dev d = devByUnit.get(row.get("true_vehicle_id"));
+                row.put("attack_onset_time", (d != null && d.onsetT >= 0) ? round3(d.onsetT) : null);
+            }
             // one row per pseudonym the MA observed (rotation + ghosts), with vehicle-level
             // revocation status — the LA linkage revokes every pseudonym of a caught vehicle.
             for (Map.Entry<String, Dev> e : devByDigest.entrySet()) {
