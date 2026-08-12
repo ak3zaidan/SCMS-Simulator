@@ -137,7 +137,16 @@ def generate(key: str, duration=None, scale=None, max_vehicles=None,
                 f["targetFlow"] = int(target_flow)
             if lanes:
                 f["lanes"] = list(range(int(lanes)))
+    # apply the shared vehicle-dynamics knobs (SCMS_VEH_*) to every prototype
+    vp = mapgen.veh_params()
+    for proto in m.get("prototypes", []):
+        proto.update({"accel": vp["accel"], "decel": vp["decel"], "length": vp["length"],
+                      "maxSpeed": vp["maxSpeed"], "minGap": vp["minGap"],
+                      "sigma": vp["sigma"], "tau": vp["tau"]})
     mp.write_text(json.dumps(m, indent=2), encoding="utf-8")
+
+    # per-scenario SNS radio config (SCMS_RADIO_RANGE / SCMS_RADIO_LOSS)
+    mapgen.write_sns_config(dst)
 
     # route-based traffic density: inject SUMO --scale into the sumocfg(s).
     if scale and float(scale) != 1.0:

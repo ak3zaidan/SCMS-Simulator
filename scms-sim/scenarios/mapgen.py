@@ -91,6 +91,47 @@ CITIES = {
 
 
 # ---------------------------------------------------------------------------
+# shared config knobs (read by both mapgen and gen_scenario, applied to SUMO + SNS)
+# ---------------------------------------------------------------------------
+def _envf(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name)
+        return float(v) if v not in (None, "") else float(default)
+    except ValueError:
+        return float(default)
+
+
+def veh_params() -> dict:
+    """SUMO driver-model / vehicle-type parameters from env (SCMS_VEH_*)."""
+    return {
+        "maxSpeed": _envf("SCMS_VEH_MAXSPEED", 55.0),
+        "accel": _envf("SCMS_VEH_ACCEL", 2.6),
+        "decel": _envf("SCMS_VEH_DECEL", 4.5),
+        "sigma": _envf("SCMS_VEH_SIGMA", 0.5),        # driver imperfection 0..1
+        "minGap": _envf("SCMS_VEH_MINGAP", 2.5),
+        "tau": _envf("SCMS_VEH_TAU", 1.0),            # reaction time / headway
+        "length": _envf("SCMS_VEH_LENGTH", 5.0),
+        "speedFactor": _envf("SCMS_VEH_SPEEDFACTOR", 1.0),
+    }
+
+
+def write_sns_config(dst: Path):
+    """Per-scenario SNS radio config: SCMS_RADIO_RANGE (m) + SCMS_RADIO_LOSS (0..1)."""
+    import json
+    sns = {
+        "maximumTtl": 10,
+        "singlehopRadius": _envf("SCMS_RADIO_RANGE", 709.4),
+        "adhocTransmissionModel": {"type": "SophisticatedAdhocTransmissionModel"},
+        "singlehopDelay": {"type": "SimpleRandomDelay", "steps": 5,
+                           "minDelay": "0.4 ms", "maxDelay": "2.4 ms"},
+        "singleHopTransmission": {"lossProbability": _envf("SCMS_RADIO_LOSS", 0.0),
+                                  "maxRetries": 0},
+    }
+    (dst / "sns").mkdir(exist_ok=True)
+    (dst / "sns" / "sns_config.json").write_text(json.dumps(sns, indent=2), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
 # key parsing + catalogue
 # ---------------------------------------------------------------------------
 def is_mapgen_key(key: str) -> bool:
@@ -211,9 +252,12 @@ def _tag_vtype(routes: Path):
     tree = ET.parse(routes)
     root = tree.getroot()
     if root.find("vType[@id='car']") is None:
-        vt = ET.Element("vType", {"id": "car", "vClass": "passenger",
-                                   "accel": "2.6", "decel": "4.5", "sigma": "0.5",
-                                   "length": "5.0", "minGap": "2.5", "maxSpeed": "55"})
+        vp = veh_params()
+        vt = ET.Element("vType", {
+            "id": "car", "vClass": "passenger",
+            "accel": str(vp["accel"]), "decel": str(vp["decel"]), "sigma": str(vp["sigma"]),
+            "length": str(vp["length"]), "minGap": str(vp["minGap"]), "tau": str(vp["tau"]),
+            "maxSpeed": str(vp["maxSpeed"]), "speedFactor": str(vp["speedFactor"])})
         root.insert(0, vt)
     for veh in root.iter("vehicle"):
         veh.set("type", "car")
@@ -284,10 +328,14 @@ def build(key: str, dst: Path, duration=None, scale=None, seed=None, period=None
     }
     (dst / "scenario_config.json").write_text(json.dumps(scenario, indent=2), encoding="utf-8")
 
+    vp = veh_params()
     mapping = {"prototypes": [{"name": "car", "applications": [OUR_APP], "weight": 1.0,
-                              "accel": 2.6, "decel": 4.5, "length": 5.0, "maxSpeed": 55.0,
-                              "minGap": 2.5, "sigma": 0.5, "tau": 1}]}
+                              "accel": vp["accel"], "decel": vp["decel"], "length": vp["length"],
+                              "maxSpeed": vp["maxSpeed"], "minGap": vp["minGap"],
+                              "sigma": vp["sigma"], "tau": vp["tau"],
+                              "deviations": {"speedFactor": 0.1}}]}
     (dst / "mapping" / "mapping_config.json").write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+    write_sns_config(dst)
 
     # generic output config (copied from a bundle so the output federate has something to do)
     src_out = MOSAIC / "scenarios" / "Highway" / "output" / "output_config.xml"
