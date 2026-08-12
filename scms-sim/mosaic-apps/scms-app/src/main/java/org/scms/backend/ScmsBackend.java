@@ -184,9 +184,10 @@ public final class ScmsBackend {
 
         devByUnit.put(unitId, d);
         devByDigest.put(d.certDigest, d);
-        if (d.attacker && "Sybil".equals(d.attackType)) {
+        if (d.attacker && "Sybil".equals(AttackLib.baseOf(d.attackType))) {
             d.ghosts = new ArrayList<>();
-            for (int k = 0; k < attackCfg.sybilGhosts; k++) {
+            int nGhosts = AttackLib.ghostCount(d.attackType, attackCfg);
+            for (int k = 0; k < nGhosts; k++) {
                 String g = hex(sha("ghost|" + MASTER_SEED + "|" + unitId + "|" + k), 8);
                 d.ghosts.add(g);
                 devByDigest.put(g, d);   // ghost identities resolve to the same attacker (for labeling)
@@ -340,7 +341,13 @@ public final class ScmsBackend {
             cfg.put("attacker_pct", ATTACKER_PCT);
             cfg.put("report_prob", REPORT_PROB);
             cfg.put("jmax", JMAX);
-            cfg.put("attacks_enabled", attacksEnabled);
+            cfg.put("attack_variants_enabled", attacksEnabled.size());
+            java.util.Set<String> bases = new java.util.TreeSet<>();
+            for (String vName : attacksEnabled) {
+                bases.add(AttackLib.baseOf(vName));
+            }
+            cfg.put("attack_bases_enabled", new ArrayList<>(bases));
+            cfg.put("attack_variants_total", AttackLib.CATALOG.size());
             manifest.put("config", cfg);
             Map<String, Object> counts = new LinkedHashMap<>();
             counts.put("vehicles", devByUnit.size());

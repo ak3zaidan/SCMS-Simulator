@@ -43,12 +43,24 @@ SCENARIOS = [
     {"key": "intas_highway_rush", "label": "InTAS Ingolstadt — highway, rush",       "kind": "route"},
 ]
 
-# Every attack type our library can assign (must match AttackLib.ALL).
+# Every attack BASE behaviour our library can assign (must match AttackLib.BASES). Each base
+# expands to a matrix of variants (temporal profile x magnitude tier) — ~291 concrete variants
+# in total — so selecting a base here enables all of its variants via SCMS_ATTACKS.
 ATTACK_TYPES = [
-    "ConstPos", "ConstPosOffset", "RandomPos", "RandomPosOffset",
-    "ConstSpeed", "ConstSpeedOffset", "RandomSpeed", "RandomSpeedOffset",
-    "EventualStop", "ReversedHeading", "Disruptive",
-    "DataReplay", "DelayedMessages", "DoS", "DoSRandom", "Sybil",
+    # position
+    "ConstPos", "ConstPosOffset", "ConstPosOffsetX", "ConstPosOffsetY",
+    "RandomPos", "RandomPosOffset", "Teleport", "SineWavePos",
+    # speed
+    "ConstSpeedZero", "ConstSpeedOffset", "ConstSpeedHigh",
+    "RandomSpeed", "RandomSpeedOffset", "StopAndGo",
+    # heading
+    "ReversedHeading", "RandomHeading", "PerpendicularHeading", "HeadingOffset",
+    # combined
+    "Disruptive", "PosSpeedInconsistent", "PosHeadingInconsistent", "EventualStop",
+    # timing
+    "DataReplay", "DelayedMessages", "OutOfOrder", "DoS", "DoSRandom",
+    # identity
+    "Sybil",
 ]
 
 # Every configurable variable, grouped for the form. `env` = the environment variable the
@@ -102,9 +114,9 @@ CONFIG_SPEC = [
      "help": "How often the back-end writes the live vehicle snapshot"},
 
     # --- Attacks ---
-    {"group": "Attacks", "name": "attacks", "label": "Enabled attack types", "type": "multi",
+    {"group": "Attacks", "name": "attacks", "label": "Enabled attack behaviours", "type": "multi",
      "default": "all", "options": ATTACK_TYPES, "env": "SCMS_ATTACKS",
-     "help": "Select which of the 16 attacks may be assigned (all = every type)"},
+     "help": "Pick base behaviours; each expands to its profile×tier variants (~291 total, all = every variant)"},
     {"group": "Attacks", "name": "offset_m", "label": "Position offset (m)", "type": "float",
      "default": 1500.0, "min": 0, "max": 5000, "step": 100, "env": "SCMS_OFFSET_M",
      "help": "ConstPosOffset / RandomPosOffset claimed-position shift"},
@@ -125,7 +137,22 @@ CONFIG_SPEC = [
      "help": "DataReplay / DelayedMessages staleness"},
     {"group": "Attacks", "name": "sybil_ghosts", "label": "Sybil ghosts", "type": "int",
      "default": 4, "min": 1, "max": 20, "env": "SCMS_SYBIL_GHOSTS",
-     "help": "Extra identities a Sybil attacker emits"},
+     "help": "Base extra identities a Sybil attacker emits (tier scales this)"},
+    {"group": "Attacks", "name": "heading_offset", "label": "Heading offset (deg)", "type": "float",
+     "default": 45.0, "min": 5, "max": 180, "step": 5, "env": "SCMS_HEADING_OFFSET",
+     "help": "HeadingOffset base deviation (tier scales this)"},
+    {"group": "Attacks", "name": "ramp_updates", "label": "Gradual ramp (msgs)", "type": "int",
+     "default": 20, "min": 1, "max": 500, "env": "SCMS_RAMP_UPDATES",
+     "help": "'gradual' profile: CAMs over which the deviation ramps to full magnitude"},
+    {"group": "Attacks", "name": "duty_on", "label": "Intermittent on (s)", "type": "float",
+     "default": 6.0, "min": 0.5, "max": 120, "step": 0.5, "env": "SCMS_DUTY_ON",
+     "help": "'intermittent' profile: attack-active window"},
+    {"group": "Attacks", "name": "duty_off", "label": "Intermittent off (s)", "type": "float",
+     "default": 6.0, "min": 0.5, "max": 120, "step": 0.5, "env": "SCMS_DUTY_OFF",
+     "help": "'intermittent' profile: benign window between bursts"},
+    {"group": "Attacks", "name": "start_delay", "label": "Delayed start (s)", "type": "float",
+     "default": 15.0, "min": 0, "max": 300, "step": 1, "env": "SCMS_START_DELAY",
+     "help": "'delayed' profile: benign lead-in before the attack begins"},
 
     # --- Detectors ---
     {"group": "Detectors", "name": "cam_interval", "label": "CAM interval (s)", "type": "float",
