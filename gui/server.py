@@ -29,6 +29,7 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "scms-sim" / "scenarios"))
 from scms_sim_ref.datagen import validate as validate_mod  # noqa: E402
 from scms_sim_ref.datagen import benchmark as benchmark_mod  # noqa: E402
+from scms_sim_ref.datagen import calibration as calibration_mod  # noqa: E402
 import mapgen  # noqa: E402
 
 PORT = 8710
@@ -390,7 +391,7 @@ def start_run(config: dict) -> dict:
         proc = subprocess.Popen(cmd, cwd=str(REPO), env=env, stdout=logf,
                                 stderr=subprocess.STDOUT, text=True)
         RUN.update(proc=proc, logf=logf, out_dir=out_dir, scenario=scenario, config=config,
-                   started=time.time(), finished=None, returncode=None)
+                   started=time.time(), finished=None, returncode=None, stats_cache=None)
         return {"ok": True, "scenario": scenario, "cmd": " ".join(cmd)}
 
 
@@ -464,20 +465,32 @@ def compute_stats(out_dir: Path) -> dict | None:
                 splits[row.get("split", "?")] += 1
     correctness = Counter(r.get("report_correctness")
                           for r in _read_jsonl(out_dir / "ground_truth" / "gt_report_labels.jsonl"))
+    attack_bases = Counter(str(a.get("attack_type", "")).split("/")[0]
+                           for a in _read_jsonl(out_dir / "ground_truth" / "gt_attacks.jsonl"))
     try:
-        bench_tasks = benchmark_mod.run(str(out_dir)).get("tasks", {})
+        bench = benchmark_mod.run(str(out_dir))
     except Exception:
-        bench_tasks = {}
+        bench = {}
+    try:
+        calib = calibration_mod.calibrate(str(out_dir))
+    except Exception:
+        calib = {}
     return {
         "counts": man.get("counts", {}),
         "seed": man.get("seed"),
         "entities": man.get("scms_entities", []),
+        "config": man.get("config", {}),
         "data_digest": man.get("data_digest_sha256", "")[:16],
         "validate": summary,
         "attack_types": dict(attacks),
+        "attack_bases": dict(attack_bases),
         "detector_reasons": dict(reasons),
         "report_correctness": dict(correctness),
-        "benchmark": bench_tasks,
+        "benchmark": bench.get("tasks", {}),
+        "generalization": bench.get("generalization", {}),
+        "graph_baseline": bench.get("graph_baseline", {}),
+        "anomaly_unsupervised": bench.get("anomaly_baseline_unsupervised", {}),
+        "calibration": calib,
         "splits": dict(splits),
     }
 
@@ -506,10 +519,12 @@ def status() -> dict:
         "stats": None,
     }
     if not running and RUN["out_dir"] is not None:
-        try:
-            st["stats"] = compute_stats(RUN["out_dir"])
-        except Exception as ex:  # stats are best-effort
-            st["stats_error"] = str(ex)
+        if RUN.get("stats_cache") is None:   # compute once per finished run, not every poll
+            try:
+                RUN["stats_cache"] = compute_stats(RUN["out_dir"])
+            except Exception as ex:  # stats are best-effort
+                st["stats_error"] = str(ex)
+        st["stats"] = RUN.get("stats_cache")
     return st
 
 

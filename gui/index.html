@@ -91,6 +91,27 @@
   .muted{color:var(--muted)} .stack{display:grid;gap:12px}
   .note{font-size:12px;color:var(--muted);padding:0 14px 12px}
   .good{color:var(--ok)} .warnc{color:var(--warn)}
+  .subhead{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--muted);
+           margin:0 0 6px;display:flex;align-items:center;gap:8px}
+  .subhead .hint{text-transform:none;letter-spacing:0;font-weight:400;font-size:10px;opacity:.8}
+  table.mt{width:100%;border-collapse:collapse;font-size:12px}
+  table.mt th,table.mt td{padding:5px 8px;text-align:right;border-bottom:1px solid var(--edge)}
+  table.mt th:first-child,table.mt td:first-child{text-align:left;color:var(--muted)}
+  table.mt th{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);font-weight:600}
+  table.mt td.v{font-weight:700;color:var(--ink);font-variant-numeric:tabular-nums}
+  table.mt tr:last-child td{border-bottom:none}
+  .sccard{background:var(--panel2);border:1px solid var(--edge);border-radius:9px;padding:8px 10px;
+          display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:6px}
+  .sccard .l{font-size:12px} .sccard .l small{display:block;color:var(--muted);font-size:10px}
+  .sccard .r{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .badge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:10px;font-weight:700;
+         vertical-align:middle;margin-left:6px}
+  .badge.pass{background:#12331f;color:var(--ok);border:1px solid #1c5230}
+  .badge.fail{background:#3a1d1f;color:var(--bad);border:1px solid #5a2a2d}
+  .field-hidden{display:none!important}
+  #cfgSearch{width:100%;padding:7px 9px;background:var(--bg);color:var(--ink);
+             border:1px solid var(--edge2);border-radius:7px;margin-top:2px}
+  #cfgSearch:focus{outline:none;border-color:var(--accent)}
 </style>
 </head>
 <body>
@@ -108,6 +129,9 @@
     <h2>Configuration — every simulation variable</h2>
     <div class="note">Blank numeric fields use the map's default. Traffic controls apply to the
       selected map type (flow vs route density).</div>
+    <div style="padding:0 14px 6px">
+      <input id="cfgSearch" type="text" placeholder="🔍 filter settings by name…" autocomplete="off">
+    </div>
     <div id="form"></div>
     <div class="body">
       <button id="reset">Reset to defaults</button>
@@ -143,16 +167,36 @@
     </div>
 
     <div class="panel" id="statsPanel" style="display:none">
-      <h2>Dataset results</h2>
+      <h2>Dataset results — SCMS-MA anomaly-detection benchmark</h2>
       <div class="body stack">
         <div class="kpis" id="kpis"></div>
+
+        <div id="benchWrap"></div>
+
         <div class="split">
-          <div><div class="muted" style="font-size:12px;margin-bottom:4px">Attack types (ground truth)</div>
+          <div id="genWrap"></div>
+          <div id="baseWrap"></div>
+        </div>
+
+        <div class="split">
+          <div id="calibWrap"></div>
+          <div id="latWrap"></div>
+        </div>
+
+        <div class="split">
+          <div><div class="subhead">Attack families <span class="hint">ground truth</span></div>
+               <div class="bars" id="familyBars"></div></div>
+          <div><div class="subhead">Dataset splits <span class="hint">subjects</span></div>
+               <div class="bars" id="splitBars"></div></div>
+        </div>
+
+        <div class="split">
+          <div><div class="subhead">Attack variants <span class="hint">ground truth</span></div>
                <div class="bars" id="attackBars"></div></div>
-          <div><div class="muted" style="font-size:12px;margin-bottom:4px">Detector reasons (MA reports)</div>
+          <div><div class="subhead">Detector reasons <span class="hint">MA reports</span></div>
                <div class="bars" id="reasonBars"></div></div>
         </div>
-        <div><div class="muted" style="font-size:12px;margin-bottom:4px">Report labels — attack / fault / false-positive</div>
+        <div><div class="subhead">Report labels <span class="hint">attack / fault / false-positive</span></div>
              <div class="bars" id="correctnessBars"></div></div>
       </div>
     </div>
@@ -169,6 +213,7 @@ async function boot(){
   SPEC=d.spec; SCEN=d.scenarios; ATTACKS=d.attack_types;
   scenByKey=Object.fromEntries(SCEN.map(s=>[s.key,s]));
   renderForm(d.defaults);
+  $('#cfgSearch').addEventListener('input',applyFilter);
   poll();                       // pick up an already-running or finished run
   statusTimer=setInterval(poll,1500);
 }
@@ -186,6 +231,26 @@ function renderForm(defaults){
     det.appendChild(box); form.appendChild(det);
   });
   syncKind();
+  applyFilter();
+}
+
+/* ---------- config search/filter ---------- */
+function applyFilter(){
+  const q=($('#cfgSearch')?.value||'').trim().toLowerCase();
+  document.querySelectorAll('#form details.group').forEach(det=>{
+    let shown=0;
+    det.querySelectorAll('.field').forEach(f=>{
+      const c=SPEC.find(x=>x.name===f.dataset.name)||{};
+      const hay=`${c.label||''} ${c.name||''} ${c.help||''}`.toLowerCase();
+      const hit = !q || hay.includes(q);
+      // never re-show a field hidden by scenario-kind gating
+      const gated = f.dataset.kind && f.style.display==='none';
+      f.classList.toggle('field-hidden', !hit);
+      if(hit && !gated) shown++;
+    });
+    det.style.display = shown||!q ? '' : 'none';
+    if(q) det.open=true;
+  });
 }
 
 function fieldEl(c,val){
@@ -243,6 +308,7 @@ function syncKind(){
   document.querySelectorAll('.field[data-kind]').forEach(f=>{
     f.style.display = (f.dataset.kind===kind)?'':'none';
   });
+  applyFilter();
 }
 
 function collect(){
@@ -344,11 +410,89 @@ function bars(el,obj){
     box.appendChild(d);
   }
 }
+const num=x=>(x==null?'—':(typeof x==='number'?(Number.isInteger(x)?x:x.toFixed(3)):x));
+const pctv=x=>(x==null?'—':(x*100).toFixed(1)+'%');
+const badge=ok=>ok==null?'':`<span class="badge ${ok?'pass':'fail'}">${ok?'✓ in range':'✗ off'}</span>`;
+function card(title,hint,inner){
+  return `<div class="subhead">${title}${hint?` <span class="hint">${hint}</span>`:''}</div>${inner}`;
+}
+function sc(label,sub,val,ok){
+  return `<div class="sccard"><div class="l">${label}${sub?`<small>${sub}</small>`:''}</div>
+          <div class="r">${val}${badge(ok)}</div></div>`;
+}
+const TASK_LABELS={
+  subject_is_attacker:'Subject → attacker',
+  report_is_true_detection:'Report → true detection',
+  vehicle_is_attacker:'Vehicle → attacker',
+};
+function benchTable(tasks){
+  const rows=Object.entries(tasks||{}).filter(([,t])=>t&&t.roc_auc!=null);
+  if(!rows.length) return card('Supervised benchmark',null,
+    '<span class="muted" style="font-size:11px">insufficient data</span>');
+  const body=rows.map(([k,t])=>`<tr>
+      <td>${TASK_LABELS[k]||k}</td>
+      <td class="v">${num(t.roc_auc)}</td>
+      <td>${num(t.pr_auc)}</td>
+      <td>${num(t.recall_at_1pct_fpr)}</td>
+      <td>${num((t['at_0.5']||{}).balanced_accuracy)}</td>
+    </tr>`).join('');
+  return card('Supervised benchmark','logistic-regression baseline, per-task test split',
+    `<table class="mt"><thead><tr><th>Task</th><th>ROC-AUC</th><th>PR-AUC</th>
+       <th>R@1%FPR</th><th>Bal.Acc</th></tr></thead><tbody>${body}</tbody></table>`);
+}
+function genSection(g){
+  g=g||{}; const parts=[];
+  const na=g.vehicle_novel_attack;
+  if(na){
+    parts.push(sc('Novel-attack mean AUC','leave-one-family-out (unseen attack)',num(na.mean_novel_attack_auc)));
+    if(na.per_family_auc && Object.keys(na.per_family_auc).length){
+      const el='__na'; parts.push(`<div class="bars" id="${el}" style="margin-top:6px"></div>`);
+      setTimeout(()=>bars('#'+el,na.per_family_auc),0);
+    }
+  }
+  const vt=g.vehicle_temporal;
+  if(vt) parts.push(sc('Temporal AUC','train past → test future',num(vt.roc_auc)));
+  const dl=g.domain_leave_one_out;
+  if(dl) parts.push(sc('Domain AUC',`leave-one-domain-out · ${dl.n_domains_evaluated} domains`,num(dl.mean_auc)));
+  if(!parts.length) parts.push('<span class="muted" style="font-size:11px">single-domain run — build a campaign for generalization metrics</span>');
+  return card('Generalization','the sim-to-real question',parts.join(''));
+}
+function baseSection(st){
+  const parts=[];
+  const oc=st.anomaly_unsupervised;
+  if(oc&&oc.roc_auc!=null) parts.push(sc('One-class Mahalanobis','trained on benign only, AUC',num(oc.roc_auc)));
+  const gb=st.graph_baseline;
+  if(gb&&(gb.node_only_auc!=null||gb.node_plus_graph_auc!=null)){
+    parts.push(sc('Graph — node only','features alone, AUC',num(gb.node_only_auc)));
+    parts.push(sc('Graph — node + 1-hop','message passing, AUC',num(gb.node_plus_graph_auc)));
+  }
+  if(!parts.length) parts.push('<span class="muted" style="font-size:11px">insufficient data</span>');
+  return card('Unsupervised & graph baselines','no attack labels in training',parts.join(''));
+}
+function calibSection(cal){
+  cal=cal||{}; const parts=[]; const ge=cal.gps_error, cc=cal.confidence_calibration;
+  if(ge){
+    parts.push(sc('GNSS error CEP',`fitted vs ${num(ge.ref_cep_m)} m reference`,`${num(ge.fitted_cep_m)} m`,ge.cep_in_real_range));
+    parts.push(sc('Rayleigh shape',`KS vs fitted ${num(ge.ks_vs_fitted_rayleigh)}`,ge.shape_is_rayleigh_like?'ok':'skew',ge.shape_is_rayleigh_like));
+  }
+  if(cc) parts.push(sc('95% conf. coverage',`target ${pctv(cc.target)}`,pctv(cc.empirical_coverage_of_95pct_radius),cc.well_calibrated));
+  if(!parts.length) parts.push('<span class="muted" style="font-size:11px">no benign GNSS samples</span>');
+  return card('Realism scorecard','vs real-world reference distributions',parts.join(''));
+}
+function latSection(va){
+  const dl=(va||{}).detection_latency_s;
+  if(!dl||dl.n==null) return card('Detection latency',null,
+    '<span class="muted" style="font-size:11px">no detections</span>');
+  return card('Detection latency',`onset → first MA report · n=${dl.n}`,
+    `<table class="mt"><tbody>
+       <tr><td>median</td><td class="v">${num(dl.median_s)} s</td></tr>
+       <tr><td>p90</td><td class="v">${num(dl.p90_s)} s</td></tr>
+       <tr><td>max</td><td class="v">${num(dl.max_s)} s</td></tr>
+     </tbody></table>`);
+}
 function renderStats(st){
   $('#statsPanel').style.display='';
   const va=st.validate||{}, c=st.counts||{};
-  const prec=va.precision!=null?(va.precision*100).toFixed(1)+'%':'—';
-  const rec=va.recall!=null?(va.recall*100).toFixed(1)+'%':'—';
   const leak=va.leakage_violations!=null?va.leakage_violations:'—';
   const bm=st.benchmark||{};
   const subjAuc=bm.subject_is_attacker&&bm.subject_is_attacker.roc_auc;
@@ -357,13 +501,20 @@ function renderStats(st){
     ['Vehicles', c.vehicles ?? c.subjects ?? '—'],
     ['MA reports', c.reports ?? '—'],
     ['Revocations', c.revocations ?? c.revoked ?? '—'],
-    ['Precision', prec],['Recall', rec],
+    ['Precision', pctv(va.precision)],['Recall', pctv(va.recall)],
     ['Leakage', `<span class="${leak===0?'good':'warnc'}">${leak}</span>`],
-    ['Subj AUC', subjAuc ?? '—'],['Report AUC', repAuc ?? '—'],
+    ['Subj AUC', num(subjAuc)],['Report AUC', num(repAuc)],
     ['Seed', st.seed ?? '—'],
     ['Digest', `<span class="muted" style="font-size:12px">${st.data_digest||'—'}</span>`],
   ];
   $('#kpis').innerHTML=kpis.map(([k,v])=>`<div class="kpi"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+  $('#benchWrap').innerHTML=benchTable(st.benchmark);
+  $('#genWrap').innerHTML=genSection(st.generalization);
+  $('#baseWrap').innerHTML=baseSection(st);
+  $('#calibWrap').innerHTML=calibSection(st.calibration);
+  $('#latWrap').innerHTML=latSection(st.validate);
+  bars('#familyBars',st.attack_bases);
+  bars('#splitBars',st.splits);
   bars('#attackBars',st.attack_types);
   bars('#reasonBars',st.detector_reasons);
   bars('#correctnessBars',st.report_correctness);
