@@ -53,6 +53,31 @@ def test_graph_baseline_returns_both_aucs():
     assert res["node_only_auc"] is not None and res["node_plus_graph_auc"] is not None
 
 
+def test_domain_generalization_leave_one_out():
+    import numpy as np
+    import pandas as pd
+    rng = np.random.default_rng(1)
+    feats, labels = [], []
+    for dom in range(4):
+        for i in range(60):
+            eid = f"d{dom}_ent_{i:03d}"
+            atk = (i % 4 == 0)
+            sig = abs(rng.normal(3.0 if atk else 0.2, 0.4))
+            feats.append({"entity_id": eid, "domain_id": dom, "score_norm_max": sig,
+                          "n_reports": 5 if atk else 0})
+            labels.append({"entity_id": eid, "label_is_attacker": int(atk)})
+    res = benchmark._domain_generalization(pd.DataFrame(feats), pd.DataFrame(labels))
+    assert res is not None
+    assert res["n_domains_evaluated"] >= 3
+    assert res["mean_auc"] > 0.7
+
+
+def test_domain_generalization_none_without_domain_id():
+    import pandas as pd
+    vf, vl = _synthetic_vehicles(40)
+    assert benchmark._domain_generalization(vf, vl) is None   # no domain_id column
+
+
 def test_novel_attack_none_when_no_families():
     # only benign -> nothing to hold out
     vf = pd.DataFrame([{"entity_id": f"e{i}", "score_norm_max": 0.1, "n_reports": 0,

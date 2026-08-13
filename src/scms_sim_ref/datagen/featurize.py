@@ -45,6 +45,14 @@ REASON_VOCAB = [
     "beaconFrequency",
 ]
 
+# Detectors whose per-report normalized score is carried as a multi-detector FUSION fingerprint
+# (detnorm_* on each report; detmax_* aggregated per vehicle) — what an ML-based global MA consumes.
+DETECTORS = [
+    "acceptanceRangeThreshold", "positionJump", "positionSpeedInconsistency",
+    "headingInconsistency", "implausibleAcceleration", "staleOrReplay",
+    "beaconFrequency", "sybilCoLocation", "constantPositionFrozen",
+]
+
 
 # Attack base -> family (mirrors org.scms.attacks.AttackLib). Used only for LABELS, so a model
 # can be evaluated on attack families it never trained on (real-world novel-attack generalization).
@@ -135,6 +143,8 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
             "pos_confidence": float(r.get("subject_pos_confidence", 0.0) or 0.0),
             "split": split,
         }
+        for d in DETECTORS:   # multi-detector fusion fingerprint (all checks' normalized scores)
+            feat[f"detnorm_{d}"] = float(r.get(f"detnorm_{d}", 0.0) or 0.0)
         for name in REASON_VOCAB:
             feat[f"reason_{name}"] = int(name in reasons)
         feat["reason_other"] = int(not any(n in REASON_VOCAB for n in reasons))
@@ -225,9 +235,13 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         # MA-visible pseudonym count: distinct subject certs the MA actually linked from its OWN
         # reports (NOT the oracle gt_identity_map, which would leak Sybil ghosts / unobserved certs).
         n_pseudonyms = len({r.get("subject_cert_digest") for r in rs})
+        # per-vehicle multi-detector fingerprint: the strongest normalized evidence from each detector
+        detmax = {d: max((float(r.get(f"detnorm_{d}", 0.0) or 0.0) for r in rs), default=0.0)
+                  for d in DETECTORS}
         split = _split_for(split_seed, tv)
         vf_rows.append({
             "entity_id": entity_id,
+            **{f"detmax_{d}": detmax[d] for d in DETECTORS},
             "n_reports": len(rs),
             "n_distinct_reporters": len(reporters),
             "n_pseudonyms": n_pseudonyms,

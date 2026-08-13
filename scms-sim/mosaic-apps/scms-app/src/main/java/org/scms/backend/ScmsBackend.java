@@ -459,15 +459,18 @@ public final class ScmsBackend {
         int idx = (int) Math.floorMod((long) (t / FALSE_REPORT_INTERVAL_S), victims.size());
         Dev v = devByUnit.get(victims.get(idx));
         if (v != null) {
-            // use a PLAUSIBLE detector reason so the false report is indistinguishable from a real
-            // one at the MA level — detecting it requires behavioural/graph signals, not the reason.
-            onDetection(c.certDigest, v.certDigest, 30.0, t, "positionSpeedInconsistency", 6.5, 2.0);
+            // use a PLAUSIBLE detector reason + fingerprint so the false report is indistinguishable
+            // from a real one at the MA level — detecting it needs behavioural/graph signals.
+            Map<String, Double> det = new HashMap<>();
+            det.put("positionSpeedInconsistency", 2.0);
+            onDetection(c.certDigest, v.certDigest, 30.0, t, "positionSpeedInconsistency", 6.5, 2.0, det);
         }
     }
 
     // -------------------------------------------------- report ingestion (LOP -> RA -> MA)
     public synchronized void onDetection(String reporterDigest, String subjectDigest, double score, double t,
-                                         String reasonCode, double subjectPosConf, double scoreNorm) {
+                                         String reasonCode, double subjectPosConf, double scoreNorm,
+                                         Map<String, Double> detNorms) {
         if (rng.nextDouble() > REPORT_PROB) {
             return; // suppression / loss on the report channel
         }
@@ -480,13 +483,19 @@ public final class ScmsBackend {
         reportCounter++;
         String rid = String.format(java.util.Locale.ROOT, "rpt_%05d", reportCounter);
         double ingestDelay = INGEST_DELAY_S * (0.5 + rng.nextDouble());   // realistic report-channel latency
-        maReports.add(maRow("report_id", rid, "ingest_time", round3(t + ingestDelay),
+        Map<String, Object> row = maRow("report_id", rid, "ingest_time", round3(t + ingestDelay),
                 "detection_time", round3(t),
                 "reporter_cert_digest", reporterDigest, "subject_cert_digest", subjectDigest,
                 "reason_codes", List.of(reasonCode),
                 "detector_score", round3(score), "detector_score_norm", round3(scoreNorm),
                 "subject_pos_confidence", round3(subjectPosConf),
-                "sig_valid", true, "cert_crl_status", "active"));
+                "sig_valid", true, "cert_crl_status", "active");
+        if (detNorms != null) {   // full multi-detector fusion fingerprint for this report
+            for (Map.Entry<String, Double> en : detNorms.entrySet()) {
+                row.put("detnorm_" + en.getKey(), round3(en.getValue()));
+            }
+        }
+        maReports.add(row);
         String correctness = subj.attacker ? "correct"
                 : (rep.colluder ? "malicious_false_report"       // a coordinated false accusation
                 : (subj.faulty ? "faulty_detection" : "false_positive"));

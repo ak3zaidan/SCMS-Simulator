@@ -178,6 +178,13 @@ def main(argv=None) -> int:
         if gen:
             print(f"  novel-attack generalization: mean_auc={gen.get('mean_novel_attack_auc')}  "
                   f"per_family={gen.get('per_family_auc')}")
+        dg = bench.get("generalization", {}).get("domain_leave_one_out")
+        if dg:
+            print(f"  domain (leave-one-out) generalization: mean_auc={dg.get('mean_auc')}  "
+                  f"n_domains={dg.get('n_domains_evaluated')}")
+        oc = bench.get("anomaly_baseline_unsupervised")
+        if oc:
+            print(f"  unsupervised one-class: roc_auc={oc.get('roc_auc')}  recall@1%fpr={oc.get('recall_at_1pct_fpr')}")
     print(f"\nDONE. Campaign at {base}  (merged/ml/*, campaign_manifest.json, merged_benchmark.json)")
     return 0
 

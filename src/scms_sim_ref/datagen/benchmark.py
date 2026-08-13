@@ -21,7 +21,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-_DROP = {"split", "time_split", "report_id", "subject_cert_digest", "true_vehicle_id", "entity_id"}
+_DROP = {"split", "time_split", "domain_id", "report_id", "subject_cert_digest",
+         "true_vehicle_id", "entity_id"}
 
 
 def _load(dataset_dir: str, name: str) -> pd.DataFrame | None:
@@ -253,6 +254,33 @@ def _oneclass(vf: pd.DataFrame | None, vl: pd.DataFrame | None) -> dict | None:
             "note": "one-class Mahalanobis trained on BENIGN vehicles only (no attack labels in training)"}
 
 
+def _domain_generalization(vf: pd.DataFrame | None, vl: pd.DataFrame | None) -> dict | None:
+    """Leave-one-DOMAIN-out (campaign only): train on all conditions but one, test on the held-out
+    condition (a different map/traffic/sensor/radio regime). The core sim-to-real question — does the
+    model transfer to an environment it never trained on?"""
+    if vf is None or vl is None or "domain_id" not in vf.columns:
+        return None
+    df = vf.merge(vl[["entity_id", "label_is_attacker"]], on="entity_id", how="inner")
+    doms = sorted(df["domain_id"].unique())
+    if len(doms) < 3:
+        return None
+    per = {}
+    for dom in doms:
+        tr = df[df["domain_id"] != dom]
+        te = df[df["domain_id"] == dom]
+        ytr, yte = tr["label_is_attacker"].to_numpy(float), te["label_is_attacker"].to_numpy(float)
+        if ytr.sum() < 3 or yte.sum() < 2 or (len(yte) - yte.sum()) < 3:
+            continue
+        w, b, mu, sd = _fit_logreg(_feature_matrix(tr)[0], ytr)
+        auc = _roc_auc(yte, _predict(_feature_matrix(te)[0], w, b, mu, sd))
+        if auc is not None:
+            per[int(dom)] = round(auc, 3)
+    if not per:
+        return None
+    return {"mean_auc": round(sum(per.values()) / len(per), 3), "n_domains_evaluated": len(per),
+            "note": "leave-one-domain-out: train on all conditions but one, test on the held-out one"}
+
+
 def run(dataset_dir: str) -> dict[str, Any]:
     sf, sl = _load(dataset_dir, "subject_features"), _load(dataset_dir, "subject_labels")
     rf, rl = _load(dataset_dir, "report_features"), _load(dataset_dir, "report_labels")
@@ -281,6 +309,9 @@ def run(dataset_dir: str) -> dict[str, Any]:
     oc = _oneclass(vf, vl)
     if oc is not None:
         out["anomaly_baseline_unsupervised"] = oc
+    dg = _domain_generalization(vf, vl)
+    if dg is not None:
+        out.setdefault("generalization", {})["domain_leave_one_out"] = dg
     return out
 
 

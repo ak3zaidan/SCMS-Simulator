@@ -337,7 +337,20 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         }
 
         if (reason != null) {
-            backend.onDetection(myDigest, dg, score, t, reason, cam.posConf, scoreNorm);
+            // Full multi-detector fingerprint (every check's normalized score, not just the first that
+            // fired) — this is what a real ML-based MDS / global-MA fusion model consumes.
+            Map<String, Double> det = new HashMap<>();
+            det.put("acceptanceRangeThreshold", (haveSelf && ART_MAX_M > 0) ? artDist / ART_MAX_M : 0.0);
+            det.put("staleOrReplay", staleSec / STALE_MAX_S);
+            det.put("beaconFrequency", (double) s.winCount / FREQ_MAX);
+            det.put("sybilCoLocation", (double) cellDistinct / SYBIL_MIN);
+            det.put("positionJump", refReady ? movedRef / (50 + 60 * gapRef) : 0.0);
+            det.put("positionSpeedInconsistency", (refReady && maxDist > 0) ? movedRef / maxDist : 0.0);
+            det.put("headingInconsistency", refReady ? hd / HEADING_DIFF : 0.0);
+            det.put("implausibleAcceleration",
+                    refReady ? Math.abs(cam.claimedSpeed - s.refSpeed) / gapRef / MAX_PLAUSIBLE_ACCEL : 0.0);
+            det.put("constantPositionFrozen", (double) s.frozenCount / FROZEN_COUNT);
+            backend.onDetection(myDigest, dg, score, t, reason, cam.posConf, scoreNorm, det);
         }
     }
 
