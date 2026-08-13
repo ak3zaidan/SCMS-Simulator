@@ -87,13 +87,17 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
     private static final double MAX_ACCEL_MS2 = 9.0;   // physical accel/decel bound for plausibility
     private static final int MIN_CONSEC = envI("SCMS_MIN_CONSEC", 2);   // consecutive violations before flagging
     private static final double MAX_PLAUSIBLE_ACCEL = envD("SCMS_MAX_ACCEL", 12.0);   // m/s^2 (ETSI/F2MD accel check)
+    private static final double KF_ALPHA = 0.5, KF_BETA = 0.3;                        // alpha-beta tracker gains
+    private static final double KF_THRESH = envD("SCMS_KF_THRESH", 4.0);             // normalized-residual gate
 
     private static final class Rx {
         double lastX, lastY, lastT, lastHeading;       // most recent CAM (frequency, sybil, live)
         double refX, refY, refT, refHeading, refSpeed;  // lagged >=0.5 s reference (motion checks)
         boolean hasRef = false;
         int frozenCount;
-        int psiStreak, hdgStreak;    // consecutive motion-inconsistency violations
+        int psiStreak, hdgStreak, kfStreak;    // consecutive motion-inconsistency violations
+        double kfX, kfY, kfVx, kfVy, kfLastT;   // constant-velocity (alpha-beta) tracker state
+        boolean kfInit = false;
         double winStart;
         int winCount;
         boolean hasPrev = false;
@@ -293,6 +297,38 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
             s.hdgStreak = hdgViol ? s.hdgStreak + 1 : 0;
         }
 
+        // Model-based (constant-velocity alpha-beta / Kalman-like) consistency SCORE. Predict this
+        // CAM's position from the tracked position+velocity and normalize the residual by the plausible
+        // uncertainty (confidence + unmodelled acceleration). This is a SOFT anomaly score carried in
+        // the fusion fingerprint (detnorm_kalmanConsistency) — NOT a hard trigger, because a CV tracker
+        // false-positives on sustained curving; an ML fusion model can weight it. The estimate is not
+        // updated toward a violating sample (so a spike can't poison the track); it re-inits if stale.
+        double kfNorm = 0;
+        boolean kfViol = false;
+        if (!s.kfInit) {
+            s.kfInit = true; s.kfX = cam.claimedX; s.kfY = cam.claimedY; s.kfVx = 0; s.kfVy = 0; s.kfLastT = t;
+        } else {
+            double dtk = t - s.kfLastT;
+            if (dtk <= 0 || dtk > 5) {   // stale / out-of-order: re-init the track
+                s.kfX = cam.claimedX; s.kfY = cam.claimedY; s.kfVx = 0; s.kfVy = 0; s.kfLastT = t; s.kfStreak = 0;
+            } else {
+                double px = s.kfX + s.kfVx * dtk, py = s.kfY + s.kfVy * dtk;
+                double resx = cam.claimedX - px, resy = cam.claimedY - py;
+                double sigma = cam.posConf + 0.5 * MAX_ACCEL_MS2 * dtk * dtk + 1.0;
+                kfNorm = Math.hypot(resx, resy) / sigma;
+                kfViol = kfNorm > KF_THRESH;
+                s.kfStreak = kfViol ? s.kfStreak + 1 : 0;
+                if (!kfViol) {           // update the track only on a consistent sample
+                    s.kfX = px + KF_ALPHA * resx; s.kfY = py + KF_ALPHA * resy;
+                    s.kfVx += KF_BETA * resx / dtk; s.kfVy += KF_BETA * resy / dtk;
+                    s.kfLastT = t;
+                } else if (s.kfStreak >= 4) {   // persistent new course: re-baseline to keep tracking
+                    s.kfX = cam.claimedX; s.kfY = cam.claimedY; s.kfVx = 0; s.kfVy = 0;
+                    s.kfLastT = t; s.kfStreak = 0;
+                }
+            }
+        }
+
         // A normalized score (~>=1 at the detector's threshold) so it is comparable across
         // detectors, unlike the raw score whose units differ (metres / degrees / seconds / counts).
         String reason = null;
@@ -350,6 +386,7 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
             det.put("implausibleAcceleration",
                     refReady ? Math.abs(cam.claimedSpeed - s.refSpeed) / gapRef / MAX_PLAUSIBLE_ACCEL : 0.0);
             det.put("constantPositionFrozen", (double) s.frozenCount / FROZEN_COUNT);
+            det.put("kalmanConsistency", kfNorm / KF_THRESH);
             backend.onDetection(myDigest, dg, score, t, reason, cam.posConf, scoreNorm, det);
         }
     }

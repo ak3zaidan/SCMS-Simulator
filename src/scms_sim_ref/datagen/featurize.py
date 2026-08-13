@@ -50,7 +50,7 @@ REASON_VOCAB = [
 DETECTORS = [
     "acceptanceRangeThreshold", "positionJump", "positionSpeedInconsistency",
     "headingInconsistency", "implausibleAcceleration", "staleOrReplay",
-    "beaconFrequency", "sybilCoLocation", "constantPositionFrozen",
+    "beaconFrequency", "sybilCoLocation", "constantPositionFrozen", "kalmanConsistency",
 ]
 
 
