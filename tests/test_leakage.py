@@ -36,6 +36,29 @@ def test_forbidden_key_predicate():
         assert not is_forbidden_feature_key(k), k
 
 
+def test_underscore_prefixed_leaf_leak_is_caught():
+    """A column disguised with a leading underscore must not bypass the linter."""
+    assert is_forbidden_feature_key("_is_attacker")
+    assert is_forbidden_feature_key("__true_vehicle_id")
+    # the legitimate visibility metadata field must still pass
+    assert not is_forbidden_feature_key("_visibility")
+    d = _clean_report().to_dict()
+    d["_is_attacker"] = 1
+    with pytest.raises(LeakageViolation):
+        assert_ma_visible(d)
+
+
+def test_camelcase_realid_and_trueid_are_caught():
+    """Separator-insensitive identity fields (camelCase) must be forbidden."""
+    for k in ("driverRealId", "ownerRealId", "vehicleTrueId", "subjectTrueId"):
+        assert is_forbidden_feature_key(k), k
+    # near-misses that are NOT identities must still pass
+    for k in ("serialId", "trailerId", "reporter_cert_digest"):
+        assert not is_forbidden_feature_key(k), k
+    with pytest.raises(LeakageViolation):
+        lint_feature_frame([{"detector_score": 0.8, "driverRealId": "veh_9"}])
+
+
 def test_clean_ma_report_passes():
     assert_ma_visible(_clean_report(), context="clean report")
     assert find_forbidden_keys(_clean_report().to_dict()) == []

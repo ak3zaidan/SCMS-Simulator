@@ -44,16 +44,21 @@ FORBIDDEN_FEATURE_KEYS = frozenset({
 
 def is_forbidden_feature_key(key: str) -> bool:
     """True if `key` names ground truth and must never appear as a feature."""
-    k = key.strip()
+    # Strip leading underscores first: a leaf column literally named `_is_attacker`
+    # must not slip past by hiding behind the visibility-field underscore convention.
+    k = key.strip().lstrip("_")
     if k in FORBIDDEN_FEATURE_KEYS:
         return True
     lk = k.lower()
+    norm = lk.replace("_", "")   # separator-insensitive: catches camelCase (driverRealId, xTrueId)
     return (
         lk.startswith("true_")
         or lk.startswith("label_")   # any evaluation label
         or lk.startswith("attack_")  # attack_type / attack_family / attack_id / ...
         or lk.endswith("_true_id")
         or lk.endswith("real_id")
+        or norm.endswith("realid")   # driverRealId / ownerRealId / sender_real_id / ...
+        or norm.endswith("trueid")   # vehicleTrueId / subjectTrueId / ...
         or lk in {"realid", "vehicleid_true"}
     )
 

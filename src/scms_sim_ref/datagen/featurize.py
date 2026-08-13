@@ -209,6 +209,10 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
     # post-revocation pseudonyms carry no signal yet are attacker-labelled). The feature table is
     # keyed by an OPAQUE linked-entity id (never the true id — that would be label leakage); the
     # label table carries the true id for evaluation.
+    # CAVEAT: the grouping below is via the ORACLE identity map, i.e. it assumes PERFECT pseudonym
+    # linkage the MA does not have for free (real linkage is per-investigation only). So the
+    # vehicle_is_attacker task is a post-linkage UPPER BOUND; the subject-level task is the
+    # MA-realistic, leakage-free headline metric. Feature *names* here are still clean (opaque id).
     reports_by_vehicle: dict[str, list[dict]] = {}
     for r in reports:
         tv = vehicle_by_digest.get(r.get("subject_cert_digest"), "unknown")
@@ -232,8 +236,10 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         times = [float(r.get("detection_time", 0)) for r in rs]
         reporters = {r.get("reporter_cert_digest") for r in rs}
         reasons = {c for r in rs for c in (r.get("reason_codes") or ["?"])}
-        # MA-visible pseudonym count: distinct subject certs the MA actually linked from its OWN
-        # reports (NOT the oracle gt_identity_map, which would leak Sybil ghosts / unobserved certs).
+        # Distinct subject certs among this vehicle's reports. NOTE: `rs` is grouped through the
+        # oracle identity map (see block comment above), so this count assumes perfect linkage; it is
+        # not something the MA could compute unaided. Unobserved/never-reported certs are excluded
+        # (only reported digests appear), but that is the only sense in which the oracle is limited.
         n_pseudonyms = len({r.get("subject_cert_digest") for r in rs})
         # per-vehicle multi-detector fingerprint: the strongest normalized evidence from each detector
         detmax = {d: max((float(r.get(f"detnorm_{d}", 0.0) or 0.0) for r in rs), default=0.0)

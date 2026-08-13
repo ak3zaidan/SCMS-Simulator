@@ -405,8 +405,13 @@ public final class ScmsBackend {
             c = AttackLib.compute(d.attackType, d.atk, sendCount, mx, my, mspeed, mheading, tNs, attackCfg);
         }
         c.posConf = conf;
+        // circular heading delta in [0,180]; pure-heading attacks (ReversedHeading, RandomHeading,
+        // PerpendicularHeading, HeadingOffset) leave x/y/speed/genTime untouched, so without this
+        // term the whole heading family was labelled falsified=false and never got an onset stamp.
+        double dHeading = Math.abs(((c.heading - mheading + 540.0) % 360.0) - 180.0);
         boolean falsified = d.attacker && (Math.hypot(c.x - mx, c.y - my) > 1.0
-                || Math.abs(c.speed - mspeed) > 1.0 || c.genTimeNs != tNs || c.flood || c.sybilGhosts > 0);
+                || Math.abs(c.speed - mspeed) > 1.0 || dHeading > 5.0
+                || c.genTimeNs != tNs || c.flood || c.sybilGhosts > 0);
         if (falsified && d.onsetT < 0) {
             d.onsetT = t;    // attack ONSET: first time this attacker actually falsified content
         }

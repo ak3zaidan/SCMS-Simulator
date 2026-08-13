@@ -28,7 +28,10 @@ def find_forbidden_keys(obj: Any, path: str = "") -> list[str]:
     if isinstance(obj, dict):
         for k, v in obj.items():
             here = f"{path}.{k}" if path else str(k)
-            if isinstance(k, str) and not k.startswith("_") and is_forbidden_feature_key(k):
+            # Check EVERY key, including `_`-prefixed leaves. The predicate strips a
+            # leading underscore before matching, so the legitimate `_visibility`
+            # metadata field still passes while a disguised `_is_attacker` is caught.
+            if isinstance(k, str) and is_forbidden_feature_key(k):
                 hits.append(here)
             hits.extend(find_forbidden_keys(v, here))
     elif isinstance(obj, (list, tuple)):

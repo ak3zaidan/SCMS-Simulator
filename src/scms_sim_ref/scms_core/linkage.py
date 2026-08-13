@@ -55,8 +55,16 @@ def _la_id_bytes(la_id: int) -> bytes:
     return la_id.to_bytes(LA_ID_BYTES, "big")
 
 
-def random_linkage_seed() -> bytes:
-    """A fresh 128-bit initial linkage seed ls_x(0), unique per device per LA."""
+def random_linkage_seed(rng: "random.Random | None" = None) -> bytes:
+    """A fresh 128-bit initial linkage seed ls_x(0), unique per device per LA.
+
+    Pass the scenario ``rng`` for a reproducible seed -- the whole pipeline promises
+    byte-for-byte determinism from the scenario RNG, and ``os.urandom`` (the default,
+    kept only for non-dataset ad-hoc use) would silently break that guarantee if this
+    were ever wired into the dataset path. Prefer ``random_linkage_seed(rng)``.
+    """
+    if rng is not None:
+        return rng.getrandbits(8 * LS_BYTES).to_bytes(LS_BYTES, "big")
     return os.urandom(LS_BYTES)
 
 
