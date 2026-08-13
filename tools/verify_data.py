@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from scms_sim_ref.schemas.records import is_forbidden_feature_key, ORACLE  # noqa
 
-FEATURE_FILES = ["report_features", "subject_features", "vehicle_features", "subject_windows"]
+FEATURE_FILES = ["report_features", "subject_features", "vehicle_features",
+                 "vehicle_features_ma", "subject_windows"]
 LABEL_FILES = ["report_labels", "subject_labels", "vehicle_labels"]
 VALID_SPLITS = {"train", "val", "test"}
 VALID_CORRECTNESS = {"correct", "false_positive", "malicious", "duplicate",

@@ -519,9 +519,13 @@ public final class ScmsBackend {
             trusted.add(rep.unitId);
         }
         int distinct = MA_DEFENSE ? trusted.size() : distinctAll;
-        double[] ag = subjAgg.computeIfAbsent(subjectDigest, k -> new double[] {t, t});
+        // Persistence and distinct-second evidence aggregate over the SAME unit as the reporter set
+        // (subj.unitId), so a Sybil attacker cannot split evidence across ghost pseudonyms to keep any
+        // single digest below the persistence gate while the reporter count builds per vehicle. (This
+        // matches the K-distinct-reporters key; keying persistence per digest instead let ghosts evade.)
+        double[] ag = subjAgg.computeIfAbsent(subj.unitId, k -> new double[] {t, t});
         ag[1] = t;                                               // lastT (firstT fixed)
-        java.util.Set<Long> secs = subjSeconds.computeIfAbsent(subjectDigest, k -> new java.util.HashSet<>());
+        java.util.Set<Long> secs = subjSeconds.computeIfAbsent(subj.unitId, k -> new java.util.HashSet<>());
         secs.add((long) Math.floor(t));
         boolean sustained = secs.size() >= REVOKE_MIN_SECONDS && (ag[1] - ag[0]) >= REVOKE_PERSIST_S;
         if (!subj.revoked && distinct >= REPORT_THRESHOLD_K && sustained) {

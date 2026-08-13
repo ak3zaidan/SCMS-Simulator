@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections import Counter
 from typing import Any
 
 import pandas as pd
@@ -124,6 +125,11 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         for c in cert_status
     }
     revoked_by_digest = {c["cert_digest"]: (c.get("crl_status") == "revoked") for c in cert_status}
+    # revocation TIME per digest is MA-visible (published on the CRL); certs the MA linked and revoked
+    # together in one case share a revocation_time -> this is the MA's OWN (imperfect) linkage signal.
+    revtime_by_digest = {c["cert_digest"]: c.get("revocation_time")
+                         for c in cert_status if c.get("crl_status") == "revoked"
+                         and c.get("revocation_time") is not None}
 
     # --- report-level tables ---
     rf_rows, rl_rows = [], []
@@ -319,19 +325,84 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
                     "split": a["split"]}
                    for (e, w), a in win_acc.items()]
 
+    # --- MA-LINKED vehicle table (realistic linkage; NO oracle map for grouping) ---
+    # Contrast with the oracle vehicle table above: here pseudonyms are grouped ONLY by what the MA
+    # can actually link -- certs revoked together in one case share a revocation_time. Non-revoked
+    # certs stay unlinked (one entity per observed pseudonym), exactly as a real MA sees them (it
+    # never links a vehicle it did not investigate). This linkage is imperfect (same-second cases can
+    # merge two vehicles), which is the honest realism. `vehicle_is_attacker_ma_linked` sits BETWEEN
+    # the per-pseudonym subject task (fully MA-realistic) and the oracle vehicle task (upper bound).
+    def _ma_link_key(digest: str) -> str:
+        t = revtime_by_digest.get(digest)
+        return f"revcase_{t:.3f}" if t is not None else f"solo_{digest}"
+
+    ma_group: dict[str, list[dict]] = {}
+    for r in reports:
+        ma_group.setdefault(_ma_link_key(r.get("subject_cert_digest")), []).append(r)
+    # also include observed-but-never-reported certs as 0-report singleton negatives
+    for digest in all_digests:
+        k = _ma_link_key(digest)
+        ma_group.setdefault(k, [])
+    digests_in_key: dict[str, set] = {}
+    for digest in all_digests:
+        digests_in_key.setdefault(_ma_link_key(digest), set()).add(digest)
+    for r in reports:
+        d = r.get("subject_cert_digest")
+        digests_in_key.setdefault(_ma_link_key(d), set()).add(d)
+
+    vfm_rows, vlm_rows = [], []
+    for key in sorted(ma_group):
+        rs = ma_group[key]
+        cluster_digests = digests_in_key.get(key, set())
+        # majority true vehicle across the linked pseudonyms (LABEL side only -> allowed to use oracle)
+        trues = [vehicle_by_digest.get(d) for d in sorted(cluster_digests) if vehicle_by_digest.get(d)]
+        maj_true = Counter(trues).most_common(1)[0][0] if trues else "unknown"
+        ment = "ment_" + hashlib.sha256(key.encode()).hexdigest()[:12]
+        norms = [float(r.get("detector_score_norm", 0.0) or 0.0) for r in rs]
+        times = [float(r.get("detection_time", 0)) for r in rs]
+        reporters = {r.get("reporter_cert_digest") for r in rs}
+        reasons = {c for r in rs for c in (r.get("reason_codes") or ["?"])}
+        detmax = {d: max((float(r.get(f"detnorm_{d}", 0.0) or 0.0) for r in rs), default=0.0)
+                  for d in DETECTORS}
+        split = _split_for(split_seed, maj_true)   # keyed by majority true id -> vehicle-disjoint splits
+        vfm_rows.append({
+            "entity_id": ment,
+            **{f"detmax_{d}": detmax[d] for d in DETECTORS},
+            "n_reports": len(rs),
+            "n_distinct_reporters": len(reporters),
+            "n_pseudonyms": len(cluster_digests),
+            "n_distinct_reasons": len(reasons) if rs else 0,
+            "score_norm_max": max(norms) if norms else 0.0,
+            "score_norm_mean": (sum(norms) / len(norms)) if norms else 0.0,
+            "report_span_s": (max(times) - min(times)) if times else 0.0,
+            "reports_per_reporter": len(rs) / max(1, len(reporters)),
+            "split": split,
+        })
+        vlm_rows.append({
+            "entity_id": ment,
+            "label_is_attacker": int(attacker_by_vehicle.get(maj_true, False)),
+            "label_is_faulty": int(faulty_by_vehicle.get(maj_true, False)),
+            "attack_family": family_by_vehicle.get(maj_true, "none" if not attacker_by_vehicle.get(maj_true) else "other"),
+            "link_true_id_count": len(set(trues)),   # 1 = pure link; >1 = MA merged distinct vehicles
+            "true_vehicle_id": maj_true,
+            "split": split,
+        })
+
     report_features = pd.DataFrame(rf_rows)
     report_labels = pd.DataFrame(rl_rows)
     subject_features = pd.DataFrame(sf_rows)
     subject_labels = pd.DataFrame(sl_rows)
     vehicle_features = pd.DataFrame(vf_rows)
     vehicle_labels = pd.DataFrame(vl_rows)
+    vehicle_features_ma = pd.DataFrame(vfm_rows)
+    vehicle_labels_ma = pd.DataFrame(vlm_rows)
     graph_edges = pd.DataFrame(edge_rows)
     subject_windows = pd.DataFrame(window_rows)
 
     # --- leakage firewall on the FEATURE tables (column-name lineage check) ---
     for name, df in (("report_features", report_features), ("subject_features", subject_features),
-                     ("vehicle_features", vehicle_features), ("graph_edges", graph_edges),
-                     ("subject_windows", subject_windows)):
+                     ("vehicle_features", vehicle_features), ("vehicle_features_ma", vehicle_features_ma),
+                     ("graph_edges", graph_edges), ("subject_windows", subject_windows)):
         cols = [c for c in df.columns if c not in ("split", "time_split")]  # split assignments, not features
         lint_feature_frame([dict.fromkeys(cols, 0)], context=name)
 
@@ -343,6 +414,7 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         ("report_features", report_features), ("report_labels", report_labels),
         ("subject_features", subject_features), ("subject_labels", subject_labels),
         ("vehicle_features", vehicle_features), ("vehicle_labels", vehicle_labels),
+        ("vehicle_features_ma", vehicle_features_ma), ("vehicle_labels_ma", vehicle_labels_ma),
         ("graph_edges", graph_edges), ("subject_windows", subject_windows),
     ):
         pq = os.path.join(out, f"{name}.parquet")

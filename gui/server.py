@@ -487,6 +487,7 @@ def compute_stats(out_dir: Path) -> dict | None:
         "detector_reasons": dict(reasons),
         "report_correctness": dict(correctness),
         "benchmark": bench.get("tasks", {}),
+        "linkage_quality": bench.get("linkage_quality", {}),
         "generalization": bench.get("generalization", {}),
         "graph_baseline": bench.get("graph_baseline", {}),
         "anomaly_unsupervised": bench.get("anomaly_baseline_unsupervised", {}),

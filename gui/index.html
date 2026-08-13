@@ -421,9 +421,10 @@ function sc(label,sub,val,ok){
           <div class="r">${val}${badge(ok)}</div></div>`;
 }
 const TASK_LABELS={
-  subject_is_attacker:'Subject → attacker',
+  subject_is_attacker:'Subject → attacker (MA-realistic)',
   report_is_true_detection:'Report → true detection',
-  vehicle_is_attacker:'Vehicle → attacker',
+  vehicle_is_attacker_ma_linked:'Vehicle → attacker (MA-linked)',
+  vehicle_is_attacker:'Vehicle → attacker (oracle ceiling)',
 };
 function benchTable(tasks){
   const rows=Object.entries(tasks||{}).filter(([,t])=>t&&t.roc_auc!=null);
@@ -439,6 +440,15 @@ function benchTable(tasks){
   return card('Supervised benchmark','logistic-regression baseline, per-task test split',
     `<table class="mt"><thead><tr><th>Task</th><th>ROC-AUC</th><th>PR-AUC</th>
        <th>R@1%FPR</th><th>Bal.Acc</th></tr></thead><tbody>${body}</tbody></table>`);
+}
+function linkageNote(lq){
+  if(!lq || lq.entity_purity==null) return '';
+  const pure=(lq.entity_purity*100).toFixed(1);
+  return `<div class="muted" style="font-size:11px;margin-top:6px">
+    MA-linked entities: <b>${lq.n_ma_entities}</b> · linkage purity <b>${pure}%</b>
+    · ${lq.n_entities_merging_distinct_vehicles} merged distinct vehicles.
+    The <i>MA-linked</i> row uses only co-revocation linkage (no oracle); it sits between the
+    per-pseudonym subject row (realistic floor) and the oracle ceiling.</div>`;
 }
 function genSection(g){
   g=g||{}; const parts=[];
@@ -508,7 +518,7 @@ function renderStats(st){
     ['Digest', `<span class="muted" style="font-size:12px">${st.data_digest||'—'}</span>`],
   ];
   $('#kpis').innerHTML=kpis.map(([k,v])=>`<div class="kpi"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
-  $('#benchWrap').innerHTML=benchTable(st.benchmark);
+  $('#benchWrap').innerHTML=benchTable(st.benchmark)+linkageNote(st.linkage_quality);
   $('#genWrap').innerHTML=genSection(st.generalization);
   $('#baseWrap').innerHTML=baseSection(st);
   $('#calibWrap').innerHTML=calibSection(st.calibration);

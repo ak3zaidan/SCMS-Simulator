@@ -22,7 +22,11 @@ import numpy as np
 import pandas as pd
 
 _DROP = {"split", "time_split", "domain_id", "report_id", "subject_cert_digest",
-         "true_vehicle_id", "entity_id"}
+         "true_vehicle_id", "entity_id",
+         # Kept in the tables (for per-subject sequence ordering / graph), but NEVER used as model
+         # features: detection_time lets a model exploit absolute wall-clock, and crl_active_at_report
+         # is downstream of the MA's OWN revoke decision (revoked==attacker), i.e. target leakage.
+         "detection_time", "crl_active_at_report"}
 
 
 def _load(dataset_dir: str, name: str) -> pd.DataFrame | None:
@@ -281,6 +285,24 @@ def _domain_generalization(vf: pd.DataFrame | None, vl: pd.DataFrame | None) -> 
             "note": "leave-one-domain-out: train on all conditions but one, test on the held-out one"}
 
 
+def _linkage_quality(vlm: pd.DataFrame | None) -> dict | None:
+    """How good is the MA's OWN (co-revocation) pseudonym linkage vs the oracle? A pure link groups
+    exactly one true vehicle; link_true_id_count>1 means the MA merged distinct vehicles. Reported so
+    the vehicle_is_attacker_ma_linked number is read with its linkage error in view."""
+    if vlm is None or "link_true_id_count" not in vlm.columns or len(vlm) == 0:
+        return None
+    multi = vlm[vlm["link_true_id_count"] > 1]
+    n_entities = int(len(vlm))
+    n_multi_veh = int(len(multi))
+    pure = int((vlm["link_true_id_count"] <= 1).sum())
+    return {
+        "n_ma_entities": n_entities,
+        "entity_purity": round(pure / n_entities, 3) if n_entities else None,
+        "n_entities_merging_distinct_vehicles": n_multi_veh,
+        "note": "MA co-revocation linkage; purity=1.0 means no entity conflated two true vehicles",
+    }
+
+
 def run(dataset_dir: str) -> dict[str, Any]:
     sf, sl = _load(dataset_dir, "subject_features"), _load(dataset_dir, "subject_labels")
     rf, rl = _load(dataset_dir, "report_features"), _load(dataset_dir, "report_labels")
@@ -294,7 +316,15 @@ def run(dataset_dir: str) -> dict[str, Any]:
     vf, vl = _load(dataset_dir, "vehicle_features"), _load(dataset_dir, "vehicle_labels")
     veh = _task(vf, vl, "entity_id", "label_is_attacker")
     if veh is not None:
-        out["tasks"]["vehicle_is_attacker"] = veh
+        out["tasks"]["vehicle_is_attacker"] = veh   # oracle-linked: POST-LINKAGE UPPER BOUND
+    # MA-realistic linkage (grouped only by what the MA actually revoked/linked, no oracle map)
+    vfm, vlm = _load(dataset_dir, "vehicle_features_ma"), _load(dataset_dir, "vehicle_labels_ma")
+    vehm = _task(vfm, vlm, "entity_id", "label_is_attacker")
+    if vehm is not None:
+        out["tasks"]["vehicle_is_attacker_ma_linked"] = vehm
+    lq = _linkage_quality(vlm)
+    if lq is not None:
+        out["linkage_quality"] = lq
     novel = _novel_attack(vf, vl)
     if novel is not None:
         out["generalization"] = {"vehicle_novel_attack": novel}

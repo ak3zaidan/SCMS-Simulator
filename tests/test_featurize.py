@@ -66,6 +66,31 @@ def test_graph_and_vehicle_exports_are_leakage_safe(tmp_path):
         assert ge["dst_entity"].str.startswith("ent_").all()
 
 
+def test_ma_linked_vehicle_table_is_leakage_safe_and_realistic(tmp_path):
+    """The MA-linked vehicle table groups pseudonyms by MA-visible co-revocation only (no oracle
+    map), is keyed by an opaque id, and its benchmark AUC is reported with a linkage-quality metric."""
+    from scms_sim_ref.datagen import benchmark
+
+    out = str(tmp_path / "run")
+    run_pipeline(PipelineConfig(out_dir=out, seed=13))
+    featurize.build(out, split_seed=5)
+    ml = os.path.join(out, "ml")
+
+    vfm = pd.read_parquet(os.path.join(ml, "vehicle_features_ma.parquet"))
+    vlm = pd.read_parquet(os.path.join(ml, "vehicle_labels_ma.parquet"))
+    # leakage-safe features, opaque id (never the true id)
+    assert find_forbidden_keys({c: 0 for c in vfm.columns if c != "split"}) == []
+    assert "entity_id" in vfm.columns and "true_vehicle_id" not in vfm.columns
+    assert vfm["entity_id"].str.startswith("ment_").all()
+    # each MA entity links >=1 true vehicle; purity column present for honest reporting
+    assert "link_true_id_count" in vlm.columns
+    assert (vlm["link_true_id_count"] >= 1).all()
+
+    r = benchmark.run(out)
+    lq = r.get("linkage_quality")
+    assert lq is not None and 0.0 <= lq["entity_purity"] <= 1.0
+
+
 def test_featurize_is_deterministic(tmp_path):
     """Same inputs + split seed -> identical feature tables."""
     out = str(tmp_path / "run")

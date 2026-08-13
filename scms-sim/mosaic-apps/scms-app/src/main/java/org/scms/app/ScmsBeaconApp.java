@@ -12,6 +12,7 @@
 package org.scms.app;
 
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -375,7 +376,9 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         if (reason != null) {
             // Full multi-detector fingerprint (every check's normalized score, not just the first that
             // fired) — this is what a real ML-based MDS / global-MA fusion model consumes.
-            Map<String, Double> det = new HashMap<>();
+            // LinkedHashMap: the on-disk detnorm_* column order is INSERTION order, not JDK-dependent
+            // HashMap bucket order — keeps "same seed -> byte-identical" robust across JDK versions.
+            Map<String, Double> det = new LinkedHashMap<>();
             det.put("acceptanceRangeThreshold", (haveSelf && ART_MAX_M > 0) ? artDist / ART_MAX_M : 0.0);
             det.put("staleOrReplay", staleSec / STALE_MAX_S);
             det.put("beaconFrequency", (double) s.winCount / FREQ_MAX);
