@@ -21,6 +21,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .models import fit_gbdt, predict_gbdt
+
 _DROP = {"split", "time_split", "domain_id", "report_id", "subject_cert_digest",
          "true_vehicle_id", "entity_id",
          # Kept in the tables (for per-subject sequence ordering / graph), but NEVER used as model
@@ -115,6 +117,38 @@ def _prf(y: np.ndarray, s: np.ndarray, thr: float = 0.5) -> dict:
             "balanced_accuracy": round(0.5 * (rec + tnr), 3), "tp": tp, "fp": fp, "fn": fn, "tn": tn}
 
 
+def _bootstrap_ci(y: np.ndarray, s: np.ndarray, metric, n_boot: int = 300,
+                  seed: int = 12345, alpha: float = 0.05) -> list | None:
+    """Percentile bootstrap CI for a metric of (y, s). Seeded -> reproducible (eval-only, not in the
+    dataset digest). Returns [lo, hi] rounded, or None if the metric is undefined on the sample."""
+    n = len(y)
+    if n < 10:
+        return None
+    rng = np.random.default_rng(seed)
+    vals = []
+    for _ in range(n_boot):
+        b = rng.integers(0, n, n)
+        v = metric(y[b], s[b])
+        if v is not None:
+            vals.append(v)
+    if len(vals) < n_boot // 2:
+        return None
+    lo, hi = np.quantile(vals, [alpha / 2, 1 - alpha / 2])
+    return [round(float(lo), 3), round(float(hi), 3)]
+
+
+def _model_metrics(yte: np.ndarray, s: np.ndarray, with_ci: bool = True) -> dict:
+    m = {
+        "roc_auc": None if _roc_auc(yte, s) is None else round(_roc_auc(yte, s), 3),
+        "pr_auc": None if _pr_auc(yte, s) is None else round(_pr_auc(yte, s), 3),
+        "recall_at_1pct_fpr": None if _recall_at_fpr(yte, s) is None else round(_recall_at_fpr(yte, s), 3),
+        "balanced_accuracy": _prf(yte, s)["balanced_accuracy"],
+    }
+    if with_ci:
+        m["roc_auc_ci95"] = _bootstrap_ci(yte, s, _roc_auc)
+    return m
+
+
 def _recall_at_fpr(y: np.ndarray, s: np.ndarray, fpr: float = 0.01) -> float | None:
     """Recall achievable at a fixed false-positive rate — the operating point a real MA cares about
     (few false accusations)."""
@@ -126,7 +160,7 @@ def _recall_at_fpr(y: np.ndarray, s: np.ndarray, fpr: float = 0.01) -> float | N
 
 
 def _task(feat: pd.DataFrame, lab: pd.DataFrame, key: str, label_col: str,
-          split_col: str = "split") -> dict | None:
+          split_col: str = "split", with_gbdt: bool = True) -> dict | None:
     if feat is None or lab is None or label_col not in lab.columns:
         return None
     if split_col in feat.columns and split_col in lab.columns:
@@ -146,15 +180,25 @@ def _task(feat: pd.DataFrame, lab: pd.DataFrame, key: str, label_col: str,
         return {"note": "train split single-class", "positives_train": int(ytr.sum()), "n_train": int(len(ytr))}
     w, b, mu, sd = _fit_logreg(xtr, ytr)
     s = _predict(xte, w, b, mu, sd)
-    return {
+    out = {
         "n_train": int(len(tr)), "n_test": int(len(te)),
         "positive_rate_test": round(float(yte.mean()), 3),
         "roc_auc": None if _roc_auc(yte, s) is None else round(_roc_auc(yte, s), 3),
         "pr_auc": None if _pr_auc(yte, s) is None else round(_pr_auc(yte, s), 3),
         "recall_at_1pct_fpr": None if _recall_at_fpr(yte, s) is None else round(_recall_at_fpr(yte, s), 3),
+        "roc_auc_ci95": _bootstrap_ci(yte, s, _roc_auc),
         "at_0.5": _prf(yte, s),
         "features": cols,
     }
+    if with_gbdt:
+        # strong non-linear tabular baseline (numpy GBDT); trees don't need standardization
+        try:
+            gb = fit_gbdt(xtr, ytr)
+            sg = predict_gbdt(gb, xte)
+            out["gbdt"] = _model_metrics(yte, sg)
+        except Exception as ex:   # never let a baseline crash the whole benchmark
+            out["gbdt"] = {"error": str(ex)}
+    return out
 
 
 def _novel_attack(vf: pd.DataFrame | None, vl: pd.DataFrame | None) -> dict | None:

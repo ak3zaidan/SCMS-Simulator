@@ -164,7 +164,9 @@ def build(dataset_dir: str) -> str:
                  f"p90 {dl.get('p90_s')} s, max {dl.get('max_s')} s (n={dl.get('n')})")
     L.append("")
 
-    L.append("## Baseline ML benchmark (logistic regression, train->test, vehicle-disjoint)")
+    L.append("## Baseline ML benchmark (logreg vs GBDT, train->test, vehicle-disjoint)")
+    L.append("*Two baselines per task: logistic regression (linear separability) and gradient-boosted "
+             "trees (strong non-linear tabular learner). 95% bootstrap CI on ROC-AUC.*")
     if not bres:
         L.append("- (no benchmark available)")
     for name, t in bres.items():
@@ -172,9 +174,17 @@ def build(dataset_dir: str) -> str:
             L.append(f"- **{name}**: {t['note']}")
             continue
         a5 = t.get("at_0.5", {})
-        L.append(f"- **{name}**: ROC-AUC **{t.get('roc_auc')}**, PR-AUC **{t.get('pr_auc')}**, "
-                 f"recall@1%FPR {t.get('recall_at_1pct_fpr')}, balanced-acc {a5.get('balanced_accuracy')}, "
-                 f"F1@0.5 {a5.get('f1')}; test n={t.get('n_test')}, positive rate {t.get('positive_rate_test')}")
+        ci = t.get("roc_auc_ci95")
+        cistr = f" (95% CI {ci[0]}–{ci[1]})" if ci else ""
+        L.append(f"- **{name}**: logreg ROC-AUC **{t.get('roc_auc')}**{cistr}, PR-AUC {t.get('pr_auc')}, "
+                 f"recall@1%FPR {t.get('recall_at_1pct_fpr')}, balanced-acc {a5.get('balanced_accuracy')}; "
+                 f"test n={t.get('n_test')}, positive rate {t.get('positive_rate_test')}")
+        g = t.get("gbdt")
+        if g and g.get("roc_auc") is not None:
+            gci = g.get("roc_auc_ci95")
+            gcistr = f" (95% CI {gci[0]}–{gci[1]})" if gci else ""
+            L.append(f"    - GBDT ROC-AUC **{g.get('roc_auc')}**{gcistr}, PR-AUC {g.get('pr_auc')}, "
+                     f"recall@1%FPR {g.get('recall_at_1pct_fpr')}, balanced-acc {g.get('balanced_accuracy')}")
     oc = bfull.get("anomaly_baseline_unsupervised")
     if oc:
         L.append(f"- **Unsupervised anomaly baseline** (one-class Mahalanobis, trained on BENIGN only): "
@@ -189,10 +199,13 @@ def build(dataset_dir: str) -> str:
         L.append(f"- **Novel-attack generalization** (leave-one-attack-family-out): mean ROC-AUC "
                  f"**{nov.get('mean_novel_attack_auc')}** — detecting attack families held out of "
                  f"training. Per family: " + ", ".join(f"{k} {v}" for k, v in nov.get("per_family_auc", {}).items()))
-    L.append("\n_`vehicle_is_attacker` is the primary task — the MA's real post-linkage decision "
-             "unit (pseudonyms linked via the LAs). `subject_is_attacker` is per-pseudonym and is "
-             "deliberately hard: pseudonym rotation fragments each attacker across short-lived, often "
-             "evasive certificates. `report_is_true_detection` is near-saturated because the tuned "
+    L.append("\n_Three classification units span a realism spectrum. `subject_is_attacker` "
+             "(per-pseudonym) is the MA-realistic FLOOR and is deliberately hard: pseudonym rotation "
+             "fragments each attacker across short-lived, often evasive certificates. "
+             "`vehicle_is_attacker_ma_linked` groups pseudonyms by what the MA can actually link "
+             "(co-revocation only, no oracle) — the realistic headline. `vehicle_is_attacker` uses "
+             "the oracle identity map (PERFECT linkage) and is an optimistic UPPER BOUND, not an "
+             "MA-achievable number. `report_is_true_detection` is near-saturated because the tuned "
              "detector suite emits mostly-true reports. Recall < 1.0 (evasive attacks) is the main "
              "realistic difficulty._\n")
 

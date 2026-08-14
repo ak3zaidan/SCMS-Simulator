@@ -426,19 +426,23 @@ const TASK_LABELS={
   vehicle_is_attacker_ma_linked:'Vehicle → attacker (MA-linked)',
   vehicle_is_attacker:'Vehicle → attacker (oracle ceiling)',
 };
+function ci(c){ return (c&&c.length===2)?`<span class="hint" style="font-size:9px"> [${c[0]}–${c[1]}]</span>`:''; }
 function benchTable(tasks){
   const rows=Object.entries(tasks||{}).filter(([,t])=>t&&t.roc_auc!=null);
   if(!rows.length) return card('Supervised benchmark',null,
     '<span class="muted" style="font-size:11px">insufficient data</span>');
-  const body=rows.map(([k,t])=>`<tr>
+  const body=rows.map(([k,t])=>{
+    const g=t.gbdt||{};
+    return `<tr>
       <td>${TASK_LABELS[k]||k}</td>
-      <td class="v">${num(t.roc_auc)}</td>
-      <td>${num(t.pr_auc)}</td>
-      <td>${num(t.recall_at_1pct_fpr)}</td>
-      <td>${num((t['at_0.5']||{}).balanced_accuracy)}</td>
-    </tr>`).join('');
-  return card('Supervised benchmark','logistic-regression baseline, per-task test split',
-    `<table class="mt"><thead><tr><th>Task</th><th>ROC-AUC</th><th>PR-AUC</th>
+      <td>${num(t.roc_auc)}</td>
+      <td class="v">${num(g.roc_auc??t.roc_auc)}${ci(g.roc_auc_ci95||t.roc_auc_ci95)}</td>
+      <td>${num(g.pr_auc??t.pr_auc)}</td>
+      <td>${num(g.recall_at_1pct_fpr??t.recall_at_1pct_fpr)}</td>
+      <td>${num(g.balanced_accuracy??(t['at_0.5']||{}).balanced_accuracy)}</td>
+    </tr>`;}).join('');
+  return card('Supervised benchmark','logreg vs gradient-boosted trees · 95% bootstrap CI · GBDT columns bold',
+    `<table class="mt"><thead><tr><th>Task</th><th>ROC<br>LR</th><th>ROC<br>GBDT</th><th>PR-AUC</th>
        <th>R@1%FPR</th><th>Bal.Acc</th></tr></thead><tbody>${body}</tbody></table>`);
 }
 function linkageNote(lq){
