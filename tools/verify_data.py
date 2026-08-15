@@ -253,14 +253,16 @@ def audit(ds_dir: Path):
         rec(ds, "V2_detnorm_nonneg", neg == 0, f"{neg} negative detnorm values")
     else:
         rec(ds, "V2_detnorm_nonneg", None, "")
-    # V3: attacker fraction ~ attacker_pct
+    # V3: attacker fraction ~ attacker_pct (config may express it as a percent [20] or fraction [0.2];
+    # when it is 0 the fleet is driven by an explicit attacker_ids list, so the check is not applicable)
     pct = man.get("config", {}).get("attacker_pct")
-    if pct is not None and gt_vehicle:
+    if pct and gt_vehicle:
+        pct_percent = pct * 100.0 if pct <= 1.0 else float(pct)
         frac = 100.0 * sum(1 for r in gt_vehicle if r.get("is_attacker")) / len(gt_vehicle)
-        rec(ds, "V3_attacker_pct_plausible", abs(frac - pct) <= max(8.0, 0.5 * pct),
-            f"config={pct}% actual={frac:.1f}%")
+        rec(ds, "V3_attacker_pct_plausible", abs(frac - pct_percent) <= max(8.0, 0.5 * pct_percent),
+            f"config={pct_percent:.0f}% actual={frac:.1f}%")
     else:
-        rec(ds, "V3_attacker_pct_plausible", None, "")
+        rec(ds, "V3_attacker_pct_plausible", None, "attacker_ids mode" if pct == 0 else "")
 
     # ============ G. FILE INTEGRITY (digests) ============
     outputs = man.get("outputs")

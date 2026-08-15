@@ -166,6 +166,7 @@ class GtVehicle:
     is_attacker: bool
     attacker_role: str = "none"
     colluding_group_id: Optional[str] = None
+    is_faulty: bool = False
     _visibility: str = ORACLE
 
     def to_dict(self) -> dict[str, Any]:
@@ -193,6 +194,7 @@ class GtAttack:
     start_time: float
     end_time: float
     params: dict[str, Any] = field(default_factory=dict)
+    attack_onset_time: Optional[float] = None   # first materially-falsified message
     _visibility: str = ORACLE
 
     def to_dict(self) -> dict[str, Any]:
