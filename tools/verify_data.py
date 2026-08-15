@@ -201,13 +201,16 @@ def audit(ds_dir: Path):
             f"manifest={n_rep} ma={len(ma_reports)} gtlabels={len(gt_labels)} feat={len(rf_rows)}")
     else:
         rec(ds, "CNT2_reports", None, "")
+    # revoked count = distinct TRUE vehicles with a revoked cert. Robust to pseudonym rotation
+    # (many revoked certs per vehicle) and to false revocations (a framed benign counts as revoked).
     n_rev = counts.get("revoked")
-    if n_rev is not None:
-        gt_rev = sum(1 for r in gt_revoc if r.get("should_have_been_revoked"))
-        ma_rev = sum(1 for r in ma_status if r.get("crl_status") == "revoked") or \
-                 sum(1 for r in ma_invest if r.get("revocation_decision") == "revoke")
-        rec(ds, "CNT3_revoked", n_rev in (gt_rev, ma_rev),
-            f"manifest={n_rev} gt_should_revoke={gt_rev} ma_revoke={ma_rev}")
+    if n_rev is not None and ma_status and digest2true:
+        revoked_true = {digest2true[c["cert_digest"]] for c in ma_status
+                        if c.get("crl_status") == "revoked" and c["cert_digest"] in digest2true}
+        rec(ds, "CNT3_revoked", len(revoked_true) == n_rev,
+            f"manifest={n_rev} distinct_revoked_vehicles={len(revoked_true)}")
+    elif n_rev is not None:
+        rec(ds, "CNT3_revoked", n_rev == len(gt_revoc), f"manifest={n_rev} gt_rows={len(gt_revoc)}")
     else:
         rec(ds, "CNT3_revoked", None, "")
     n_inv = counts.get("investigations")

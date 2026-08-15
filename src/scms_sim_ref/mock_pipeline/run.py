@@ -34,6 +34,7 @@ import json
 import math
 import os
 import random
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -50,9 +51,11 @@ ATTACK_CATALOG = (
     "ConstPos", "ConstPosOffset", "RandomPos", "Teleport", "SineWavePos",
     "ConstSpeedOffset", "RandomSpeed", "StopAndGo",
     "ReversedHeading", "HeadingOffset", "DataReplay",
-    "SlowDrift", "AlongRoadOffset",
+    "SlowDrift", "AlongRoadOffset", "Sybil",
 )
 WEATHER_MULT = {"clear": 1.0, "rain": 1.5, "fog": 2.0, "snow": 2.5}
+_SYBIL_MIN = 4        # distinct certs co-located in one cell before sybilCoLocation fires
+_CELL_M = 5.0         # spatial cell size for co-location
 
 
 # --------------------------------------------------------------------------- #
@@ -91,6 +94,16 @@ class PipelineConfig:
     net_delay_max: float = 2.0
     crl_propagation_delay: float = 2.0
     emit_sample_prob: float = 0.03       # per-message ground-truth emission sampling
+    # --- pseudonym rotation ---
+    rotate_period_s: float = 0.0         # 0 = one pseudonym per vehicle (no rotation)
+    # --- collusion / false accusation ---
+    collude_pct: float = 0.0             # fraction of ATTACKERS that also file false reports
+    victim_pct: float = 0.10             # fraction of benign vehicles targeted by colluders
+    ma_defense: bool = True              # trusted-reporter gating (reputation + rate limit)
+    reputation_max: int = 40             # a reporter itself reported more than this is distrusted
+    report_budget: int = 30              # a reporter filing more than this is rate-limited
+    # --- Sybil ---
+    sybil_ghosts: int = 6                # ghost identities a "Sybil" attacker fabricates
     jmax: int = 20
     out_dir: str = "datasets/poc_run"
 
@@ -175,6 +188,13 @@ class Vehicle:
     gps_q: float = 1.0                   # per-vehicle GNSS quality multiplier
     is_faulty: bool = False
     attack_type: str = "none"
+    # pseudonyms / sybil / collusion
+    pseudonyms: list = field(default_factory=list)   # [{k,i,j,digest,valid_from,valid_to}]
+    ghosts: list = field(default_factory=list)       # sybil ghost cert digests
+    colluder: bool = False
+    victims: list = field(default_factory=list)      # vids this colluder falsely reports
+    revoked: bool = False
+    revocation_time: Optional[float] = None
     # mutable per-run state
     bias_x: float = 0.0
     bias_y: float = 0.0
@@ -182,6 +202,12 @@ class Vehicle:
     drift: float = 0.0
     hist: list = field(default_factory=list)   # (x,y,speed,heading) claim history for replay
     onset: Optional[float] = None
+
+    def active_pseudonym(self, t: float, rotate_period_s: float) -> dict:
+        if rotate_period_s <= 0 or len(self.pseudonyms) <= 1:
+            return self.pseudonyms[0]
+        idx = min(int(t / rotate_period_s), len(self.pseudonyms) - 1)
+        return self.pseudonyms[idx]
 
     def true_state(self, t: float) -> tuple[float, float, float, float]:
         """True (x, y, speed, heading[deg]) at time t: straight heading + gentle lane wander."""
@@ -237,6 +263,16 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     faulty_set = set(frng.sample(non_attackers, min(n_faulty, len(non_attackers)))) if n_faulty else set()
     attackers_sorted = sorted(attacker_set)
     catalog = cfg.attack_types or (cfg.attack_type,)
+    # colluders (subset of attackers) + their benign victims
+    crng = random.Random(f"{cfg.seed}:collusion")
+    n_coll = int(round(len(attackers_sorted) * cfg.collude_pct))
+    colluder_set = set(crng.sample(attackers_sorted, n_coll)) if n_coll else set()
+    n_victims = int(round(len(non_attackers) * cfg.victim_pct))
+    victim_pool = sorted(frng.sample(non_attackers, min(n_victims, len(non_attackers)))) if (n_victims and colluder_set) else []
+
+    total_time = cfg.n_steps * cfg.dt
+    n_rot = 1 if cfg.rotate_period_s <= 0 else max(1, math.ceil(total_time / cfg.rotate_period_s))
+    pseudonym_info: dict[str, dict] = {}   # digest -> {i,j,lv,veh,ghost,valid_from,valid_to}
 
     # ---- Provisioning (real linkage values via two Linkage Authorities) ----
     vehicles: list[Vehicle] = []
@@ -244,38 +280,61 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     for vid in range(cfg.n_vehicles):
         is_att = vid in attacker_set
         vr = random.Random(f"{cfg.seed}:veh:{vid}")
-        key = ca.keypair_from_seed(cfg.derive(f"key:{vid}"))
-        pub = ca.public_bytes(key)
-        cert_digest = ca.hashed_id8(pub).hex()
         la_h1, la_h2 = f"lc1:{vid}", f"lc2:{vid}"
         la_id1, la_id2 = 0x0001, 0x0002
         ctx = DeviceLinkageContext(la_id1, la_id2,
                                    cfg.derive(f"ls1:{vid}", 16), cfg.derive(f"ls2:{vid}", 16))
         la1.register(la_h1, ctx.ls1_0, la_id1)
         la2.register(la_h2, ctx.ls2_0, la_id2)
-        i_period, j = 0, vid % cfg.jmax
         req_hash = hashlib.sha256(f"req|{cfg.seed}|{vid}".encode()).hexdigest()[:16]
-        pca.issue(cert_digest, req_hash, i_period, j, la_h1, la_h2)
         true_id = f"veh_{vid:03d}"
         ra.bind(req_hash, true_id)
         atype = catalog[attackers_sorted.index(vid) % len(catalog)] if is_att else "none"
+
+        # rotating pseudonyms (one when rotation is off); one CRL entry at i=0 covers all of them
+        pseudonyms = []
+        for k in range(n_rot):
+            i_k, j_k = k // cfg.jmax, (vid + k) % cfg.jmax
+            pk = ca.keypair_from_seed(cfg.derive(f"key:{vid}:{k}"))
+            dig = ca.hashed_id8(ca.public_bytes(pk)).hex()
+            pca.issue(dig, req_hash, i_k, j_k, la_h1, la_h2)
+            vf = k * cfg.rotate_period_s if cfg.rotate_period_s > 0 else 0.0
+            vt = (k + 1) * cfg.rotate_period_s if cfg.rotate_period_s > 0 else total_time
+            pseudonyms.append({"k": k, "i": i_k, "j": j_k, "digest": dig, "valid_from": vf, "valid_to": vt})
+            pseudonym_info[dig] = {"i": i_k, "j": j_k, "lv": ctx.linkage_value_for(i_k, j_k),
+                                   "ghost": False, "veh_vid": vid}
+            gt_idmap.append(R.GtIdentityMap(true_vehicle_id=true_id, pseudonym_cert_digest=dig,
+                                            i_period=i_k, valid_from=round(vf, 3), valid_to=round(vt, 3)))
+        p0 = pseudonyms[0]
         v = Vehicle(
             vid=vid, spawn_x=float(vid * 20), lane_y=float(vid % 4) * 4.0,
             speed=cfg.nominal_speed * (0.85 + 0.3 * vr.random()),
-            is_attacker=is_att, priv=key, pub=pub, cert_digest=cert_digest,
-            linkage_ctx=ctx, i_period=i_period, j_index=j, request_hash=req_hash,
-            direction=(vr.random() - 0.5) * 0.5,          # small spread around +x
+            is_attacker=is_att, priv=None, pub=b"", cert_digest=p0["digest"],
+            linkage_ctx=ctx, i_period=p0["i"], j_index=p0["j"], request_hash=req_hash,
+            direction=(vr.random() - 0.5) * 0.5,
             wander_amp=vr.random() * 1.5, wander_w=0.15 + vr.random() * 0.25,
             phase=vr.random() * 6.283, gps_q=0.5 + vr.expovariate(1.2),
-            is_faulty=(vid in faulty_set), attack_type=atype)
+            is_faulty=(vid in faulty_set), attack_type=atype, pseudonyms=pseudonyms,
+            colluder=(vid in colluder_set), victims=list(victim_pool) if vid in colluder_set else [])
+        # sybil ghost identities (extra co-located pseudonyms of the same true vehicle)
+        if is_att and atype == "Sybil":
+            for g in range(cfg.sybil_ghosts):
+                gj = (cfg.jmax - 1 - g) % cfg.jmax
+                gk = ca.keypair_from_seed(cfg.derive(f"ghost:{vid}:{g}"))
+                gdig = ca.hashed_id8(ca.public_bytes(gk)).hex()
+                pca.issue(gdig, req_hash, 0, gj, la_h1, la_h2)
+                v.ghosts.append(gdig)
+                pseudonym_info[gdig] = {"i": 0, "j": gj, "lv": ctx.linkage_value_for(0, gj),
+                                        "ghost": True, "veh_vid": vid}
+                gt_idmap.append(R.GtIdentityMap(true_vehicle_id=true_id, pseudonym_cert_digest=gdig,
+                                                i_period=0, valid_from=0.0, valid_to=total_time))
         vehicles.append(v)
         gt_vehicle.append(R.GtVehicle(true_vehicle_id=true_id, spawn_time=0.0, is_attacker=is_att,
                                       attacker_role=(atype if is_att else "none"),
-                                      is_faulty=(vid in faulty_set)))
-        gt_idmap.append(R.GtIdentityMap(true_vehicle_id=true_id, pseudonym_cert_digest=cert_digest,
-                                        i_period=i_period, valid_from=0.0, valid_to=cfg.n_steps * cfg.dt))
+                                      is_faulty=(vid in faulty_set),
+                                      colluding_group_id=("colluders" if vid in colluder_set else None)))
 
-    digest_to_vehicle = {v.cert_digest: v for v in vehicles}
+    digest_to_vehicle = {d: vehicles[info["veh_vid"]] for d, info in pseudonym_info.items()}
     vrng = {v.vid: random.Random(f"{cfg.seed}:sensor:{v.vid}") for v in vehicles}
 
     # ---- MA state (updated ONLINE during the loop) ----
@@ -289,9 +348,11 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     reporters_by_subject: dict[str, set[str]] = {}
     subj_seconds: dict[str, set[int]] = {}
     subj_span: dict[str, list[float]] = {}
-    revocation_time: dict[str, float] = {}
-    revoked_digests: list[str] = []
-    last_claimed: dict[tuple[int, str], tuple[float, float, float, float, float]] = {}
+    revoked_vehicles: dict[int, float] = {}          # vid -> revocation time (vehicle-level)
+    revoked_digests: list[str] = []                  # triggering digests (for the CRL sanity check)
+    filed_by: dict[str, int] = {}                    # reports FILED per reporter cert (rate-limit)
+    received_by: dict[str, int] = {}                 # reports RECEIVED per subject cert (reputation)
+    last_claimed: dict[tuple[int, str], dict] = {}
     cert_first_seen: dict[str, float] = {}
     cert_last_seen: dict[str, float] = {}
     counters = {"report": 0, "case": 0, "crl": 0}
@@ -376,19 +437,80 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             det["staleOrReplay"] = 1.2
         return det
 
-    def resolve_and_revoke(subject_digest: str, t: float) -> None:
+    DET_KEYS = ("positionSpeedInconsistency", "positionJump", "headingInconsistency",
+                "staleOrReplay", "constantPositionFrozen", "sybilCoLocation")
+    touched_subjects: set[str] = set()
+
+    def trusted(reporter_digest: str) -> bool:
+        """Collusion-robust MA gate: only count a reporter that is not revoked, not itself
+        heavily reported (reputation), and not spraying beyond a report budget (rate limit)."""
+        if not cfg.ma_defense:
+            return True
+        rv = digest_to_vehicle.get(reporter_digest)
+        if rv is None:
+            return False
+        return (rv.vid not in revoked_vehicles
+                and filed_by.get(reporter_digest, 0) <= cfg.report_budget
+                and received_by.get(reporter_digest, 0) < cfg.reputation_max)
+
+    def file_report(t, reporter_digest, subject_digest, subject_veh, reasons, det, conf,
+                    cx, cy, px, py, malicious):
+        counters["report"] += 1
+        rid = f"rpt_{counters['report']:05d}"
+        delay = rng.uniform(0.0, cfg.net_delay_max)
+        rep_veh = digest_to_vehicle[reporter_digest]
+        row = R.MaReport(
+            report_id=rid, ingest_time=round(t + delay, 3), detection_time=t, generation_time=t,
+            reporter_cert_digest=reporter_digest, subject_cert_digest=subject_digest,
+            reason_codes=reasons,
+            detector_outputs=[{"check_id": reasons[0], "score": round(det.get(reasons[0], 1.0), 3),
+                               "verdict": "fail"}],
+            cert_validity={"sig_valid": True, "not_expired": True, "not_revoked": True, "chain_ok": True},
+            evidence_msg_refs=[f"{rid}-m"],
+            st_bbox=[min(cx, px), min(cy, py), max(cx, px), max(cy, py)],
+            st_tstart=t, st_tend=t, duplicate_flag=False).to_dict()
+        row["detector_score"] = round(det.get(reasons[0], 1.0), 3)
+        row["detector_score_norm"] = round(max(det.values()) if det else 1.0, 3)
+        row["subject_pos_confidence"] = round(conf, 3)
+        row["cert_crl_status"] = "active"
+        row["sig_valid"] = True
+        for k in DET_KEYS:
+            row[f"detnorm_{k}"] = round(det.get(k, 0.0), 3)
+        ma_reports.append(row)
+        if malicious:
+            correctness = "malicious_false_report"
+        elif subject_veh.is_attacker:
+            correctness = "correct"
+        elif subject_veh.is_faulty:
+            correctness = "faulty_detection"
+        else:
+            correctness = "false_positive"
+        gt_report_labels.append(R.GtReportLabel(
+            report_id=rid, reporter_true_id=f"veh_{rep_veh.vid:03d}",
+            subject_true_id=f"veh_{subject_veh.vid:03d}", report_correctness=correctness))
+        reporters_by_subject.setdefault(subject_digest, set()).add(reporter_digest)
+        subj_seconds.setdefault(subject_digest, set()).add(int(t))
+        span = subj_span.setdefault(subject_digest, [t, t])
+        span[1] = t
+        filed_by[reporter_digest] = filed_by.get(reporter_digest, 0) + 1
+        received_by[subject_digest] = received_by.get(subject_digest, 0) + 1
+        touched_subjects.add(subject_digest)
+
+    def resolve_and_revoke(veh: Vehicle, trigger_digest: str, t: float) -> None:
         counters["case"] += 1
         counters["crl"] += 1
         case_id = f"case_{counters['case']:04d}"
-        prov = pca.resolve(subject_digest)
-        ls1_i, la_id1 = la1.seed_at(prov["la_handle1"], prov["i"])
-        ls2_i, la_id2 = la2.seed_at(prov["la_handle2"], prov["i"])
+        prov = pca.resolve(trigger_digest)
+        ls1_0, la_id1 = la1.seed_at(prov["la_handle1"], 0)   # revoke from period 0 -> covers ALL
+        ls2_0, la_id2 = la2.seed_at(prov["la_handle2"], 0)   # of this vehicle's pseudonyms + ghosts
         ra.blacklist_request(prov["request_hash"], t)
-        crl_entries.append(CrlLinkageEntry(i=prov["i"], la_id1=la_id1, la_id2=la_id2,
-                                           ls1_i=ls1_i, ls2_i=ls2_i, jmax=cfg.jmax))
-        revocation_time[subject_digest] = t
-        revoked_digests.append(subject_digest)
-        reporters = reporters_by_subject.get(subject_digest, set())
+        crl_entries.append(CrlLinkageEntry(i=0, la_id1=la_id1, la_id2=la_id2,
+                                           ls1_i=ls1_0, ls2_i=ls2_0, jmax=cfg.jmax))
+        veh.revoked = True
+        veh.revocation_time = t
+        revoked_vehicles[veh.vid] = t
+        revoked_digests.append(trigger_digest)
+        reporters = {r for r in reporters_by_subject.get(trigger_digest, set()) if trusted(r)}
         ma_investigations.append(R.MaInvestigation(
             case_id=case_id, opened_time=t, trigger="report_threshold",
             cluster_size=len(reporters), num_distinct_reporters=len(reporters),
@@ -397,18 +519,27 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             resolved_case_handle=hashlib.sha256(case_id.encode()).hexdigest()[:12]))
         ma_crl_events.append(R.MaCrlEvent(crl_id=f"crl_{counters['crl']:04d}", issue_time=t,
                                           entry_type="seed", num_entries=len(crl_entries)))
-        subj = digest_to_vehicle[subject_digest]
-        gt_linkage_rev.append(R.GtLinkageRevocation(true_vehicle_id=f"veh_{subj.vid:03d}",
-                                                    should_have_been_revoked=subj.is_attacker,
+        gt_linkage_rev.append(R.GtLinkageRevocation(true_vehicle_id=f"veh_{veh.vid:03d}",
+                                                    should_have_been_revoked=veh.is_attacker,
                                                     true_revocation_time=t))
 
-    # ---- Simulation loop: broadcast -> receive -> detect -> report -> (online) revoke ----
+    def enforced(veh: Vehicle, t: float) -> bool:
+        return veh.revoked and veh.revocation_time is not None and t >= veh.revocation_time + cfg.crl_propagation_delay
+
+    # ---- Simulation loop: pre-pass broadcast -> detect -> collude -> (online) revoke ----
     for step in range(cfg.n_steps):
         t = step * cfg.dt
-        touched_subjects: set[str] = set()
+        touched_subjects.clear()
+
+        # PRE-PASS: every active broadcast this step (real pseudonyms + sybil ghosts)
+        broadcasts: list[dict] = []
         for tx in vehicles:
-            cert_first_seen.setdefault(tx.cert_digest, t)
-            cert_last_seen[tx.cert_digest] = t
+            if enforced(tx, t):
+                continue
+            ps = tx.active_pseudonym(t, cfg.rotate_period_s)
+            digest = ps["digest"]
+            cert_first_seen.setdefault(digest, t)
+            cert_last_seen[digest] = t
             x, y, tspeed, theading = tx.true_state(t)
             mx, my, conf = measure(tx, x, y)
             attacking = tx.is_attacker and cfg.attack_start <= t <= cfg.attack_end
@@ -421,82 +552,93 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                                        or abs(cs - tspeed) > 1.0 or _ang_diff(ch, theading) > 5.0)
             if falsified and tx.onset is None:
                 tx.onset = t
+            broadcasts.append(dict(veh=tx, digest=digest, cx=cx, cy=cy, cs=cs, ch=ch, conf=conf,
+                                   ghost=False, x=x, y=y, falsified=falsified))
+            if attacking and tx.attack_type == "Sybil":     # fabricate co-located ghost identities
+                sr = vrng[tx.vid]
+                for gdig in tx.ghosts:
+                    cert_first_seen.setdefault(gdig, t)
+                    cert_last_seen[gdig] = t
+                    broadcasts.append(dict(veh=tx, digest=gdig, cx=cx + sr.uniform(-2, 2),
+                                           cy=cy + sr.uniform(-2, 2), cs=cs, ch=ch, conf=conf,
+                                           ghost=True, x=x, y=y, falsified=True))
+
+        # per-message ground-truth emission sampling (real broadcasts only)
+        for b in broadcasts:
+            if b["ghost"]:
+                continue
             if rng.random() < cfg.emit_sample_prob:
+                tx = b["veh"]
                 gt_emissions.append(dict(
                     emit_id=f"emt_{len(gt_emissions):08d}", t=round(t, 3),
-                    true_vehicle_id=f"veh_{tx.vid:03d}", true_x=round(x, 3), true_y=round(y, 3),
-                    claimed_x=round(cx, 3), claimed_y=round(cy, 3), claimed_speed=round(cs, 3),
-                    pos_conf=round(conf, 3), is_attacker=tx.is_attacker, is_faulty=tx.is_faulty,
-                    falsified=bool(falsified), _visibility=R.ORACLE))
+                    true_vehicle_id=f"veh_{tx.vid:03d}", true_x=round(b["x"], 3), true_y=round(b["y"], 3),
+                    claimed_x=round(b["cx"], 3), claimed_y=round(b["cy"], 3), claimed_speed=round(b["cs"], 3),
+                    pos_conf=round(b["conf"], 3), is_attacker=tx.is_attacker, is_faulty=tx.is_faulty,
+                    falsified=bool(b["falsified"]), _visibility=R.ORACLE))
+
+        # sybil co-location: distinct certs sharing a spatial cell this step
+        cells = Counter((round(b["cx"] / _CELL_M), round(b["cy"] / _CELL_M)) for b in broadcasts)
+
+        # DETECTION pass
+        for b in broadcasts:
+            tx, digest, cx, cy, cs, ch, conf = (b["veh"], b["digest"], b["cx"], b["cy"],
+                                                b["cs"], b["ch"], b["conf"])
+            sybil_norm = cells[(round(cx / _CELL_M), round(cy / _CELL_M))] / _SYBIL_MIN
             for rx in vehicles:
-                if rx.vid == tx.vid:
+                if rx.vid == tx.vid or enforced(rx, t):
                     continue
-                rt = revocation_time.get(tx.cert_digest)
-                if rt is not None and t >= rt + cfg.crl_propagation_delay:
-                    continue                                        # ENFORCEMENT: drop revoked cert
-                key = (rx.vid, tx.cert_digest)
+                reporter_digest = rx.active_pseudonym(t, cfg.rotate_period_s)["digest"]
+                key = (rx.vid, digest)
                 st = last_claimed.get(key)
-                if st is None:                                      # first reception -> seed reference
-                    last_claimed[key] = {"ref": (cx, cy, cs, ch, t), "streak": {}}
-                    continue
-                ref = st["ref"]
-                det = detectors(ref, cx, cy, cs, ch, t, conf)
-                violating = any(v >= 1.0 for v in det.values())
-                for k, v in det.items():
-                    st["streak"][k] = st["streak"].get(k, 0) + 1 if v >= 1.0 else 0
-                if not violating:
-                    st["ref"] = (cx, cy, cs, ch, t)                 # advance ref only on clean samples
-                fired = {k: det[k] for k in det if st["streak"].get(k, 0) >= MIN_CONSEC}
+                if st is None:
+                    st = {"ref": (cx, cy, cs, ch, t), "streak": {}}
+                    last_claimed[key] = st
+                    det = {k: 0.0 for k in DET_KEYS}
+                else:
+                    det = detectors(st["ref"], cx, cy, cs, ch, t, conf)
+                det["sybilCoLocation"] = sybil_norm
+                motion_violating = any(det[k] >= 1.0 for k in det if k != "sybilCoLocation")
+                for k in DET_KEYS:
+                    st["streak"][k] = st["streak"].get(k, 0) + 1 if det.get(k, 0.0) >= 1.0 else 0
+                if not motion_violating:
+                    st["ref"] = (cx, cy, cs, ch, t)             # advance ref only on clean motion
+                fired = {k: det[k] for k in DET_KEYS if st["streak"].get(k, 0) >= MIN_CONSEC}
                 if not fired:
                     continue
-                if rng.random() > cfg.report_prob:                  # suppression / loss
+                if rng.random() > cfg.report_prob:
                     continue
-                counters["report"] += 1
-                rid = f"rpt_{counters['report']:05d}"
-                delay = rng.uniform(0.0, cfg.net_delay_max)
-                px, py = ref[0], ref[1]
-                score_norm = max(det.values())
                 reasons = sorted(fired, key=lambda k: -det[k])
-                row = R.MaReport(
-                    report_id=rid, ingest_time=round(t + delay, 3), detection_time=t, generation_time=t,
-                    reporter_cert_digest=rx.cert_digest, subject_cert_digest=tx.cert_digest,
-                    reason_codes=reasons,
-                    detector_outputs=[{"check_id": reasons[0], "score": round(det[reasons[0]], 3),
-                                       "verdict": "fail"}],
-                    cert_validity={"sig_valid": True, "not_expired": True,
-                                   "not_revoked": True, "chain_ok": True},
-                    evidence_msg_refs=[f"{rid}-m"],
-                    st_bbox=[min(cx, px), min(cy, py), max(cx, px), max(cy, py)],
-                    st_tstart=ref[4], st_tend=t, duplicate_flag=False).to_dict()
-                row["detector_score"] = round(det[reasons[0]], 3)
-                row["detector_score_norm"] = round(score_norm, 3)
-                row["subject_pos_confidence"] = round(conf, 3)
-                row["cert_crl_status"] = "active"
-                row["sig_valid"] = True
-                for d, val in det.items():
-                    row[f"detnorm_{d}"] = round(val, 3)
-                ma_reports.append(row)
-                subj = digest_to_vehicle[tx.cert_digest]
-                correctness = ("correct" if subj.is_attacker
-                               else ("faulty_detection" if subj.is_faulty else "false_positive"))
-                gt_report_labels.append(R.GtReportLabel(
-                    report_id=rid, reporter_true_id=f"veh_{rx.vid:03d}",
-                    subject_true_id=f"veh_{tx.vid:03d}", report_correctness=correctness))
-                reporters_by_subject.setdefault(tx.cert_digest, set()).add(rx.cert_digest)
-                subj_seconds.setdefault(tx.cert_digest, set()).add(int(t))
-                span = subj_span.setdefault(tx.cert_digest, [t, t])
-                span[1] = t
-                touched_subjects.add(tx.cert_digest)
-        # Online MA decision: revoke subjects with SUSTAINED multi-reporter evidence.
-        for subject_digest in sorted(touched_subjects):
-            if subject_digest in revocation_time:
+                file_report(t, reporter_digest, digest, tx, reasons, det, conf,
+                            cx, cy, st["ref"][0], st["ref"][1], malicious=False)
+
+        # COLLUSION pass: colluders file fabricated reports against benign victims
+        for tx in vehicles:
+            if not tx.colluder or enforced(tx, t) or not (cfg.attack_start <= t <= cfg.attack_end):
                 continue
-            reporters = reporters_by_subject[subject_digest]
+            reporter_digest = tx.active_pseudonym(t, cfg.rotate_period_s)["digest"]
+            for vv in tx.victims:
+                victim = vehicles[vv]
+                if enforced(victim, t):
+                    continue
+                subject_digest = victim.active_pseudonym(t, cfg.rotate_period_s)["digest"]
+                if rng.random() > cfg.report_prob:
+                    continue
+                det = {k: 0.0 for k in DET_KEYS}
+                det["positionSpeedInconsistency"] = 1.3         # plausible fabricated evidence
+                file_report(t, reporter_digest, subject_digest, victim,
+                            ["positionSpeedInconsistency"], det, 5.0, 0.0, 0.0, 0.0, 0.0, malicious=True)
+
+        # Online MA decision: revoke subjects with SUSTAINED, TRUSTED multi-reporter evidence.
+        for subject_digest in sorted(touched_subjects):
+            veh = digest_to_vehicle[subject_digest]
+            if veh.vid in revoked_vehicles:
+                continue
+            reporters = {r for r in reporters_by_subject[subject_digest] if trusted(r)}
             secs = subj_seconds[subject_digest]
             span = subj_span[subject_digest]
             if (len(reporters) >= cfg.report_threshold_k and len(secs) >= cfg.revoke_min_seconds
                     and (span[1] - span[0]) >= cfg.revoke_persist_s):
-                resolve_and_revoke(subject_digest, t)
+                resolve_and_revoke(veh, subject_digest, t)
 
     # ---- attack ground truth (with onset) ----
     gt_attacks = [R.GtAttack(
@@ -504,19 +646,22 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         start_time=cfg.attack_start, end_time=cfg.attack_end, attack_onset_time=v.onset,
         params={}) for v in vehicles if v.is_attacker]
 
-    # ---- Real-linkage sanity: every CRL entry must actually revoke its target ----
-    for d in revoked_digests:
-        v = digest_to_vehicle[d]
-        assert any(e.matches(v.i_period, v.j_index,
-                             v.linkage_ctx.linkage_value_for(v.i_period, v.j_index))
-                   for e in crl_entries), "CRL entry failed to revoke its target device"
+    # ---- Real-linkage sanity: the CRL entry must revoke EVERY observed cert of a revoked vehicle ----
+    for vid in revoked_vehicles:
+        for d in cert_first_seen:
+            info = pseudonym_info[d]
+            if info["veh_vid"] != vid:
+                continue
+            assert any(e.matches(info["i"], info["j"], info["lv"]) for e in crl_entries), \
+                "CRL entry failed to revoke a pseudonym of its target device"
 
-    # ---- Certificate status (MA-visible) ----
+    # ---- Certificate status (MA-visible): a cert is revoked iff its vehicle is ----
     ma_cert_status = [R.MaCertStatus(
         cert_digest=d, first_seen=f, last_seen=cert_last_seen[d], valid_from=0.0,
         valid_to=cfg.n_steps * cfg.dt, issuing_pca="PCA-1",
-        crl_status=("revoked" if d in revocation_time else "active"),
-        revocation_time=revocation_time.get(d)) for d, f in cert_first_seen.items()]
+        crl_status=("revoked" if pseudonym_info[d]["veh_vid"] in revoked_vehicles else "active"),
+        revocation_time=revoked_vehicles.get(pseudonym_info[d]["veh_vid"]))
+        for d, f in cert_first_seen.items()]
 
     # ---- Write outputs + manifest ----
     data_files = _write_outputs(cfg, ma_reports, ma_investigations, ma_crl_events, ma_cert_status,
@@ -525,10 +670,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     data_digest = _data_digest(cfg.out_dir, data_files)
     _write_manifest(cfg, data_files, data_digest,
                     counts=dict(vehicles=cfg.n_vehicles, reports=len(ma_reports),
-                                investigations=len(ma_investigations), revoked=len(revoked_digests)))
+                                investigations=len(ma_investigations), revoked=len(revoked_vehicles)))
 
     return RunResult(out_dir=cfg.out_dir, n_vehicles=cfg.n_vehicles, n_reports=len(ma_reports),
-                     n_investigations=len(ma_investigations), n_revoked=len(revoked_digests),
+                     n_investigations=len(ma_investigations), n_revoked=len(revoked_vehicles),
                      revoked_cert_digests=sorted(revoked_digests), data_digest=data_digest,
                      counts=dict(cert_status=len(ma_cert_status), gt_reports=len(gt_report_labels)))
 
@@ -607,11 +752,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--attacker-pct", type=float, default=0.0)
     p.add_argument("--faulty-pct", type=float, default=0.05)
     p.add_argument("--weather", default="clear", choices=list(WEATHER_MULT))
+    p.add_argument("--rotate-period", type=float, default=0.0, help="pseudonym rotation period (s); 0=off")
+    p.add_argument("--collude-pct", type=float, default=0.0, help="fraction of attackers that false-report")
+    p.add_argument("--victim-pct", type=float, default=0.10, help="fraction of benign vehicles targeted")
+    p.add_argument("--sybil-ghosts", type=int, default=6, help="ghost identities a Sybil attacker fakes")
+    p.add_argument("--no-ma-defense", action="store_true", help="disable trusted-reporter gating")
     p.add_argument("--out", default="datasets/poc_run")
     args = p.parse_args(argv)
     cfg = PipelineConfig(seed=args.seed, n_vehicles=args.vehicles, n_steps=args.steps,
                          attacker_pct=args.attacker_pct, faulty_pct=args.faulty_pct,
-                         weather=args.weather, out_dir=args.out)
+                         weather=args.weather, rotate_period_s=args.rotate_period,
+                         collude_pct=args.collude_pct, victim_pct=args.victim_pct,
+                         sybil_ghosts=args.sybil_ghosts, ma_defense=not args.no_ma_defense,
+                         out_dir=args.out)
     res = run_pipeline(cfg)
     print(f"vehicles={res.n_vehicles} reports={res.n_reports} "
           f"investigations={res.n_investigations} revoked={res.n_revoked}")

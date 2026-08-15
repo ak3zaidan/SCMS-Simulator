@@ -1,0 +1,72 @@
+"""Tests for pseudonym rotation, collusion / false accusation, and Sybil-ghost attacks."""
+
+import collections
+import json
+
+from scms_sim_ref.datagen.leakage_linter import find_forbidden_keys
+from scms_sim_ref.mock_pipeline import PipelineConfig, run_pipeline
+
+
+def _jsonl(p):
+    return [json.loads(ln) for ln in open(p, encoding="utf-8") if ln.strip()]
+
+
+def test_rotation_gives_multiple_pseudonyms_but_vehicle_level_revocation(tmp_path):
+    out = str(tmp_path / "run")
+    cfg = PipelineConfig(seed=5, n_vehicles=40, n_steps=100, attacker_pct=0.15,
+                         rotate_period_s=30.0, faulty_pct=0.0, out_dir=out)
+    res = run_pipeline(cfg)
+    idm = _jsonl(tmp_path / "run" / "ground_truth" / "gt_identity_map.jsonl")
+    per_vehicle = collections.Counter(m["true_vehicle_id"] for m in idm)
+    assert max(per_vehicle.values()) >= 3, "rotation should give several pseudonyms per vehicle"
+    # a revoked vehicle's pseudonyms are ALL revoked (vehicle-level via one CRL entry)
+    status = _jsonl(tmp_path / "run" / "ma" / "ma_cert_status.jsonl")
+    d2v = {m["pseudonym_cert_digest"]: m["true_vehicle_id"] for m in idm}
+    revoked_vehicles = {d2v[s["cert_digest"]] for s in status
+                        if s.get("crl_status") == "revoked" and s["cert_digest"] in d2v}
+    assert len(revoked_vehicles) == res.n_revoked
+
+
+def test_collusion_frames_victims_and_defense_reduces_it(tmp_path):
+    def framings(defense):
+        out = str(tmp_path / f"run_{defense}")
+        cfg = PipelineConfig(seed=5, n_vehicles=60, n_steps=80, attacker_pct=0.15,
+                             collude_pct=0.6, victim_pct=0.15, ma_defense=defense,
+                             faulty_pct=0.0, out_dir=out)
+        run_pipeline(cfg)
+        labels = [r["report_correctness"]
+                  for r in _jsonl(tmp_path / f"run_{defense}" / "ground_truth" / "gt_report_labels.jsonl")]
+        rev = _jsonl(tmp_path / f"run_{defense}" / "ground_truth" / "gt_linkage_revocation.jsonl")
+        assert "malicious_false_report" in labels, "colluders must file false reports"
+        return sum(1 for r in rev if not r["should_have_been_revoked"])   # framed benign victims
+
+    framed_off = framings(False)
+    framed_on = framings(True)
+    assert framed_off >= 1, "without defense, collusion should frame at least one victim"
+    assert framed_on < framed_off, "the trusted-reporter defense must reduce framings"
+
+
+def test_sybil_ghosts_are_co_located_and_flagged(tmp_path):
+    out = str(tmp_path / "run")
+    cfg = PipelineConfig(seed=3, n_vehicles=40, n_steps=60, attacker_ids=(5,),
+                         attack_type="Sybil", attack_types=("Sybil",), sybil_ghosts=6,
+                         faulty_pct=0.0, out_dir=out)
+    run_pipeline(cfg)
+    idm = _jsonl(tmp_path / "run" / "ground_truth" / "gt_identity_map.jsonl")
+    per = collections.Counter(m["true_vehicle_id"] for m in idm)
+    assert per["veh_005"] == 7, "Sybil attacker = 1 real + 6 ghost identities"
+    reasons = collections.Counter()
+    for r in _jsonl(tmp_path / "run" / "ma" / "ma_reports.jsonl"):
+        reasons.update(r.get("reason_codes", []))
+    assert reasons["sybilCoLocation"] > 0, "co-located ghosts must trigger sybilCoLocation"
+
+
+def test_advanced_run_is_deterministic_and_leakage_free(tmp_path):
+    kw = dict(seed=9, n_vehicles=50, n_steps=90, attacker_pct=0.2, rotate_period_s=40.0,
+              collude_pct=0.5, victim_pct=0.1, faulty_pct=0.05)
+    r1 = run_pipeline(PipelineConfig(out_dir=str(tmp_path / "a"), **kw))
+    r2 = run_pipeline(PipelineConfig(out_dir=str(tmp_path / "b"), **kw))
+    assert r1.data_digest == r2.data_digest
+    for name in ("ma_reports.jsonl", "ma_cert_status.jsonl", "ma_investigations.jsonl"):
+        for row in _jsonl(tmp_path / "a" / "ma" / name):
+            assert find_forbidden_keys(row) == [], f"{name} leaks: {find_forbidden_keys(row)}"
