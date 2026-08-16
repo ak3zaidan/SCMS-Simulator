@@ -52,8 +52,10 @@ ATTACK_CATALOG = (
     "ConstSpeedOffset", "RandomSpeed", "StopAndGo",
     "ReversedHeading", "HeadingOffset", "DataReplay",
     "SlowDrift", "AlongRoadOffset", "Sybil",
+    "DoS", "DelayedMessages",
 )
 WEATHER_MULT = {"clear": 1.0, "rain": 1.5, "fog": 2.0, "snow": 2.5}
+WEATHER_RADIO_LOSS = {"clear": 0.0, "rain": 0.03, "fog": 0.02, "snow": 0.06}
 _SYBIL_MIN = 4        # distinct certs co-located in one cell before sybilCoLocation fires
 _CELL_M = 5.0         # spatial cell size for co-location
 
@@ -80,6 +82,9 @@ class PipelineConfig:
     gps_bias_tau_s: float = 20.0         # bias correlation time
     gps_outlier_rate: float = 0.01       # per-message multipath outlier probability
     gps_outlier_mag_m: float = 12.0
+    gps_degrade_rate: float = 0.006      # per-step prob a benign vehicle enters a bad-GNSS burst
+    gps_degrade_factor: float = 6.0      # noise multiplier during a burst (canyon/tunnel/foliage)
+    gps_degrade_dur_s: float = 3.0       # burst length (< the revocation persistence gate)
     faulty_pct: float = 0.05             # malfunctioning-sensor (non-attacker) fraction
     faulty_bias_mult: float = 5.0        # faulty = large SUSTAINED bias (smooth, self-consistent)
     weather: str = "clear"
@@ -94,6 +99,17 @@ class PipelineConfig:
     net_delay_max: float = 2.0
     crl_propagation_delay: float = 2.0
     emit_sample_prob: float = 0.03       # per-message ground-truth emission sampling
+    # --- radio / channel realism ---
+    radio_range_m: float = 500.0         # a receiver only hears transmitters within this range
+    packet_loss_base: float = 0.0        # baseline per-message loss
+    nlos_loss: float = 0.0               # 0..1 obstruction loss, growing with distance/range
+    chan_capacity: int = 40              # in-range CAMs/step before congestion (CBR) loss kicks in
+    art_max_m: float = 900.0             # acceptance-range threshold (max plausible claim distance)
+    max_accel_mps2: float = 12.0         # implausible-acceleration threshold
+    freq_max: float = 6.0                # beacon-rate normalizer (CAMs/interval)
+    dos_burst: int = 12                  # CAMs/interval a DoS attacker floods
+    delay_s: float = 6.0                 # DelayedMessages staleness
+    stale_max_s: float = 5.0             # staleness threshold for staleOrReplay
     # --- pseudonym rotation ---
     rotate_period_s: float = 0.0         # 0 = one pseudonym per vehicle (no rotation)
     # --- collusion / false accusation ---
@@ -198,6 +214,7 @@ class Vehicle:
     # mutable per-run state
     bias_x: float = 0.0
     bias_y: float = 0.0
+    degrade_until: float = -1.0          # in a transient bad-GNSS burst while t < this
     frozen: Optional[tuple[float, float]] = None
     drift: float = 0.0
     hist: list = field(default_factory=list)   # (x,y,speed,heading) claim history for replay
@@ -357,7 +374,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     cert_last_seen: dict[str, float] = {}
     counters = {"report": 0, "case": 0, "crl": 0}
 
-    def measure(v: Vehicle, x: float, y: float) -> tuple[float, float, float]:
+    def measure(v: Vehicle, x: float, y: float, t: float) -> tuple[float, float, float]:
         """Advance the per-vehicle GNSS error state and return (mx, my, pos_conf)."""
         r = vrng[v.vid]
         a = math.exp(-cfg.dt / cfg.gps_bias_tau_s)
@@ -365,14 +382,21 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         q = bmag * math.sqrt(max(1e-9, 1 - a * a))
         v.bias_x = a * v.bias_x + q * r.gauss(0, 1)
         v.bias_y = a * v.bias_y + q * r.gauss(0, 1)
-        sigma = cfg.gps_sigma_m * v.gps_q * wmult
+        # transient bad-GNSS bursts (urban canyon / tunnel / foliage) -> a benign vehicle emits
+        # SUSTAINED large residuals for a few seconds, the realistic source of benign false positives
+        if not v.is_attacker and t >= v.degrade_until and r.random() < cfg.gps_degrade_rate:
+            v.degrade_until = t + cfg.gps_degrade_dur_s
+        sigma_nom = cfg.gps_sigma_m * v.gps_q * wmult
+        sigma = sigma_nom * (cfg.gps_degrade_factor if t < v.degrade_until else 1.0)
         mx = x + v.bias_x + r.gauss(0, sigma)
         my = y + v.bias_y + r.gauss(0, sigma)
         if r.random() < cfg.gps_outlier_rate:
             ang = r.random() * 6.283
             mx += cfg.gps_outlier_mag_m * math.cos(ang)
             my += cfg.gps_outlier_mag_m * math.sin(ang)
-        conf = 2.448 * math.sqrt(sigma * sigma + v.bias_x * v.bias_x + v.bias_y * v.bias_y)
+        # broadcast confidence reflects the NOMINAL error, not the multipath spike -- a real receiver
+        # underreports uncertainty during a burst, so the sustained residual reads as misbehaviour
+        conf = 2.448 * math.sqrt(sigma_nom * sigma_nom + v.bias_x * v.bias_x + v.bias_y * v.bias_y)
         return mx, my, conf
 
     def attack_claim(v: Vehicle, t: float, mx: float, my: float, mspeed: float,
@@ -421,15 +445,18 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     def detectors(ref, cx, cy, cs, ch, t, conf) -> dict:
         """Confidence-normalized residuals (detnorm ~1 at the firing threshold). A single GNSS
         outlier gives a one-off spike but is filtered by the streak gate + not advancing the ref."""
-        det = {d: 0.0 for d in ("positionSpeedInconsistency", "positionJump",
-                                "headingInconsistency", "staleOrReplay", "constantPositionFrozen")}
+        det = {d: 0.0 for d in ("positionSpeedInconsistency", "positionJump", "headingInconsistency",
+                                "staleOrReplay", "constantPositionFrozen", "implausibleAcceleration")}
         px, py, ps, ph, pt = ref
         dtt = max(1e-6, t - pt)
         disp = math.hypot(cx - px, cy - py)
         tol = max(conf, 0.5 * cfg.consistency_threshold_m)     # uncertainty scale
         det["positionSpeedInconsistency"] = abs(disp - cs * dtt) / (Z * tol)
         det["positionJump"] = disp / (cs * dtt + Z * tol + cfg.consistency_threshold_m)
-        if disp > 5.0:
+        det["implausibleAcceleration"] = (abs(cs - ps) / dtt) / cfg.max_accel_mps2
+        # heading is only trustworthy when the displacement dominates position noise -- otherwise the
+        # bearing between two noisy fixes is ill-defined (a false-positive source for noisy/faulty GNSS)
+        if disp > max(5.0, 2.5 * conf):
             bearing = math.degrees(math.atan2(cy - py, cx - px)) % 360.0
             det["headingInconsistency"] = _ang_diff(ch, bearing) / cfg.heading_threshold_deg
         if cx == px and cy == py and cs > 0.5:
@@ -438,7 +465,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         return det
 
     DET_KEYS = ("positionSpeedInconsistency", "positionJump", "headingInconsistency",
-                "staleOrReplay", "constantPositionFrozen", "sybilCoLocation")
+                "staleOrReplay", "constantPositionFrozen", "implausibleAcceleration",
+                "sybilCoLocation", "acceptanceRangeThreshold", "beaconFrequency")
+    MOTION_KEYS = ("positionSpeedInconsistency", "positionJump", "headingInconsistency",
+                   "constantPositionFrozen", "implausibleAcceleration")
     touched_subjects: set[str] = set()
 
     def trusted(reporter_digest: str) -> bool:
@@ -541,19 +571,24 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             cert_first_seen.setdefault(digest, t)
             cert_last_seen[digest] = t
             x, y, tspeed, theading = tx.true_state(t)
-            mx, my, conf = measure(tx, x, y)
+            mx, my, conf = measure(tx, x, y, t)
             attacking = tx.is_attacker and cfg.attack_start <= t <= cfg.attack_end
+            msg_count, cg = 1, t                                  # CAMs this interval; claimed gen time
             if attacking:
                 cx, cy, cs, ch = attack_claim(tx, t, mx, my, tspeed, theading)
+                if tx.attack_type == "DoS":
+                    msg_count = cfg.dos_burst                     # flood the channel
+                elif tx.attack_type == "DelayedMessages":
+                    cg = t - cfg.delay_s                          # stale timestamp
             else:
                 cx, cy, cs, ch = mx, my, tspeed, theading
             tx.hist.append((cx, cy, cs, ch))
-            falsified = attacking and (math.hypot(cx - mx, cy - my) > 1.0
-                                       or abs(cs - tspeed) > 1.0 or _ang_diff(ch, theading) > 5.0)
+            falsified = attacking and (math.hypot(cx - mx, cy - my) > 1.0 or abs(cs - tspeed) > 1.0
+                                       or _ang_diff(ch, theading) > 5.0 or msg_count > 1 or cg < t - 1e-6)
             if falsified and tx.onset is None:
                 tx.onset = t
             broadcasts.append(dict(veh=tx, digest=digest, cx=cx, cy=cy, cs=cs, ch=ch, conf=conf,
-                                   ghost=False, x=x, y=y, falsified=falsified))
+                                   ghost=False, x=x, y=y, falsified=falsified, msg_count=msg_count, cg=cg))
             if attacking and tx.attack_type == "Sybil":     # fabricate co-located ghost identities
                 sr = vrng[tx.vid]
                 for gdig in tx.ghosts:
@@ -561,7 +596,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     cert_last_seen[gdig] = t
                     broadcasts.append(dict(veh=tx, digest=gdig, cx=cx + sr.uniform(-2, 2),
                                            cy=cy + sr.uniform(-2, 2), cs=cs, ch=ch, conf=conf,
-                                           ghost=True, x=x, y=y, falsified=True))
+                                           ghost=True, x=x, y=y, falsified=True, msg_count=1, cg=t))
 
         # per-message ground-truth emission sampling (real broadcasts only)
         for b in broadcasts:
@@ -579,15 +614,26 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # sybil co-location: distinct certs sharing a spatial cell this step
         cells = Counter((round(b["cx"] / _CELL_M), round(b["cy"] / _CELL_M)) for b in broadcasts)
 
-        # DETECTION pass
-        for b in broadcasts:
-            tx, digest, cx, cy, cs, ch, conf = (b["veh"], b["digest"], b["cx"], b["cy"],
-                                                b["cs"], b["ch"], b["conf"])
-            sybil_norm = cells[(round(cx / _CELL_M), round(cy / _CELL_M))] / _SYBIL_MIN
-            for rx in vehicles:
-                if rx.vid == tx.vid or enforced(rx, t):
-                    continue
-                reporter_digest = rx.active_pseudonym(t, cfg.rotate_period_s)["digest"]
+        # DETECTION pass (receiver-outer): a receiver only hears in-range transmitters, with
+        # distance/NLOS/weather/congestion packet loss -> the report graph becomes spatially LOCAL
+        # (reporters near the subject) instead of all-to-all, and far-away attackers go unobserved.
+        rx_pos = {rx.vid: rx.true_state(t)[:2] for rx in vehicles if not enforced(rx, t)}
+        wx_loss = WEATHER_RADIO_LOSS.get(cfg.weather, 0.0)
+        for rx in vehicles:
+            if enforced(rx, t):
+                continue
+            rxx, rxy = rx_pos[rx.vid]
+            in_range = [(b, math.hypot(b["x"] - rxx, b["y"] - rxy)) for b in broadcasts
+                        if b["veh"].vid != rx.vid and math.hypot(b["x"] - rxx, b["y"] - rxy) <= cfg.radio_range_m]
+            load = sum(b["msg_count"] for b, _ in in_range)
+            cong = min(0.8, max(0.0, (load - cfg.chan_capacity) / max(1, cfg.chan_capacity)) * 0.5)
+            reporter_digest = rx.active_pseudonym(t, cfg.rotate_period_s)["digest"]
+            for b, dist in in_range:
+                loss = cfg.packet_loss_base + cfg.nlos_loss * (dist / cfg.radio_range_m) + cong + wx_loss
+                if loss > 0 and rng.random() < loss:
+                    continue                                    # packet dropped on the channel
+                tx, digest, cx, cy, cs, ch, conf = (b["veh"], b["digest"], b["cx"], b["cy"],
+                                                    b["cs"], b["ch"], b["conf"])
                 key = (rx.vid, digest)
                 st = last_claimed.get(key)
                 if st is None:
@@ -596,8 +642,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     det = {k: 0.0 for k in DET_KEYS}
                 else:
                     det = detectors(st["ref"], cx, cy, cs, ch, t, conf)
-                det["sybilCoLocation"] = sybil_norm
-                motion_violating = any(det[k] >= 1.0 for k in det if k != "sybilCoLocation")
+                # radio-dependent detectors (need the receiver position + per-message metadata)
+                det["sybilCoLocation"] = cells[(round(cx / _CELL_M), round(cy / _CELL_M))] / _SYBIL_MIN
+                det["acceptanceRangeThreshold"] = math.hypot(cx - rxx, cy - rxy) / cfg.art_max_m
+                det["beaconFrequency"] = b["msg_count"] / cfg.freq_max
+                det["staleOrReplay"] = max(det.get("staleOrReplay", 0.0), (t - b["cg"]) / cfg.stale_max_s)
+                motion_violating = any(det.get(k, 0.0) >= 1.0 for k in MOTION_KEYS)
                 for k in DET_KEYS:
                     st["streak"][k] = st["streak"].get(k, 0) + 1 if det.get(k, 0.0) >= 1.0 else 0
                 if not motion_violating:
@@ -757,6 +807,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--victim-pct", type=float, default=0.10, help="fraction of benign vehicles targeted")
     p.add_argument("--sybil-ghosts", type=int, default=6, help="ghost identities a Sybil attacker fakes")
     p.add_argument("--no-ma-defense", action="store_true", help="disable trusted-reporter gating")
+    p.add_argument("--radio-range", type=float, default=500.0, help="reception range (m)")
+    p.add_argument("--packet-loss", type=float, default=0.0, help="baseline per-message loss")
+    p.add_argument("--nlos", type=float, default=0.0, help="distance-growing obstruction loss (0..1)")
+    p.add_argument("--chan-capacity", type=int, default=40, help="in-range CAMs/step before congestion")
     p.add_argument("--out", default="datasets/poc_run")
     args = p.parse_args(argv)
     cfg = PipelineConfig(seed=args.seed, n_vehicles=args.vehicles, n_steps=args.steps,
@@ -764,7 +818,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                          weather=args.weather, rotate_period_s=args.rotate_period,
                          collude_pct=args.collude_pct, victim_pct=args.victim_pct,
                          sybil_ghosts=args.sybil_ghosts, ma_defense=not args.no_ma_defense,
-                         out_dir=args.out)
+                         radio_range_m=args.radio_range, packet_loss_base=args.packet_loss,
+                         nlos_loss=args.nlos, chan_capacity=args.chan_capacity, out_dir=args.out)
     res = run_pipeline(cfg)
     print(f"vehicles={res.n_vehicles} reports={res.n_reports} "
           f"investigations={res.n_investigations} revoked={res.n_revoked}")
