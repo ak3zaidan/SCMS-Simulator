@@ -92,10 +92,13 @@ class PipelineConfig:
     consistency_threshold_m: float = 5.0
     pos_jump_max_m: float = 45.0
     heading_threshold_deg: float = 35.0
+    detector_lag_s: float = 1.5          # compare each fix to one ~this old (robust to turns/outliers)
     report_prob: float = 0.9
     report_threshold_k: int = 3          # distinct reporters to open an investigation
     revoke_min_seconds: int = 4          # AND reports in >= this many distinct seconds
     revoke_persist_s: float = 3.0        # AND spanning >= this long (blunts transient benign FPs)
+    revoke_window_s: float = 15.0        # evidence must be SUSTAINED within this recent window
+                                         # (so bursty benign faults spread over a trip never add up)
     net_delay_max: float = 2.0
     crl_propagation_delay: float = 2.0
     emit_sample_prob: float = 0.03       # per-message ground-truth emission sampling
@@ -120,6 +123,19 @@ class PipelineConfig:
     report_budget: int = 30              # a reporter filing more than this is rate-limited
     # --- Sybil ---
     sybil_ghosts: int = 6                # ghost identities a "Sybil" attacker fabricates
+    # --- long-running traffic flow (opt-in; default is the fixed-fleet linear model) ---
+    traffic_flow: bool = False           # spawn/despawn vehicles over time (steady-state population)
+    duration_s: float = 0.0              # flow: sim length in seconds (overrides n_steps if > 0)
+    arrival_rate: float = 2.0            # flow: mean vehicles spawned per second
+    road_network: str = "linear"         # "linear" (straight lines) | "grid" (routed trips)
+    grid_w: int = 6
+    grid_h: int = 6
+    grid_block_m: float = 120.0
+    trip_speed_min: float = 8.0
+    trip_speed_max: float = 18.0
+    attack_delay_s: float = 2.0          # flow: an attacker starts falsifying this long after spawn
+    state_prune_every: int = 50          # flow: steps between detection-state LRU prunes
+    state_prune_ttl: int = 20            # flow: evict detection state untouched this many steps
     jmax: int = 20
     out_dir: str = "datasets/poc_run"
 
@@ -211,6 +227,12 @@ class Vehicle:
     victims: list = field(default_factory=list)      # vids this colluder falsely reports
     revoked: bool = False
     revocation_time: Optional[float] = None
+    # lifecycle (flow mode): spawn/despawn over time + a routed trip
+    spawn_time: float = 0.0
+    finish_time: Optional[float] = None   # None = never despawns (fixed-fleet)
+    trip: object = None                    # roads.Trip when road_network="grid"
+    attack_from: float = 0.0
+    attack_to: float = 0.0
     # mutable per-run state
     bias_x: float = 0.0
     bias_y: float = 0.0
@@ -223,11 +245,16 @@ class Vehicle:
     def active_pseudonym(self, t: float, rotate_period_s: float) -> dict:
         if rotate_period_s <= 0 or len(self.pseudonyms) <= 1:
             return self.pseudonyms[0]
-        idx = min(int(t / rotate_period_s), len(self.pseudonyms) - 1)
+        # rotate on the vehicle's OWN clock (since spawn), so flow vehicles rotate mid-trip
+        idx = min(int(max(0.0, t - self.spawn_time) / rotate_period_s), len(self.pseudonyms) - 1)
         return self.pseudonyms[idx]
 
     def true_state(self, t: float) -> tuple[float, float, float, float]:
-        """True (x, y, speed, heading[deg]) at time t: straight heading + gentle lane wander."""
+        """True (x, y, speed, heading[deg]) at time t."""
+        if self.trip is not None:
+            return self.trip.state(t)
+        # straight heading + gentle lane wander, on the vehicle's own clock
+        t = t - self.spawn_time
         ux, uy = math.cos(self.direction), math.sin(self.direction)
         nx, ny = -uy, ux
         along = self.speed * t
@@ -267,35 +294,18 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     la1, la2 = LinkageAuthority(1), LinkageAuthority(2)
     pca, ra = PseudonymCA(), RegistrationAuthority()
 
-    # ---- attacker / faulty assignment (deterministic) ----
-    if cfg.attacker_pct > 0:
-        arng = random.Random(f"{cfg.seed}:attackers")
-        k = max(1, int(round(cfg.n_vehicles * cfg.attacker_pct)))
-        attacker_set = set(arng.sample(range(cfg.n_vehicles), min(k, cfg.n_vehicles)))
-    else:
-        attacker_set = set(cfg.attacker_ids)
-    non_attackers = [v for v in range(cfg.n_vehicles) if v not in attacker_set]
-    frng = random.Random(f"{cfg.seed}:faulty")
-    n_faulty = int(cfg.n_vehicles * cfg.faulty_pct)
-    faulty_set = set(frng.sample(non_attackers, min(n_faulty, len(non_attackers)))) if n_faulty else set()
-    attackers_sorted = sorted(attacker_set)
     catalog = cfg.attack_types or (cfg.attack_type,)
-    # colluders (subset of attackers) + their benign victims
-    crng = random.Random(f"{cfg.seed}:collusion")
-    n_coll = int(round(len(attackers_sorted) * cfg.collude_pct))
-    colluder_set = set(crng.sample(attackers_sorted, n_coll)) if n_coll else set()
-    n_victims = int(round(len(non_attackers) * cfg.victim_pct))
-    victim_pool = sorted(frng.sample(non_attackers, min(n_victims, len(non_attackers)))) if (n_victims and colluder_set) else []
-
     total_time = cfg.n_steps * cfg.dt
-    n_rot = 1 if cfg.rotate_period_s <= 0 else max(1, math.ceil(total_time / cfg.rotate_period_s))
-    pseudonym_info: dict[str, dict] = {}   # digest -> {i,j,lv,veh,ghost,valid_from,valid_to}
-
-    # ---- Provisioning (real linkage values via two Linkage Authorities) ----
+    net = None
+    if cfg.road_network == "grid":
+        from .roads import GridNetwork
+        net = GridNetwork(cfg.grid_w, cfg.grid_h, cfg.grid_block_m)
+    pseudonym_info: dict[str, dict] = {}   # digest -> {i,j,lv,ghost,veh_vid}
     vehicles: list[Vehicle] = []
     gt_vehicle, gt_idmap = [], []
-    for vid in range(cfg.n_vehicles):
-        is_att = vid in attacker_set
+    atk_counter = {"n": 0}                  # running index for round-robin attack-type assignment
+
+    def make_vehicle(vid, spawn_time, is_att, is_flt, is_coll, trip, life_hint):
         vr = random.Random(f"{cfg.seed}:veh:{vid}")
         la_h1, la_h2 = f"lc1:{vid}", f"lc2:{vid}"
         la_id1, la_id2 = 0x0001, 0x0002
@@ -306,34 +316,41 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         req_hash = hashlib.sha256(f"req|{cfg.seed}|{vid}".encode()).hexdigest()[:16]
         true_id = f"veh_{vid:03d}"
         ra.bind(req_hash, true_id)
-        atype = catalog[attackers_sorted.index(vid) % len(catalog)] if is_att else "none"
-
-        # rotating pseudonyms (one when rotation is off); one CRL entry at i=0 covers all of them
+        if is_att:
+            atype = catalog[atk_counter["n"] % len(catalog)]
+            atk_counter["n"] += 1
+        else:
+            atype = "none"
+        finish_time = (trip.t1 if trip is not None
+                       else (spawn_time + life_hint if cfg.traffic_flow else None))
+        life = life_hint if finish_time is None else max(cfg.dt, finish_time - spawn_time)
+        n_rot = 1 if cfg.rotate_period_s <= 0 else max(1, math.ceil(life / cfg.rotate_period_s))
         pseudonyms = []
         for k in range(n_rot):
             i_k, j_k = k // cfg.jmax, (vid + k) % cfg.jmax
             pk = ca.keypair_from_seed(cfg.derive(f"key:{vid}:{k}"))
             dig = ca.hashed_id8(ca.public_bytes(pk)).hex()
             pca.issue(dig, req_hash, i_k, j_k, la_h1, la_h2)
-            vf = k * cfg.rotate_period_s if cfg.rotate_period_s > 0 else 0.0
-            vt = (k + 1) * cfg.rotate_period_s if cfg.rotate_period_s > 0 else total_time
+            vf = spawn_time + (k * cfg.rotate_period_s if cfg.rotate_period_s > 0 else 0.0)
+            vt = spawn_time + ((k + 1) * cfg.rotate_period_s if cfg.rotate_period_s > 0 else life)
             pseudonyms.append({"k": k, "i": i_k, "j": j_k, "digest": dig, "valid_from": vf, "valid_to": vt})
             pseudonym_info[dig] = {"i": i_k, "j": j_k, "lv": ctx.linkage_value_for(i_k, j_k),
                                    "ghost": False, "veh_vid": vid}
             gt_idmap.append(R.GtIdentityMap(true_vehicle_id=true_id, pseudonym_cert_digest=dig,
                                             i_period=i_k, valid_from=round(vf, 3), valid_to=round(vt, 3)))
         p0 = pseudonyms[0]
+        speed = trip.speed if trip is not None else cfg.nominal_speed * (0.85 + 0.3 * vr.random())
         v = Vehicle(
-            vid=vid, spawn_x=float(vid * 20), lane_y=float(vid % 4) * 4.0,
-            speed=cfg.nominal_speed * (0.85 + 0.3 * vr.random()),
+            vid=vid, spawn_x=float(vid * 20), lane_y=float(vid % 4) * 4.0, speed=speed,
             is_attacker=is_att, priv=None, pub=b"", cert_digest=p0["digest"],
             linkage_ctx=ctx, i_period=p0["i"], j_index=p0["j"], request_hash=req_hash,
             direction=(vr.random() - 0.5) * 0.5,
             wander_amp=vr.random() * 1.5, wander_w=0.15 + vr.random() * 0.25,
             phase=vr.random() * 6.283, gps_q=0.5 + vr.expovariate(1.2),
-            is_faulty=(vid in faulty_set), attack_type=atype, pseudonyms=pseudonyms,
-            colluder=(vid in colluder_set), victims=list(victim_pool) if vid in colluder_set else [])
-        # sybil ghost identities (extra co-located pseudonyms of the same true vehicle)
+            is_faulty=is_flt, attack_type=atype, pseudonyms=pseudonyms, colluder=is_coll,
+            spawn_time=spawn_time, finish_time=finish_time, trip=trip)
+        v.attack_from = (spawn_time + cfg.attack_delay_s) if cfg.traffic_flow else cfg.attack_start
+        v.attack_to = finish_time if (cfg.traffic_flow and finish_time is not None) else cfg.attack_end
         if is_att and atype == "Sybil":
             for g in range(cfg.sybil_ghosts):
                 gj = (cfg.jmax - 1 - g) % cfg.jmax
@@ -344,12 +361,57 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 pseudonym_info[gdig] = {"i": 0, "j": gj, "lv": ctx.linkage_value_for(0, gj),
                                         "ghost": True, "veh_vid": vid}
                 gt_idmap.append(R.GtIdentityMap(true_vehicle_id=true_id, pseudonym_cert_digest=gdig,
-                                                i_period=0, valid_from=0.0, valid_to=total_time))
+                                                i_period=0, valid_from=round(spawn_time, 3),
+                                                valid_to=round(spawn_time + life, 3)))
         vehicles.append(v)
-        gt_vehicle.append(R.GtVehicle(true_vehicle_id=true_id, spawn_time=0.0, is_attacker=is_att,
-                                      attacker_role=(atype if is_att else "none"),
-                                      is_faulty=(vid in faulty_set),
-                                      colluding_group_id=("colluders" if vid in colluder_set else None)))
+        gt_vehicle.append(R.GtVehicle(true_vehicle_id=true_id, spawn_time=round(spawn_time, 3),
+                                      is_attacker=is_att, attacker_role=(atype if is_att else "none"),
+                                      is_faulty=is_flt,
+                                      colluding_group_id=("colluders" if is_coll else None)))
+        return v
+
+    if cfg.traffic_flow:
+        # ---- FLOW: vehicles arrive over time and despawn at trip end (steady-state population) ----
+        n_steps = int(round((cfg.duration_s if cfg.duration_s > 0 else total_time) / cfg.dt))
+        total_time = n_steps * cfg.dt
+        rrng = random.Random(f"{cfg.seed}:flow")
+        vid, tt = 0, 0.0
+        while True:
+            tt += rrng.expovariate(cfg.arrival_rate) if cfg.arrival_rate > 0 else total_time
+            if tt >= total_time:
+                break
+            is_att = rrng.random() < cfg.attacker_pct
+            is_flt = (not is_att) and rrng.random() < cfg.faulty_pct
+            is_coll = is_att and rrng.random() < cfg.collude_pct
+            spd = cfg.trip_speed_min + rrng.random() * (cfg.trip_speed_max - cfg.trip_speed_min)
+            trip = net.random_trip(rrng, spd, tt) if net is not None else None
+            make_vehicle(vid, tt, is_att, is_flt, is_coll, trip, life_hint=90.0)
+            vid += 1
+    else:
+        # ---- FIXED FLEET: N vehicles present for the whole run (the default model) ----
+        n_steps = cfg.n_steps
+        if cfg.attacker_pct > 0:
+            arng = random.Random(f"{cfg.seed}:attackers")
+            k = max(1, int(round(cfg.n_vehicles * cfg.attacker_pct)))
+            attacker_set = set(arng.sample(range(cfg.n_vehicles), min(k, cfg.n_vehicles)))
+        else:
+            attacker_set = set(cfg.attacker_ids)
+        non_attackers = [v for v in range(cfg.n_vehicles) if v not in attacker_set]
+        frng = random.Random(f"{cfg.seed}:faulty")
+        n_faulty = int(cfg.n_vehicles * cfg.faulty_pct)
+        faulty_set = set(frng.sample(non_attackers, min(n_faulty, len(non_attackers)))) if n_faulty else set()
+        attackers_sorted = sorted(attacker_set)
+        crng = random.Random(f"{cfg.seed}:collusion")
+        n_coll = int(round(len(attackers_sorted) * cfg.collude_pct))
+        colluder_set = set(crng.sample(attackers_sorted, n_coll)) if n_coll else set()
+        n_victims = int(round(len(non_attackers) * cfg.victim_pct))
+        victim_pool = sorted(frng.sample(non_attackers, min(n_victims, len(non_attackers)))) if (n_victims and colluder_set) else []
+        for vid in range(cfg.n_vehicles):
+            make_vehicle(vid, 0.0, vid in attacker_set, vid in faulty_set, vid in colluder_set,
+                         None, life_hint=total_time)
+        for v in vehicles:
+            if v.colluder:
+                v.victims = list(victim_pool)
 
     digest_to_vehicle = {d: vehicles[info["veh_vid"]] for d, info in pseudonym_info.items()}
     vrng = {v.vid: random.Random(f"{cfg.seed}:sensor:{v.vid}") for v in vehicles}
@@ -362,9 +424,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     ma_crl_events: list[R.MaCrlEvent] = []
     gt_linkage_rev: list[R.GtLinkageRevocation] = []
     crl_entries: list[CrlLinkageEntry] = []
-    reporters_by_subject: dict[str, set[str]] = {}
-    subj_seconds: dict[str, set[int]] = {}
-    subj_span: dict[str, list[float]] = {}
+    subj_events: dict[str, list] = {}    # subject digest -> [(time, reporter_digest)] in a sliding window
     revoked_vehicles: dict[int, float] = {}          # vid -> revocation time (vehicle-level)
     revoked_digests: list[str] = []                  # triggering digests (for the CRL sanity check)
     filed_by: dict[str, int] = {}                    # reports FILED per reporter cert (rate-limit)
@@ -518,10 +578,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         gt_report_labels.append(R.GtReportLabel(
             report_id=rid, reporter_true_id=f"veh_{rep_veh.vid:03d}",
             subject_true_id=f"veh_{subject_veh.vid:03d}", report_correctness=correctness))
-        reporters_by_subject.setdefault(subject_digest, set()).add(reporter_digest)
-        subj_seconds.setdefault(subject_digest, set()).add(int(t))
-        span = subj_span.setdefault(subject_digest, [t, t])
-        span[1] = t
+        subj_events.setdefault(subject_digest, []).append((t, reporter_digest))
         filed_by[reporter_digest] = filed_by.get(reporter_digest, 0) + 1
         received_by[subject_digest] = received_by.get(subject_digest, 0) + 1
         touched_subjects.add(subject_digest)
@@ -540,7 +597,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         veh.revocation_time = t
         revoked_vehicles[veh.vid] = t
         revoked_digests.append(trigger_digest)
-        reporters = {r for r in reporters_by_subject.get(trigger_digest, set()) if trusted(r)}
+        reporters = {r for (_tt, r) in subj_events.get(trigger_digest, []) if trusted(r)}
         ma_investigations.append(R.MaInvestigation(
             case_id=case_id, opened_time=t, trigger="report_threshold",
             cluster_size=len(reporters), num_distinct_reporters=len(reporters),
@@ -556,14 +613,52 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     def enforced(veh: Vehicle, t: float) -> bool:
         return veh.revoked and veh.revocation_time is not None and t >= veh.revocation_time + cfg.crl_propagation_delay
 
-    # ---- Simulation loop: pre-pass broadcast -> detect -> collude -> (online) revoke ----
-    for step in range(cfg.n_steps):
+    # ---- streaming output (flow only): keep long runs memory-bounded ----
+    stream = cfg.traffic_flow
+    stream_counts = {"reports": 0, "labels": 0, "emit": 0}
+    fh_rep = fh_lbl = fh_emit = None
+    if stream:
+        os.makedirs(os.path.join(cfg.out_dir, "ma"), exist_ok=True)
+        os.makedirs(os.path.join(cfg.out_dir, "ground_truth"), exist_ok=True)
+        fh_rep = open(os.path.join(cfg.out_dir, "ma", "ma_reports.jsonl"), "w", encoding="utf-8", newline="\n")
+        fh_lbl = open(os.path.join(cfg.out_dir, "ground_truth", "gt_report_labels.jsonl"), "w", encoding="utf-8", newline="\n")
+        fh_emit = open(os.path.join(cfg.out_dir, "ground_truth", "gt_emissions_sample.jsonl"), "w", encoding="utf-8", newline="\n")
+
+    def flush_streams():
+        for row in ma_reports:
+            fh_rep.write(ca.canonical_bytes(row).decode("utf-8") + "\n")
+        for row in gt_report_labels:
+            fh_lbl.write(ca.canonical_bytes(row.to_dict()).decode("utf-8") + "\n")
+        for row in gt_emissions:
+            fh_emit.write(ca.canonical_bytes(row).decode("utf-8") + "\n")
+        stream_counts["reports"] += len(ma_reports)
+        stream_counts["labels"] += len(gt_report_labels)
+        stream_counts["emit"] += len(gt_emissions)
+        ma_reports.clear(); gt_report_labels.clear(); gt_emissions.clear()
+
+    def prune_state(step_now: int, active: dict) -> None:
+        cutoff = step_now - cfg.state_prune_ttl
+        for k in [k for k, st in last_claimed.items() if st.get("touch", -1) < cutoff]:
+            del last_claimed[k]
+        for d in [d for d in subj_events if pseudonym_info[d]["veh_vid"] not in active]:
+            subj_events.pop(d, None)
+
+    # ---- Simulation loop: activate -> pre-pass -> detect -> collude -> revoke -> despawn ----
+    spawn_order = sorted(vehicles, key=lambda v: (v.spawn_time, v.vid))
+    spawn_ptr = 0
+    active: dict[int, Vehicle] = {}
+    for step in range(n_steps):
         t = step * cfg.dt
         touched_subjects.clear()
+        while spawn_ptr < len(spawn_order) and spawn_order[spawn_ptr].spawn_time <= t:
+            av = spawn_order[spawn_ptr]; active[av.vid] = av; spawn_ptr += 1
+        for vid in [vid for vid, v in active.items() if v.finish_time is not None and t > v.finish_time]:
+            active.pop(vid).hist.clear()
+        active_list = [active[vid] for vid in sorted(active)]
 
         # PRE-PASS: every active broadcast this step (real pseudonyms + sybil ghosts)
         broadcasts: list[dict] = []
-        for tx in vehicles:
+        for tx in active_list:
             if enforced(tx, t):
                 continue
             ps = tx.active_pseudonym(t, cfg.rotate_period_s)
@@ -572,7 +667,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             cert_last_seen[digest] = t
             x, y, tspeed, theading = tx.true_state(t)
             mx, my, conf = measure(tx, x, y, t)
-            attacking = tx.is_attacker and cfg.attack_start <= t <= cfg.attack_end
+            attacking = tx.is_attacker and tx.attack_from <= t <= tx.attack_to
             msg_count, cg = 1, t                                  # CAMs this interval; claimed gen time
             if attacking:
                 cx, cy, cs, ch = attack_claim(tx, t, mx, my, tspeed, theading)
@@ -605,7 +700,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             if rng.random() < cfg.emit_sample_prob:
                 tx = b["veh"]
                 gt_emissions.append(dict(
-                    emit_id=f"emt_{len(gt_emissions):08d}", t=round(t, 3),
+                    emit_id=f"emt_{stream_counts['emit'] + len(gt_emissions):08d}", t=round(t, 3),
                     true_vehicle_id=f"veh_{tx.vid:03d}", true_x=round(b["x"], 3), true_y=round(b["y"], 3),
                     claimed_x=round(b["cx"], 3), claimed_y=round(b["cy"], 3), claimed_speed=round(b["cs"], 3),
                     pos_conf=round(b["conf"], 3), is_attacker=tx.is_attacker, is_faulty=tx.is_faulty,
@@ -617,9 +712,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # DETECTION pass (receiver-outer): a receiver only hears in-range transmitters, with
         # distance/NLOS/weather/congestion packet loss -> the report graph becomes spatially LOCAL
         # (reporters near the subject) instead of all-to-all, and far-away attackers go unobserved.
-        rx_pos = {rx.vid: rx.true_state(t)[:2] for rx in vehicles if not enforced(rx, t)}
+        rx_pos = {rx.vid: rx.true_state(t)[:2] for rx in active_list if not enforced(rx, t)}
         wx_loss = WEATHER_RADIO_LOSS.get(cfg.weather, 0.0)
-        for rx in vehicles:
+        for rx in active_list:
             if enforced(rx, t):
                 continue
             rxx, rxy = rx_pos[rx.vid]
@@ -637,21 +732,33 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 key = (rx.vid, digest)
                 st = last_claimed.get(key)
                 if st is None:
-                    st = {"ref": (cx, cy, cs, ch, t), "streak": {}}
+                    st = {"h": [(cx, cy, cs, ch, t)], "streak": {}, "touch": step}
                     last_claimed[key] = st
                     det = {k: 0.0 for k in DET_KEYS}
+                    ref = st["h"][0]
                 else:
-                    det = detectors(st["ref"], cx, cy, cs, ch, t, conf)
+                    st["touch"] = step
+                    h = st["h"]
+                    # LAGGED reference: the newest fix at least detector_lag_s old (else the oldest).
+                    # A short lag keeps the path ~straight over the interval, so turns don't read as
+                    # position/speed inconsistency, while a single GNSS outlier can't sustain a streak.
+                    ref = h[0]
+                    for f in h:
+                        if t - f[4] >= cfg.detector_lag_s:
+                            ref = f
+                        else:
+                            break
+                    det = detectors(ref, cx, cy, cs, ch, t, conf)
+                    h.append((cx, cy, cs, ch, t))
+                    while len(h) > 1 and t - h[0][4] > cfg.detector_lag_s + 2 * cfg.dt:
+                        h.pop(0)
                 # radio-dependent detectors (need the receiver position + per-message metadata)
                 det["sybilCoLocation"] = cells[(round(cx / _CELL_M), round(cy / _CELL_M))] / _SYBIL_MIN
                 det["acceptanceRangeThreshold"] = math.hypot(cx - rxx, cy - rxy) / cfg.art_max_m
                 det["beaconFrequency"] = b["msg_count"] / cfg.freq_max
                 det["staleOrReplay"] = max(det.get("staleOrReplay", 0.0), (t - b["cg"]) / cfg.stale_max_s)
-                motion_violating = any(det.get(k, 0.0) >= 1.0 for k in MOTION_KEYS)
                 for k in DET_KEYS:
                     st["streak"][k] = st["streak"].get(k, 0) + 1 if det.get(k, 0.0) >= 1.0 else 0
-                if not motion_violating:
-                    st["ref"] = (cx, cy, cs, ch, t)             # advance ref only on clean motion
                 fired = {k: det[k] for k in DET_KEYS if st["streak"].get(k, 0) >= MIN_CONSEC}
                 if not fired:
                     continue
@@ -659,17 +766,22 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     continue
                 reasons = sorted(fired, key=lambda k: -det[k])
                 file_report(t, reporter_digest, digest, tx, reasons, det, conf,
-                            cx, cy, st["ref"][0], st["ref"][1], malicious=False)
+                            cx, cy, ref[0], ref[1], malicious=False)
 
-        # COLLUSION pass: colluders file fabricated reports against benign victims
-        for tx in vehicles:
-            if not tx.colluder or enforced(tx, t) or not (cfg.attack_start <= t <= cfg.attack_end):
+        # COLLUSION pass: colluders file fabricated reports against benign victims. In flow mode
+        # victims are chosen dynamically (nearby active benign vehicles); in fixed mode from the list.
+        for tx in active_list:
+            if not tx.colluder or enforced(tx, t) or not (tx.attack_from <= t <= tx.attack_to):
                 continue
             reporter_digest = tx.active_pseudonym(t, cfg.rotate_period_s)["digest"]
-            for vv in tx.victims:
-                victim = vehicles[vv]
-                if enforced(victim, t):
-                    continue
+            if cfg.traffic_flow:
+                txx, txy = rx_pos.get(tx.vid, tx.true_state(t)[:2])
+                cand = [v for v in active_list if not v.is_attacker and not enforced(v, t)
+                        and math.hypot(rx_pos[v.vid][0] - txx, rx_pos[v.vid][1] - txy) <= cfg.radio_range_m]
+                victim_vehicles = cand[:2]
+            else:
+                victim_vehicles = [vehicles[vv] for vv in tx.victims if vv in active and not enforced(active[vv], t)]
+            for victim in victim_vehicles:
                 subject_digest = victim.active_pseudonym(t, cfg.rotate_period_s)["digest"]
                 if rng.random() > cfg.report_prob:
                     continue
@@ -678,22 +790,35 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 file_report(t, reporter_digest, subject_digest, victim,
                             ["positionSpeedInconsistency"], det, 5.0, 0.0, 0.0, 0.0, 0.0, malicious=True)
 
-        # Online MA decision: revoke subjects with SUSTAINED, TRUSTED multi-reporter evidence.
+        # Online MA decision: revoke subjects with SUSTAINED, TRUSTED evidence in a RECENT window.
+        # (Lifetime-accumulated evidence would let bursty benign faults spread over a long trip add
+        # up to a false revocation; a sliding window requires genuinely sustained misbehaviour.)
         for subject_digest in sorted(touched_subjects):
             veh = digest_to_vehicle[subject_digest]
             if veh.vid in revoked_vehicles:
                 continue
-            reporters = {r for r in reporters_by_subject[subject_digest] if trusted(r)}
-            secs = subj_seconds[subject_digest]
-            span = subj_span[subject_digest]
-            if (len(reporters) >= cfg.report_threshold_k and len(secs) >= cfg.revoke_min_seconds
-                    and (span[1] - span[0]) >= cfg.revoke_persist_s):
+            ev = [e for e in subj_events[subject_digest] if e[0] >= t - cfg.revoke_window_s]
+            subj_events[subject_digest] = ev
+            trust = {r for (_tt, r) in ev if trusted(r)}
+            secs = {int(tt) for (tt, _r) in ev}
+            span = (ev[-1][0] - ev[0][0]) if ev else 0.0
+            if (len(trust) >= cfg.report_threshold_k and len(secs) >= cfg.revoke_min_seconds
+                    and span >= cfg.revoke_persist_s):
                 resolve_and_revoke(veh, subject_digest, t)
+
+        if stream:
+            flush_streams()
+            if (step + 1) % cfg.state_prune_every == 0:
+                prune_state(step, active)
+
+    if stream:
+        for fh in (fh_rep, fh_lbl, fh_emit):
+            fh.close()
 
     # ---- attack ground truth (with onset) ----
     gt_attacks = [R.GtAttack(
         attack_id=f"atk_{v.vid}", true_vehicle_id=f"veh_{v.vid:03d}", attack_type=v.attack_type,
-        start_time=cfg.attack_start, end_time=cfg.attack_end, attack_onset_time=v.onset,
+        start_time=round(v.attack_from, 3), end_time=round(v.attack_to, 3), attack_onset_time=v.onset,
         params={}) for v in vehicles if v.is_attacker]
 
     # ---- Real-linkage sanity: the CRL entry must revoke EVERY observed cert of a revoked vehicle ----
@@ -708,24 +833,34 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     # ---- Certificate status (MA-visible): a cert is revoked iff its vehicle is ----
     ma_cert_status = [R.MaCertStatus(
         cert_digest=d, first_seen=f, last_seen=cert_last_seen[d], valid_from=0.0,
-        valid_to=cfg.n_steps * cfg.dt, issuing_pca="PCA-1",
+        valid_to=total_time, issuing_pca="PCA-1",
         crl_status=("revoked" if pseudonym_info[d]["veh_vid"] in revoked_vehicles else "active"),
         revocation_time=revoked_vehicles.get(pseudonym_info[d]["veh_vid"]))
         for d, f in cert_first_seen.items()]
 
     # ---- Write outputs + manifest ----
-    data_files = _write_outputs(cfg, ma_reports, ma_investigations, ma_crl_events, ma_cert_status,
-                                gt_vehicle, gt_idmap, gt_attacks, gt_report_labels, gt_linkage_rev,
-                                gt_emissions)
+    if stream:
+        # ma_reports / gt_report_labels / gt_emissions were streamed to disk during the loop
+        data_files = _write_side_files(cfg, ma_investigations, ma_crl_events, ma_cert_status,
+                                       gt_vehicle, gt_idmap, gt_attacks, gt_linkage_rev)
+        for rel in ("ma/ma_reports.jsonl", "ground_truth/gt_report_labels.jsonl",
+                    "ground_truth/gt_emissions_sample.jsonl"):
+            data_files[rel] = os.path.join(cfg.out_dir, rel)
+        n_reports, n_gt_reports = stream_counts["reports"], stream_counts["labels"]
+    else:
+        data_files = _write_outputs(cfg, ma_reports, ma_investigations, ma_crl_events, ma_cert_status,
+                                    gt_vehicle, gt_idmap, gt_attacks, gt_report_labels, gt_linkage_rev,
+                                    gt_emissions)
+        n_reports, n_gt_reports = len(ma_reports), len(gt_report_labels)
     data_digest = _data_digest(cfg.out_dir, data_files)
     _write_manifest(cfg, data_files, data_digest,
-                    counts=dict(vehicles=cfg.n_vehicles, reports=len(ma_reports),
+                    counts=dict(vehicles=len(vehicles), reports=n_reports,
                                 investigations=len(ma_investigations), revoked=len(revoked_vehicles)))
 
-    return RunResult(out_dir=cfg.out_dir, n_vehicles=cfg.n_vehicles, n_reports=len(ma_reports),
+    return RunResult(out_dir=cfg.out_dir, n_vehicles=len(vehicles), n_reports=n_reports,
                      n_investigations=len(ma_investigations), n_revoked=len(revoked_vehicles),
                      revoked_cert_digests=sorted(revoked_digests), data_digest=data_digest,
-                     counts=dict(cert_status=len(ma_cert_status), gt_reports=len(gt_report_labels)))
+                     counts=dict(cert_status=len(ma_cert_status), gt_reports=n_gt_reports))
 
 
 # --------------------------------------------------------------------------- #
@@ -754,6 +889,23 @@ def _write_outputs(cfg, ma_reports, ma_invest, ma_crl, ma_cert, gt_veh, gt_idmap
         "ground_truth/gt_report_labels.jsonl": sorted(gt_report_labels, key=lambda r: r.report_id),
         "ground_truth/gt_linkage_revocation.jsonl": sorted(gt_linkage_rev, key=lambda r: r.true_vehicle_id),
         "ground_truth/gt_emissions_sample.jsonl": sorted(gt_emissions, key=lambda r: r["emit_id"]),
+    }
+    return {rel: _write_jsonl(os.path.join(cfg.out_dir, rel), rows) for rel, rows in files.items()}
+
+
+def _write_side_files(cfg, ma_invest, ma_crl, ma_cert, gt_veh, gt_idmap,
+                      gt_attacks, gt_linkage_rev) -> dict[str, str]:
+    """Write everything EXCEPT the three big tables that flow mode streamed to disk directly."""
+    os.makedirs(os.path.join(cfg.out_dir, "ma"), exist_ok=True)
+    os.makedirs(os.path.join(cfg.out_dir, "ground_truth"), exist_ok=True)
+    files = {
+        "ma/ma_investigations.jsonl": sorted(ma_invest, key=lambda r: (r.opened_time, r.case_id)),
+        "ma/ma_crl_events.jsonl": sorted(ma_crl, key=lambda r: (r.issue_time, r.crl_id)),
+        "ma/ma_cert_status.jsonl": sorted(ma_cert, key=lambda r: r.cert_digest),
+        "ground_truth/gt_vehicle.jsonl": sorted(gt_veh, key=lambda r: r.true_vehicle_id),
+        "ground_truth/gt_identity_map.jsonl": sorted(gt_idmap, key=lambda r: r.pseudonym_cert_digest),
+        "ground_truth/gt_attacks.jsonl": sorted(gt_attacks, key=lambda r: r.attack_id),
+        "ground_truth/gt_linkage_revocation.jsonl": sorted(gt_linkage_rev, key=lambda r: r.true_vehicle_id),
     }
     return {rel: _write_jsonl(os.path.join(cfg.out_dir, rel), rows) for rel, rows in files.items()}
 
@@ -811,6 +963,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--packet-loss", type=float, default=0.0, help="baseline per-message loss")
     p.add_argument("--nlos", type=float, default=0.0, help="distance-growing obstruction loss (0..1)")
     p.add_argument("--chan-capacity", type=int, default=40, help="in-range CAMs/step before congestion")
+    # long-running traffic flow
+    p.add_argument("--flow", action="store_true", help="traffic-flow mode: vehicles spawn/despawn over time")
+    p.add_argument("--duration", type=float, default=0.0, help="flow: sim length in seconds")
+    p.add_argument("--arrival-rate", type=float, default=2.0, help="flow: mean vehicles spawned per second")
+    p.add_argument("--road", default="linear", choices=["linear", "grid"], help="road network model")
+    p.add_argument("--grid", type=int, default=6, help="grid road network dimension (grid x grid)")
+    p.add_argument("--grid-block", type=float, default=120.0, help="grid block spacing (m)")
     p.add_argument("--out", default="datasets/poc_run")
     args = p.parse_args(argv)
     cfg = PipelineConfig(seed=args.seed, n_vehicles=args.vehicles, n_steps=args.steps,
@@ -819,7 +978,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                          collude_pct=args.collude_pct, victim_pct=args.victim_pct,
                          sybil_ghosts=args.sybil_ghosts, ma_defense=not args.no_ma_defense,
                          radio_range_m=args.radio_range, packet_loss_base=args.packet_loss,
-                         nlos_loss=args.nlos, chan_capacity=args.chan_capacity, out_dir=args.out)
+                         nlos_loss=args.nlos, chan_capacity=args.chan_capacity,
+                         traffic_flow=args.flow, duration_s=args.duration, arrival_rate=args.arrival_rate,
+                         road_network=("grid" if (args.flow and args.road == "linear") else args.road),
+                         grid_w=args.grid, grid_h=args.grid, grid_block_m=args.grid_block,
+                         out_dir=args.out)
     res = run_pipeline(cfg)
     print(f"vehicles={res.n_vehicles} reports={res.n_reports} "
           f"investigations={res.n_investigations} revoked={res.n_revoked}")
