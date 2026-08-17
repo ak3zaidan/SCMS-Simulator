@@ -194,6 +194,10 @@ def build(dataset_dir: str) -> str:
     if dl:
         L.append(f"- Detection latency (onset→revocation): median **{dl.get('median_s')} s**, "
                  f"p90 {dl.get('p90_s')} s, max {dl.get('max_s')} s (n={dl.get('n')})")
+    rbf = vsum.get("recall_by_family") or {}
+    if rbf:
+        L.append("- Recall by attack family (the difficulty profile): "
+                 + ", ".join(f"{f} {v}" for f, v in sorted(rbf.items(), key=lambda kv: kv[1])))
     L.append("")
 
     L.append("## Baseline ML benchmark (logreg vs GBDT, train->test, vehicle-disjoint)")

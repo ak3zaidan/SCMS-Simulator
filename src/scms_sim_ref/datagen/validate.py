@@ -64,6 +64,19 @@ def validate(dataset_dir: str) -> tuple[dict, list]:
     precision = len(tp) / len(revoked) if revoked else 1.0
     recall = len(tp) / len(attackers) if attackers else 0.0
 
+    # per-family recall: which attack families the MA actually catches (the dataset's difficulty
+    # profile). Families that evade -> the hard, research-relevant cases.
+    from .featurize import _ATTACK_FAMILY
+    fam_of = {a["true_vehicle_id"]: _ATTACK_FAMILY.get(str(a.get("attack_type", "")).split("/")[0], "other")
+              for a in _read(os.path.join(gt, "gt_attacks.jsonl"))}
+    fam_tot: dict[str, int] = {}
+    fam_caught: dict[str, int] = {}
+    for v in attackers:
+        f = fam_of.get(v, "other")
+        fam_tot[f] = fam_tot.get(f, 0) + 1
+        fam_caught[f] = fam_caught.get(f, 0) + (1 if v in revoked else 0)
+    recall_by_family = {f: round(fam_caught[f] / fam_tot[f], 3) for f in sorted(fam_tot)}
+
     summary = {
         "dataset_dir": dataset_dir,
         "ma_rows": ma_rows,
@@ -77,6 +90,7 @@ def validate(dataset_dir: str) -> tuple[dict, list]:
         "false_revocations": len(benign_fp),
         "precision": round(precision, 3),
         "recall": round(recall, 3),
+        "recall_by_family": recall_by_family,
         "detection_latency_s": latency,
     }
     return summary, leaks
