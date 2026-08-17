@@ -167,6 +167,7 @@ class GtVehicle:
     attacker_role: str = "none"
     colluding_group_id: Optional[str] = None
     is_faulty: bool = False
+    veh_type: str = "car"
     _visibility: str = ORACLE
 
     def to_dict(self) -> dict[str, Any]:

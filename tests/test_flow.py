@@ -99,6 +99,23 @@ def test_demand_profiles_shape_arrivals(tmp_path):
     assert cv(rush) > cv(uni), f"rush should be peakier than uniform: rush={rush} uni={uni}"
 
 
+def test_heterogeneous_fleet_types_and_kinematics(tmp_path):
+    """A 'mixed' fleet spawns multiple vehicle classes; heavier classes drive slower."""
+    import collections
+    import statistics
+    _flow(tmp_path, fleet="mixed", arrival_rate=3.0, duration_s=200.0, attacker_pct=0.1)
+    veh = _jsonl(tmp_path / "run" / "ground_truth" / "gt_vehicle.jsonl")
+    mix = collections.Counter(v.get("veh_type") for v in veh)
+    assert len(mix) >= 3, f"mixed fleet should include several classes, got {mix}"
+    type_of = {v["true_vehicle_id"]: v.get("veh_type") for v in veh}
+    speeds = collections.defaultdict(list)
+    for e in _jsonl(tmp_path / "run" / "ground_truth" / "gt_emissions_sample.jsonl"):
+        if not e["is_attacker"]:
+            speeds[type_of.get(e["true_vehicle_id"])].append(e["claimed_speed"])
+    if speeds.get("car") and speeds.get("truck"):
+        assert statistics.mean(speeds["truck"]) < statistics.mean(speeds["car"]) + 1.0
+
+
 def test_flow_vehicles_follow_grid_routes(tmp_path):
     """Sampled true positions stay within the grid road network bounds (routed mobility)."""
     _flow(tmp_path, grid_w=5, grid_h=5, grid_block_m=120.0)

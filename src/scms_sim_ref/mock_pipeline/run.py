@@ -56,6 +56,25 @@ ATTACK_CATALOG = (
 )
 WEATHER_MULT = {"clear": 1.0, "rain": 1.5, "fog": 2.0, "snow": 2.5}
 WEATHER_RADIO_LOSS = {"clear": 0.0, "rain": 0.03, "fog": 0.02, "snow": 0.06}
+# Heterogeneous fleet: distinct length + kinematics per class (trucks/buses slower & sluggish, motos
+# nimble). Weights are the "mixed" fleet composition; "car" fleet is homogeneous.
+VEHICLE_TYPES = {
+    "car":        {"speed_mult": 1.00, "length": 4.5,  "accel": 1.8, "decel": 2.5, "weight": 0.75},
+    "motorcycle": {"speed_mult": 1.10, "length": 2.2,  "accel": 2.5, "decel": 3.0, "weight": 0.08},
+    "truck":      {"speed_mult": 0.80, "length": 12.0, "accel": 0.8, "decel": 1.5, "weight": 0.10},
+    "bus":        {"speed_mult": 0.85, "length": 12.0, "accel": 0.9, "decel": 1.6, "weight": 0.07},
+}
+
+
+def _pick_vehicle_type(rng, fleet: str) -> str:
+    if fleet != "mixed":
+        return fleet if fleet in VEHICLE_TYPES else "car"
+    r, acc = rng.random(), 0.0
+    for name, p in VEHICLE_TYPES.items():
+        acc += p["weight"]
+        if r <= acc:
+            return name
+    return "car"
 _SYBIL_MIN = 4        # distinct certs at NEARLY the same point before sybilCoLocation fires
 _CELL_M = 3.0         # co-location cell: small enough that a bumper-to-bumper queue (~7 m spacing)
                       # never fills it, but tightly co-located Sybil ghosts (spoofing one point) do
@@ -134,6 +153,7 @@ class PipelineConfig:
     grid_block_m: float = 120.0
     trip_speed_min: float = 8.0
     trip_speed_max: float = 18.0
+    fleet: str = "mixed"                 # "mixed" (car/moto/truck/bus) | a single type name
     # car-following (IDM) -> queues, stop-and-go, congestion (flow + grid only)
     car_following: bool = True
     idm_accel: float = 1.5               # max acceleration (m/s^2)
@@ -244,6 +264,12 @@ class Vehicle:
     trip: object = None                    # roads.Trip when road_network="grid"
     attack_from: float = 0.0
     attack_to: float = 0.0
+    # vehicle class (heterogeneous fleet)
+    veh_type: str = "car"
+    veh_length: float = 4.5
+    idm_a: float = 1.8                     # per-class max acceleration
+    idm_b: float = 2.5                     # per-class comfortable deceleration
+    desired_speed: float = 0.0            # free-flow target (car-following cap)
     # car-following kinematic state (integrated each step when cf=True)
     cf: bool = False
     s_pos: float = 0.0                     # arc-length travelled along the route
@@ -365,7 +391,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             gt_idmap.append(R.GtIdentityMap(true_vehicle_id=true_id, pseudonym_cert_digest=dig,
                                             i_period=i_k, valid_from=round(vf, 3), valid_to=round(vt, 3)))
         p0 = pseudonyms[0]
-        speed = trip.speed if trip is not None else cfg.nominal_speed * (0.85 + 0.3 * vr.random())
+        base_speed = trip.speed if trip is not None else cfg.nominal_speed * (0.85 + 0.3 * vr.random())
+        vtype = _pick_vehicle_type(vr, cfg.fleet)
+        tp = VEHICLE_TYPES[vtype]
+        speed = base_speed * tp["speed_mult"]
         v = Vehicle(
             vid=vid, spawn_x=float(vid * 20), lane_y=float(vid % 4) * 4.0, speed=speed,
             is_attacker=is_att, priv=None, pub=b"", cert_digest=p0["digest"],
@@ -375,6 +404,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             phase=vr.random() * 6.283, gps_q=0.5 + vr.expovariate(1.2),
             is_faulty=is_flt, attack_type=atype, pseudonyms=pseudonyms, colluder=is_coll,
             spawn_time=spawn_time, finish_time=finish_time, trip=trip)
+        v.veh_type, v.veh_length = vtype, tp["length"]
+        v.idm_a, v.idm_b, v.desired_speed = tp["accel"], tp["decel"], speed
         if cf:
             v.cf = True
             v.cur_v = speed
@@ -396,7 +427,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         vehicles.append(v)
         gt_vehicle.append(R.GtVehicle(true_vehicle_id=true_id, spawn_time=round(spawn_time, 3),
                                       is_attacker=is_att, attacker_role=(atype if is_att else "none"),
-                                      is_faulty=is_flt,
+                                      is_faulty=is_flt, veh_type=vtype,
                                       colluding_group_id=("colluders" if is_coll else None)))
         return v
 
@@ -694,35 +725,35 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     cf_active = bool(cfg.traffic_flow and cfg.car_following and net is not None)
     _CF_CELL = max(cfg.idm_lookahead_m, 30.0)
 
-    def _idm_accel(v_cur, v0, gap, v_lead):
+    def _idm_accel(v_cur, v0, gap, v_lead, lead_len, a_max, b_dec):
         if gap == math.inf:
-            a = cfg.idm_accel * (1 - (v_cur / max(0.1, v0)) ** 4)
+            a = a_max * (1 - (v_cur / max(0.1, v0)) ** 4)
         else:
-            gap_b = max(0.5, gap - cfg.veh_length_m)
+            gap_b = max(0.5, gap - lead_len)                # leader occupies its own length
             dv = v_cur - v_lead
             s_star = cfg.idm_min_gap + max(0.0, v_cur * cfg.idm_time_headway
-                                           + v_cur * dv / (2 * math.sqrt(cfg.idm_accel * cfg.idm_decel)))
-            a = cfg.idm_accel * (1 - (v_cur / max(0.1, v0)) ** 4 - (s_star / gap_b) ** 2)
-        return max(-6.0, min(cfg.idm_accel, a))
+                                           + v_cur * dv / (2 * math.sqrt(a_max * b_dec)))
+            a = a_max * (1 - (v_cur / max(0.1, v0)) ** 4 - (s_star / gap_b) ** 2)
+        return max(-6.0, min(a_max, a))
 
     def car_follow(active_list, t):
         # snapshot start-of-step positions so the update is order-independent (deterministic)
-        snap = {v.vid: (v.cur_x, v.cur_y, v.cur_h, v.cur_v) for v in active_list}
+        snap = {v.vid: (v.cur_x, v.cur_y, v.cur_h, v.cur_v, v.veh_length) for v in active_list}
         buckets: dict = {}
         for v in active_list:
             buckets.setdefault((int(v.cur_x // _CF_CELL), int(v.cur_y // _CF_CELL)), []).append(v.vid)
         for v in active_list:
-            vx, vy, vh, _vv = snap[v.vid]
+            vx, vy, vh, _vv, _vl = snap[v.vid]
             hr = math.radians(vh)
             cosh, sinh = math.cos(hr), math.sin(hr)
             cx0, cy0 = int(vx // _CF_CELL), int(vy // _CF_CELL)
-            best_gap, best_v = math.inf, 0.0
+            best_gap, best_v, best_len = math.inf, 0.0, cfg.veh_length_m
             for dcx in (-1, 0, 1):
                 for dcy in (-1, 0, 1):
                     for wvid in buckets.get((cx0 + dcx, cy0 + dcy), ()):
                         if wvid == v.vid:
                             continue
-                        wx, wy, wh, wv = snap[wvid]
+                        wx, wy, wh, wv, wl = snap[wvid]
                         dx, dy = wx - vx, wy - vy
                         fwd = dx * cosh + dy * sinh
                         if fwd <= 0.0 or fwd > cfg.idm_lookahead_m:
@@ -730,9 +761,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                         if abs(-dx * sinh + dy * cosh) > 3.0 or _ang_diff(wh, vh) > 45.0:
                             continue
                         if fwd < best_gap:
-                            best_gap, best_v = fwd, wv
-            a = _idm_accel(v.cur_v, v.trip.speed, best_gap, best_v)
-            v.cur_v = max(0.0, min(v.trip.speed, v.cur_v + a * cfg.dt))
+                            best_gap, best_v, best_len = fwd, wv, wl
+            a = _idm_accel(v.cur_v, v.desired_speed, best_gap, best_v, best_len, v.idm_a, v.idm_b)
+            v.cur_v = max(0.0, min(v.desired_speed, v.cur_v + a * cfg.dt))
             v.s_pos += v.cur_v * cfg.dt
             if v.s_pos >= v.trip.length:
                 v.s_pos = v.trip.length
@@ -1118,6 +1149,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--grid-block", type=float, default=120.0, help="grid block spacing (m)")
     p.add_argument("--demand", default="uniform", choices=["uniform", "rush", "night"],
                    help="time-varying arrival-demand profile")
+    p.add_argument("--fleet", default="mixed", help="'mixed' or a single vehicle class (car/truck/bus/motorcycle)")
     p.add_argument("--no-car-following", action="store_true", help="disable IDM car-following")
     p.add_argument("--out", default="datasets/poc_run")
     args = p.parse_args(argv)
@@ -1132,7 +1164,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                          road_network=("grid" if (args.flow and args.road == "linear") else args.road),
                          grid_w=args.grid, grid_h=args.grid, grid_block_m=args.grid_block,
                          demand_profile=args.demand, car_following=not args.no_car_following,
-                         out_dir=args.out)
+                         fleet=args.fleet, out_dir=args.out)
     res = run_pipeline(cfg)
     print(f"vehicles={res.n_vehicles} reports={res.n_reports} "
           f"investigations={res.n_investigations} revoked={res.n_revoked}")
