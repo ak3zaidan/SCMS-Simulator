@@ -107,6 +107,8 @@ class PipelineConfig:
     gps_degrade_rate: float = 0.006      # per-step prob a benign vehicle enters a bad-GNSS burst
     gps_degrade_factor: float = 6.0      # noise multiplier during a burst (canyon/tunnel/foliage)
     gps_degrade_dur_s: float = 3.0       # burst length (< the revocation persistence gate)
+    gps_jam_rate: float = 0.0            # per-step prob a benign vehicle loses GNSS fix entirely
+    gps_jam_dur_s: float = 4.0           # outage length; it HONESTLY broadcasts huge uncertainty
     faulty_pct: float = 0.05             # malfunctioning-sensor (non-attacker) fraction
     faulty_bias_mult: float = 5.0        # faulty = large SUSTAINED bias (smooth, self-consistent)
     weather: str = "clear"
@@ -287,6 +289,7 @@ class Vehicle:
     bias_x: float = 0.0
     bias_y: float = 0.0
     degrade_until: float = -1.0          # in a transient bad-GNSS burst while t < this
+    jam_until: float = -1.0              # in a total GNSS outage (goes silent) while t < this
     frozen: Optional[tuple[float, float]] = None
     drift: float = 0.0
     drift_rate: float = 0.0
@@ -909,6 +912,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             x, y, tspeed, theading = tx.true_state(t)
             mx, my, conf = measure(tx, x, y, t)
             attacking = tx.is_attacker and tx.attack_from <= t <= tx.attack_to
+            if (not attacking) and cfg.gps_jam_rate > 0:
+                r = vrng[tx.vid]
+                if t >= tx.jam_until and r.random() < cfg.gps_jam_rate:
+                    tx.jam_until = t + cfg.gps_jam_dur_s
+                if t < tx.jam_until:
+                    continue                                      # GNSS outage -> no fix -> goes silent
             msg_count, cg, sig_ok = 1, t, True                    # CAMs; claimed gen time; signature ok
             cvf, cvt = ps["valid_from"], ps["valid_to"]           # cert validity window (MA-visible)
             if attacking:

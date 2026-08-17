@@ -52,6 +52,17 @@ def test_delayed_messages_trigger_stale_detector(tmp_path):
     assert _reasons(out)["staleOrReplay"] > 0, "stale timestamps must trigger staleOrReplay"
 
 
+def test_gps_jam_outage_goes_silent_without_false_revocation(tmp_path):
+    """A benign GNSS outage makes a vehicle go silent (no fix -> no CAM); it must resume cleanly and
+    not be falsely revoked for the position gap."""
+    out = str(tmp_path / "run")
+    run_pipeline(PipelineConfig(out_dir=out, traffic_flow=True, road_network="grid", car_following=True,
+                                duration_s=200.0, arrival_rate=2.5, grid_w=6, grid_h=6,
+                                attacker_pct=0.15, gps_jam_rate=0.02, radio_range_m=250.0, seed=6))
+    s = __import__("scms_sim_ref.datagen.validate", fromlist=["validate"]).validate(out)[0]
+    assert s["precision"] is not None and s["precision"] >= 0.8, s
+
+
 def test_degradation_bursts_yield_false_positives_but_not_faulty_revocations(tmp_path):
     """Transient bad-GNSS bursts give realistic benign false positives; short bursts stay under the
     revocation persistence gate so faults/benign are not systematically revoked."""
