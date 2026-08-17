@@ -94,7 +94,8 @@ def cell_config(cell: dict, idx: int, base_seed: int, n_steps: int, out_dir: Pat
         kw.update(traffic_flow=True, road_network="grid", car_following=True,
                   duration_s=flow_duration, arrival_rate=2.0, grid_w=6, grid_h=6,
                   grid_block_m=140.0, demand_profile=cell.get("demand", "uniform"),
-                  traffic_lights=bool(cell.get("lights", False)), fleet=cell.get("fleet", "mixed"))
+                  traffic_lights=bool(cell.get("lights", False)), fleet=cell.get("fleet", "mixed"),
+                  attack_intensity=cell.get("intensity", 1.0))
     return PipelineConfig(**kw)
 
 
@@ -135,7 +136,7 @@ def main(argv=None) -> int:
     if a.flow:
         # under flow, demand / signals / fleet become permutation axes; n_vehicles is irrelevant
         grid = {**grid, "demand": ["uniform", "rush", "night"], "lights": [False, True],
-                "fleet": ["mixed", "car"], "n_vehicles": [0]}
+                "fleet": ["mixed", "car"], "intensity": [1.0, 0.5], "n_vehicles": [0]}
     cells = enumerate_cells(grid)
     total = len(cells)
     dropped = 0
