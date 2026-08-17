@@ -189,6 +189,9 @@ def _task(feat: pd.DataFrame, lab: pd.DataFrame, key: str, label_col: str,
         "roc_auc_ci95": _bootstrap_ci(yte, s, _roc_auc),
         "at_0.5": _prf(yte, s),
         "features": cols,
+        # standardized logreg coefficients rank which detectors/features drive detection (free)
+        "top_features": [[c, round(float(wi), 3)]
+                         for c, wi in sorted(zip(cols, w), key=lambda kv: -abs(kv[1]))[:8]],
     }
     if with_gbdt:
         # strong non-linear tabular baseline (numpy GBDT); trees don't need standardization

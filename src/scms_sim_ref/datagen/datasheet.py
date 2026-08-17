@@ -221,6 +221,10 @@ def build(dataset_dir: str) -> str:
             gcistr = f" (95% CI {gci[0]}–{gci[1]})" if gci else ""
             L.append(f"    - GBDT ROC-AUC **{g.get('roc_auc')}**{gcistr}, PR-AUC {g.get('pr_auc')}, "
                      f"recall@1%FPR {g.get('recall_at_1pct_fpr')}, balanced-acc {g.get('balanced_accuracy')}")
+        tf = t.get("top_features")
+        if tf:
+            L.append("    - Top features (|logreg coef|): "
+                     + ", ".join(f"{c} {w:+.2f}" for c, w in tf[:6]))
     oc = bfull.get("anomaly_baseline_unsupervised")
     if oc:
         L.append(f"- **Unsupervised anomaly baseline** (one-class Mahalanobis, trained on BENIGN only): "
