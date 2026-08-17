@@ -127,6 +127,9 @@ CONFIG_SPEC = [
     {"group": "Python flow", "name": "pf_jam", "label": "GPS jam rate", "type": "float",
      "default": 0.0, "step": 0.01, "min": 0, "max": 1, "gen": "python-flow", "arg": "--gps-jam-rate",
      "help": "per-step prob a benign vehicle loses GNSS fix (goes silent)"},
+    {"group": "Python flow", "name": "pf_maxveh", "label": "Max total vehicles", "type": "int",
+     "default": 0, "gen": "python-flow", "arg": "--max-total-vehicles",
+     "help": "0 = unlimited; cap for a predictable memory bound on long runs"},
     {"group": "Python flow", "name": "pf_seed", "label": "Seed", "type": "int", "default": 7,
      "gen": "python-flow", "arg": "--seed"},
 
