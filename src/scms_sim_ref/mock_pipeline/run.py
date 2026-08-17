@@ -177,6 +177,7 @@ class PipelineConfig:
     state_prune_ttl: int = 20            # flow: evict detection state untouched this many steps
     live_interval_s: float = 0.0         # >0: write a throttled live_state.json for the GUI map
                                          # (best-effort viz; NOT part of the data digest)
+    verbose: bool = False                # print a flow progress heartbeat (CLI/GUI set this True)
     jmax: int = 20
     out_dir: str = "datasets/poc_run"
 
@@ -1134,7 +1135,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
 
         if live_every and step % live_every == 0:
             write_live(active_list, t)
-        if cfg.traffic_flow and n_steps >= 40 and step % max(1, n_steps // 20) == 0:
+        if cfg.verbose and cfg.traffic_flow and n_steps >= 40 and step % max(1, n_steps // 20) == 0:
             print(f"[flow t={t:.0f}/{total_time:.0f}s] active={len(active)} spawned={spawn_ptr} "
                   f"reports={counters['report']} revoked={len(revoked_vehicles)}", flush=True)
         if stream:
@@ -1325,7 +1326,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                          grid_w=args.grid, grid_h=(args.grid_h or args.grid), grid_block_m=args.grid_block,
                          demand_profile=args.demand, car_following=not args.no_car_following,
                          fleet=args.fleet, live_interval_s=args.live_interval,
-                         traffic_lights=args.traffic_lights, out_dir=args.out)
+                         traffic_lights=args.traffic_lights, verbose=True, out_dir=args.out)
     res = run_pipeline(cfg)
     print(f"vehicles={res.n_vehicles} reports={res.n_reports} "
           f"investigations={res.n_investigations} revoked={res.n_revoked}")
