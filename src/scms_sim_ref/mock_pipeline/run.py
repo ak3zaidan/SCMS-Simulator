@@ -657,6 +657,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 "staleOrReplay", "constantPositionFrozen", "implausibleAcceleration",
                 "sybilCoLocation", "acceptanceRangeThreshold", "beaconFrequency",
                 "signatureVerification", "certValidity", "mapOffRoad")
+    # SOFT features: carried in the fusion fingerprint (detnorm_*) for ML, but NEVER trigger a report
+    # on their own -- a constant-velocity tracker false-positives on curves, so it must stay soft.
+    SOFT_KEYS = ("kalmanConsistency",)
     MOTION_KEYS = ("positionSpeedInconsistency", "positionJump", "headingInconsistency",
                    "constantPositionFrozen", "implausibleAcceleration")
     touched_subjects: set[str] = set()
@@ -694,7 +697,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         row["subject_pos_confidence"] = round(conf, 3)
         row["cert_crl_status"] = "active"
         row["sig_valid"] = bool(sig_valid)
-        for k in DET_KEYS:
+        for k in (*DET_KEYS, *SOFT_KEYS):
             row[f"detnorm_{k}"] = round(det.get(k, 0.0), 3)
         ma_reports.append(row)
         if malicious:
@@ -1047,6 +1050,19 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 det["staleOrReplay"] = max(det.get("staleOrReplay", 0.0), (t - b["cg"]) / cfg.stale_max_s)
                 det["mapOffRoad"] = _offroad(cx, cy) / cfg.offroad_tol_m
                 det["certValidity"] = 1.5 if (t > b["cvt"] + 1.0 or t < b["cvf"] - 1.0) else 0.0
+                # soft constant-velocity (alpha-beta) consistency residual -> fusion feature only
+                kf = st.get("kf")
+                if kf is None:
+                    st["kf"] = (cx, cy, 0.0, 0.0, t)
+                    det["kalmanConsistency"] = 0.0
+                else:
+                    ex, ey, evx, evy, et = kf
+                    dtk = max(1e-3, t - et)
+                    predx, predy = ex + evx * dtk, ey + evy * dtk
+                    rxk, ryk = cx - predx, cy - predy
+                    det["kalmanConsistency"] = math.hypot(rxk, ryk) / (2 * cfg.consistency_threshold_m + conf)
+                    st["kf"] = (predx + 0.5 * rxk, predy + 0.5 * ryk,
+                                evx + 0.3 * rxk / dtk, evy + 0.3 * ryk / dtk, t)
                 if not b["sig_ok"]:
                     # signature fails -> the content cannot be trusted, so the plausibility detectors
                     # are moot; the receiver only reports the crypto-verification failure itself.
