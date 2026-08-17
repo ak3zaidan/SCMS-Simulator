@@ -121,6 +121,12 @@ CONFIG_SPEC = [
     {"group": "Python flow", "name": "pf_lights", "label": "Traffic lights", "type": "bool",
      "default": False, "gen": "python-flow", "arg": "--traffic-lights",
      "help": "signalized intersections (stops + queues)"},
+    {"group": "Python flow", "name": "pf_intensity", "label": "Attack intensity", "type": "float",
+     "default": 1.0, "step": 0.25, "min": 0, "max": 3, "gen": "python-flow", "arg": "--attack-intensity",
+     "help": "scales falsification magnitude (subtle <1 .. blatant >1)"},
+    {"group": "Python flow", "name": "pf_jam", "label": "GPS jam rate", "type": "float",
+     "default": 0.0, "step": 0.01, "min": 0, "max": 1, "gen": "python-flow", "arg": "--gps-jam-rate",
+     "help": "per-step prob a benign vehicle loses GNSS fix (goes silent)"},
     {"group": "Python flow", "name": "pf_seed", "label": "Seed", "type": "int", "default": 7,
      "gen": "python-flow", "arg": "--seed"},
 

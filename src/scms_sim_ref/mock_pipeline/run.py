@@ -1309,6 +1309,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--live-interval", type=float, default=0.0, help="write live_state.json every N sim-seconds (GUI map)")
     p.add_argument("--no-car-following", action="store_true", help="disable IDM car-following")
     p.add_argument("--traffic-lights", action="store_true", help="signalized intersections (grid)")
+    p.add_argument("--gps-jam-rate", type=float, default=0.0, help="per-step prob a benign vehicle loses GNSS fix")
+    p.add_argument("--max-total-vehicles", type=int, default=0, help="flow: cap total spawns (0=unlimited)")
     p.add_argument("--featurize", action="store_true", help="build ML tables after generation")
     p.add_argument("--grid-h", type=int, default=0, help="grid height (0 = square, = --grid)")
     p.add_argument("--out", default="datasets/poc_run")
@@ -1326,7 +1328,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                          grid_w=args.grid, grid_h=(args.grid_h or args.grid), grid_block_m=args.grid_block,
                          demand_profile=args.demand, car_following=not args.no_car_following,
                          fleet=args.fleet, live_interval_s=args.live_interval,
-                         traffic_lights=args.traffic_lights, verbose=True, out_dir=args.out)
+                         traffic_lights=args.traffic_lights, gps_jam_rate=args.gps_jam_rate,
+                         max_total_vehicles=args.max_total_vehicles, verbose=True, out_dir=args.out)
     res = run_pipeline(cfg)
     print(f"vehicles={res.n_vehicles} reports={res.n_reports} "
           f"investigations={res.n_investigations} revoked={res.n_revoked}")
