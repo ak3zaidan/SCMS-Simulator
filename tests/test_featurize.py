@@ -91,6 +91,24 @@ def test_ma_linked_vehicle_table_is_leakage_safe_and_realistic(tmp_path):
     assert lq is not None and 0.0 <= lq["entity_purity"] <= 1.0
 
 
+def test_feature_schema_json_classifies_columns_safely(tmp_path):
+    """ml/schema.json labels every column; no column marked as a (fusion) feature is a leaky key."""
+    import json
+    from scms_sim_ref.datagen.leakage_linter import is_forbidden_feature_key
+
+    out = str(tmp_path / "run")
+    run_pipeline(PipelineConfig(out_dir=out, seed=7, n_vehicles=40, n_steps=40))
+    featurize.build(out)
+    schema = json.loads((tmp_path / "run" / "ml" / "schema.json").read_text())
+    feature_kinds = {"feature", "fusion_feature", "fusion_feature_agg", "reason_flag_feature"}
+    for tbl in ("report_features", "subject_features", "vehicle_features", "vehicle_features_ma"):
+        feats = [c["name"] for c in schema[tbl] if c["kind"] in feature_kinds]
+        assert feats, f"{tbl} should have feature columns"
+        assert not [c for c in feats if is_forbidden_feature_key(c)], f"{tbl} feature col is leaky"
+    # label tables expose their labels as kind=label/id, never as feature
+    assert any(c["kind"] == "label" for c in schema["subject_labels"])
+
+
 def test_featurize_is_deterministic(tmp_path):
     """Same inputs + split seed -> identical feature tables."""
     out = str(tmp_path / "run")

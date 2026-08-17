@@ -430,6 +430,15 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         df.to_csv(csv, index=False)
         written[name] = {"rows": int(len(df)), "parquet": pq}
 
+    # --- machine-readable feature schema (which columns are features / labels / ids / fusion) ---
+    _write_schema(out, {
+        "report_features": report_features, "report_labels": report_labels,
+        "subject_features": subject_features, "subject_labels": subject_labels,
+        "vehicle_features": vehicle_features, "vehicle_labels": vehicle_labels,
+        "vehicle_features_ma": vehicle_features_ma, "vehicle_labels_ma": vehicle_labels_ma,
+        "graph_edges": graph_edges, "subject_windows": subject_windows,
+    })
+
     # --- split-integrity check: no true vehicle spans multiple splits ---
     split_of_vehicle: dict[str, str] = {}
     leaks = 0
@@ -450,6 +459,45 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         "split_leakage": leaks,
     }
     return summary
+
+
+_ID_COLS = {"report_id", "subject_cert_digest", "reporter_cert_digest", "entity_id",
+            "true_vehicle_id", "src_entity", "dst_entity", "window"}
+
+
+def _col_kind(name: str) -> str:
+    if name in ("split", "time_split", "domain_id"):
+        return "split"
+    if name in _ID_COLS:
+        return "id"
+    if name.startswith("label_") or name in ("link_true_id_count",):
+        return "label"
+    if name.startswith("detnorm_"):
+        return "fusion_feature"          # per-detector normalized score (ML fusion fingerprint)
+    if name.startswith("detmax_"):
+        return "fusion_feature_agg"      # per-vehicle max of a detector across its reports
+    if name.startswith("reason_"):
+        return "reason_flag_feature"     # one-hot of which reason fired
+    return "feature"
+
+
+def _write_schema(out: str, frames: dict) -> None:
+    """Emit ml/schema.json: for each table, each column's kind + dtype -> ML consumers can pick the
+    feature columns (feature/fusion_feature/reason_flag_feature) and never train on id/label/split."""
+    schema = {}
+    for name, df in frames.items():
+        cols = []
+        for c in df.columns:
+            dtype = str(df[c].dtype) if len(df) else "unknown"
+            cols.append({"name": str(c), "kind": _col_kind(str(c)), "dtype": dtype})
+        schema[name] = cols
+    schema["_legend"] = {"feature": "MA-visible model input", "fusion_feature": "per-detector detnorm",
+                         "fusion_feature_agg": "per-vehicle detector max", "reason_flag_feature":
+                         "which reason fired (one-hot)", "label": "evaluation label (never a feature)",
+                         "id": "identifier (never a feature)", "split": "train/val/test assignment"}
+    with open(os.path.join(out, "schema.json"), "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(schema, fh, indent=2)
+        fh.write("\n")
 
 
 def main(argv: list[str] | None = None) -> int:
