@@ -89,10 +89,12 @@ def cell_config(cell: dict, idx: int, base_seed: int, n_steps: int, out_dir: Pat
         collude_pct=cell["collude_pct"], victim_pct=0.12,
         out_dir=str(out_dir))
     if flow:
-        # each domain is a long routed simulation with car-following + a demand profile
+        # each domain is a long routed simulation with car-following + a demand profile, and
+        # (as permutation axes) signalized/unsignalized intersections and mixed/car fleets
         kw.update(traffic_flow=True, road_network="grid", car_following=True,
                   duration_s=flow_duration, arrival_rate=2.0, grid_w=6, grid_h=6,
-                  grid_block_m=140.0, demand_profile=cell.get("demand", "uniform"))
+                  grid_block_m=140.0, demand_profile=cell.get("demand", "uniform"),
+                  traffic_lights=bool(cell.get("lights", False)), fleet=cell.get("fleet", "mixed"))
     return PipelineConfig(**kw)
 
 
@@ -131,8 +133,9 @@ def main(argv=None) -> int:
 
     grid = dict(GRIDS[a.grid])
     if a.flow:
-        # a demand profile becomes another permutation axis; n_vehicles is irrelevant under flow
-        grid = {**grid, "demand": ["uniform", "rush", "night"], "n_vehicles": [0]}
+        # under flow, demand / signals / fleet become permutation axes; n_vehicles is irrelevant
+        grid = {**grid, "demand": ["uniform", "rush", "night"], "lights": [False, True],
+                "fleet": ["mixed", "car"], "n_vehicles": [0]}
     cells = enumerate_cells(grid)
     total = len(cells)
     dropped = 0
