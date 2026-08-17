@@ -152,6 +152,7 @@ class PipelineConfig:
     traffic_flow: bool = False           # spawn/despawn vehicles over time (steady-state population)
     duration_s: float = 0.0              # flow: sim length in seconds (overrides n_steps if > 0)
     arrival_rate: float = 2.0            # flow: mean vehicles spawned per second
+    max_total_vehicles: int = 0          # flow: cap total spawns (0 = unlimited) -> bounds memory
     road_network: str = "linear"         # "linear" (straight lines) | "grid" (routed trips)
     grid_w: int = 6
     grid_h: int = 6
@@ -503,6 +504,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             tt += rrng.expovariate(cfg.arrival_rate) if cfg.arrival_rate > 0 else total_time
             if tt >= total_time:
                 break
+            if cfg.max_total_vehicles and vid >= cfg.max_total_vehicles:
+                break                            # cap total spawns (predictable memory bound)
             frac = tt / total_time
             if rrng.random() > demand_mult(frac):
                 continue                          # thinned out (off-peak)
