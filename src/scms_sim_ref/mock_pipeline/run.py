@@ -53,6 +53,7 @@ ATTACK_CATALOG = (
     "ReversedHeading", "HeadingOffset", "DataReplay",
     "SlowDrift", "AlongRoadOffset", "Sybil",
     "DoS", "DelayedMessages", "InvalidSignature", "ExpiredCert", "NotYetValid",
+    "OutOfOrder", "DoSRandom",
 )
 WEATHER_MULT = {"clear": 1.0, "rain": 1.5, "fog": 2.0, "snow": 2.5}
 WEATHER_RADIO_LOSS = {"clear": 0.0, "rain": 0.03, "fog": 0.02, "snow": 0.06}
@@ -624,6 +625,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         elif typ == "AlongRoadOffset":
             hr = math.radians(mheading)
             cx, cy = mx + 30.0 * math.cos(hr), my + 30.0 * math.sin(hr)
+        elif typ == "DoSRandom":                             # flood with random content
+            cx, cy = mx + r.uniform(-60, 60), my + r.uniform(-60, 60)
         return cx, cy, cs, ch
 
     Z = 3.0                     # residual must exceed ~3x the broadcast uncertainty to count
@@ -912,6 +915,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     cg = t - cfg.delay_s                          # stale timestamp
                 elif tx.attack_type == "DataReplay":
                     cg = t - 5.0 * cfg.dt                         # replayed frame carries its old gen time
+                elif tx.attack_type == "OutOfOrder":
+                    cg = t - vrng[tx.vid].uniform(cfg.delay_s, 2.0 * cfg.delay_s)  # non-monotonic gen time
+                elif tx.attack_type == "DoSRandom":
+                    msg_count = cfg.dos_burst                     # flood + random content (set in claim)
                 elif tx.attack_type == "InvalidSignature":
                     sig_ok = False                                # forged / tampered message
                 elif tx.attack_type == "ExpiredCert":

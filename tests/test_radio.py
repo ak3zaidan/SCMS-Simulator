@@ -35,6 +35,15 @@ def test_dos_attack_triggers_beacon_frequency(tmp_path):
     assert _reasons(out)["beaconFrequency"] > 0, "a DoS flood must trigger the beaconFrequency detector"
 
 
+def test_out_of_order_and_dos_random_are_caught(tmp_path):
+    """Completes the timing family: OutOfOrder -> staleOrReplay, DoSRandom -> beaconFrequency."""
+    for atk, reason in (("OutOfOrder", "staleOrReplay"), ("DoSRandom", "beaconFrequency")):
+        out = str(tmp_path / atk)
+        run_pipeline(PipelineConfig(out_dir=out, seed=4, n_vehicles=36, n_steps=70, attacker_ids=(5, 11),
+                                    attack_type=atk, attack_types=(atk,), faulty_pct=0.0))
+        assert _reasons(out)[reason] > 0, f"{atk} should trigger {reason}"
+
+
 def test_delayed_messages_trigger_stale_detector(tmp_path):
     out = str(tmp_path / "run")
     run_pipeline(PipelineConfig(out_dir=out, seed=2, n_vehicles=30, n_steps=60, attacker_ids=(4,),
