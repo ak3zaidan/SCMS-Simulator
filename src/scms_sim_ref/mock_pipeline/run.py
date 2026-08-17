@@ -52,7 +52,7 @@ ATTACK_CATALOG = (
     "ConstSpeedOffset", "RandomSpeed", "StopAndGo",
     "ReversedHeading", "HeadingOffset", "DataReplay",
     "SlowDrift", "AlongRoadOffset", "Sybil",
-    "DoS", "DelayedMessages",
+    "DoS", "DelayedMessages", "InvalidSignature",
 )
 WEATHER_MULT = {"clear": 1.0, "rain": 1.5, "fog": 2.0, "snow": 2.5}
 WEATHER_RADIO_LOSS = {"clear": 0.0, "rain": 0.03, "fog": 0.02, "snow": 0.06}
@@ -571,7 +571,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
 
     DET_KEYS = ("positionSpeedInconsistency", "positionJump", "headingInconsistency",
                 "staleOrReplay", "constantPositionFrozen", "implausibleAcceleration",
-                "sybilCoLocation", "acceptanceRangeThreshold", "beaconFrequency")
+                "sybilCoLocation", "acceptanceRangeThreshold", "beaconFrequency",
+                "signatureVerification")
     MOTION_KEYS = ("positionSpeedInconsistency", "positionJump", "headingInconsistency",
                    "constantPositionFrozen", "implausibleAcceleration")
     touched_subjects: set[str] = set()
@@ -589,7 +590,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 and received_by.get(reporter_digest, 0) < cfg.reputation_max)
 
     def file_report(t, reporter_digest, subject_digest, subject_veh, reasons, det, conf,
-                    cx, cy, px, py, malicious):
+                    cx, cy, px, py, malicious, sig_valid=True):
         counters["report"] += 1
         rid = f"rpt_{counters['report']:05d}"
         delay = rng.uniform(0.0, cfg.net_delay_max)
@@ -608,7 +609,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         row["detector_score_norm"] = round(max(det.values()) if det else 1.0, 3)
         row["subject_pos_confidence"] = round(conf, 3)
         row["cert_crl_status"] = "active"
-        row["sig_valid"] = True
+        row["sig_valid"] = bool(sig_valid)
         for k in DET_KEYS:
             row[f"detnorm_{k}"] = round(det.get(k, 0.0), 3)
         ma_reports.append(row)
@@ -765,22 +766,26 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             x, y, tspeed, theading = tx.true_state(t)
             mx, my, conf = measure(tx, x, y, t)
             attacking = tx.is_attacker and tx.attack_from <= t <= tx.attack_to
-            msg_count, cg = 1, t                                  # CAMs this interval; claimed gen time
+            msg_count, cg, sig_ok = 1, t, True                    # CAMs; claimed gen time; signature ok
             if attacking:
                 cx, cy, cs, ch = attack_claim(tx, t, mx, my, tspeed, theading)
                 if tx.attack_type == "DoS":
                     msg_count = cfg.dos_burst                     # flood the channel
                 elif tx.attack_type == "DelayedMessages":
                     cg = t - cfg.delay_s                          # stale timestamp
+                elif tx.attack_type == "InvalidSignature":
+                    sig_ok = False                                # forged / tampered message
             else:
                 cx, cy, cs, ch = mx, my, tspeed, theading
             tx.hist.append((cx, cy, cs, ch))
             falsified = attacking and (math.hypot(cx - mx, cy - my) > 1.0 or abs(cs - tspeed) > 1.0
-                                       or _ang_diff(ch, theading) > 5.0 or msg_count > 1 or cg < t - 1e-6)
+                                       or _ang_diff(ch, theading) > 5.0 or msg_count > 1
+                                       or cg < t - 1e-6 or not sig_ok)
             if falsified and tx.onset is None:
                 tx.onset = t
             broadcasts.append(dict(veh=tx, digest=digest, cx=cx, cy=cy, cs=cs, ch=ch, conf=conf,
-                                   ghost=False, x=x, y=y, falsified=falsified, msg_count=msg_count, cg=cg))
+                                   ghost=False, x=x, y=y, falsified=falsified, msg_count=msg_count,
+                                   cg=cg, sig_ok=sig_ok))
             if attacking and tx.attack_type == "Sybil":     # fabricate co-located ghost identities
                 sr = vrng[tx.vid]
                 for gdig in tx.ghosts:
@@ -788,7 +793,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     cert_last_seen[gdig] = t
                     broadcasts.append(dict(veh=tx, digest=gdig, cx=cx + sr.uniform(-1, 1),
                                            cy=cy + sr.uniform(-1, 1), cs=cs, ch=ch, conf=conf,
-                                           ghost=True, x=x, y=y, falsified=True, msg_count=1, cg=t))
+                                           ghost=True, x=x, y=y, falsified=True, msg_count=1,
+                                           cg=t, sig_ok=True))
 
         # per-message ground-truth emission sampling (real broadcasts only)
         for b in broadcasts:
@@ -885,6 +891,11 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 det["acceptanceRangeThreshold"] = math.hypot(cx - rxx, cy - rxy) / cfg.art_max_m
                 det["beaconFrequency"] = b["msg_count"] / cfg.freq_max
                 det["staleOrReplay"] = max(det.get("staleOrReplay", 0.0), (t - b["cg"]) / cfg.stale_max_s)
+                if not b["sig_ok"]:
+                    # signature fails -> the content cannot be trusted, so the plausibility detectors
+                    # are moot; the receiver only reports the crypto-verification failure itself.
+                    det = {k: 0.0 for k in DET_KEYS}
+                    det["signatureVerification"] = 1.5
                 for k in DET_KEYS:
                     st["streak"][k] = st["streak"].get(k, 0) + 1 if det.get(k, 0.0) >= 1.0 else 0
                 fired = {k: det[k] for k in DET_KEYS if st["streak"].get(k, 0) >= MIN_CONSEC}
@@ -894,7 +905,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     continue
                 reasons = sorted(fired, key=lambda k: -det[k])
                 file_report(t, reporter_digest, digest, tx, reasons, det, conf,
-                            cx, cy, ref[0], ref[1], malicious=False)
+                            cx, cy, ref[0], ref[1], malicious=False, sig_valid=b["sig_ok"])
 
         # COLLUSION pass: colluders file fabricated reports against benign victims. In flow mode
         # victims are chosen dynamically (nearby active benign vehicles); in fixed mode from the list.

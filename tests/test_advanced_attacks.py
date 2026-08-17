@@ -61,6 +61,26 @@ def test_sybil_ghosts_are_co_located_and_flagged(tmp_path):
     assert reasons["sybilCoLocation"] > 0, "co-located ghosts must trigger sybilCoLocation"
 
 
+def test_invalid_signature_attack_is_caught_by_signature_verification(tmp_path):
+    """Forged/tampered messages (sig_valid=False) must trip the signatureVerification detector and
+    be reported with sig_valid=False; content plausibility is moot for an unverifiable message."""
+    out = str(tmp_path / "run")
+    run_pipeline(PipelineConfig(out_dir=out, n_vehicles=40, n_steps=60, attacker_ids=(5, 9, 14),
+                                attack_type="InvalidSignature", attack_types=("InvalidSignature",),
+                                faulty_pct=0.0, seed=4))
+    reasons = collections.Counter()
+    sig_false = 0
+    for ln in open(out + "/ma/ma_reports.jsonl", encoding="utf-8"):
+        r = json.loads(ln)
+        reasons.update(r.get("reason_codes", []))
+        if r.get("sig_valid") is False:
+            sig_false += 1
+    assert reasons["signatureVerification"] > 0
+    assert sig_false > 0, "invalid-signature reports must carry sig_valid=False"
+    rev = _jsonl(tmp_path / "run" / "ground_truth" / "gt_linkage_revocation.jsonl")
+    assert all(r["should_have_been_revoked"] for r in rev), "no benign should be revoked here"
+
+
 def test_advanced_run_is_deterministic_and_leakage_free(tmp_path):
     kw = dict(seed=9, n_vehicles=50, n_steps=90, attacker_pct=0.2, rotate_period_s=40.0,
               collude_pct=0.5, victim_pct=0.1, faulty_pct=0.05)

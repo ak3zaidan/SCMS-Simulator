@@ -44,6 +44,7 @@ REASON_VOCAB = [
     "implausibleAcceleration",
     "staleOrReplay",
     "beaconFrequency",
+    "signatureVerification",
 ]
 
 # Detectors whose per-report normalized score is carried as a multi-detector FUSION fingerprint
@@ -52,6 +53,7 @@ DETECTORS = [
     "acceptanceRangeThreshold", "positionJump", "positionSpeedInconsistency",
     "headingInconsistency", "implausibleAcceleration", "staleOrReplay",
     "beaconFrequency", "sybilCoLocation", "constantPositionFrozen", "kalmanConsistency",
+    "signatureVerification",
 ]
 
 
@@ -68,6 +70,7 @@ for _fam, _bases in {
     "timing": ["DataReplay", "DelayedMessages", "OutOfOrder", "DoS", "DoSRandom"],
     "identity": ["Sybil"],
     "stealth": ["AlongRoadOffset", "SlowDrift", "LaggingPosition"],
+    "credential": ["InvalidSignature", "ExpiredCert", "NotYetValid"],
 }.items():
     for _b in _bases:
         _ATTACK_FAMILY[_b] = _fam
