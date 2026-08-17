@@ -814,12 +814,32 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # (reporters near the subject) instead of all-to-all, and far-away attackers go unobserved.
         rx_pos = {rx.vid: rx.true_state(t)[:2] for rx in active_list if not enforced(rx, t)}
         wx_loss = WEATHER_RADIO_LOSS.get(cfg.weather, 0.0)
+        # spatial index over broadcasts (cell = radio range) so each receiver only tests transmitters
+        # in its own + adjacent cells -> reception is O(active x local density), not O(active^2). Cell
+        # size = range means the 3x3 neighbourhood provably contains every in-range pair; candidates
+        # are re-sorted into broadcast order so packet-loss RNG (hence output) is byte-identical.
+        rng_cell = max(cfg.radio_range_m, 1.0)
+        bcell: dict = {}
+        for bi, b in enumerate(broadcasts):
+            bcell.setdefault((int(b["x"] // rng_cell), int(b["y"] // rng_cell)), []).append(bi)
         for rx in active_list:
             if enforced(rx, t):
                 continue
             rxx, rxy = rx_pos[rx.vid]
-            in_range = [(b, math.hypot(b["x"] - rxx, b["y"] - rxy)) for b in broadcasts
-                        if b["veh"].vid != rx.vid and math.hypot(b["x"] - rxx, b["y"] - rxy) <= cfg.radio_range_m]
+            cx0, cy0 = int(rxx // rng_cell), int(rxy // rng_cell)
+            cand = []
+            for dcx in (-1, 0, 1):
+                for dcy in (-1, 0, 1):
+                    cand.extend(bcell.get((cx0 + dcx, cy0 + dcy), ()))
+            cand.sort()
+            in_range = []
+            for bi in cand:
+                b = broadcasts[bi]
+                if b["veh"].vid == rx.vid:
+                    continue
+                d = math.hypot(b["x"] - rxx, b["y"] - rxy)
+                if d <= cfg.radio_range_m:
+                    in_range.append((b, d))
             load = sum(b["msg_count"] for b, _ in in_range)
             cong = min(0.8, max(0.0, (load - cfg.chan_capacity) / max(1, cfg.chan_capacity)) * 0.5)
             reporter_digest = rx.active_pseudonym(t, cfg.rotate_period_s)["digest"]
