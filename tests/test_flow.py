@@ -60,6 +60,45 @@ def test_flow_detection_is_realistic_not_degenerate(tmp_path):
     assert s["recall"] is not None and s["recall"] >= 0.4, s
 
 
+def test_car_following_produces_congestion(tmp_path):
+    """IDM car-following at high density must yield speed variation and queueing (stop-and-go)."""
+    import statistics
+    _flow(tmp_path, car_following=True, arrival_rate=4.0, grid_w=4, grid_h=4, grid_block_m=100.0,
+          duration_s=180.0, trip_speed_min=12.0, trip_speed_max=16.0)
+    em = _jsonl(tmp_path / "run" / "ground_truth" / "gt_emissions_sample.jsonl")
+    sp = [e["claimed_speed"] for e in em if not e["is_attacker"]]
+    assert statistics.pstdev(sp) > 1.5, "car-following should spread speeds (free flow vs queues)"
+    assert any(s < 5.0 for s in sp), "some vehicles must be slowed/queued"
+
+
+def test_flow_detection_realistic_under_car_following(tmp_path):
+    """At a normal density the MA still separates attackers from congested benign traffic."""
+    _flow(tmp_path, car_following=True, arrival_rate=2.0, grid_w=6, grid_h=6, grid_block_m=140.0,
+          duration_s=250.0, attacker_pct=0.15)
+    s, _ = V.validate(str(tmp_path / "run"))
+    assert s["precision"] is not None and s["precision"] >= 0.75, s
+    assert s["recall"] is not None and s["recall"] >= 0.4, s
+
+
+def test_demand_profiles_shape_arrivals(tmp_path):
+    """'rush' concentrates arrivals into peaks; 'uniform' spreads them evenly."""
+    import statistics
+
+    def per_minute(profile):
+        r = _flow(tmp_path / profile, demand_profile=profile, arrival_rate=4.0, duration_s=300.0)
+        veh = _jsonl(tmp_path / profile / "run" / "ground_truth" / "gt_vehicle.jsonl")
+        buckets = [0] * 5
+        for v in veh:
+            b = min(4, int(v["spawn_time"] // 60))
+            buckets[b] += 1
+        return buckets
+
+    uni, rush = per_minute("uniform"), per_minute("rush")
+    # coefficient of variation across the run is higher for rush (peaky) than uniform (flat)
+    cv = lambda b: statistics.pstdev(b) / max(1e-9, statistics.mean(b))
+    assert cv(rush) > cv(uni), f"rush should be peakier than uniform: rush={rush} uni={uni}"
+
+
 def test_flow_vehicles_follow_grid_routes(tmp_path):
     """Sampled true positions stay within the grid road network bounds (routed mobility)."""
     _flow(tmp_path, grid_w=5, grid_h=5, grid_block_m=120.0)

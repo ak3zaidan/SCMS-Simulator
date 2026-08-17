@@ -43,3 +43,18 @@ def test_massive_grid_merges_with_domain_id_and_is_leakage_safe(tmp_path, monkey
     assert not (out / "domains").exists()
     cat = json.loads((out / "domain_catalog.json").read_text())
     assert len(cat) == 2 and {c["scenario"] for c in cat} == {"ConstPos", "ALL"}
+
+
+def test_massive_flow_domains_are_routed_simulations(tmp_path, monkeypatch):
+    """--flow makes each domain a long routed car-following sim; demand becomes an axis."""
+    tiny = {"scenario": ["ConstPos", "ALL"], "weather": ["clear"], "rotate_period_s": [0.0],
+            "collude_pct": [0.0], "faulty_pct": [0.05], "attacker_pct": [0.2], "n_vehicles": [40]}
+    monkeypatch.setitem(massive.GRIDS, "tiny", tiny)
+    out = tmp_path / "mflow"
+    rc = massive.main(["--grid", "tiny", "--flow", "--flow-duration", "120", "--max-domains", "3",
+                       "--sample", "--seed", "5", "--out", str(out)])
+    assert rc == 0
+    cat = json.loads((out / "domain_catalog.json").read_text())
+    assert all("demand" in c for c in cat), "flow domains carry a demand profile"
+    vf = pd.read_csv(out / "ml" / "vehicle_features.csv")
+    assert "domain_id" in vf.columns and len(vf) > 0

@@ -75,10 +75,11 @@ def enumerate_cells(grid: dict) -> list[dict]:
     return cells
 
 
-def cell_config(cell: dict, idx: int, base_seed: int, n_steps: int, out_dir: Path) -> PipelineConfig:
+def cell_config(cell: dict, idx: int, base_seed: int, n_steps: int, out_dir: Path,
+                flow: bool = False, flow_duration: float = 0.0) -> PipelineConfig:
     scen = cell["scenario"]
     attack_types = tuple(ATTACK_TYPES) if scen == "ALL" else (scen,)
-    return PipelineConfig(
+    kw = dict(
         seed=(base_seed + idx * 100003) % 2_000_000_000,
         n_vehicles=cell["n_vehicles"], n_steps=n_steps,
         attacker_pct=cell["attacker_pct"], attack_types=attack_types,
@@ -87,6 +88,12 @@ def cell_config(cell: dict, idx: int, base_seed: int, n_steps: int, out_dir: Pat
         rotate_period_s=cell["rotate_period_s"],
         collude_pct=cell["collude_pct"], victim_pct=0.12,
         out_dir=str(out_dir))
+    if flow:
+        # each domain is a long routed simulation with car-following + a demand profile
+        kw.update(traffic_flow=True, road_network="grid", car_following=True,
+                  duration_s=flow_duration, arrival_rate=2.0, grid_w=6, grid_h=6,
+                  grid_block_m=140.0, demand_profile=cell.get("demand", "uniform"))
+    return PipelineConfig(**kw)
 
 
 def _append(df: pd.DataFrame, idx: int, path: Path, header_written: set) -> int:
@@ -117,10 +124,15 @@ def main(argv=None) -> int:
     ap.add_argument("--sample", action="store_true", help="if capped, randomly sample cells instead of taking the first")
     ap.add_argument("--keep-domains", action="store_true", help="keep each per-domain dir (default: delete after merge)")
     ap.add_argument("--parquet", action="store_true", help="also write merged parquet (memory-heavy at scale)")
+    ap.add_argument("--flow", action="store_true", help="each domain is a long routed flow simulation")
+    ap.add_argument("--flow-duration", type=float, default=300.0, help="flow: seconds per domain")
     ap.add_argument("--out", default=str(REPO / "datasets" / "massive"))
     a = ap.parse_args(argv)
 
-    grid = GRIDS[a.grid]
+    grid = dict(GRIDS[a.grid])
+    if a.flow:
+        # a demand profile becomes another permutation axis; n_vehicles is irrelevant under flow
+        grid = {**grid, "demand": ["uniform", "rush", "night"], "n_vehicles": [0]}
     cells = enumerate_cells(grid)
     total = len(cells)
     dropped = 0
@@ -145,7 +157,7 @@ def main(argv=None) -> int:
     catalog, row_counts = [], {t: 0 for t in TABLES}
     for idx, cell in enumerate(cells):
         dom_dir = base / "domains" / f"d{idx:04d}"
-        cfg = cell_config(cell, idx, a.seed, a.steps, dom_dir)
+        cfg = cell_config(cell, idx, a.seed, a.steps, dom_dir, flow=a.flow, flow_duration=a.flow_duration)
         res = run_pipeline(cfg)
         featmod.build(str(dom_dir), split_seed=1234)
         for tbl in TABLES:

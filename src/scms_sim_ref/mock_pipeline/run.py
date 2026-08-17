@@ -56,8 +56,9 @@ ATTACK_CATALOG = (
 )
 WEATHER_MULT = {"clear": 1.0, "rain": 1.5, "fog": 2.0, "snow": 2.5}
 WEATHER_RADIO_LOSS = {"clear": 0.0, "rain": 0.03, "fog": 0.02, "snow": 0.06}
-_SYBIL_MIN = 4        # distinct certs co-located in one cell before sybilCoLocation fires
-_CELL_M = 5.0         # spatial cell size for co-location
+_SYBIL_MIN = 4        # distinct certs at NEARLY the same point before sybilCoLocation fires
+_CELL_M = 3.0         # co-location cell: small enough that a bumper-to-bumper queue (~7 m spacing)
+                      # never fills it, but tightly co-located Sybil ghosts (spoofing one point) do
 
 
 # --------------------------------------------------------------------------- #
@@ -133,6 +134,16 @@ class PipelineConfig:
     grid_block_m: float = 120.0
     trip_speed_min: float = 8.0
     trip_speed_max: float = 18.0
+    # car-following (IDM) -> queues, stop-and-go, congestion (flow + grid only)
+    car_following: bool = True
+    idm_accel: float = 1.5               # max acceleration (m/s^2)
+    idm_decel: float = 2.0               # comfortable deceleration (m/s^2)
+    idm_time_headway: float = 1.3        # desired time gap to leader (s)
+    idm_min_gap: float = 2.5             # jam distance (m)
+    veh_length_m: float = 5.0
+    idm_lookahead_m: float = 70.0        # leader search distance ahead
+    # time-varying demand (rush hour / night) + origin-destination bias
+    demand_profile: str = "uniform"      # "uniform" | "rush" | "night"
     attack_delay_s: float = 2.0          # flow: an attacker starts falsifying this long after spawn
     state_prune_every: int = 50          # flow: steps between detection-state LRU prunes
     state_prune_ttl: int = 20            # flow: evict detection state untouched this many steps
@@ -233,6 +244,13 @@ class Vehicle:
     trip: object = None                    # roads.Trip when road_network="grid"
     attack_from: float = 0.0
     attack_to: float = 0.0
+    # car-following kinematic state (integrated each step when cf=True)
+    cf: bool = False
+    s_pos: float = 0.0                     # arc-length travelled along the route
+    cur_v: float = 0.0                     # current speed
+    cur_x: float = 0.0
+    cur_y: float = 0.0
+    cur_h: float = 0.0
     # mutable per-run state
     bias_x: float = 0.0
     bias_y: float = 0.0
@@ -251,6 +269,8 @@ class Vehicle:
 
     def true_state(self, t: float) -> tuple[float, float, float, float]:
         """True (x, y, speed, heading[deg]) at time t."""
+        if self.cf:                       # car-following: kinematics integrated in the loop
+            return self.cur_x, self.cur_y, self.cur_v, self.cur_h
         if self.trip is not None:
             return self.trip.state(t)
         # straight heading + gentle lane wander, on the vehicle's own clock
@@ -321,9 +341,15 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             atk_counter["n"] += 1
         else:
             atype = "none"
-        finish_time = (trip.t1 if trip is not None
-                       else (spawn_time + life_hint if cfg.traffic_flow else None))
-        life = life_hint if finish_time is None else max(cfg.dt, finish_time - spawn_time)
+        cf = bool(cfg.traffic_flow and cfg.car_following and trip is not None)
+        if cf:
+            # car-following: arrival time is dynamic (congestion) -> despawn on route completion.
+            finish_time = None
+            life = 2.0 * trip.length / max(1.0, cfg.trip_speed_min)   # generous upper bound
+        else:
+            finish_time = (trip.t1 if trip is not None
+                           else (spawn_time + life_hint if cfg.traffic_flow else None))
+            life = life_hint if finish_time is None else max(cfg.dt, finish_time - spawn_time)
         n_rot = 1 if cfg.rotate_period_s <= 0 else max(1, math.ceil(life / cfg.rotate_period_s))
         pseudonyms = []
         for k in range(n_rot):
@@ -349,8 +375,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             phase=vr.random() * 6.283, gps_q=0.5 + vr.expovariate(1.2),
             is_faulty=is_flt, attack_type=atype, pseudonyms=pseudonyms, colluder=is_coll,
             spawn_time=spawn_time, finish_time=finish_time, trip=trip)
+        if cf:
+            v.cf = True
+            v.cur_v = speed
+            v.cur_x, v.cur_y, v.cur_h = trip.at_distance(0.0)
         v.attack_from = (spawn_time + cfg.attack_delay_s) if cfg.traffic_flow else cfg.attack_start
-        v.attack_to = finish_time if (cfg.traffic_flow and finish_time is not None) else cfg.attack_end
+        v.attack_to = (spawn_time + life) if cfg.traffic_flow else cfg.attack_end
         if is_att and atype == "Sybil":
             for g in range(cfg.sybil_ghosts):
                 gj = (cfg.jmax - 1 - g) % cfg.jmax
@@ -374,17 +404,33 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # ---- FLOW: vehicles arrive over time and despawn at trip end (steady-state population) ----
         n_steps = int(round((cfg.duration_s if cfg.duration_s > 0 else total_time) / cfg.dt))
         total_time = n_steps * cfg.dt
+
+        def demand_mult(frac):    # time-of-day arrival-rate multiplier in (0, 1]
+            if cfg.demand_profile == "rush":     # morning + evening peaks, quiet midday/edges
+                peak = math.exp(-((frac - 0.25) / 0.09) ** 2) + math.exp(-((frac - 0.75) / 0.09) ** 2)
+                return 0.2 + 0.8 * min(1.0, peak)
+            if cfg.demand_profile == "night":    # sparse throughout, gently ramping
+                return 0.15 + 0.25 * frac
+            return 1.0                            # uniform
+
+        center = (net.w // 2, net.h // 2) if net is not None else None
         rrng = random.Random(f"{cfg.seed}:flow")
         vid, tt = 0, 0.0
-        while True:
+        while True:                              # thinning: candidates at max rate, kept per demand
             tt += rrng.expovariate(cfg.arrival_rate) if cfg.arrival_rate > 0 else total_time
             if tt >= total_time:
                 break
+            frac = tt / total_time
+            if rrng.random() > demand_mult(frac):
+                continue                          # thinned out (off-peak)
             is_att = rrng.random() < cfg.attacker_pct
             is_flt = (not is_att) and rrng.random() < cfg.faulty_pct
             is_coll = is_att and rrng.random() < cfg.collude_pct
             spd = cfg.trip_speed_min + rrng.random() * (cfg.trip_speed_max - cfg.trip_speed_min)
-            trip = net.random_trip(rrng, spd, tt) if net is not None else None
+            # OD bias: during a rush peak, most trips head to the centre (commute-to-core)
+            dest = center if (net is not None and cfg.demand_profile == "rush"
+                              and rrng.random() < demand_mult(frac) - 0.2) else None
+            trip = net.random_trip(rrng, spd, tt, dest_hint=dest) if net is not None else None
             make_vehicle(vid, tt, is_att, is_flt, is_coll, trip, life_hint=90.0)
             vid += 1
     else:
@@ -511,14 +557,13 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         dtt = max(1e-6, t - pt)
         disp = math.hypot(cx - px, cy - py)
         tol = max(conf, 0.5 * cfg.consistency_threshold_m)     # uncertainty scale
-        det["positionSpeedInconsistency"] = abs(disp - cs * dtt) / (Z * tol)
-        det["positionJump"] = disp / (cs * dtt + Z * tol + cfg.consistency_threshold_m)
+        avg_v = 0.5 * (cs + ps)                                # avg over the interval (accel/decel-safe)
+        jerk_slack = 0.3 * abs(cs - ps) * dtt                  # extra tolerance for stop-and-go jerk
+        det["positionSpeedInconsistency"] = max(0.0, abs(disp - avg_v * dtt) - jerk_slack) / (Z * tol)
+        det["positionJump"] = disp / (avg_v * dtt + Z * tol + cfg.consistency_threshold_m)
         det["implausibleAcceleration"] = (abs(cs - ps) / dtt) / cfg.max_accel_mps2
-        # heading is only trustworthy when the displacement dominates position noise -- otherwise the
-        # bearing between two noisy fixes is ill-defined (a false-positive source for noisy/faulty GNSS)
-        if disp > max(5.0, 2.5 * conf):
-            bearing = math.degrees(math.atan2(cy - py, cx - px)) % 360.0
-            det["headingInconsistency"] = _ang_diff(ch, bearing) / cfg.heading_threshold_deg
+        # headingInconsistency is computed in the loop over a SHORT (one-step) baseline, not this
+        # lagged reference -- a 1.5 s baseline spans road turns and reads them as heading lies.
         if cx == px and cy == py and cs > 0.5:
             det["constantPositionFrozen"] = 1.5
             det["staleOrReplay"] = 1.2
@@ -643,7 +688,57 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         for d in [d for d in subj_events if pseudonym_info[d]["veh_vid"] not in active]:
             subj_events.pop(d, None)
 
-    # ---- Simulation loop: activate -> pre-pass -> detect -> collude -> revoke -> despawn ----
+    # car-following: the Intelligent Driver Model gives realistic accel/decel, so vehicles queue and
+    # experience stop-and-go behind slower leaders -> genuine congestion the detectors must tolerate.
+    cf_active = bool(cfg.traffic_flow and cfg.car_following and net is not None)
+    _CF_CELL = max(cfg.idm_lookahead_m, 30.0)
+
+    def _idm_accel(v_cur, v0, gap, v_lead):
+        if gap == math.inf:
+            a = cfg.idm_accel * (1 - (v_cur / max(0.1, v0)) ** 4)
+        else:
+            gap_b = max(0.5, gap - cfg.veh_length_m)
+            dv = v_cur - v_lead
+            s_star = cfg.idm_min_gap + max(0.0, v_cur * cfg.idm_time_headway
+                                           + v_cur * dv / (2 * math.sqrt(cfg.idm_accel * cfg.idm_decel)))
+            a = cfg.idm_accel * (1 - (v_cur / max(0.1, v0)) ** 4 - (s_star / gap_b) ** 2)
+        return max(-6.0, min(cfg.idm_accel, a))
+
+    def car_follow(active_list, t):
+        # snapshot start-of-step positions so the update is order-independent (deterministic)
+        snap = {v.vid: (v.cur_x, v.cur_y, v.cur_h, v.cur_v) for v in active_list}
+        buckets: dict = {}
+        for v in active_list:
+            buckets.setdefault((int(v.cur_x // _CF_CELL), int(v.cur_y // _CF_CELL)), []).append(v.vid)
+        for v in active_list:
+            vx, vy, vh, _vv = snap[v.vid]
+            hr = math.radians(vh)
+            cosh, sinh = math.cos(hr), math.sin(hr)
+            cx0, cy0 = int(vx // _CF_CELL), int(vy // _CF_CELL)
+            best_gap, best_v = math.inf, 0.0
+            for dcx in (-1, 0, 1):
+                for dcy in (-1, 0, 1):
+                    for wvid in buckets.get((cx0 + dcx, cy0 + dcy), ()):
+                        if wvid == v.vid:
+                            continue
+                        wx, wy, wh, wv = snap[wvid]
+                        dx, dy = wx - vx, wy - vy
+                        fwd = dx * cosh + dy * sinh
+                        if fwd <= 0.0 or fwd > cfg.idm_lookahead_m:
+                            continue
+                        if abs(-dx * sinh + dy * cosh) > 3.0 or _ang_diff(wh, vh) > 45.0:
+                            continue
+                        if fwd < best_gap:
+                            best_gap, best_v = fwd, wv
+            a = _idm_accel(v.cur_v, v.trip.speed, best_gap, best_v)
+            v.cur_v = max(0.0, min(v.trip.speed, v.cur_v + a * cfg.dt))
+            v.s_pos += v.cur_v * cfg.dt
+            if v.s_pos >= v.trip.length:
+                v.s_pos = v.trip.length
+                v.finish_time = t          # route complete -> despawn next step
+            v.cur_x, v.cur_y, v.cur_h = v.trip.at_distance(v.s_pos)
+
+    # ---- Simulation loop: activate -> car-follow -> pre-pass -> detect -> collude -> revoke ----
     spawn_order = sorted(vehicles, key=lambda v: (v.spawn_time, v.vid))
     spawn_ptr = 0
     active: dict[int, Vehicle] = {}
@@ -655,6 +750,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         for vid in [vid for vid, v in active.items() if v.finish_time is not None and t > v.finish_time]:
             active.pop(vid).hist.clear()
         active_list = [active[vid] for vid in sorted(active)]
+        if cf_active:
+            car_follow(active_list, t)
 
         # PRE-PASS: every active broadcast this step (real pseudonyms + sybil ghosts)
         broadcasts: list[dict] = []
@@ -689,8 +786,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 for gdig in tx.ghosts:
                     cert_first_seen.setdefault(gdig, t)
                     cert_last_seen[gdig] = t
-                    broadcasts.append(dict(veh=tx, digest=gdig, cx=cx + sr.uniform(-2, 2),
-                                           cy=cy + sr.uniform(-2, 2), cs=cs, ch=ch, conf=conf,
+                    broadcasts.append(dict(veh=tx, digest=gdig, cx=cx + sr.uniform(-1, 1),
+                                           cy=cy + sr.uniform(-1, 1), cs=cs, ch=ch, conf=conf,
                                            ghost=True, x=x, y=y, falsified=True, msg_count=1, cg=t))
 
         # per-message ground-truth emission sampling (real broadcasts only)
@@ -706,8 +803,11 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     pos_conf=round(b["conf"], 3), is_attacker=tx.is_attacker, is_faulty=tx.is_faulty,
                     falsified=bool(b["falsified"]), _visibility=R.ORACLE))
 
-        # sybil co-location: distinct certs sharing a spatial cell this step
-        cells = Counter((round(b["cx"] / _CELL_M), round(b["cy"] / _CELL_M)) for b in broadcasts)
+        # sybil co-location: distinct certs at nearly the same point AND heading. Keying on heading
+        # too means crossing traffic converging at an intersection (different headings) is not
+        # mistaken for a Sybil (whose ghosts copy the attacker's single position + heading).
+        cells = Counter((round(b["cx"] / _CELL_M), round(b["cy"] / _CELL_M), int(b["ch"] // 45) % 8)
+                        for b in broadcasts)
 
         # DETECTION pass (receiver-outer): a receiver only hears in-range transmitters, with
         # distance/NLOS/weather/congestion packet loss -> the report graph becomes spatially LOCAL
@@ -749,11 +849,19 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                         else:
                             break
                     det = detectors(ref, cx, cy, cs, ch, t, conf)
+                    # headingInconsistency over a ONE-STEP baseline (most recent prior fix): turns are
+                    # negligible over one step, so a moving vehicle's bearing matches its claimed heading.
+                    prev = h[-1]
+                    dprev = math.hypot(cx - prev[0], cy - prev[1])
+                    if cs > 3.0 and (t - prev[4]) <= 2.0 * cfg.dt and dprev > max(5.0, 2.5 * conf):
+                        bearing = math.degrees(math.atan2(cy - prev[1], cx - prev[0])) % 360.0
+                        det["headingInconsistency"] = _ang_diff(ch, bearing) / cfg.heading_threshold_deg
                     h.append((cx, cy, cs, ch, t))
                     while len(h) > 1 and t - h[0][4] > cfg.detector_lag_s + 2 * cfg.dt:
                         h.pop(0)
                 # radio-dependent detectors (need the receiver position + per-message metadata)
-                det["sybilCoLocation"] = cells[(round(cx / _CELL_M), round(cy / _CELL_M))] / _SYBIL_MIN
+                det["sybilCoLocation"] = cells[(round(cx / _CELL_M), round(cy / _CELL_M),
+                                                int(ch // 45) % 8)] / _SYBIL_MIN
                 det["acceptanceRangeThreshold"] = math.hypot(cx - rxx, cy - rxy) / cfg.art_max_m
                 det["beaconFrequency"] = b["msg_count"] / cfg.freq_max
                 det["staleOrReplay"] = max(det.get("staleOrReplay", 0.0), (t - b["cg"]) / cfg.stale_max_s)
@@ -970,6 +1078,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--road", default="linear", choices=["linear", "grid"], help="road network model")
     p.add_argument("--grid", type=int, default=6, help="grid road network dimension (grid x grid)")
     p.add_argument("--grid-block", type=float, default=120.0, help="grid block spacing (m)")
+    p.add_argument("--demand", default="uniform", choices=["uniform", "rush", "night"],
+                   help="time-varying arrival-demand profile")
+    p.add_argument("--no-car-following", action="store_true", help="disable IDM car-following")
     p.add_argument("--out", default="datasets/poc_run")
     args = p.parse_args(argv)
     cfg = PipelineConfig(seed=args.seed, n_vehicles=args.vehicles, n_steps=args.steps,
@@ -982,6 +1093,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                          traffic_flow=args.flow, duration_s=args.duration, arrival_rate=args.arrival_rate,
                          road_network=("grid" if (args.flow and args.road == "linear") else args.road),
                          grid_w=args.grid, grid_h=args.grid, grid_block_m=args.grid_block,
+                         demand_profile=args.demand, car_following=not args.no_car_following,
                          out_dir=args.out)
     res = run_pipeline(cfg)
     print(f"vehicles={res.n_vehicles} reports={res.n_reports} "
