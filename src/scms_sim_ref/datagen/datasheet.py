@@ -47,6 +47,7 @@ def build(dataset_dir: str) -> str:
     rlbl = _jsonl(os.path.join(gt, "gt_report_labels.jsonl"))
     atk = _jsonl(os.path.join(gt, "gt_attacks.jsonl"))
     emit = _jsonl(os.path.join(gt, "gt_emissions_sample.jsonl"))
+    cst = _jsonl(os.path.join(ma, "ma_cert_status.jsonl"))
 
     n_veh = len(veh)
     n_att = sum(bool(v.get("is_attacker")) for v in veh)
@@ -101,7 +102,38 @@ def build(dataset_dir: str) -> str:
     L.append(f"- Attack base behaviours present: **{len(atk_bases)}**; concrete variants: **{len(atk_types)}**")
     if atk_bases:
         L.append("- Attack mix (by base): " + ", ".join(f"{k} {v}" for k, v in atk_bases.most_common(12)))
+    from .featurize import _ATTACK_FAMILY
+    fam_mix = collections.Counter(_ATTACK_FAMILY.get(b, "other") for b in
+                                  (str(a.get("attack_type", "")).split("/")[0] for a in atk))
+    if fam_mix:
+        L.append("- Attack mix (by family): " + ", ".join(f"{k} {v}" for k, v in fam_mix.most_common()))
+    fleet_mix = collections.Counter(v.get("veh_type", "car") for v in veh)
+    if len(fleet_mix) > 1:
+        L.append("- Fleet composition: " + ", ".join(f"{k} {v}" for k, v in fleet_mix.most_common()))
     L.append("")
+
+    # --- traffic flow & congestion (present for flow-mode / routed runs) ---
+    is_flow = bool(cfg.get("traffic_flow")) or (len({round(v.get("spawn_time", 0.0), 1) for v in veh}) > 3)
+    if is_flow and cst:
+        ev = sorted([(c["first_seen"], 1) for c in cst if "first_seen" in c]
+                    + [(c.get("last_seen", c.get("first_seen", 0)), -1) for c in cst])
+        cur = peak = 0
+        for _t, d in ev:
+            cur += d
+            peak = max(peak, cur)
+        spawns = sorted(v.get("spawn_time", 0.0) for v in veh)
+        span = (spawns[-1] - spawns[0]) if len(spawns) > 1 else 0.0
+        benign_sp = [float(e.get("claimed_speed", 0) or 0) for e in emit if not e.get("is_attacker")]
+        L.append("## Traffic flow & congestion")
+        L.append(f"- Total vehicles over the run: **{n_veh}**; peak concurrent (approx): **{peak}** "
+                 f"(steady-state turnover)")
+        if span > 0:
+            L.append(f"- Arrivals span {span:.0f} s ({n_veh / max(1.0, span):.2f} vehicles/s mean)")
+        if benign_sp:
+            slowed = sum(1 for s in benign_sp if s < 5.0) / len(benign_sp)
+            L.append(f"- Benign speed (m/s): {_stats(benign_sp)}; queued (<5 m/s): {100 * slowed:.0f}% "
+                     f"(car-following congestion)")
+        L.append("")
 
     L.append("## Feature distributions (MA-visible)")
     L.append(f"- Detector score: {_stats(scores)}")
