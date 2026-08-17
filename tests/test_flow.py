@@ -1,5 +1,6 @@
 """Tests for long-running traffic-flow mode: spawn/despawn, routed trips, streaming, determinism."""
 
+import collections
 import json
 
 from scms_sim_ref.datagen import validate as V
