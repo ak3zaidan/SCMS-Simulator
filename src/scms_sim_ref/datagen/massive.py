@@ -92,7 +92,7 @@ def cell_config(cell: dict, idx: int, base_seed: int, n_steps: int, out_dir: Pat
         # each domain is a long routed simulation with car-following + a demand profile, and
         # (as permutation axes) signalized/unsignalized intersections and mixed/car fleets
         kw.update(traffic_flow=True, road_network="grid", car_following=True,
-                  duration_s=flow_duration, arrival_rate=2.0, grid_w=6, grid_h=6,
+                  duration_s=flow_duration, arrival_rate=2.0, grid_w=6, grid_h=6, n_lanes=2,
                   grid_block_m=140.0, demand_profile=cell.get("demand", "uniform"),
                   traffic_lights=bool(cell.get("lights", False)), fleet=cell.get("fleet", "mixed"),
                   attack_intensity=cell.get("intensity", 1.0))
