@@ -130,6 +130,22 @@ def test_map_offroad_detector_catches_position_offsets(tmp_path):
     assert s["recall"] is not None and s["recall"] >= 0.6, s   # was ~0 before the map detector
 
 
+def test_multilane_reduces_gridlock(tmp_path):
+    """At high density, parallel lanes let faster vehicles overtake slow ones -> higher mean speed
+    than a single-lane road (which serializes behind the slowest vehicle)."""
+    import statistics
+
+    def mean_speed(lanes):
+        _flow(tmp_path / str(lanes), n_lanes=lanes, car_following=True, arrival_rate=5.0,
+              duration_s=150.0, grid_w=5, grid_h=5, grid_block_m=120.0, attacker_pct=0.1,
+              radio_range_m=200.0)
+        em = _jsonl(tmp_path / str(lanes) / "run" / "ground_truth" / "gt_emissions_sample.jsonl")
+        sp = [e["claimed_speed"] for e in em if not e["is_attacker"]]
+        return statistics.mean(sp) if sp else 0.0
+
+    assert mean_speed(3) > mean_speed(1) + 1.0, "multi-lane should relieve single-lane gridlock"
+
+
 def test_traffic_lights_create_stops_at_intersections(tmp_path):
     """Signalized intersections make vehicles fully stop at reds (queues), unlike free-flow."""
     def stopped_fraction(lights):

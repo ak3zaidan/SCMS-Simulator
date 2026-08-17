@@ -157,6 +157,8 @@ class PipelineConfig:
     grid_w: int = 6
     grid_h: int = 6
     grid_block_m: float = 120.0
+    n_lanes: int = 1                     # >1: parallel lanes per road -> overtaking, less gridlock
+    lane_width_m: float = 3.5
     trip_speed_min: float = 8.0
     trip_speed_max: float = 18.0
     fleet: str = "mixed"                 # "mixed" (car/moto/truck/bus) | a single type name
@@ -283,6 +285,7 @@ class Vehicle:
     desired_speed: float = 0.0            # free-flow target (car-following cap)
     # car-following kinematic state (integrated each step when cf=True)
     cf: bool = False
+    lane_off: float = 0.0                  # perpendicular lane offset (multi-lane roads)
     s_pos: float = 0.0                     # arc-length travelled along the route
     cur_v: float = 0.0                     # current speed
     cur_x: float = 0.0
@@ -460,10 +463,16 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             spawn_time=spawn_time, finish_time=finish_time, trip=trip)
         v.veh_type, v.veh_length = vtype, tp["length"]
         v.idm_a, v.idm_b, v.desired_speed = tp["accel"], tp["decel"], speed
+        if cfg.n_lanes > 1:
+            v.lane_off = (vr.randrange(cfg.n_lanes) - (cfg.n_lanes - 1) / 2.0) * cfg.lane_width_m
         if cf:
             v.cf = True
             v.cur_v = speed
             v.cur_x, v.cur_y, v.cur_h = trip.at_distance(0.0)
+            if v.lane_off:
+                hr = math.radians(v.cur_h)
+                v.cur_x += v.lane_off * -math.sin(hr)
+                v.cur_y += v.lane_off * math.cos(hr)
         v.attack_from = (spawn_time + cfg.attack_delay_s) if cfg.traffic_flow else cfg.attack_start
         v.attack_to = (spawn_time + life) if cfg.traffic_flow else cfg.attack_end
         if is_att and atype == "Sybil":
@@ -889,6 +898,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 v.s_pos = v.trip.length
                 v.finish_time = t          # route complete -> despawn next step
             v.cur_x, v.cur_y, v.cur_h = v.trip.at_distance(v.s_pos)
+            if v.lane_off:                 # offset into this vehicle's lane (perpendicular to heading)
+                hr = math.radians(v.cur_h)
+                v.cur_x += v.lane_off * -math.sin(hr)
+                v.cur_y += v.lane_off * math.cos(hr)
 
     # ---- Simulation loop: activate -> car-follow -> pre-pass -> detect -> collude -> revoke ----
     spawn_order = sorted(vehicles, key=lambda v: (v.spawn_time, v.vid))
@@ -1303,6 +1316,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--road", default="linear", choices=["linear", "grid"], help="road network model")
     p.add_argument("--grid", type=int, default=6, help="grid road network dimension (grid x grid)")
     p.add_argument("--grid-block", type=float, default=120.0, help="grid block spacing (m)")
+    p.add_argument("--lanes", type=int, default=1, help="parallel lanes per road (overtaking; reduces gridlock)")
     p.add_argument("--demand", default="uniform", choices=["uniform", "rush", "night"],
                    help="time-varying arrival-demand profile")
     p.add_argument("--fleet", default="mixed", help="'mixed' or a single vehicle class (car/truck/bus/motorcycle)")
@@ -1326,6 +1340,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                          traffic_flow=args.flow, duration_s=args.duration, arrival_rate=args.arrival_rate,
                          road_network=("grid" if (args.flow and args.road == "linear") else args.road),
                          grid_w=args.grid, grid_h=(args.grid_h or args.grid), grid_block_m=args.grid_block,
+                         n_lanes=args.lanes,
                          demand_profile=args.demand, car_following=not args.no_car_following,
                          fleet=args.fleet, live_interval_s=args.live_interval,
                          traffic_lights=args.traffic_lights, gps_jam_rate=args.gps_jam_rate,
