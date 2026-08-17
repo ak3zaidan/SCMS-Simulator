@@ -55,8 +55,9 @@ ATTACK_CATALOG = (
     "DoS", "DelayedMessages", "InvalidSignature", "ExpiredCert", "NotYetValid",
     "OutOfOrder", "DoSRandom",
 )
-WEATHER_MULT = {"clear": 1.0, "rain": 1.5, "fog": 2.0, "snow": 2.5}
+WEATHER_MULT = {"clear": 1.0, "rain": 1.5, "fog": 2.0, "snow": 2.5}        # GNSS error multiplier
 WEATHER_RADIO_LOSS = {"clear": 0.0, "rain": 0.03, "fog": 0.02, "snow": 0.06}
+WEATHER_SPEED_MULT = {"clear": 1.0, "rain": 0.85, "fog": 0.75, "snow": 0.6}  # drivers slow in bad weather
 # Heterogeneous fleet: distinct length + kinematics per class (trucks/buses slower & sluggish, motos
 # nimble). Weights are the "mixed" fleet composition; "car" fleet is homogeneous.
 VEHICLE_TYPES = {
@@ -441,7 +442,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         base_speed = trip.speed if trip is not None else cfg.nominal_speed * (0.85 + 0.3 * vr.random())
         vtype = _pick_vehicle_type(vr, cfg.fleet)
         tp = VEHICLE_TYPES[vtype]
-        speed = base_speed * tp["speed_mult"]
+        speed = base_speed * tp["speed_mult"] * WEATHER_SPEED_MULT.get(cfg.weather, 1.0)
         v = Vehicle(
             vid=vid, spawn_x=float(vid * 20), lane_y=float(vid % 4) * 4.0, speed=speed,
             is_attacker=is_att, priv=None, pub=b"", cert_digest=p0["digest"],
