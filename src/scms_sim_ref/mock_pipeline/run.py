@@ -98,6 +98,7 @@ class PipelineConfig:
     attack_types: tuple[str, ...] = ATTACK_CATALOG
     attack_start: float = 5.0
     attack_end: float = 60.0
+    attack_intensity: float = 1.0        # scales falsification magnitudes (subtle <1 .. blatant >1)
     # --- GNSS / sensor realism ---
     gps_sigma_m: float = 1.2             # white per-axis noise (× per-vehicle quality × weather)
     gps_bias_sigma_m: float = 1.5        # OU-correlated slow bias amplitude
@@ -593,22 +594,23 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         """Falsified claim for an active attacker; returns (cx, cy, cspeed, cheading)."""
         r = vrng[v.vid]
         typ = v.attack_type
+        k = cfg.attack_intensity                             # scales falsification magnitude
         cx, cy, cs, ch = mx, my, mspeed, mheading
         if typ == "ConstPos":
             if v.frozen is None:
                 v.frozen = (mx, my)
             cx, cy = v.frozen
         elif typ == "ConstPosOffset":
-            cx, cy = mx + 25.0, my + 25.0
+            cx, cy = mx + 25.0 * k, my + 25.0 * k
         elif typ == "RandomPos":
-            cx, cy = mx + r.uniform(-60, 60), my + r.uniform(-60, 60)
+            cx, cy = mx + r.uniform(-60, 60) * k, my + r.uniform(-60, 60) * k
         elif typ == "Teleport":
             if int(t) % 4 == 0:
-                cx, cy = mx + 150.0, my + 80.0
+                cx, cy = mx + 150.0 * k, my + 80.0 * k
         elif typ == "SineWavePos":
-            cx, cy = mx, my + 20.0 * math.sin(0.6 * t)
+            cx, cy = mx, my + 20.0 * k * math.sin(0.6 * t)
         elif typ == "ConstSpeedOffset":
-            cs = mspeed + 12.0
+            cs = mspeed + 12.0 * k
         elif typ == "RandomSpeed":
             cs = r.uniform(0, 40)
         elif typ == "StopAndGo":
@@ -616,21 +618,21 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         elif typ == "ReversedHeading":
             ch = (mheading + 180.0) % 360.0
         elif typ == "HeadingOffset":
-            ch = (mheading + 45.0) % 360.0
+            ch = (mheading + 45.0 * k) % 360.0
         elif typ == "DataReplay":
             if len(v.hist) >= 5:
                 cx, cy, cs, ch = v.hist[-5]
         elif typ == "SlowDrift":
             # position drift whose rate ramps up: stealthy at onset (evades), but the growing
             # velocity discrepancy eventually crosses the plausibility threshold (high-latency catch).
-            v.drift_rate = min(5.0, v.drift_rate + 0.10)
+            v.drift_rate = min(5.0, v.drift_rate + 0.10 * k)
             v.drift += v.drift_rate * cfg.dt
             cx, cy = mx + v.drift, my
         elif typ == "AlongRoadOffset":
             hr = math.radians(mheading)
-            cx, cy = mx + 30.0 * math.cos(hr), my + 30.0 * math.sin(hr)
+            cx, cy = mx + 30.0 * k * math.cos(hr), my + 30.0 * k * math.sin(hr)
         elif typ == "DoSRandom":                             # flood with random content
-            cx, cy = mx + r.uniform(-60, 60), my + r.uniform(-60, 60)
+            cx, cy = mx + r.uniform(-60, 60) * k, my + r.uniform(-60, 60) * k
         return cx, cy, cs, ch
 
     Z = 3.0                     # residual must exceed ~3x the broadcast uncertainty to count
@@ -1278,6 +1280,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--vehicles", type=int, default=12)
     p.add_argument("--steps", type=int, default=40)
     p.add_argument("--attacker-pct", type=float, default=0.0)
+    p.add_argument("--attack-intensity", type=float, default=1.0, help="scale falsification magnitude (subtle<1)")
     p.add_argument("--faulty-pct", type=float, default=0.05)
     p.add_argument("--weather", default="clear", choices=list(WEATHER_MULT))
     p.add_argument("--rotate-period", type=float, default=0.0, help="pseudonym rotation period (s); 0=off")
@@ -1307,7 +1310,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--out", default="datasets/poc_run")
     args = p.parse_args(argv)
     cfg = PipelineConfig(seed=args.seed, n_vehicles=args.vehicles, n_steps=args.steps,
-                         attacker_pct=args.attacker_pct, faulty_pct=args.faulty_pct,
+                         attacker_pct=args.attacker_pct, attack_intensity=args.attack_intensity,
+                         faulty_pct=args.faulty_pct,
                          weather=args.weather, rotate_period_s=args.rotate_period,
                          collude_pct=args.collude_pct, victim_pct=args.victim_pct,
                          sybil_ghosts=args.sybil_ghosts, ma_defense=not args.no_ma_defense,

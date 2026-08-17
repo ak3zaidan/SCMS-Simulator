@@ -95,6 +95,22 @@ def test_expired_and_not_yet_valid_certs_are_caught(tmp_path):
         assert rev and all(r["should_have_been_revoked"] for r in rev), atk
 
 
+def test_attack_intensity_controls_difficulty(tmp_path):
+    """Lower attack_intensity -> subtler falsification -> harder to catch (lower recall)."""
+    from scms_sim_ref.datagen import validate as V
+
+    def recall(k):
+        out = str(tmp_path / f"i{k}")
+        run_pipeline(PipelineConfig(out_dir=out, traffic_flow=True, road_network="grid",
+                                    car_following=True, duration_s=160.0, arrival_rate=2.5, grid_w=6,
+                                    grid_h=6, attacker_pct=0.2, attack_type="ConstPosOffset",
+                                    attack_types=("ConstPosOffset",), attack_intensity=k,
+                                    faulty_pct=0.0, radio_range_m=250.0, seed=6))
+        return V.validate(out)[0]["recall"]
+
+    assert recall(0.3) < recall(1.5), "subtle attacks must be harder to detect than blatant ones"
+
+
 def test_advanced_run_is_deterministic_and_leakage_free(tmp_path):
     kw = dict(seed=9, n_vehicles=50, n_steps=90, attacker_pct=0.2, rotate_period_s=40.0,
               collude_pct=0.5, victim_pct=0.1, faulty_pct=0.05)
