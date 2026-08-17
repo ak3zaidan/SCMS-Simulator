@@ -81,6 +81,20 @@ def test_invalid_signature_attack_is_caught_by_signature_verification(tmp_path):
     assert all(r["should_have_been_revoked"] for r in rev), "no benign should be revoked here"
 
 
+def test_expired_and_not_yet_valid_certs_are_caught(tmp_path):
+    """Using a cert outside its validity window must trip the certValidity detector."""
+    for atk in ("ExpiredCert", "NotYetValid"):
+        out = str(tmp_path / atk)
+        run_pipeline(PipelineConfig(out_dir=out, n_vehicles=36, n_steps=60, attacker_ids=(5, 11),
+                                    attack_type=atk, attack_types=(atk,), faulty_pct=0.0, seed=4))
+        reasons = collections.Counter()
+        for ln in open(out + "/ma/ma_reports.jsonl", encoding="utf-8"):
+            reasons.update(json.loads(ln).get("reason_codes", []))
+        assert reasons["certValidity"] > 0, f"{atk} should trigger certValidity"
+        rev = _jsonl(tmp_path / atk / "ground_truth" / "gt_linkage_revocation.jsonl")
+        assert rev and all(r["should_have_been_revoked"] for r in rev), atk
+
+
 def test_advanced_run_is_deterministic_and_leakage_free(tmp_path):
     kw = dict(seed=9, n_vehicles=50, n_steps=90, attacker_pct=0.2, rotate_period_s=40.0,
               collude_pct=0.5, victim_pct=0.1, faulty_pct=0.05)

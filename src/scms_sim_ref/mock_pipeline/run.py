@@ -52,7 +52,7 @@ ATTACK_CATALOG = (
     "ConstSpeedOffset", "RandomSpeed", "StopAndGo",
     "ReversedHeading", "HeadingOffset", "DataReplay",
     "SlowDrift", "AlongRoadOffset", "Sybil",
-    "DoS", "DelayedMessages", "InvalidSignature",
+    "DoS", "DelayedMessages", "InvalidSignature", "ExpiredCert", "NotYetValid",
 )
 WEATHER_MULT = {"clear": 1.0, "rain": 1.5, "fog": 2.0, "snow": 2.5}
 WEATHER_RADIO_LOSS = {"clear": 0.0, "rain": 0.03, "fog": 0.02, "snow": 0.06}
@@ -572,7 +572,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     DET_KEYS = ("positionSpeedInconsistency", "positionJump", "headingInconsistency",
                 "staleOrReplay", "constantPositionFrozen", "implausibleAcceleration",
                 "sybilCoLocation", "acceptanceRangeThreshold", "beaconFrequency",
-                "signatureVerification")
+                "signatureVerification", "certValidity")
     MOTION_KEYS = ("positionSpeedInconsistency", "positionJump", "headingInconsistency",
                    "constantPositionFrozen", "implausibleAcceleration")
     touched_subjects: set[str] = set()
@@ -767,6 +767,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             mx, my, conf = measure(tx, x, y, t)
             attacking = tx.is_attacker and tx.attack_from <= t <= tx.attack_to
             msg_count, cg, sig_ok = 1, t, True                    # CAMs; claimed gen time; signature ok
+            cvf, cvt = ps["valid_from"], ps["valid_to"]           # cert validity window (MA-visible)
             if attacking:
                 cx, cy, cs, ch = attack_claim(tx, t, mx, my, tspeed, theading)
                 if tx.attack_type == "DoS":
@@ -775,17 +776,22 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     cg = t - cfg.delay_s                          # stale timestamp
                 elif tx.attack_type == "InvalidSignature":
                     sig_ok = False                                # forged / tampered message
+                elif tx.attack_type == "ExpiredCert":
+                    cvt = t - 5.0                                 # reuse a cert past its validity
+                elif tx.attack_type == "NotYetValid":
+                    cvf = t + 5.0                                 # present a not-yet-valid cert
             else:
                 cx, cy, cs, ch = mx, my, tspeed, theading
             tx.hist.append((cx, cy, cs, ch))
+            cert_bad = (t > cvt + 1.0) or (t < cvf - 1.0)
             falsified = attacking and (math.hypot(cx - mx, cy - my) > 1.0 or abs(cs - tspeed) > 1.0
                                        or _ang_diff(ch, theading) > 5.0 or msg_count > 1
-                                       or cg < t - 1e-6 or not sig_ok)
+                                       or cg < t - 1e-6 or not sig_ok or cert_bad)
             if falsified and tx.onset is None:
                 tx.onset = t
             broadcasts.append(dict(veh=tx, digest=digest, cx=cx, cy=cy, cs=cs, ch=ch, conf=conf,
                                    ghost=False, x=x, y=y, falsified=falsified, msg_count=msg_count,
-                                   cg=cg, sig_ok=sig_ok))
+                                   cg=cg, sig_ok=sig_ok, cvf=cvf, cvt=cvt))
             if attacking and tx.attack_type == "Sybil":     # fabricate co-located ghost identities
                 sr = vrng[tx.vid]
                 for gdig in tx.ghosts:
@@ -794,7 +800,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     broadcasts.append(dict(veh=tx, digest=gdig, cx=cx + sr.uniform(-1, 1),
                                            cy=cy + sr.uniform(-1, 1), cs=cs, ch=ch, conf=conf,
                                            ghost=True, x=x, y=y, falsified=True, msg_count=1,
-                                           cg=t, sig_ok=True))
+                                           cg=t, sig_ok=True, cvf=0.0, cvt=total_time))
 
         # per-message ground-truth emission sampling (real broadcasts only)
         for b in broadcasts:
@@ -891,6 +897,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 det["acceptanceRangeThreshold"] = math.hypot(cx - rxx, cy - rxy) / cfg.art_max_m
                 det["beaconFrequency"] = b["msg_count"] / cfg.freq_max
                 det["staleOrReplay"] = max(det.get("staleOrReplay", 0.0), (t - b["cg"]) / cfg.stale_max_s)
+                det["certValidity"] = 1.5 if (t > b["cvt"] + 1.0 or t < b["cvf"] - 1.0) else 0.0
                 if not b["sig_ok"]:
                     # signature fails -> the content cannot be trusted, so the plausibility detectors
                     # are moot; the receiver only reports the crypto-verification failure itself.
