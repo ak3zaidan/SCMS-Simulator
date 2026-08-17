@@ -331,10 +331,51 @@ def _ang_diff(a: float, b: float) -> float:
     return d if d <= 180.0 else 360.0 - d
 
 
+_PROB_FIELDS = ("report_prob", "attacker_pct", "faulty_pct", "collude_pct", "victim_pct",
+                "packet_loss_base", "nlos_loss", "gps_outlier_rate", "gps_degrade_rate")
+
+
+def validate_config(cfg: PipelineConfig) -> PipelineConfig:
+    """Fail fast on impossible configs and clamp fractions to [0,1]. Returns the (mutated) config.
+
+    Guards the degenerate cases an adversarial audit flagged: zero dt / IDM params (division by
+    zero), a grid too small to route on, unknown enum values. Called at the top of run_pipeline."""
+    if cfg.dt <= 0:
+        raise ValueError(f"dt must be > 0 (got {cfg.dt})")
+    if cfg.n_steps < 0:
+        raise ValueError(f"n_steps must be >= 0 (got {cfg.n_steps})")
+    if cfg.jmax < 1:
+        raise ValueError(f"jmax must be >= 1 (got {cfg.jmax})")
+    if cfg.radio_range_m <= 0:
+        raise ValueError(f"radio_range_m must be > 0 (got {cfg.radio_range_m})")
+    if cfg.idm_accel <= 0 or cfg.idm_decel <= 0:
+        raise ValueError(f"idm_accel and idm_decel must be > 0 (got {cfg.idm_accel}, {cfg.idm_decel})")
+    if cfg.weather not in WEATHER_MULT:
+        raise ValueError(f"weather must be one of {sorted(WEATHER_MULT)} (got {cfg.weather!r})")
+    if cfg.demand_profile not in ("uniform", "rush", "night"):
+        raise ValueError(f"demand_profile must be uniform|rush|night (got {cfg.demand_profile!r})")
+    if cfg.fleet != "mixed" and cfg.fleet not in VEHICLE_TYPES:
+        raise ValueError(f"fleet must be 'mixed' or one of {sorted(VEHICLE_TYPES)} (got {cfg.fleet!r})")
+    if cfg.road_network not in ("linear", "grid"):
+        raise ValueError(f"road_network must be linear|grid (got {cfg.road_network!r})")
+    if cfg.traffic_flow:
+        if cfg.arrival_rate < 0:
+            raise ValueError(f"arrival_rate must be >= 0 (got {cfg.arrival_rate})")
+        if cfg.duration_s < 0:
+            raise ValueError(f"duration_s must be >= 0 (got {cfg.duration_s})")
+        if cfg.road_network == "grid" and (cfg.grid_w < 2 or cfg.grid_h < 2):
+            raise ValueError(f"grid road network needs grid_w and grid_h >= 2 "
+                             f"(got {cfg.grid_w}x{cfg.grid_h})")
+    for name in _PROB_FIELDS:                       # clamp fractions rather than produce nonsense
+        setattr(cfg, name, min(1.0, max(0.0, float(getattr(cfg, name)))))
+    return cfg
+
+
 # --------------------------------------------------------------------------- #
 # Pipeline
 # --------------------------------------------------------------------------- #
 def run_pipeline(cfg: PipelineConfig) -> RunResult:
+    validate_config(cfg)
     rng = random.Random(cfg.seed)
     wmult = WEATHER_MULT.get(cfg.weather, 1.0)
     la1, la2 = LinkageAuthority(1), LinkageAuthority(2)
@@ -784,6 +825,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             av = spawn_order[spawn_ptr]; active[av.vid] = av; spawn_ptr += 1
         for vid in [vid for vid, v in active.items() if v.finish_time is not None and t > v.finish_time]:
             active.pop(vid).hist.clear()
+            vrng.pop(vid, None)              # a despawned vehicle never transmits again -> free its RNG
         active_list = [active[vid] for vid in sorted(active)]
         if cf_active:
             car_follow(active_list, t)
