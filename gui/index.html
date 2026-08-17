@@ -129,6 +129,7 @@
     <h2>Configuration — every simulation variable</h2>
     <div class="note">Blank numeric fields use the map's default. Traffic controls apply to the
       selected map type (flow vs route density).</div>
+    <div id="presets" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:0 14px 8px"></div>
     <div style="padding:0 14px 6px">
       <input id="cfgSearch" type="text" placeholder="🔍 filter settings by name…" autocomplete="off">
     </div>
@@ -205,17 +206,38 @@
 
 <script>
 const $=s=>document.querySelector(s);
-let SPEC=[], SCEN=[], ATTACKS=[], scenByKey={};
+let SPEC=[], SCEN=[], ATTACKS=[], scenByKey={}, PRESETS={};
 let statusTimer=null, liveTimer=null;
 
 async function boot(){
   const d=await (await fetch('/api/defaults')).json();
-  SPEC=d.spec; SCEN=d.scenarios; ATTACKS=d.attack_types;
+  SPEC=d.spec; SCEN=d.scenarios; ATTACKS=d.attack_types; PRESETS=d.presets||{};
   scenByKey=Object.fromEntries(SCEN.map(s=>[s.key,s]));
   renderForm(d.defaults);
+  renderPresets();
   $('#cfgSearch').addEventListener('input',applyFilter);
   poll();                       // pick up an already-running or finished run
   statusTimer=setInterval(poll,1500);
+}
+
+function renderPresets(){
+  const bar=$('#presets'); if(!bar) return;
+  bar.innerHTML='<span class="muted" style="font-size:11px">Presets:</span> ';
+  Object.keys(PRESETS).forEach(name=>{
+    const b=document.createElement('button'); b.textContent=name;
+    b.style.cssText='padding:4px 9px;font-size:11px;font-weight:600';
+    b.addEventListener('click',()=>applyPreset(name));
+    bar.appendChild(b);
+  });
+}
+
+function applyPreset(name){
+  const p=PRESETS[name]||{};
+  for(const [k,v] of Object.entries(p)){
+    const el=$('#f_'+k); if(!el) continue;
+    if(el.type==='checkbox') el.checked=!!v; else el.value=v;
+  }
+  syncKind();                    // re-gate fields for the (likely python-flow) generator
 }
 
 function renderForm(defaults){

@@ -118,6 +118,9 @@ CONFIG_SPEC = [
      "default": "uniform", "options": ["uniform", "rush", "night"], "gen": "python-flow", "arg": "--demand"},
     {"group": "Python flow", "name": "pf_fleet", "label": "Fleet", "type": "choice", "default": "mixed",
      "options": ["mixed", "car", "truck", "bus", "motorcycle"], "gen": "python-flow", "arg": "--fleet"},
+    {"group": "Python flow", "name": "pf_lights", "label": "Traffic lights", "type": "bool",
+     "default": False, "gen": "python-flow", "arg": "--traffic-lights",
+     "help": "signalized intersections (stops + queues)"},
     {"group": "Python flow", "name": "pf_seed", "label": "Seed", "type": "int", "default": 7,
      "gen": "python-flow", "arg": "--seed"},
 
@@ -358,6 +361,29 @@ def _defaults() -> dict:
     return {c["name"]: c["default"] for c in CONFIG_SPEC}
 
 
+# One-click Python-flow scenario presets (each patches the pf_* form fields).
+PRESETS = {
+    "Urban rush (signalized)": {
+        "generator": "python-flow", "pf_duration": 300, "pf_arrival": 3.0, "pf_grid": 6,
+        "pf_attacker": 0.15, "pf_faulty": 0.06, "pf_collude": 0.3, "pf_rotate": 60,
+        "pf_radio": 250, "pf_weather": "clear", "pf_demand": "rush", "pf_fleet": "mixed",
+        "pf_lights": True},
+    "Highway free-flow": {
+        "generator": "python-flow", "pf_duration": 300, "pf_arrival": 2.0, "pf_grid": 8,
+        "pf_attacker": 0.12, "pf_faulty": 0.05, "pf_collude": 0.0, "pf_rotate": 90,
+        "pf_radio": 400, "pf_weather": "clear", "pf_demand": "uniform", "pf_fleet": "mixed"},
+    "Sparse night (rain)": {
+        "generator": "python-flow", "pf_duration": 300, "pf_arrival": 1.0, "pf_grid": 6,
+        "pf_attacker": 0.2, "pf_faulty": 0.05, "pf_collude": 0.2, "pf_rotate": 60,
+        "pf_radio": 300, "pf_weather": "rain", "pf_demand": "night", "pf_fleet": "mixed"},
+    "Gridlock stress": {
+        "generator": "python-flow", "pf_duration": 250, "pf_arrival": 5.0, "pf_grid": 4,
+        "pf_attacker": 0.1, "pf_faulty": 0.08, "pf_collude": 0.3, "pf_rotate": 0,
+        "pf_radio": 200, "pf_weather": "fog", "pf_demand": "rush", "pf_fleet": "mixed",
+        "pf_lights": True},
+}
+
+
 def _attacks_env(value) -> str | None:
     """Normalize the attack multi-select into an SCMS_ATTACKS value ('all' or comma list)."""
     if value in (None, "", "all"):
@@ -441,7 +467,10 @@ def _start_python_flow(config: dict) -> dict:
         if c.get("gen") != "python-flow" or not c.get("arg"):
             continue
         val = config.get(c["name"], "")
-        if val != "" and val is not None:
+        if c["type"] == "bool":
+            if val:
+                cmd.append(c["arg"])                # store_true flag (e.g. --traffic-lights)
+        elif val != "" and val is not None:
             cmd += [c["arg"], str(val)]
     try:
         (out_dir / "live_state.json").unlink()
@@ -615,7 +644,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, html, "text/html; charset=utf-8")
         if self.path == "/api/defaults":
             return self._send(200, {"spec": CONFIG_SPEC, "defaults": _defaults(),
-                                    "scenarios": SCENARIOS, "attack_types": ATTACK_TYPES})
+                                    "scenarios": SCENARIOS, "attack_types": ATTACK_TYPES,
+                                    "presets": PRESETS})
         if self.path == "/api/status":
             return self._send(200, status())
         if self.path == "/api/live":
