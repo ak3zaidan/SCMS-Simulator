@@ -86,8 +86,40 @@ CONFIG_SPEC = [
      "env": None, "param": "Seed",
      "help": "Deterministic seed — same seed + config reproduces a byte-identical dataset"},
     {"group": "Scenario", "name": "visualize", "label": "Also open MOSAIC 2D map", "type": "bool",
-     "default": False, "env": None, "param": "Visualize",
+     "default": False, "env": None, "param": "Visualize", "gen": "mosaic",
      "help": "Open MOSAIC's own 2D web visualizer alongside the embedded map"},
+
+    # --- Generator selector (mosaic = Java/SUMO via run.ps1; python-flow = pure-Python routed sim) ---
+    {"group": "Scenario", "name": "generator", "label": "Generator", "type": "choice",
+     "default": "python-flow", "options": ["python-flow", "mosaic"], "env": None,
+     "help": "python-flow = built-in routed traffic sim (no toolchain needed); mosaic = Java/SUMO"},
+
+    # --- Python-flow generator (routed traffic + car-following, runs without the MOSAIC toolchain) ---
+    {"group": "Python flow", "name": "pf_duration", "label": "Duration (s)", "type": "int",
+     "default": 300, "gen": "python-flow", "arg": "--duration", "help": "simulation length in seconds"},
+    {"group": "Python flow", "name": "pf_arrival", "label": "Arrival rate (veh/s)", "type": "float",
+     "default": 2.5, "step": 0.5, "gen": "python-flow", "arg": "--arrival-rate"},
+    {"group": "Python flow", "name": "pf_grid", "label": "Grid size (NxN)", "type": "int",
+     "default": 6, "min": 2, "max": 20, "gen": "python-flow", "arg": "--grid",
+     "help": "grid road network dimension (intersections per side)"},
+    {"group": "Python flow", "name": "pf_attacker", "label": "Attacker fraction", "type": "float",
+     "default": 0.15, "step": 0.05, "min": 0, "max": 1, "gen": "python-flow", "arg": "--attacker-pct"},
+    {"group": "Python flow", "name": "pf_faulty", "label": "Faulty fraction", "type": "float",
+     "default": 0.05, "step": 0.05, "min": 0, "max": 1, "gen": "python-flow", "arg": "--faulty-pct"},
+    {"group": "Python flow", "name": "pf_collude", "label": "Collusion fraction", "type": "float",
+     "default": 0.0, "step": 0.1, "min": 0, "max": 1, "gen": "python-flow", "arg": "--collude-pct"},
+    {"group": "Python flow", "name": "pf_rotate", "label": "Pseudonym rotate (s)", "type": "float",
+     "default": 0, "gen": "python-flow", "arg": "--rotate-period", "help": "0 = no rotation"},
+    {"group": "Python flow", "name": "pf_radio", "label": "Radio range (m)", "type": "float",
+     "default": 250, "gen": "python-flow", "arg": "--radio-range"},
+    {"group": "Python flow", "name": "pf_weather", "label": "Weather", "type": "choice",
+     "default": "clear", "options": ["clear", "rain", "fog", "snow"], "gen": "python-flow", "arg": "--weather"},
+    {"group": "Python flow", "name": "pf_demand", "label": "Demand profile", "type": "choice",
+     "default": "uniform", "options": ["uniform", "rush", "night"], "gen": "python-flow", "arg": "--demand"},
+    {"group": "Python flow", "name": "pf_fleet", "label": "Fleet", "type": "choice", "default": "mixed",
+     "options": ["mixed", "car", "truck", "bus", "motorcycle"], "gen": "python-flow", "arg": "--fleet"},
+    {"group": "Python flow", "name": "pf_seed", "label": "Seed", "type": "int", "default": 7,
+     "gen": "python-flow", "arg": "--seed"},
 
     # --- Traffic ---
     {"group": "Traffic", "name": "max_vehicles", "label": "Max vehicles", "type": "int", "default": "",
@@ -342,6 +374,11 @@ def start_run(config: dict) -> dict:
     with _LOCK:
         if RUN["proc"] is not None and RUN["proc"].poll() is None:
             return {"ok": False, "error": "A simulation is already running."}
+
+        # ---- Python-flow generator: pure-Python routed traffic sim (no MOSAIC toolchain) ----
+        if str(config.get("generator", "")) == "python-flow":
+            return _start_python_flow(config)
+
         scenario = str(config.get("scenario", "smoke"))
         valid = {s["key"] for s in SCENARIOS}
         if scenario not in valid and not mapgen.is_mapgen_key(scenario):
@@ -393,6 +430,37 @@ def start_run(config: dict) -> dict:
         RUN.update(proc=proc, logf=logf, out_dir=out_dir, scenario=scenario, config=config,
                    started=time.time(), finished=None, returncode=None, stats_cache=None)
         return {"ok": True, "scenario": scenario, "cmd": " ".join(cmd)}
+
+
+def _start_python_flow(config: dict) -> dict:
+    """Launch the pure-Python routed traffic-flow generator (--flow --road grid) with a live map."""
+    out_dir = REPO / "datasets" / "python_flow"
+    cmd = [sys.executable, "-m", "scms_sim_ref.mock_pipeline.run", "--flow", "--road", "grid",
+           "--featurize", "--live-interval", "1", "--out", str(out_dir)]
+    for c in CONFIG_SPEC:
+        if c.get("gen") != "python-flow" or not c.get("arg"):
+            continue
+        val = config.get(c["name"], "")
+        if val != "" and val is not None:
+            cmd += [c["arg"], str(val)]
+    try:
+        (out_dir / "live_state.json").unlink()
+    except OSError:
+        pass
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(REPO / "src")
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if RUN.get("logf"):
+        try:
+            RUN["logf"].close()
+        except Exception:
+            pass
+    logf = open(LOG_PATH, "w", encoding="utf-8", errors="replace")
+    proc = subprocess.Popen(cmd, cwd=str(REPO), env=env, stdout=logf,
+                            stderr=subprocess.STDOUT, text=True)
+    RUN.update(proc=proc, logf=logf, out_dir=out_dir, scenario="python-flow", config=config,
+               started=time.time(), finished=None, returncode=None, stats_cache=None)
+    return {"ok": True, "scenario": "python-flow", "cmd": " ".join(cmd)}
 
 
 def stop_run() -> dict:

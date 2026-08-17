@@ -230,6 +230,7 @@ function renderForm(defaults){
     items.forEach(c=>box.appendChild(fieldEl(c,defaults[c.name])));
     det.appendChild(box); form.appendChild(det);
   });
+  setTimeout(()=>$('#f_generator')?.addEventListener('change',syncKind),0);
   syncKind();
   applyFilter();
 }
@@ -243,8 +244,8 @@ function applyFilter(){
       const c=SPEC.find(x=>x.name===f.dataset.name)||{};
       const hay=`${c.label||''} ${c.name||''} ${c.help||''}`.toLowerCase();
       const hit = !q || hay.includes(q);
-      // never re-show a field hidden by scenario-kind gating
-      const gated = f.dataset.kind && f.style.display==='none';
+      // never re-show a field hidden by generator/scenario-kind gating (any inline display:none)
+      const gated = f.style.display==='none';
       f.classList.toggle('field-hidden', !hit);
       if(hit && !gated) shown++;
     });
@@ -256,6 +257,7 @@ function applyFilter(){
 function fieldEl(c,val){
   const w=document.createElement('div'); w.className='field'; w.dataset.name=c.name;
   if(c.kind) w.dataset.kind=c.kind;
+  if(c.gen) w.dataset.gen=c.gen;
   const help=c.help?`<div class="help">${c.help}</div>`:'';
   if(c.type==='bool'){
     w.innerHTML=`<div class="row-check"><input type="checkbox" id="f_${c.name}" ${val?'checked':''}>
@@ -303,10 +305,16 @@ function fieldEl(c,val){
   return w;
 }
 
-function syncKind(){
+function syncKind(){    // generator + scenario-kind gating combined
+  const gen=$('#f_generator')?.value||'python-flow';
   const kind=(scenByKey[$('#f_scenario')?.value]||{}).kind;
-  document.querySelectorAll('.field[data-kind]').forEach(f=>{
-    f.style.display = (f.dataset.kind===kind)?'':'none';
+  document.querySelectorAll('#form .field').forEach(f=>{
+    const fg=f.dataset.gen; let vis;
+    if(f.dataset.name==='generator') vis=true;
+    else if(fg==='python-flow') vis=(gen==='python-flow');
+    else if(gen!=='mosaic') vis=false;                       // hide Java fields in python-flow mode
+    else vis = !f.dataset.kind || f.dataset.kind===kind;     // mosaic: scenario-kind gating
+    f.style.display = vis?'':'none';
   });
   applyFilter();
 }

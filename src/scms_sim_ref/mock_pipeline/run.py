@@ -166,6 +166,8 @@ class PipelineConfig:
     attack_delay_s: float = 2.0          # flow: an attacker starts falsifying this long after spawn
     state_prune_every: int = 50          # flow: steps between detection-state LRU prunes
     state_prune_ttl: int = 20            # flow: evict detection state untouched this many steps
+    live_interval_s: float = 0.0         # >0: write a throttled live_state.json for the GUI map
+                                         # (best-effort viz; NOT part of the data digest)
     jmax: int = 20
     out_dir: str = "datasets/poc_run"
 
@@ -543,6 +545,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     gt_linkage_rev: list[R.GtLinkageRevocation] = []
     crl_entries: list[CrlLinkageEntry] = []
     subj_events: dict[str, list] = {}    # subject digest -> [(time, reporter_digest)] in a sliding window
+    reported_vids: set[int] = set()       # true vids ever reported (for the live map colouring only)
     revoked_vehicles: dict[int, float] = {}          # vid -> revocation time (vehicle-level)
     revoked_digests: list[str] = []                  # triggering digests (for the CRL sanity check)
     filed_by: dict[str, int] = {}                    # reports FILED per reporter cert (rate-limit)
@@ -700,6 +703,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             report_id=rid, reporter_true_id=f"veh_{rep_veh.vid:03d}",
             subject_true_id=f"veh_{subject_veh.vid:03d}", report_correctness=correctness))
         subj_events.setdefault(subject_digest, []).append((t, reporter_digest))
+        reported_vids.add(subject_veh.vid)
         filed_by[reporter_digest] = filed_by.get(reporter_digest, 0) + 1
         received_by[subject_digest] = received_by.get(subject_digest, 0) + 1
         touched_subjects.add(subject_digest)
@@ -763,6 +767,27 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             del last_claimed[k]
         for d in [d for d in subj_events if pseudonym_info[d]["veh_vid"] not in active]:
             subj_events.pop(d, None)
+
+    live_path = os.path.join(cfg.out_dir, "live_state.json")
+    live_every = max(1, int(round(cfg.live_interval_s / cfg.dt))) if cfg.live_interval_s > 0 else 0
+    if live_every:
+        os.makedirs(cfg.out_dir, exist_ok=True)
+
+    def write_live(active_list, t):
+        # throttled live snapshot for the GUI map: [x, y, state]; state 0 benign/1 attacker/2 reported/
+        # 3 revoked. Best-effort, atomic-replaced, and NOT part of the data digest (determinism-safe).
+        vs = []
+        for v in active_list:
+            x, y = (v.cur_x, v.cur_y) if v.cf else v.true_state(t)[:2]
+            state = (3 if v.vid in revoked_vehicles else 1 if v.is_attacker
+                     else 2 if v.vid in reported_vids else 0)
+            vs.append([round(x, 1), round(y, 1), state])
+        try:
+            with open(live_path + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump({"t": round(t, 1), "n": len(vs), "vehicles": vs}, fh)
+            os.replace(live_path + ".tmp", live_path)
+        except OSError:
+            pass
 
     # car-following: the Intelligent Driver Model gives realistic accel/decel, so vehicles queue and
     # experience stop-and-go behind slower leaders -> genuine congestion the detectors must tolerate.
@@ -1033,6 +1058,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     and span >= cfg.revoke_persist_s):
                 resolve_and_revoke(veh, subject_digest, t)
 
+        if live_every and step % live_every == 0:
+            write_live(active_list, t)
         if stream:
             flush_streams()
             if (step + 1) % cfg.state_prune_every == 0:
@@ -1200,7 +1227,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--demand", default="uniform", choices=["uniform", "rush", "night"],
                    help="time-varying arrival-demand profile")
     p.add_argument("--fleet", default="mixed", help="'mixed' or a single vehicle class (car/truck/bus/motorcycle)")
+    p.add_argument("--live-interval", type=float, default=0.0, help="write live_state.json every N sim-seconds (GUI map)")
     p.add_argument("--no-car-following", action="store_true", help="disable IDM car-following")
+    p.add_argument("--featurize", action="store_true", help="build ML tables after generation")
+    p.add_argument("--grid-h", type=int, default=0, help="grid height (0 = square, = --grid)")
     p.add_argument("--out", default="datasets/poc_run")
     args = p.parse_args(argv)
     cfg = PipelineConfig(seed=args.seed, n_vehicles=args.vehicles, n_steps=args.steps,
@@ -1212,14 +1242,18 @@ def main(argv: Optional[list[str]] = None) -> int:
                          nlos_loss=args.nlos, chan_capacity=args.chan_capacity,
                          traffic_flow=args.flow, duration_s=args.duration, arrival_rate=args.arrival_rate,
                          road_network=("grid" if (args.flow and args.road == "linear") else args.road),
-                         grid_w=args.grid, grid_h=args.grid, grid_block_m=args.grid_block,
+                         grid_w=args.grid, grid_h=(args.grid_h or args.grid), grid_block_m=args.grid_block,
                          demand_profile=args.demand, car_following=not args.no_car_following,
-                         fleet=args.fleet, out_dir=args.out)
+                         fleet=args.fleet, live_interval_s=args.live_interval, out_dir=args.out)
     res = run_pipeline(cfg)
     print(f"vehicles={res.n_vehicles} reports={res.n_reports} "
           f"investigations={res.n_investigations} revoked={res.n_revoked}")
-    print(f"revoked_cert_digests={res.revoked_cert_digests}")
+    print(f"revoked_cert_digests={res.revoked_cert_digests[:8]}")
     print(f"data_digest={res.data_digest}")
+    if args.featurize:
+        from ..datagen import featurize as _feat
+        _feat.build(res.out_dir)
+        print("featurized ml/ tables written")
     print(f"outputs in {os.path.abspath(res.out_dir)}")
     return 0
 
