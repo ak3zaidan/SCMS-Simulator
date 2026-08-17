@@ -127,6 +127,7 @@ class PipelineConfig:
     nlos_loss: float = 0.0               # 0..1 obstruction loss, growing with distance/range
     chan_capacity: int = 40              # in-range CAMs/step before congestion (CBR) loss kicks in
     art_max_m: float = 150.0             # tolerance for claiming a position beyond the radio range
+    offroad_tol_m: float = 15.0          # map check: claimed distance from the nearest road tolerated
     max_accel_mps2: float = 12.0         # implausible-acceleration threshold
     freq_max: float = 6.0                # beacon-rate normalizer (CAMs/interval)
     dos_burst: int = 12                  # CAMs/interval a DoS attacker floods
@@ -652,7 +653,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     DET_KEYS = ("positionSpeedInconsistency", "positionJump", "headingInconsistency",
                 "staleOrReplay", "constantPositionFrozen", "implausibleAcceleration",
                 "sybilCoLocation", "acceptanceRangeThreshold", "beaconFrequency",
-                "signatureVerification", "certValidity")
+                "signatureVerification", "certValidity", "mapOffRoad")
     MOTION_KEYS = ("positionSpeedInconsistency", "positionJump", "headingInconsistency",
                    "constantPositionFrozen", "implausibleAcceleration")
     touched_subjects: set[str] = set()
@@ -797,6 +798,20 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     _CF_CELL = max(cfg.idm_lookahead_m, 30.0)
     _lights = bool(cfg.traffic_lights and net is not None)
     _half_cycle = max(1.0, cfg.light_cycle_s / 2.0)
+    # map-matching: on a grid the roads are the lines x=k*block and y=k*block. A claimed position far
+    # from every road is implausible (HD-map check) -> catches lateral/diagonal position offsets.
+    _gblk = cfg.grid_block_m
+    _gw = (net.w - 1) * _gblk if net is not None else 0.0
+    _gh = (net.h - 1) * _gblk if net is not None else 0.0
+
+    def _offroad(x, y):
+        if net is None:
+            return 0.0
+        vx = round(x / _gblk) * _gblk
+        dv = abs(x - vx) if (0 <= vx <= _gw and -_gblk <= y <= _gh + _gblk) else 1e9
+        hy = round(y / _gblk) * _gblk
+        dh = abs(y - hy) if (0 <= hy <= _gh and -_gblk <= x <= _gw + _gblk) else 1e9
+        return min(dv, dh)
 
     def _light_green(nx: int, ny: int, axis_x: bool, t: float) -> bool:
         # checkerboard phase offset so adjacent intersections alternate; each axis gets half the cycle
@@ -1023,6 +1038,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                                                       - cfg.radio_range_m) / cfg.art_max_m
                 det["beaconFrequency"] = b["msg_count"] / cfg.freq_max
                 det["staleOrReplay"] = max(det.get("staleOrReplay", 0.0), (t - b["cg"]) / cfg.stale_max_s)
+                det["mapOffRoad"] = _offroad(cx, cy) / cfg.offroad_tol_m
                 det["certValidity"] = 1.5 if (t > b["cvt"] + 1.0 or t < b["cvf"] - 1.0) else 0.0
                 if not b["sig_ok"]:
                     # signature fails -> the content cannot be trusted, so the plausibility detectors

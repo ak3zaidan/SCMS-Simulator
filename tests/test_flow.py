@@ -116,6 +116,19 @@ def test_heterogeneous_fleet_types_and_kinematics(tmp_path):
         assert statistics.mean(speeds["truck"]) < statistics.mean(speeds["car"]) + 1.0
 
 
+def test_map_offroad_detector_catches_position_offsets(tmp_path):
+    """On a known road grid, a constant position OFFSET puts the claim off-road -> now detectable
+    (it evaded the relative detectors), while honest on-road traffic is not flagged."""
+    r = _flow(tmp_path, attack_type="ConstPosOffset", attack_types=("ConstPosOffset",),
+              attacker_pct=0.2, faulty_pct=0.0, duration_s=200.0, arrival_rate=2.5)
+    reasons = collections.Counter()
+    for ln in open(tmp_path / "run" / "ma" / "ma_reports.jsonl", encoding="utf-8"):
+        reasons.update(json.loads(ln).get("reason_codes", []))
+    assert reasons["mapOffRoad"] > 0, "off-road offset should trip the map detector"
+    s = V.validate(str(tmp_path / "run"))[0]
+    assert s["recall"] is not None and s["recall"] >= 0.6, s   # was ~0 before the map detector
+
+
 def test_traffic_lights_create_stops_at_intersections(tmp_path):
     """Signalized intersections make vehicles fully stop at reds (queues), unlike free-flow."""
     def stopped_fraction(lights):

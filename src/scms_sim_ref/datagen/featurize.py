@@ -46,6 +46,7 @@ REASON_VOCAB = [
     "beaconFrequency",
     "signatureVerification",
     "certValidity",
+    "mapOffRoad",
 ]
 
 # Detectors whose per-report normalized score is carried as a multi-detector FUSION fingerprint
@@ -54,7 +55,7 @@ DETECTORS = [
     "acceptanceRangeThreshold", "positionJump", "positionSpeedInconsistency",
     "headingInconsistency", "implausibleAcceleration", "staleOrReplay",
     "beaconFrequency", "sybilCoLocation", "constantPositionFrozen", "kalmanConsistency",
-    "signatureVerification", "certValidity",
+    "signatureVerification", "certValidity", "mapOffRoad",
 ]
 
 
