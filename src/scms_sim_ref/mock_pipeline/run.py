@@ -5,7 +5,7 @@ schemas, trust boundaries, leakage firewall, and reproducibility can be validate
 without any MOSAIC/SUMO/Java toolchain:
 
     provision (real linkage values) -> signed CAMs over a MODELLED GNSS sensor ->
-    live attacks (13-type catalog across 7 families) -> receiver multi-detector
+    live attacks (19-type catalog across 8 families) -> receiver multi-detector
     fusion -> misbehaviour reports (digests only) -> MA correlation (ONLINE) ->
     REAL two-LA linkage resolution (MA never learns the true identity) ->
     persistence-gated revocation -> CRL issuance -> enforcement -> reports stop.
@@ -110,7 +110,6 @@ class PipelineConfig:
     weather: str = "clear"
     # --- detection / revocation ---
     consistency_threshold_m: float = 5.0
-    pos_jump_max_m: float = 45.0
     heading_threshold_deg: float = 35.0
     detector_lag_s: float = 1.5          # compare each fix to one ~this old (robust to turns/outliers)
     report_prob: float = 0.9
@@ -127,7 +126,7 @@ class PipelineConfig:
     packet_loss_base: float = 0.0        # baseline per-message loss
     nlos_loss: float = 0.0               # 0..1 obstruction loss, growing with distance/range
     chan_capacity: int = 40              # in-range CAMs/step before congestion (CBR) loss kicks in
-    art_max_m: float = 900.0             # acceptance-range threshold (max plausible claim distance)
+    art_max_m: float = 150.0             # tolerance for claiming a position beyond the radio range
     max_accel_mps2: float = 12.0         # implausible-acceleration threshold
     freq_max: float = 6.0                # beacon-rate normalizer (CAMs/interval)
     dos_burst: int = 12                  # CAMs/interval a DoS attacker floods
@@ -283,6 +282,7 @@ class Vehicle:
     degrade_until: float = -1.0          # in a transient bad-GNSS burst while t < this
     frozen: Optional[tuple[float, float]] = None
     drift: float = 0.0
+    drift_rate: float = 0.0
     hist: list = field(default_factory=list)   # (x,y,speed,heading) claim history for replay
     onset: Optional[float] = None
 
@@ -569,7 +569,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             if len(v.hist) >= 5:
                 cx, cy, cs, ch = v.hist[-5]
         elif typ == "SlowDrift":
-            v.drift += 0.35
+            # position drift whose rate ramps up: stealthy at onset (evades), but the growing
+            # velocity discrepancy eventually crosses the plausibility threshold (high-latency catch).
+            v.drift_rate = min(5.0, v.drift_rate + 0.10)
+            v.drift += v.drift_rate * cfg.dt
             cx, cy = mx + v.drift, my
         elif typ == "AlongRoadOffset":
             hr = math.radians(mheading)
@@ -805,6 +808,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     msg_count = cfg.dos_burst                     # flood the channel
                 elif tx.attack_type == "DelayedMessages":
                     cg = t - cfg.delay_s                          # stale timestamp
+                elif tx.attack_type == "DataReplay":
+                    cg = t - 5.0 * cfg.dt                         # replayed frame carries its old gen time
                 elif tx.attack_type == "InvalidSignature":
                     sig_ok = False                                # forged / tampered message
                 elif tx.attack_type == "ExpiredCert":
@@ -925,7 +930,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 # radio-dependent detectors (need the receiver position + per-message metadata)
                 det["sybilCoLocation"] = cells[(round(cx / _CELL_M), round(cy / _CELL_M),
                                                 int(ch // 45) % 8)] / _SYBIL_MIN
-                det["acceptanceRangeThreshold"] = math.hypot(cx - rxx, cy - rxy) / cfg.art_max_m
+                # a receiver only physically hears in-range transmitters, so a claim placing the
+                # sender far BEYOND the radio range is implausible (excess distance / tolerance).
+                det["acceptanceRangeThreshold"] = max(0.0, math.hypot(cx - rxx, cy - rxy)
+                                                      - cfg.radio_range_m) / cfg.art_max_m
                 det["beaconFrequency"] = b["msg_count"] / cfg.freq_max
                 det["staleOrReplay"] = max(det.get("staleOrReplay", 0.0), (t - b["cg"]) / cfg.stale_max_s)
                 det["certValidity"] = 1.5 if (t > b["cvt"] + 1.0 or t < b["cvf"] - 1.0) else 0.0
