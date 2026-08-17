@@ -187,8 +187,14 @@
         <div class="split">
           <div><div class="subhead">Attack families <span class="hint">ground truth</span></div>
                <div class="bars" id="familyBars"></div></div>
+          <div><div class="subhead">Detection by family <span class="hint">recall (revoked)</span></div>
+               <div class="bars" id="recallBars"></div></div>
+        </div>
+
+        <div class="split">
           <div><div class="subhead">Dataset splits <span class="hint">subjects</span></div>
                <div class="bars" id="splitBars"></div></div>
+          <div></div>
         </div>
 
         <div class="split">
@@ -558,6 +564,8 @@ function renderStats(st){
   $('#calibWrap').innerHTML=calibSection(st.calibration);
   $('#latWrap').innerHTML=latSection(st.validate);
   bars('#familyBars',st.attack_bases);
+  const rbf=(st.validate||{}).recall_by_family||{};
+  bars('#recallBars',Object.fromEntries(Object.entries(rbf).map(([k,v])=>[k,Math.round(v*100)])));
   bars('#splitBars',st.splits);
   bars('#attackBars',st.attack_types);
   bars('#reasonBars',st.detector_reasons);
