@@ -116,6 +116,18 @@ def test_heterogeneous_fleet_types_and_kinematics(tmp_path):
         assert statistics.mean(speeds["truck"]) < statistics.mean(speeds["car"]) + 1.0
 
 
+def test_traffic_lights_create_stops_at_intersections(tmp_path):
+    """Signalized intersections make vehicles fully stop at reds (queues), unlike free-flow."""
+    def stopped_fraction(lights):
+        _flow(tmp_path / str(lights), traffic_lights=lights, car_following=True, arrival_rate=3.0,
+              duration_s=180.0, grid_w=6, grid_h=6, attacker_pct=0.1)
+        em = _jsonl(tmp_path / str(lights) / "run" / "ground_truth" / "gt_emissions_sample.jsonl")
+        sp = [e["claimed_speed"] for e in em if not e["is_attacker"]]
+        return sum(1 for s in sp if s < 1.0) / max(1, len(sp))
+
+    assert stopped_fraction(True) > stopped_fraction(False) + 0.03, "reds should fully stop vehicles"
+
+
 def test_flow_vehicles_follow_grid_routes(tmp_path):
     """Sampled true positions stay within the grid road network bounds (routed mobility)."""
     _flow(tmp_path, grid_w=5, grid_h=5, grid_block_m=120.0)

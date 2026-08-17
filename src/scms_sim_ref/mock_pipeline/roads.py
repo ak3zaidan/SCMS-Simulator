@@ -51,6 +51,13 @@ class Trip:
         x, y, hd = self.at_distance(self.speed * (t - self.t0))
         return x, y, self.speed, hd
 
+    def next_node(self, s: float):
+        """The next route vertex (intersection) ahead of arc-length s: ((x, y), distance) or (None, inf)."""
+        for k in range(1, len(self.cum)):
+            if self.cum[k] > s + 1e-6:
+                return self.wp[k], self.cum[k] - s
+        return None, math.inf
+
 
 class GridNetwork:
     """A w x h grid of intersections spaced `block` metres apart, 4-neighbour roads."""

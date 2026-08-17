@@ -161,6 +161,8 @@ class PipelineConfig:
     idm_min_gap: float = 2.5             # jam distance (m)
     veh_length_m: float = 5.0
     idm_lookahead_m: float = 70.0        # leader search distance ahead
+    traffic_lights: bool = False         # signalized intersections (grid nodes) -> stops & queues
+    light_cycle_s: float = 24.0          # full signal cycle (half green per axis)
     # time-varying demand (rush hour / night) + origin-destination bias
     demand_profile: str = "uniform"      # "uniform" | "rush" | "night"
     attack_delay_s: float = 2.0          # flow: an attacker starts falsifying this long after spawn
@@ -793,6 +795,14 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     # experience stop-and-go behind slower leaders -> genuine congestion the detectors must tolerate.
     cf_active = bool(cfg.traffic_flow and cfg.car_following and net is not None)
     _CF_CELL = max(cfg.idm_lookahead_m, 30.0)
+    _lights = bool(cfg.traffic_lights and net is not None)
+    _half_cycle = max(1.0, cfg.light_cycle_s / 2.0)
+
+    def _light_green(nx: int, ny: int, axis_x: bool, t: float) -> bool:
+        # checkerboard phase offset so adjacent intersections alternate; each axis gets half the cycle
+        offset = ((nx + ny) % 2) * _half_cycle
+        x_phase = int((t + offset) // _half_cycle) % 2 == 0
+        return x_phase == axis_x
 
     def _idm_accel(v_cur, v0, gap, v_lead, lead_len, a_max, b_dec):
         if gap == math.inf:
@@ -831,6 +841,16 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                             continue
                         if fwd < best_gap:
                             best_gap, best_v, best_len = fwd, wv, wl
+            if _lights:                                  # stop at a red signal on the next intersection
+                node, dnode = v.trip.next_node(v.s_pos)
+                if node is not None and dnode < cfg.idm_lookahead_m:
+                    ni = int(round(node[0] / cfg.grid_block_m))
+                    nj = int(round(node[1] / cfg.grid_block_m))
+                    axis_x = abs(cosh) >= abs(sinh)      # travelling mostly E-W vs N-S
+                    if not _light_green(ni, nj, axis_x, t):
+                        stop_gap = max(0.0, dnode - 2.0)  # halt ~2 m before the stop line
+                        if stop_gap < best_gap:
+                            best_gap, best_v, best_len = stop_gap, 0.0, 0.0
             a = _idm_accel(v.cur_v, v.desired_speed, best_gap, best_v, best_len, v.idm_a, v.idm_b)
             v.cur_v = max(0.0, min(v.desired_speed, v.cur_v + a * cfg.dt))
             v.s_pos += v.cur_v * cfg.dt
@@ -1229,6 +1249,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--fleet", default="mixed", help="'mixed' or a single vehicle class (car/truck/bus/motorcycle)")
     p.add_argument("--live-interval", type=float, default=0.0, help="write live_state.json every N sim-seconds (GUI map)")
     p.add_argument("--no-car-following", action="store_true", help="disable IDM car-following")
+    p.add_argument("--traffic-lights", action="store_true", help="signalized intersections (grid)")
     p.add_argument("--featurize", action="store_true", help="build ML tables after generation")
     p.add_argument("--grid-h", type=int, default=0, help="grid height (0 = square, = --grid)")
     p.add_argument("--out", default="datasets/poc_run")
@@ -1244,7 +1265,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                          road_network=("grid" if (args.flow and args.road == "linear") else args.road),
                          grid_w=args.grid, grid_h=(args.grid_h or args.grid), grid_block_m=args.grid_block,
                          demand_profile=args.demand, car_following=not args.no_car_following,
-                         fleet=args.fleet, live_interval_s=args.live_interval, out_dir=args.out)
+                         fleet=args.fleet, live_interval_s=args.live_interval,
+                         traffic_lights=args.traffic_lights, out_dir=args.out)
     res = run_pipeline(cfg)
     print(f"vehicles={res.n_vehicles} reports={res.n_reports} "
           f"investigations={res.n_investigations} revoked={res.n_revoked}")
