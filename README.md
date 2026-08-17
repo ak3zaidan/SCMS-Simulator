@@ -24,18 +24,43 @@ MA-visible data (features) and simulation ground truth (labels).
 .\run.ps1 -Scenario osm_tokyo                # real Tokyo streets (OpenStreetMap)
 ```
 
-## Quick start
+## Quick start (pure Python — no MOSAIC toolchain needed)
 
 ```powershell
 python -m pip install -r requirements.txt      # cryptography, pydantic, pytest
-python -m pytest -q                            # 21 tests
+python -m pytest -q                            # full test suite
 $env:PYTHONPATH = "src"
-python -m scms_sim_ref.mock_pipeline.run --out datasets/poc_run
+python -m scms_sim_ref.mock_pipeline.run --out datasets/poc_run   # small reference run
 ```
 
-The run writes `datasets/poc_run/ma/*.jsonl` (MA-visible), a **separate**
-`datasets/poc_run/ground_truth/*.jsonl` (oracle-only), and `manifest.json`
-(seed, config, per-file SHA-256, data digest, standards profile).
+The built-in generator is a full microscopic traffic simulator: routed trips on a road grid with
+IDM car-following (queues/congestion), signalized intersections, time-of-day demand, a mixed fleet
+(car/moto/truck/bus), weather, range-limited lossy radio, 21 attack types across 8 families, and a
+13-signal detector suite with a windowed Misbehavior-Authority. It is deterministic (same seed +
+config → byte-identical data) and memory-bounded via streaming.
+
+```powershell
+# long-running routed traffic-flow simulation (spawn/despawn over time)
+python -m scms_sim_ref.mock_pipeline.run --flow --road grid --grid 8 --duration 1800 `
+    --arrival-rate 2 --attacker-pct 0.15 --collude-pct 0.3 --traffic-lights --demand rush `
+    --featurize --out datasets/long_run
+# a huge multi-domain training corpus (every scenario x permutation, merged with domain_id)
+python -m scms_sim_ref.datagen.massive --grid full --flow --out datasets/massive
+```
+
+Each run writes `ma/*.jsonl` (MA-visible features), a **separate** `ground_truth/*.jsonl`
+(oracle-only labels), `ml/*` (train/val/test ML tables via `--featurize`), a `DATASHEET.md`, and
+`manifest.json` (seed, config, per-file SHA-256, data digest, standards profile).
+
+## GUI control panel
+
+```powershell
+.\gui.ps1      # http://127.0.0.1:8710 — pick the "python-flow" generator (default), tweak/preset, Start
+```
+
+A dependency-free web panel: choose the generator, use one-click presets (urban rush / highway /
+sparse night / gridlock), watch the live congestion map, and read the full results dashboard
+(precision/recall, per-task ROC-AUC with GBDT + CIs, calibration, generalization).
 
 ## MOSAIC layer — build & run the custom app
 
