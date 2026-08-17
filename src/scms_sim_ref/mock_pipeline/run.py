@@ -1120,6 +1120,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
 
         if live_every and step % live_every == 0:
             write_live(active_list, t)
+        if cfg.traffic_flow and n_steps >= 40 and step % max(1, n_steps // 20) == 0:
+            print(f"[flow t={t:.0f}/{total_time:.0f}s] active={len(active)} spawned={spawn_ptr} "
+                  f"reports={counters['report']} revoked={len(revoked_vehicles)}", flush=True)
         if stream:
             flush_streams()
             if (step + 1) % cfg.state_prune_every == 0:
