@@ -120,3 +120,35 @@ def test_advanced_run_is_deterministic_and_leakage_free(tmp_path):
     for name in ("ma_reports.jsonl", "ma_cert_status.jsonl", "ma_investigations.jsonl"):
         for row in _jsonl(tmp_path / "a" / "ma" / name):
             assert find_forbidden_keys(row) == [], f"{name} leaks: {find_forbidden_keys(row)}"
+
+
+def _falsified_fraction(tmp_path, duty):
+    out = str(tmp_path / f"run{duty}")
+    cfg = PipelineConfig(seed=9, n_vehicles=60, n_steps=160, attacker_pct=0.3, faulty_pct=0.0,
+                         attack_start=5.0, attack_end=160.0, attack_duty_cycle=duty,
+                         attack_pulse_period_s=20.0, emit_sample_prob=1.0, out_dir=out)
+    res = run_pipeline(cfg)
+    em = _jsonl(tmp_path / f"run{duty}" / "ground_truth" / "gt_emissions_sample.jsonl")
+    atk = [e for e in em if e["is_attacker"]]
+    frac = sum(1 for e in atk if e["falsified"]) / max(1, len(atk))
+    return frac, res.n_revoked
+
+
+def test_pulsed_attack_falsifies_less_and_evades_more(tmp_path):
+    """An intermittent (25% duty) attacker falsifies far fewer messages than a continuous one, and
+    the sustained-evidence MA revokes fewer of them -> a genuine evasion / difficulty lever."""
+    cont_frac, cont_rev = _falsified_fraction(tmp_path, 1.0)
+    puls_frac, puls_rev = _falsified_fraction(tmp_path, 0.25)
+    assert cont_frac > 0.8, cont_frac
+    assert puls_frac < 0.5, f"25%% duty should falsify a minority of messages: {puls_frac}"
+    assert puls_rev <= cont_rev, (puls_rev, cont_rev)
+
+
+def test_duty_cycle_one_is_byte_identical_to_default(tmp_path):
+    """duty_cycle=1.0 (default) must not perturb generation at all."""
+    base = run_pipeline(PipelineConfig(seed=3, n_vehicles=30, n_steps=80, attacker_pct=0.2,
+                                       out_dir=str(tmp_path / "a")))
+    same = run_pipeline(PipelineConfig(seed=3, n_vehicles=30, n_steps=80, attacker_pct=0.2,
+                                       attack_duty_cycle=1.0, attack_pulse_period_s=20.0,
+                                       out_dir=str(tmp_path / "b")))
+    assert base.data_digest == same.data_digest

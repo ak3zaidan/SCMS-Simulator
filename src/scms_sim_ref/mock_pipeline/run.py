@@ -100,6 +100,9 @@ class PipelineConfig:
     attack_start: float = 5.0
     attack_end: float = 60.0
     attack_intensity: float = 1.0        # scales falsification magnitudes (subtle <1 .. blatant >1)
+    attack_duty_cycle: float = 1.0       # <1: attacker falsifies only in bursts (evades sustained-
+                                         # evidence revocation); fraction of each pulse period "on"
+    attack_pulse_period_s: float = 20.0  # length of one on/off pulse cycle when duty_cycle < 1
     # --- GNSS / sensor realism ---
     gps_sigma_m: float = 1.2             # white per-axis noise (× per-vehicle quality × weather)
     gps_bias_sigma_m: float = 1.5        # OU-correlated slow bias amplitude
@@ -287,6 +290,7 @@ class Vehicle:
     trip: object = None                    # roads.Trip when road_network="grid"
     attack_from: float = 0.0
     attack_to: float = 0.0
+    pulse_phase: float = 0.0               # per-vehicle offset [0,1) for intermittent (pulsed) attacks
     # vehicle class (heterogeneous fleet)
     veh_type: str = "car"
     veh_length: float = 4.5
@@ -358,7 +362,8 @@ def _ang_diff(a: float, b: float) -> float:
 
 
 _PROB_FIELDS = ("report_prob", "attacker_pct", "faulty_pct", "collude_pct", "victim_pct",
-                "packet_loss_base", "nlos_loss", "gps_outlier_rate", "gps_degrade_rate")
+                "packet_loss_base", "nlos_loss", "gps_outlier_rate", "gps_degrade_rate",
+                "attack_duty_cycle")
 
 
 def validate_config(cfg: PipelineConfig) -> PipelineConfig:
@@ -512,6 +517,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 v.cur_y += v.lane_off * math.cos(hr)
         v.attack_from = (spawn_time + cfg.attack_delay_s) if cfg.traffic_flow else cfg.attack_start
         v.attack_to = (spawn_time + life) if cfg.traffic_flow else cfg.attack_end
+        if is_att and cfg.attack_duty_cycle < 1.0:   # desync pulses across attackers (own rng stream)
+            v.pulse_phase = random.Random(f"{cfg.seed}:pulse:{vid}").random()
         if is_att and atype == "Sybil":
             for g in range(cfg.sybil_ghosts):
                 gj = (cfg.jmax - 1 - g) % cfg.jmax
@@ -975,6 +982,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             x, y, tspeed, theading = tx.true_state(t)
             mx, my, conf = measure(tx, x, y, t)
             attacking = tx.is_attacker and tx.attack_from <= t <= tx.attack_to
+            if attacking and cfg.attack_duty_cycle < 1.0:  # intermittent: falsify only in bursts
+                period = max(1e-6, cfg.attack_pulse_period_s)
+                phase = ((t - tx.attack_from) / period + tx.pulse_phase) % 1.0
+                attacking = phase < cfg.attack_duty_cycle
             if (not attacking) and cfg.gps_jam_rate > 0:
                 r = vrng[tx.vid]
                 if t >= tx.jam_until and r.random() < cfg.gps_jam_rate:
@@ -1342,6 +1353,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--steps", type=int, default=40)
     p.add_argument("--attacker-pct", type=float, default=0.0)
     p.add_argument("--attack-intensity", type=float, default=1.0, help="scale falsification magnitude (subtle<1)")
+    p.add_argument("--attack-duty-cycle", type=float, default=1.0,
+                   help="<1: attacker falsifies only in bursts (intermittent/pulsed, evades revocation)")
+    p.add_argument("--attack-pulse-period", type=float, default=20.0, help="pulse cycle length (s) when duty<1")
     p.add_argument("--faulty-pct", type=float, default=0.05)
     p.add_argument("--weather", default="clear", choices=list(WEATHER_MULT))
     p.add_argument("--rotate-period", type=float, default=0.0, help="pseudonym rotation period (s); 0=off")
@@ -1394,6 +1408,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
     cfg = PipelineConfig(seed=args.seed, n_vehicles=args.vehicles, n_steps=args.steps,
                          attacker_pct=args.attacker_pct, attack_intensity=args.attack_intensity,
+                         attack_duty_cycle=args.attack_duty_cycle,
+                         attack_pulse_period_s=args.attack_pulse_period,
                          faulty_pct=args.faulty_pct,
                          weather=args.weather, rotate_period_s=args.rotate_period,
                          collude_pct=args.collude_pct, victim_pct=args.victim_pct,
