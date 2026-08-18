@@ -46,6 +46,19 @@ def test_flow_is_deterministic_and_leakage_free(tmp_path):
             assert find_forbidden_keys(row) == [], f"{name} leaks: {find_forbidden_keys(row)}"
 
 
+def test_signalized_congestion_does_not_expire_benign_certs(tmp_path):
+    """Regression: under traffic lights + congestion a benign trip takes far longer than free-flow;
+    its cert validity window must still cover it, so certValidity must NOT mass-fire on benign traffic."""
+    _flow(tmp_path, traffic_lights=True, car_following=True, arrival_rate=4.0, grid_w=6, grid_h=6,
+          grid_block_m=140.0, duration_s=200.0, attacker_pct=0.0, faulty_pct=0.0,
+          trip_speed_min=10.0, trip_speed_max=16.0)
+    reasons = collections.Counter()
+    for ln in open(tmp_path / "run" / "ma" / "ma_reports.jsonl", encoding="utf-8"):
+        reasons.update(json.loads(ln).get("reason_codes", []))
+    # no attackers -> a correct benign cert window means (near) zero certValidity firings
+    assert reasons.get("certValidity", 0) <= 2, f"benign certs expiring under congestion: {reasons}"
+
+
 def test_all_new_realism_features_are_deterministic(tmp_path):
     """Every new flow realism knob enabled at once still yields byte-identical output run-to-run."""
     kw = dict(traffic_flow=True, road_network="grid", duration_s=200.0, arrival_rate=2.5,

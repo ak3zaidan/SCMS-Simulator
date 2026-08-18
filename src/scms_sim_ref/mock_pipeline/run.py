@@ -525,7 +525,15 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         if cf:
             # car-following: arrival time is dynamic (congestion) -> despawn on route completion.
             finish_time = None
-            life = 2.0 * trip.length / max(1.0, cfg.trip_speed_min)   # generous upper bound
+            # Cert validity window must cover the REALISTIC (congested) trip duration, not just 2x
+            # free-flow: under traffic lights + queues a benign trip can take far longer, and if the
+            # window is too short the honest cert "expires" mid-trip -> mass false certValidity
+            # positives (precision collapse). Budget = 3x free-flow (stop-and-go) + ~half a signal
+            # cycle of waiting per intersection on the route + slack.
+            free_flow = trip.length / max(1.0, cfg.trip_speed_min)
+            light_budget = ((trip.length / max(1.0, cfg.grid_block_m)) * (cfg.light_cycle_s * 0.5)
+                            if cfg.traffic_lights else 0.0)
+            life = 3.0 * free_flow + light_budget + 30.0
         else:
             finish_time = (trip.t1 if trip is not None
                            else (spawn_time + life_hint if cfg.traffic_flow else None))
