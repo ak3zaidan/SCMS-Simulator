@@ -30,6 +30,7 @@ sys.path.insert(0, str(REPO / "scms-sim" / "scenarios"))
 from scms_sim_ref.datagen import validate as validate_mod  # noqa: E402
 from scms_sim_ref.datagen import benchmark as benchmark_mod  # noqa: E402
 from scms_sim_ref.datagen import calibration as calibration_mod  # noqa: E402
+from scms_sim_ref import mock_pipeline as pipeline_mod  # noqa: E402
 import mapgen  # noqa: E402
 
 PORT = 8710
@@ -413,6 +414,9 @@ def start_run(config: dict) -> dict:
         # ---- Python-flow generator: pure-Python routed traffic sim (no MOSAIC toolchain) ----
         if str(config.get("generator", "")) == "python-flow":
             return _start_python_flow(config)
+        # ---- Config replay: run an exact saved PipelineConfig (uploaded/pasted JSON) ----
+        if str(config.get("generator", "")) == "config-replay":
+            return _start_config_replay(config)
 
         scenario = str(config.get("scenario", "smoke"))
         valid = {s["key"] for s in SCENARIOS}
@@ -499,6 +503,62 @@ def _start_python_flow(config: dict) -> dict:
     RUN.update(proc=proc, logf=logf, out_dir=out_dir, scenario="python-flow", config=config,
                started=time.time(), finished=None, returncode=None, stats_cache=None)
     return {"ok": True, "scenario": "python-flow", "cmd": " ".join(cmd)}
+
+
+def _start_config_replay(config: dict) -> dict:
+    """Replay an exact PipelineConfig supplied as JSON (from a saved/downloaded config or manifest).
+
+    The config dict is validated by building a PipelineConfig from it (via the same config_from_dict
+    the CLI --config uses), written to a temp file, and run with --config so the dataset reproduces
+    exactly. A live map + featurized ml/ tables are produced, like the python-flow generator."""
+    payload = config.get("config_json")
+    if not isinstance(payload, dict) or not payload:
+        return {"ok": False, "error": "config-replay needs a non-empty 'config_json' object"}
+    try:
+        cfg = pipeline_mod.config_from_dict(payload)   # raises on bad values -> surfaced below
+        pipeline_mod.validate_config(cfg)
+    except (ValueError, TypeError) as e:
+        return {"ok": False, "error": f"invalid config: {e}"}
+    out_dir = REPO / "datasets" / "config_replay"
+    cfg_path = REPO / "datasets" / "replay_config.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cfg_path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump({k: (list(v) if isinstance(v, tuple) else v) for k, v in cfg.__dict__.items()},
+                  fh, indent=2, sort_keys=True)
+    cmd = [sys.executable, "-m", "scms_sim_ref.mock_pipeline.run", "--config", str(cfg_path),
+           "--featurize", "--live-interval", "1", "--out", str(out_dir)]
+    try:
+        (out_dir / "live_state.json").unlink()
+    except OSError:
+        pass
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(REPO / "src")
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if RUN.get("logf"):
+        try:
+            RUN["logf"].close()
+        except Exception:
+            pass
+    logf = open(LOG_PATH, "w", encoding="utf-8", errors="replace")
+    proc = subprocess.Popen(cmd, cwd=str(REPO), env=env, stdout=logf,
+                            stderr=subprocess.STDOUT, text=True)
+    RUN.update(proc=proc, logf=logf, out_dir=out_dir, scenario="config-replay", config=config,
+               started=time.time(), finished=None, returncode=None, stats_cache=None)
+    return {"ok": True, "scenario": "config-replay", "cmd": " ".join(cmd)}
+
+
+def last_effective_config() -> dict | None:
+    """The effective (replayable) config of the most recent run, read from its manifest.json."""
+    out_dir = RUN["out_dir"]
+    if out_dir is None:
+        return None
+    man = Path(out_dir) / "manifest.json"
+    if not man.exists():
+        return None
+    try:
+        return json.loads(man.read_text(encoding="utf-8")).get("config")
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def stop_run() -> dict:
@@ -659,6 +719,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, status())
         if self.path == "/api/live":
             return self._send(200, live_state())
+        if self.path == "/api/config":               # effective config of the last run (download)
+            return self._send(200, {"config": last_effective_config()})
         return self._send(404, {"error": "not found"})
 
     def _same_origin(self) -> bool:

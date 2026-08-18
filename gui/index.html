@@ -134,8 +134,11 @@
       <input id="cfgSearch" type="text" placeholder="🔍 filter settings by name…" autocomplete="off">
     </div>
     <div id="form"></div>
-    <div class="body">
+    <div class="body" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center">
       <button id="reset">Reset to defaults</button>
+      <button id="dlcfg" title="Download the exact, replayable config of the last run">⭳ Download config</button>
+      <button id="replaycfg" title="Load a saved config/manifest JSON and reproduce it byte-for-byte">⭱ Replay config…</button>
+      <input id="cfgfile" type="file" accept="application/json,.json" style="display:none">
     </div>
   </div>
 
@@ -374,6 +377,28 @@ $('#start').addEventListener('click',async()=>{
 $('#stop').addEventListener('click',async()=>{ await fetch('/api/stop',{method:'POST'}); poll(); });
 $('#reset').addEventListener('click',async()=>{
   const d=await (await fetch('/api/defaults')).json(); renderForm(d.defaults);
+});
+// Download the last run's exact, replayable config (from its manifest).
+$('#dlcfg').addEventListener('click',async()=>{
+  const r=await (await fetch('/api/config')).json();
+  if(!r.config){ alert('No completed run yet — run a simulation first.'); return; }
+  const blob=new Blob([JSON.stringify(r.config,null,2)],{type:'application/json'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob); a.download='scms_config.json'; a.click();
+  URL.revokeObjectURL(a.href);
+});
+// Load a config/manifest JSON and reproduce that run exactly (server uses --config).
+$('#replaycfg').addEventListener('click',()=>$('#cfgfile').click());
+$('#cfgfile').addEventListener('change',async(ev)=>{
+  const file=ev.target.files[0]; if(!file) return;
+  let cfg; try{ cfg=JSON.parse(await file.text()); }catch(e){ alert('Not valid JSON: '+e); return; }
+  if(cfg && cfg.config && typeof cfg.config==='object') cfg=cfg.config;   // accept a full manifest
+  $('#cfgfile').value='';
+  $('#start').disabled=true;
+  const r=await (await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({generator:'config-replay',config_json:cfg})})).json();
+  if(!r.ok){ alert(r.error||'failed to start'); $('#start').disabled=false; return; }
+  $('#statsPanel').style.display='none'; startLive(); poll();
 });
 
 function setPill(state,txt){
