@@ -406,6 +406,12 @@ PRESETS = {
         "pf_attacker": 0.1, "pf_faulty": 0.08, "pf_collude": 0.3, "pf_rotate": 0,
         "pf_radio": 200, "pf_weather": "fog", "pf_demand": "rush", "pf_fleet": "mixed",
         "pf_lights": True},
+    "Max realism (hard)": {   # showcases every realism/evasion knob: gravity trips, cornering, pulsed
+        "generator": "python-flow", "pf_duration": 300, "pf_arrival": 2.5, "pf_grid": 6,
+        "pf_attacker": 0.2, "pf_faulty": 0.06, "pf_collude": 0.3, "pf_rotate": 60,
+        "pf_radio": 250, "pf_weather": "rain", "pf_demand": "rush", "pf_fleet": "mixed",
+        "pf_lights": True, "pf_od": "gravity", "pf_turn": True, "pf_intensity": 0.7,
+        "pf_duty": 0.5, "pf_jitter": 15, "pf_pulse": 20},
 }
 
 
