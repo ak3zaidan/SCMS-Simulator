@@ -197,7 +197,8 @@
         <div class="split">
           <div><div class="subhead">Dataset splits <span class="hint">subjects</span></div>
                <div class="bars" id="splitBars"></div></div>
-          <div></div>
+          <div><div class="subhead">Detector reliability <span class="hint">report-level precision %</span></div>
+               <div class="bars" id="reliabilityBars"></div></div>
         </div>
 
         <div class="split">
@@ -572,6 +573,8 @@ function renderStats(st){
   const bm=st.benchmark||{};
   const subjAuc=bm.subject_is_attacker&&bm.subject_is_attacker.roc_auc;
   const repAuc=bm.report_is_true_detection&&bm.report_is_true_detection.roc_auc;
+  const primaryTask=bm.vehicle_is_attacker||bm.subject_is_attacker||{};
+  const bestF1=(primaryTask.at_best_f1||{}).f1;
   const kpis=[
     ['Vehicles', c.vehicles ?? c.subjects ?? '—'],
     ['MA reports', c.reports ?? '—'],
@@ -579,6 +582,7 @@ function renderStats(st){
     ['Precision', pctv(va.precision)],['Recall', pctv(va.recall)],
     ['Leakage', `<span class="${leak===0?'good':'warnc'}">${leak}</span>`],
     ['Subj AUC', num(subjAuc)],['Report AUC', num(repAuc)],
+    ['Best F1', bestF1!=null?num(bestF1):'—'],
     ['Seed', st.seed ?? '—'],
     ['Digest', `<span class="muted" style="font-size:12px">${st.data_digest||'—'}</span>`],
   ];
@@ -595,6 +599,9 @@ function renderStats(st){
   bars('#attackBars',st.attack_types);
   bars('#reasonBars',st.detector_reasons);
   bars('#correctnessBars',st.report_correctness);
+  const rel=(st.validate||{}).detector_reliability||{};
+  bars('#reliabilityBars',Object.fromEntries(Object.entries(rel)
+       .sort((a,b)=>b[1].precision-a[1].precision).map(([k,v])=>[k,Math.round(v.precision*100)])));
 }
 
 boot();
