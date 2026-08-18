@@ -1462,6 +1462,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--lanes", type=int, default=1, help="parallel lanes per road (overtaking; reduces gridlock)")
     p.add_argument("--od-model", default="uniform", choices=["uniform", "gravity"],
                    help="trip destination law: uniform | gravity (realistic distance-decay trip lengths)")
+    p.add_argument("--od-gravity-scale", type=float, default=2.0,
+                   help="gravity OD: hop decay scale (smaller -> shorter trips)")
+    p.add_argument("--turn-speed", type=float, default=6.0,
+                   help="cornering: speed cap (m/s) through a sharp bend when --turn-slowdown is on")
     p.add_argument("--demand", default="uniform", choices=["uniform", "rush", "night"],
                    help="time-varying arrival-demand profile")
     p.add_argument("--fleet", default="mixed", help="'mixed' or a single vehicle class (car/truck/bus/motorcycle)")
@@ -1517,8 +1521,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                          grid_w=args.grid, grid_h=(args.grid_h or args.grid), grid_block_m=args.grid_block,
                          n_lanes=args.lanes,
                          demand_profile=args.demand, od_model=args.od_model,
+                         od_gravity_scale=args.od_gravity_scale,
                          car_following=not args.no_car_following,
-                         turn_slowdown=args.turn_slowdown,
+                         turn_slowdown=args.turn_slowdown, turn_speed_mps=args.turn_speed,
                          fleet=args.fleet, live_interval_s=args.live_interval,
                          traffic_lights=args.traffic_lights, gps_jam_rate=args.gps_jam_rate,
                          max_total_vehicles=args.max_total_vehicles, verbose=True,
