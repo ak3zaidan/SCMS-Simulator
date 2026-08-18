@@ -7,12 +7,16 @@ isolation, plus a mixed "ALL" scenario) crossed with every permutation of the en
 deterministic pipeline run; all cells are featurized and MERGED into a single dataset with a
 `domain_id` per row -- ready for cross-domain training and the leave-one-domain-out benchmark.
 
-    python -m scms_sim_ref.datagen.massive --grid full  --out datasets/massive
-    python -m scms_sim_ref.datagen.massive --grid quick --out datasets/massive_quick
+    python -m scms_sim_ref.datagen.massive --grid full   --out datasets/massive
+    python -m scms_sim_ref.datagen.massive --grid medium --out datasets/massive   # tractable middle ground
+    python -m scms_sim_ref.datagen.massive --grid quick  --out datasets/massive_quick
+    python -m scms_sim_ref.datagen.massive --grid full --flow --dry-run           # preview size, generate nothing
 
-Scales to thousands of cells: each domain is streamed into the merged CSVs and its per-domain
-directory is deleted immediately (unless --keep-domains), so disk and memory stay bounded. Nothing is
-truncated silently -- if a cap drops cells, it is logged.
+Grids: quick (smoke) < medium (broad, tractable) < full (exhaustive product). Scales to thousands of
+cells: each domain is streamed into the merged CSVs and its per-domain directory is deleted immediately
+(unless --keep-domains), so disk and memory stay bounded. A failing domain is isolated and recorded in
+manifest.failed_domains (never aborts the campaign). Nothing is truncated silently -- if a cap drops
+cells, it is logged; --dry-run prints the plan without generating.
 """
 from __future__ import annotations
 
