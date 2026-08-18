@@ -557,14 +557,19 @@ function calibSection(cal){
 }
 function latSection(va){
   const dl=(va||{}).detection_latency_s;
+  const rbt=(va||{}).recall_by_type||{};
+  const hardest=Object.entries(rbt).sort((a,b)=>a[1].recall-b[1].recall).slice(0,4)
+    .map(([t,d])=>`<tr><td>${t}</td><td class="v">${num(d.recall)} <span class="muted">(n=${d.n})</span></td></tr>`).join('');
+  const hardBlock=hardest?`<div class="subhead" style="margin-top:8px">Hardest attack types <span class="hint">recall</span></div>
+     <table class="mt"><tbody>${hardest}</tbody></table>`:'';
   if(!dl||dl.n==null) return card('Detection latency',null,
-    '<span class="muted" style="font-size:11px">no detections</span>');
+    '<span class="muted" style="font-size:11px">no detections</span>'+hardBlock);
   return card('Detection latency',`onset → first MA report · n=${dl.n}`,
     `<table class="mt"><tbody>
        <tr><td>median</td><td class="v">${num(dl.median_s)} s</td></tr>
        <tr><td>p90</td><td class="v">${num(dl.p90_s)} s</td></tr>
        <tr><td>max</td><td class="v">${num(dl.max_s)} s</td></tr>
-     </tbody></table>`);
+     </tbody></table>`+hardBlock);
 }
 function renderStats(st){
   $('#statsPanel').style.display='';
