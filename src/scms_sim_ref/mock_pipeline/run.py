@@ -433,6 +433,20 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
 _TUPLE_FIELDS = ("attacker_ids", "attack_types")
 
 
+def config_schema() -> dict:
+    """Machine-readable schema of every PipelineConfig field: {name: {type, default}}. Lets tools
+    build config UIs/validators programmatically against the full knob surface."""
+    out = {}
+    for f in dataclasses.fields(PipelineConfig):
+        default = f.default
+        if default is dataclasses.MISSING:
+            default = None
+        elif isinstance(default, tuple):
+            default = list(default)
+        out[f.name] = {"type": str(f.type), "default": default}
+    return out
+
+
 def config_from_dict(d: dict) -> PipelineConfig:
     """Build a PipelineConfig from a plain dict (e.g. a saved run's manifest).
 
@@ -1464,10 +1478,18 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "replay it exactly; --out and --featurize still apply. Ignores other flags.")
     p.add_argument("--dump-config", default=None,
                    help="write the effective config to this JSON path, then run as usual")
+    p.add_argument("--dump-config-schema", default=None,
+                   help="write the config field schema (name/type/default) to this JSON path and exit")
     p.add_argument("--out", default=None)
     if _preargs.preset:                              # preset seeds defaults; explicit flags override
         p.set_defaults(**CLI_PRESETS[_preargs.preset])
     args = p.parse_args(argv)
+    if args.dump_config_schema:                       # emit the config field schema and exit (no run)
+        with open(args.dump_config_schema, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(config_schema(), fh, indent=2, sort_keys=True)
+        print(f"config schema ({len(config_schema())} fields) written to "
+              f"{os.path.abspath(args.dump_config_schema)}")
+        return 0
     if args.config:                                  # replay a saved config exactly
         with open(args.config, encoding="utf-8") as fh:
             cfg = config_from_dict(json.load(fh))

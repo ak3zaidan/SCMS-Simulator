@@ -48,6 +48,31 @@ def test_dump_config_then_reload(tmp_path):
     assert back.__dict__ == cfg.__dict__
 
 
+def test_config_schema_covers_all_fields_and_is_json_safe():
+    import json
+    from scms_sim_ref.mock_pipeline import config_schema, PipelineConfig
+    import dataclasses
+
+    sch = config_schema()
+    names = {f.name for f in dataclasses.fields(PipelineConfig)}
+    assert set(sch) == names, "schema must list every config field"
+    for name, meta in sch.items():
+        assert "type" in meta and "default" in meta
+    json.dumps(sch)                                  # must be JSON-serializable (no tuples/MISSING)
+    # a few spot checks
+    assert sch["attack_types"]["default"] == list(PipelineConfig().attack_types)
+    assert sch["seed"]["default"] == PipelineConfig().seed
+
+
+def test_cli_dump_config_schema(tmp_path):
+    import json
+    from scms_sim_ref.mock_pipeline.run import main
+    path = tmp_path / "schema.json"
+    assert main(["--dump-config-schema", str(path)]) == 0
+    sch = json.loads(path.read_text())
+    assert "attack_duty_cycle" in sch and "od_model" in sch and "turn_slowdown" in sch
+
+
 def test_cli_config_flag_runs(tmp_path):
     src = _cfg(tmp_path / "src")
     cfgpath = tmp_path / "c.json"
