@@ -46,7 +46,16 @@ python -m scms_sim_ref.mock_pipeline.run --flow --road grid --grid 8 --duration 
     --featurize --out datasets/long_run
 # a huge multi-domain training corpus (every scenario x permutation, merged with domain_id)
 python -m scms_sim_ref.datagen.massive --grid full --flow --out datasets/massive
+
+# one-command named scenario (flags still override); reproduce any past run byte-for-byte from its manifest
+python -m scms_sim_ref.mock_pipeline.run --preset urban_rush --featurize --out datasets/urban
+python -m scms_sim_ref.mock_pipeline.run --config datasets/urban/manifest.json --out datasets/replay
 ```
+
+Presets: `urban_rush`, `highway`, `night_rain`, `gridlock`, `stealth_hard`. Other realism knobs:
+`--od-model gravity` (distance-decay trip lengths), `--turn-slowdown` (slow into corners),
+`--attack-duty-cycle 0.3` (pulsed/intermittent attackers), `--attack-delay-jitter 20` (varied onset).
+Long runs are interruptible — Ctrl-C finalizes a valid partial dataset.
 
 Each run writes `ma/*.jsonl` (MA-visible features), a **separate** `ground_truth/*.jsonl`
 (oracle-only labels), `ml/*` (train/val/test ML tables via `--featurize`), a `DATASHEET.md`, and
