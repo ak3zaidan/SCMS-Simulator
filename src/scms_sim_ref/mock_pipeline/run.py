@@ -188,6 +188,7 @@ class PipelineConfig:
     od_model: str = "uniform"            # trip destination law: "uniform" | "gravity" (distance-decay)
     od_gravity_scale: float = 2.0        # gravity: hop decay scale (smaller -> shorter trips)
     attack_delay_s: float = 2.0          # flow: an attacker starts falsifying this long after spawn
+    attack_delay_jitter_s: float = 0.0   # spread attack onset across attackers by up to this (realism)
     state_prune_every: int = 50          # flow: steps between detection-state LRU prunes
     state_prune_ttl: int = 20            # flow: evict detection state untouched this many steps
     live_interval_s: float = 0.0         # >0: write a throttled live_state.json for the GUI map
@@ -549,6 +550,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 v.cur_x += v.lane_off * -math.sin(hr)
                 v.cur_y += v.lane_off * math.cos(hr)
         v.attack_from = (spawn_time + cfg.attack_delay_s) if cfg.traffic_flow else cfg.attack_start
+        if is_att and cfg.attack_delay_jitter_s > 0:  # varied attack onset across attackers (realism)
+            v.attack_from += random.Random(f"{cfg.seed}:onset:{vid}").random() * cfg.attack_delay_jitter_s
         v.attack_to = (spawn_time + life) if cfg.traffic_flow else cfg.attack_end
         if is_att and cfg.attack_duty_cycle < 1.0:   # desync pulses across attackers (own rng stream)
             v.pulse_phase = random.Random(f"{cfg.seed}:pulse:{vid}").random()
@@ -1422,6 +1425,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--attack-duty-cycle", type=float, default=1.0,
                    help="<1: attacker falsifies only in bursts (intermittent/pulsed, evades revocation)")
     p.add_argument("--attack-pulse-period", type=float, default=20.0, help="pulse cycle length (s) when duty<1")
+    p.add_argument("--attack-delay-jitter", type=float, default=0.0,
+                   help="spread attacker onset times by up to this many seconds (realistic varied onset)")
     p.add_argument("--faulty-pct", type=float, default=0.05)
     p.add_argument("--weather", default="clear", choices=list(WEATHER_MULT))
     p.add_argument("--rotate-period", type=float, default=0.0, help="pseudonym rotation period (s); 0=off")
@@ -1478,6 +1483,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                          attacker_pct=args.attacker_pct, attack_intensity=args.attack_intensity,
                          attack_duty_cycle=args.attack_duty_cycle,
                          attack_pulse_period_s=args.attack_pulse_period,
+                         attack_delay_jitter_s=args.attack_delay_jitter,
                          faulty_pct=args.faulty_pct,
                          weather=args.weather, rotate_period_s=args.rotate_period,
                          collude_pct=args.collude_pct, victim_pct=args.victim_pct,

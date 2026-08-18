@@ -152,3 +152,22 @@ def test_duty_cycle_one_is_byte_identical_to_default(tmp_path):
                                        attack_duty_cycle=1.0, attack_pulse_period_s=20.0,
                                        out_dir=str(tmp_path / "b")))
     assert base.data_digest == same.data_digest
+
+
+def test_attack_delay_jitter_spreads_onset_and_is_byte_identical_at_zero(tmp_path):
+    """Onset jitter diversifies attacker start times; jitter=0 is byte-identical to the default."""
+    import statistics
+    # byte-identical no-op at 0
+    a = run_pipeline(PipelineConfig(seed=4, n_vehicles=30, n_steps=80, attacker_pct=0.3,
+                                    out_dir=str(tmp_path / "a")))
+    b = run_pipeline(PipelineConfig(seed=4, n_vehicles=30, n_steps=80, attacker_pct=0.3,
+                                    attack_delay_jitter_s=0.0, out_dir=str(tmp_path / "b")))
+    assert a.data_digest == b.data_digest
+
+    # with jitter, attacker start_times are spread out (not all identical)
+    run_pipeline(PipelineConfig(seed=4, n_vehicles=40, n_steps=80, attacker_pct=0.4,
+                                attack_start=5.0, attack_delay_jitter_s=20.0,
+                                out_dir=str(tmp_path / "j")))
+    starts = [atk["start_time"] for atk in _jsonl(tmp_path / "j" / "ground_truth" / "gt_attacks.jsonl")]
+    assert len(set(starts)) > 3 and statistics.pstdev(starts) > 1.0, starts
+    assert min(starts) >= 5.0 and max(starts) <= 25.0 + 1e-6
