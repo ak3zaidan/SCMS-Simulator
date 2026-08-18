@@ -17,6 +17,10 @@ from scms_sim_ref.mock_pipeline.run import validate_config
     dict(fleet="spaceship"),
     dict(road_network="hyperloop"),
     dict(traffic_flow=True, road_network="grid", grid_w=1, grid_h=1),
+    dict(od_model="teleport"),
+    dict(turn_speed_mps=-1.0),
+    dict(attack_pulse_period_s=0.0),
+    dict(od_gravity_scale=0.0),
 ])
 def test_invalid_config_raises_clear_error(kw):
     with pytest.raises(ValueError):

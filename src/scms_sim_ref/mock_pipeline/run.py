@@ -412,6 +412,12 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"demand_profile must be uniform|rush|night (got {cfg.demand_profile!r})")
     if cfg.od_model not in ("uniform", "gravity"):
         raise ValueError(f"od_model must be uniform|gravity (got {cfg.od_model!r})")
+    if cfg.turn_speed_mps < 0:
+        raise ValueError(f"turn_speed_mps must be >= 0 (got {cfg.turn_speed_mps})")
+    if cfg.attack_pulse_period_s <= 0:
+        raise ValueError(f"attack_pulse_period_s must be > 0 (got {cfg.attack_pulse_period_s})")
+    if cfg.od_gravity_scale <= 0:
+        raise ValueError(f"od_gravity_scale must be > 0 (got {cfg.od_gravity_scale})")
     if cfg.fleet != "mixed" and cfg.fleet not in VEHICLE_TYPES:
         raise ValueError(f"fleet must be 'mixed' or one of {sorted(VEHICLE_TYPES)} (got {cfg.fleet!r})")
     if cfg.road_network not in ("linear", "grid"):
