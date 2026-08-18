@@ -64,6 +64,14 @@ def test_cli_preset_applies_and_flags_override(tmp_path):
     assert cfg["duration_s"] == 20.0 and cfg["attacker_pct"] == 0.0
 
 
+def test_list_presets_exits_cleanly(capsys):
+    from scms_sim_ref.mock_pipeline.run import main, CLI_PRESETS
+    assert main(["--list-presets"]) == 0
+    out = capsys.readouterr().out
+    for name in CLI_PRESETS:
+        assert name in out
+
+
 def test_all_cli_presets_run(tmp_path):
     """Every named preset produces a valid dataset (short duration override for speed)."""
     import json

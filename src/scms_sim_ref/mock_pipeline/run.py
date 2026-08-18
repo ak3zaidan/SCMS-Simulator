@@ -1490,10 +1490,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="write the effective config to this JSON path, then run as usual")
     p.add_argument("--dump-config-schema", default=None,
                    help="write the config field schema (name/type/default) to this JSON path and exit")
+    p.add_argument("--list-presets", action="store_true",
+                   help="print the named scenario presets and their settings, then exit")
     p.add_argument("--out", default=None)
     if _preargs.preset:                              # preset seeds defaults; explicit flags override
         p.set_defaults(**CLI_PRESETS[_preargs.preset])
     args = p.parse_args(argv)
+    if args.list_presets:                             # print preset names + settings and exit
+        for name, kw in CLI_PRESETS.items():
+            print(f"{name}:")
+            print("   " + ", ".join(f"{k}={v}" for k, v in sorted(kw.items())))
+        return 0
     if args.dump_config_schema:                       # emit the config field schema and exit (no run)
         with open(args.dump_config_schema, "w", encoding="utf-8", newline="\n") as fh:
             json.dump(config_schema(), fh, indent=2, sort_keys=True)
