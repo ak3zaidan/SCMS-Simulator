@@ -46,6 +46,19 @@ def test_flow_is_deterministic_and_leakage_free(tmp_path):
             assert find_forbidden_keys(row) == [], f"{name} leaks: {find_forbidden_keys(row)}"
 
 
+def test_all_new_realism_features_are_deterministic(tmp_path):
+    """Every new flow realism knob enabled at once still yields byte-identical output run-to-run."""
+    kw = dict(traffic_flow=True, road_network="grid", duration_s=200.0, arrival_rate=2.5,
+              grid_w=6, grid_h=6, n_lanes=2, car_following=True, od_model="gravity",
+              turn_slowdown=True, traffic_lights=True, demand_profile="rush", fleet="mixed",
+              attacker_pct=0.2, attack_duty_cycle=0.4, attack_pulse_period_s=15.0,
+              attack_delay_jitter_s=10.0, rotate_period_s=60.0, collude_pct=0.3, weather="rain",
+              seed=13)
+    a = run_pipeline(PipelineConfig(out_dir=str(tmp_path / "a"), **kw))
+    b = run_pipeline(PipelineConfig(out_dir=str(tmp_path / "b"), **kw))
+    assert a.data_digest == b.data_digest, "combined new-realism config must be deterministic"
+
+
 def test_flow_streamed_report_count_matches_manifest(tmp_path):
     r = _flow(tmp_path)
     man = json.loads((tmp_path / "run" / "manifest.json").read_text())
