@@ -21,6 +21,20 @@ def test_detector_reliability_is_reported_and_sane(tmp_path):
     assert reliable, f"expected some high-precision detectors, got {dr}"
 
 
+def test_recall_by_type_is_per_attack_type(tmp_path):
+    """validate reports recall for each specific attack type (finer than family), with counts."""
+    out = str(tmp_path / "run")
+    run_pipeline(PipelineConfig(seed=3, n_vehicles=100, n_steps=140, attacker_pct=0.4,
+                                faulty_pct=0.0, out_dir=out))
+    rbt = V.validate(out)[0]["recall_by_type"]
+    assert rbt, "expected per-type recall"
+    for ty, d in rbt.items():
+        assert d["n"] >= 1 and 0.0 <= d["recall"] <= 1.0
+    # types present here must be a subset of the configured attack catalog
+    from scms_sim_ref.mock_pipeline.run import ATTACK_CATALOG
+    assert set(rbt) <= set(ATTACK_CATALOG)
+
+
 def test_collusion_lowers_a_detectors_report_precision(tmp_path):
     """Colluders file plausible false reports against benign victims -> report-level detector
     precision drops vs a collusion-free run (the diagnostic reflects gameability)."""

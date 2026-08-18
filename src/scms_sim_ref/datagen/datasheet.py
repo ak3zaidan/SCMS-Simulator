@@ -198,6 +198,11 @@ def build(dataset_dir: str) -> str:
     if rbf:
         L.append("- Recall by attack family (the difficulty profile): "
                  + ", ".join(f"{f} {v}" for f, v in sorted(rbf.items(), key=lambda kv: kv[1])))
+    rbt = vsum.get("recall_by_type") or {}
+    if rbt:
+        hardest = sorted(rbt.items(), key=lambda kv: kv[1]["recall"])[:6]
+        L.append("- Hardest attack types (lowest recall): "
+                 + ", ".join(f"{t} {d['recall']} (n={d['n']})" for t, d in hardest))
     dr = vsum.get("detector_reliability") or {}
     if dr:
         L.append("- Per-detector reliability (report-level precision @ coverage — which reason codes "

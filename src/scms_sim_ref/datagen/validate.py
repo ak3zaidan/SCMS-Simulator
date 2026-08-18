@@ -67,15 +67,25 @@ def validate(dataset_dir: str) -> tuple[dict, list]:
     # per-family recall: which attack families the MA actually catches (the dataset's difficulty
     # profile). Families that evade -> the hard, research-relevant cases.
     from .featurize import _ATTACK_FAMILY
+    gt_atk_rows = _read(os.path.join(gt, "gt_attacks.jsonl"))
     fam_of = {a["true_vehicle_id"]: _ATTACK_FAMILY.get(str(a.get("attack_type", "")).split("/")[0], "other")
-              for a in _read(os.path.join(gt, "gt_attacks.jsonl"))}
+              for a in gt_atk_rows}
+    type_of = {a["true_vehicle_id"]: str(a.get("attack_type", "")).split("/")[0] for a in gt_atk_rows}
     fam_tot: dict[str, int] = {}
     fam_caught: dict[str, int] = {}
+    typ_tot: dict[str, int] = {}
+    typ_caught: dict[str, int] = {}
     for v in attackers:
         f = fam_of.get(v, "other")
         fam_tot[f] = fam_tot.get(f, 0) + 1
         fam_caught[f] = fam_caught.get(f, 0) + (1 if v in revoked else 0)
+        ty = type_of.get(v, "?")
+        typ_tot[ty] = typ_tot.get(ty, 0) + 1
+        typ_caught[ty] = typ_caught.get(ty, 0) + (1 if v in revoked else 0)
     recall_by_family = {f: round(fam_caught[f] / fam_tot[f], 3) for f in sorted(fam_tot)}
+    # finest difficulty signal: which specific attack TYPES evade (e.g. SlowDrift vs Teleport)
+    recall_by_type = {ty: {"recall": round(typ_caught[ty] / typ_tot[ty], 3), "n": typ_tot[ty]}
+                      for ty in sorted(typ_tot)}
 
     # per-detector reliability: of the reports citing each reason code, what fraction actually target
     # a true attacker (report-level precision) and how many reports it fires on (coverage). Shows
@@ -106,6 +116,7 @@ def validate(dataset_dir: str) -> tuple[dict, list]:
         "precision": round(precision, 3),
         "recall": round(recall, 3),
         "recall_by_family": recall_by_family,
+        "recall_by_type": recall_by_type,
         "detector_reliability": detector_reliability,
         "detection_latency_s": latency,
     }
