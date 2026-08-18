@@ -456,8 +456,17 @@ def config_from_dict(d: dict) -> PipelineConfig:
 # --------------------------------------------------------------------------- #
 # Pipeline
 # --------------------------------------------------------------------------- #
+# Graceful interruption of long (multi-hour) flow runs: a SIGINT (Ctrl-C) sets this flag; the step
+# loop checks it and breaks to the NORMAL finalization path, so the partial dataset is still written
+# with a valid manifest + digest instead of being lost. PER_STEP_HOOK is a test/telemetry seam called
+# once per step (default None -> zero effect); tests use it to simulate an interrupt deterministically.
+_ABORT = {"flag": False}
+PER_STEP_HOOK = None
+
+
 def run_pipeline(cfg: PipelineConfig) -> RunResult:
     validate_config(cfg)
+    _ABORT["flag"] = False                            # fresh per run (module state is not reentrant)
     rng = random.Random(cfg.seed)
     wmult = WEATHER_MULT.get(cfg.weather, 1.0)
     la1, la2 = LinkageAuthority(1), LinkageAuthority(2)
@@ -982,7 +991,27 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     spawn_order = sorted(vehicles, key=lambda v: (v.spawn_time, v.vid))
     spawn_ptr = 0
     active: dict[int, Vehicle] = {}
+    t = 0.0                                           # defined even if interrupted before step 0
+    # Catch Ctrl-C for a graceful stop (finish the step, then finalize). Only in the main thread; a
+    # second Ctrl-C restores the default handler so it hard-aborts. Restored after the loop.
+    import signal as _signal
+    _prev_sigint = None
+    try:
+        def _on_sigint(signum, frame):
+            if _ABORT["flag"]:                        # second Ctrl-C -> hard abort as usual
+                _signal.signal(_signal.SIGINT, _prev_sigint or _signal.SIG_DFL)
+                raise KeyboardInterrupt
+            _ABORT["flag"] = True
+        _prev_sigint = _signal.signal(_signal.SIGINT, _on_sigint)
+    except (ValueError, TypeError):                   # not the main thread -> no graceful handling
+        _prev_sigint = None
     for step in range(n_steps):
+        if PER_STEP_HOOK is not None:
+            PER_STEP_HOOK(step)                       # test/telemetry seam (may set _ABORT)
+        if _ABORT["flag"]:
+            print(f"[interrupted at step {step} -> finalizing partial dataset]", flush=True)
+            n_steps = step                            # manifest reflects the steps actually run
+            break
         t = step * cfg.dt
         touched_subjects.clear()
         while spawn_ptr < len(spawn_order) and spawn_order[spawn_ptr].spawn_time <= t:
@@ -1234,6 +1263,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             flush_streams()
             if (step + 1) % cfg.state_prune_every == 0:
                 prune_state(step, active)
+
+    if _prev_sigint is not None:                      # restore the caller's Ctrl-C behaviour
+        try:
+            _signal.signal(_signal.SIGINT, _prev_sigint)
+        except (ValueError, TypeError):
+            pass
 
     if stream:
         for fh in (fh_rep, fh_lbl, fh_emit):
