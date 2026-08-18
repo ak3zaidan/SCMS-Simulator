@@ -547,6 +547,11 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             pca.issue(dig, req_hash, i_k, j_k, la_h1, la_h2)
             vf = spawn_time + (k * cfg.rotate_period_s if cfg.rotate_period_s > 0 else 0.0)
             vt = spawn_time + ((k + 1) * cfg.rotate_period_s if cfg.rotate_period_s > 0 else life)
+            if cf and k == n_rot - 1:
+                # dynamic (congestion-dependent) despawn can outrun any life estimate; the vehicle's
+                # FINAL cert must stay valid for its whole presence, so cap it past the sim end -> a
+                # present benign vehicle can never show an "expired" cert (attacks override cvt/cvf).
+                vt = max(vt, total_time + cfg.dt)
             pseudonyms.append({"k": k, "i": i_k, "j": j_k, "digest": dig, "valid_from": vf, "valid_to": vt})
             pseudonym_info[dig] = {"i": i_k, "j": j_k, "lv": ctx.linkage_value_for(i_k, j_k),
                                    "ghost": False, "veh_vid": vid}
