@@ -33,6 +33,22 @@ def test_config_from_manifest_replays_byte_identical(tmp_path):
     assert a.data_digest == b.data_digest, "replay from manifest must reproduce the dataset exactly"
 
 
+def test_flow_config_manifest_replays_byte_identical(tmp_path):
+    """A realistic flow run (routed + car-following + new realism knobs) replays byte-for-byte from
+    its manifest -- the reproducibility guarantee for the path that matters most."""
+    cfg = PipelineConfig(seed=11, traffic_flow=True, road_network="grid", duration_s=120.0,
+                         arrival_rate=2.0, grid_w=6, grid_h=6, n_lanes=2, attacker_pct=0.2,
+                         od_model="gravity", turn_slowdown=True, traffic_lights=True,
+                         demand_profile="rush", attack_duty_cycle=0.5, boundary_origins=True,
+                         out_dir=str(tmp_path / "a"))
+    a = run_pipeline(cfg)
+    manifest = json.loads((tmp_path / "a" / "manifest.json").read_text())
+    cfg2 = config_from_dict(manifest)
+    cfg2.out_dir = str(tmp_path / "b")
+    b = run_pipeline(cfg2)
+    assert a.data_digest == b.data_digest, "flow replay from manifest must reproduce the dataset exactly"
+
+
 def test_config_from_dict_ignores_unknown_keys(capsys):
     cfg = config_from_dict({"seed": 3, "n_vehicles": 9, "not_a_real_field": 123})
     assert cfg.seed == 3 and cfg.n_vehicles == 9
