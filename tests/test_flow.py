@@ -59,6 +59,17 @@ def test_signalized_congestion_does_not_expire_benign_certs(tmp_path):
     assert reasons.get("certValidity", 0) <= 2, f"benign certs expiring under congestion: {reasons}"
 
 
+def test_signalized_congested_flow_keeps_reasonable_precision(tmp_path):
+    """A signalized rush-hour congested run (no heavy collusion) must still separate attacks from
+    congestion -- guards against a congestion/cert-window regression tanking precision under lights."""
+    _flow(tmp_path, traffic_lights=True, car_following=True, arrival_rate=3.0, grid_w=6, grid_h=6,
+          grid_block_m=140.0, duration_s=200.0, n_lanes=2, demand_profile="rush",
+          attacker_pct=0.15, collude_pct=0.0, faulty_pct=0.05)
+    s, _ = V.validate(str(tmp_path / "run"))
+    assert s["precision"] is not None and s["precision"] >= 0.7, s
+    assert s["recall"] is not None and s["recall"] >= 0.5, s
+
+
 def test_all_new_realism_features_are_deterministic(tmp_path):
     """Every new flow realism knob enabled at once still yields byte-identical output run-to-run."""
     kw = dict(traffic_flow=True, road_network="grid", duration_s=200.0, arrival_rate=2.5,
