@@ -43,6 +43,10 @@ def test_massive_grid_merges_with_domain_id_and_is_leakage_safe(tmp_path, monkey
     assert not (out / "domains").exists()
     cat = json.loads((out / "domain_catalog.json").read_text())
     assert len(cat) == 2 and {c["scenario"] for c in cat} == {"ConstPos", "ALL"}
+    # each domain carries difficulty labels (precision/recall/family recall) for curriculum/stratified use
+    for c in cat:
+        assert "recall" in c and "precision" in c and "recall_by_family" in c
+        assert c["recall"] is None or 0.0 <= c["recall"] <= 1.0
 
 
 def test_massive_isolates_a_failing_domain(tmp_path, monkeypatch):

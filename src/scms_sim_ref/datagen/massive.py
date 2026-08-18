@@ -32,6 +32,7 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "src"))
 from scms_sim_ref.mock_pipeline import PipelineConfig, run_pipeline   # noqa: E402
 from scms_sim_ref.datagen import featurize as featmod                 # noqa: E402
+from scms_sim_ref.datagen import validate as valmod                   # noqa: E402
 
 TABLES = ["report_features", "report_labels", "subject_features", "subject_labels",
           "vehicle_features", "vehicle_labels", "vehicle_features_ma", "vehicle_labels_ma",
@@ -172,8 +173,13 @@ def main(argv=None) -> int:
                 if csv.exists():
                     df = pd.read_csv(csv)
                     row_counts[tbl] += _append(df, idx, base / "ml" / f"{tbl}.csv", header_written)
+            # per-domain difficulty labels (from its own ground truth, before the dir is deleted):
+            # lets a trainer curriculum-weight or stratify the merged corpus by how hard each domain is.
+            vs = valmod.validate(str(dom_dir))[0]
             catalog.append({"domain_id": idx, **cell, "seed": cfg.seed,
-                            "reports": res.n_reports, "revoked": res.n_revoked})
+                            "reports": res.n_reports, "revoked": res.n_revoked,
+                            "precision": vs.get("precision"), "recall": vs.get("recall"),
+                            "recall_by_family": vs.get("recall_by_family", {})})
         except Exception as e:                       # noqa: BLE001 -- keep the campaign alive
             failed.append({"domain_id": idx, **cell, "error": f"{type(e).__name__}: {e}"})
             print(f"   [{idx + 1}/{len(cells)}] FAILED domain {idx}: {type(e).__name__}: {e}", flush=True)
