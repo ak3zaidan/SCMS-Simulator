@@ -198,6 +198,12 @@ def build(dataset_dir: str) -> str:
     if rbf:
         L.append("- Recall by attack family (the difficulty profile): "
                  + ", ".join(f"{f} {v}" for f, v in sorted(rbf.items(), key=lambda kv: kv[1])))
+    dr = vsum.get("detector_reliability") or {}
+    if dr:
+        L.append("- Per-detector reliability (report-level precision @ coverage — which reason codes "
+                 "carry trustworthy signal): "
+                 + ", ".join(f"{c} {d['precision']}@{d['reports']}"
+                             for c, d in sorted(dr.items(), key=lambda kv: -kv[1]["precision"])))
     L.append("")
 
     L.append("## Baseline ML benchmark (logreg vs GBDT, train->test, vehicle-disjoint)")

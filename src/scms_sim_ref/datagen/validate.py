@@ -77,6 +77,21 @@ def validate(dataset_dir: str) -> tuple[dict, list]:
         fam_caught[f] = fam_caught.get(f, 0) + (1 if v in revoked else 0)
     recall_by_family = {f: round(fam_caught[f] / fam_tot[f], 3) for f in sorted(fam_tot)}
 
+    # per-detector reliability: of the reports citing each reason code, what fraction actually target
+    # a true attacker (report-level precision) and how many reports it fires on (coverage). Shows
+    # which of the detectors carry trustworthy signal vs which are noisy / gameable by false reports.
+    idmap = _read(os.path.join(gt, "gt_identity_map.jsonl"))
+    d2v = {m.get("pseudonym_cert_digest"): m.get("true_vehicle_id") for m in idmap}
+    det_hits: dict[str, int] = {}
+    det_true: dict[str, int] = {}
+    for r in _read(os.path.join(ma, "ma_reports.jsonl")):
+        subj_atk = d2v.get(r.get("subject_cert_digest")) in attackers
+        for code in r.get("reason_codes", []):
+            det_hits[code] = det_hits.get(code, 0) + 1
+            det_true[code] = det_true.get(code, 0) + (1 if subj_atk else 0)
+    detector_reliability = {c: {"reports": det_hits[c], "precision": round(det_true[c] / det_hits[c], 3)}
+                            for c in sorted(det_hits)}
+
     summary = {
         "dataset_dir": dataset_dir,
         "ma_rows": ma_rows,
@@ -91,6 +106,7 @@ def validate(dataset_dir: str) -> tuple[dict, list]:
         "precision": round(precision, 3),
         "recall": round(recall, 3),
         "recall_by_family": recall_by_family,
+        "detector_reliability": detector_reliability,
         "detection_latency_s": latency,
     }
     return summary, leaks
