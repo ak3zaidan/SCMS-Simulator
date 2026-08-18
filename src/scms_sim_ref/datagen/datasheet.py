@@ -133,6 +133,18 @@ def build(dataset_dir: str) -> str:
             slowed = sum(1 for s in benign_sp if s < 5.0) / len(benign_sp)
             L.append(f"- Benign speed (m/s): {_stats(benign_sp)}; queued (<5 m/s): {100 * slowed:.0f}% "
                      f"(car-following congestion)")
+        # which mobility/attack realism features were active for this dataset (self-documenting)
+        feats = []
+        if cfg.get("n_lanes", 1) > 1: feats.append(f"{cfg['n_lanes']} lanes")
+        if cfg.get("traffic_lights"): feats.append("traffic lights")
+        if cfg.get("turn_slowdown"): feats.append("corner slowdown")
+        if cfg.get("od_model") == "gravity": feats.append("gravity trip lengths")
+        if cfg.get("demand_profile", "uniform") != "uniform": feats.append(f"{cfg['demand_profile']} demand")
+        if cfg.get("attack_duty_cycle", 1.0) < 1.0: feats.append(f"pulsed attacks (duty {cfg['attack_duty_cycle']})")
+        if cfg.get("attack_delay_jitter_s", 0.0) > 0: feats.append(f"onset jitter {cfg['attack_delay_jitter_s']}s")
+        if cfg.get("attack_intensity", 1.0) != 1.0: feats.append(f"attack intensity {cfg['attack_intensity']}")
+        if feats:
+            L.append("- Realism features active: " + ", ".join(feats))
         L.append("")
 
     L.append("## Feature distributions (MA-visible)")
