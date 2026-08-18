@@ -58,6 +58,21 @@ class Trip:
                 return self.wp[k], self.cum[k] - s
         return None, math.inf
 
+    def next_turn(self, s: float) -> tuple[float, float]:
+        """The next interior vertex ahead where the route BENDS: (distance, bend_angle[deg]).
+
+        The bend angle is the change of heading at that vertex (0 = straight through, ~90 for a
+        grid corner). Used to slow a vehicle realistically into turns. (inf, 0) if none ahead."""
+        for k in range(1, len(self.wp) - 1):        # interior vertices have an outgoing segment
+            if self.cum[k] > s + 1e-6:
+                (ax, ay), (bx, by), (cx, cy) = self.wp[k - 1], self.wp[k], self.wp[k + 1]
+                h_in = math.atan2(by - ay, bx - ax)
+                h_out = math.atan2(cy - by, cx - bx)
+                ang = abs(math.degrees(h_out - h_in))
+                ang = ang if ang <= 180.0 else 360.0 - ang
+                return self.cum[k] - s, ang
+        return math.inf, 0.0
+
 
 class GridNetwork:
     """A w x h grid of intersections spaced `block` metres apart, 4-neighbour roads."""

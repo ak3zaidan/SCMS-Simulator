@@ -173,6 +173,13 @@ class PipelineConfig:
     idm_lookahead_m: float = 70.0        # leader search distance ahead
     traffic_lights: bool = False         # signalized intersections (grid nodes) -> stops & queues
     light_cycle_s: float = 24.0          # full signal cycle (half green per axis)
+    # cornering: vehicles slow into sharp turns rather than taking 90-degree grid corners at full
+    # speed -> realistic speed dips at intersections (opt-in; car-following + grid only). Off by
+    # default: it makes benign kinematics harder to separate from attacks (more realistic, but it
+    # shifts the tuned operating point), so enable it deliberately for harder/realer corpora.
+    turn_slowdown: bool = False
+    turn_speed_mps: float = 6.0          # speed cap through a sharp bend (m/s); ~21 km/h
+    turn_min_angle_deg: float = 40.0     # only bends sharper than this are slowed
     # time-varying demand (rush hour / night) + origin-destination bias
     demand_profile: str = "uniform"      # "uniform" | "rush" | "night"
     attack_delay_s: float = 2.0          # flow: an attacker starts falsifying this long after spawn
@@ -848,6 +855,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     cf_active = bool(cfg.traffic_flow and cfg.car_following and net is not None)
     _CF_CELL = max(cfg.idm_lookahead_m, 30.0)
     _lights = bool(cfg.traffic_lights and net is not None)
+    _turn = bool(cfg.turn_slowdown and net is not None)
     _half_cycle = max(1.0, cfg.light_cycle_s / 2.0)
     # map-matching: on a grid the roads are the lines x=k*block and y=k*block. A claimed position far
     # from every road is implausible (HD-map check) -> catches lateral/diagonal position offsets.
@@ -917,6 +925,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                         stop_gap = max(0.0, dnode - 2.0)  # halt ~2 m before the stop line
                         if stop_gap < best_gap:
                             best_gap, best_v, best_len = stop_gap, 0.0, 0.0
+            if _turn and best_gap > 0.5:                 # slow into a sharp bend (curve-speed cap)
+                td, bend = v.trip.next_turn(v.s_pos)
+                if bend >= cfg.turn_min_angle_deg and td < cfg.idm_lookahead_m and td < best_gap:
+                    best_gap, best_v, best_len = td, min(v.desired_speed, cfg.turn_speed_mps), 0.0
             a = _idm_accel(v.cur_v, v.desired_speed, best_gap, best_v, best_len, v.idm_a, v.idm_b)
             v.cur_v = max(0.0, min(v.desired_speed, v.cur_v + a * cfg.dt))
             v.s_pos += v.cur_v * cfg.dt
@@ -1348,6 +1360,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--fleet", default="mixed", help="'mixed' or a single vehicle class (car/truck/bus/motorcycle)")
     p.add_argument("--live-interval", type=float, default=0.0, help="write live_state.json every N sim-seconds (GUI map)")
     p.add_argument("--no-car-following", action="store_true", help="disable IDM car-following")
+    p.add_argument("--turn-slowdown", action="store_true", help="slow into sharp grid corners (realer, harder)")
     p.add_argument("--traffic-lights", action="store_true", help="signalized intersections (grid)")
     p.add_argument("--gps-jam-rate", type=float, default=0.0, help="per-step prob a benign vehicle loses GNSS fix")
     p.add_argument("--max-total-vehicles", type=int, default=0, help="flow: cap total spawns (0=unlimited)")
@@ -1384,6 +1397,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                          grid_w=args.grid, grid_h=(args.grid_h or args.grid), grid_block_m=args.grid_block,
                          n_lanes=args.lanes,
                          demand_profile=args.demand, car_following=not args.no_car_following,
+                         turn_slowdown=args.turn_slowdown,
                          fleet=args.fleet, live_interval_s=args.live_interval,
                          traffic_lights=args.traffic_lights, gps_jam_rate=args.gps_jam_rate,
                          max_total_vehicles=args.max_total_vehicles, verbose=True,

@@ -146,6 +146,26 @@ def test_multilane_reduces_gridlock(tmp_path):
     assert mean_speed(3) > mean_speed(1) + 1.0, "multi-lane should relieve single-lane gridlock"
 
 
+def test_turn_slowdown_dips_speed_at_corners(tmp_path):
+    """Cornering (opt-in) makes vehicles slow into sharp bends. At LOW density (no congestion to
+    confound it), honest speeds dip toward the turn cap only when it is enabled."""
+    def low_speeds(turn):
+        # arrival_rate low + fast free speed: without turns honest traffic runs near free speed,
+        # so any slow honest samples come from the corner cap, not from queueing.
+        _flow(tmp_path / str(turn), turn_slowdown=turn, car_following=True, arrival_rate=0.6,
+              duration_s=220.0, grid_w=6, grid_h=6, grid_block_m=140.0, attacker_pct=0.0,
+              faulty_pct=0.0, trip_speed_min=16.0, trip_speed_max=20.0)
+        em = _jsonl(tmp_path / str(turn) / "run" / "ground_truth" / "gt_emissions_sample.jsonl")
+        sp = [e["claimed_speed"] for e in em if not e["is_attacker"]]
+        frac_slow = sum(1 for s in sp if s < 10.0) / max(1, len(sp))
+        return frac_slow, (min(sp) if sp else 99.0)
+
+    on_frac, on_min = low_speeds(True)
+    off_frac, off_min = low_speeds(False)
+    assert on_frac > off_frac + 0.05, f"cornering should add slow samples: on={on_frac} off={off_frac}"
+    assert on_min < off_min - 1.0, f"cornering should push a lower min speed: on={on_min} off={off_min}"
+
+
 def test_traffic_lights_create_stops_at_intersections(tmp_path):
     """Signalized intersections make vehicles fully stop at reds (queues), unlike free-flow."""
     def stopped_fraction(lights):
