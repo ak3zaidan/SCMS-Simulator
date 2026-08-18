@@ -1496,6 +1496,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="write the config field schema (name/type/default) to this JSON path and exit")
     p.add_argument("--list-presets", action="store_true",
                    help="print the named scenario presets and their settings, then exit")
+    p.add_argument("--check-config", default=None,
+                   help="validate a config/manifest JSON (no run); exit 0 if valid, 1 with the error")
     p.add_argument("--out", default=None)
     if _preargs.preset:                              # preset seeds defaults; explicit flags override
         p.set_defaults(**CLI_PRESETS[_preargs.preset])
@@ -1504,6 +1506,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         for name, kw in CLI_PRESETS.items():
             print(f"{name}:")
             print("   " + ", ".join(f"{k}={v}" for k, v in sorted(kw.items())))
+        return 0
+    if args.check_config:                             # validate a config/manifest JSON and exit
+        try:
+            with open(args.check_config, encoding="utf-8") as fh:
+                cfg = config_from_dict(json.load(fh))
+            validate_config(cfg)
+        except (OSError, ValueError, TypeError) as e:
+            print(f"config INVALID: {type(e).__name__}: {e}", file=_sys.stderr)
+            return 1
+        print(f"config OK: {len(cfg.__dict__)} fields, seed={cfg.seed}, out_dir={cfg.out_dir}")
         return 0
     if args.dump_config_schema:                       # emit the config field schema and exit (no run)
         with open(args.dump_config_schema, "w", encoding="utf-8", newline="\n") as fh:

@@ -73,6 +73,19 @@ def test_cli_dump_config_schema(tmp_path):
     assert "attack_duty_cycle" in sch and "od_model" in sch and "turn_slowdown" in sch
 
 
+def test_cli_check_config_valid_and_invalid(tmp_path):
+    import json
+    from scms_sim_ref.mock_pipeline.run import main
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps({"seed": 5, "n_vehicles": 10, "weather": "rain"}))
+    assert main(["--check-config", str(good)]) == 0
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"weather": "hail"}))          # invalid enum -> validate_config raises
+    assert main(["--check-config", str(bad)]) == 1
+    missing = tmp_path / "nope.json"
+    assert main(["--check-config", str(missing)]) == 1       # unreadable -> 1, not a crash
+
+
 def test_cli_config_flag_runs(tmp_path):
     src = _cfg(tmp_path / "src")
     cfgpath = tmp_path / "c.json"
