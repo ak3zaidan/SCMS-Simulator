@@ -1553,6 +1553,15 @@ def _emit_result(res, featurize: bool) -> None:
           f"investigations={res.n_investigations} revoked={res.n_revoked}")
     print(f"revoked_cert_digests={res.revoked_cert_digests[:8]}")
     print(f"data_digest={res.data_digest}")
+    try:                                             # immediate detection-quality feedback (top layer)
+        from ..datagen import validate as _val
+        s, _ = _val.validate(res.out_dir)
+        lat = (s.get("detection_latency_s") or {}).get("median_s")
+        print(f"detection: precision={s.get('precision')} recall={s.get('recall')} "
+              f"attackers={s.get('attackers')} revoked={s.get('revoked')}"
+              + (f" latency_med={lat}s" if lat is not None else ""))
+    except Exception:                                # never let a summary print break the run
+        pass
     if featurize:
         from ..datagen import featurize as _feat
         _feat.build(res.out_dir)
