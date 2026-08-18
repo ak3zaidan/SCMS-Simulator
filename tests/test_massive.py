@@ -63,6 +63,14 @@ def test_medium_grid_is_valid_and_between_quick_and_full(tmp_path):
     assert rc == 0 and (out / "manifest.json").exists()
 
 
+def test_massive_dry_run_writes_nothing(tmp_path):
+    """--dry-run previews the plan and exits without creating the output directory."""
+    out = tmp_path / "dry"
+    rc = massive.main(["--grid", "medium", "--dry-run", "--out", str(out)])
+    assert rc == 0
+    assert not out.exists(), "dry-run must not write any output"
+
+
 def test_massive_isolates_a_failing_domain(tmp_path, monkeypatch):
     """One bad cell must not abort the campaign: it is recorded in failed_domains and the rest merge."""
     tiny = {"scenario": ["ConstPos", "RandomSpeed", "ALL"], "weather": ["clear"],

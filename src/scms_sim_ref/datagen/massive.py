@@ -139,6 +139,7 @@ def main(argv=None) -> int:
     ap.add_argument("--steps", type=int, default=80)
     ap.add_argument("--max-domains", type=int, default=0, help="cap cells (0 = no cap / full grid)")
     ap.add_argument("--sample", action="store_true", help="if capped, randomly sample cells instead of taking the first")
+    ap.add_argument("--dry-run", action="store_true", help="print the plan (cell count + axes) and exit without generating")
     ap.add_argument("--keep-domains", action="store_true", help="keep each per-domain dir (default: delete after merge)")
     ap.add_argument("--parquet", action="store_true", help="also write merged parquet (memory-heavy at scale)")
     ap.add_argument("--flow", action="store_true", help="each domain is a long routed flow simulation")
@@ -163,15 +164,19 @@ def main(argv=None) -> int:
             cells = cells[:a.max_domains]
         dropped = total - len(cells)
 
+    print(f"== massive grid '{a.grid}': {total} cells in the product, running {len(cells)}"
+          + (f" (CAP dropped {dropped})" if dropped else "") + f", seed {a.seed} ==", flush=True)
+    print(f"   axes: " + ", ".join(f"{k}({len(v)})" for k, v in grid.items()), flush=True)
+    if a.dry_run:                                    # preview the plan without generating anything
+        print(f"   [dry-run] would generate {len(cells)} domain(s) into {a.out}; no output written.",
+              flush=True)
+        return 0
+
     base = Path(a.out)
     if base.exists():
         shutil.rmtree(base)
     (base / "ml").mkdir(parents=True)
     (base / "domains").mkdir(parents=True)
-
-    print(f"== massive grid '{a.grid}': {total} cells in the product, running {len(cells)}"
-          + (f" (CAP dropped {dropped})" if dropped else "") + f", seed {a.seed} ==", flush=True)
-    print(f"   axes: " + ", ".join(f"{k}({len(v)})" for k, v in grid.items()), flush=True)
 
     header_written: set = set()
     catalog, row_counts, failed = [], {t: 0 for t in TABLES}, []
