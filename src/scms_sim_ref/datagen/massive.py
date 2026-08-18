@@ -158,23 +158,31 @@ def main(argv=None) -> int:
     print(f"   axes: " + ", ".join(f"{k}({len(v)})" for k, v in grid.items()), flush=True)
 
     header_written: set = set()
-    catalog, row_counts = [], {t: 0 for t in TABLES}
+    catalog, row_counts, failed = [], {t: 0 for t in TABLES}, []
     for idx, cell in enumerate(cells):
         dom_dir = base / "domains" / f"d{idx:04d}"
-        cfg = cell_config(cell, idx, a.seed, a.steps, dom_dir, flow=a.flow, flow_duration=a.flow_duration)
-        res = run_pipeline(cfg)
-        featmod.build(str(dom_dir), split_seed=1234)
-        for tbl in TABLES:
-            csv = dom_dir / "ml" / f"{tbl}.csv"
-            if csv.exists():
-                df = pd.read_csv(csv)
-                row_counts[tbl] += _append(df, idx, base / "ml" / f"{tbl}.csv", header_written)
-        catalog.append({"domain_id": idx, **cell, "seed": cfg.seed,
-                        "reports": res.n_reports, "revoked": res.n_revoked})
-        if not a.keep_domains:
-            shutil.rmtree(dom_dir, ignore_errors=True)
+        # Isolate each cell: one bad domain (e.g. a degenerate config) must not throw away the
+        # thousands of good ones already merged. Failures are RECORDED (not silently dropped).
+        try:
+            cfg = cell_config(cell, idx, a.seed, a.steps, dom_dir, flow=a.flow, flow_duration=a.flow_duration)
+            res = run_pipeline(cfg)
+            featmod.build(str(dom_dir), split_seed=1234)
+            for tbl in TABLES:
+                csv = dom_dir / "ml" / f"{tbl}.csv"
+                if csv.exists():
+                    df = pd.read_csv(csv)
+                    row_counts[tbl] += _append(df, idx, base / "ml" / f"{tbl}.csv", header_written)
+            catalog.append({"domain_id": idx, **cell, "seed": cfg.seed,
+                            "reports": res.n_reports, "revoked": res.n_revoked})
+        except Exception as e:                       # noqa: BLE001 -- keep the campaign alive
+            failed.append({"domain_id": idx, **cell, "error": f"{type(e).__name__}: {e}"})
+            print(f"   [{idx + 1}/{len(cells)}] FAILED domain {idx}: {type(e).__name__}: {e}", flush=True)
+        finally:
+            if not a.keep_domains:
+                shutil.rmtree(dom_dir, ignore_errors=True)
         if (idx + 1) % 25 == 0 or idx + 1 == len(cells):
-            print(f"   [{idx + 1}/{len(cells)}] merged; report rows so far={row_counts['report_features']}", flush=True)
+            print(f"   [{idx + 1}/{len(cells)}] merged; report rows so far={row_counts['report_features']}"
+                  + (f"; {len(failed)} failed" if failed else ""), flush=True)
 
     if not a.keep_domains:
         shutil.rmtree(base / "domains", ignore_errors=True)
@@ -197,9 +205,11 @@ def main(argv=None) -> int:
     manifest = {
         "generator": "scms_sim_ref.datagen.massive (factorial grid)",
         "grid": a.grid, "seed": a.seed, "n_cells_in_product": total,
-        "n_domains_run": len(cells), "n_dropped_by_cap": dropped,
+        "n_domains_run": len(cells), "n_domains_ok": len(catalog),
+        "n_domains_failed": len(failed), "n_dropped_by_cap": dropped,
         "axes": {k: v for k, v in grid.items()},
         "row_counts": row_counts, "data_digest_sha256": dh.hexdigest(),
+        "failed_domains": failed,
         "outputs": [{"path": k, "sha256": v} for k, v in sorted(outputs.items())],
     }
     (base / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
@@ -208,6 +218,14 @@ def main(argv=None) -> int:
     print(f"\n== merged dataset row counts ==")
     for t in TABLES:
         print(f"   {t:24s} {row_counts[t]:>10,}")
+    if failed:
+        print(f"\n!! {len(failed)}/{len(cells)} domains FAILED (recorded in manifest.failed_domains); "
+              f"the campaign merged the {len(catalog)} that succeeded.", flush=True)
+
+    if not catalog or row_counts["report_features"] == 0:
+        print("\nNo domains produced data -- skipping merged benchmark.", flush=True)
+        print(f"\nDONE (with failures). Massive dataset at {base}", flush=True)
+        return 1 if failed else 0
 
     # benchmark the merged dataset (incl. leave-one-domain-out generalization)
     from scms_sim_ref.datagen import benchmark as bmod

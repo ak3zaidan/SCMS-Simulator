@@ -45,6 +45,32 @@ def test_massive_grid_merges_with_domain_id_and_is_leakage_safe(tmp_path, monkey
     assert len(cat) == 2 and {c["scenario"] for c in cat} == {"ConstPos", "ALL"}
 
 
+def test_massive_isolates_a_failing_domain(tmp_path, monkeypatch):
+    """One bad cell must not abort the campaign: it is recorded in failed_domains and the rest merge."""
+    tiny = {"scenario": ["ConstPos", "RandomSpeed", "ALL"], "weather": ["clear"],
+            "rotate_period_s": [0.0], "collude_pct": [0.0], "faulty_pct": [0.0],
+            "attacker_pct": [0.25], "n_vehicles": [40]}
+    monkeypatch.setitem(massive.GRIDS, "tiny", tiny)
+
+    real = massive.run_pipeline
+    def boom(cfg):                                   # make domain 1 explode, others run normally
+        if "d0001" in str(cfg.out_dir):
+            raise RuntimeError("synthetic domain failure")
+        return real(cfg)
+    monkeypatch.setattr(massive, "run_pipeline", boom)
+
+    out = tmp_path / "massive"
+    rc = massive.main(["--grid", "tiny", "--seed", "3", "--steps", "50", "--out", str(out)])
+    assert rc == 0                                   # campaign still succeeds (some domains merged)
+
+    man = json.loads((out / "manifest.json").read_text())
+    assert man["n_domains_failed"] == 1 and man["n_domains_ok"] == 2
+    assert man["failed_domains"][0]["domain_id"] == 1
+    assert "synthetic domain failure" in man["failed_domains"][0]["error"]
+    vf = pd.read_csv(out / "ml" / "vehicle_features.csv")
+    assert set(vf["domain_id"].unique()) == {0, 2}, "only the successful domains are merged"
+
+
 def test_massive_flow_domains_are_routed_simulations(tmp_path, monkeypatch):
     """--flow makes each domain a long routed car-following sim; demand becomes an axis."""
     tiny = {"scenario": ["ConstPos", "ALL"], "weather": ["clear"], "rotate_period_s": [0.0],
