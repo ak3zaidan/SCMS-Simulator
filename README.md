@@ -44,8 +44,8 @@ config → byte-identical data) and memory-bounded via streaming.
 python -m scms_sim_ref.mock_pipeline.run --flow --road grid --grid 8 --duration 1800 `
     --arrival-rate 2 --attacker-pct 0.15 --collude-pct 0.3 --traffic-lights --demand rush `
     --featurize --out datasets/long_run
-# a huge multi-domain training corpus (every scenario x permutation, merged with domain_id)
-python -m scms_sim_ref.datagen.massive --grid full --flow --out datasets/massive
+# a multi-domain training corpus (scenario x permutation, merged with domain_id). grids: quick|medium|full
+python -m scms_sim_ref.datagen.massive --grid medium --flow --out datasets/massive   # --dry-run to preview size
 
 # one-command named scenario (flags still override); reproduce any past run byte-for-byte from its manifest
 python -m scms_sim_ref.mock_pipeline.run --preset urban_rush --featurize --out datasets/urban
