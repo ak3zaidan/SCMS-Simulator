@@ -33,6 +33,25 @@ def test_interrupt_finalizes_partial_dataset(tmp_path):
     assert s["leakage_violations"] == 0
 
 
+def test_interrupted_partial_dataset_is_usable_downstream(tmp_path):
+    """A Ctrl-C'd partial dataset must still featurize into ML tables without crashing."""
+    from scms_sim_ref.datagen import featurize
+    out = str(tmp_path / "run")
+    def hook(step):
+        if step == 30:
+            runmod._ABORT["flag"] = True
+    runmod.PER_STEP_HOOK = hook
+    try:
+        run_pipeline(PipelineConfig(seed=7, traffic_flow=True, road_network="grid", duration_s=600.0,
+                                    arrival_rate=2.5, grid_w=6, grid_h=6, attacker_pct=0.2,
+                                    out_dir=out))
+    finally:
+        runmod.PER_STEP_HOOK = None
+    featurize.build(out)                              # must not raise on a partial dataset
+    import os
+    assert os.path.exists(os.path.join(out, "ml", "schema.json"))
+
+
 def test_abort_flag_is_reset_between_runs(tmp_path):
     """A stale abort flag from a prior run must not truncate the next run."""
     runmod._ABORT["flag"] = True                      # leftover from a hypothetical earlier interrupt
