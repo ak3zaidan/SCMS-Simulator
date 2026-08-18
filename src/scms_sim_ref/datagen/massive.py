@@ -96,7 +96,9 @@ def cell_config(cell: dict, idx: int, base_seed: int, n_steps: int, out_dir: Pat
                   duration_s=flow_duration, arrival_rate=2.0, grid_w=6, grid_h=6, n_lanes=2,
                   grid_block_m=140.0, demand_profile=cell.get("demand", "uniform"),
                   traffic_lights=bool(cell.get("lights", False)), fleet=cell.get("fleet", "mixed"),
-                  attack_intensity=cell.get("intensity", 1.0))
+                  attack_intensity=cell.get("intensity", 1.0),
+                  attack_duty_cycle=cell.get("duty", 1.0),        # pulsed-attack difficulty axis
+                  od_model=cell.get("od", "uniform"))             # trip-length realism axis
     return PipelineConfig(**kw)
 
 
@@ -135,9 +137,11 @@ def main(argv=None) -> int:
 
     grid = dict(GRIDS[a.grid])
     if a.flow:
-        # under flow, demand / signals / fleet become permutation axes; n_vehicles is irrelevant
+        # under flow, demand / signals / fleet / attack difficulty become permutation axes; n_vehicles
+        # is irrelevant. "duty" spans continuous vs pulsed (evasive) attackers -> a difficulty axis.
         grid = {**grid, "demand": ["uniform", "rush", "night"], "lights": [False, True],
-                "fleet": ["mixed", "car"], "intensity": [1.0, 0.5], "n_vehicles": [0]}
+                "fleet": ["mixed", "car"], "intensity": [1.0, 0.5], "duty": [1.0, 0.4],
+                "n_vehicles": [0]}
     cells = enumerate_cells(grid)
     total = len(cells)
     dropped = 0

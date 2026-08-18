@@ -86,5 +86,6 @@ def test_massive_flow_domains_are_routed_simulations(tmp_path, monkeypatch):
     assert rc == 0
     cat = json.loads((out / "domain_catalog.json").read_text())
     assert all("demand" in c for c in cat), "flow domains carry a demand profile"
+    assert all("duty" in c for c in cat), "flow domains span the pulsed-attack difficulty axis"
     vf = pd.read_csv(out / "ml" / "vehicle_features.csv")
     assert "domain_id" in vf.columns and len(vf) > 0
