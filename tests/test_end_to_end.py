@@ -48,9 +48,12 @@ def test_full_flow_pipeline_end_to_end(tmp_path):
     # 4) calibration: GNSS error in the real range
     assert calibration.calibrate(out)["gps_error"]["cep_in_real_range"]
 
-    # 5) datasheet renders and includes the traffic-flow section
+    # 5) datasheet renders and includes the traffic-flow section + the analysis diagnostics
     md = datasheet.build(out)
     assert "Traffic flow & congestion" in md and "Fleet composition" in md
+    assert "Per-detector reliability" in md, "detector-reliability table must render"
+    assert "Hardest attack types" in md, "per-type difficulty must render"
+    assert "best-F1 operating point" in md, "best-F1 operating point must render"
 
     # 6) data-integrity audit: no FAILs on this dataset
     fails = [r for r in verify_data.run_audit(Path(out).parent) if r[2] == "FAIL"]
