@@ -64,6 +64,17 @@ GRIDS = {
         "attacker_pct": [0.2],
         "n_vehicles": [60],
     },
+    # a tractable middle ground: broad attack + condition coverage without the full product's blow-up
+    "medium": {
+        "scenario": ["ConstPos", "ConstPosOffset", "RandomSpeed", "HeadingOffset", "ReversedHeading",
+                     "SlowDrift", "AlongRoadOffset", "DoS", "Sybil", "InvalidSignature", "ALL"],
+        "weather": ["clear", "rain"],
+        "rotate_period_s": [0.0, 60.0],
+        "collude_pct": [0.0, 0.5],
+        "faulty_pct": [0.05],
+        "attacker_pct": [0.2],
+        "n_vehicles": [80],
+    },
 }
 
 

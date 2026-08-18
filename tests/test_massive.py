@@ -49,6 +49,20 @@ def test_massive_grid_merges_with_domain_id_and_is_leakage_safe(tmp_path, monkey
         assert c["recall"] is None or 0.0 <= c["recall"] <= 1.0
 
 
+def test_medium_grid_is_valid_and_between_quick_and_full(tmp_path):
+    from scms_sim_ref.mock_pipeline.run import ATTACK_CATALOG
+    for g in ("quick", "medium", "full"):
+        for s in massive.GRIDS[g]["scenario"]:
+            assert s == "ALL" or s in ATTACK_CATALOG, f"{g} has invalid scenario {s}"
+    n = {g: len(massive.enumerate_cells(massive.GRIDS[g])) for g in ("quick", "medium", "full")}
+    assert n["quick"] < n["medium"] < n["full"]
+    # the medium grid runs end-to-end (capped to keep the test fast)
+    out = tmp_path / "med"
+    rc = massive.main(["--grid", "medium", "--max-domains", "2", "--steps", "40",
+                       "--seed", "5", "--out", str(out)])
+    assert rc == 0 and (out / "manifest.json").exists()
+
+
 def test_massive_isolates_a_failing_domain(tmp_path, monkeypatch):
     """One bad cell must not abort the campaign: it is recorded in failed_domains and the rest merge."""
     tiny = {"scenario": ["ConstPos", "RandomSpeed", "ALL"], "weather": ["clear"],
