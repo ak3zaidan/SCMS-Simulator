@@ -107,6 +107,10 @@ def test_feature_schema_json_classifies_columns_safely(tmp_path):
         assert not [c for c in feats if is_forbidden_feature_key(c)], f"{tbl} feature col is leaky"
     # label tables expose their labels as kind=label/id, never as feature
     assert any(c["kind"] == "label" for c in schema["subject_labels"])
+    # data dictionary: detector fusion features carry a human-readable description
+    rf = {c["name"]: c for c in schema["report_features"]}
+    heading = rf.get("detnorm_headingInconsistency")
+    assert heading and heading.get("desc"), "detector features should carry a desc in schema.json"
 
 
 def test_featurize_is_deterministic(tmp_path):

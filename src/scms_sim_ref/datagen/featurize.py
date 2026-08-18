@@ -465,6 +465,46 @@ _ID_COLS = {"report_id", "subject_cert_digest", "reporter_cert_digest", "entity_
             "true_vehicle_id", "src_entity", "dst_entity", "window"}
 
 
+# Human-readable data dictionary: what each detector/engineered feature means. Emitted into
+# schema.json so an ML consumer understands the columns without reading the generator source.
+_DETECTOR_DOCS = {
+    "positionSpeedInconsistency": "claimed displacement inconsistent with claimed speed over the interval",
+    "positionJump": "implausibly large position change between consecutive claims",
+    "headingInconsistency": "claimed heading vs the bearing implied by consecutive positions",
+    "staleOrReplay": "claim generation-time older than the staleness threshold (stale/replayed)",
+    "constantPositionFrozen": "position frozen across consecutive CAMs while still claiming to move",
+    "implausibleAcceleration": "implied acceleration exceeds a physical limit",
+    "sybilCoLocation": "many distinct certificates at the same point+heading (ghost cluster)",
+    "acceptanceRangeThreshold": "claimed position lies beyond the receiver's radio range",
+    "beaconFrequency": "CAM rate above the plausible beacon rate (flooding / DoS)",
+    "signatureVerification": "message signature failed to verify",
+    "certValidity": "certificate presented outside its validity window",
+    "mapOffRoad": "claimed position far from any road (HD-map plausibility check)",
+    "kalmanConsistency": "constant-velocity tracker residual (soft fusion feature, never a hard reason)",
+}
+_FEATURE_DOCS = {
+    "pos_confidence": "reported 95% GNSS position-uncertainty radius (m)",
+    "detector_score_norm": "primary detector's normalized score (~1 at its firing threshold)",
+    "n_distinct_reasons": "count of distinct reason codes across a subject's reports",
+    "reports_per_reporter": "reports about a subject divided by its distinct reporters (collusion signal)",
+    "n_pseudonyms": "distinct pseudonym certs the MA linked to this vehicle",
+    "reporter_mean_indegree": "mean in-degree of this vehicle's reporters in the report graph",
+    "score_norm_mean": "mean normalized detector score across a vehicle's reports",
+    "score_norm_max": "max normalized detector score across a vehicle's reports",
+    "detection_time": "time of the report (sequencing only; excluded from model features)",
+}
+
+
+def _col_desc(name: str) -> str | None:
+    if name.startswith("detnorm_"):
+        d = _DETECTOR_DOCS.get(name[len("detnorm_"):])
+        return d if d is None else f"per-report detnorm: {d}"
+    if name.startswith("detmax_"):
+        d = _DETECTOR_DOCS.get(name[len("detmax_"):])
+        return d if d is None else f"per-vehicle max detnorm: {d}"
+    return _FEATURE_DOCS.get(name)
+
+
 def _col_kind(name: str) -> str:
     if name in ("split", "time_split", "domain_id"):
         return "split"
@@ -489,7 +529,11 @@ def _write_schema(out: str, frames: dict) -> None:
         cols = []
         for c in df.columns:
             dtype = str(df[c].dtype) if len(df) else "unknown"
-            cols.append({"name": str(c), "kind": _col_kind(str(c)), "dtype": dtype})
+            entry = {"name": str(c), "kind": _col_kind(str(c)), "dtype": dtype}
+            desc = _col_desc(str(c))
+            if desc:
+                entry["desc"] = desc
+            cols.append(entry)
         schema[name] = cols
     schema["_legend"] = {"feature": "MA-visible model input", "fusion_feature": "per-detector detnorm",
                          "fusion_feature_agg": "per-vehicle detector max", "reason_flag_feature":
