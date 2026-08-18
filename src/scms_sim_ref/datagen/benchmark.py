@@ -117,6 +117,27 @@ def _prf(y: np.ndarray, s: np.ndarray, thr: float = 0.5) -> dict:
             "balanced_accuracy": round(0.5 * (rec + tnr), 3), "tp": tp, "fp": fp, "fn": fn, "tn": tn}
 
 
+def _best_f1(y: np.ndarray, s: np.ndarray) -> dict | None:
+    """The operating point (threshold) that MAXIMIZES F1, and its precision/recall. An uncalibrated
+    score's default 0.5 cut is rarely the useful point; this is the achievable precision/recall a
+    consumer would actually deploy at. Deterministic (stable sort), numpy-only."""
+    n = len(y)
+    P = float(y.sum())
+    if n == 0 or P == 0:
+        return None
+    order = np.argsort(-s, kind="mergesort")         # stable -> reproducible tie handling
+    ys, ss = y[order], s[order]
+    tp = np.cumsum(ys)
+    fp = np.cumsum(1.0 - ys)
+    prec = tp / np.maximum(tp + fp, 1.0)
+    rec = tp / P
+    denom = prec + rec
+    f1 = np.where(denom > 0, 2 * prec * rec / np.maximum(denom, 1e-12), 0.0)
+    i = int(np.argmax(f1))
+    return {"threshold": round(float(ss[i]), 4), "precision": round(float(prec[i]), 3),
+            "recall": round(float(rec[i]), 3), "f1": round(float(f1[i]), 3)}
+
+
 def _bootstrap_ci(y: np.ndarray, s: np.ndarray, metric, n_boot: int = 300,
                   seed: int = 12345, alpha: float = 0.05) -> list | None:
     """Percentile bootstrap CI for a metric of (y, s). Seeded -> reproducible (eval-only, not in the
@@ -188,6 +209,7 @@ def _task(feat: pd.DataFrame, lab: pd.DataFrame, key: str, label_col: str,
         "recall_at_1pct_fpr": None if _recall_at_fpr(yte, s) is None else round(_recall_at_fpr(yte, s), 3),
         "roc_auc_ci95": _bootstrap_ci(yte, s, _roc_auc),
         "at_0.5": _prf(yte, s),
+        "at_best_f1": _best_f1(yte, s),
         "features": cols,
         # standardized logreg coefficients rank which detectors/features drive detection (free)
         "top_features": [[c, round(float(wi), 3)]

@@ -215,6 +215,10 @@ def build(dataset_dir: str) -> str:
         L.append(f"- **{name}**: logreg ROC-AUC **{t.get('roc_auc')}**{cistr}, PR-AUC {t.get('pr_auc')}, "
                  f"recall@1%FPR {t.get('recall_at_1pct_fpr')}, balanced-acc {a5.get('balanced_accuracy')}; "
                  f"test n={t.get('n_test')}, positive rate {t.get('positive_rate_test')}")
+        bf = t.get("at_best_f1")
+        if bf:
+            L.append(f"    - best-F1 operating point: F1 {bf.get('f1')} "
+                     f"(precision {bf.get('precision')}, recall {bf.get('recall')} @ thr {bf.get('threshold')})")
         g = t.get("gbdt")
         if g and g.get("roc_auc") is not None:
             gci = g.get("roc_auc_ci95")
