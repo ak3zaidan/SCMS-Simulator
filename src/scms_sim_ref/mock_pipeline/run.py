@@ -35,6 +35,7 @@ import math
 import os
 import random
 from collections import Counter
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -385,6 +386,31 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
     for name in _PROB_FIELDS:                       # clamp fractions rather than produce nonsense
         setattr(cfg, name, min(1.0, max(0.0, float(getattr(cfg, name)))))
     return cfg
+
+
+# tuple-typed config fields -- JSON has no tuples, so lists are coerced back on load
+_TUPLE_FIELDS = ("attacker_ids", "attack_types")
+
+
+def config_from_dict(d: dict) -> PipelineConfig:
+    """Build a PipelineConfig from a plain dict (e.g. a saved run's manifest).
+
+    Accepts either a raw config dict or a full manifest.json (which nests the config under a
+    "config" key). Unknown keys are ignored with a stderr warning (forward/backward compatible
+    across config-schema changes); list values for tuple fields are coerced back to tuples. This
+    is the inverse of what `_write_manifest` serializes, so a saved run replays byte-for-byte."""
+    import sys as _sys
+    if "config" in d and isinstance(d["config"], dict):
+        d = d["config"]
+    known = {f.name for f in dataclasses.fields(PipelineConfig)}
+    unknown = sorted(set(d) - known)
+    if unknown:
+        print(f"[config] ignoring {len(unknown)} unknown key(s): {', '.join(unknown)}", file=_sys.stderr)
+    kw = {k: v for k, v in d.items() if k in known}
+    for name in _TUPLE_FIELDS:
+        if name in kw and isinstance(kw[name], list):
+            kw[name] = tuple(kw[name])
+    return PipelineConfig(**kw)
 
 
 # --------------------------------------------------------------------------- #
@@ -1327,8 +1353,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--max-total-vehicles", type=int, default=0, help="flow: cap total spawns (0=unlimited)")
     p.add_argument("--featurize", action="store_true", help="build ML tables after generation")
     p.add_argument("--grid-h", type=int, default=0, help="grid height (0 = square, = --grid)")
-    p.add_argument("--out", default="datasets/poc_run")
+    p.add_argument("--config", default=None,
+                   help="load config from a JSON file (raw config dict or a run's manifest.json) and "
+                        "replay it exactly; --out and --featurize still apply. Ignores other flags.")
+    p.add_argument("--dump-config", default=None,
+                   help="write the effective config to this JSON path, then run as usual")
+    p.add_argument("--out", default=None)
     args = p.parse_args(argv)
+    if args.config:                                  # replay a saved config exactly
+        with open(args.config, encoding="utf-8") as fh:
+            cfg = config_from_dict(json.load(fh))
+        if args.out:
+            cfg.out_dir = args.out
+        cfg.verbose = True
+        res = run_pipeline(cfg)
+        _emit_result(res, args.featurize)
+        if args.dump_config:
+            _dump_config(cfg, args.dump_config)
+        return 0
     cfg = PipelineConfig(seed=args.seed, n_vehicles=args.vehicles, n_steps=args.steps,
                          attacker_pct=args.attacker_pct, attack_intensity=args.attack_intensity,
                          faulty_pct=args.faulty_pct,
@@ -1344,18 +1386,33 @@ def main(argv: Optional[list[str]] = None) -> int:
                          demand_profile=args.demand, car_following=not args.no_car_following,
                          fleet=args.fleet, live_interval_s=args.live_interval,
                          traffic_lights=args.traffic_lights, gps_jam_rate=args.gps_jam_rate,
-                         max_total_vehicles=args.max_total_vehicles, verbose=True, out_dir=args.out)
+                         max_total_vehicles=args.max_total_vehicles, verbose=True,
+                         out_dir=(args.out or "datasets/poc_run"))
     res = run_pipeline(cfg)
+    _emit_result(res, args.featurize)
+    if args.dump_config:
+        _dump_config(cfg, args.dump_config)
+    return 0
+
+
+def _emit_result(res, featurize: bool) -> None:
     print(f"vehicles={res.n_vehicles} reports={res.n_reports} "
           f"investigations={res.n_investigations} revoked={res.n_revoked}")
     print(f"revoked_cert_digests={res.revoked_cert_digests[:8]}")
     print(f"data_digest={res.data_digest}")
-    if args.featurize:
+    if featurize:
         from ..datagen import featurize as _feat
         _feat.build(res.out_dir)
         print("featurized ml/ tables written")
     print(f"outputs in {os.path.abspath(res.out_dir)}")
-    return 0
+
+
+def _dump_config(cfg: PipelineConfig, path: str) -> None:
+    """Serialize the effective config to JSON (same shape config_from_dict reads back)."""
+    d = {k: (list(v) if isinstance(v, tuple) else v) for k, v in cfg.__dict__.items()}
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(d, fh, indent=2, sort_keys=True)
+    print(f"effective config written to {os.path.abspath(path)}")
 
 
 if __name__ == "__main__":

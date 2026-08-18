@@ -1,0 +1,57 @@
+"""Config save/load: a saved config (or a run's manifest) replays byte-for-byte."""
+
+import json
+
+from scms_sim_ref.mock_pipeline import (PipelineConfig, config_from_dict, run_pipeline)
+from scms_sim_ref.mock_pipeline import run as runmod
+
+
+def _cfg(tmp, **over):
+    kw = dict(seed=7, n_vehicles=20, n_steps=25, attacker_pct=0.2, weather="rain",
+              attack_types=("ConstPos", "RandomSpeed"))
+    kw.update(over)
+    return PipelineConfig(out_dir=str(tmp), **kw)
+
+
+def test_dict_roundtrip_preserves_tuple_fields():
+    cfg = _cfg("x")
+    d = {k: (list(v) if isinstance(v, tuple) else v) for k, v in cfg.__dict__.items()}
+    d = json.loads(json.dumps(d))                       # through JSON: tuples -> lists
+    back = config_from_dict(d)
+    assert isinstance(back.attack_types, tuple), "list must be coerced back to tuple"
+    assert back.attack_types == cfg.attack_types
+    assert back.__dict__ == cfg.__dict__, "round-trip must be lossless"
+
+
+def test_config_from_manifest_replays_byte_identical(tmp_path):
+    a = run_pipeline(_cfg(tmp_path / "a"))
+    manifest = json.loads((tmp_path / "a" / "manifest.json").read_text())
+    # rebuild from the saved manifest (nested "config"), point at a fresh dir, and rerun
+    cfg2 = config_from_dict(manifest)
+    cfg2.out_dir = str(tmp_path / "b")
+    b = run_pipeline(cfg2)
+    assert a.data_digest == b.data_digest, "replay from manifest must reproduce the dataset exactly"
+
+
+def test_config_from_dict_ignores_unknown_keys(capsys):
+    cfg = config_from_dict({"seed": 3, "n_vehicles": 9, "not_a_real_field": 123})
+    assert cfg.seed == 3 and cfg.n_vehicles == 9
+    assert "not_a_real_field" in capsys.readouterr().err
+
+
+def test_dump_config_then_reload(tmp_path):
+    cfg = _cfg(tmp_path / "run", n_lanes=2, traffic_lights=True)
+    path = tmp_path / "cfg.json"
+    runmod._dump_config(cfg, str(path))
+    back = config_from_dict(json.loads(path.read_text()))
+    assert back.n_lanes == 2 and back.traffic_lights is True
+    assert back.__dict__ == cfg.__dict__
+
+
+def test_cli_config_flag_runs(tmp_path):
+    src = _cfg(tmp_path / "src")
+    cfgpath = tmp_path / "c.json"
+    runmod._dump_config(src, str(cfgpath))
+    rc = runmod.main(["--config", str(cfgpath), "--out", str(tmp_path / "out")])
+    assert rc == 0
+    assert (tmp_path / "out" / "manifest.json").exists()
