@@ -182,6 +182,8 @@ class PipelineConfig:
     turn_min_angle_deg: float = 40.0     # only bends sharper than this are slowed
     # time-varying demand (rush hour / night) + origin-destination bias
     demand_profile: str = "uniform"      # "uniform" | "rush" | "night"
+    od_model: str = "uniform"            # trip destination law: "uniform" | "gravity" (distance-decay)
+    od_gravity_scale: float = 2.0        # gravity: hop decay scale (smaller -> shorter trips)
     attack_delay_s: float = 2.0          # flow: an attacker starts falsifying this long after spawn
     state_prune_every: int = 50          # flow: steps between detection-state LRU prunes
     state_prune_ttl: int = 20            # flow: evict detection state untouched this many steps
@@ -378,6 +380,8 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"weather must be one of {sorted(WEATHER_MULT)} (got {cfg.weather!r})")
     if cfg.demand_profile not in ("uniform", "rush", "night"):
         raise ValueError(f"demand_profile must be uniform|rush|night (got {cfg.demand_profile!r})")
+    if cfg.od_model not in ("uniform", "gravity"):
+        raise ValueError(f"od_model must be uniform|gravity (got {cfg.od_model!r})")
     if cfg.fleet != "mixed" and cfg.fleet not in VEHICLE_TYPES:
         raise ValueError(f"fleet must be 'mixed' or one of {sorted(VEHICLE_TYPES)} (got {cfg.fleet!r})")
     if cfg.road_network not in ("linear", "grid"):
@@ -559,7 +563,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             # OD bias: during a rush peak, most trips head to the centre (commute-to-core)
             dest = center if (net is not None and cfg.demand_profile == "rush"
                               and rrng.random() < demand_mult(frac) - 0.2) else None
-            trip = net.random_trip(rrng, spd, tt, dest_hint=dest) if net is not None else None
+            trip = (net.random_trip(rrng, spd, tt, dest_hint=dest, od_model=cfg.od_model,
+                                    gravity_scale=cfg.od_gravity_scale)
+                    if net is not None else None)
             make_vehicle(vid, tt, is_att, is_flt, is_coll, trip, life_hint=90.0)
             vid += 1
     else:
@@ -1355,6 +1361,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--grid", type=int, default=6, help="grid road network dimension (grid x grid)")
     p.add_argument("--grid-block", type=float, default=120.0, help="grid block spacing (m)")
     p.add_argument("--lanes", type=int, default=1, help="parallel lanes per road (overtaking; reduces gridlock)")
+    p.add_argument("--od-model", default="uniform", choices=["uniform", "gravity"],
+                   help="trip destination law: uniform | gravity (realistic distance-decay trip lengths)")
     p.add_argument("--demand", default="uniform", choices=["uniform", "rush", "night"],
                    help="time-varying arrival-demand profile")
     p.add_argument("--fleet", default="mixed", help="'mixed' or a single vehicle class (car/truck/bus/motorcycle)")
@@ -1396,7 +1404,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                          road_network=("grid" if (args.flow and args.road == "linear") else args.road),
                          grid_w=args.grid, grid_h=(args.grid_h or args.grid), grid_block_m=args.grid_block,
                          n_lanes=args.lanes,
-                         demand_profile=args.demand, car_following=not args.no_car_following,
+                         demand_profile=args.demand, od_model=args.od_model,
+                         car_following=not args.no_car_following,
                          turn_slowdown=args.turn_slowdown,
                          fleet=args.fleet, live_interval_s=args.live_interval,
                          traffic_lights=args.traffic_lights, gps_jam_rate=args.gps_jam_rate,

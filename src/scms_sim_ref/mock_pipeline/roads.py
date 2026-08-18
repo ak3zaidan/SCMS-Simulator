@@ -110,11 +110,34 @@ class GridNetwork:
             cur = prev.get(cur)
         return list(reversed(path))
 
+    def _gravity_dest(self, rng, o: tuple[int, int], min_hops: int, scale: float):
+        """Pick a destination with a distance-decay (gravity) law: weight ~ exp(-(hops-min)/scale),
+        so most trips are short and a few are long -- the realistic urban trip-length distribution.
+        Deterministic (fixed node order + a single rng draw)."""
+        cands, weights = [], []
+        s = max(0.5, scale)
+        for n in self.nodes:
+            hd = abs(n[0] - o[0]) + abs(n[1] - o[1])
+            if hd >= min_hops:
+                cands.append(n)
+                weights.append(math.exp(-(hd - min_hops) / s))
+        if not cands:
+            return o
+        r = rng.random() * sum(weights)
+        acc = 0.0
+        for n, w in zip(cands, weights):
+            acc += w
+            if r <= acc:
+                return n
+        return cands[-1]
+
     def random_trip(self, rng, speed: float, spawn_time: float, min_hops: int = 3,
-                    dest_hint=None) -> Trip:
+                    dest_hint=None, od_model: str = "uniform", gravity_scale: float = 2.0) -> Trip:
         o = rng.choice(self.nodes)
         if dest_hint is not None and dest_hint != o:
             d = dest_hint                         # OD bias (e.g. commute toward the centre)
+        elif od_model == "gravity":
+            d = self._gravity_dest(rng, o, min_hops, gravity_scale)
         else:
             d = o
             for _ in range(8):
