@@ -171,3 +171,16 @@ def test_attack_delay_jitter_spreads_onset_and_is_byte_identical_at_zero(tmp_pat
     starts = [atk["start_time"] for atk in _jsonl(tmp_path / "j" / "ground_truth" / "gt_attacks.jsonl")]
     assert len(set(starts)) > 3 and statistics.pstdev(starts) > 1.0, starts
     assert min(starts) >= 5.0 and max(starts) <= 25.0 + 1e-6
+
+
+def test_mixed_run_catches_credential_attacks(tmp_path):
+    """In a realistic MIXED run (all attack types, no heavy collusion) the credential family
+    (ExpiredCert/NotYetValid/InvalidSignature) is reliably revoked -- the practical case works even
+    though a pathological pure-credential high-density run can evade the reporter-budget gate."""
+    from scms_sim_ref.datagen import validate as V
+    out = str(tmp_path / "run")
+    run_pipeline(PipelineConfig(seed=7, n_vehicles=120, n_steps=120, attacker_pct=0.3,
+                                collude_pct=0.0, faulty_pct=0.05, out_dir=out))
+    s, _ = V.validate(out)
+    cred = s["recall_by_family"].get("credential")
+    assert cred is not None and cred >= 0.6, f"mixed run should catch credential attacks: {cred}"
