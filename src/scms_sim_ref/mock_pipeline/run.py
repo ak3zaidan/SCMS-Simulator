@@ -365,6 +365,30 @@ _PROB_FIELDS = ("report_prob", "attacker_pct", "faulty_pct", "collude_pct", "vic
                 "packet_loss_base", "nlos_loss", "gps_outlier_rate", "gps_degrade_rate",
                 "attack_duty_cycle")
 
+# Named CLI scenario presets (mirror the GUI one-click presets). Keys are argparse dests, so any flag
+# the user also passes still overrides the preset (they are applied via parser.set_defaults). Reach a
+# realistic long routed run in one command, e.g.: python -m ...run --preset urban_rush --featurize
+CLI_PRESETS = {
+    "urban_rush": dict(flow=True, road="grid", grid=6, lanes=2, arrival_rate=3.0, duration=300.0,
+                       demand="rush", traffic_lights=True, od_model="gravity", fleet="mixed",
+                       attacker_pct=0.15, faulty_pct=0.06, collude_pct=0.3, rotate_period=60.0,
+                       weather="clear", radio_range=250.0),
+    "highway": dict(flow=True, road="grid", grid=4, lanes=3, arrival_rate=4.0, duration=300.0,
+                    demand="uniform", traffic_lights=False, fleet="mixed", attacker_pct=0.12,
+                    faulty_pct=0.05, weather="clear", radio_range=400.0),
+    "night_rain": dict(flow=True, road="grid", grid=6, lanes=2, arrival_rate=1.2, duration=300.0,
+                       demand="night", traffic_lights=True, od_model="gravity", fleet="mixed",
+                       attacker_pct=0.2, faulty_pct=0.05, weather="rain", gps_jam_rate=0.01,
+                       radio_range=220.0),
+    "gridlock": dict(flow=True, road="grid", grid=5, lanes=1, arrival_rate=5.0, duration=250.0,
+                     demand="rush", traffic_lights=True, turn_slowdown=True, fleet="mixed",
+                     attacker_pct=0.15, faulty_pct=0.05, weather="clear", radio_range=200.0),
+    "stealth_hard": dict(flow=True, road="grid", grid=6, lanes=2, arrival_rate=2.0, duration=300.0,
+                         demand="uniform", od_model="gravity", fleet="mixed", attacker_pct=0.2,
+                         attack_intensity=0.5, attack_duty_cycle=0.3, faulty_pct=0.08,
+                         weather="fog", radio_range=250.0),
+}
+
 
 def validate_config(cfg: PipelineConfig) -> PipelineConfig:
     """Fail fast on impossible configs and clamp fractions to [0,1]. Returns the (mutated) config.
@@ -1347,7 +1371,14 @@ def _write_manifest(cfg, data_files, data_digest, counts) -> None:
 
 def main(argv: Optional[list[str]] = None) -> int:
     import argparse
+    import sys as _sys
+    # phase 1: read --preset early so it can seed the parser defaults (any other flag still overrides)
+    _pre = argparse.ArgumentParser(add_help=False)
+    _pre.add_argument("--preset", choices=list(CLI_PRESETS))
+    _preargs, _ = _pre.parse_known_args(argv if argv is not None else _sys.argv[1:])
     p = argparse.ArgumentParser(description="Run the SCMS closed-loop reference pipeline.")
+    p.add_argument("--preset", choices=list(CLI_PRESETS),
+                   help="named scenario preset (" + ", ".join(CLI_PRESETS) + "); flags still override it")
     p.add_argument("--seed", type=int, default=1001)
     p.add_argument("--vehicles", type=int, default=12)
     p.add_argument("--steps", type=int, default=40)
@@ -1394,6 +1425,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--dump-config", default=None,
                    help="write the effective config to this JSON path, then run as usual")
     p.add_argument("--out", default=None)
+    if _preargs.preset:                              # preset seeds defaults; explicit flags override
+        p.set_defaults(**CLI_PRESETS[_preargs.preset])
     args = p.parse_args(argv)
     if args.config:                                  # replay a saved config exactly
         with open(args.config, encoding="utf-8") as fh:
