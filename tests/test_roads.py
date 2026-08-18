@@ -44,6 +44,24 @@ def test_uniform_od_unchanged_by_new_kwargs():
     assert a == b
 
 
+def test_boundary_origins_start_trips_at_the_perimeter():
+    """With boundary_origins, every trip's first waypoint is on the grid perimeter."""
+    net = GridNetwork(6, 6, 100.0)
+    rng = random.Random(3)
+    span = 5 * 100.0
+    for _ in range(80):
+        wp0 = net.random_trip(rng, 12.0, 0.0, boundary_origin=True).wp[0]
+        on_edge = wp0[0] in (0.0, span) or wp0[1] in (0.0, span)
+        assert on_edge, f"origin {wp0} not on the perimeter"
+    # default (off) can start anywhere -> at least one interior origin over many draws
+    interior = 0
+    for _ in range(200):
+        wp0 = net.random_trip(rng, 12.0, 0.0).wp[0]
+        if wp0[0] not in (0.0, span) and wp0[1] not in (0.0, span):
+            interior += 1
+    assert interior > 0, "default origins should include interior nodes"
+
+
 def test_next_turn_reports_grid_corner_angle():
     """A route that goes east then north bends ~90 degrees at the middle vertex."""
     trip = Trip([(0.0, 0.0), (100.0, 0.0), (100.0, 100.0)], speed=10.0, spawn_time=0.0)

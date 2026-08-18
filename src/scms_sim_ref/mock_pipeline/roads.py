@@ -80,6 +80,9 @@ class GridNetwork:
     def __init__(self, w: int, h: int, block: float):
         self.w, self.h, self.block = int(w), int(h), float(block)
         self.nodes = [(i, j) for i in range(self.w) for j in range(self.h)]
+        # perimeter intersections: realistic traffic sources/sinks (edges of the modelled area)
+        self.boundary = [(i, j) for (i, j) in self.nodes
+                         if i in (0, self.w - 1) or j in (0, self.h - 1)]
 
     def _coord(self, n: tuple[int, int]) -> tuple[float, float]:
         return (n[0] * self.block, n[1] * self.block)
@@ -132,8 +135,9 @@ class GridNetwork:
         return cands[-1]
 
     def random_trip(self, rng, speed: float, spawn_time: float, min_hops: int = 3,
-                    dest_hint=None, od_model: str = "uniform", gravity_scale: float = 2.0) -> Trip:
-        o = rng.choice(self.nodes)
+                    dest_hint=None, od_model: str = "uniform", gravity_scale: float = 2.0,
+                    boundary_origin: bool = False) -> Trip:
+        o = rng.choice(self.boundary if (boundary_origin and self.boundary) else self.nodes)
         if dest_hint is not None and dest_hint != o:
             d = dest_hint                         # OD bias (e.g. commute toward the centre)
         elif od_model == "gravity":

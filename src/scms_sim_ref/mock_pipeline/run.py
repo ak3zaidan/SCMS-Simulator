@@ -187,6 +187,7 @@ class PipelineConfig:
     demand_profile: str = "uniform"      # "uniform" | "rush" | "night"
     od_model: str = "uniform"            # trip destination law: "uniform" | "gravity" (distance-decay)
     od_gravity_scale: float = 2.0        # gravity: hop decay scale (smaller -> shorter trips)
+    boundary_origins: bool = False       # trips ORIGINATE at the grid perimeter (realistic sources/sinks)
     attack_delay_s: float = 2.0          # flow: an attacker starts falsifying this long after spawn
     attack_delay_jitter_s: float = 0.0   # spread attack onset across attackers by up to this (realism)
     state_prune_every: int = 50          # flow: steps between detection-state LRU prunes
@@ -627,7 +628,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             dest = center if (net is not None and cfg.demand_profile == "rush"
                               and rrng.random() < demand_mult(frac) - 0.2) else None
             trip = (net.random_trip(rrng, spd, tt, dest_hint=dest, od_model=cfg.od_model,
-                                    gravity_scale=cfg.od_gravity_scale)
+                                    gravity_scale=cfg.od_gravity_scale,
+                                    boundary_origin=cfg.boundary_origins)
                     if net is not None else None)
             make_vehicle(vid, tt, is_att, is_flt, is_coll, trip, life_hint=90.0)
             vid += 1
@@ -1472,6 +1474,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="gravity OD: hop decay scale (smaller -> shorter trips)")
     p.add_argument("--turn-speed", type=float, default=6.0,
                    help="cornering: speed cap (m/s) through a sharp bend when --turn-slowdown is on")
+    p.add_argument("--boundary-origins", action="store_true",
+                   help="trips originate at the grid perimeter (realistic network sources/sinks)")
     p.add_argument("--demand", default="uniform", choices=["uniform", "rush", "night"],
                    help="time-varying arrival-demand profile")
     p.add_argument("--fleet", default="mixed", help="'mixed' or a single vehicle class (car/truck/bus/motorcycle)")
@@ -1534,7 +1538,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                          grid_w=args.grid, grid_h=(args.grid_h or args.grid), grid_block_m=args.grid_block,
                          n_lanes=args.lanes,
                          demand_profile=args.demand, od_model=args.od_model,
-                         od_gravity_scale=args.od_gravity_scale,
+                         od_gravity_scale=args.od_gravity_scale, boundary_origins=args.boundary_origins,
                          car_following=not args.no_car_following,
                          turn_slowdown=args.turn_slowdown, turn_speed_mps=args.turn_speed,
                          fleet=args.fleet, live_interval_s=args.live_interval,
