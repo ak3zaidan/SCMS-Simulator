@@ -46,6 +46,7 @@ def test_massive_grid_merges_with_domain_id_and_is_leakage_safe(tmp_path, monkey
     # each domain carries difficulty labels (precision/recall/family recall) for curriculum/stratified use
     for c in cat:
         assert "recall" in c and "precision" in c and "recall_by_family" in c
+        assert "recall_by_type" in c, "per-domain labels include per-attack-type difficulty"
         assert c["recall"] is None or 0.0 <= c["recall"] <= 1.0
 
 

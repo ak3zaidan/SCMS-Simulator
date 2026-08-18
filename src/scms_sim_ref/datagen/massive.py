@@ -199,7 +199,8 @@ def main(argv=None) -> int:
             catalog.append({"domain_id": idx, **cell, "seed": cfg.seed,
                             "reports": res.n_reports, "revoked": res.n_revoked,
                             "precision": vs.get("precision"), "recall": vs.get("recall"),
-                            "recall_by_family": vs.get("recall_by_family", {})})
+                            "recall_by_family": vs.get("recall_by_family", {}),
+                            "recall_by_type": vs.get("recall_by_type", {})})
         except Exception as e:                       # noqa: BLE001 -- keep the campaign alive
             failed.append({"domain_id": idx, **cell, "error": f"{type(e).__name__}: {e}"})
             print(f"   [{idx + 1}/{len(cells)}] FAILED domain {idx}: {type(e).__name__}: {e}", flush=True)
