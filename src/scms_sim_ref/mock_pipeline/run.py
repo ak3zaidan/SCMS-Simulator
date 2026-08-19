@@ -80,6 +80,7 @@ def _pick_vehicle_type(rng, fleet: str) -> str:
     return "car"
 _SYBIL_MIN = 4        # distinct certs at NEARLY the same point before sybilCoLocation fires
 _CELL_M = 3.0         # co-location cell: small enough that a bumper-to-bumper queue (~7 m spacing)
+_RSU_VID_BASE = 10_000_000   # Road-Side Unit vids start here (never collide with vehicle vids)
                       # never fills it, but tightly co-located Sybil ghosts (spoofing one point) do
 
 
@@ -188,6 +189,7 @@ class PipelineConfig:
     od_model: str = "uniform"            # trip destination law: "uniform" | "gravity" (distance-decay)
     od_gravity_scale: float = 2.0        # gravity: hop decay scale (smaller -> shorter trips)
     boundary_origins: bool = False       # trips ORIGINATE at the grid perimeter (realistic sources/sinks)
+    n_rsus: int = 0                      # fixed Road-Side Units: static, always-trusted receivers (0=off)
     attack_delay_s: float = 2.0          # flow: an attacker starts falsifying this long after spawn
     attack_delay_jitter_s: float = 0.0   # spread attack onset across attackers by up to this (realism)
     state_prune_every: int = 50          # flow: steps between detection-state LRU prunes
@@ -278,6 +280,7 @@ class Vehicle:
     # sensor / class
     gps_q: float = 1.0                   # per-vehicle GNSS quality multiplier
     is_faulty: bool = False
+    is_rsu: bool = False                 # fixed Road-Side Unit: a static, always-trusted receiver
     attack_type: str = "none"
     # pseudonyms / sybil / collusion
     pseudonyms: list = field(default_factory=list)   # [{k,i,j,digest,valid_from,valid_to}]
@@ -419,6 +422,8 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"attack_pulse_period_s must be > 0 (got {cfg.attack_pulse_period_s})")
     if cfg.od_gravity_scale <= 0:
         raise ValueError(f"od_gravity_scale must be > 0 (got {cfg.od_gravity_scale})")
+    if cfg.n_rsus < 0:
+        raise ValueError(f"n_rsus must be >= 0 (got {cfg.n_rsus})")
     if cfg.fleet != "mixed" and cfg.fleet not in VEHICLE_TYPES:
         raise ValueError(f"fleet must be 'mixed' or one of {sorted(VEHICLE_TYPES)} (got {cfg.fleet!r})")
     if cfg.road_network not in ("linear", "grid"):
@@ -675,6 +680,30 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     digest_to_vehicle = {d: vehicles[info["veh_vid"]] for d, info in pseudonym_info.items()}
     vrng = {v.vid: random.Random(f"{cfg.seed}:sensor:{v.vid}") for v in vehicles}
 
+    # ---- Road-Side Units (opt-in): fixed, always-trusted receivers ----
+    # RSUs never move and never transmit; they only OBSERVE in-range CAMs and file reports like any
+    # receiver, but as trusted infrastructure. They add corroborating, non-gameable evidence near
+    # their location. n_rsus=0 (default) -> rsus=[] -> the reception loop is byte-identical.
+    rsus: list[Vehicle] = []
+    if cfg.n_rsus > 0:
+        if net is not None:                      # spread across grid intersections
+            spots = [net._coord(net.nodes[(i * max(1, len(net.nodes) // cfg.n_rsus)) % len(net.nodes)])
+                     for i in range(cfg.n_rsus)]
+        else:                                    # spread along the linear corridor
+            span = max(1.0, cfg.n_vehicles * 20.0)
+            spots = [(span * (i + 0.5) / cfg.n_rsus, 0.0) for i in range(cfg.n_rsus)]
+        for ri, (sx, sy) in enumerate(spots):
+            pk = ca.keypair_from_seed(cfg.derive(f"rsu:{ri}"))
+            dig = ca.hashed_id8(ca.public_bytes(pk)).hex()
+            rsu = Vehicle(vid=_RSU_VID_BASE + ri, spawn_x=float(sx), lane_y=float(sy), speed=0.0,
+                          is_attacker=False, priv=None, pub=b"", cert_digest=dig, linkage_ctx=None,
+                          i_period=0, j_index=0, request_hash="", is_rsu=True, wander_amp=0.0,
+                          pseudonyms=[{"k": 0, "i": 0, "j": 0, "digest": dig,
+                                       "valid_from": 0.0, "valid_to": total_time + cfg.dt}])
+            pseudonym_info[dig] = {"i": 0, "j": 0, "lv": None, "ghost": False, "veh_vid": rsu.vid}
+            digest_to_vehicle[dig] = rsu
+            rsus.append(rsu)
+
     # ---- MA state (updated ONLINE during the loop) ----
     ma_reports: list[dict] = []
     gt_report_labels: list[R.GtReportLabel] = []
@@ -808,6 +837,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         rv = digest_to_vehicle.get(reporter_digest)
         if rv is None:
             return False
+        if getattr(rv, "is_rsu", False):
+            return True                          # trusted infrastructure: never rate-limited/distrusted
         return (rv.vid not in revoked_vehicles
                 and filed_by.get(reporter_digest, 0) <= cfg.report_budget
                 and received_by.get(reporter_digest, 0) < cfg.reputation_max)
@@ -1147,7 +1178,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # DETECTION pass (receiver-outer): a receiver only hears in-range transmitters, with
         # distance/NLOS/weather/congestion packet loss -> the report graph becomes spatially LOCAL
         # (reporters near the subject) instead of all-to-all, and far-away attackers go unobserved.
-        rx_pos = {rx.vid: rx.true_state(t)[:2] for rx in active_list if not enforced(rx, t)}
+        # RSUs are static receivers: appended AFTER vehicles so vehicle-side reception (and its RNG
+        # draws) is unchanged -> byte-identical when n_rsus=0 (rsus is empty).
+        receivers = active_list + rsus
+        rx_pos = {rx.vid: rx.true_state(t)[:2] for rx in receivers if not enforced(rx, t)}
         wx_loss = WEATHER_RADIO_LOSS.get(cfg.weather, 0.0)
         # spatial index over broadcasts (cell = radio range) so each receiver only tests transmitters
         # in its own + adjacent cells -> reception is O(active x local density), not O(active^2). Cell
@@ -1157,7 +1191,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         bcell: dict = {}
         for bi, b in enumerate(broadcasts):
             bcell.setdefault((int(b["x"] // rng_cell), int(b["y"] // rng_cell)), []).append(bi)
-        for rx in active_list:
+        for rx in receivers:
             if enforced(rx, t):
                 continue
             rxx, rxy = rx_pos[rx.vid]
@@ -1489,6 +1523,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="cornering: speed cap (m/s) through a sharp bend when --turn-slowdown is on")
     p.add_argument("--boundary-origins", action="store_true",
                    help="trips originate at the grid perimeter (realistic network sources/sinks)")
+    p.add_argument("--n-rsus", type=int, default=0,
+                   help="fixed Road-Side Units: static, always-trusted receivers spread over the map (0=off)")
     p.add_argument("--demand", default="uniform", choices=["uniform", "rush", "night"],
                    help="time-varying arrival-demand profile")
     p.add_argument("--fleet", default="mixed", help="'mixed' or a single vehicle class (car/truck/bus/motorcycle)")
@@ -1564,6 +1600,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                          n_lanes=args.lanes,
                          demand_profile=args.demand, od_model=args.od_model,
                          od_gravity_scale=args.od_gravity_scale, boundary_origins=args.boundary_origins,
+                         n_rsus=args.n_rsus,
                          car_following=not args.no_car_following,
                          turn_slowdown=args.turn_slowdown, turn_speed_mps=args.turn_speed,
                          fleet=args.fleet, live_interval_s=args.live_interval,
