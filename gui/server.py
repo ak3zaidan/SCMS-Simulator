@@ -450,7 +450,15 @@ PRESETS = {
         "pf_attacker": 0.2, "pf_faulty": 0.06, "pf_collude": 0.3, "pf_rotate": 60,
         "pf_radio": 250, "pf_weather": "rain", "pf_demand": "rush", "pf_fleet": "mixed",
         "pf_lights": True, "pf_od": "gravity", "pf_turn": True, "pf_intensity": 0.7,
-        "pf_duty": 0.5, "pf_jitter": 15, "pf_pulse": 20},
+        "pf_duty": 0.5, "pf_jitter": 15, "pf_pulse": 20, "pf_boundary": True,
+        "pf_fleet_mix": "car:0.6,truck:0.25,bus:0.1,motorcycle:0.05",
+        "pf_attack_mix": "ConstPos:0.3,Sybil:0.2,SlowDrift:0.2,HeadingOffset:0.15,DoS:0.15",
+        "pf_rsus": 8, "pf_rsu_placement": "spread", "pf_lanes": 2},
+    "Ring beltway": {
+        "generator": "python-flow", "pf_road": "ring", "pf_grid": 24, "pf_block": 130,
+        "pf_duration": 300, "pf_arrival": 2.0, "pf_attacker": 0.15, "pf_faulty": 0.05,
+        "pf_rotate": 60, "pf_radio": 260, "pf_weather": "clear", "pf_demand": "uniform",
+        "pf_fleet": "mixed", "pf_lanes": 2, "pf_rsus": 6},
 }
 
 
