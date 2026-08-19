@@ -406,7 +406,8 @@ PRESETS = {
     "Sparse night (rain)": {
         "generator": "python-flow", "pf_duration": 300, "pf_arrival": 1.0, "pf_grid": 6,
         "pf_attacker": 0.2, "pf_faulty": 0.05, "pf_collude": 0.2, "pf_rotate": 60,
-        "pf_radio": 300, "pf_weather": "rain", "pf_demand": "night", "pf_fleet": "mixed"},
+        "pf_radio": 300, "pf_weather": "rain", "pf_demand": "night", "pf_fleet": "mixed",
+        "pf_rsus": 8},   # sparse traffic -> RSUs add infrastructure-assisted detection coverage
     "Gridlock stress": {
         "generator": "python-flow", "pf_duration": 250, "pf_arrival": 5.0, "pf_grid": 4,
         "pf_attacker": 0.1, "pf_faulty": 0.08, "pf_collude": 0.3, "pf_rotate": 0,
