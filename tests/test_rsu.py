@@ -58,6 +58,36 @@ def test_validate_reports_rsu_contribution(tmp_path):
     assert V.validate(out0)[0]["rsu_contribution"] == {}
 
 
+def test_rsu_placement_strategies_all_work(tmp_path):
+    """Every RSU placement strategy produces a valid run; 'all' puts one RSU at every intersection."""
+    for pl in ("spread", "perimeter", "center", "corners"):
+        out = str(tmp_path / pl)
+        run_pipeline(PipelineConfig(seed=13, traffic_flow=True, road_network="grid", duration_s=120.0,
+                                    arrival_rate=0.8, grid_w=5, grid_h=5, radio_range_m=120.0,
+                                    attacker_pct=0.2, n_rsus=6, rsu_placement=pl, out_dir=out))
+        rc = V.validate(out)[0]["rsu_contribution"]
+        assert rc.get("rsus_reporting", 0) >= 1
+    # 'all' ignores n_rsus and covers every one of the 5x5 = 25 intersections
+    out = str(tmp_path / "all")
+    run_pipeline(PipelineConfig(seed=13, traffic_flow=True, road_network="grid", duration_s=120.0,
+                                arrival_rate=0.8, grid_w=5, grid_h=5, radio_range_m=120.0,
+                                attacker_pct=0.2, n_rsus=6, rsu_placement="all", out_dir=out))
+    assert V.validate(out)[0]["rsu_contribution"]["rsus_reporting"] <= 25
+
+
+def test_rsu_range_extends_coverage(tmp_path):
+    """A longer RSU radio range makes each RSU hear more transmitters -> more RSU-sourced reports."""
+    def rsu_reports(rng_m):
+        out = str(tmp_path / f"r{rng_m}")
+        run_pipeline(PipelineConfig(seed=13, traffic_flow=True, road_network="grid", duration_s=150.0,
+                                    arrival_rate=0.5, grid_w=6, grid_h=6, radio_range_m=100.0,
+                                    attacker_pct=0.25, attack_type="RandomPos",
+                                    attack_types=("RandomPos",), n_rsus=6, rsu_range_m=rng_m,
+                                    out_dir=out))
+        return V.validate(out)[0]["rsu_contribution"].get("reports", 0)
+    assert rsu_reports(400.0) > rsu_reports(100.0) * 2, "longer RSU range should hear many more CAMs"
+
+
 def test_rsus_improve_detection_in_reporter_starved_traffic(tmp_path):
     """In sparse traffic (few mobile reporters), always-present RSUs raise revocation recall of an
     easily-detected attack without hurting precision -- infrastructure-assisted detection."""

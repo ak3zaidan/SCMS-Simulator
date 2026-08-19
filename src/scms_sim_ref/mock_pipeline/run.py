@@ -190,6 +190,8 @@ class PipelineConfig:
     od_gravity_scale: float = 2.0        # gravity: hop decay scale (smaller -> shorter trips)
     boundary_origins: bool = False       # trips ORIGINATE at the grid perimeter (realistic sources/sinks)
     n_rsus: int = 0                      # fixed Road-Side Units: static, always-trusted receivers (0=off)
+    rsu_placement: str = "spread"        # where RSUs go: spread|perimeter|center|corners|all(grid nodes)
+    rsu_range_m: float = 0.0             # RSU radio range (m); 0 = use radio_range_m (vehicles' range)
     attack_delay_s: float = 2.0          # flow: an attacker starts falsifying this long after spawn
     attack_delay_jitter_s: float = 0.0   # spread attack onset across attackers by up to this (realism)
     state_prune_every: int = 50          # flow: steps between detection-state LRU prunes
@@ -281,6 +283,7 @@ class Vehicle:
     gps_q: float = 1.0                   # per-vehicle GNSS quality multiplier
     is_faulty: bool = False
     is_rsu: bool = False                 # fixed Road-Side Unit: a static, always-trusted receiver
+    rx_range: float = 0.0                # receiver radio range override (0 = use cfg.radio_range_m)
     attack_type: str = "none"
     # pseudonyms / sybil / collusion
     pseudonyms: list = field(default_factory=list)   # [{k,i,j,digest,valid_from,valid_to}]
@@ -361,6 +364,34 @@ class RunResult:
     counts: dict = field(default_factory=dict)
 
 
+def _rsu_spots(cfg: "PipelineConfig", net) -> list:
+    """Placement coordinates for the RSUs, per cfg.rsu_placement. Deterministic (fixed node order)."""
+    p = cfg.rsu_placement
+    if net is None:                              # linear corridor: evenly along the road
+        span = max(1.0, cfg.n_vehicles * 20.0)
+        n = cfg.n_rsus
+        return [(span * (i + 0.5) / n, 0.0) for i in range(n)]
+    nodes = net.nodes
+    if p == "all":                              # one RSU at every intersection (n_rsus ignored)
+        picked = nodes
+    elif p == "corners":
+        w, h = net.w - 1, net.h - 1
+        corners = [(0, 0), (w, 0), (0, h), (w, h)]
+        picked = [corners[i % 4] for i in range(cfg.n_rsus)]
+    elif p == "perimeter":
+        b = net.boundary
+        step = max(1, len(b) // max(1, cfg.n_rsus))
+        picked = [b[(i * step) % len(b)] for i in range(cfg.n_rsus)]
+    elif p == "center":                         # cluster near the grid centre
+        cx, cy = (net.w - 1) / 2.0, (net.h - 1) / 2.0
+        near = sorted(nodes, key=lambda n: abs(n[0] - cx) + abs(n[1] - cy))
+        picked = [near[i % len(near)] for i in range(cfg.n_rsus)]
+    else:                                       # "spread": evenly across all intersections
+        step = max(1, len(nodes) // max(1, cfg.n_rsus))
+        picked = [nodes[(i * step) % len(nodes)] for i in range(cfg.n_rsus)]
+    return [net._coord(n) for n in picked]
+
+
 def _ang_diff(a: float, b: float) -> float:
     d = abs((a - b) % 360.0)
     return d if d <= 180.0 else 360.0 - d
@@ -424,6 +455,11 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"od_gravity_scale must be > 0 (got {cfg.od_gravity_scale})")
     if cfg.n_rsus < 0:
         raise ValueError(f"n_rsus must be >= 0 (got {cfg.n_rsus})")
+    if cfg.rsu_placement not in ("spread", "perimeter", "center", "corners", "all"):
+        raise ValueError(f"rsu_placement must be spread|perimeter|center|corners|all "
+                         f"(got {cfg.rsu_placement!r})")
+    if cfg.rsu_range_m < 0:
+        raise ValueError(f"rsu_range_m must be >= 0 (got {cfg.rsu_range_m})")
     if cfg.fleet != "mixed" and cfg.fleet not in VEHICLE_TYPES:
         raise ValueError(f"fleet must be 'mixed' or one of {sorted(VEHICLE_TYPES)} (got {cfg.fleet!r})")
     if cfg.road_network not in ("linear", "grid"):
@@ -685,19 +721,16 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     # receiver, but as trusted infrastructure. They add corroborating, non-gameable evidence near
     # their location. n_rsus=0 (default) -> rsus=[] -> the reception loop is byte-identical.
     rsus: list[Vehicle] = []
+    rsu_range = cfg.rsu_range_m if cfg.rsu_range_m > 0 else cfg.radio_range_m
     if cfg.n_rsus > 0:
-        if net is not None:                      # spread across grid intersections
-            spots = [net._coord(net.nodes[(i * max(1, len(net.nodes) // cfg.n_rsus)) % len(net.nodes)])
-                     for i in range(cfg.n_rsus)]
-        else:                                    # spread along the linear corridor
-            span = max(1.0, cfg.n_vehicles * 20.0)
-            spots = [(span * (i + 0.5) / cfg.n_rsus, 0.0) for i in range(cfg.n_rsus)]
+        spots = _rsu_spots(cfg, net)
         for ri, (sx, sy) in enumerate(spots):
             pk = ca.keypair_from_seed(cfg.derive(f"rsu:{ri}"))
             dig = ca.hashed_id8(ca.public_bytes(pk)).hex()
             rsu = Vehicle(vid=_RSU_VID_BASE + ri, spawn_x=float(sx), lane_y=float(sy), speed=0.0,
                           is_attacker=False, priv=None, pub=b"", cert_digest=dig, linkage_ctx=None,
                           i_period=0, j_index=0, request_hash="", is_rsu=True, wander_amp=0.0,
+                          rx_range=rsu_range,
                           pseudonyms=[{"k": 0, "i": 0, "j": 0, "digest": dig,
                                        "valid_from": 0.0, "valid_to": total_time + cfg.dt}])
             pseudonym_info[dig] = {"i": 0, "j": 0, "lv": None, "ghost": False, "veh_vid": rsu.vid}
@@ -1195,10 +1228,15 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             if enforced(rx, t):
                 continue
             rxx, rxy = rx_pos[rx.vid]
+            # per-receiver range: an RSU may reach further than vehicles, so it searches a wider cell
+            # window (radius = ceil(range/cell)). Vehicles keep rx_range=0 -> range=radio_range_m ->
+            # radius 1 -> the original 3x3 -> byte-identical.
+            rr = rx.rx_range or cfg.radio_range_m
+            rad = max(1, int(math.ceil(rr / rng_cell)))
             cx0, cy0 = int(rxx // rng_cell), int(rxy // rng_cell)
             cand = []
-            for dcx in (-1, 0, 1):
-                for dcy in (-1, 0, 1):
+            for dcx in range(-rad, rad + 1):
+                for dcy in range(-rad, rad + 1):
                     cand.extend(bcell.get((cx0 + dcx, cy0 + dcy), ()))
             cand.sort()
             in_range = []
@@ -1207,13 +1245,13 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 if b["veh"].vid == rx.vid:
                     continue
                 d = math.hypot(b["x"] - rxx, b["y"] - rxy)
-                if d <= cfg.radio_range_m:
+                if d <= rr:
                     in_range.append((b, d))
             load = sum(b["msg_count"] for b, _ in in_range)
             cong = min(0.8, max(0.0, (load - cfg.chan_capacity) / max(1, cfg.chan_capacity)) * 0.5)
             reporter_digest = rx.active_pseudonym(t, cfg.rotate_period_s)["digest"]
             for b, dist in in_range:
-                loss = cfg.packet_loss_base + cfg.nlos_loss * (dist / cfg.radio_range_m) + cong + wx_loss
+                loss = cfg.packet_loss_base + cfg.nlos_loss * (dist / rr) + cong + wx_loss
                 if loss > 0 and rng.random() < loss:
                     continue                                    # packet dropped on the channel
                 tx, digest, cx, cy, cs, ch, conf = (b["veh"], b["digest"], b["cx"], b["cy"],
@@ -1525,6 +1563,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="trips originate at the grid perimeter (realistic network sources/sinks)")
     p.add_argument("--n-rsus", type=int, default=0,
                    help="fixed Road-Side Units: static, always-trusted receivers spread over the map (0=off)")
+    p.add_argument("--rsu-placement", default="spread",
+                   choices=["spread", "perimeter", "center", "corners", "all"],
+                   help="where RSUs are placed on the grid")
+    p.add_argument("--rsu-range", type=float, default=0.0,
+                   help="RSU radio range (m); 0 = same as vehicles' --radio-range")
     p.add_argument("--demand", default="uniform", choices=["uniform", "rush", "night"],
                    help="time-varying arrival-demand profile")
     p.add_argument("--fleet", default="mixed", help="'mixed' or a single vehicle class (car/truck/bus/motorcycle)")
@@ -1600,7 +1643,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                          n_lanes=args.lanes,
                          demand_profile=args.demand, od_model=args.od_model,
                          od_gravity_scale=args.od_gravity_scale, boundary_origins=args.boundary_origins,
-                         n_rsus=args.n_rsus,
+                         n_rsus=args.n_rsus, rsu_placement=args.rsu_placement, rsu_range_m=args.rsu_range,
                          car_following=not args.no_car_following,
                          turn_slowdown=args.turn_slowdown, turn_speed_mps=args.turn_speed,
                          fleet=args.fleet, live_interval_s=args.live_interval,
