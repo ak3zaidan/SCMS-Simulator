@@ -90,6 +90,37 @@ def _parse_fleet_mix(s: str) -> dict | None:
     return {n: parsed[n] for n in VEHICLE_TYPES if n in parsed}   # canonical order
 
 
+def _parse_attack_mix(s: str) -> dict | None:
+    """Parse 'ConstPos:0.6,Sybil:0.4' -> {type: weight} in canonical ATTACK_CATALOG order. Empty ->
+    None (default round-robin). Raises on an unknown attack type or non-positive weight."""
+    if not s or not s.strip():
+        return None
+    parsed = {}
+    for part in s.split(","):
+        name, _, w = part.strip().partition(":")
+        name = name.strip()
+        if name not in ATTACK_CATALOG:
+            raise ValueError(f"attack_mix has unknown type {name!r}")
+        wt = float(w)
+        if wt <= 0:
+            raise ValueError(f"attack_mix weight for {name!r} must be > 0 (got {wt})")
+        parsed[name] = wt
+    if not parsed:
+        raise ValueError(f"attack_mix parsed to nothing: {s!r}")
+    return {n: parsed[n] for n in ATTACK_CATALOG if n in parsed}   # canonical order
+
+
+def _weighted_pick(rng, weights: dict) -> str:
+    """Deterministic weighted choice over {name: weight} (order-stable) using one rng draw."""
+    tot = sum(weights.values()) or 1.0
+    r, acc = rng.random(), 0.0
+    for name, wt in weights.items():
+        acc += wt / tot
+        if r <= acc:
+            return name
+    return next(iter(weights))
+
+
 def _pick_vehicle_type(rng, fleet: str, weights: dict | None = None) -> str:
     if fleet != "mixed":
         return fleet if fleet in VEHICLE_TYPES else "car"
@@ -124,6 +155,8 @@ class PipelineConfig:
     attack_start: float = 5.0
     attack_end: float = 60.0
     attack_intensity: float = 1.0        # scales falsification magnitudes (subtle <1 .. blatant >1)
+    attack_mix: str = ""                 # per-type weights, e.g. "ConstPos:0.6,Sybil:0.4"
+                                         # (empty = round-robin over attack_types)
     attack_duty_cycle: float = 1.0       # <1: attacker falsifies only in bursts (evades sustained-
                                          # evidence revocation); fraction of each pulse period "on"
     attack_pulse_period_s: float = 20.0  # length of one on/off pulse cycle when duty_cycle < 1
@@ -517,6 +550,7 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
     if cfg.fleet != "mixed" and cfg.fleet not in VEHICLE_TYPES:
         raise ValueError(f"fleet must be 'mixed' or one of {sorted(VEHICLE_TYPES)} (got {cfg.fleet!r})")
     _parse_fleet_mix(cfg.fleet_mix)      # raises ValueError on a bad class name / weight
+    _parse_attack_mix(cfg.attack_mix)    # raises ValueError on an unknown attack type / weight
     if cfg.trip_speed_min <= 0 or cfg.trip_speed_max < cfg.trip_speed_min:
         raise ValueError(f"need 0 < trip_speed_min <= trip_speed_max "
                          f"(got {cfg.trip_speed_min}, {cfg.trip_speed_max})")
@@ -595,6 +629,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
 
     catalog = cfg.attack_types or (cfg.attack_type,)
     fleet_weights = _parse_fleet_mix(cfg.fleet_mix)   # None -> default mixed weights (byte-identical)
+    attack_weights = _parse_attack_mix(cfg.attack_mix)  # None -> round-robin catalog (byte-identical)
     total_time = cfg.n_steps * cfg.dt
     net = None
     if cfg.road_network == "grid":
@@ -617,7 +652,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         true_id = f"veh_{vid:03d}"
         ra.bind(req_hash, true_id)
         if is_att:
-            atype = catalog[atk_counter["n"] % len(catalog)]
+            if attack_weights:                       # weighted per-type assignment (own rng stream)
+                atype = _weighted_pick(random.Random(f"{cfg.seed}:atkmix:{vid}"), attack_weights)
+            else:                                    # default: round-robin over the catalog
+                atype = catalog[atk_counter["n"] % len(catalog)]
             atk_counter["n"] += 1
         else:
             atype = "none"
@@ -1588,6 +1626,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--steps", type=int, default=40)
     p.add_argument("--attacker-pct", type=float, default=0.0)
     p.add_argument("--attack-intensity", type=float, default=1.0, help="scale falsification magnitude (subtle<1)")
+    p.add_argument("--attack-mix", default="", help="per-type attack weights, e.g. 'ConstPos:0.6,Sybil:0.4'")
     p.add_argument("--attack-duty-cycle", type=float, default=1.0,
                    help="<1: attacker falsifies only in bursts (intermittent/pulsed, evades revocation)")
     p.add_argument("--attack-pulse-period", type=float, default=20.0, help="pulse cycle length (s) when duty<1")
@@ -1699,6 +1738,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
     cfg = PipelineConfig(seed=args.seed, n_vehicles=args.vehicles, n_steps=args.steps,
                          attacker_pct=args.attacker_pct, attack_intensity=args.attack_intensity,
+                         attack_mix=args.attack_mix,
                          attack_duty_cycle=args.attack_duty_cycle,
                          attack_pulse_period_s=args.attack_pulse_period,
                          attack_delay_jitter_s=args.attack_delay_jitter,

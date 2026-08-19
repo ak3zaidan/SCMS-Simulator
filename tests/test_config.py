@@ -31,6 +31,7 @@ from scms_sim_ref.mock_pipeline.run import validate_config
     dict(rsu_coords="not-a-coord"),
     dict(lane_width_m=0.0),
     dict(light_cycle_s=0.0),
+    dict(attack_mix="Nonexistent:0.5"),
 ])
 def test_invalid_config_raises_clear_error(kw):
     with pytest.raises(ValueError):

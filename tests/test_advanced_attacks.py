@@ -184,3 +184,17 @@ def test_mixed_run_catches_credential_attacks(tmp_path):
     s, _ = V.validate(out)
     cred = s["recall_by_family"].get("credential")
     assert cred is not None and cred >= 0.6, f"mixed run should catch credential attacks: {cred}"
+
+
+def test_attack_mix_controls_scenario_composition(tmp_path):
+    """attack_mix gives per-type control over the attack scenario (fractions ~ requested weights)."""
+    import collections
+    out = str(tmp_path / "run")
+    run_pipeline(PipelineConfig(seed=5, traffic_flow=True, road_network="grid", duration_s=200.0,
+                                arrival_rate=3.0, grid_w=6, grid_h=6, attacker_pct=0.5,
+                                attack_mix="ConstPos:0.7,Sybil:0.3", faulty_pct=0.0, out_dir=out))
+    atk = _jsonl(tmp_path / "run" / "ground_truth" / "gt_attacks.jsonl")
+    mix = collections.Counter(a["attack_type"] for a in atk)
+    assert set(mix) == {"ConstPos", "Sybil"}, mix               # only the requested types appear
+    tot = sum(mix.values())
+    assert mix["ConstPos"] / tot > 0.55, mix                    # ConstPos dominant as weighted (0.7)
