@@ -21,6 +21,13 @@ from scms_sim_ref.mock_pipeline.run import validate_config
     dict(turn_speed_mps=-1.0),
     dict(attack_pulse_period_s=0.0),
     dict(od_gravity_scale=0.0),
+    dict(n_rsus=-1),
+    dict(rsu_placement="everywhere"),
+    dict(rsu_range_m=-5.0),
+    dict(fleet_mix="spaceship:0.5"),
+    dict(fleet_mix="car:-0.2"),
+    dict(trip_speed_min=0.0),
+    dict(trip_speed_min=20.0, trip_speed_max=10.0),
 ])
 def test_invalid_config_raises_clear_error(kw):
     with pytest.raises(ValueError):

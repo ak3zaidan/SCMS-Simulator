@@ -69,15 +69,38 @@ VEHICLE_TYPES = {
 }
 
 
-def _pick_vehicle_type(rng, fleet: str) -> str:
+def _parse_fleet_mix(s: str) -> dict | None:
+    """Parse 'car:0.6,truck:0.3,bus:0.1' -> {name: weight} in canonical VEHICLE_TYPES order (so the
+    sampling draw is order-stable). Empty/blank -> None (use the default mixed weights). Raises on a
+    bad class name or non-positive weight."""
+    if not s or not s.strip():
+        return None
+    parsed = {}
+    for part in s.split(","):
+        name, _, w = part.strip().partition(":")
+        name = name.strip()
+        if name not in VEHICLE_TYPES:
+            raise ValueError(f"fleet_mix has unknown class {name!r} (valid: {sorted(VEHICLE_TYPES)})")
+        wt = float(w)
+        if wt <= 0:
+            raise ValueError(f"fleet_mix weight for {name!r} must be > 0 (got {wt})")
+        parsed[name] = wt
+    if not parsed:
+        raise ValueError(f"fleet_mix parsed to nothing: {s!r}")
+    return {n: parsed[n] for n in VEHICLE_TYPES if n in parsed}   # canonical order
+
+
+def _pick_vehicle_type(rng, fleet: str, weights: dict | None = None) -> str:
     if fleet != "mixed":
         return fleet if fleet in VEHICLE_TYPES else "car"
+    w = weights or {n: VEHICLE_TYPES[n]["weight"] for n in VEHICLE_TYPES}
+    tot = sum(w.values()) or 1.0
     r, acc = rng.random(), 0.0
-    for name, p in VEHICLE_TYPES.items():
-        acc += p["weight"]
+    for name, wt in w.items():
+        acc += wt / tot
         if r <= acc:
             return name
-    return "car"
+    return next(iter(w))
 _SYBIL_MIN = 4        # distinct certs at NEARLY the same point before sybilCoLocation fires
 _CELL_M = 3.0         # co-location cell: small enough that a bumper-to-bumper queue (~7 m spacing)
 _RSU_VID_BASE = 10_000_000   # Road-Side Unit vids start here (never collide with vehicle vids)
@@ -167,6 +190,8 @@ class PipelineConfig:
     trip_speed_min: float = 8.0
     trip_speed_max: float = 18.0
     fleet: str = "mixed"                 # "mixed" (car/moto/truck/bus) | a single type name
+    fleet_mix: str = ""                  # custom mixed composition, e.g. "car:0.6,truck:0.3,bus:0.1"
+                                         # (only when fleet="mixed"; empty = default weights)
     # car-following (IDM) -> queues, stop-and-go, congestion (flow + grid only)
     car_following: bool = True
     idm_accel: float = 1.5               # max acceleration (m/s^2)
@@ -462,6 +487,10 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"rsu_range_m must be >= 0 (got {cfg.rsu_range_m})")
     if cfg.fleet != "mixed" and cfg.fleet not in VEHICLE_TYPES:
         raise ValueError(f"fleet must be 'mixed' or one of {sorted(VEHICLE_TYPES)} (got {cfg.fleet!r})")
+    _parse_fleet_mix(cfg.fleet_mix)      # raises ValueError on a bad class name / weight
+    if cfg.trip_speed_min <= 0 or cfg.trip_speed_max < cfg.trip_speed_min:
+        raise ValueError(f"need 0 < trip_speed_min <= trip_speed_max "
+                         f"(got {cfg.trip_speed_min}, {cfg.trip_speed_max})")
     if cfg.road_network not in ("linear", "grid"):
         raise ValueError(f"road_network must be linear|grid (got {cfg.road_network!r})")
     if cfg.traffic_flow:
@@ -536,6 +565,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     pca, ra = PseudonymCA(), RegistrationAuthority()
 
     catalog = cfg.attack_types or (cfg.attack_type,)
+    fleet_weights = _parse_fleet_mix(cfg.fleet_mix)   # None -> default mixed weights (byte-identical)
     total_time = cfg.n_steps * cfg.dt
     net = None
     if cfg.road_network == "grid":
@@ -600,7 +630,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                                             i_period=i_k, valid_from=round(vf, 3), valid_to=round(vt, 3)))
         p0 = pseudonyms[0]
         base_speed = trip.speed if trip is not None else cfg.nominal_speed * (0.85 + 0.3 * vr.random())
-        vtype = _pick_vehicle_type(vr, cfg.fleet)
+        vtype = _pick_vehicle_type(vr, cfg.fleet, fleet_weights)
         tp = VEHICLE_TYPES[vtype]
         speed = base_speed * tp["speed_mult"] * WEATHER_SPEED_MULT.get(cfg.weather, 1.0)
         v = Vehicle(
@@ -1571,6 +1601,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--demand", default="uniform", choices=["uniform", "rush", "night"],
                    help="time-varying arrival-demand profile")
     p.add_argument("--fleet", default="mixed", help="'mixed' or a single vehicle class (car/truck/bus/motorcycle)")
+    p.add_argument("--fleet-mix", default="", help="custom mixed composition, e.g. 'car:0.6,truck:0.3,bus:0.1'")
+    p.add_argument("--trip-speed-min", type=float, default=8.0, help="min desired trip speed (m/s)")
+    p.add_argument("--trip-speed-max", type=float, default=18.0, help="max desired trip speed (m/s)")
+    p.add_argument("--idm-accel", type=float, default=1.5, help="IDM max acceleration (m/s^2)")
+    p.add_argument("--idm-decel", type=float, default=2.0, help="IDM comfortable deceleration (m/s^2)")
+    p.add_argument("--idm-time-headway", type=float, default=1.3, help="IDM desired time gap to leader (s)")
+    p.add_argument("--idm-min-gap", type=float, default=2.5, help="IDM jam distance (m)")
+    p.add_argument("--idm-lookahead", type=float, default=70.0, help="IDM leader search distance (m)")
     p.add_argument("--live-interval", type=float, default=0.0, help="write live_state.json every N sim-seconds (GUI map)")
     p.add_argument("--no-car-following", action="store_true", help="disable IDM car-following")
     p.add_argument("--turn-slowdown", action="store_true", help="slow into sharp grid corners (realer, harder)")
@@ -1646,7 +1684,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                          n_rsus=args.n_rsus, rsu_placement=args.rsu_placement, rsu_range_m=args.rsu_range,
                          car_following=not args.no_car_following,
                          turn_slowdown=args.turn_slowdown, turn_speed_mps=args.turn_speed,
-                         fleet=args.fleet, live_interval_s=args.live_interval,
+                         fleet=args.fleet, fleet_mix=args.fleet_mix,
+                         trip_speed_min=args.trip_speed_min, trip_speed_max=args.trip_speed_max,
+                         idm_accel=args.idm_accel, idm_decel=args.idm_decel,
+                         idm_time_headway=args.idm_time_headway, idm_min_gap=args.idm_min_gap,
+                         idm_lookahead_m=args.idm_lookahead,
+                         live_interval_s=args.live_interval,
                          traffic_lights=args.traffic_lights, gps_jam_rate=args.gps_jam_rate,
                          max_total_vehicles=args.max_total_vehicles, verbose=True,
                          out_dir=(args.out or "datasets/poc_run"))

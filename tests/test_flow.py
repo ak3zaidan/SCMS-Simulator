@@ -154,6 +154,19 @@ def test_heterogeneous_fleet_types_and_kinematics(tmp_path):
         assert statistics.mean(speeds["truck"]) < statistics.mean(speeds["car"]) + 1.0
 
 
+def test_custom_fleet_mix_controls_composition(tmp_path):
+    """fleet_mix gives full control over the class composition (fractions ~ requested weights)."""
+    import collections
+    _flow(tmp_path, fleet="mixed", fleet_mix="truck:0.7,car:0.3", arrival_rate=3.0, duration_s=200.0,
+          grid_w=6, grid_h=6, attacker_pct=0.0)
+    veh = _jsonl(tmp_path / "run" / "ground_truth" / "gt_vehicle.jsonl")
+    mix = collections.Counter(v.get("veh_type") for v in veh)
+    tot = sum(mix.values())
+    assert set(mix) <= {"truck", "car"}, mix                       # only the requested classes appear
+    assert mix["truck"] / tot > mix["car"] / tot, mix              # truck dominant as weighted (0.7)
+    assert mix["truck"] / tot > 0.55, mix
+
+
 def test_map_offroad_detector_catches_position_offsets(tmp_path):
     """On a known road grid, a constant position OFFSET puts the claim off-road -> now detectable
     (it evaded the relative detectors), while honest on-road traffic is not flagged."""
