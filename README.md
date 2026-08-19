@@ -54,8 +54,10 @@ python -m scms_sim_ref.mock_pipeline.run --config datasets/urban/manifest.json -
 
 Presets: `urban_rush`, `highway`, `night_rain`, `gridlock`, `stealth_hard`. Other realism knobs:
 `--od-model gravity` (distance-decay trip lengths), `--turn-slowdown` (slow into corners),
-`--attack-duty-cycle 0.3` (pulsed/intermittent attackers), `--attack-delay-jitter 20` (varied onset).
-Long runs are interruptible — Ctrl-C finalizes a valid partial dataset.
+`--attack-duty-cycle 0.3` (pulsed/intermittent attackers), `--attack-delay-jitter 20` (varied onset),
+`--boundary-origins` (trips enter at the network edge), `--n-rsus 12` (fixed always-trusted Road-Side
+Units — infrastructure-assisted detection that lifts recall in sparse traffic). Long runs are
+interruptible — Ctrl-C finalizes a valid partial dataset.
 
 Each run writes `ma/*.jsonl` (MA-visible features), a **separate** `ground_truth/*.jsonl`
 (oracle-only labels), `ml/*` (train/val/test ML tables via `--featurize`), a `DATASHEET.md`, and
