@@ -70,6 +70,33 @@ def test_signalized_congested_flow_keeps_reasonable_precision(tmp_path):
     assert s["recall"] is not None and s["recall"] >= 0.5, s
 
 
+def test_full_control_surface_is_deterministic(tmp_path):
+    """Every full-control knob enabled at once (fleet_mix, attack_mix, RSUs+placement+range, custom
+    network geometry, gravity/boundary/cornering) must still be byte-identical run-to-run."""
+    kw = dict(traffic_flow=True, road_network="grid", duration_s=180.0, arrival_rate=2.5,
+              grid_w=7, grid_h=4, grid_block_m=150.0, n_lanes=3, lane_width_m=3.25,
+              traffic_lights=True, light_cycle_s=28.0, demand_profile="rush", od_model="gravity",
+              boundary_origins=True, turn_slowdown=True, fleet="mixed",
+              fleet_mix="car:0.5,truck:0.3,bus:0.2", attacker_pct=0.2,
+              attack_mix="ConstPos:0.4,Sybil:0.3,SlowDrift:0.3", attack_duty_cycle=0.5,
+              attack_delay_jitter_s=10.0, n_rsus=6, rsu_placement="perimeter", rsu_range_m=300.0,
+              rotate_period_s=60.0, collude_pct=0.3, weather="rain", seed=19)
+    a = run_pipeline(PipelineConfig(out_dir=str(tmp_path / "a"), **kw))
+    b = run_pipeline(PipelineConfig(out_dir=str(tmp_path / "b"), **kw))
+    assert a.data_digest == b.data_digest, "the full-control config must be deterministic"
+
+
+def test_ring_full_control_is_deterministic(tmp_path):
+    """Same, on the ring topology with RSUs + custom traffic."""
+    kw = dict(traffic_flow=True, road_network="ring", duration_s=150.0, arrival_rate=2.0,
+              grid_w=20, grid_block_m=130.0, n_lanes=2, fleet_mix="car:0.7,motorcycle:0.3",
+              attacker_pct=0.2, attack_mix="RandomPos:0.6,HeadingOffset:0.4", n_rsus=5,
+              rsu_range_m=260.0, seed=23)
+    a = run_pipeline(PipelineConfig(out_dir=str(tmp_path / "a"), **kw))
+    b = run_pipeline(PipelineConfig(out_dir=str(tmp_path / "b"), **kw))
+    assert a.data_digest == b.data_digest
+
+
 def test_all_new_realism_features_are_deterministic(tmp_path):
     """Every new flow realism knob enabled at once still yields byte-identical output run-to-run."""
     kw = dict(traffic_flow=True, road_network="grid", duration_s=200.0, arrival_rate=2.5,
