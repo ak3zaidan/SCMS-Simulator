@@ -73,9 +73,13 @@ python -m ... --flow --road grid --rsu-coords "300,300;600,300;300,600" --out da
 python -m ... --flow --road grid --fleet-mix "car:0.6,truck:0.3,bus:0.1" `
     --trip-speed-min 10 --trip-speed-max 22 --idm-accel 1.2 --idm-time-headway 1.6
 
-# Network: non-square grid, block spacing, lanes, lane width, signal timing
+# Network: topology (grid / ring / linear), non-square grid, block spacing, lanes, lane width, signals
 python -m ... --flow --road grid --grid 10 --grid-h 4 --grid-block 160 `
     --lanes 3 --lane-width 3.25 --traffic-lights --light-cycle 30
+python -m ... --flow --road ring --grid 24 --grid-block 120   # circular beltway of 24 intersections
+
+# Attacks: control the scenario composition (per-type weights)
+python -m ... --flow --road grid --attacker-pct 0.2 --attack-mix "ConstPos:0.5,Sybil:0.3,SlowDrift:0.2"
 ```
 
 `--rsu-placement` ∈ {spread, perimeter, center, corners, all}. The GUI mirrors all of this, and its

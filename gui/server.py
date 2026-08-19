@@ -100,9 +100,12 @@ CONFIG_SPEC = [
      "default": 300, "gen": "python-flow", "arg": "--duration", "help": "simulation length in seconds"},
     {"group": "Python flow", "name": "pf_arrival", "label": "Arrival rate (veh/s)", "type": "float",
      "default": 2.5, "step": 0.5, "gen": "python-flow", "arg": "--arrival-rate"},
-    {"group": "Python flow", "name": "pf_grid", "label": "Grid size (NxN)", "type": "int",
-     "default": 6, "min": 2, "max": 20, "gen": "python-flow", "arg": "--grid",
-     "help": "grid road network dimension (intersections per side)"},
+    {"group": "Python flow", "name": "pf_road", "label": "Road network", "type": "choice",
+     "default": "grid", "options": ["grid", "ring", "linear"], "gen": "python-flow", "arg": "--road",
+     "help": "grid = routed NxN grid; ring = circular beltway; linear = straight roads"},
+    {"group": "Python flow", "name": "pf_grid", "label": "Grid size (N) / ring nodes", "type": "int",
+     "default": 6, "min": 2, "max": 40, "gen": "python-flow", "arg": "--grid",
+     "help": "grid: intersections per side; ring: number of intersections on the circle"},
     {"group": "Python flow", "name": "pf_attacker", "label": "Attacker fraction", "type": "float",
      "default": 0.15, "step": 0.05, "min": 0, "max": 1, "gen": "python-flow", "arg": "--attacker-pct"},
     {"group": "Python flow", "name": "pf_faulty", "label": "Faulty fraction", "type": "float",
@@ -531,8 +534,10 @@ def start_run(config: dict) -> dict:
 def _start_python_flow(config: dict) -> dict:
     """Launch the pure-Python routed traffic-flow generator (--flow --road grid) with a live map."""
     out_dir = REPO / "datasets" / "python_flow"
-    cmd = [sys.executable, "-m", "scms_sim_ref.mock_pipeline.run", "--flow", "--road", "grid",
+    cmd = [sys.executable, "-m", "scms_sim_ref.mock_pipeline.run", "--flow",
            "--featurize", "--live-interval", "1", "--out", str(out_dir)]
+    if not any(c.get("name") == "pf_road" for c in CONFIG_SPEC):   # safety: default to grid
+        cmd += ["--road", "grid"]
     for c in CONFIG_SPEC:
         if c.get("gen") != "python-flow" or not c.get("arg"):
             continue
