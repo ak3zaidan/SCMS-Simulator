@@ -106,9 +106,11 @@ def cell_config(cell: dict, idx: int, base_seed: int, n_steps: int, out_dir: Pat
         out_dir=str(out_dir))
     if flow:
         # each domain is a long routed simulation with car-following + a demand profile, and
-        # (as permutation axes) signalized/unsignalized intersections and mixed/car fleets
-        kw.update(traffic_flow=True, road_network="grid", car_following=True,
-                  duration_s=flow_duration, arrival_rate=2.0, grid_w=6, grid_h=6, n_lanes=2,
+        # (as permutation axes) topology, signals, fleet, attack difficulty, RSUs
+        road = cell.get("road", "grid")
+        gw = 16 if road == "ring" else 6             # ring: grid_w = number of intersections on the loop
+        kw.update(traffic_flow=True, road_network=road, car_following=True,
+                  duration_s=flow_duration, arrival_rate=2.0, grid_w=gw, grid_h=6, n_lanes=2,
                   grid_block_m=140.0, demand_profile=cell.get("demand", "uniform"),
                   traffic_lights=bool(cell.get("lights", False)), fleet=cell.get("fleet", "mixed"),
                   attack_intensity=cell.get("intensity", 1.0),
@@ -158,7 +160,8 @@ def main(argv=None) -> int:
         # is irrelevant. "duty" spans continuous vs pulsed (evasive) attackers -> a difficulty axis.
         grid = {**grid, "demand": ["uniform", "rush", "night"], "lights": [False, True],
                 "fleet": ["mixed", "car"], "intensity": [1.0, 0.5], "duty": [1.0, 0.4],
-                "rsus": [0, 8], "n_vehicles": [0]}   # RSU (infrastructure-assisted) coverage axis
+                "rsus": [0, 8], "road": ["grid", "ring"],   # RSU + topology coverage axes
+                "n_vehicles": [0]}
     cells = enumerate_cells(grid)
     total = len(cells)
     dropped = 0

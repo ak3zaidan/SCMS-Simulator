@@ -111,5 +111,6 @@ def test_massive_flow_domains_are_routed_simulations(tmp_path, monkeypatch):
     assert all("demand" in c for c in cat), "flow domains carry a demand profile"
     assert all("duty" in c for c in cat), "flow domains span the pulsed-attack difficulty axis"
     assert all("rsus" in c for c in cat), "flow domains span the RSU (infrastructure) axis"
+    assert all("road" in c for c in cat), "flow domains span the topology (grid/ring) axis"
     vf = pd.read_csv(out / "ml" / "vehicle_features.csv")
     assert "domain_id" in vf.columns and len(vf) > 0
