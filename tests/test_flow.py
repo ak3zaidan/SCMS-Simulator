@@ -228,6 +228,17 @@ def test_traffic_lights_create_stops_at_intersections(tmp_path):
     assert stopped_fraction(True) > stopped_fraction(False) + 0.03, "reds should fully stop vehicles"
 
 
+def test_network_dimensions_are_fully_configurable(tmp_path):
+    """Full network control: a non-square grid with a custom block size spans the expected extent."""
+    _flow(tmp_path, grid_w=8, grid_h=3, grid_block_m=200.0, attacker_pct=0.0, duration_s=100.0,
+          arrival_rate=2.0)
+    emis = _jsonl(tmp_path / "run" / "ground_truth" / "gt_emissions_sample.jsonl")
+    xs = [e["true_x"] for e in emis]
+    ys = [e["true_y"] for e in emis]
+    assert max(xs) > 7 * 200.0 - 60 and max(xs) <= 7 * 200.0 + 5      # width  = (8-1)*200
+    assert max(ys) <= 2 * 200.0 + 5                                    # height = (3-1)*200
+
+
 def test_flow_vehicles_follow_grid_routes(tmp_path):
     """Sampled true positions stay within the grid road network bounds (routed mobility)."""
     _flow(tmp_path, grid_w=5, grid_h=5, grid_block_m=120.0)

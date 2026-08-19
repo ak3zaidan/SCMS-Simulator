@@ -485,6 +485,14 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
                          f"(got {cfg.rsu_placement!r})")
     if cfg.rsu_range_m < 0:
         raise ValueError(f"rsu_range_m must be >= 0 (got {cfg.rsu_range_m})")
+    if cfg.n_lanes < 1:
+        raise ValueError(f"n_lanes must be >= 1 (got {cfg.n_lanes})")
+    if cfg.lane_width_m <= 0:
+        raise ValueError(f"lane_width_m must be > 0 (got {cfg.lane_width_m})")
+    if cfg.light_cycle_s <= 0:
+        raise ValueError(f"light_cycle_s must be > 0 (got {cfg.light_cycle_s})")
+    if cfg.grid_block_m <= 0:
+        raise ValueError(f"grid_block_m must be > 0 (got {cfg.grid_block_m})")
     if cfg.fleet != "mixed" and cfg.fleet not in VEHICLE_TYPES:
         raise ValueError(f"fleet must be 'mixed' or one of {sorted(VEHICLE_TYPES)} (got {cfg.fleet!r})")
     _parse_fleet_mix(cfg.fleet_mix)      # raises ValueError on a bad class name / weight
@@ -1583,6 +1591,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--grid", type=int, default=6, help="grid road network dimension (grid x grid)")
     p.add_argument("--grid-block", type=float, default=120.0, help="grid block spacing (m)")
     p.add_argument("--lanes", type=int, default=1, help="parallel lanes per road (overtaking; reduces gridlock)")
+    p.add_argument("--lane-width", type=float, default=3.5, help="lane width (m) for multi-lane offsets")
+    p.add_argument("--light-cycle", type=float, default=24.0, help="traffic-light full cycle (s); half green per axis")
     p.add_argument("--od-model", default="uniform", choices=["uniform", "gravity"],
                    help="trip destination law: uniform | gravity (realistic distance-decay trip lengths)")
     p.add_argument("--od-gravity-scale", type=float, default=2.0,
@@ -1678,7 +1688,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                          traffic_flow=args.flow, duration_s=args.duration, arrival_rate=args.arrival_rate,
                          road_network=("grid" if (args.flow and args.road == "linear") else args.road),
                          grid_w=args.grid, grid_h=(args.grid_h or args.grid), grid_block_m=args.grid_block,
-                         n_lanes=args.lanes,
+                         n_lanes=args.lanes, lane_width_m=args.lane_width, light_cycle_s=args.light_cycle,
                          demand_profile=args.demand, od_model=args.od_model,
                          od_gravity_scale=args.od_gravity_scale, boundary_origins=args.boundary_origins,
                          n_rsus=args.n_rsus, rsu_placement=args.rsu_placement, rsu_range_m=args.rsu_range,
