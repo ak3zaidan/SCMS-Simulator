@@ -139,6 +139,15 @@
       <button id="dlcfg" title="Download the exact, replayable config of the last run">⭳ Download config</button>
       <button id="replaycfg" title="Load a saved config/manifest JSON and reproduce it byte-for-byte">⭱ Replay config…</button>
       <input id="cfgfile" type="file" accept="application/json,.json" style="display:none">
+      <button id="advtoggle" title="Full control: edit EVERY config field">⚙ Advanced: all fields</button>
+    </div>
+    <div id="advPanel" style="display:none;padding:0 14px 12px">
+      <div class="note">Full control — every simulation parameter. Runs the exact config (via config
+        replay). Blank/unchanged fields keep their default.</div>
+      <input id="advSearch" type="text" placeholder="🔍 filter fields…" autocomplete="off"
+             style="margin:6px 0">
+      <div id="advForm" style="max-height:340px;overflow:auto"></div>
+      <button id="advrun" class="primary" style="margin-top:8px">▶ Run advanced config</button>
     </div>
   </div>
 
@@ -399,6 +408,54 @@ $('#cfgfile').addEventListener('change',async(ev)=>{
   const r=await (await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({generator:'config-replay',config_json:cfg})})).json();
   if(!r.ok){ alert(r.error||'failed to start'); $('#start').disabled=false; return; }
+  $('#statsPanel').style.display='none'; startLive(); poll();
+});
+
+// ---- Advanced: full control over EVERY PipelineConfig field (runs via config-replay) ----
+let ADV=null;
+$('#advtoggle').addEventListener('click',async()=>{
+  const p=$('#advPanel'); const show=p.style.display==='none'; p.style.display=show?'':'none';
+  if(show && !ADV){
+    ADV=await (await fetch('/api/schema')).json();
+    renderAdvForm();
+  }
+});
+function renderAdvForm(){
+  const sch=ADV.schema, def=ADV.defaults;
+  const rows=Object.keys(sch).sort().map(name=>{
+    const meta=sch[name], d=def[name];
+    const isBool=(meta.type==='bool'||typeof d==='boolean');
+    const val=(d==null?'':(Array.isArray(d)?d.join(','):d));
+    const inp=isBool
+      ? `<input type="checkbox" id="adv_${name}" ${d?'checked':''}>`
+      : `<input type="text" id="adv_${name}" value="${val}" style="width:120px">`;
+    return `<div class="advrow" data-name="${name}" style="display:flex;gap:8px;align-items:center;padding:2px 0">
+      <label style="flex:1;font-size:12px" title="${meta.type}">${name}</label>${inp}</div>`;
+  }).join('');
+  $('#advForm').innerHTML=rows;
+}
+$('#advSearch').addEventListener('input',()=>{
+  const q=$('#advSearch').value.toLowerCase();
+  document.querySelectorAll('#advForm .advrow').forEach(r=>{
+    r.style.display=r.dataset.name.toLowerCase().includes(q)?'':'none';
+  });
+});
+$('#advrun').addEventListener('click',async()=>{
+  const sch=ADV.schema, def=ADV.defaults, cfg={};
+  for(const name of Object.keys(sch)){
+    const el=$('#adv_'+name); if(!el) continue;
+    const meta=sch[name], d=def[name];
+    if(el.type==='checkbox'){ cfg[name]=el.checked; continue; }
+    let v=el.value.trim(); if(v==='') { cfg[name]=d; continue; }
+    if(Array.isArray(d)){ cfg[name]=v.split(',').map(s=>s.trim()).filter(Boolean); }
+    else if(typeof d==='number'){ const n=Number(v); cfg[name]=Number.isNaN(n)?d:n; }
+    else { cfg[name]=v; }
+  }
+  $('#advrun').disabled=true;
+  const r=await (await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({generator:'config-replay',config_json:cfg})})).json();
+  $('#advrun').disabled=false;
+  if(!r.ok){ alert(r.error||'failed to start'); return; }
   $('#statsPanel').style.display='none'; startLive(); poll();
 });
 

@@ -775,6 +775,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, live_state())
         if self.path == "/api/config":               # effective config of the last run (download)
             return self._send(200, {"config": last_effective_config()})
+        if self.path == "/api/schema":               # every PipelineConfig field (advanced full control)
+            defaults = {k: (list(v) if isinstance(v, tuple) else v)
+                        for k, v in pipeline_mod.PipelineConfig().__dict__.items()}
+            return self._send(200, {"schema": pipeline_mod.config_schema(), "defaults": defaults})
         return self._send(404, {"error": "not found"})
 
     def _same_origin(self) -> bool:
