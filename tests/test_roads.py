@@ -90,3 +90,23 @@ def test_ring_network_geometry_and_routing():
     assert len(tr.wp) >= 4
     for (x, y) in tr.wp:
         assert net.dist_to_road(x, y) < 1e-6
+
+
+def test_grid_dropout_removes_roads_but_stays_connected():
+    """grid_dropout removes redundant roads (irregular grid) while keeping every node reachable."""
+    from collections import deque
+    base = GridNetwork(6, 6, 120.0)
+    net = GridNetwork(6, 6, 120.0, dropout=0.3, seed=7)
+    assert len(net._dropped) > 0, "dropout should remove some roads"
+    # BFS over the pruned adjacency still reaches all 36 intersections (spanning tree protected)
+    seen = {net.nodes[0]}
+    q = deque([net.nodes[0]])
+    while q:
+        for m in net._neighbors(q.popleft()):
+            if m not in seen:
+                seen.add(m)
+                q.append(m)
+    assert len(seen) == len(net.nodes), "dropout must keep the grid connected"
+    # dropout=0 leaves adjacency identical to a plain grid
+    assert GridNetwork(6, 6, 120.0, dropout=0.0)._dropped == set()
+    assert base._neighbors((2, 2)) == GridNetwork(6, 6, 120.0, dropout=0.0)._neighbors((2, 2))

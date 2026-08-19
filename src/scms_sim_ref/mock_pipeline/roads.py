@@ -77,12 +77,48 @@ class Trip:
 class GridNetwork:
     """A w x h grid of intersections spaced `block` metres apart, 4-neighbour roads."""
 
-    def __init__(self, w: int, h: int, block: float):
+    def __init__(self, w: int, h: int, block: float, dropout: float = 0.0, seed: int = 0):
         self.w, self.h, self.block = int(w), int(h), float(block)
         self.nodes = [(i, j) for i in range(self.w) for j in range(self.h)]
         # perimeter intersections: realistic traffic sources/sinks (edges of the modelled area)
         self.boundary = [(i, j) for (i, j) in self.nodes
                          if i in (0, self.w - 1) or j in (0, self.h - 1)]
+        # optional irregularity: remove a fraction of roads while keeping the grid CONNECTED (only
+        # redundant, non-spanning-tree edges are droppable). dropout=0 -> no edges removed -> unchanged.
+        self._dropped: set = set()
+        if dropout > 0:
+            self._dropped = self._pick_dropped(dropout, seed)
+
+    def _full_neighbors(self, n):
+        i, j = n
+        out = []
+        if i > 0: out.append((i - 1, j))
+        if i < self.w - 1: out.append((i + 1, j))
+        if j > 0: out.append((i, j - 1))
+        if j < self.h - 1: out.append((i, j + 1))
+        return out
+
+    def _pick_dropped(self, dropout: float, seed: int) -> set:
+        import random as _r
+        edges, tree = [], set()
+        for n in self.nodes:                         # every undirected edge once
+            for m in self._full_neighbors(n):
+                if m > n:
+                    edges.append((n, m))
+        # BFS spanning tree (protected so the graph stays connected)
+        prev = {self.nodes[0]: None}
+        q = deque([self.nodes[0]])
+        while q:
+            n = q.popleft()
+            for m in self._full_neighbors(n):
+                if m not in prev:
+                    prev[m] = n
+                    tree.add(frozenset((n, m)))
+                    q.append(m)
+        droppable = [e for e in edges if frozenset(e) not in tree]
+        _r.Random(f"{seed}:dropout").shuffle(droppable)
+        n_drop = min(len(droppable), int(dropout * len(edges)))
+        return {frozenset(e) for e in droppable[:n_drop]}
 
     def _coord(self, n: tuple[int, int]) -> tuple[float, float]:
         return (n[0] * self.block, n[1] * self.block)
@@ -98,13 +134,10 @@ class GridNetwork:
         return min(dv, dh)
 
     def _neighbors(self, n: tuple[int, int]) -> list[tuple[int, int]]:
-        i, j = n
-        out = []
-        if i > 0: out.append((i - 1, j))
-        if i < self.w - 1: out.append((i + 1, j))
-        if j > 0: out.append((i, j - 1))
-        if j < self.h - 1: out.append((i, j + 1))
-        return out
+        nb = self._full_neighbors(n)
+        if self._dropped:
+            nb = [m for m in nb if frozenset((n, m)) not in self._dropped]
+        return nb
 
     def _bfs(self, o: tuple[int, int], d: tuple[int, int]) -> list[tuple[int, int]]:
         prev = {o: None}

@@ -33,6 +33,8 @@ from scms_sim_ref.mock_pipeline.run import validate_config
     dict(light_cycle_s=0.0),
     dict(attack_mix="Nonexistent:0.5"),
     dict(road_network="ring", traffic_flow=True, grid_w=2),
+    dict(grid_dropout=1.5),
+    dict(grid_dropout=-0.1),
 ])
 def test_invalid_config_raises_clear_error(kw):
     with pytest.raises(ValueError):
