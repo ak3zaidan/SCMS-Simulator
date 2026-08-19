@@ -573,9 +573,32 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
 _TUPLE_FIELDS = ("attacker_ids", "attack_types")
 
 
+def _field_group(name: str) -> str:
+    """Category for a config field, so UIs/tools can group the ~97 knobs sensibly."""
+    g = [
+        ("RSU", ("n_rsus", "rsu_")),
+        ("Attacks", ("attack", "attacker", "sybil", "collude", "victim", "dos", "delay")),
+        ("Mobility", ("fleet", "trip_", "idm_", "demand", "arrival", "n_lanes", "lane_", "turn_",
+                      "car_following", "veh_length", "od_", "boundary", "traffic_flow", "duration",
+                      "max_total", "nominal_speed", "state_prune")),
+        ("Network", ("road_network", "grid", "traffic_lights", "light_cycle")),
+        ("GNSS/sensor", ("gps_", "faulty", "weather")),
+        ("Radio", ("radio", "packet", "nlos", "chan", "freq", "art_max", "stale")),
+        ("Detection/MA", ("consistency", "heading", "detector", "report", "revoke", "reputation",
+                          "ma_defense", "max_accel", "offroad", "rotate", "beacon", "net_delay",
+                          "crl_")),
+        ("Run", ("seed", "n_vehicles", "n_steps", "dt", "jmax", "out_dir", "verbose",
+                 "live_interval", "emit_sample")),
+    ]
+    for label, prefixes in g:
+        if any(name == p or name.startswith(p) for p in prefixes):
+            return label
+    return "Other"
+
+
 def config_schema() -> dict:
-    """Machine-readable schema of every PipelineConfig field: {name: {type, default}}. Lets tools
-    build config UIs/validators programmatically against the full knob surface."""
+    """Machine-readable schema of every PipelineConfig field: {name: {type, default, group}}. Lets
+    tools/UIs build config forms/validators (and group them) against the full knob surface."""
     out = {}
     for f in dataclasses.fields(PipelineConfig):
         default = f.default
@@ -583,7 +606,7 @@ def config_schema() -> dict:
             default = None
         elif isinstance(default, tuple):
             default = list(default)
-        out[f.name] = {"type": str(f.type), "default": default}
+        out[f.name] = {"type": str(f.type), "default": default, "group": _field_group(f.name)}
     return out
 
 

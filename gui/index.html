@@ -422,7 +422,10 @@ $('#advtoggle').addEventListener('click',async()=>{
 });
 function renderAdvForm(){
   const sch=ADV.schema, def=ADV.defaults;
-  const rows=Object.keys(sch).sort().map(name=>{
+  const order=['RSU','Attacks','Mobility','Network','GNSS/sensor','Radio','Detection/MA','Run','Other'];
+  const byGroup={};
+  for(const name of Object.keys(sch)){ (byGroup[sch[name].group||'Other']??=[]).push(name); }
+  const rowHtml=name=>{
     const meta=sch[name], d=def[name];
     const isBool=(meta.type==='bool'||typeof d==='boolean');
     const val=(d==null?'':(Array.isArray(d)?d.join(','):d));
@@ -431,13 +434,24 @@ function renderAdvForm(){
       : `<input type="text" id="adv_${name}" value="${val}" style="width:120px">`;
     return `<div class="advrow" data-name="${name}" style="display:flex;gap:8px;align-items:center;padding:2px 0">
       <label style="flex:1;font-size:12px" title="${meta.type}">${name}</label>${inp}</div>`;
-  }).join('');
-  $('#advForm').innerHTML=rows;
+  };
+  const parts=[];
+  for(const grp of order){
+    const names=(byGroup[grp]||[]).sort(); if(!names.length) continue;
+    parts.push(`<div class="advgroup" data-group="${grp}">
+      <div class="subhead" style="margin-top:8px">${grp} <span class="hint">${names.length}</span></div>
+      ${names.map(rowHtml).join('')}</div>`);
+  }
+  $('#advForm').innerHTML=parts.join('');
 }
 $('#advSearch').addEventListener('input',()=>{
   const q=$('#advSearch').value.toLowerCase();
-  document.querySelectorAll('#advForm .advrow').forEach(r=>{
-    r.style.display=r.dataset.name.toLowerCase().includes(q)?'':'none';
+  document.querySelectorAll('#advForm .advgroup').forEach(g=>{
+    let any=false;
+    g.querySelectorAll('.advrow').forEach(r=>{
+      const m=r.dataset.name.toLowerCase().includes(q); r.style.display=m?'':'none'; any=any||m;
+    });
+    g.style.display=any?'':'none';
   });
 });
 $('#advrun').addEventListener('click',async()=>{
