@@ -46,6 +46,18 @@ def test_rsus_file_trusted_reports_and_are_not_counted_as_vehicles(tmp_path):
         assert find_forbidden_keys(r) == []
 
 
+def test_validate_reports_rsu_contribution(tmp_path):
+    """validate() quantifies RSU-sourced evidence; absent (empty) when no RSUs are configured."""
+    out = _sparse(tmp_path, 20)
+    s = V.validate(out)[0]
+    rc = s["rsu_contribution"]
+    assert rc and rc["reports"] > 0 and rc["rsus_reporting"] >= 1
+    assert 0.0 <= rc["precision"] <= 1.0
+    # no RSUs -> empty contribution block
+    out0 = _sparse(tmp_path, 0)
+    assert V.validate(out0)[0]["rsu_contribution"] == {}
+
+
 def test_rsus_improve_detection_in_reporter_starved_traffic(tmp_path):
     """In sparse traffic (few mobile reporters), always-present RSUs raise revocation recall of an
     easily-detected attack without hurting precision -- infrastructure-assisted detection."""

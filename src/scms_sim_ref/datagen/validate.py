@@ -94,13 +94,26 @@ def validate(dataset_dir: str) -> tuple[dict, list]:
     d2v = {m.get("pseudonym_cert_digest"): m.get("true_vehicle_id") for m in idmap}
     det_hits: dict[str, int] = {}
     det_true: dict[str, int] = {}
+    # RSU contribution: RSUs are trusted infrastructure receivers whose cert digests are NOT vehicle
+    # pseudonyms (absent from gt_identity_map), so a report whose reporter is unknown to the id-map is
+    # from an RSU. Quantify how much (and how reliably) infrastructure adds to the evidence.
+    rsu_reporters: set = set()
+    rsu_reports = 0
+    rsu_true = 0
     for r in _read(os.path.join(ma, "ma_reports.jsonl")):
         subj_atk = d2v.get(r.get("subject_cert_digest")) in attackers
         for code in r.get("reason_codes", []):
             det_hits[code] = det_hits.get(code, 0) + 1
             det_true[code] = det_true.get(code, 0) + (1 if subj_atk else 0)
+        rep = r.get("reporter_cert_digest")
+        if rep is not None and rep not in d2v:
+            rsu_reporters.add(rep)
+            rsu_reports += 1
+            rsu_true += 1 if subj_atk else 0
     detector_reliability = {c: {"reports": det_hits[c], "precision": round(det_true[c] / det_hits[c], 3)}
                             for c in sorted(det_hits)}
+    rsu_contribution = ({"rsus_reporting": len(rsu_reporters), "reports": rsu_reports,
+                         "precision": round(rsu_true / rsu_reports, 3)} if rsu_reports else {})
 
     summary = {
         "dataset_dir": dataset_dir,
@@ -118,6 +131,7 @@ def validate(dataset_dir: str) -> tuple[dict, list]:
         "recall_by_family": recall_by_family,
         "recall_by_type": recall_by_type,
         "detector_reliability": detector_reliability,
+        "rsu_contribution": rsu_contribution,
         "detection_latency_s": latency,
     }
     return summary, leaks

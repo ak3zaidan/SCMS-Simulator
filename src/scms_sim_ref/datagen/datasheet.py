@@ -221,6 +221,10 @@ def build(dataset_dir: str) -> str:
                  "carry trustworthy signal): "
                  + ", ".join(f"{c} {d['precision']}@{d['reports']}"
                              for c, d in sorted(dr.items(), key=lambda kv: -kv[1]["precision"])))
+    rc = vsum.get("rsu_contribution") or {}
+    if rc:
+        L.append(f"- RSU (infrastructure) contribution: {rc['reports']} reports from "
+                 f"{rc['rsus_reporting']} RSUs at precision {rc['precision']}")
     L.append("")
 
     L.append("## Baseline ML benchmark (logreg vs GBDT, train->test, vehicle-disjoint)")
