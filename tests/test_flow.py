@@ -228,6 +228,24 @@ def test_traffic_lights_create_stops_at_intersections(tmp_path):
     assert stopped_fraction(True) > stopped_fraction(False) + 0.03, "reds should fully stop vehicles"
 
 
+def test_ring_topology_routes_and_detects(tmp_path):
+    """The ring road network runs end-to-end: benign vehicles stay on the ring (mapOffRoad not a mass
+    FP) and a detectable attack is still revoked at reasonable precision."""
+    r = _flow(tmp_path, road_network="ring", grid_w=24, grid_block_m=120.0, duration_s=200.0,
+              arrival_rate=1.5, attacker_pct=0.15, attack_type="RandomPos",
+              attack_types=("RandomPos",), faulty_pct=0.0)
+    emis = _jsonl(tmp_path / "run" / "ground_truth" / "gt_emissions_sample.jsonl")
+    # honest positions are on the ring: distance from centre ~ R for benign samples
+    from scms_sim_ref.mock_pipeline.roads import RingNetwork
+    net = RingNetwork(24, 120.0)
+    ben = [e for e in emis if not e["is_attacker"]]
+    on_ring = sum(1 for e in ben if net.dist_to_road(e["true_x"], e["true_y"]) < 2.0)
+    assert on_ring / max(1, len(ben)) > 0.95, "benign vehicles should ride the ring"
+    s, _ = V.validate(str(tmp_path / "run"))
+    assert s["precision"] is not None and s["precision"] >= 0.7, s
+    assert s["recall"] is not None and s["recall"] >= 0.6, s
+
+
 def test_network_dimensions_are_fully_configurable(tmp_path):
     """Full network control: a non-square grid with a custom block size spans the expected extent."""
     _flow(tmp_path, grid_w=8, grid_h=3, grid_block_m=200.0, attacker_pct=0.0, duration_s=100.0,

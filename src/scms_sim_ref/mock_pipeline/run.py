@@ -450,6 +450,9 @@ def _rsu_spots(cfg: "PipelineConfig", net) -> list:
         n = cfg.n_rsus
         return [(span * (i + 0.5) / n, 0.0) for i in range(n)]
     nodes = net.nodes
+    grid_nodes = bool(nodes) and isinstance(nodes[0], tuple)   # ring nodes are ints
+    if p in ("corners", "center") and not grid_nodes:
+        p = "spread"                            # corners/center are grid-only -> fall back on a ring
     if p == "all":                              # one RSU at every intersection (n_rsus ignored)
         picked = nodes
     elif p == "corners":
@@ -554,8 +557,8 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
     if cfg.trip_speed_min <= 0 or cfg.trip_speed_max < cfg.trip_speed_min:
         raise ValueError(f"need 0 < trip_speed_min <= trip_speed_max "
                          f"(got {cfg.trip_speed_min}, {cfg.trip_speed_max})")
-    if cfg.road_network not in ("linear", "grid"):
-        raise ValueError(f"road_network must be linear|grid (got {cfg.road_network!r})")
+    if cfg.road_network not in ("linear", "grid", "ring"):
+        raise ValueError(f"road_network must be linear|grid|ring (got {cfg.road_network!r})")
     if cfg.traffic_flow:
         if cfg.arrival_rate < 0:
             raise ValueError(f"arrival_rate must be >= 0 (got {cfg.arrival_rate})")
@@ -564,6 +567,8 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         if cfg.road_network == "grid" and (cfg.grid_w < 2 or cfg.grid_h < 2):
             raise ValueError(f"grid road network needs grid_w and grid_h >= 2 "
                              f"(got {cfg.grid_w}x{cfg.grid_h})")
+        if cfg.road_network == "ring" and cfg.grid_w < 3:
+            raise ValueError(f"ring road network needs grid_w >= 3 nodes (got {cfg.grid_w})")
     for name in _PROB_FIELDS:                       # clamp fractions rather than produce nonsense
         setattr(cfg, name, min(1.0, max(0.0, float(getattr(cfg, name)))))
     return cfg
@@ -658,6 +663,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     if cfg.road_network == "grid":
         from .roads import GridNetwork
         net = GridNetwork(cfg.grid_w, cfg.grid_h, cfg.grid_block_m)
+    elif cfg.road_network == "ring":
+        from .roads import RingNetwork
+        net = RingNetwork(cfg.grid_w, cfg.grid_block_m)   # grid_w = number of ring intersections
     pseudonym_info: dict[str, dict] = {}   # digest -> {i,j,lv,ghost,veh_vid}
     vehicles: list[Vehicle] = []
     gt_vehicle, gt_idmap = [], []
@@ -1125,20 +1133,11 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     _lights = bool(cfg.traffic_lights and net is not None)
     _turn = bool(cfg.turn_slowdown and net is not None)
     _half_cycle = max(1.0, cfg.light_cycle_s / 2.0)
-    # map-matching: on a grid the roads are the lines x=k*block and y=k*block. A claimed position far
-    # from every road is implausible (HD-map check) -> catches lateral/diagonal position offsets.
-    _gblk = cfg.grid_block_m
-    _gw = (net.w - 1) * _gblk if net is not None else 0.0
-    _gh = (net.h - 1) * _gblk if net is not None else 0.0
-
+    # map-matching (HD-map check): distance from a claimed position to the nearest road; a claim far
+    # off-road is implausible. Each network defines dist_to_road for its topology (grid lines / ring
+    # chords) -> catches lateral/diagonal position offsets regardless of topology.
     def _offroad(x, y):
-        if net is None:
-            return 0.0
-        vx = round(x / _gblk) * _gblk
-        dv = abs(x - vx) if (0 <= vx <= _gw and -_gblk <= y <= _gh + _gblk) else 1e9
-        hy = round(y / _gblk) * _gblk
-        dh = abs(y - hy) if (0 <= hy <= _gh and -_gblk <= x <= _gw + _gblk) else 1e9
-        return min(dv, dh)
+        return net.dist_to_road(x, y) if net is not None else 0.0
 
     def _light_green(nx: int, ny: int, axis_x: bool, t: float) -> bool:
         # checkerboard phase offset so adjacent intersections alternate; each axis gets half the cycle
@@ -1670,7 +1669,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--flow", action="store_true", help="traffic-flow mode: vehicles spawn/despawn over time")
     p.add_argument("--duration", type=float, default=0.0, help="flow: sim length in seconds")
     p.add_argument("--arrival-rate", type=float, default=2.0, help="flow: mean vehicles spawned per second")
-    p.add_argument("--road", default="linear", choices=["linear", "grid"], help="road network model")
+    p.add_argument("--road", default="linear", choices=["linear", "grid", "ring"], help="road network model")
     p.add_argument("--grid", type=int, default=6, help="grid road network dimension (grid x grid)")
     p.add_argument("--grid-block", type=float, default=120.0, help="grid block spacing (m)")
     p.add_argument("--lanes", type=int, default=1, help="parallel lanes per road (overtaking; reduces gridlock)")

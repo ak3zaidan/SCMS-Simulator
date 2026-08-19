@@ -87,6 +87,16 @@ class GridNetwork:
     def _coord(self, n: tuple[int, int]) -> tuple[float, float]:
         return (n[0] * self.block, n[1] * self.block)
 
+    def dist_to_road(self, x: float, y: float) -> float:
+        """HD-map check: distance from (x,y) to the nearest road. On a grid the roads are the lines
+        x=k*block and y=k*block within the network extent."""
+        gw, gh, blk = (self.w - 1) * self.block, (self.h - 1) * self.block, self.block
+        vx = round(x / blk) * blk
+        dv = abs(x - vx) if (0 <= vx <= gw and -blk <= y <= gh + blk) else 1e9
+        hy = round(y / blk) * blk
+        dh = abs(y - hy) if (0 <= hy <= gh and -blk <= x <= gw + blk) else 1e9
+        return min(dv, dh)
+
     def _neighbors(self, n: tuple[int, int]) -> list[tuple[int, int]]:
         i, j = n
         out = []
@@ -150,4 +160,56 @@ class GridNetwork:
                     d = cand
                     break
         wp = [self._coord(n) for n in self._bfs(o, d)]
+        return Trip(wp, speed, spawn_time)
+
+
+def _pt_seg_dist(px, py, ax, ay, bx, by):
+    """Distance from point (px,py) to segment (a,b)."""
+    dx, dy = bx - ax, by - ay
+    dd = dx * dx + dy * dy
+    t = 0.0 if dd == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / dd))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+class RingNetwork:
+    """A ring road: `n` intersections evenly spaced on a circle, connected in a cycle. Vehicles route
+    the shorter way round. Same Trip/coord interface as GridNetwork (topology-agnostic downstream)."""
+
+    def __init__(self, n: int, block: float):
+        self.n = max(3, int(n))
+        self.block = float(block)
+        self.R = self.n * self.block / (2.0 * math.pi)     # circumference ~ n*block
+        self.cx = self.cy = self.R                          # centre (keeps coords >= 0)
+        self.nodes = list(range(self.n))
+        self.boundary = list(self.nodes)                   # every node is on the ring
+        self.w = self.h = self.n                            # for RSU-placement compatibility
+
+    def _coord(self, i: int) -> tuple[float, float]:
+        th = 2.0 * math.pi * (i % self.n) / self.n
+        return (self.cx + self.R * math.cos(th), self.cy + self.R * math.sin(th))
+
+    def _arc(self, o: int, d: int) -> list[int]:
+        cw, ccw = (d - o) % self.n, (o - d) % self.n
+        return [(o + k) % self.n for k in range(cw + 1)] if cw <= ccw \
+            else [(o - k) % self.n for k in range(ccw + 1)]
+
+    def dist_to_road(self, x: float, y: float) -> float:
+        best = 1e18
+        for i in range(self.n):
+            ax, ay = self._coord(i)
+            bx, by = self._coord(i + 1)
+            best = min(best, _pt_seg_dist(x, y, ax, ay, bx, by))
+        return best
+
+    def random_trip(self, rng, speed: float, spawn_time: float, min_hops: int = 3,
+                    dest_hint=None, od_model: str = "uniform", gravity_scale: float = 2.0,
+                    boundary_origin: bool = False) -> Trip:
+        o = rng.choice(self.nodes)
+        d = o
+        for _ in range(8):
+            cand = rng.choice(self.nodes)
+            if min((cand - o) % self.n, (o - cand) % self.n) >= min_hops:
+                d = cand
+                break
+        wp = [self._coord(i) for i in self._arc(o, d)]
         return Trip(wp, speed, spawn_time)

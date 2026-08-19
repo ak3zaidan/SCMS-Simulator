@@ -3,7 +3,7 @@
 import random
 import statistics
 
-from scms_sim_ref.mock_pipeline.roads import GridNetwork, Trip
+from scms_sim_ref.mock_pipeline.roads import GridNetwork, RingNetwork, Trip
 
 
 def _lengths(od_model, scale=2.0, n=400):
@@ -72,3 +72,21 @@ def test_next_turn_reports_grid_corner_angle():
     straight = Trip([(0.0, 0.0), (100.0, 0.0), (200.0, 0.0)], speed=10.0, spawn_time=0.0)
     _d, ang2 = straight.next_turn(0.0)
     assert abs(ang2) < 1e-6
+
+
+def test_ring_network_geometry_and_routing():
+    """RingNetwork: node coords lie on the ring (dist_to_road ~0); the centre is ~R off-road; a
+    routed trip follows the ring and returns to the coord interface Trip expects."""
+    import random
+    net = RingNetwork(24, 120.0)
+    # every intersection is a road endpoint -> on-road
+    for i in net.nodes:
+        x, y = net._coord(i)
+        assert net.dist_to_road(x, y) < 1e-6, i
+    # the ring centre is far from any chord (~the apothem, close to R)
+    assert net.dist_to_road(net.cx, net.cy) > 0.9 * net.R
+    # a trip is a polyline of on-ring waypoints
+    tr = net.random_trip(random.Random(1), 12.0, 0.0, min_hops=3)
+    assert len(tr.wp) >= 4
+    for (x, y) in tr.wp:
+        assert net.dist_to_road(x, y) < 1e-6
