@@ -88,6 +88,17 @@ def test_rsu_range_extends_coverage(tmp_path):
     assert rsu_reports(400.0) > rsu_reports(100.0) * 2, "longer RSU range should hear many more CAMs"
 
 
+def test_explicit_rsu_coords_place_units_exactly(tmp_path):
+    """rsu_coords gives manual control: exactly the listed positions become RSUs (even with n_rsus=0)."""
+    out = str(tmp_path / "rc")
+    run_pipeline(PipelineConfig(seed=13, traffic_flow=True, road_network="grid", duration_s=120.0,
+                                arrival_rate=0.8, grid_w=6, grid_h=6, radio_range_m=200.0,
+                                attacker_pct=0.2, attack_type="RandomPos", attack_types=("RandomPos",),
+                                rsu_coords="300,300;600,300", out_dir=out))
+    rc = V.validate(out)[0]["rsu_contribution"]
+    assert rc.get("rsus_reporting") == 2, rc
+
+
 def test_rsus_improve_detection_in_reporter_starved_traffic(tmp_path):
     """In sparse traffic (few mobile reporters), always-present RSUs raise revocation recall of an
     easily-detected attack without hurting precision -- infrastructure-assisted detection."""

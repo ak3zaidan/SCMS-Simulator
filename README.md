@@ -59,6 +59,29 @@ Presets: `urban_rush`, `highway`, `night_rain`, `gridlock`, `stealth_hard`. Othe
 Units — infrastructure-assisted detection that lifts recall in sparse traffic). Long runs are
 interruptible — Ctrl-C finalizes a valid partial dataset.
 
+### Full control (RSUs / traffic / network)
+
+Every simulation parameter is directly controllable. Highlights:
+
+```powershell
+# RSUs: how many, where, and how far they hear (or place them by hand)
+python -m scms_sim_ref.mock_pipeline.run --flow --road grid --n-rsus 12 `
+    --rsu-placement perimeter --rsu-range 350 --out datasets/rsu_demo
+python -m ... --flow --road grid --rsu-coords "300,300;600,300;300,600" --out datasets/rsu_manual
+
+# Traffic: custom fleet composition, speeds, and car-following (IDM) dynamics
+python -m ... --flow --road grid --fleet-mix "car:0.6,truck:0.3,bus:0.1" `
+    --trip-speed-min 10 --trip-speed-max 22 --idm-accel 1.2 --idm-time-headway 1.6
+
+# Network: non-square grid, block spacing, lanes, lane width, signal timing
+python -m ... --flow --road grid --grid 10 --grid-h 4 --grid-block 160 `
+    --lanes 3 --lane-width 3.25 --traffic-lights --light-cycle 30
+```
+
+`--rsu-placement` ∈ {spread, perimeter, center, corners, all}. The GUI mirrors all of this, and its
+**"⚙ Advanced: all fields"** panel exposes *every* config field (runs the exact config via replay).
+`--dump-config-schema out.json` lists the full field surface; `--check-config cfg.json` validates one.
+
 Each run writes `ma/*.jsonl` (MA-visible features), a **separate** `ground_truth/*.jsonl`
 (oracle-only labels), `ml/*` (train/val/test ML tables via `--featurize`), a `DATASHEET.md`, and
 `manifest.json` (seed, config, per-file SHA-256, data digest, standards profile).

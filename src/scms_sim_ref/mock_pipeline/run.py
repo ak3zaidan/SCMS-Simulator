@@ -217,6 +217,7 @@ class PipelineConfig:
     n_rsus: int = 0                      # fixed Road-Side Units: static, always-trusted receivers (0=off)
     rsu_placement: str = "spread"        # where RSUs go: spread|perimeter|center|corners|all(grid nodes)
     rsu_range_m: float = 0.0             # RSU radio range (m); 0 = use radio_range_m (vehicles' range)
+    rsu_coords: str = ""                 # explicit RSU positions "x1,y1;x2,y2;..." (overrides placement)
     attack_delay_s: float = 2.0          # flow: an attacker starts falsifying this long after spawn
     attack_delay_jitter_s: float = 0.0   # spread attack onset across attackers by up to this (realism)
     state_prune_every: int = 50          # flow: steps between detection-state LRU prunes
@@ -389,8 +390,27 @@ class RunResult:
     counts: dict = field(default_factory=dict)
 
 
+def _parse_rsu_coords(s: str) -> list:
+    """Parse explicit RSU positions 'x1,y1;x2,y2;...' -> [(x,y), ...]. Empty -> []. Raises on bad format."""
+    if not s or not s.strip():
+        return []
+    out = []
+    for pair in s.split(";"):
+        pair = pair.strip()
+        if not pair:
+            continue
+        xs, _, ys = pair.partition(",")
+        out.append((float(xs), float(ys)))
+    if not out:
+        raise ValueError(f"rsu_coords parsed to nothing: {s!r}")
+    return out
+
+
 def _rsu_spots(cfg: "PipelineConfig", net) -> list:
-    """Placement coordinates for the RSUs, per cfg.rsu_placement. Deterministic (fixed node order)."""
+    """Placement coordinates for the RSUs. Explicit rsu_coords wins; else per cfg.rsu_placement."""
+    explicit = _parse_rsu_coords(cfg.rsu_coords)
+    if explicit:
+        return explicit
     p = cfg.rsu_placement
     if net is None:                              # linear corridor: evenly along the road
         span = max(1.0, cfg.n_vehicles * 20.0)
@@ -485,6 +505,7 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
                          f"(got {cfg.rsu_placement!r})")
     if cfg.rsu_range_m < 0:
         raise ValueError(f"rsu_range_m must be >= 0 (got {cfg.rsu_range_m})")
+    _parse_rsu_coords(cfg.rsu_coords)    # raises ValueError on a malformed coordinate string
     if cfg.n_lanes < 1:
         raise ValueError(f"n_lanes must be >= 1 (got {cfg.n_lanes})")
     if cfg.lane_width_m <= 0:
@@ -760,7 +781,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     # their location. n_rsus=0 (default) -> rsus=[] -> the reception loop is byte-identical.
     rsus: list[Vehicle] = []
     rsu_range = cfg.rsu_range_m if cfg.rsu_range_m > 0 else cfg.radio_range_m
-    if cfg.n_rsus > 0:
+    if cfg.n_rsus > 0 or cfg.rsu_coords.strip():
         spots = _rsu_spots(cfg, net)
         for ri, (sx, sy) in enumerate(spots):
             pk = ca.keypair_from_seed(cfg.derive(f"rsu:{ri}"))
@@ -1608,6 +1629,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="where RSUs are placed on the grid")
     p.add_argument("--rsu-range", type=float, default=0.0,
                    help="RSU radio range (m); 0 = same as vehicles' --radio-range")
+    p.add_argument("--rsu-coords", default="",
+                   help="explicit RSU positions 'x1,y1;x2,y2;...' (overrides --rsu-placement)")
     p.add_argument("--demand", default="uniform", choices=["uniform", "rush", "night"],
                    help="time-varying arrival-demand profile")
     p.add_argument("--fleet", default="mixed", help="'mixed' or a single vehicle class (car/truck/bus/motorcycle)")
@@ -1692,6 +1715,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                          demand_profile=args.demand, od_model=args.od_model,
                          od_gravity_scale=args.od_gravity_scale, boundary_origins=args.boundary_origins,
                          n_rsus=args.n_rsus, rsu_placement=args.rsu_placement, rsu_range_m=args.rsu_range,
+                         rsu_coords=args.rsu_coords,
                          car_following=not args.no_car_following,
                          turn_slowdown=args.turn_slowdown, turn_speed_mps=args.turn_speed,
                          fleet=args.fleet, fleet_mix=args.fleet_mix,

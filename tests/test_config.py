@@ -28,6 +28,9 @@ from scms_sim_ref.mock_pipeline.run import validate_config
     dict(fleet_mix="car:-0.2"),
     dict(trip_speed_min=0.0),
     dict(trip_speed_min=20.0, trip_speed_max=10.0),
+    dict(rsu_coords="not-a-coord"),
+    dict(lane_width_m=0.0),
+    dict(light_cycle_s=0.0),
 ])
 def test_invalid_config_raises_clear_error(kw):
     with pytest.raises(ValueError):
