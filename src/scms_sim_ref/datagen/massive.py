@@ -113,7 +113,8 @@ def cell_config(cell: dict, idx: int, base_seed: int, n_steps: int, out_dir: Pat
                   traffic_lights=bool(cell.get("lights", False)), fleet=cell.get("fleet", "mixed"),
                   attack_intensity=cell.get("intensity", 1.0),
                   attack_duty_cycle=cell.get("duty", 1.0),        # pulsed-attack difficulty axis
-                  od_model=cell.get("od", "uniform"))             # trip-length realism axis
+                  od_model=cell.get("od", "uniform"),             # trip-length realism axis
+                  n_rsus=int(cell.get("rsus", 0)))                # infrastructure-assisted axis
     return PipelineConfig(**kw)
 
 
@@ -157,7 +158,7 @@ def main(argv=None) -> int:
         # is irrelevant. "duty" spans continuous vs pulsed (evasive) attackers -> a difficulty axis.
         grid = {**grid, "demand": ["uniform", "rush", "night"], "lights": [False, True],
                 "fleet": ["mixed", "car"], "intensity": [1.0, 0.5], "duty": [1.0, 0.4],
-                "n_vehicles": [0]}
+                "rsus": [0, 8], "n_vehicles": [0]}   # RSU (infrastructure-assisted) coverage axis
     cells = enumerate_cells(grid)
     total = len(cells)
     dropped = 0
