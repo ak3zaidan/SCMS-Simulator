@@ -443,6 +443,19 @@ for _c in CONFIG_SPEC:
 _LOCK = threading.Lock()
 _AGENT_LOCK = threading.Lock()
 AGENT = agent.AgentSession()   # AI copilot session (single local user)
+# Live progress for the in-flight copilot turn (read by GET /api/agent/progress while the
+# POST /api/agent request is still running — ThreadingHTTPServer serves them on separate threads).
+_AGENT_PROG_LOCK = threading.Lock()
+AGENT_PROGRESS = {"running": False, "steps": [], "current": None, "turn": 0}
+
+
+def _agent_event(kind: str, data: dict):
+    with _AGENT_PROG_LOCK:
+        if kind == "tool_start":
+            AGENT_PROGRESS["current"] = data.get("tool")
+        elif kind == "tool_end":
+            AGENT_PROGRESS["current"] = None
+            AGENT_PROGRESS["steps"].append(data)
 
 
 def agent_turn(body: dict) -> dict:
@@ -451,7 +464,15 @@ def agent_turn(body: dict) -> dict:
     if not msg:
         return {"error": "empty message"}
     with _AGENT_LOCK:                                   # serialise turns (shared session + sim)
-        out = agent.run_agent(AGENT, msg)
+        with _AGENT_PROG_LOCK:
+            AGENT_PROGRESS.update(running=True, steps=[], current=None,
+                                  turn=AGENT_PROGRESS["turn"] + 1)
+        try:
+            out = agent.run_agent(AGENT, msg, on_event=_agent_event)
+        finally:
+            with _AGENT_PROG_LOCK:
+                AGENT_PROGRESS["running"] = False
+                AGENT_PROGRESS["current"] = None
     if AGENT.last_out_dir:                              # show the copilot's dataset in the stats/map
         with _LOCK:
             if RUN.get("logf"):
@@ -842,6 +863,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"enabled": bool(agent.openai_key()), "model": agent.openai_model(),
                                     "config": AGENT.config, "results": AGENT.last_results,
                                     "history_len": len(AGENT.history)})
+        if self.path == "/api/agent/progress":        # live steps of the in-flight copilot turn
+            with _AGENT_PROG_LOCK:
+                return self._send(200, {"running": AGENT_PROGRESS["running"],
+                                        "current": AGENT_PROGRESS["current"],
+                                        "steps": list(AGENT_PROGRESS["steps"]),
+                                        "turn": AGENT_PROGRESS["turn"]})
         if self.path == "/api/schema":               # every PipelineConfig field (advanced full control)
             defaults = {k: (list(v) if isinstance(v, tuple) else v)
                         for k, v in pipeline_mod.PipelineConfig().__dict__.items()}

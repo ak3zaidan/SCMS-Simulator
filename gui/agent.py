@@ -420,8 +420,17 @@ def _exec_tool(session: AgentSession, name: str, args: dict) -> dict:
 
 
 def run_agent(session: AgentSession, user_msg: str, max_steps: int = 10,
-              model: str | None = None, key: str | None = None) -> dict:
-    """Run one user turn through the tool-calling loop. Returns {reply, steps, config, results, error}."""
+              model: str | None = None, key: str | None = None, on_event=None) -> dict:
+    """Run one user turn through the tool-calling loop. Returns {reply, steps, config, results, error}.
+
+    on_event(kind, data) is an optional progress callback (for live UI): kind is
+    "tool_start" ({tool, args}) or "tool_end" (the finished step dict)."""
+    def emit(kind, data):
+        if on_event:
+            try:
+                on_event(kind, data)
+            except Exception:                               # never let UI plumbing break a turn
+                pass
     if key is None:
         key = openai_key()
     model = model or openai_model()
@@ -450,8 +459,11 @@ def run_agent(session: AgentSession, user_msg: str, max_steps: int = 10,
                     fargs = json.loads(call["function"].get("arguments") or "{}")
                 except json.JSONDecodeError:
                     fargs = {}
+                emit("tool_start", {"tool": fn, "args": fargs})
                 result = _exec_tool(session, fn, fargs)
-                steps.append({"tool": fn, "args": fargs, "result": result})
+                step = {"tool": fn, "args": fargs, "result": result}
+                steps.append(step)
+                emit("tool_end", step)
                 tool_msg = {"role": "tool", "tool_call_id": call["id"],
                             "content": json.dumps(result, default=str)}
                 messages.append(tool_msg)

@@ -161,6 +161,8 @@
   .step{background:var(--bg);border:1px solid var(--edge);border-left:3px solid var(--accent);
         border-radius:7px;padding:7px 10px;font-size:11.5px}
   .step.bad{border-left-color:var(--bad)}
+  .step.running{border-left-color:var(--warn);opacity:.9}
+  .step.running .t{color:var(--warn)}
   .step .t{font-weight:700;color:var(--accent);font-family:ui-monospace,Menlo,monospace}
   .step.bad .t{color:var(--bad)}
   .step .d{color:var(--muted);margin-top:2px;font-family:ui-monospace,Menlo,monospace;word-break:break-word}
@@ -874,15 +876,26 @@ function expTable(st){                 // sweep / compare → comparison table
     (row.err?`<td class="errmsg" colspan="9">${escH(row.err)}</td>`:'')+`</tr>`).join('');
   return `<table class="exp"><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>`;
 }
+function stepCardHtml(st){
+  const info=stepDesc(st);
+  const tbl=expTable(st)||'';
+  return `<div class="step${info.bad?' bad':''}"><div class="t">${escH(st.tool)}</div>`+
+         `<div class="d">${escH(info.d)}</div>${tbl}</div>`;
+}
+const TOOL_VERB={set_config:'configuring',apply_preset:'loading preset',run_and_analyze:'running simulation',
+  sweep:'sweeping parameter',compare:'comparing variants',reset_config:'resetting',
+  get_config:'reading config',describe_fields:'looking up fields'};
+function renderSteps(container,steps,current){    // live-updatable step list (+ optional running row)
+  let html=(steps||[]).map(stepCardHtml).join('');
+  if(current) html+=`<div class="step running"><div class="t">${escH(current)}</div>`+
+    `<div class="d">${escH(TOOL_VERB[current]||'working')}… `+
+    `<span class="typing"><span></span><span></span><span></span></span></div></div>`;
+  container.innerHTML=html;
+  $('#chat').scrollTop=$('#chat').scrollHeight;
+}
 function addSteps(steps){
   if(!steps||!steps.length) return;
-  const wrap=chatEl('steps');
-  steps.forEach(st=>{ const info=stepDesc(st);
-    const el=document.createElement('div'); el.className='step'+(info.bad?' bad':'');
-    el.innerHTML=`<div class="t">${st.tool}</div><div class="d">${escH(info.d)}</div>`;
-    const tbl=expTable(st); if(tbl) el.innerHTML+=tbl;
-    wrap.appendChild(el); });
-  $('#chat').scrollTop=$('#chat').scrollHeight;
+  renderSteps(chatEl('steps'),steps,null);
 }
 function addMetrics(res){
   if(!res) return;
@@ -896,20 +909,30 @@ function addMetrics(res){
   $('#chat').scrollTop=$('#chat').scrollHeight;
 }
 
+async function pollAgentProgress(liveEl){
+  try{
+    const p=await (await fetch('/api/agent/progress')).json();
+    if(p.steps&&(p.steps.length||p.current)) renderSteps(liveEl,p.steps,p.running?p.current:null);
+    if(p.running) drawLiveOnce();     // the sim writes live_state during the run → animate the map
+  }catch(e){}
+}
 async function sendChat(){
   if(chatBusy||!COPILOT_ON) return;
   const ta=$('#chatInput'), text=ta.value.trim(); if(!text) return;
   chatBusy=true; ta.value=''; $('#chatSend').disabled=$('#chatInput').disabled=true;
   chatEl('msg user',escH(text));
   const think=chatEl('msg bot','<span class="typing"><span></span><span></span><span></span></span>');
+  const liveEl=chatEl('steps');      // live step list, updated by the progress poller
+  const prog=setInterval(()=>pollAgentProgress(liveEl),900);
   let out;
   try{ out=await (await fetch('/api/agent',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({message:text})})).json(); }
   catch(e){ out={error:'network error: '+e}; }
-  think.remove();
-  if(out.error){ chatEl('msg err',escH(out.error)); }
+  clearInterval(prog); think.remove();
+  if(out.error){ liveEl.remove(); chatEl('msg err',escH(out.error)); }
   else{
-    addSteps(out.steps);
+    if(out.steps&&out.steps.length) renderSteps(liveEl,out.steps,null);   // authoritative final list
+    else liveEl.remove();
     if(out.results) addMetrics(out.results);
     if(out.reply) chatEl('msg bot',escH(out.reply));
     poll();            // agent runs update RUN → refresh stats panel + map

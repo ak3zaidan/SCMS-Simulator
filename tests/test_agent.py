@@ -146,6 +146,34 @@ def test_agent_reports_missing_key():
     assert out["error"] and "OPENAI_API_KEY" in out["error"]
 
 
+def test_on_event_fires_around_each_tool(tmp_path, monkeypatch):
+    """The progress callback emits tool_start/tool_end around every executed tool (live-UI plumbing)."""
+    monkeypatch.setattr(agent, "AGENT_OUT", tmp_path / "agent_run")
+    script = [
+        _msg(tool_calls=[_call("c1", "set_config", {"overrides": dict(
+            traffic_flow=True, road_network="grid", duration_s=40, grid_w=5, grid_h=5,
+            attacker_pct=0.3, seed=5)})]),
+        _msg(tool_calls=[_call("c2", "run_and_analyze", {})]),
+        _msg(content="done"),
+    ]
+    calls = {"i": 0}
+    def fake_chat(messages, tools, model, key, timeout=90.0):
+        m = script[calls["i"]]; calls["i"] += 1; return m
+    monkeypatch.setattr(agent, "_CHAT_FN", fake_chat)
+
+    events = []
+    s = agent.AgentSession()
+    agent.run_agent(s, "configure and run", key="test",
+                    on_event=lambda kind, data: events.append((kind, data.get("tool"))))
+    assert events == [("tool_start", "set_config"), ("tool_end", "set_config"),
+                      ("tool_start", "run_and_analyze"), ("tool_end", "run_and_analyze")]
+    # a throwing callback must not break the turn
+    s2 = agent.AgentSession(); calls["i"] = 0
+    out = agent.run_agent(s2, "again", key="test",
+                          on_event=lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert out["reply"] == "done" and not out.get("error")
+
+
 # ---------------- LIVE OpenAI end-to-end (skipped without a key) ----------------
 @pytest.mark.skipif(not agent.openai_key(), reason="no OPENAI_API_KEY in .env/env")
 def test_live_agent_configures_runs_and_reports(tmp_path, monkeypatch):
