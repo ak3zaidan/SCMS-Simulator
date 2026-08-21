@@ -43,8 +43,11 @@
   details.group>summary{cursor:pointer;padding:10px 14px;font-weight:600;font-size:13px;
         list-style:none;display:flex;align-items:center;gap:8px}
   details.group>summary::-webkit-details-marker{display:none}
-  details.group>summary::before{content:"▸";color:var(--muted);font-size:11px}
+  details.group>summary::before{content:"▸";color:var(--accent,#4a9eff);font-size:11px;transition:transform .12s}
   details.group[open]>summary::before{content:"▾"}
+  details.group>summary:hover{background:var(--edge)}
+  details.group[open]>summary{color:var(--ink)}
+  details.group[open]{background:rgba(255,255,255,.015)}
   .fields{padding:4px 14px 12px}
   .field{margin:10px 0}
   .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
@@ -290,7 +293,9 @@ function applyFilter(){
       f.classList.toggle('field-hidden', !hit);
       if(hit && !gated) shown++;
     });
-    det.style.display = shown||!q ? '' : 'none';
+    // hide a whole section when it has no visible fields (e.g. mosaic-only groups while the
+    // python-flow generator is selected) so a section never opens to an empty body.
+    det.style.display = shown ? '' : 'none';
     if(q) det.open=true;
   });
 }

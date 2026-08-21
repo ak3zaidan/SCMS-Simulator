@@ -418,6 +418,27 @@ CONFIG_SPEC = [
      "help": "Fraction of CAMs logged to gt_emissions_sample (true-vs-claimed, message-level labels)"},
 ]
 
+# Regroup the python-flow controls into the same semantic sections as the MOSAIC controls, so the
+# config panel shows meaningful, populated sections in either generator mode (instead of one giant
+# "Python flow" group + several empty mosaic groups).
+_PF_GROUP = {
+    "Scenario": ("pf_duration", "pf_seed"),
+    "Traffic": ("pf_arrival", "pf_demand", "pf_od", "pf_boundary", "pf_fleet", "pf_fleet_mix",
+                "pf_tmin", "pf_tmax", "pf_maxveh", "pf_turn"),
+    "Network": ("pf_road", "pf_grid", "pf_grid_h", "pf_block", "pf_dropout", "pf_lanes",
+                "pf_lane_width", "pf_lights", "pf_light_cycle"),
+    "RSU (infrastructure)": ("pf_rsus", "pf_rsu_placement", "pf_rsu_range"),
+    "Attacks": ("pf_attacker", "pf_intensity", "pf_attack_mix", "pf_duty", "pf_jitter", "pf_pulse",
+                "pf_collude"),
+    "SCMS policy": ("pf_rotate",),
+    "Vehicle & radio": ("pf_radio",),
+    "Sensors & CAM timing": ("pf_faulty", "pf_weather", "pf_jam"),
+}
+_PF_NAME_TO_GROUP = {name: grp for grp, names in _PF_GROUP.items() for name in names}
+for _c in CONFIG_SPEC:
+    if _c.get("gen") == "python-flow" and _c["name"] in _PF_NAME_TO_GROUP:
+        _c["group"] = _PF_NAME_TO_GROUP[_c["name"]]
+
 _LOCK = threading.Lock()
 RUN = {"proc": None, "logf": None, "out_dir": None, "scenario": None, "config": None,
        "started": None, "finished": None, "returncode": None}
