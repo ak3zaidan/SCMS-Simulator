@@ -28,3 +28,7 @@ scms-sim/scenarios/gen_*/
 scms-sim/scenarios/_mapcache/
 tmp/
 gui/last_run.log
+
+# Secrets — never commit API keys
+.env
+.env.*

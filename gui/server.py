@@ -32,6 +32,7 @@ from scms_sim_ref.datagen import benchmark as benchmark_mod  # noqa: E402
 from scms_sim_ref.datagen import calibration as calibration_mod  # noqa: E402
 from scms_sim_ref import mock_pipeline as pipeline_mod  # noqa: E402
 import mapgen  # noqa: E402
+import agent  # noqa: E402  (AI copilot)
 
 PORT = 8710
 
@@ -440,6 +441,28 @@ for _c in CONFIG_SPEC:
         _c["group"] = _PF_NAME_TO_GROUP[_c["name"]]
 
 _LOCK = threading.Lock()
+_AGENT_LOCK = threading.Lock()
+AGENT = agent.AgentSession()   # AI copilot session (single local user)
+
+
+def agent_turn(body: dict) -> dict:
+    """Run one AI-copilot turn (configure/run/analyze/iterate). Reflects any run in the GUI panels."""
+    msg = str(body.get("message", "")).strip()
+    if not msg:
+        return {"error": "empty message"}
+    with _AGENT_LOCK:                                   # serialise turns (shared session + sim)
+        out = agent.run_agent(AGENT, msg)
+    if AGENT.last_out_dir:                              # show the copilot's dataset in the stats/map
+        with _LOCK:
+            if RUN.get("logf"):
+                try:
+                    RUN["logf"].close()
+                except Exception:
+                    pass
+            RUN.update(proc=None, logf=None, out_dir=Path(AGENT.last_out_dir), scenario="ai-copilot",
+                       started=time.time(), finished=time.time(), returncode=0, stats_cache=None,
+                       config=AGENT.effective_config())
+    return out
 RUN = {"proc": None, "logf": None, "out_dir": None, "scenario": None, "config": None,
        "started": None, "finished": None, "returncode": None}
 
@@ -815,6 +838,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, live_state())
         if self.path == "/api/config":               # effective config of the last run (download)
             return self._send(200, {"config": last_effective_config()})
+        if self.path == "/api/agent/info":            # copilot availability for the UI
+            return self._send(200, {"enabled": bool(agent.openai_key()), "model": agent.openai_model(),
+                                    "config": AGENT.config, "results": AGENT.last_results,
+                                    "history_len": len(AGENT.history)})
         if self.path == "/api/schema":               # every PipelineConfig field (advanced full control)
             defaults = {k: (list(v) if isinstance(v, tuple) else v)
                         for k, v in pipeline_mod.PipelineConfig().__dict__.items()}
@@ -842,6 +869,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, start_run(body))
         if self.path == "/api/stop":
             return self._send(200, stop_run())
+        if self.path == "/api/agent":
+            return self._send(200, agent_turn(body))
+        if self.path == "/api/agent/reset":
+            global AGENT
+            AGENT = agent.AgentSession()
+            return self._send(200, {"ok": True})
         return self._send(404, {"error": "not found"})
 
 

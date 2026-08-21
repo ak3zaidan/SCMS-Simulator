@@ -146,6 +146,40 @@
   #cfgSearch{width:100%;padding:7px 9px;background:var(--bg);color:var(--ink);
              border:1px solid var(--edge2);border-radius:7px;margin-top:2px}
   #cfgSearch:focus{outline:none;border-color:var(--accent)}
+  /* ---------- AI Copilot ---------- */
+  #copilot .body{display:flex;flex-direction:column;gap:10px}
+  .chat{max-height:380px;overflow:auto;display:flex;flex-direction:column;gap:10px;padding:2px}
+  .chat:empty::after{content:"Ask the copilot to build a scenario — it configures, runs, and analyzes for you.";
+        color:var(--muted);font-size:12px;font-style:italic}
+  .msg{max-width:88%;padding:9px 12px;border-radius:12px;font-size:13px;white-space:pre-wrap;
+        word-wrap:break-word;line-height:1.45}
+  .msg.user{align-self:flex-end;background:var(--accent2);color:#fff;border-bottom-right-radius:4px}
+  .msg.bot{align-self:flex-start;background:var(--panel2);border:1px solid var(--edge);
+        border-bottom-left-radius:4px}
+  .msg.err{align-self:stretch;background:#3a1d1f;border:1px solid #5a2a2d;color:#ffb0b0}
+  .steps{align-self:stretch;display:flex;flex-direction:column;gap:6px}
+  .step{background:var(--bg);border:1px solid var(--edge);border-left:3px solid var(--accent);
+        border-radius:7px;padding:7px 10px;font-size:11.5px}
+  .step.bad{border-left-color:var(--bad)}
+  .step .t{font-weight:700;color:var(--accent);font-family:ui-monospace,Menlo,monospace}
+  .step.bad .t{color:var(--bad)}
+  .step .d{color:var(--muted);margin-top:2px;font-family:ui-monospace,Menlo,monospace;word-break:break-word}
+  .metrics{align-self:stretch;display:flex;flex-wrap:wrap;gap:6px}
+  .metric{background:var(--bg);border:1px solid var(--edge);border-radius:7px;padding:5px 9px;
+        font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+  .metric b{display:block;font-size:14px;color:var(--ink);font-variant-numeric:tabular-nums;
+        text-transform:none;letter-spacing:0;margin-top:1px}
+  .chatIn{display:flex;gap:8px;align-items:flex-end}
+  .chatIn textarea{flex:1;resize:vertical;min-height:46px;max-height:160px;padding:9px 11px;
+        background:var(--bg);color:var(--ink);border:1px solid var(--edge2);border-radius:8px;font:inherit}
+  .chatIn textarea:focus{outline:none;border-color:var(--accent)}
+  .typing{display:inline-flex;gap:4px;align-items:center}
+  .typing span{width:6px;height:6px;border-radius:50%;background:var(--muted);animation:blink 1.2s infinite}
+  .typing span:nth-child(2){animation-delay:.2s}.typing span:nth-child(3){animation-delay:.4s}
+  @keyframes blink{0%,60%,100%{opacity:.25}30%{opacity:1}}
+  .chip-sugg{font-size:11px;padding:4px 9px;border-radius:999px;background:var(--panel2);
+        border:1px solid var(--edge);cursor:pointer;color:var(--ink)}
+  .chip-sugg:hover{border-color:var(--accent)}
 </style>
 </head>
 <body>
@@ -185,8 +219,26 @@
     </div>
   </div>
 
-  <!-- RIGHT: live map + progress + stats -->
+  <!-- RIGHT: copilot + live map + progress + stats -->
   <div class="stack">
+    <div class="panel" id="copilot">
+      <h2>🤖 AI Copilot — describe it in words; I configure, run &amp; analyze</h2>
+      <div class="body">
+        <div id="copilotOff" class="note" style="display:none;color:var(--warn)">
+          No OpenAI API key found. Add <b>OPENAI_API_KEY</b> to the repo-root <b>.env</b> and restart the server.</div>
+        <div class="chat" id="chat"></div>
+        <div id="suggs" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+        <div class="chatIn">
+          <textarea id="chatInput" rows="2" placeholder="e.g. Ring road with 12 intersections, 25% attackers, 60s — run it and show precision and recall"></textarea>
+          <button id="chatSend" class="primary">Send</button>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <button id="chatReset" style="font-size:11px;padding:5px 10px">↺ New conversation</button>
+          <span class="muted" id="chatModel" style="font-size:11px"></span>
+        </div>
+      </div>
+    </div>
+
     <div class="panel">
       <h2>Embedded live map — vehicles by SCMS state</h2>
       <div class="mapwrap">
@@ -735,7 +787,107 @@ function renderStats(st){
        .sort((a,b)=>b[1].precision-a[1].precision).map(([k,v])=>[k,Math.round(v.precision*100)])));
 }
 
+/* ================= AI Copilot ================= */
+let COPILOT_ON=false, chatBusy=false;
+const SUGGESTIONS=[
+  "Ring road, 12 intersections, 25% attackers, 60s — run it and report precision & recall",
+  "Sparse rural grid where mobile reporters are scarce; add 8 RSUs and show the RSU contribution",
+  "Compare a clear-weather run to a foggy one at 30% attackers and tell me which is harder to detect",
+  "Mix RandomPos, ConstPos and a replay attack; which family has the worst recall?",
+];
+
+async function initCopilot(){
+  let info; try{ info=await (await fetch('/api/agent/info')).json(); }catch(e){ info={enabled:false}; }
+  COPILOT_ON=!!info.enabled;
+  $('#chatModel').textContent=COPILOT_ON?('model: '+(info.model||'?')):'';
+  $('#copilotOff').style.display=COPILOT_ON?'none':'';
+  $('#chatInput').disabled=$('#chatSend').disabled=!COPILOT_ON;
+  const sg=$('#suggs'); sg.innerHTML='';
+  if(COPILOT_ON) SUGGESTIONS.forEach(t=>{
+    const c=document.createElement('button'); c.className='chip-sugg'; c.textContent=t;
+    c.addEventListener('click',()=>{ $('#chatInput').value=t; $('#chatInput').focus(); });
+    sg.appendChild(c);
+  });
+  $('#chatSend').addEventListener('click',sendChat);
+  $('#chatReset').addEventListener('click',resetChat);
+  $('#chatInput').addEventListener('keydown',e=>{
+    if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){ e.preventDefault(); sendChat(); }
+  });
+}
+
+const escH=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+  .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+function chatEl(cls,html){
+  const d=document.createElement('div'); d.className=cls; if(html!=null) d.innerHTML=html;
+  $('#chat').appendChild(d); $('#chat').scrollTop=$('#chat').scrollHeight; return d;
+}
+function fmtp(x){ return (x==null)?'—':(x*100).toFixed(1)+'%'; }
+function fmtn(x){ return (x==null)?'—':(+x).toFixed(3); }
+
+function stepDesc(st){
+  const a=st.args||{}, r=st.result||{};
+  if(r.error) return {bad:true,d:'⚠ '+r.error};
+  if(st.tool==='set_config'){ const ap=r.applied||a.overrides||a;
+    const s=Object.entries(ap).map(([k,v])=>k+'='+v).join(', ');
+    return {d:s||'(no changes)'}; }
+  if(st.tool==='apply_preset') return {d:'preset → '+(r.preset||a.name)};
+  if(st.tool==='run_and_analyze'){ const an=r.analysis||{};
+    return {d:`ran · precision ${fmtp(an.precision)}, recall ${fmtp(an.recall)}, ${an.vehicles??'?'} vehicles`}; }
+  if(st.tool==='reset_config') return {d:'config reset to defaults'};
+  if(st.tool==='get_config') return {d:'read current config'};
+  if(st.tool==='describe_fields') return {d:'looked up: '+((a.names||[]).join(', '))};
+  return {d:JSON.stringify(a).slice(0,160)};
+}
+function addSteps(steps){
+  if(!steps||!steps.length) return;
+  const wrap=chatEl('steps');
+  steps.forEach(st=>{ const info=stepDesc(st);
+    const el=document.createElement('div'); el.className='step'+(info.bad?' bad':'');
+    el.innerHTML=`<div class="t">${st.tool}</div><div class="d">${escH(info.d)}</div>`;
+    wrap.appendChild(el); });
+  $('#chat').scrollTop=$('#chat').scrollHeight;
+}
+function addMetrics(res){
+  if(!res) return;
+  const rc=res.rsu_contribution||{};
+  const items=[['Precision',fmtp(res.precision)],['Recall',fmtp(res.recall)],
+    ['Vehicle AUC',fmtn(res.vehicle_auc)],['Report AUC',fmtn(res.report_auc)],
+    ['Vehicles',res.vehicles??'—'],['Reports',res.reports??'—'],['Revoked',res.revoked??'—']];
+  if(rc&&rc.reports!=null) items.push(['RSU reports',rc.reports]);
+  const wrap=chatEl('metrics');
+  wrap.innerHTML=items.map(([k,v])=>`<div class="metric">${k}<b>${v}</b></div>`).join('');
+  $('#chat').scrollTop=$('#chat').scrollHeight;
+}
+
+async function sendChat(){
+  if(chatBusy||!COPILOT_ON) return;
+  const ta=$('#chatInput'), text=ta.value.trim(); if(!text) return;
+  chatBusy=true; ta.value=''; $('#chatSend').disabled=$('#chatInput').disabled=true;
+  chatEl('msg user',escH(text));
+  const think=chatEl('msg bot','<span class="typing"><span></span><span></span><span></span></span>');
+  let out;
+  try{ out=await (await fetch('/api/agent',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({message:text})})).json(); }
+  catch(e){ out={error:'network error: '+e}; }
+  think.remove();
+  if(out.error){ chatEl('msg err',escH(out.error)); }
+  else{
+    addSteps(out.steps);
+    if(out.results) addMetrics(out.results);
+    if(out.reply) chatEl('msg bot',escH(out.reply));
+    poll();            // agent runs update RUN → refresh stats panel + map
+    drawLiveOnce();
+  }
+  chatBusy=false; $('#chatSend').disabled=$('#chatInput').disabled=false; ta.focus();
+}
+async function resetChat(){
+  if(chatBusy) return;
+  try{ await fetch('/api/agent/reset',{method:'POST'}); }catch(e){}
+  $('#chat').innerHTML='';
+}
+
 boot();
+initCopilot();
 </script>
 </body>
 </html>
