@@ -106,3 +106,23 @@ def test_rsus_improve_detection_in_reporter_starved_traffic(tmp_path):
     s1, _ = V.validate(_sparse(tmp_path, 20))
     assert s1["recall"] > s0["recall"] + 0.15, (s0["recall"], s1["recall"])
     assert s1["precision"] >= 0.9, s1["precision"]
+
+
+def test_rsu_dataset_passes_integrity_audit(tmp_path):
+    """An RSU dataset passes verify_data: RSU reporter certs (infrastructure, not vehicle pseudonyms)
+    are allowed as unresolved reporters, but subject digests must still resolve."""
+    import importlib.util
+    from pathlib import Path
+    out = str(tmp_path / "run")
+    run_pipeline(PipelineConfig(seed=13, traffic_flow=True, road_network="grid", duration_s=150.0,
+                                arrival_rate=1.0, grid_w=6, grid_h=6, radio_range_m=200.0,
+                                attacker_pct=0.2, n_rsus=8, out_dir=out))
+    repo = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("verify_data", repo / "tools" / "verify_data.py")
+    vd = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(vd)
+    res = vd.run_audit(tmp_path)                      # audit just this dataset's parent
+    fails = [r for r in res if r[2] == "FAIL"]
+    assert not fails, fails
+    r3 = [r for r in res if r[1] == "R3_cert_digests_resolve"][0]
+    assert r3[2] == "PASS" and "subj_unresolved=0" in r3[3]

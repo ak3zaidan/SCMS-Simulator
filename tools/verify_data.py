@@ -123,15 +123,22 @@ def audit(ds_dir: Path):
     else:
         rec(ds, "R2_report_features_subset_of_ma", None, "missing files")
 
-    # R3: every cert digest referenced in MA reports resolves in the identity map
+    # R3: every SUBJECT cert digest resolves to a vehicle (subjects are vehicles). REPORTER digests
+    # may additionally be Road-Side-Unit infrastructure certs, which are NOT vehicle pseudonyms and so
+    # are absent from the identity map -- allow up to n_rsus distinct unresolved reporters.
     if ma_reports and digest2true:
-        refd = set()
-        for r in ma_reports:
-            refd.add(r.get("subject_cert_digest")); refd.add(r.get("reporter_cert_digest"))
-        refd.discard(None)
-        unresolved = refd - set(digest2true)
-        rec(ds, "R3_cert_digests_resolve", not unresolved,
-            f"{len(unresolved)}/{len(refd)} unresolved")
+        known = set(digest2true)
+        subj_unresolved = {r.get("subject_cert_digest") for r in ma_reports} - known - {None}
+        rep_unresolved = {r.get("reporter_cert_digest") for r in ma_reports} - known - {None}
+        cfg = man.get("config") or {}
+        n_rsus = int(cfg.get("n_rsus", 0) or 0)
+        coords = str(cfg.get("rsu_coords", "") or "").strip()
+        if coords:                                   # explicit placement may exceed n_rsus
+            n_rsus = max(n_rsus, sum(1 for p in coords.split(";") if p.strip()))
+        ok = (not subj_unresolved) and (len(rep_unresolved) <= n_rsus)
+        rec(ds, "R3_cert_digests_resolve", ok,
+            f"subj_unresolved={len(subj_unresolved)} reporter_unresolved={len(rep_unresolved)} "
+            f"(RSU allowance={n_rsus})")
     else:
         rec(ds, "R3_cert_digests_resolve", None, "missing files")
 
