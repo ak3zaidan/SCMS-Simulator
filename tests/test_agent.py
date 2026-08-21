@@ -59,6 +59,50 @@ def test_run_and_analyze_produces_metrics(tmp_path, monkeypatch):
     assert s.last_results is a
 
 
+def _small_grid(s):
+    agent._exec_tool(s, "set_config", {"overrides": dict(
+        traffic_flow=True, road_network="grid", duration_s=40, arrival_rate=1.5, grid_w=5, grid_h=5,
+        attacker_pct=0.25, seed=7)})
+
+
+def test_sweep_varies_one_field_and_picks_best(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "AGENT_OUT", tmp_path / "agent_run")
+    s = agent.AgentSession()
+    _small_grid(s)
+    r = agent._exec_tool(s, "sweep", {"field": "attacker_pct", "values": [0.1, 0.25, 0.4],
+                                      "metric": "recall"})
+    assert r["field"] == "attacker_pct" and len(r["runs"]) == 3
+    assert all("precision" in row and "recall" in row for row in r["runs"])
+    # best is the run maximising recall, and the GUI's last run reflects it
+    assert r["best"]["recall"] == max(row["recall"] for row in r["runs"])
+    assert s.last_results["recall"] == r["best"]["recall"]
+    # sweeping does NOT persist the swept field onto the session config
+    assert "attacker_pct" in s.config and s.config["attacker_pct"] == 0.25
+
+
+def test_sweep_guards(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "AGENT_OUT", tmp_path / "agent_run")
+    s = agent.AgentSession(); _small_grid(s)
+    assert "error" in agent._exec_tool(s, "sweep", {"field": "nope", "values": [1]})
+    assert "error" in agent._exec_tool(s, "sweep", {"field": "attacker_pct", "values": [0.1] * 7})
+    assert "error" in agent._exec_tool(s, "sweep", {"field": "attacker_pct", "values": []})
+    assert "error" in agent._exec_tool(s, "sweep", {"field": "attacker_pct", "values": [0.2],
+                                                    "metric": "bogus"})
+
+
+def test_compare_runs_variants_side_by_side(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "AGENT_OUT", tmp_path / "agent_run")
+    s = agent.AgentSession(); _small_grid(s)
+    r = agent._exec_tool(s, "compare", {"variants": [
+        {"label": "clear", "overrides": {"weather": "clear"}},
+        {"label": "fog", "overrides": {"weather": "fog"}}]})
+    labels = [v["label"] for v in r["variants"]]
+    assert labels == ["clear", "fog"]
+    assert all("precision" in v and "recall" in v for v in r["variants"])
+    # too many variants is rejected
+    assert "error" in agent._exec_tool(s, "compare", {"variants": [{"overrides": {}}] * 5})
+
+
 # ---------------- tool-calling loop with a scripted (mock) LLM ----------------
 def _msg(content=None, tool_calls=None):
     m = {"content": content}
@@ -114,4 +158,23 @@ def test_live_agent_configures_runs_and_reports(tmp_path, monkeypatch):
     assert s.config.get("road_network") == "ring", s.config
     assert abs(float(s.config.get("attacker_pct", 0)) - 0.25) < 1e-6, s.config
     assert out["results"] and out["results"]["precision"] is not None
+    assert isinstance(out["reply"], str) and len(out["reply"]) > 0
+
+
+@pytest.mark.skipif(not agent.openai_key(), reason="no OPENAI_API_KEY in .env/env")
+def test_live_agent_runs_an_experiment(tmp_path, monkeypatch):
+    """Given a sensitivity question, the live copilot should use an experiment tool (sweep/compare)
+    rather than a single run, and return usable results."""
+    monkeypatch.setattr(agent, "AGENT_OUT", tmp_path / "agent_run")
+    s = agent.AgentSession()
+    out = agent.run_agent(s, "On a small traffic-flow grid (about 40 seconds), sweep the attacker "
+                             "percentage across 0.1, 0.25 and 0.4 and tell me how revocation recall "
+                             "changes and which is highest.", max_steps=10)
+    assert not out.get("error"), out.get("error")
+    tools = [st["tool"] for st in out["steps"]]
+    assert "sweep" in tools or "compare" in tools, tools
+    sweeps = [st for st in out["steps"] if st["tool"] == "sweep"]
+    if sweeps:
+        res = sweeps[-1]["result"]
+        assert res.get("runs") and res.get("best"), res
     assert isinstance(out["reply"], str) and len(out["reply"]) > 0

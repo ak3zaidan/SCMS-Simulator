@@ -123,6 +123,14 @@ def system_prompt() -> str:
         "types, detector_reliability (report-level precision per detector), vehicle/subject ML AUCs, "
         "detection latency, and rsu_contribution. Higher attacker_pct/intensity = easier; stealth/"
         "pulsed/low-intensity = harder; RSUs help in sparse traffic; collusion lowers precision.\n\n"
+        "EXPERIMENTS: when the user asks to vary/sweep/try ONE field across specific values, or asks how "
+        "a metric changes with a field, you MUST use the sweep tool in a SINGLE call (never emulate it "
+        "with repeated set_config+run_and_analyze) — it varies the field, runs each, and returns the "
+        "metric per value plus the best. Use compare for A/B questions (up to 4 labelled override sets, "
+        "e.g. clear vs foggy, with vs without RSUs). When the user gives a numeric target (e.g. "
+        "'recall >= 0.85'), pick the field most likely to move it, sweep it, adopt the best value with "
+        "set_config, then confirm with run_and_analyze; iterate a couple of times if the target is not "
+        "yet met, and say so honestly if it cannot be reached within the caps.\n\n"
         "Always finish with a short, plain-language summary of what you set, what happened (key numbers), "
         "and what you'd try next. Be concise. Every configurable field (use exact names):\n" + _cheat_sheet()
     )
@@ -166,6 +174,30 @@ def tool_specs() -> list:
             "description": "Get full metadata (type, options, range, unit, help) for specific config fields.",
             "parameters": {"type": "object", "properties": {
                 "names": {"type": "array", "items": {"type": "string"}}}, "required": ["names"]}}},
+        {"type": "function", "function": {
+            "name": "sweep",
+            "description": "Vary ONE field across up to 6 values (holding all other current-config "
+                           "fields fixed), run each, and return precision/recall + the chosen metric "
+                           "for every value plus the best. Use this to answer sensitivity questions "
+                           "('how does recall change as attacker_pct rises?') and to optimise toward a "
+                           "numeric target in one call.",
+            "parameters": {"type": "object", "properties": {
+                "field": {"type": "string", "description": "config field to vary (exact name)"},
+                "values": {"type": "array", "description": "up to 6 values to try for that field"},
+                "metric": {"type": "string", "enum": list(_METRICS),
+                           "description": "metric to optimise (default recall; latency is lower-better)"}},
+                "required": ["field", "values"]}}},
+        {"type": "function", "function": {
+            "name": "compare",
+            "description": "Run up to 4 labelled scenario variants (each a set of overrides merged onto "
+                           "the CURRENT config) and return their metrics side by side. Use for A/B "
+                           "questions ('clear vs foggy', 'with vs without RSUs').",
+            "parameters": {"type": "object", "properties": {
+                "variants": {"type": "array", "description": "list of {label, overrides:{field:value}}",
+                             "items": {"type": "object", "properties": {
+                                 "label": {"type": "string"},
+                                 "overrides": {"type": "object"}}}}},
+                "required": ["variants"]}}},
     ]
 
 
@@ -234,14 +266,15 @@ def _compact_analysis(summary: dict, bench: dict, res) -> dict:
     }
 
 
-def _run_and_analyze(session: AgentSession) -> dict:
-    cfg = config_from_dict(session.effective_config())
+def _run_config(config: dict, out_dir: str, max_duration: float = AGENT_MAX_DURATION) -> dict:
+    """Generate + analyse one dataset from a raw config dict. Pure: no session mutation."""
+    cfg = config_from_dict({**_defaults(), **config})
     validate_config(cfg)
-    if cfg.duration_s > AGENT_MAX_DURATION:
-        cfg.duration_s = AGENT_MAX_DURATION
+    if cfg.duration_s > max_duration:
+        cfg.duration_s = max_duration
     if not cfg.traffic_flow and cfg.n_steps > AGENT_MAX_STEPS:
         cfg.n_steps = AGENT_MAX_STEPS
-    cfg.out_dir = str(AGENT_OUT)
+    cfg.out_dir = out_dir
     if cfg.live_interval_s <= 0:
         cfg.live_interval_s = 2.0            # leave a live-map snapshot for the GUI (not digested)
     res = run_pipeline(cfg)
@@ -251,9 +284,96 @@ def _run_and_analyze(session: AgentSession) -> dict:
         bench = benchmark_mod.run(cfg.out_dir)
     except Exception:
         bench = {}
-    session.last_out_dir = cfg.out_dir
-    session.last_results = _compact_analysis(summary, bench, res)
+    return _compact_analysis(summary, bench, res)
+
+
+def _run_and_analyze(session: AgentSession) -> dict:
+    out = str(AGENT_OUT)
+    session.last_results = _run_config(session.effective_config(), out)
+    session.last_out_dir = out
     return session.last_results
+
+
+# a few metrics a sweep/compare can be judged on (higher is better unless noted)
+_METRICS = ("recall", "precision", "vehicle_auc", "report_auc", "novel_attack_auc",
+            "detection_latency_s")
+
+
+def _metric_of(analysis: dict, metric: str):
+    return (analysis or {}).get(metric)
+
+
+def _sweep(session: AgentSession, field: str, values: list, metric: str = "recall") -> dict:
+    """Run the current config once per value of `field`, holding everything else fixed.
+    Returns each run's key metrics + the value that best optimises `metric`."""
+    if field not in _defaults():
+        return {"error": f"unknown field {field!r}"}
+    if not isinstance(values, list) or not values:
+        return {"error": "values must be a non-empty list"}
+    if len(values) > 6:
+        return {"error": f"too many values ({len(values)}); use at most 6 per sweep"}
+    if metric not in _METRICS:
+        return {"error": f"unknown metric {metric!r}; choose from {list(_METRICS)}"}
+    base = session.effective_config()
+    cap = min(float(base.get("duration_s", AGENT_MAX_DURATION) or AGENT_MAX_DURATION), 90.0)
+    runs, best, best_dir = [], None, None
+    for i, v in enumerate(values):
+        out = str(AGENT_OUT.parent / f"agent_sweep_{i}")
+        try:
+            a = _run_config({**base, field: v}, out, max_duration=cap)
+        except (ValueError, TypeError) as e:
+            runs.append({"value": v, "error": f"{type(e).__name__}: {e}"})
+            continue
+        row = {"value": v, "precision": a.get("precision"), "recall": a.get("recall"),
+               metric: _metric_of(a, metric)}
+        runs.append(row)
+        m = _metric_of(a, metric)
+        lower_better = metric == "detection_latency_s"
+        if m is not None and (best is None or (m < best if lower_better else m > best)):
+            best, best_dir = m, out
+            session.last_results = a          # GUI reflects the current best run
+    if best_dir:
+        session.last_out_dir = best_dir
+    best_row = None
+    ok = [r for r in runs if "error" not in r and r.get(metric) is not None]
+    if ok:
+        lower_better = metric == "detection_latency_s"
+        best_row = (min if lower_better else max)(ok, key=lambda r: r[metric])
+    return {"field": field, "metric": metric, "runs": runs, "best": best_row}
+
+
+def _compare(session: AgentSession, variants: list) -> dict:
+    """Run several named override sets (each merged onto the CURRENT config) and return their
+    metrics side by side. variants = [{"label": str, "overrides": {field: value}}, ...]."""
+    if not isinstance(variants, list) or not variants:
+        return {"error": "variants must be a non-empty list"}
+    if len(variants) > 4:
+        return {"error": f"too many variants ({len(variants)}); use at most 4"}
+    base = session.effective_config()
+    known = set(_defaults())
+    cap = min(float(base.get("duration_s", AGENT_MAX_DURATION) or AGENT_MAX_DURATION), 90.0)
+    rows = []
+    for i, var in enumerate(variants):
+        if not isinstance(var, dict):
+            return {"error": "each variant must be an object with overrides"}
+        ov = var.get("overrides") if isinstance(var.get("overrides"), dict) else \
+            {k: v for k, v in var.items() if k != "label"}
+        unknown = [k for k in ov if k not in known]
+        clean = {k: v for k, v in ov.items() if k in known}
+        label = var.get("label") or (", ".join(f"{k}={v}" for k, v in clean.items()) or f"variant {i+1}")
+        out = str(AGENT_OUT.parent / f"agent_cmp_{i}")
+        try:
+            a = _run_config({**base, **clean}, out, max_duration=cap)
+        except (ValueError, TypeError) as e:
+            rows.append({"label": label, "overrides": clean, "error": f"{type(e).__name__}: {e}"})
+            continue
+        rows.append({"label": label, "overrides": clean, "ignored_unknown": unknown,
+                     "precision": a.get("precision"), "recall": a.get("recall"),
+                     "vehicle_auc": a.get("vehicle_auc"), "report_auc": a.get("report_auc"),
+                     "detection_latency_s": a.get("detection_latency_s")})
+        session.last_out_dir = out
+        session.last_results = a
+    return {"variants": rows}
 
 
 def _exec_tool(session: AgentSession, name: str, args: dict) -> dict:
@@ -289,12 +409,17 @@ def _exec_tool(session: AgentSession, name: str, args: dict) -> dict:
         if name == "describe_fields":
             sch = config_schema()
             return {"ok": True, "fields": {n: sch[n] for n in (args.get("names") or []) if n in sch}}
+        if name == "sweep":
+            return _sweep(session, args.get("field"), args.get("values"),
+                          args.get("metric") or "recall")
+        if name == "compare":
+            return _compare(session, args.get("variants"))
         return {"error": f"unknown tool {name!r}"}
     except (ValueError, TypeError) as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
-def run_agent(session: AgentSession, user_msg: str, max_steps: int = 8,
+def run_agent(session: AgentSession, user_msg: str, max_steps: int = 10,
               model: str | None = None, key: str | None = None) -> dict:
     """Run one user turn through the tool-calling loop. Returns {reply, steps, config, results, error}."""
     if key is None:

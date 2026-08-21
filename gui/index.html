@@ -180,6 +180,15 @@
   .chip-sugg{font-size:11px;padding:4px 9px;border-radius:999px;background:var(--panel2);
         border:1px solid var(--edge);cursor:pointer;color:var(--ink)}
   .chip-sugg:hover{border-color:var(--accent)}
+  table.exp{width:100%;border-collapse:collapse;margin-top:7px;font-size:11px}
+  table.exp th,table.exp td{border:1px solid var(--edge);padding:4px 7px;text-align:right;
+        font-variant-numeric:tabular-nums}
+  table.exp th{color:var(--muted);text-transform:uppercase;letter-spacing:.4px;font-size:10px;
+        font-weight:600;background:var(--panel2)}
+  table.exp td.lbl{text-align:left;color:var(--ink);font-family:ui-monospace,Menlo,monospace}
+  table.exp tr.best td{background:#12331f;color:var(--ok)}
+  table.exp tr.err td{color:var(--bad)}
+  table.exp td.errmsg{text-align:left;color:var(--bad);font-size:10px}
 </style>
 </head>
 <body>
@@ -791,9 +800,10 @@ function renderStats(st){
 let COPILOT_ON=false, chatBusy=false;
 const SUGGESTIONS=[
   "Ring road, 12 intersections, 25% attackers, 60s — run it and report precision & recall",
-  "Sparse rural grid where mobile reporters are scarce; add 8 RSUs and show the RSU contribution",
+  "Tune attacker_pct to get revocation recall above 0.85, then confirm the final run",
+  "Sweep attacker_pct from 0.1 to 0.5 and show how recall changes",
   "Compare a clear-weather run to a foggy one at 30% attackers and tell me which is harder to detect",
-  "Mix RandomPos, ConstPos and a replay attack; which family has the worst recall?",
+  "Sparse rural grid where mobile reporters are scarce; add 8 RSUs and show the RSU contribution",
 ];
 
 async function initCopilot(){
@@ -836,7 +846,33 @@ function stepDesc(st){
   if(st.tool==='reset_config') return {d:'config reset to defaults'};
   if(st.tool==='get_config') return {d:'read current config'};
   if(st.tool==='describe_fields') return {d:'looked up: '+((a.names||[]).join(', '))};
+  if(st.tool==='sweep'){ const b=r.best;
+    return {d:`swept ${r.field} (${(r.runs||[]).length} runs)`+
+      (b?` · best ${r.metric}=${fmtMetric(r.metric,b[r.metric])} at ${r.field}=${b.value}`:'')}; }
+  if(st.tool==='compare') return {d:`compared ${(r.variants||[]).length} variants`};
   return {d:JSON.stringify(a).slice(0,160)};
+}
+function fmtMetric(m,v){ return (m==='precision'||m==='recall')?fmtp(v):fmtn(v); }
+function expTable(st){                 // sweep / compare → comparison table
+  const r=st.result||{};
+  let head, rows;
+  if(st.tool==='sweep'&&r.runs){
+    const m=r.metric, best=r.best;
+    head=[r.field,'precision','recall', m==='precision'||m==='recall'?null:m].filter(Boolean);
+    rows=r.runs.map(x=>({cells:[x.value, x.error?'—':fmtp(x.precision), x.error?'—':fmtp(x.recall),
+      (m==='precision'||m==='recall')?null:(x.error?'—':fmtn(x[m]))].filter(v=>v!==null),
+      best:best&&x.value===best.value, err:x.error}));
+  } else if(st.tool==='compare'&&r.variants){
+    head=['variant','precision','recall','veh AUC','latency'];
+    rows=r.variants.map(x=>({cells:[x.label, x.error?'—':fmtp(x.precision), x.error?'—':fmtp(x.recall),
+      x.error?'—':fmtn(x.vehicle_auc), x.error?'—':(x.detection_latency_s==null?'—':x.detection_latency_s+'s')],
+      err:x.error}));
+  } else return null;
+  const th=head.map(h=>`<th>${escH(h)}</th>`).join('');
+  const tr=rows.map(row=>`<tr class="${row.best?'best':''}${row.err?' err':''}">`+
+    row.cells.map((c,i)=>`<td${i===0?' class="lbl"':''}>${escH(c)}</td>`).join('')+
+    (row.err?`<td class="errmsg" colspan="9">${escH(row.err)}</td>`:'')+`</tr>`).join('');
+  return `<table class="exp"><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>`;
 }
 function addSteps(steps){
   if(!steps||!steps.length) return;
@@ -844,6 +880,7 @@ function addSteps(steps){
   steps.forEach(st=>{ const info=stepDesc(st);
     const el=document.createElement('div'); el.className='step'+(info.bad?' bad':'');
     el.innerHTML=`<div class="t">${st.tool}</div><div class="d">${escH(info.d)}</div>`;
+    const tbl=expTable(st); if(tbl) el.innerHTML+=tbl;
     wrap.appendChild(el); });
   $('#chat').scrollTop=$('#chat').scrollHeight;
 }
