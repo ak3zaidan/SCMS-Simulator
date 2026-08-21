@@ -844,6 +844,15 @@ async function initCopilot(){
   $('#chatInput').addEventListener('keydown',e=>{
     if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){ e.preventDefault(); sendChat(); }
   });
+  if(COPILOT_ON) restoreChat();
+}
+
+async function restoreChat(){        // rebuild the transcript after a page reload (server keeps it)
+  let h; try{ h=await (await fetch('/api/agent/history')).json(); }catch(e){ return; }
+  const msgs=h.messages||[]; if(!msgs.length) return;
+  $('#chat').innerHTML='';
+  msgs.forEach(m=>chatEl(m.role==='user'?'msg user':'msg bot',escH(m.content)));
+  if(h.results) addMetrics(h.results);   // last run's numbers (map/stats restored via /api/status)
 }
 
 const escH=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;')

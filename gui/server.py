@@ -866,6 +866,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"enabled": bool(agent.openai_key()), "model": agent.openai_model(),
                                     "config": AGENT.config, "results": AGENT.last_results,
                                     "history_len": len(AGENT.history)})
+        if self.path == "/api/agent/history":         # transcript to restore the chat on page reload
+            msgs = [{"role": m["role"], "content": m["content"]} for m in AGENT.history
+                    if m.get("role") in ("user", "assistant") and m.get("content")]
+            return self._send(200, {"messages": msgs, "results": AGENT.last_results})
         if self.path == "/api/agent/progress":        # live steps of the in-flight copilot turn
             with _AGENT_PROG_LOCK:
                 return self._send(200, {"running": AGENT_PROGRESS["running"],
