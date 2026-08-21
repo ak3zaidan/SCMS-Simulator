@@ -80,6 +80,7 @@
   .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
   .kpi{background:var(--panel2);border:1px solid var(--edge);border-radius:9px;padding:8px 10px}
   .kpi .k{font-size:11px;color:var(--muted)} .kpi .v{font-size:19px;font-weight:700}
+  .q-good{color:var(--ok)} .q-ok{color:var(--warn)} .q-bad{color:var(--bad)}
   .bars{display:grid;gap:5px;margin-top:6px}
   .bar{display:grid;grid-template-columns:150px 1fr 44px;align-items:center;gap:8px;font-size:11px}
   .bar .t{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -550,6 +551,9 @@ function bars(el,obj){
 }
 const num=x=>(x==null?'—':(typeof x==='number'?(Number.isInteger(x)?x:x.toFixed(3)):x));
 const pctv=x=>(x==null?'—':(x*100).toFixed(1)+'%');
+// colour a 0..1 quality metric green/amber/red for at-a-glance reading
+const qual=(x,fmt)=>{ if(x==null) return '—';
+  const cls = x>=0.85?'q-good':(x>=0.7?'q-ok':'q-bad'); return `<span class="${cls}">${fmt(x)}</span>`; };
 const badge=ok=>ok==null?'':`<span class="badge ${ok?'pass':'fail'}">${ok?'✓ in range':'✗ off'}</span>`;
 function card(title,hint,inner){
   return `<div class="subhead">${title}${hint?` <span class="hint">${hint}</span>`:''}</div>${inner}`;
@@ -660,10 +664,10 @@ function renderStats(st){
     ['Vehicles', c.vehicles ?? c.subjects ?? '—'],
     ['MA reports', c.reports ?? '—'],
     ['Revocations', c.revocations ?? c.revoked ?? '—'],
-    ['Precision', pctv(va.precision)],['Recall', pctv(va.recall)],
-    ['Leakage', `<span class="${leak===0?'good':'warnc'}">${leak}</span>`],
-    ['Subj AUC', num(subjAuc)],['Report AUC', num(repAuc)],
-    ['Best F1', bestF1!=null?num(bestF1):'—'],
+    ['Precision', qual(va.precision, pctv)],['Recall', qual(va.recall, pctv)],
+    ['Leakage', `<span class="${leak===0?'q-good':'q-bad'}">${leak}</span>`],
+    ['Subj AUC', qual(subjAuc, num)],['Report AUC', qual(repAuc, num)],
+    ['Best F1', qual(bestF1, num)],
     ['Seed', st.seed ?? '—'],
     ['Digest', `<span class="muted" style="font-size:12px">${st.data_digest||'—'}</span>`],
   ];
