@@ -191,6 +191,22 @@
   table.exp tr.best td{background:#12331f;color:var(--ok)}
   table.exp tr.err td{color:var(--bad)}
   table.exp td.errmsg{text-align:left;color:var(--bad);font-size:10px}
+  details.cdetails{align-self:stretch;background:var(--bg);border:1px solid var(--edge);
+        border-radius:8px;padding:6px 10px;font-size:11px}
+  details.cdetails>summary{cursor:pointer;color:var(--accent);font-weight:600;font-size:11px;
+        list-style:none}
+  details.cdetails>summary::-webkit-details-marker{display:none}
+  details.cdetails>summary::before{content:"▸ ";font-size:10px}
+  details.cdetails[open]>summary::before{content:"▾ "}
+  .csec{margin-top:8px}
+  .csec .ch{color:var(--muted);text-transform:uppercase;letter-spacing:.4px;font-size:10px;margin-bottom:4px}
+  .cbars{display:grid;gap:3px}
+  .cbar{display:grid;grid-template-columns:130px 1fr 46px;align-items:center;gap:8px}
+  .cbar .ct{color:var(--ink);font-family:ui-monospace,Menlo,monospace;font-size:10px;
+        white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .cbar .ctrack{height:8px;background:var(--panel2);border-radius:4px;overflow:hidden}
+  .cbar .ctrack>span{display:block;height:100%;background:var(--accent2)}
+  .cbar .cv{text-align:right;font-variant-numeric:tabular-nums;color:var(--muted);font-size:10px}
 </style>
 </head>
 <body>
@@ -900,13 +916,45 @@ function addSteps(steps){
 function addMetrics(res){
   if(!res) return;
   const rc=res.rsu_contribution||{};
+  const lat=res.detection_latency_s;
   const items=[['Precision',fmtp(res.precision)],['Recall',fmtp(res.recall)],
     ['Vehicle AUC',fmtn(res.vehicle_auc)],['Report AUC',fmtn(res.report_auc)],
     ['Vehicles',res.vehicles??'—'],['Reports',res.reports??'—'],['Revoked',res.revoked??'—']];
+  if(res.false_revocations!=null) items.push(['False revk.',res.false_revocations]);
+  if(lat&&lat.median_s!=null) items.push(['Med. latency',lat.median_s+'s']);
+  else if(typeof lat==='number') items.push(['Med. latency',lat+'s']);
   if(rc&&rc.reports!=null) items.push(['RSU reports',rc.reports]);
   const wrap=chatEl('metrics');
   wrap.innerHTML=items.map(([k,v])=>`<div class="metric">${k}<b>${v}</b></div>`).join('');
+  addDetails(res);
   $('#chat').scrollTop=$('#chat').scrollHeight;
+}
+function miniBars(obj,pct){          // {label:value} -> horizontal bars (value 0..1 if pct)
+  const ents=Object.entries(obj||{}); if(!ents.length) return '';
+  const max=pct?1:Math.max(...ents.map(([,v])=>+v||0))||1;
+  return `<div class="cbars">`+ents.map(([k,v])=>{
+    const w=Math.max(0,Math.min(100,(+v||0)/max*100));
+    const lbl=pct?fmtp(v):fmtn(v);
+    return `<div class="cbar"><span class="ct">${escH(k)}</span>`+
+      `<span class="ctrack"><span style="width:${w}%"></span></span><span class="cv">${lbl}</span></div>`;
+  }).join('')+`</div>`;
+}
+function addDetails(res){
+  const secs=[];
+  if(res.recall_by_family&&Object.keys(res.recall_by_family).length)
+    secs.push(['Recall by attack family',miniBars(res.recall_by_family,true)]);
+  if(res.hardest_types&&Object.keys(res.hardest_types).length)
+    secs.push(['Hardest attack types (lowest recall)',miniBars(res.hardest_types,true)]);
+  if(res.detector_reliability&&Object.keys(res.detector_reliability).length){
+    const top=Object.fromEntries(Object.entries(res.detector_reliability)
+      .sort((a,b)=>b[1]-a[1]).slice(0,6));
+    secs.push(['Detector reliability (report precision)',miniBars(top,true)]);
+  }
+  if(!secs.length) return;
+  const d=document.createElement('details'); d.className='cdetails';
+  d.innerHTML=`<summary>Detailed analysis</summary>`+
+    secs.map(([t,b])=>`<div class="csec"><div class="ch">${t}</div>${b}</div>`).join('');
+  $('#chat').appendChild(d); $('#chat').scrollTop=$('#chat').scrollHeight;
 }
 
 async function pollAgentProgress(liveEl){
