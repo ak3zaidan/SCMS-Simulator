@@ -604,9 +604,135 @@ def _field_group(name: str) -> str:
     return "Other"
 
 
+# Enumerated fields -> their valid options (sourced from the live constants so they never drift).
+_ENUM_OPTIONS = {
+    "weather": list(WEATHER_MULT),
+    "road_network": ["linear", "grid", "ring"],
+    "demand_profile": ["uniform", "rush", "night"],
+    "od_model": ["uniform", "gravity"],
+    "fleet": ["mixed", *VEHICLE_TYPES],
+    "rsu_placement": ["spread", "perimeter", "center", "corners", "all"],
+    "attack_type": list(ATTACK_CATALOG),
+}
+
+# Per-field documentation + ranges/units so every knob is self-describing in UIs and tooling.
+# Keys: h=help, lo=min, hi=max, st=step, u=unit. (Fractions [0,1] get lo/hi/st filled by default.)
+_FIELD_META = {
+    # Run
+    "seed": dict(h="RNG seed — same seed + config gives a byte-identical dataset", lo=0, st=1),
+    "n_vehicles": dict(h="Fixed-fleet vehicle count (ignored in traffic-flow mode)", lo=1, hi=5000),
+    "n_steps": dict(h="Fixed-fleet simulation steps (ignored when duration_s > 0)", lo=0),
+    "dt": dict(h="Simulation timestep", lo=0.1, hi=5, st=0.1, u="s"),
+    "emit_sample_prob": dict(h="Per-message ground-truth emission sampling probability", lo=0, hi=1, st=0.01),
+    "live_interval_s": dict(h="Write the live-map JSON every N sim-seconds (0 = off)", lo=0, u="s"),
+    "verbose": dict(h="Print a progress heartbeat while running"),
+    "jmax": dict(h="Linkage j-index period size (SCMS internal)", lo=1),
+    "out_dir": dict(h="Output directory for the generated dataset"),
+    # Mobility
+    "nominal_speed": dict(h="Fixed-fleet cruising speed", lo=1, hi=60, u="m/s"),
+    "traffic_flow": dict(h="Spawn/despawn vehicles over time on a road network (vs a fixed fleet)"),
+    "duration_s": dict(h="Traffic-flow length; overrides n_steps when > 0", lo=0, u="s"),
+    "arrival_rate": dict(h="Mean vehicle arrivals per second (traffic-flow)", lo=0, hi=20, st=0.5, u="/s"),
+    "max_total_vehicles": dict(h="Cap total spawns (0 = unlimited) — bounds memory on long runs", lo=0),
+    "n_lanes": dict(h="Parallel lanes per road (overtaking; relieves gridlock)", lo=1, hi=6),
+    "lane_width_m": dict(h="Lane width for multi-lane offsets", lo=1, hi=6, st=0.25, u="m"),
+    "trip_speed_min": dict(h="Minimum desired trip speed", lo=1, hi=60, u="m/s"),
+    "trip_speed_max": dict(h="Maximum desired trip speed", lo=1, hi=60, u="m/s"),
+    "fleet": dict(h="Vehicle mix: 'mixed' or a single class"),
+    "fleet_mix": dict(h="Custom class weights, e.g. car:0.6,truck:0.3,bus:0.1 (blank = default mix)"),
+    "car_following": dict(h="IDM car-following (queues, stop-and-go, congestion)"),
+    "idm_accel": dict(h="IDM maximum acceleration", lo=0.1, hi=5, st=0.1, u="m/s²"),
+    "idm_decel": dict(h="IDM comfortable deceleration", lo=0.1, hi=6, st=0.1, u="m/s²"),
+    "idm_time_headway": dict(h="IDM desired time gap to the leader", lo=0.3, hi=4, st=0.1, u="s"),
+    "idm_min_gap": dict(h="IDM jam distance / minimum gap", lo=0.5, hi=10, st=0.5, u="m"),
+    "veh_length_m": dict(h="Default vehicle length", lo=1, hi=20, u="m"),
+    "idm_lookahead_m": dict(h="IDM leader search distance", lo=10, hi=200, u="m"),
+    "turn_slowdown": dict(h="Slow into sharp grid corners (more realistic, harder to detect)"),
+    "turn_speed_mps": dict(h="Speed cap through a sharp bend", lo=1, hi=20, u="m/s"),
+    "turn_min_angle_deg": dict(h="Only bends sharper than this are slowed", lo=0, hi=180, u="°"),
+    "demand_profile": dict(h="Arrival-demand shape over the run"),
+    "od_model": dict(h="Trip destination law: uniform or distance-decay gravity"),
+    "od_gravity_scale": dict(h="Gravity hop-decay scale (smaller = shorter trips)", lo=0.1, hi=10, st=0.5),
+    "boundary_origins": dict(h="Trips originate at the network perimeter (realistic sources/sinks)"),
+    "state_prune_every": dict(h="Steps between detection-state prunes (flow memory)", lo=1),
+    "state_prune_ttl": dict(h="Evict detection state untouched this many steps", lo=1),
+    # Network
+    "road_network": dict(h="Road topology: straight lines, routed grid, or a circular ring"),
+    "grid_w": dict(h="Grid columns (grid) / number of intersections (ring)", lo=2, hi=40),
+    "grid_h": dict(h="Grid rows (0 = square, equal to grid_w)", lo=0, hi=40),
+    "grid_block_m": dict(h="Spacing between adjacent intersections", lo=20, hi=500, u="m"),
+    "grid_dropout": dict(h="Fraction of grid roads removed (irregular grid; stays connected)", lo=0, hi=1, st=0.05),
+    "traffic_lights": dict(h="Signalized intersections (stops + queues)"),
+    "light_cycle_s": dict(h="Full signal cycle; half green per axis", lo=2, hi=120, u="s"),
+    # Attacks
+    "attacker_ids": dict(h="Fixed-fleet attacker vehicle ids (used only when attacker_pct = 0)"),
+    "attacker_pct": dict(h="Fraction of vehicles that are attackers", lo=0, hi=1, st=0.05),
+    "attack_type": dict(h="Single/default attack type"),
+    "attack_types": dict(h="Enabled attack types (round-robin), comma-separated"),
+    "attack_start": dict(h="Fixed-fleet: attack begins at this time", lo=0, u="s"),
+    "attack_end": dict(h="Fixed-fleet: attack ends at this time", lo=0, u="s"),
+    "attack_intensity": dict(h="Falsification magnitude scale (subtle <1 .. blatant >1)", lo=0, hi=5, st=0.25),
+    "attack_mix": dict(h="Per-type weights, e.g. ConstPos:0.6,Sybil:0.4 (blank = round-robin)"),
+    "attack_duty_cycle": dict(h="Fraction of each pulse the attacker falsifies (<1 = intermittent)", lo=0, hi=1, st=0.05),
+    "attack_pulse_period_s": dict(h="On/off cycle length for pulsed attacks", lo=1, u="s"),
+    "attack_delay_s": dict(h="Flow: attacker starts falsifying this long after spawn", lo=0, u="s"),
+    "attack_delay_jitter_s": dict(h="Spread attacker onset by up to this much", lo=0, u="s"),
+    "dos_burst": dict(h="CAMs per interval a DoS attacker floods", lo=1),
+    "delay_s": dict(h="DelayedMessages staleness", lo=0, u="s"),
+    "collude_pct": dict(h="Fraction of attackers that also file false reports", lo=0, hi=1, st=0.05),
+    "victim_pct": dict(h="Fraction of benign vehicles targeted by colluders", lo=0, hi=1, st=0.05),
+    "sybil_ghosts": dict(h="Ghost identities a Sybil attacker fabricates", lo=0, hi=20),
+    # GNSS / sensor
+    "gps_sigma_m": dict(h="White per-axis GNSS noise", lo=0, hi=20, st=0.1, u="m"),
+    "gps_bias_sigma_m": dict(h="OU-correlated slow GNSS bias amplitude", lo=0, hi=20, st=0.1, u="m"),
+    "gps_bias_tau_s": dict(h="GNSS bias correlation time", lo=1, u="s"),
+    "gps_outlier_rate": dict(h="Per-message multipath outlier probability", lo=0, hi=1, st=0.01),
+    "gps_outlier_mag_m": dict(h="Multipath outlier magnitude", lo=0, u="m"),
+    "gps_degrade_rate": dict(h="Per-step prob a benign vehicle enters a bad-GNSS burst", lo=0, hi=1, st=0.005),
+    "gps_degrade_factor": dict(h="Noise multiplier during a bad-GNSS burst", lo=1, hi=20),
+    "gps_degrade_dur_s": dict(h="Bad-GNSS burst length", lo=0, u="s"),
+    "gps_jam_rate": dict(h="Per-step prob a benign vehicle loses GNSS fix (goes silent)", lo=0, hi=1, st=0.01),
+    "gps_jam_dur_s": dict(h="GNSS outage length", lo=0, u="s"),
+    "faulty_pct": dict(h="Fraction of benign vehicles with a malfunctioning sensor", lo=0, hi=1, st=0.05),
+    "faulty_bias_mult": dict(h="Faulty-sensor sustained bias multiplier", lo=1, hi=20),
+    "weather": dict(h="Weather — degrades GNSS accuracy, radio, and speed"),
+    # Detection / MA
+    "consistency_threshold_m": dict(h="Position/speed consistency tolerance", lo=0, u="m"),
+    "heading_threshold_deg": dict(h="Heading-inconsistency threshold", lo=0, hi=180, u="°"),
+    "detector_lag_s": dict(h="Lagged-reference age used by detectors", lo=0, u="s"),
+    "report_prob": dict(h="Probability a receiver files a report on a detection", lo=0, hi=1, st=0.05),
+    "report_threshold_k": dict(h="Distinct reporters needed to open an investigation", lo=1, hi=20),
+    "revoke_min_seconds": dict(h="AND reports in at least this many distinct seconds", lo=1),
+    "revoke_persist_s": dict(h="AND evidence spanning at least this long", lo=0, u="s"),
+    "revoke_window_s": dict(h="Sustained-evidence sliding window", lo=1, u="s"),
+    "net_delay_max": dict(h="Maximum report ingest delay", lo=0, u="s"),
+    "crl_propagation_delay": dict(h="CRL propagation delay before enforcement", lo=0, u="s"),
+    "offroad_tol_m": dict(h="Map off-road tolerance (HD-map check)", lo=0, u="m"),
+    "max_accel_mps2": dict(h="Implausible-acceleration threshold", lo=1, u="m/s²"),
+    "rotate_period_s": dict(h="Pseudonym rotation period (0 = no rotation)", lo=0, u="s"),
+    "ma_defense": dict(h="Trusted-reporter gating (reputation + rate limit)"),
+    "reputation_max": dict(h="A reporter itself reported more than this is distrusted", lo=1),
+    "report_budget": dict(h="A reporter filing more than this is rate-limited", lo=1),
+    # Radio
+    "radio_range_m": dict(h="Vehicle reception range", lo=10, hi=2000, u="m"),
+    "packet_loss_base": dict(h="Baseline per-message packet loss", lo=0, hi=1, st=0.01),
+    "nlos_loss": dict(h="Distance-growing obstruction (NLOS) loss", lo=0, hi=1, st=0.05),
+    "chan_capacity": dict(h="In-range CAMs/step before congestion loss", lo=1),
+    "art_max_m": dict(h="Acceptance-range tolerance beyond radio range", lo=0, u="m"),
+    "freq_max": dict(h="Beacon-rate normalizer (CAMs/interval)", lo=1),
+    "stale_max_s": dict(h="Staleness threshold for staleOrReplay", lo=0, u="s"),
+    # RSU
+    "n_rsus": dict(h="Number of Road-Side Units — static, always-trusted receivers (0 = off)", lo=0, hi=200),
+    "rsu_placement": dict(h="Where RSUs are placed on the network"),
+    "rsu_range_m": dict(h="RSU radio range (0 = same as radio_range_m)", lo=0, u="m"),
+    "rsu_coords": dict(h="Explicit RSU positions x1,y1;x2,y2;... (overrides placement)"),
+}
+
+
 def config_schema() -> dict:
-    """Machine-readable schema of every PipelineConfig field: {name: {type, default, group}}. Lets
-    tools/UIs build config forms/validators (and group them) against the full knob surface."""
+    """Machine-readable schema of every PipelineConfig field: for each, {type, default, group, widget,
+    help, options, min, max, step, unit}. widget in {bool, select, int, float, text}. Lets UIs/tools
+    render a fully self-describing form (dropdowns for enums, ranges/units for numbers)."""
     out = {}
     for f in dataclasses.fields(PipelineConfig):
         default = f.default
@@ -614,7 +740,23 @@ def config_schema() -> dict:
             default = None
         elif isinstance(default, tuple):
             default = list(default)
-        out[f.name] = {"type": str(f.type), "default": default, "group": _field_group(f.name)}
+        typ = str(f.type)
+        opts = _ENUM_OPTIONS.get(f.name)
+        if isinstance(default, bool):
+            widget = "bool"
+        elif opts is not None:
+            widget = "select"
+        elif typ.startswith("int"):
+            widget = "int"
+        elif typ.startswith("float"):
+            widget = "float"
+        else:
+            widget = "text"
+        meta = _FIELD_META.get(f.name, {})
+        out[f.name] = {"type": typ, "default": default, "group": _field_group(f.name),
+                       "widget": widget, "help": meta.get("h", ""), "options": opts,
+                       "min": meta.get("lo"), "max": meta.get("hi"),
+                       "step": meta.get("st"), "unit": meta.get("u")}
     return out
 
 

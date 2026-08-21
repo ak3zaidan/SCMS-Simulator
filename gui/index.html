@@ -81,6 +81,36 @@
   .kpi{background:var(--panel2);border:1px solid var(--edge);border-radius:9px;padding:8px 10px}
   .kpi .k{font-size:11px;color:var(--muted)} .kpi .v{font-size:19px;font-weight:700}
   .q-good{color:var(--ok)} .q-ok{color:var(--warn)} .q-bad{color:var(--bad)}
+  /* Advanced (all-fields) panel */
+  #advPanel .note{color:var(--muted);font-size:12px;margin-bottom:8px}
+  #advForm{max-height:56vh;overflow:auto;padding-right:4px}
+  details.adv-group{border:1px solid var(--edge);border-radius:9px;margin:8px 0;background:var(--panel2);overflow:hidden}
+  details.adv-group>summary{cursor:pointer;list-style:none;padding:9px 11px;font-weight:600;
+        font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--ink)}
+  details.adv-group>summary::-webkit-details-marker{display:none}
+  details.adv-group>summary::before{content:"▸";color:var(--accent);margin-right:7px;font-size:10px}
+  details.adv-group[open]>summary::before{content:"▾"}
+  details.adv-group>summary:hover{background:var(--edge)}
+  .adv-row{padding:8px 11px;border-top:1px solid var(--edge)}
+  .adv-line{display:flex;align-items:center;justify-content:space-between;gap:12px}
+  .adv-name{font-size:12.5px;font-weight:600;color:var(--ink);
+        font-family:ui-monospace,Consolas,monospace}
+  .adv-unit{color:var(--muted);font-weight:400;font-size:11px;margin-left:4px}
+  .adv-help{font-size:11px;color:var(--muted);margin-top:4px;line-height:1.4}
+  .adv-range{color:var(--accent);opacity:.85;white-space:nowrap;font-variant-numeric:tabular-nums}
+  #advForm input[type=number],#advForm input[type=text],#advForm select{
+        width:150px;flex:none;background:var(--bg);color:var(--ink);border:1px solid var(--edge2);
+        border-radius:7px;padding:6px 8px;font:inherit;font-size:12.5px}
+  #advForm input:focus,#advForm select:focus{outline:none;border-color:var(--accent)}
+  #advForm select{cursor:pointer}
+  .adv-switch{position:relative;display:inline-block;width:38px;height:21px;flex:none}
+  .adv-switch input{opacity:0;width:0;height:0}
+  .adv-switch>span{position:absolute;inset:0;background:var(--edge2);border-radius:999px;
+        transition:.15s;cursor:pointer}
+  .adv-switch>span::before{content:"";position:absolute;width:15px;height:15px;left:3px;top:3px;
+        background:#fff;border-radius:50%;transition:.15s}
+  .adv-switch input:checked+span{background:var(--accent2)}
+  .adv-switch input:checked+span::before{transform:translateX(17px)}
   .bars{display:grid;gap:5px;margin-top:6px}
   .bar{display:grid;grid-template-columns:150px 1fr 44px;align-items:center;gap:8px;font-size:11px}
   .bar .t{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -426,49 +456,65 @@ $('#advtoggle').addEventListener('click',async()=>{
     renderAdvForm();
   }
 });
+const ADV_ORDER=['Scenario','Run','Network','Mobility','Traffic','RSU','RSU (infrastructure)',
+  'Attacks','GNSS/sensor','Radio','Detection/MA','SCMS policy','Vehicle & radio','Sensors & CAM timing','Other'];
+function advRow(name){
+  const m=ADV.schema[name], d=ADV.defaults[name];
+  const esc=s=>String(s).replace(/"/g,'&quot;');
+  let inp;
+  if(m.widget==='bool'){
+    inp=`<label class="adv-switch"><input type="checkbox" id="adv_${name}" ${d?'checked':''}><span></span></label>`;
+  }else if(m.widget==='select'){
+    inp=`<select id="adv_${name}">`+(m.options||[]).map(o=>
+        `<option value="${esc(o)}" ${o===d?'selected':''}>${o}</option>`).join('')+`</select>`;
+  }else if(m.widget==='int'||m.widget==='float'){
+    const a=[m.min!=null?`min="${m.min}"`:'',m.max!=null?`max="${m.max}"`:'',
+            `step="${m.step!=null?m.step:(m.widget==='float'?'any':1)}"`].join(' ');
+    inp=`<input type="number" id="adv_${name}" value="${d==null?'':d}" ${a}>`;
+  }else{
+    const v=(d==null?'':(Array.isArray(d)?d.join(','):d));
+    inp=`<input type="text" id="adv_${name}" value="${esc(v)}" placeholder="(default)">`;
+  }
+  const unit=m.unit?`<span class="adv-unit">${m.unit}</span>`:'';
+  const rng=(m.widget==='int'||m.widget==='float')&&(m.min!=null||m.max!=null)
+    ? `<span class="adv-range">${m.min!=null?m.min:'−∞'} … ${m.max!=null?m.max:'∞'}</span>`:'';
+  return `<div class="adv-row" data-hay="${esc((name+' '+(m.help||'')).toLowerCase())}">
+    <div class="adv-line"><span class="adv-name">${name}${unit}</span><span class="adv-input">${inp}</span></div>
+    <div class="adv-help">${m.help||''} ${rng}</div></div>`;
+}
 function renderAdvForm(){
-  const sch=ADV.schema, def=ADV.defaults;
-  const order=['RSU','Attacks','Mobility','Network','GNSS/sensor','Radio','Detection/MA','Run','Other'];
   const byGroup={};
-  for(const name of Object.keys(sch)){ (byGroup[sch[name].group||'Other']??=[]).push(name); }
-  const rowHtml=name=>{
-    const meta=sch[name], d=def[name];
-    const isBool=(meta.type==='bool'||typeof d==='boolean');
-    const val=(d==null?'':(Array.isArray(d)?d.join(','):d));
-    const inp=isBool
-      ? `<input type="checkbox" id="adv_${name}" ${d?'checked':''}>`
-      : `<input type="text" id="adv_${name}" value="${val}" style="width:120px">`;
-    return `<div class="advrow" data-name="${name}" style="display:flex;gap:8px;align-items:center;padding:2px 0">
-      <label style="flex:1;font-size:12px" title="${meta.type}">${name}</label>${inp}</div>`;
-  };
+  for(const name of Object.keys(ADV.schema)){ (byGroup[ADV.schema[name].group||'Other']??=[]).push(name); }
+  const seen=new Set(), order=[...ADV_ORDER, ...Object.keys(byGroup).filter(g=>!ADV_ORDER.includes(g))];
   const parts=[];
   for(const grp of order){
+    if(seen.has(grp)) continue; seen.add(grp);
     const names=(byGroup[grp]||[]).sort(); if(!names.length) continue;
-    parts.push(`<div class="advgroup" data-group="${grp}">
-      <div class="subhead" style="margin-top:8px">${grp} <span class="hint">${names.length}</span></div>
-      ${names.map(rowHtml).join('')}</div>`);
+    parts.push(`<details class="adv-group" open><summary>${grp} <span class="hint">${names.length}</span></summary>
+      ${names.map(advRow).join('')}</details>`);
   }
   $('#advForm').innerHTML=parts.join('');
 }
 $('#advSearch').addEventListener('input',()=>{
   const q=$('#advSearch').value.toLowerCase();
-  document.querySelectorAll('#advForm .advgroup').forEach(g=>{
+  document.querySelectorAll('#advForm .adv-group').forEach(g=>{
     let any=false;
-    g.querySelectorAll('.advrow').forEach(r=>{
-      const m=r.dataset.name.toLowerCase().includes(q); r.style.display=m?'':'none'; any=any||m;
+    g.querySelectorAll('.adv-row').forEach(r=>{
+      const hit=r.dataset.hay.includes(q); r.style.display=hit?'':'none'; any=any||hit;
     });
-    g.style.display=any?'':'none';
+    g.style.display=any?'':'none'; if(q) g.open=true;
   });
 });
 $('#advrun').addEventListener('click',async()=>{
   const sch=ADV.schema, def=ADV.defaults, cfg={};
   for(const name of Object.keys(sch)){
     const el=$('#adv_'+name); if(!el) continue;
-    const meta=sch[name], d=def[name];
-    if(el.type==='checkbox'){ cfg[name]=el.checked; continue; }
+    const m=sch[name], d=def[name];
+    if(m.widget==='bool'){ cfg[name]=el.checked; continue; }
+    if(m.widget==='select'){ cfg[name]=el.value; continue; }
     let v=el.value.trim(); if(v==='') { cfg[name]=d; continue; }
-    if(Array.isArray(d)){ cfg[name]=v.split(',').map(s=>s.trim()).filter(Boolean); }
-    else if(typeof d==='number'){ const n=Number(v); cfg[name]=Number.isNaN(n)?d:n; }
+    if(m.widget==='int'||m.widget==='float'){ const n=Number(v); cfg[name]=Number.isNaN(n)?d:n; }
+    else if(Array.isArray(d)){ cfg[name]=v.split(',').map(s=>s.trim()).filter(Boolean); }
     else { cfg[name]=v; }
   }
   $('#advrun').disabled=true;
