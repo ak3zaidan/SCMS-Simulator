@@ -447,6 +447,7 @@ AGENT = agent.AgentSession()   # AI copilot session (single local user)
 # POST /api/agent request is still running — ThreadingHTTPServer serves them on separate threads).
 _AGENT_PROG_LOCK = threading.Lock()
 AGENT_PROGRESS = {"running": False, "steps": [], "current": None, "turn": 0}
+_AGENT_CANCEL = threading.Event()          # set by /api/agent/cancel; polled during a turn
 
 
 def _agent_event(kind: str, data: dict):
@@ -464,11 +465,13 @@ def agent_turn(body: dict) -> dict:
     if not msg:
         return {"error": "empty message"}
     with _AGENT_LOCK:                                   # serialise turns (shared session + sim)
+        _AGENT_CANCEL.clear()
         with _AGENT_PROG_LOCK:
             AGENT_PROGRESS.update(running=True, steps=[], current=None,
                                   turn=AGENT_PROGRESS["turn"] + 1)
         try:
-            out = agent.run_agent(AGENT, msg, on_event=_agent_event)
+            out = agent.run_agent(AGENT, msg, on_event=_agent_event,
+                                  should_cancel=_AGENT_CANCEL.is_set)
         finally:
             with _AGENT_PROG_LOCK:
                 AGENT_PROGRESS["running"] = False
@@ -898,6 +901,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, stop_run())
         if self.path == "/api/agent":
             return self._send(200, agent_turn(body))
+        if self.path == "/api/agent/cancel":          # stop the in-flight turn (no lock: turn holds it)
+            _AGENT_CANCEL.set()
+            return self._send(200, {"ok": True, "cancelling": True})
         if self.path == "/api/agent/reset":
             global AGENT
             AGENT = agent.AgentSession()

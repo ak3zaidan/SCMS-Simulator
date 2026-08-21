@@ -174,6 +174,29 @@ def test_on_event_fires_around_each_tool(tmp_path, monkeypatch):
     assert out["reply"] == "done" and not out.get("error")
 
 
+def test_cancel_stops_the_loop_before_tools_run(monkeypatch):
+    """If should_cancel() is already true, the turn stops immediately (no LLM/tool calls)."""
+    chat_calls = {"n": 0}
+    def fake_chat(*a, **k):
+        chat_calls["n"] += 1
+        return _msg(tool_calls=[_call("c1", "run_and_analyze", {})])
+    monkeypatch.setattr(agent, "_CHAT_FN", fake_chat)
+    s = agent.AgentSession()
+    out = agent.run_agent(s, "go", key="test", should_cancel=lambda: True)
+    assert out.get("cancelled") and out["reply"] == agent._CANCELLED_REPLY
+    assert chat_calls["n"] == 0 and out["steps"] == []
+    assert s._cancel is None                      # cleared after the turn
+
+
+def test_sweep_honours_cancel_between_runs(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "AGENT_OUT", tmp_path / "agent_run")
+    s = agent.AgentSession()
+    _small_grid(s)
+    s._cancel = lambda: True                       # cancel before the first run
+    r = agent._sweep(s, "attacker_pct", [0.1, 0.25, 0.4], "recall")
+    assert r.get("cancelled") and r["runs"] == [] and r["best"] is None
+
+
 # ---------------- LIVE OpenAI end-to-end (skipped without a key) ----------------
 @pytest.mark.skipif(not agent.openai_key(), reason="no OPENAI_API_KEY in .env/env")
 def test_live_agent_configures_runs_and_reports(tmp_path, monkeypatch):

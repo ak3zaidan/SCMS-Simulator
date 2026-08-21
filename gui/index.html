@@ -157,6 +157,7 @@
   .msg.bot{align-self:flex-start;background:var(--panel2);border:1px solid var(--edge);
         border-bottom-left-radius:4px}
   .msg.err{align-self:stretch;background:#3a1d1f;border:1px solid #5a2a2d;color:#ffb0b0}
+  .msg.cancelled{font-style:italic;color:var(--muted)}
   .steps{align-self:stretch;display:flex;flex-direction:column;gap:6px}
   .step{background:var(--bg);border:1px solid var(--edge);border-left:3px solid var(--accent);
         border-radius:7px;padding:7px 10px;font-size:11.5px}
@@ -258,6 +259,7 @@
         <div class="chatIn">
           <textarea id="chatInput" rows="2" placeholder="e.g. Ring road with 12 intersections, 25% attackers, 60s — run it and show precision and recall"></textarea>
           <button id="chatSend" class="primary">Send</button>
+          <button id="chatStop" class="danger" style="display:none">■ Stop</button>
         </div>
         <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
           <button id="chatReset" style="font-size:11px;padding:5px 10px">↺ New conversation</button>
@@ -837,6 +839,7 @@ async function initCopilot(){
     sg.appendChild(c);
   });
   $('#chatSend').addEventListener('click',sendChat);
+  $('#chatStop').addEventListener('click',cancelChat);
   $('#chatReset').addEventListener('click',resetChat);
   $('#chatInput').addEventListener('keydown',e=>{
     if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){ e.preventDefault(); sendChat(); }
@@ -964,10 +967,20 @@ async function pollAgentProgress(liveEl){
     if(p.running) drawLiveOnce();     // the sim writes live_state during the run → animate the map
   }catch(e){}
 }
+async function cancelChat(){
+  if(!chatBusy) return;
+  $('#chatStop').disabled=true; $('#chatStop').textContent='■ Stopping…';
+  try{ await fetch('/api/agent/cancel',{method:'POST'}); }catch(e){}
+}
+function chatBusyUI(on){
+  chatBusy=on;
+  $('#chatSend').disabled=$('#chatInput').disabled=on;
+  const st=$('#chatStop'); st.style.display=on?'':'none'; st.disabled=false; st.textContent='■ Stop';
+}
 async function sendChat(){
   if(chatBusy||!COPILOT_ON) return;
   const ta=$('#chatInput'), text=ta.value.trim(); if(!text) return;
-  chatBusy=true; ta.value=''; $('#chatSend').disabled=$('#chatInput').disabled=true;
+  chatBusyUI(true); ta.value='';
   chatEl('msg user',escH(text));
   const think=chatEl('msg bot','<span class="typing"><span></span><span></span><span></span></span>');
   const liveEl=chatEl('steps');      // live step list, updated by the progress poller
@@ -982,11 +995,11 @@ async function sendChat(){
     if(out.steps&&out.steps.length) renderSteps(liveEl,out.steps,null);   // authoritative final list
     else liveEl.remove();
     if(out.results) addMetrics(out.results);
-    if(out.reply) chatEl('msg bot',escH(out.reply));
+    if(out.reply) chatEl(out.cancelled?'msg bot cancelled':'msg bot',escH(out.reply));
     poll();            // agent runs update RUN → refresh stats panel + map
     drawLiveOnce();
   }
-  chatBusy=false; $('#chatSend').disabled=$('#chatInput').disabled=false; ta.focus();
+  chatBusyUI(false); ta.focus();
 }
 async function resetChat(){
   if(chatBusy) return;

@@ -210,6 +210,13 @@ class AgentSession:
         self.history: list = []         # OpenAI message list (excluding system)
         self.last_results: dict | None = None
         self.last_out_dir: str | None = None
+        self._cancel = None             # callable() -> bool, set for the duration of a turn
+
+    def cancelled(self) -> bool:
+        try:
+            return bool(self._cancel and self._cancel())
+        except Exception:
+            return False
 
     def effective_config(self) -> dict:
         d = {k: (list(v) if isinstance(v, tuple) else v)
@@ -318,6 +325,9 @@ def _sweep(session: AgentSession, field: str, values: list, metric: str = "recal
     cap = min(float(base.get("duration_s", AGENT_MAX_DURATION) or AGENT_MAX_DURATION), 90.0)
     runs, best, best_dir = [], None, None
     for i, v in enumerate(values):
+        if session.cancelled():
+            return {"field": field, "metric": metric, "runs": runs, "best": None,
+                    "cancelled": True}
         out = str(AGENT_OUT.parent / f"agent_sweep_{i}")
         try:
             a = _run_config({**base, field: v}, out, max_duration=cap)
@@ -354,6 +364,8 @@ def _compare(session: AgentSession, variants: list) -> dict:
     cap = min(float(base.get("duration_s", AGENT_MAX_DURATION) or AGENT_MAX_DURATION), 90.0)
     rows = []
     for i, var in enumerate(variants):
+        if session.cancelled():
+            return {"variants": rows, "cancelled": True}
         if not isinstance(var, dict):
             return {"error": "each variant must be an object with overrides"}
         ov = var.get("overrides") if isinstance(var.get("overrides"), dict) else \
@@ -419,12 +431,17 @@ def _exec_tool(session: AgentSession, name: str, args: dict) -> dict:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+_CANCELLED_REPLY = "(stopped at your request)"
+
+
 def run_agent(session: AgentSession, user_msg: str, max_steps: int = 10,
-              model: str | None = None, key: str | None = None, on_event=None) -> dict:
+              model: str | None = None, key: str | None = None, on_event=None,
+              should_cancel=None) -> dict:
     """Run one user turn through the tool-calling loop. Returns {reply, steps, config, results, error}.
 
     on_event(kind, data) is an optional progress callback (for live UI): kind is
-    "tool_start" ({tool, args}) or "tool_end" (the finished step dict)."""
+    "tool_start" ({tool, args}) or "tool_end" (the finished step dict).
+    should_cancel() -> bool is polled between steps (and inside sweep/compare) to stop early."""
     def emit(kind, data):
         if on_event:
             try:
@@ -436,11 +453,15 @@ def run_agent(session: AgentSession, user_msg: str, max_steps: int = 10,
     model = model or openai_model()
     if not key:
         return {"error": "No OPENAI_API_KEY found in .env", "reply": "", "steps": [], "config": session.config}
+    session._cancel = should_cancel
     session.history.append({"role": "user", "content": user_msg})
     messages = [{"role": "system", "content": system_prompt()}] + session.history
     steps = []
     try:
         for _ in range(max_steps):
+            if session.cancelled():
+                return {"reply": _CANCELLED_REPLY, "steps": steps, "config": session.config,
+                        "results": session.last_results, "cancelled": True}
             msg = _CHAT_FN(messages, tool_specs(), model, key)
             # normalise to a plain dict we can append back
             asst = {"role": "assistant", "content": msg.get("content")}
@@ -476,3 +497,5 @@ def run_agent(session: AgentSession, user_msg: str, max_steps: int = 10,
                 "reply": ""}
     except Exception as e:                                  # noqa: BLE001 - surface to the UI
         return {"error": f"{type(e).__name__}: {e}", "steps": steps, "config": session.config, "reply": ""}
+    finally:
+        session._cancel = None
