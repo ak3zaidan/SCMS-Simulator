@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sys
 import urllib.request
 from pathlib import Path
@@ -33,6 +34,37 @@ AGENT_MAX_DURATION = 150.0     # cap traffic-flow seconds per agent run (keep tu
 AGENT_MAX_STEPS = 200          # cap fixed-fleet steps per agent run
 DEFAULT_MODEL = "gpt-4o-mini"
 _OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+
+# Scenario library: designed worlds/timelines saved as JSON so they can be reloaded by name.
+SCENARIO_DIR = REPO / "saved_scenarios"
+_SCENARIO_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,40}$")
+
+
+def _scenario_path(name: str) -> Path:
+    """File path for a saved scenario. Raises ValueError unless the name matches the strict
+    allow-list (path-traversal guard) — paths are built ONLY from validated names."""
+    if not isinstance(name, str) or not _SCENARIO_NAME_RE.match(name):
+        raise ValueError(f"invalid scenario name {name!r}: use 1-40 characters from "
+                         f"letters, digits, '_' and '-'")
+    return SCENARIO_DIR / f"{name}.json"
+
+
+def scenario_library() -> list:
+    """All saved scenarios as [{name, description, n_fields}], sorted by name (GUI + copilot)."""
+    items = []
+    if SCENARIO_DIR.is_dir():
+        for p in SCENARIO_DIR.glob("*.json"):
+            if not _SCENARIO_NAME_RE.match(p.stem):
+                continue                                 # ignore files we would refuse to load
+            try:
+                doc = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue                                 # unreadable file: skip, never crash the list
+            cfg = doc.get("saved_config")
+            items.append({"name": p.stem, "description": str(doc.get("description") or ""),
+                          "n_fields": len(cfg) if isinstance(cfg, dict) else 0})
+    items.sort(key=lambda d: d["name"])
+    return items
 
 
 # --------------------------------------------------------------------------- #
@@ -154,7 +186,10 @@ def system_prompt() -> str:
         "waves ({t,until} -- attackers only falsify inside wave windows: coordinated campaigns), and "
         "attack zones ({t,x,y,radius,[until]} -- geofenced campaigns: attackers only falsify while "
         "physically inside an active zone, e.g. 'spoofing near the stadium'). "
-        "Combine map + timeline for realistic story scenarios.\n\n"
+        "Combine map + timeline for realistic story scenarios. SCENARIO LIBRARY: after a "
+        "successful designed run, offer save_scenario(name, description) so the world/timeline can "
+        "be reloaded later, and when the user names a saved scenario, check list_scenarios and use "
+        "load_scenario to restore it.\n\n"
         "EXPERIMENTS: when the user asks to vary/sweep/try ONE field across specific values, or asks how "
         "a metric changes with a field, you MUST use the sweep tool in a SINGLE call (never emulate it "
         "with repeated set_config+run_and_analyze) — it varies the field, runs each, and returns the "
@@ -278,6 +313,28 @@ def tool_specs() -> list:
                            '{"t":100,"until":200,"type":"attack_wave"}]',
                            "items": {"type": "object"}}},
                 "required": ["events"]}}},
+        {"type": "function", "function": {
+            "name": "save_scenario",
+            "description": "Save the CURRENT config overrides (map, timeline, everything set so "
+                           "far) to the scenario library under a name so they can be reloaded "
+                           "later. Overwrites an existing scenario with the same name.",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "1-40 chars: letters, digits, '_', '-' "
+                         "(e.g. river-town-fog)"},
+                "description": {"type": "string",
+                                "description": "one-line human-readable summary of the scenario"}},
+                "required": ["name", "description"]}}},
+        {"type": "function", "function": {
+            "name": "load_scenario",
+            "description": "Load a saved scenario by name: validates its saved config and "
+                           "REPLACES the current config with it (then run_and_analyze to execute).",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string"}}, "required": ["name"]}}},
+        {"type": "function", "function": {
+            "name": "list_scenarios",
+            "description": "List every saved scenario in the library (name, description, number "
+                           "of saved config fields), sorted by name.",
+            "parameters": {"type": "object", "properties": {}}}},
     ]
 
 
@@ -625,6 +682,36 @@ def _exec_tool(session: AgentSession, name: str, args: dict) -> dict:
             session.config = {**session.config, "events": doc}
             return {"ok": True, "events": parsed,
                     "note": f"{len(parsed)} event(s) scheduled (validated against the timeline rules)"}
+        if name == "save_scenario":
+            sname = args.get("name")
+            path = _scenario_path(sname)                 # raises on a bad name (traversal guard)
+            SCENARIO_DIR.mkdir(parents=True, exist_ok=True)
+            doc = {"name": sname, "description": str(args.get("description") or ""),
+                   "saved_config": dict(session.config)}
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump(doc, fh, indent=2)
+            return {"ok": True, "name": sname, "n_fields": len(session.config)}
+        if name == "load_scenario":
+            sname = args.get("name")
+            path = _scenario_path(sname)                 # raises on a bad name (traversal guard)
+            if not path.exists():
+                return {"error": f"no saved scenario named {sname!r}; call list_scenarios to see "
+                                 f"the library"}
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            saved = doc.get("saved_config")
+            if not isinstance(saved, dict):
+                return {"error": f"scenario {sname!r} is malformed (saved_config must be an object)"}
+            known = set(_defaults())
+            clean = {k: v for k, v in saved.items() if k in known}
+            for jf in ("events", "custom_network"):      # JSON-typed fields may be stored as objects
+                if jf in clean and not isinstance(clean[jf], str):
+                    clean[jf] = json.dumps(clean[jf], separators=(",", ":"))
+            cfg = config_from_dict({**_defaults(), **clean})   # same validation path as set_config
+            validate_config(cfg)                         # raises -> {error}; session.config untouched
+            session.config = clean                       # REPLACE (not merge): the scenario is the world
+            return {"ok": True, "name": sname, "config": session.config}
+        if name == "list_scenarios":
+            return {"ok": True, "scenarios": scenario_library()}
         return {"error": f"unknown tool {name!r}"}
     except Exception as e:                       # noqa: BLE001 - the tool boundary must never kill a
         return {"error": f"{type(e).__name__}: {e}"}   # turn; the error is the LLM's repair signal

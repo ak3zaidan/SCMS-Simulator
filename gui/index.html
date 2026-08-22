@@ -890,6 +890,7 @@ async function initCopilot(){
     c.addEventListener('click',()=>{ $('#chatInput').value=t; $('#chatInput').focus(); });
     sg.appendChild(c);
   });
+  if(COPILOT_ON) loadScenarioChips();
   $('#chatSend').addEventListener('click',sendChat);
   $('#chatStop').addEventListener('click',cancelChat);
   $('#chatReset').addEventListener('click',resetChat);
@@ -897,6 +898,21 @@ async function initCopilot(){
     if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){ e.preventDefault(); sendChat(); }
   });
   if(COPILOT_ON) restoreChat();
+}
+
+async function loadScenarioChips(){  // saved-scenario library → 📁 chips next to the suggestions
+  let r; try{ r=await (await fetch('/api/scenarios')).json(); }catch(e){ return; }
+  const scen=(r&&r.scenarios)||[];
+  document.querySelectorAll('#suggs .chip-scn').forEach(c=>c.remove());
+  scen.forEach(s=>{
+    const c=document.createElement('button'); c.className='chip-sugg chip-scn';
+    c.textContent='📁 '+s.name;
+    if(s.description) c.title=s.description;
+    c.addEventListener('click',()=>{
+      $('#chatInput').value='Load scenario "'+s.name+'" and run it'; $('#chatInput').focus();
+    });
+    $('#suggs').appendChild(c);
+  });
 }
 
 async function restoreChat(){        // rebuild the transcript after a page reload (server keeps it)
@@ -940,6 +956,10 @@ function stepDesc(st){
   if(st.tool==='set_events'){ const evs=r.events||[];
     return {d:evs.length?('timeline: '+evs.map(e=>`${e.type}@${e.t}s`+(e.until?`–${e.until}s`:''))
       .join(', ')):'timeline cleared'}; }
+  if(st.tool==='save_scenario') return {d:'saved scenario "'+(r.name||a.name)+'" ('+(r.n_fields??'?')+' fields)'};
+  if(st.tool==='load_scenario') return {d:'loaded scenario "'+(r.name||a.name)+'"'};
+  if(st.tool==='list_scenarios') return {d:(r.scenarios||[]).length+' saved scenario(s): '+
+    (r.scenarios||[]).map(x=>x.name).join(', ')};
   if(st.tool==='sweep'){ const b=r.best;
     return {d:`swept ${r.field} (${(r.runs||[]).length} runs)`+
       (b?` · best ${r.metric}=${fmtMetric(r.metric,b[r.metric])} at ${r.field}=${b.value}`:'')}; }
@@ -978,7 +998,9 @@ const TOOL_VERB={set_config:'configuring',apply_preset:'loading preset',run_and_
   sweep:'sweeping parameter',compare:'comparing variants',reset_config:'resetting',
   get_config:'reading config',describe_fields:'looking up fields',
   design_network:'designing the road map',set_events:'scheduling scenario events',
-  get_network:'reading the current map',import_osm:'importing the real city map'};
+  get_network:'reading the current map',import_osm:'importing the real city map',
+  save_scenario:'saving the scenario',load_scenario:'loading the scenario',
+  list_scenarios:'listing saved scenarios'};
 function renderSteps(container,steps,current){    // live-updatable step list (+ optional running row)
   let html=(steps||[]).map(stepCardHtml).join('');
   if(current) html+=`<div class="step running"><div class="t">${escH(current)}</div>`+
@@ -1074,6 +1096,7 @@ async function sendChat(){
     poll();            // agent runs update RUN → refresh stats panel + map
     drawLiveOnce();
   }
+  loadScenarioChips(); // the turn may have saved/removed scenarios → refresh the 📁 chips
   chatBusyUI(false); ta.focus();
 }
 async function resetChat(){
