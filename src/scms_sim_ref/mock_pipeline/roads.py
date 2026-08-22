@@ -21,21 +21,37 @@ from collections import deque
 
 
 class Trip:
-    """A routed journey along a polyline of waypoints at a constant desired speed."""
-    __slots__ = ("wp", "cum", "speed", "t0", "length", "t1")
+    """A routed journey along a polyline of waypoints at a constant desired speed.
 
-    def __init__(self, waypoints: list[tuple[float, float]], speed: float, spawn_time: float):
+    `caps` (optional) holds a per-SEGMENT speed limit (m/s) aligned with the waypoint pairs --
+    None entries mean unlimited. Networks with per-edge speed limits (highway vs residential in a
+    custom map) pass it; the car-following loop then caps the vehicle's target speed per segment."""
+    __slots__ = ("wp", "cum", "speed", "t0", "length", "t1", "caps")
+
+    def __init__(self, waypoints: list[tuple[float, float]], speed: float, spawn_time: float,
+                 caps: list | None = None):
         if len(waypoints) < 2:
             waypoints = [waypoints[0], (waypoints[0][0] + 1.0, waypoints[0][1])]
+            caps = None
         self.wp = waypoints
         self.speed = max(1.0, speed)
         self.t0 = spawn_time
+        self.caps = caps if (caps and any(c is not None for c in caps)) else None
         cum = [0.0]
         for (ax, ay), (bx, by) in zip(waypoints, waypoints[1:]):
             cum.append(cum[-1] + math.hypot(bx - ax, by - ay))
         self.cum = cum
         self.length = cum[-1]
         self.t1 = spawn_time + self.length / self.speed   # arrival (despawn) time
+
+    def cap_at(self, s: float):
+        """Speed limit (m/s) of the segment containing arc-length s, or None (no caps/unlimited)."""
+        if self.caps is None:
+            return None
+        for k in range(1, len(self.cum)):
+            if s <= self.cum[k]:
+                return self.caps[k - 1] if k - 1 < len(self.caps) else None
+        return self.caps[-1] if self.caps else None
 
     def at_distance(self, d: float) -> tuple[float, float, float]:
         """(x, y, heading[deg]) at arc-length d along the route (clamped to the endpoints)."""
@@ -339,16 +355,25 @@ class CustomNetwork:
             raise ValueError(f"custom network too large: {len(edges)} edges (max {self.MAX_EDGES})")
         n = len(self.coords)
         seen: set = set()
+        self.edge_speed: dict[tuple[int, int], float] = {}   # optional per-edge limit (m/s)
         for e in edges:
             try:
                 a, b = int(e[0]), int(e[1])
             except (TypeError, ValueError, IndexError):
-                raise ValueError(f"edge {e!r} must be [a, b] node indices") from None
+                raise ValueError(f"edge {e!r} must be [a, b] node indices "
+                                 f"(optionally [a, b, speed_mps])") from None
             if not (0 <= a < n and 0 <= b < n):
                 raise ValueError(f"edge [{a},{b}] references a missing node (have {n} nodes)")
             if a == b:
                 raise ValueError(f"edge [{a},{b}] is a self-loop")
-            seen.add((min(a, b), max(a, b)))
+            key = (min(a, b), max(a, b))
+            seen.add(key)
+            if isinstance(e, (list, tuple)) and len(e) > 2 and e[2] is not None:
+                sp = float(e[2])
+                if not (1.0 <= sp <= 70.0):
+                    raise ValueError(f"edge [{a},{b}] speed limit {sp} out of range 1-70 m/s "
+                                     f"(33 ~ 120 km/h highway, 8.3 ~ 30 km/h zone)")
+                self.edge_speed[key] = sp
         self.edges: list[tuple[int, int]] = sorted(seen)
         self.nodes = list(range(n))
         self.adj: dict[int, list[tuple[int, float]]] = {i: [] for i in self.nodes}
@@ -547,21 +572,31 @@ class CustomNetwork:
                 if hops.get(cand, -1) >= mh and cand != o:
                     d = cand
                     break
-        wp = [self.coords[i] for i in self._route(o, d)]
-        return Trip(wp, speed, spawn_time)
+        route = self._route(o, d)
+        wp = [self.coords[i] for i in route]
+        caps = None
+        if self.edge_speed:
+            caps = [self.edge_speed.get((min(n1, n2), max(n1, n2)))
+                    for n1, n2 in zip(route, route[1:])]
+        return Trip(wp, speed, spawn_time, caps=caps)
 
     def geometry(self) -> dict:
         return {"nodes": [[x, y] for x, y in self.coords],
-                "edges": [[a, b] for a, b in self.edges]}
+                "edges": [([a, b, self.edge_speed[(a, b)]] if (a, b) in self.edge_speed
+                           else [a, b]) for a, b in self.edges]}
 
     def stats(self) -> dict:
         """Design feedback for the AI/user: size, extent, road length, connectivity facts."""
-        return {"n_nodes": len(self.nodes), "n_edges": len(self.edges),
-                "total_road_m": round(self.total_road_m, 1),
-                "mean_segment_m": round(self.block, 1),
-                "bbox_m": [round(v, 1) for v in self.bbox],
-                "n_dead_ends": sum(1 for i in self.nodes if len(self.adj[i]) == 1),
-                "boundary_nodes": len(self.boundary), "center_node": self.center}
+        out = {"n_nodes": len(self.nodes), "n_edges": len(self.edges),
+               "total_road_m": round(self.total_road_m, 1),
+               "mean_segment_m": round(self.block, 1),
+               "bbox_m": [round(v, 1) for v in self.bbox],
+               "n_dead_ends": sum(1 for i in self.nodes if len(self.adj[i]) == 1),
+               "boundary_nodes": len(self.boundary), "center_node": self.center}
+        if self.edge_speed:
+            out["speed_limited_edges"] = len(self.edge_speed)
+            out["speed_range_mps"] = [min(self.edge_speed.values()), max(self.edge_speed.values())]
+        return out
 
 
 def spider_graph(arms: int, rings: int, block: float) -> tuple[list, list]:

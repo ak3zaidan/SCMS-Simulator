@@ -472,6 +472,8 @@ EVENT_TYPES = {
     "weather": "weather changes at t (sensor noise, radio loss, new drivers' speed): {t, value}",
     "close_edge": "road closed to NEW trips while active (navigation avoidance): {t, edge, [until]}",
     "attack_wave": "attackers only falsify inside attack_wave windows (if any are defined): {t, until}",
+    "attack_zone": "attackers only falsify while INSIDE an active zone (geofenced campaign): "
+                   "{t, x, y, radius, [until]}",
 }
 
 
@@ -521,6 +523,14 @@ def _parse_events(s) -> list[dict]:
         elif et == "attack_wave":
             if until is None:
                 raise ValueError(f"event {k}: attack_wave needs 'until'")
+        elif et == "attack_zone":
+            try:
+                ev["x"], ev["y"] = float(e["x"]), float(e["y"])
+                ev["radius"] = float(e["radius"])
+            except (KeyError, TypeError, ValueError):
+                raise ValueError(f"event {k}: attack_zone needs numeric x, y, radius") from None
+            if ev["radius"] <= 0:
+                raise ValueError(f"event {k}: attack_zone radius must be > 0")
         out.append(ev)
     out.sort(key=lambda e: (e["t"], e["type"]))
     return out
@@ -954,6 +964,19 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         if not _wave_evs:
             return True
         return any(e["t"] <= t < e["until"] for e in _wave_evs)
+
+    _zone_evs = [e for e in events if e["type"] == "attack_zone"]
+
+    def attack_zone_ok(x: float, y: float, t: float) -> bool:
+        # no zones -> attack anywhere; else the attacker's TRUE position must be inside an active
+        # zone (a geofenced spoofing campaign, e.g. "attack the downtown core")
+        if not _zone_evs:
+            return True
+        for e in _zone_evs:
+            if e["t"] <= t and (e["until"] is None or t < e["until"]):
+                if math.hypot(x - e["x"], y - e["y"]) <= e["radius"]:
+                    return True
+        return False
     pseudonym_info: dict[str, dict] = {}   # digest -> {i,j,lv,ghost,veh_vid}
     vehicles: list[Vehicle] = []
     gt_vehicle, gt_idmap = [], []
@@ -987,7 +1010,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             # window is too short the honest cert "expires" mid-trip -> mass false certValidity
             # positives (precision collapse). Budget = 3x free-flow (stop-and-go) + ~half a signal
             # cycle of waiting per intersection on the route + slack.
-            free_flow = trip.length / max(1.0, cfg.trip_speed_min)
+            eff_min = cfg.trip_speed_min
+            if getattr(trip, "caps", None):          # slow zones can undercut trip_speed_min --
+                mc = min((c for c in trip.caps if c is not None), default=None)
+                if mc is not None:                   # -- budget the cert life for the slowest zone
+                    eff_min = min(eff_min, mc)
+            free_flow = trip.length / max(1.0, eff_min)
             light_budget = ((trip.length / max(1.0, cfg.grid_block_m)) * (cfg.light_cycle_s * 0.5)
                             if cfg.traffic_lights else 0.0)
             life = 3.0 * free_flow + light_budget + 30.0
@@ -1507,8 +1535,13 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 td, bend = v.trip.next_turn(v.s_pos)
                 if bend >= cfg.turn_min_angle_deg and td < cfg.idm_lookahead_m and td < best_gap:
                     best_gap, best_v, best_len = td, min(v.desired_speed, cfg.turn_speed_mps), 0.0
-            a = _idm_accel(v.cur_v, v.desired_speed, best_gap, best_v, best_len, v.idm_a, v.idm_b)
-            v.cur_v = max(0.0, min(v.desired_speed, v.cur_v + a * cfg.dt))
+            v0 = v.desired_speed
+            if v.trip.caps is not None:              # per-edge speed limit (highway vs residential)
+                cap = v.trip.cap_at(v.s_pos)
+                if cap is not None and cap < v0:
+                    v0 = cap
+            a = _idm_accel(v.cur_v, v0, best_gap, best_v, best_len, v.idm_a, v.idm_b)
+            v.cur_v = max(0.0, min(v0, v.cur_v + a * cfg.dt))
             v.s_pos += v.cur_v * cfg.dt
             if v.s_pos >= v.trip.length:
                 v.s_pos = v.trip.length
@@ -1567,7 +1600,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             x, y, tspeed, theading = tx.true_state(t)
             mx, my, conf = measure(tx, x, y, t)
             attacking = (tx.is_attacker and tx.attack_from <= t <= tx.attack_to
-                         and attack_wave_active(t))
+                         and attack_wave_active(t) and attack_zone_ok(x, y, t))
             if attacking and cfg.attack_duty_cycle < 1.0:  # intermittent: falsify only in bursts
                 period = max(1e-6, cfg.attack_pulse_period_s)
                 phase = ((t - tx.attack_from) / period + tx.pulse_phase) % 1.0

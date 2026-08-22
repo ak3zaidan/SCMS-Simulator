@@ -188,6 +188,56 @@ def test_weather_front_changes_the_run(tmp_path):
     assert fronted.data_digest == again.data_digest
 
 
+def test_per_edge_speed_limits_slow_traffic(tmp_path):
+    """A corridor whose middle segment is a 30 km/h zone: vehicles measurably slower than on the
+    same corridor unrestricted; caps validated; geometry carries the limit for the GUI."""
+    nodes = [[0, 0], [400, 0], [800, 0], [1200, 0]]
+    fast = [[0, 1], [1, 2], [2, 3]]
+    slow = [[0, 1], [1, 2, 4.0], [2, 3]]                 # 4 m/s zone in the middle
+    net = CustomNetwork(nodes, slow)
+    assert net.edge_speed == {(1, 2): 4.0}
+    assert [1, 2, 4.0] in net.geometry()["edges"]
+    rng = random.Random(1)
+    trip = net.random_trip(rng, 15.0, 0.0)
+    if trip.caps:                                        # cap lookup maps to the right segment
+        s_mid = (trip.cum[1] + trip.cum[2]) / 2.0 if len(trip.cum) > 2 else trip.length / 2
+        assert trip.cap_at(s_mid) in (4.0, None)
+    with pytest.raises(ValueError, match="out of range"):
+        CustomNetwork(nodes, [[0, 1, 500.0]])
+    # end-to-end: mean measured speed drops under the cap regime
+    def mean_speed(edges, name):
+        run_pipeline(PipelineConfig(seed=5, traffic_flow=True, road_network="custom",
+                                    custom_network=json.dumps({"nodes": nodes, "edges": edges}),
+                                    duration_s=60.0, arrival_rate=1.0, attacker_pct=0.0,
+                                    trip_speed_min=12.0, trip_speed_max=16.0,
+                                    out_dir=str(tmp_path / name)))
+        # all vehicles honest (attacker_pct=0) -> claimed_speed tracks the true driven speed
+        ems = [json.loads(ln) for ln in
+               open(tmp_path / name / "ground_truth" / "gt_emissions_sample.jsonl",
+                    encoding="utf-8")]
+        speeds = [e["claimed_speed"] for e in ems if e.get("claimed_speed") is not None]
+        return sum(speeds) / max(1, len(speeds))
+    v_fast = mean_speed(fast, "fast")
+    v_slow = mean_speed(slow, "slow")
+    assert v_slow < v_fast - 1.0, (v_slow, v_fast)       # the 4 m/s zone drags the mean down
+
+
+def test_attack_zone_geofences_falsification(tmp_path):
+    """Attackers falsify only inside the active zone -> a zone covering nothing suppresses nearly
+    all misbehaviour; a zone covering the whole map behaves like an unrestricted run."""
+    base = dict(seed=11, traffic_flow=True, road_network="custom", custom_network=H_JSON,
+                duration_s=50.0, arrival_rate=1.5, attacker_pct=0.3)
+    everywhere = run_pipeline(PipelineConfig(**base, out_dir=str(tmp_path / "z0"),
+        events=json.dumps([{"t": 0, "type": "attack_zone", "x": 400, "y": 300, "radius": 5000}])))
+    nowhere = run_pipeline(PipelineConfig(**base, out_dir=str(tmp_path / "z1"),
+        events=json.dumps([{"t": 0, "type": "attack_zone", "x": 99999, "y": 99999, "radius": 10}])))
+    plain = run_pipeline(PipelineConfig(**base, out_dir=str(tmp_path / "z2")))
+    assert nowhere.n_reports < everywhere.n_reports * 0.6   # geofence suppressed the campaign
+    assert everywhere.n_reports > 0 and plain.n_reports > 0
+    with pytest.raises(ValueError, match="attack_zone"):
+        _parse_events(json.dumps([{"t": 0, "type": "attack_zone", "x": 1, "y": 2}]))
+
+
 def test_closure_event_reroutes_new_trips(tmp_path):
     ev = json.dumps([{"t": 0, "until": 50, "type": "close_edge", "edge": [1, 3]}])
     closed = _run(tmp_path, "c1", road_network="custom", custom_network=H_JSON, events=ev)
