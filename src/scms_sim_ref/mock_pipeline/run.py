@@ -293,6 +293,20 @@ class PipelineConfig:
     turn_slowdown: bool = False
     turn_speed_mps: float = 6.0          # speed cap through a sharp bend (m/s); ~21 km/h
     turn_min_angle_deg: float = 40.0     # only bends sharper than this are slowed
+    # discretionary lane changes (MOBIL-style; audit gap #7). OFF by default -> byte-identical output.
+    # Only meaningful with n_lanes>1 AND traffic_flow (routed car-following): a vehicle held up in its
+    # own lane will move to an adjacent lane when a MOBIL incentive holds and the target lane offers a
+    # safe gap, then its perpendicular offset transitions SMOOTHLY over lane_change_time_s -> a real
+    # lateral velocity + brief heading swing. This is the dominant benign source of the HARDEST
+    # misbehaviour false positives (sudden lateral move + heading deviation that mimics a position/
+    # heading lie), so enabling it adds that benign-difficulty tail. validate_config requires the
+    # n_lanes>1 + traffic_flow combination when it is on; when off, no RNG is drawn and the world is
+    # unchanged. The lateral maneuver is INTENTIONALLY visible to the detectors (benign FP pressure);
+    # the MA's sustained-evidence gate is what keeps a single lane change from causing a revocation.
+    lane_changes: bool = False
+    lane_change_time_s: float = 2.5      # smooth lateral transition duration (s); shapes the transient
+    lane_change_politeness: float = 0.2  # MOBIL politeness: weight on OTHER vehicles' accel change
+    lane_change_threshold: float = 0.2   # MOBIL incentive threshold (m/s^2) to commit to a change
     # time-varying demand (rush hour / night) + origin-destination bias
     demand_profile: str = "uniform"      # "uniform" | "rush" | "night"
     od_model: str = "uniform"            # trip destination law: "uniform" | "gravity" (distance-decay)
@@ -425,7 +439,15 @@ class Vehicle:
     desired_speed: float = 0.0            # free-flow target (car-following cap)
     # car-following kinematic state (integrated each step when cf=True)
     cf: bool = False
-    lane_off: float = 0.0                  # perpendicular lane offset (multi-lane roads)
+    lane_off: float = 0.0                  # perpendicular lane offset (multi-lane roads); the CURRENT
+                                           # (possibly mid-transition) offset used for rendering
+    lane_idx: int = 0                      # committed lane index 0..n_lanes-1 (source for lane changes)
+    lc_active: bool = False                # mid discretionary (MOBIL) lane-change lateral transition
+    lc_t0: float = 0.0                     # transition start time
+    lc_off0: float = 0.0                   # lateral offset at transition start
+    lc_off1: float = 0.0                   # lateral offset target (adjacent lane centre)
+    lc_dur: float = 0.0                    # effective transition duration (speed-adaptive; caps heading swing)
+    lc_cooldown: float = 0.0               # no new lane change before this time (anti-oscillation gate)
     s_pos: float = 0.0                     # arc-length travelled along the route
     cur_v: float = 0.0                     # current speed
     cur_x: float = 0.0
@@ -709,6 +731,15 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"n_lanes must be >= 1 (got {cfg.n_lanes})")
     if cfg.lane_width_m <= 0:
         raise ValueError(f"lane_width_m must be > 0 (got {cfg.lane_width_m})")
+    if cfg.lane_changes:                                  # discretionary lane changes: only meaningful
+        if cfg.n_lanes <= 1:                             # with >1 lane AND routed car-following (flow)
+            raise ValueError("lane_changes needs n_lanes > 1 (multi-lane roads to change between)")
+        if not cfg.traffic_flow:
+            raise ValueError("lane_changes needs traffic_flow=true (routed car-following mobility)")
+        if cfg.lane_change_time_s <= 0:
+            raise ValueError(f"lane_change_time_s must be > 0 (got {cfg.lane_change_time_s})")
+        if cfg.lane_change_politeness < 0:
+            raise ValueError(f"lane_change_politeness must be >= 0 (got {cfg.lane_change_politeness})")
     if cfg.light_cycle_s <= 0:
         raise ValueError(f"light_cycle_s must be > 0 (got {cfg.light_cycle_s})")
     if cfg.grid_block_m <= 0:
@@ -850,6 +881,13 @@ _FIELD_META = {
     "turn_slowdown": dict(h="Slow into sharp grid corners (more realistic, harder to detect)"),
     "turn_speed_mps": dict(h="Speed cap through a sharp bend", lo=1, hi=20, u="m/s"),
     "turn_min_angle_deg": dict(h="Only bends sharper than this are slowed", lo=0, hi=180, u="°"),
+    "lane_changes": dict(h="MOBIL discretionary lane changes (needs n_lanes>1 + flow; realistic benign "
+                           "lateral move + heading swing that mimics a position/heading lie)"),
+    "lane_change_time_s": dict(h="Smooth lane-change lateral transition duration", lo=0.5, hi=6, st=0.5, u="s"),
+    "lane_change_politeness": dict(h="MOBIL politeness: weight on other vehicles' acceleration change",
+                                   lo=0, hi=2, st=0.1),
+    "lane_change_threshold": dict(h="MOBIL incentive threshold to commit to a lane change", lo=0, hi=3,
+                                  st=0.1, u="m/s²"),
     "demand_profile": dict(h="Arrival-demand shape over the run"),
     "od_model": dict(h="Trip destination law: uniform or distance-decay gravity"),
     "od_gravity_scale": dict(h="Gravity hop-decay scale (smaller = shorter trips)", lo=0.1, hi=10, st=0.5),
@@ -1023,6 +1061,10 @@ def config_from_dict(d: dict) -> PipelineConfig:
 # once per step (default None -> zero effect); tests use it to simulate an interrupt deterministically.
 _ABORT = {"flag": False}
 PER_STEP_HOOK = None
+# Telemetry seam (default None -> zero effect, byte-identical): when set to a callable it is invoked
+# with a small dict on each INITIATED discretionary lane change (vid, t, from_off, to_off, is_attacker,
+# is_faulty, peak_heading_dev_deg). Tests use it to assert lane transitions + heading transients occur.
+LANE_CHANGE_HOOK = None
 
 
 def run_pipeline(cfg: PipelineConfig) -> RunResult:
@@ -1188,7 +1230,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         v.veh_type, v.veh_length = vtype, tp["length"]
         v.idm_a, v.idm_b, v.desired_speed = tp["accel"], tp["decel"], speed
         if cfg.n_lanes > 1:
-            v.lane_off = (vr.randrange(cfg.n_lanes) - (cfg.n_lanes - 1) / 2.0) * cfg.lane_width_m
+            _li = vr.randrange(cfg.n_lanes)   # single draw (unchanged): also seeds the lane-change index
+            v.lane_off = (_li - (cfg.n_lanes - 1) / 2.0) * cfg.lane_width_m
+            v.lane_idx = _li
         if cf:
             v.cf = True
             v.cur_v = speed
@@ -1656,6 +1700,17 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     _lights = bool(cfg.traffic_lights and net is not None)
     _turn = bool(cfg.turn_slowdown and net is not None)
     _half_cycle = max(1.0, cfg.light_cycle_s / 2.0)
+    # discretionary (MOBIL) lane changes: opt-in, and (like _turn) a no-op unless the world supports it
+    # (multi-lane + routed car-following). When off, none of the code/RNG below is reached.
+    _lane_changes = bool(cf_active and cfg.n_lanes > 1 and cfg.lane_changes)
+    _lc_time = max(cfg.dt, cfg.lane_change_time_s)        # lateral transition duration (>= one step)
+    _lc_cool = max(cfg.dt, 2.0 * _lc_time)               # anti-oscillation: settle before reconsidering
+    _lc_half = 0.5 * cfg.lane_width_m                     # half-lane window for lane classification
+    _lc_reconsider = min(1.0, 0.25 * cfg.dt)             # ~per-second reconsideration (staggers changes)
+    _LC_BSAFE = 4.0                                       # MOBIL safety: max decel imposed on a cut-in follower
+    _LC_MIN_SPEED = 3.0                                   # discretionary changes need real motion (m/s)
+    _LC_MAXDEV_TAN = math.tan(math.radians(12.0))        # cap the lane-change heading swing to ~12 deg
+    lc_rng: dict = {}                                     # per-vehicle string-keyed streams (ON path only)
     # map-matching (HD-map check): distance from a claimed position to the nearest road; a claim far
     # off-road is implausible. Each network defines dist_to_road for its topology (grid lines / ring
     # chords) -> catches lateral/diagonal position offsets regardless of topology.
@@ -1681,12 +1736,131 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             a = a_max * (1 - (v_cur / max(0.1, v0)) ** 4 - (s_star / gap_b) ** 2)
         return max(-6.0, min(a_max, a))
 
+    def _mobil_decide(v, t, snap, buckets, cx0, cy0, vx, vy, cosh, sinh, vh, vspd, vlen, params):
+        """MOBIL-style discretionary lane change on the START-OF-STEP snapshot (order-independent).
+
+        Change to an adjacent lane iff (a) our own lane is blocked (a leader within lookahead), (b) the
+        target lane's new follower is NOT forced to brake harder than _LC_BSAFE (safety), and (c) the
+        incentive -- our acceleration gain plus a politeness-weighted term for the affected followers --
+        exceeds lane_change_threshold. Deterministic: reads only the frozen snapshot + static params."""
+        if vspd < _LC_MIN_SPEED:              # discretionary changes need real motion, not a dead crawl
+            return                            # (also keeps the heading swing physically plausible)
+        INF = math.inf
+        # lane-classified nearest leader (fwd>0) / follower (fwd<0), each [gap, speed, length, vid]
+        cur_L = [INF, 0.0, cfg.veh_length_m, None]; cur_F = [INF, 0.0, cfg.veh_length_m, None]
+        lft_L = [INF, 0.0, cfg.veh_length_m, None]; lft_F = [INF, 0.0, cfg.veh_length_m, None]
+        rgt_L = [INF, 0.0, cfg.veh_length_m, None]; rgt_F = [INF, 0.0, cfg.veh_length_m, None]
+        for dcx in (-1, 0, 1):
+            for dcy in (-1, 0, 1):
+                for wvid in buckets.get((cx0 + dcx, cy0 + dcy), ()):
+                    if wvid == v.vid:
+                        continue
+                    wx, wy, wh, wv, wl = snap[wvid]
+                    if _ang_diff(wh, vh) > 45.0:                # only same-direction traffic
+                        continue
+                    dx, dy = wx - vx, wy - vy
+                    fwd = dx * cosh + dy * sinh
+                    if abs(fwd) > cfg.idm_lookahead_m:
+                        continue
+                    lat = -dx * sinh + dy * cosh               # +lat = to our LEFT (higher lane index)
+                    if abs(lat) <= _lc_half:
+                        L, F = cur_L, cur_F
+                    elif _lc_half < lat <= 3.0 * _lc_half:
+                        L, F = lft_L, lft_F
+                    elif -3.0 * _lc_half <= lat < -_lc_half:
+                        L, F = rgt_L, rgt_F
+                    else:
+                        continue
+                    if fwd > 0.0:
+                        if fwd < L[0]:
+                            L[0], L[1], L[2], L[3] = fwd, wv, wl, wvid
+                    elif -fwd < F[0]:
+                        F[0], F[1], F[2], F[3] = -fwd, wv, wl, wvid
+        if cur_L[0] >= cfg.idm_lookahead_m:                    # own lane not blocked -> no reason to move
+            return
+        a_max, b_dec, v0 = v.idm_a, v.idm_b, v.desired_speed
+        a_old = _idm_accel(vspd, v0, cur_L[0], cur_L[1], cur_L[2], a_max, b_dec)
+
+        def _incentive(tgt_L, tgt_F):
+            a_new = _idm_accel(vspd, v0, tgt_L[0], tgt_L[1], tgt_L[2], a_max, b_dec)
+            d_new = 0.0
+            if tgt_F[3] is not None:                           # would-be follower in the target lane
+                fdes, fa, fb = params[tgt_F[3]]
+                fspd = snap[tgt_F[3]][3]
+                a_f_after = _idm_accel(fspd, fdes, tgt_F[0], vspd, vlen, fa, fb)
+                if a_f_after < -_LC_BSAFE:                     # safety veto: forces a hard brake
+                    return None
+                gap_before = (tgt_L[0] + tgt_F[0]) if tgt_L[3] is not None else INF
+                a_f_before = _idm_accel(fspd, fdes, gap_before, tgt_L[1], tgt_L[2], fa, fb)
+                d_new = a_f_after - a_f_before
+            d_old = 0.0
+            if cur_F[3] is not None:                           # follower we leave behind benefits
+                odes, oa, ob = params[cur_F[3]]
+                ospd = snap[cur_F[3]][3]
+                a_o_before = _idm_accel(ospd, odes, cur_F[0], vspd, vlen, oa, ob)
+                gap_after = (cur_L[0] + cur_F[0]) if cur_L[3] is not None else INF
+                a_o_after = _idm_accel(ospd, odes, gap_after, cur_L[1], cur_L[2], oa, ob)
+                d_old = a_o_after - a_o_before
+            return (a_new - a_old) + cfg.lane_change_politeness * (d_new + d_old)
+
+        best = None                                            # (incentive, target_lane_index)
+        if v.lane_idx + 1 <= cfg.n_lanes - 1:                  # consider the LEFT adjacent lane
+            inc = _incentive(lft_L, lft_F)
+            if inc is not None and inc > cfg.lane_change_threshold:
+                best = (inc, v.lane_idx + 1)
+        if v.lane_idx - 1 >= 0:                                # consider the RIGHT adjacent lane
+            inc = _incentive(rgt_L, rgt_F)
+            if inc is not None and inc > cfg.lane_change_threshold and (best is None or inc > best[0]):
+                best = (inc, v.lane_idx - 1)
+        if best is None:
+            return
+        new_idx = best[1]
+        new_off = (new_idx - (cfg.n_lanes - 1) / 2.0) * cfg.lane_width_m
+        # speed-adaptive duration: stretch the transition just enough that the peak lateral velocity
+        # (smoothstep peak = 1.5*Delta/T) never swings the heading past ~_LC_MAXDEV_TAN of forward speed
+        # -> a slow vehicle changes lanes GENTLY (a few deg), not a physically-implausible sideways lurch.
+        dur = max(_lc_time, 1.5 * abs(new_off - v.lane_off) / (_LC_MAXDEV_TAN * max(vspd, 0.5)))
+        v.lc_active, v.lc_t0, v.lc_off0, v.lc_off1, v.lc_dur = True, t, v.lane_off, new_off, dur
+        v.lane_idx, v.lc_cooldown = new_idx, t + max(_lc_cool, 2.0 * dur)
+        if LANE_CHANGE_HOOK is not None:                       # telemetry seam (None by default)
+            peak_lat = 1.5 * abs(new_off - v.lc_off0) / dur    # smoothstep peak lateral velocity
+            LANE_CHANGE_HOOK(dict(vid=v.vid, t=round(t, 3), from_off=round(v.lc_off0, 3),
+                                  to_off=round(new_off, 3), is_attacker=v.is_attacker,
+                                  is_faulty=v.is_faulty,
+                                  peak_heading_dev_deg=round(math.degrees(
+                                      math.atan2(peak_lat, max(0.5, vspd))), 3)))
+
+    def _lane_step(v, t, snap, buckets, cx0, cy0, vx, vy, cosh, sinh, vh, vspd, vlen, params):
+        """Maybe start a lane change, then integrate one step of the smooth lateral transition.
+
+        Returns the lateral velocity (m/s) this step so the caller can add the matching brief heading
+        deviation -- the realistic benign transient (a real lane change swings the heading a few deg)."""
+        if (not v.lc_active) and t >= v.lc_cooldown:
+            r = lc_rng.get(v.vid)
+            if r is None:
+                r = lc_rng[v.vid] = random.Random(f"{cfg.seed}:lanechg:{v.vid}")
+            if r.random() < _lc_reconsider:                   # drivers reconsider intermittently
+                _mobil_decide(v, t, snap, buckets, cx0, cy0, vx, vy, cosh, sinh, vh, vspd, vlen, params)
+        if not v.lc_active:
+            return 0.0
+        prev = v.lane_off
+        elapsed = (t - v.lc_t0) + cfg.dt
+        if elapsed >= v.lc_dur:                               # transition complete -> settle in target
+            v.lane_off, v.lc_active = v.lc_off1, False
+        else:
+            p = elapsed / v.lc_dur                            # smoothstep -> zero lateral velocity at ends
+            v.lane_off = v.lc_off0 + (v.lc_off1 - v.lc_off0) * (p * p * (3.0 - 2.0 * p))
+        return (v.lane_off - prev) / cfg.dt
+
     def car_follow(active_list, t):
         # snapshot start-of-step positions so the update is order-independent (deterministic)
         snap = {v.vid: (v.cur_x, v.cur_y, v.cur_h, v.cur_v, v.veh_length) for v in active_list}
         buckets: dict = {}
         for v in active_list:
             buckets.setdefault((int(v.cur_x // _CF_CELL), int(v.cur_y // _CF_CELL)), []).append(v.vid)
+        # static per-vehicle kinematics needed to score a neighbour's IDM accel in a MOBIL decision
+        # (positions/speeds always come from `snap`; these don't change within a step). ON path only.
+        params = {w.vid: (w.desired_speed, w.idm_a, w.idm_b) for w in active_list} if _lane_changes else None
         for v in active_list:
             vx, vy, vh, _vv, _vl = snap[v.vid]
             hr = math.radians(vh)
@@ -1732,10 +1906,15 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 v.s_pos = v.trip.length
                 v.finish_time = t          # route complete -> despawn next step
             v.cur_x, v.cur_y, v.cur_h = v.trip.at_distance(v.s_pos)
+            lat_rate = 0.0
+            if _lane_changes:              # maybe start / advance a smooth discretionary lane change
+                lat_rate = _lane_step(v, t, snap, buckets, cx0, cy0, vx, vy, cosh, sinh, vh, _vv, _vl, params)
             if v.lane_off:                 # offset into this vehicle's lane (perpendicular to heading)
                 hr = math.radians(v.cur_h)
                 v.cur_x += v.lane_off * -math.sin(hr)
                 v.cur_y += v.lane_off * math.cos(hr)
+            if lat_rate:                   # a lane change in progress -> lateral velocity swings heading
+                v.cur_h = (v.cur_h + math.degrees(math.atan2(lat_rate, max(0.5, v.cur_v)))) % 360.0
 
     # ---- Simulation loop: activate -> car-follow -> pre-pass -> detect -> collude -> revoke ----
     spawn_order = sorted(vehicles, key=lambda v: (v.spawn_time, v.vid))
@@ -1769,6 +1948,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         for vid in [vid for vid, v in active.items() if v.finish_time is not None and t > v.finish_time]:
             active.pop(vid).hist.clear()
             vrng.pop(vid, None)              # a despawned vehicle never transmits again -> free its RNG
+            lc_rng.pop(vid, None)            # (empty/no-op unless lane_changes is on -> digest-safe)
         active_list = [active[vid] for vid in sorted(active)]
         if cf_active:
             car_follow(active_list, t)
@@ -2287,6 +2467,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="remove this fraction of grid roads for an irregular/incomplete grid (0..1)")
     p.add_argument("--lanes", type=int, default=1, help="parallel lanes per road (overtaking; reduces gridlock)")
     p.add_argument("--lane-width", type=float, default=3.5, help="lane width (m) for multi-lane offsets")
+    p.add_argument("--lane-changes", action="store_true",
+                   help="MOBIL discretionary lane changes (needs --lanes>1 + --flow; realistic benign "
+                        "lateral move + heading swing)")
+    p.add_argument("--lane-change-time", type=float, default=2.5,
+                   help="smooth lane-change lateral transition duration (s)")
+    p.add_argument("--lane-change-politeness", type=float, default=0.2,
+                   help="MOBIL politeness factor (weight on other vehicles' accel change)")
+    p.add_argument("--lane-change-threshold", type=float, default=0.2,
+                   help="MOBIL incentive threshold (m/s^2) to commit to a lane change")
     p.add_argument("--light-cycle", type=float, default=24.0, help="traffic-light full cycle (s); half green per axis")
     p.add_argument("--arterial-every", type=int, default=0,
                    help="grid: every Nth row & column is a faster arterial road (0=off)")
@@ -2408,6 +2597,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                          rsu_coords=args.rsu_coords,
                          car_following=not args.no_car_following,
                          turn_slowdown=args.turn_slowdown, turn_speed_mps=args.turn_speed,
+                         lane_changes=args.lane_changes, lane_change_time_s=args.lane_change_time,
+                         lane_change_politeness=args.lane_change_politeness,
+                         lane_change_threshold=args.lane_change_threshold,
                          fleet=args.fleet, fleet_mix=args.fleet_mix,
                          trip_speed_min=args.trip_speed_min, trip_speed_max=args.trip_speed_max,
                          idm_accel=args.idm_accel, idm_decel=args.idm_decel,
