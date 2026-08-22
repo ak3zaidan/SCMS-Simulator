@@ -48,6 +48,7 @@ REASON_VOCAB = [
     "signatureVerification",
     "certValidity",
     "mapOffRoad",
+    "vruImpersonation",
 ]
 
 # Detectors whose per-report normalized score is carried as a multi-detector FUSION fingerprint
@@ -56,7 +57,7 @@ DETECTORS = [
     "acceptanceRangeThreshold", "positionJump", "positionSpeedInconsistency",
     "headingInconsistency", "implausibleAcceleration", "staleOrReplay",
     "beaconFrequency", "sybilCoLocation", "constantPositionFrozen", "kalmanConsistency",
-    "signatureVerification", "certValidity", "mapOffRoad",
+    "signatureVerification", "certValidity", "mapOffRoad", "vruImpersonation",
 ]
 
 
@@ -71,7 +72,7 @@ for _fam, _bases in {
     "heading": ["ReversedHeading", "RandomHeading", "PerpendicularHeading", "HeadingOffset"],
     "combined": ["Disruptive", "PosSpeedInconsistent", "PosHeadingInconsistent", "EventualStop"],
     "timing": ["DataReplay", "DelayedMessages", "OutOfOrder", "DoS", "DoSRandom"],
-    "identity": ["Sybil"],
+    "identity": ["Sybil", "VruImpersonation"],
     "stealth": ["AlongRoadOffset", "SlowDrift", "LaggingPosition"],
     "credential": ["InvalidSignature", "ExpiredCert", "NotYetValid"],
 }.items():
@@ -550,6 +551,7 @@ _DETECTOR_DOCS = {
     "certValidity": "certificate presented outside its validity window",
     "mapOffRoad": "claimed position far from any road (HD-map plausibility check)",
     "kalmanConsistency": "constant-velocity tracker residual (soft fusion feature, never a hard reason)",
+    "vruImpersonation": "beacon self-declares VRU yet moves at vehicle speed (VRU-impersonation spoof)",
 }
 _FEATURE_DOCS = {
     "pos_confidence": "reported 95% GNSS position-uncertainty radius (m)",

@@ -67,9 +67,25 @@ ATTACK_CATALOG = (
 COMBINED_ATTACKS = (
     "Disruptive", "PosSpeedInconsistent", "PosHeadingInconsistent", "EventualStop",
 )
-# Every attack type the engine can RENDER (default catalog + opt-in combined). Used to validate the
-# opt-in selectors (attack_mix / attack_type) without widening the default selection.
-KNOWN_ATTACK_TYPES = ATTACK_CATALOG + COMBINED_ATTACKS
+# The "identity-spoofing" family (VRU-impersonation gap): a moving VEHICLE fraudulently self-declares
+# station_type="vru" on its beacon so a receiver grants it the VRU detector exemptions (off-road +
+# vehicle-kinematic checks) -- while it otherwise drives like a vehicle. It is caught by the
+# vruImpersonation detector (declared VRU + vehicle-grade speed). Like COMBINED_ATTACKS it is OPT-IN
+# ONLY -- excluded from ATTACK_CATALOG (the default round-robin) so the default data_digest is
+# byte-identical -- and produced only when explicitly requested via attack_types / attack_mix /
+# attack_type. featurize._ATTACK_FAMILY folds it into the "identity" family (alongside Sybil).
+IDENTITY_SPOOF_ATTACKS = (
+    "VruImpersonation",
+)
+# Every attack type the engine can RENDER (default catalog + opt-in combined + opt-in identity-spoof).
+# Used to validate the opt-in selectors (attack_mix / attack_type) without widening the default set.
+KNOWN_ATTACK_TYPES = ATTACK_CATALOG + COMBINED_ATTACKS + IDENTITY_SPOOF_ATTACKS
+
+# A self-declared VRU (pedestrian/cyclist) travelling faster than this is not plausibly a VRU -- a fast
+# cyclist / e-bike tops out ~8-10 m/s -- so a beacon that DECLARES vru while moving above it is a
+# vehicle impersonating a VRU. Used by the vruImpersonation detector; genuine VRUs (~vru_speed_mps,
+# a few m/s) stay far below it.
+VRU_MAX_PLAUSIBLE_SPEED_MPS = 10.0
 WEATHER_MULT = {"clear": 1.0, "rain": 1.5, "fog": 2.0, "snow": 2.5}        # GNSS error multiplier
 WEATHER_RADIO_LOSS = {"clear": 0.0, "rain": 0.03, "fog": 0.02, "snow": 0.06}
 WEATHER_SPEED_MULT = {"clear": 1.0, "rain": 0.85, "fog": 0.75, "snow": 0.6}  # drivers slow in bad weather
@@ -932,7 +948,7 @@ _ENUM_OPTIONS = {
     "od_model": ["uniform", "gravity"],
     "fleet": ["mixed", *VEHICLE_TYPES],
     "rsu_placement": ["spread", "perimeter", "center", "corners", "all"],
-    "attack_type": ["", *ATTACK_CATALOG, *COMBINED_ATTACKS],   # "" = unset (use attack_types)
+    "attack_type": ["", *ATTACK_CATALOG, *COMBINED_ATTACKS, *IDENTITY_SPOOF_ATTACKS],  # "" = unset
 }
 
 # Per-field documentation + ranges/units so every knob is self-describing in UIs and tooling.
@@ -1191,6 +1207,13 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         catalog = cfg.attack_types or (cfg.attack_type or "ConstPos",)
     fleet_weights = _parse_fleet_mix(cfg.fleet_mix)   # None -> default mixed weights (byte-identical)
     attack_weights = _parse_attack_mix(cfg.attack_mix)  # None -> round-robin catalog (byte-identical)
+    # A run carries the MA-visible self-declared station_type (and the vruImpersonation detector) when
+    # EITHER genuine VRUs are present (vru_pct>0) OR the opt-in VRU-impersonation attack is selected via
+    # any of the attack selectors. When NEITHER holds no beacon ever declares "vru", so gating the
+    # station_type field + the extra detector key on this flag keeps the DEFAULT path byte-identical.
+    _impersonation_enabled = ("VruImpersonation" in catalog
+                              or (attack_weights is not None and "VruImpersonation" in attack_weights))
+    _emit_station_type = cfg.vru_pct > 0 or _impersonation_enabled
     total_time = cfg.n_steps * cfg.dt
     net = None
     if cfg.road_network == "grid":
@@ -1574,6 +1597,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     last_claimed: dict[tuple[int, str], dict] = {}
     cert_first_seen: dict[str, float] = {}
     cert_last_seen: dict[str, float] = {}
+    # Cert digests the MA ever OBSERVED declaring station_type="vru" on a beacon (MA-visible; genuine
+    # VRUs always, a VruImpersonation attacker while attacking). Drives the cert_status station type so
+    # it reflects the OBSERVED declaration, never the oracle is_vru. Empty on the default path.
+    vru_declared_digests: set[str] = set()
     counters = {"report": 0, "case": 0, "crl": 0}
     # Per-colluder RNG for FABRICATED false-report evidence: keyed by seed+vid (deterministic), one
     # stream per colluder so draws accumulate across the run -> the fabricated detector score / pos
@@ -1697,6 +1724,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     v.frozen = (mx, my)
                 cx, cy = v.frozen
                 cs = 0.8 + 2.0 * k                           # residual > 0.5 so the frozen detector stays live
+        # NOTE: "VruImpersonation" deliberately has NO branch here -- it drives HONESTLY (position/speed/
+        # heading are the true values) and falsifies only its self-declared station_type (set to "vru" in
+        # the broadcast pre-pass) to steal the VRU detector exemptions. It is caught by vruImpersonation.
         return cx, cy, cs, ch
 
     Z = 3.0                     # residual must exceed ~3x the broadcast uncertainty to count
@@ -1727,6 +1757,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 "staleOrReplay", "constantPositionFrozen", "implausibleAcceleration",
                 "sybilCoLocation", "acceptanceRangeThreshold", "beaconFrequency",
                 "signatureVerification", "certValidity", "mapOffRoad")
+    # vruImpersonation is added ONLY when station types are in play (VRUs or the opt-in impersonation
+    # attack). Otherwise no beacon declares "vru", the detector is always 0.0, and appending its
+    # detnorm_* to every report would perturb the DEFAULT digest -- so it is gated here to stay
+    # byte-identical, mirroring how the station_type report field is gated on _emit_station_type.
+    if _emit_station_type:
+        DET_KEYS = DET_KEYS + ("vruImpersonation",)
     # SOFT features: carried in the fusion fingerprint (detnorm_*) for ML, but NEVER trigger a report
     # on their own -- a constant-velocity tracker false-positives on curves, so it must stay soft.
     SOFT_KEYS = ("kalmanConsistency",)
@@ -1769,7 +1805,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         row["subject_pos_confidence"] = round(conf, 3)
         row["cert_crl_status"] = "active"
         row["sig_valid"] = bool(sig_valid)
-        if cfg.vru_pct > 0:                              # MA-VISIBLE self-declared station type on the
+        if _emit_station_type:                           # MA-VISIBLE self-declared station type on the
             row["station_type"] = station_type          # subject's beacon; key absent by default (byte-identical)
         for k in (*DET_KEYS, *SOFT_KEYS):
             row[f"detnorm_{k}"] = round(det.get(k, 0.0), 3)
@@ -2237,17 +2273,27 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     cvf = t + 5.0                                 # present a not-yet-valid cert
             else:
                 cx, cy, cs, ch = mx, my, tspeed, theading
+            # MA-VISIBLE self-declared station type carried on the beacon. Genuine VRUs always declare
+            # "vru"; a VruImpersonation attacker is a moving VEHICLE that FRAUDULENTLY declares "vru"
+            # while attacking (so a receiver grants it the VRU detector exemptions), driving otherwise
+            # honestly -- the only field it falsifies. Everyone else declares "vehicle".
+            declared_station = "vru" if tx.is_vru else "vehicle"
+            if attacking and tx.attack_type == "VruImpersonation":
+                declared_station = "vru"
             tx.hist.append((cx, cy, cs, ch))
             cert_bad = (t > cvt + 1.0) or (t < cvf - 1.0)
             falsified = attacking and (math.hypot(cx - mx, cy - my) > 1.0 or abs(cs - tspeed) > 1.0
                                        or _ang_diff(ch, theading) > 5.0 or msg_count > 1
-                                       or cg < t - 1e-6 or not sig_ok or cert_bad)
+                                       or cg < t - 1e-6 or not sig_ok or cert_bad
+                                       or (declared_station == "vru" and not tx.is_vru))
             if falsified and tx.onset is None:
                 tx.onset = t
+            if declared_station == "vru":                # remember the MA-observed declaration per cert
+                vru_declared_digests.add(digest)
             broadcasts.append(dict(veh=tx, digest=digest, cx=cx, cy=cy, cs=cs, ch=ch, conf=conf,
                                    ghost=False, x=x, y=y, falsified=falsified, msg_count=msg_count,
                                    cg=cg, sig_ok=sig_ok, cvf=cvf, cvt=cvt,
-                                   station_type=("vru" if tx.is_vru else "vehicle")))
+                                   station_type=declared_station))
             if attacking and tx.attack_type == "Sybil":     # fabricate co-located ghost identities
                 sr = vrng[tx.vid]
                 for gdig in tx.ghosts:
@@ -2431,12 +2477,20 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     # for a VRU-declared beacon. Detectors that are meaningful regardless of station type
                     # stay ON: sybilCoLocation, signatureVerification, certValidity, acceptanceRange-
                     # Threshold (impossible-distance claim), beaconFrequency (flooding/DoS), staleOrReplay.
-                    # NOTE: the gate trusts a self-declared field, so a vehicle SPOOFING station_type=vru
-                    # to dodge these checks is the (deferred) VRU-spoofing attack -- documented, not yet
-                    # generated. A phantom/spoofed VRU would still trip the retained detectors.
                     for _mk in MOTION_KEYS:
                         det[_mk] = 0.0
                     det["mapOffRoad"] = 0.0
+                    # The gate above trusts a SELF-DECLARED field, so a moving VEHICLE that declares
+                    # station_type="vru" (the VruImpersonation attack) would otherwise dodge every
+                    # suppressed detector for free. Close it: a self-declared VRU travelling at VEHICLE
+                    # speed is impersonating a VRU. Fire vruImpersonation on the DECLARED type + the
+                    # CLAIMED speed cs -- a plausible-VRU beacon claims a few m/s, so a claim well above
+                    # the cyclist bound (VRU_MAX_PLAUSIBLE_SPEED_MPS) is a vehicle. cs is the noise-free
+                    # broadcast value (NOT a displacement estimate), so GNSS jitter/outliers on a slow
+                    # genuine VRU never inflate it -> this NEVER fires on real VRUs, while an honest-
+                    # driving impersonator (claiming its true vehicle speed) trips it and is revocable.
+                    if "vruImpersonation" in DET_KEYS:
+                        det["vruImpersonation"] = max(0.0, cs) / VRU_MAX_PLAUSIBLE_SPEED_MPS
                 for k in DET_KEYS:
                     st["streak"][k] = st["streak"].get(k, 0) + 1 if det.get(k, 0.0) >= 1.0 else 0
                 fired = {k: det[k] for k in DET_KEYS if st["streak"].get(k, 0) >= MIN_CONSEC}
@@ -2547,16 +2601,20 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 "CRL entry failed to revoke a pseudonym of its target device"
 
     # ---- Certificate status (MA-visible): a cert is revoked iff its vehicle is ----
-    # When VRUs are present each row also carries the MA-VISIBLE self-declared station_type (vehicle|vru)
-    # the MA observed on the cert's beacons -- the leakage-safe signal a model may learn from, distinct
-    # from the ORACLE is_vru label in gt_vehicle. vru_pct=0 -> plain R.MaCertStatus -> byte-identical.
+    # When station types are in play each row also carries the MA-VISIBLE self-declared station_type
+    # (vehicle|vru) the MA OBSERVED on the cert's beacons -- the leakage-safe signal a model may learn
+    # from, distinct from the ORACLE is_vru label in gt_vehicle. It is derived from the OBSERVED
+    # declaration (vru_declared_digests), never the oracle is_vru: a VruImpersonation attacker (a real
+    # vehicle, is_vru=False) that broadcast station_type="vru" therefore appears as a declared VRU here,
+    # exactly as the MA saw it -- so the MA-visible field never leaks the attacker's true type. Neither
+    # VRUs nor the impersonation attack present -> plain R.MaCertStatus -> byte-identical.
     def _cert_status_row(d, f):
         kw = dict(cert_digest=d, first_seen=f, last_seen=cert_last_seen[d], valid_from=0.0,
                   valid_to=total_time, issuing_pca="PCA-1",
                   crl_status=("revoked" if pseudonym_info[d]["veh_vid"] in revoked_vehicles else "active"),
                   revocation_time=revoked_vehicles.get(pseudonym_info[d]["veh_vid"]))
-        if cfg.vru_pct > 0:
-            st = "vru" if getattr(digest_to_vehicle.get(d), "is_vru", False) else "vehicle"
+        if _emit_station_type:
+            st = "vru" if d in vru_declared_digests else "vehicle"
             return _MaCertStatusVru(station_type=st, **kw)
         return R.MaCertStatus(**kw)
     ma_cert_status = [_cert_status_row(d, f) for d, f in cert_first_seen.items()]
