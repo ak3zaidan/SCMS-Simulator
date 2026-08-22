@@ -307,6 +307,22 @@ class PipelineConfig:
     lane_change_time_s: float = 2.5      # smooth lateral transition duration (s); shapes the transient
     lane_change_politeness: float = 0.2  # MOBIL politeness: weight on OTHER vehicles' accel change
     lane_change_threshold: float = 0.2   # MOBIL incentive threshold (m/s^2) to commit to a change
+    # gap-acceptance / yielding at UNSIGNALIZED intersections (audit gap #7 remainder). OFF by default
+    # -> byte-identical output. At an intersection with no signal governing a vehicle this step, crossing
+    # streams are otherwise mutually invisible (the IDM leader search rejects >45-deg heading differences),
+    # so two cross streams drive THROUGH each other with no yield. When ON, a vehicle approaching an
+    # unsignalized node YIELDS to conflicting cross-traffic that outranks it under a deterministic
+    # first-come rule -- the vehicle currently CLOSEST to the node has priority, ties broken by vehicle id.
+    # A lower-priority vehicle treats the node as a virtual stopped leader (the SAME stop mechanism traffic
+    # lights use) until the higher-priority conflicting vehicle has cleared (once it passes the node it is
+    # no longer a claimant). The rule is computed from the START-OF-STEP snapshot (order-independent) and
+    # priority is a strict total order, so the yield relation is acyclic -> the top vehicle always makes
+    # progress -> no gridlock/starvation. Only meaningful with traffic_flow + a routed network, and it
+    # governs UNsignalized nodes only: with traffic_lights ON every node is signalized, so gap_acceptance
+    # defers entirely to the signal (they coexist, but gap primarily targets the traffic_lights=false
+    # case). Produces realistic slowing at uncontrolled junctions (benign speed transients) that the MA's
+    # sustained-evidence gate absorbs without false revocations. No RNG is drawn on either path.
+    gap_acceptance: bool = False
     # time-varying demand (rush hour / night) + origin-destination bias
     demand_profile: str = "uniform"      # "uniform" | "rush" | "night"
     od_model: str = "uniform"            # trip destination law: "uniform" | "gravity" (distance-decay)
@@ -740,6 +756,14 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
             raise ValueError(f"lane_change_time_s must be > 0 (got {cfg.lane_change_time_s})")
         if cfg.lane_change_politeness < 0:
             raise ValueError(f"lane_change_politeness must be >= 0 (got {cfg.lane_change_politeness})")
+    if cfg.gap_acceptance:                                # yielding at unsignalized intersections:
+        if not cfg.traffic_flow:                          # needs routed car-following on a real network
+            raise ValueError("gap_acceptance needs traffic_flow=true (routed car-following mobility)")
+        if cfg.road_network == "linear":                 # a straight road has no intersection nodes to yield at
+            raise ValueError("gap_acceptance needs a routed network with intersections "
+                             "(grid/ring/spider/custom), not the linear road")
+        # NOTE: gap_acceptance governs UNsignalized nodes only. With traffic_lights on, every node is
+        # signalized, so it defers entirely to the signal -> it is most meaningful with traffic_lights=false.
     if cfg.light_cycle_s <= 0:
         raise ValueError(f"light_cycle_s must be > 0 (got {cfg.light_cycle_s})")
     if cfg.grid_block_m <= 0:
@@ -813,8 +837,8 @@ def _field_group(name: str) -> str:
         ("Attacks", ("attack", "attacker", "sybil", "collude", "victim", "dos", "delay",
                      "crl_aware", "crl_dormant")),
         ("Mobility", ("fleet", "trip_", "idm_", "demand", "arrival", "n_lanes", "lane_", "turn_",
-                      "car_following", "veh_length", "od_", "boundary", "traffic_flow", "duration",
-                      "max_total", "nominal_speed", "state_prune")),
+                      "gap_acceptance", "car_following", "veh_length", "od_", "boundary",
+                      "traffic_flow", "duration", "max_total", "nominal_speed", "state_prune")),
         ("Network", ("road_network", "grid", "custom_network", "traffic_lights", "light_cycle",
                      "arterial", "local_speed")),
         ("Scenario events", ("events",)),
@@ -888,6 +912,10 @@ _FIELD_META = {
                                    lo=0, hi=2, st=0.1),
     "lane_change_threshold": dict(h="MOBIL incentive threshold to commit to a lane change", lo=0, hi=3,
                                   st=0.1, u="m/s²"),
+    "gap_acceptance": dict(h="Yield to conflicting cross-traffic at UNSIGNALIZED intersections "
+                             "(deterministic first-come priority; needs traffic_flow + a routed "
+                             "network; governs unsignalized nodes only; realistic slowing without "
+                             "false revocations)"),
     "demand_profile": dict(h="Arrival-demand shape over the run"),
     "od_model": dict(h="Trip destination law: uniform or distance-decay gravity"),
     "od_gravity_scale": dict(h="Gravity hop-decay scale (smaller = shorter trips)", lo=0.1, hi=10, st=0.5),
@@ -1065,6 +1093,10 @@ PER_STEP_HOOK = None
 # with a small dict on each INITIATED discretionary lane change (vid, t, from_off, to_off, is_attacker,
 # is_faulty, peak_heading_dev_deg). Tests use it to assert lane transitions + heading transients occur.
 LANE_CHANGE_HOOK = None
+# Telemetry seam (default None -> zero effect, byte-identical): when set to a callable it is invoked
+# with a small dict each time a vehicle YIELDS at an unsignalized intersection under gap-acceptance
+# (vid, t, node[x,y], dnode, speed, is_attacker, is_faulty). Tests use it to assert yields occur.
+GAP_YIELD_HOOK = None
 
 
 def run_pipeline(cfg: PipelineConfig) -> RunResult:
@@ -1700,6 +1732,11 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     _lights = bool(cfg.traffic_lights and net is not None)
     _turn = bool(cfg.turn_slowdown and net is not None)
     _half_cycle = max(1.0, cfg.light_cycle_s / 2.0)
+    # gap-acceptance at UNsignalized intersections: opt-in, and (like _turn) a no-op unless the world
+    # supports it (routed car-following). It governs unsignalized nodes only, so with traffic_lights on
+    # (every node signalized) it defers entirely to the signal -> effectively active only when _lights is
+    # off. When off, none of the yield code below is reached and NO rng is drawn -> byte-identical output.
+    _gap = bool(cf_active and cfg.gap_acceptance and not _lights)
     # discretionary (MOBIL) lane changes: opt-in, and (like _turn) a no-op unless the world supports it
     # (multi-lane + routed car-following). When off, none of the code/RNG below is reached.
     _lane_changes = bool(cf_active and cfg.n_lanes > 1 and cfg.lane_changes)
@@ -1861,6 +1898,34 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # static per-vehicle kinematics needed to score a neighbour's IDM accel in a MOBIL decision
         # (positions/speeds always come from `snap`; these don't change within a step). ON path only.
         params = {w.vid: (w.desired_speed, w.idm_a, w.idm_b) for w in active_list} if _lane_changes else None
+        # gap-acceptance: deterministic first-come yielding at UNsignalized intersections, computed from
+        # the start-of-step `snap` so it is order-independent. Group approaching vehicles by the node they
+        # are heading for; at each node the CLOSEST claimant has priority (ties -> lower vid). A vehicle
+        # must yield (treat the node as a virtual stopped leader below) if a CONFLICTING cross-traffic
+        # claimant outranks it. Priority is a strict total order, so the yield relation is acyclic -> the
+        # closest vehicle at every node always makes progress -> no gridlock/starvation. No rng is drawn.
+        gap_stop: dict = {}
+        if _gap:
+            claims: dict = {}
+            for w in active_list:
+                node, dnode = w.trip.next_node(w.s_pos)
+                if node is None or dnode >= cfg.idm_lookahead_m:
+                    continue
+                claims.setdefault((round(node[0], 2), round(node[1], 2)), []).append((dnode, w.vid))
+            for lst in claims.values():
+                if len(lst) < 2:                          # a lone approacher has nobody to yield to
+                    continue
+                lst.sort()                                # (dnode, vid): strict total priority order
+                for i in range(1, len(lst)):              # rank 0 is granted the node; the rest may yield
+                    dnode_i, vid_i = lst[i]
+                    hi = snap[vid_i][2]
+                    for j in range(i):                    # a higher-priority CONFLICTING claimant -> yield
+                        # cross-traffic conflict = heading differs by more than 45 deg (the same traffic
+                        # the IDM leader search skips) but is not near-opposing (>=135 deg: opposing
+                        # through movements pass side by side, they do not cross).
+                        if 45.0 < _ang_diff(hi, snap[lst[j][1]][2]) < 135.0:
+                            gap_stop[vid_i] = dnode_i
+                            break
         for v in active_list:
             vx, vy, vh, _vv, _vl = snap[v.vid]
             hr = math.radians(vh)
@@ -1890,6 +1955,15 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                         stop_gap = max(0.0, dnode - 2.0)  # halt ~2 m before the stop line
                         if stop_gap < best_gap:
                             best_gap, best_v, best_len = stop_gap, 0.0, 0.0
+            elif _gap and v.vid in gap_stop:             # yield to conflicting cross-traffic (unsignalized)
+                dnode = gap_stop[v.vid]                   # reuse the traffic-light stop mechanism: a virtual
+                stop_gap = max(0.0, dnode - 2.0)          # stopped leader ~2 m before the intersection line
+                if stop_gap < best_gap:
+                    best_gap, best_v, best_len = stop_gap, 0.0, 0.0
+                if GAP_YIELD_HOOK is not None:           # telemetry seam (None by default -> digest-safe)
+                    GAP_YIELD_HOOK(dict(vid=v.vid, t=round(t, 3), dnode=round(dnode, 3),
+                                        speed=round(v.cur_v, 3), is_attacker=v.is_attacker,
+                                        is_faulty=v.is_faulty))
             if _turn and best_gap > 0.5:                 # slow into a sharp bend (curve-speed cap)
                 td, bend = v.trip.next_turn(v.s_pos)
                 if bend >= cfg.turn_min_angle_deg and td < cfg.idm_lookahead_m and td < best_gap:
@@ -2515,6 +2589,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--no-car-following", action="store_true", help="disable IDM car-following")
     p.add_argument("--turn-slowdown", action="store_true", help="slow into sharp grid corners (realer, harder)")
     p.add_argument("--traffic-lights", action="store_true", help="signalized intersections (grid)")
+    p.add_argument("--gap-acceptance", action="store_true",
+                   help="yield to conflicting cross-traffic at UNSIGNALIZED intersections (first-come "
+                        "priority; needs --flow + a routed network; realistic slowing at junctions)")
     p.add_argument("--gps-jam-rate", type=float, default=0.0, help="per-step prob a benign vehicle loses GNSS fix")
     p.add_argument("--max-total-vehicles", type=int, default=0, help="flow: cap total spawns (0=unlimited)")
     p.add_argument("--featurize", action="store_true", help="build ML tables after generation")
@@ -2606,7 +2683,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                          idm_time_headway=args.idm_time_headway, idm_min_gap=args.idm_min_gap,
                          idm_lookahead_m=args.idm_lookahead,
                          live_interval_s=args.live_interval,
-                         traffic_lights=args.traffic_lights, gps_jam_rate=args.gps_jam_rate,
+                         traffic_lights=args.traffic_lights, gap_acceptance=args.gap_acceptance,
+                         gps_jam_rate=args.gps_jam_rate,
                          max_total_vehicles=args.max_total_vehicles, verbose=True,
                          out_dir=(args.out or "datasets/poc_run"))
     res = run_pipeline(cfg)
