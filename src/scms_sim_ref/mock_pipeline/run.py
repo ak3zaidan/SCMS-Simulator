@@ -45,9 +45,11 @@ from ..scms_core import crypto_abstract as ca
 from ..scms_core.linkage import CrlLinkageEntry, DeviceLinkageContext, linkage_seed_at
 from ..schemas import records as R
 
-# Attack catalog spanning the 7 families the featurizer knows (position/speed/heading/
-# combined/timing/stealth). Assigned round-robin to attackers; index 0 (ConstPos) is a
-# strong, always-detectable attack so a single-attacker run always closes the loop.
+# DEFAULT attack selection (round-robin over attackers). Spans the position/speed/heading/timing/
+# stealth/identity/credential families; index 0 (ConstPos) is a strong, always-detectable attack so a
+# single-attacker run always closes the loop. This tuple is the FROZEN default: the golden data_digest
+# depends on its exact contents+order, so it MUST NOT change. The "combined" family (below) is
+# deliberately NOT here so the default dataset is byte-identical -- it is opt-in only.
 ATTACK_CATALOG = (
     "ConstPos", "ConstPosOffset", "RandomPos", "Teleport", "SineWavePos",
     "ConstSpeedOffset", "RandomSpeed", "StopAndGo",
@@ -56,6 +58,18 @@ ATTACK_CATALOG = (
     "DoS", "DelayedMessages", "InvalidSignature", "ExpiredCert", "NotYetValid",
     "OutOfOrder", "DoSRandom",
 )
+# The "combined" family (audit gap #9): a single attacker falsifies MULTIPLE fields mutually
+# inconsistently, so it trips several detector families at once. attack_claim() renders these, and
+# featurize._ATTACK_FAMILY maps them to family "combined". They are OPT-IN ONLY -- excluded from
+# ATTACK_CATALOG (the default round-robin) so the default data_digest is byte-identical -- and are
+# produced only when the user explicitly asks for them via attack_types=(...), attack_mix, or a single
+# attack_type.
+COMBINED_ATTACKS = (
+    "Disruptive", "PosSpeedInconsistent", "PosHeadingInconsistent", "EventualStop",
+)
+# Every attack type the engine can RENDER (default catalog + opt-in combined). Used to validate the
+# opt-in selectors (attack_mix / attack_type) without widening the default selection.
+KNOWN_ATTACK_TYPES = ATTACK_CATALOG + COMBINED_ATTACKS
 WEATHER_MULT = {"clear": 1.0, "rain": 1.5, "fog": 2.0, "snow": 2.5}        # GNSS error multiplier
 WEATHER_RADIO_LOSS = {"clear": 0.0, "rain": 0.03, "fog": 0.02, "snow": 0.06}
 WEATHER_SPEED_MULT = {"clear": 1.0, "rain": 0.85, "fog": 0.75, "snow": 0.6}  # drivers slow in bad weather
@@ -91,15 +105,17 @@ def _parse_fleet_mix(s: str) -> dict | None:
 
 
 def _parse_attack_mix(s: str) -> dict | None:
-    """Parse 'ConstPos:0.6,Sybil:0.4' -> {type: weight} in canonical ATTACK_CATALOG order. Empty ->
-    None (default round-robin). Raises on an unknown attack type or non-positive weight."""
+    """Parse 'ConstPos:0.6,Sybil:0.4' -> {type: weight} in canonical KNOWN_ATTACK_TYPES order. Empty ->
+    None (default round-robin). Raises on an unknown attack type or non-positive weight. The opt-in
+    "combined" family is accepted here (KNOWN_ATTACK_TYPES = catalog + combined), so it is reachable via
+    attack_mix without being part of the default selection."""
     if not s or not s.strip():
         return None
     parsed = {}
     for part in s.split(","):
         name, _, w = part.strip().partition(":")
         name = name.strip()
-        if name not in ATTACK_CATALOG:
+        if name not in KNOWN_ATTACK_TYPES:
             raise ValueError(f"attack_mix has unknown type {name!r}")
         wt = float(w)
         if wt <= 0:
@@ -107,7 +123,7 @@ def _parse_attack_mix(s: str) -> dict | None:
         parsed[name] = wt
     if not parsed:
         raise ValueError(f"attack_mix parsed to nothing: {s!r}")
-    return {n: parsed[n] for n in ATTACK_CATALOG if n in parsed}   # canonical order
+    return {n: parsed[n] for n in KNOWN_ATTACK_TYPES if n in parsed}   # canonical order
 
 
 def _weighted_pick(rng, weights: dict) -> str:
@@ -150,7 +166,9 @@ class PipelineConfig:
     n_steps: int = 40
     dt: float = 1.0
     nominal_speed: float = 15.0          # m/s
-    attack_type: str = "ConstPos"        # default single-attacker type (index-0 fallback)
+    attack_type: str = ""                # single-type narrowing selector; "" (sentinel) = unset ->
+                                         # attack_types (the full catalog) is used. Any real value
+                                         # (including "ConstPos") narrows the run to that one type.
     attack_types: tuple[str, ...] = ATTACK_CATALOG
     attack_start: float = 5.0
     attack_end: float = 60.0
@@ -768,7 +786,7 @@ _ENUM_OPTIONS = {
     "od_model": ["uniform", "gravity"],
     "fleet": ["mixed", *VEHICLE_TYPES],
     "rsu_placement": ["spread", "perimeter", "center", "corners", "all"],
-    "attack_type": list(ATTACK_CATALOG),
+    "attack_type": ["", *ATTACK_CATALOG, *COMBINED_ATTACKS],   # "" = unset (use attack_types)
 }
 
 # Per-field documentation + ranges/units so every knob is self-describing in UIs and tooling.
@@ -835,9 +853,9 @@ _FIELD_META = {
     # Attacks
     "attacker_ids": dict(h="Fixed-fleet attacker vehicle ids (used only when attacker_pct = 0)"),
     "attacker_pct": dict(h="Fraction of vehicles that are attackers", lo=0, hi=1, st=0.05),
-    "attack_type": dict(h="Single attack type: a non-default value, with attack_types left at its "
-                          "default (full catalog), makes the whole run use only this type; otherwise "
-                          "it is the index-0 fallback and attack_types wins"),
+    "attack_type": dict(h="Single attack type: any value (incl. an opt-in 'combined' type), with "
+                          "attack_types left at its default (full catalog), narrows the whole run to "
+                          "only this type; blank (default) = unset, so attack_types is used instead"),
     "attack_types": dict(h="Enabled attack types (round-robin), comma-separated"),
     "attack_start": dict(h="Fixed-fleet: attack begins at this time", lo=0, u="s"),
     "attack_end": dict(h="Fixed-fleet: attack ends at this time", lo=0, u="s"),
@@ -983,12 +1001,13 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     la1, la2 = LinkageAuthority(1), LinkageAuthority(2)
     pca, ra = PseudonymCA(), RegistrationAuthority()
 
-    # attack_type is otherwise only an index-0 fallback (attack_types defaults to the full catalog),
-    # so the GUI single-type dropdown would do nothing. Make it effective: when the user picks a
-    # NON-default attack_type AND leaves attack_types at its default (full catalog), narrow the
-    # catalog to just that type. The default attack_type keeps the full-catalog round-robin, so the
-    # default digest is unchanged; attack_types set explicitly still wins.
-    if cfg.attack_type != PipelineConfig.attack_type and cfg.attack_types == PipelineConfig.attack_types:
+    # attack_type is a single-type narrowing selector (F2 fix). It defaults to the sentinel "" (unset),
+    # so ANY explicit value -- including "ConstPos", a real catalog member -- narrows the run to just
+    # that type, as long as attack_types is left at its default (full catalog). A sentinel/unset
+    # attack_type leaves the catalog alone, so the default path (attack_types non-empty) never consults
+    # it and the golden digest is byte-identical. An explicitly-set attack_types still wins over it.
+    # The narrowing target may be an opt-in "combined" type; attack_claim() renders those.
+    if cfg.attack_type and cfg.attack_types == PipelineConfig.attack_types:
         catalog = (cfg.attack_type,)
     else:
         catalog = cfg.attack_types or (cfg.attack_type,)
@@ -1383,6 +1402,41 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             cx, cy = mx + 30.0 * k * math.cos(hr), my + 30.0 * k * math.sin(hr)
         elif typ == "DoSRandom":                             # flood with random content
             cx, cy = mx + r.uniform(-60, 60) * k, my + r.uniform(-60, 60) * k
+        # ---- "combined" family (opt-in): each falsifies MULTIPLE fields mutually inconsistently so it
+        # trips several detector families at once (that is the whole point of the family). ----
+        elif typ == "Disruptive":
+            # lie on ALL THREE fields at once, each inconsistent with the others: erratic position
+            # jumps (position-jump), a speed those jumps cannot justify (position/speed + implausible
+            # accel from the oscillation), and a heading rotated off the travel direction (heading).
+            cx = mx + r.uniform(-55, 55) * k
+            cy = my + r.uniform(-55, 55) * k
+            cs = max(0.0, mspeed + (18.0 if int(t) % 2 == 0 else -12.0) * k)
+            ch = (mheading + 100.0 * k) % 360.0
+        elif typ == "PosSpeedInconsistent":
+            # the claimed POSITION keeps advancing along the real track (so its displacement implies a
+            # normal driving speed) while the claimed SPEED says nearly stopped -- position and speed
+            # flatly contradict. Heading stays honest. The near-zero speed makes the displacement read
+            # as both a position jump AND a position/speed inconsistency to receivers.
+            cs = max(0.0, mspeed - 20.0 * k)
+        elif typ == "PosHeadingInconsistent":
+            # the claimed POSITION swings hard sideways (perpendicular to travel) while the claimed
+            # HEADING keeps pointing straight ahead -- the motion direction and the claimed heading
+            # disagree. Speed stays honest. The sideways swing trips the position detectors; the
+            # heading-vs-bearing gap trips the heading detector.
+            hr = math.radians(mheading + 90.0)               # perpendicular to travel
+            swing = 30.0 * k * math.sin(1.3 * t)
+            cx, cy = mx + swing * math.cos(hr), my + swing * math.sin(hr)
+            ch = mheading                                    # still claim straight-ahead heading
+        elif typ == "EventualStop":
+            # drives honestly, then "parks": after a short delay it freezes its claimed position while
+            # the TRUE vehicle keeps moving, yet keeps claiming a small residual creeping speed. The
+            # frozen position with a still-positive speed trips the constant-position-frozen and
+            # stale/replay detectors -- "stopped here" contradicts "still moving".
+            if (t - v.attack_from) >= 6.0:
+                if v.frozen is None:
+                    v.frozen = (mx, my)
+                cx, cy = v.frozen
+                cs = 0.8 + 2.0 * k                           # residual > 0.5 so the frozen detector stays live
         return cx, cy, cs, ch
 
     Z = 3.0                     # residual must exceed ~3x the broadcast uncertainty to count
