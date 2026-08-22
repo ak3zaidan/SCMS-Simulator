@@ -1932,6 +1932,15 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 cfab = collude_fab_rng.setdefault(tx.vid, random.Random(f"{cfg.seed}:collude_fab:{tx.vid}"))
                 det = {k: 0.0 for k in DET_KEYS}
                 det["positionSpeedInconsistency"] = cfab.uniform(1.05, 4.0)
+                # Every GENUINE in-range report also carries the always-on radio detectors -- a self
+                # sybil count (>=1/_SYBIL_MIN) and a beacon rate (>=1/freq_max) -- plus a small
+                # staleness. Leaving them exactly 0.0 made every fabricated report separable by those
+                # structural zeros (the collusion "oracle" the varied score/conf did NOT remove). Fill
+                # them from the SAME formulas genuine reports use with plausible inputs, kept below
+                # each detector's fire threshold so positionSpeedInconsistency stays the fired reason.
+                det["sybilCoLocation"] = cfab.randint(1, 2) / _SYBIL_MIN
+                det["beaconFrequency"] = cfab.randint(1, 3) / cfg.freq_max
+                det["staleOrReplay"] = cfab.uniform(0.0, 0.15)
                 fab_conf = cfab.uniform(2.0, 9.0)
                 file_report(t, reporter_digest, subject_digest, victim,
                             ["positionSpeedInconsistency"], det, fab_conf, 0.0, 0.0, 0.0, 0.0, malicious=True)

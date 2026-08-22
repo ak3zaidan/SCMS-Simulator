@@ -83,6 +83,19 @@ def test_bug1_colluder_false_reports_are_plausible_not_a_constant_fingerprint(tm
                if lo_s <= r["detector_score"] <= hi_s and lo_c <= r["subject_pos_confidence"] <= hi_c]
     assert len(overlap) > 20, f"fabricated band still separable from genuine (overlap={len(overlap)})"
 
+    # (d) the ALWAYS-ON radio detectors are no longer a structural giveaway. Every genuine in-range
+    # report carries sybilCoLocation>0 (self-count) and beaconFrequency>0 (beacon rate); fabricated
+    # reports that left these exactly 0.0 stayed 100%-separable on the detnorm_* fusion features even
+    # after score/conf were varied (regression-audit finding F1). After the fix they carry plausible
+    # non-zero values overlapping the genuine band.
+    for key in ("detnorm_beaconFrequency", "detnorm_sybilCoLocation"):
+        mvals = [r.get(key, 0.0) for r in mal]
+        gvals = [r.get(key, 0.0) for r in genuine]
+        frac_zero = sum(v == 0.0 for v in mvals) / len(mvals)
+        assert frac_zero < 0.05, f"{key}: {frac_zero:.0%} of fabricated reports are exactly 0.0 (separable)"
+        lo, hi = min(mvals), max(mvals)
+        assert any(lo <= g <= hi for g in gvals), f"{key}: fabricated band shares no genuine reports"
+
     # subject/label integrity preserved: still frames the victim, still labelled malicious.
     assert all(r["reason_codes"] == ["positionSpeedInconsistency"] for r in mal)
 
