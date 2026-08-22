@@ -34,6 +34,33 @@ def _stats(xs: list[float]) -> str:
     return f"mean {a.mean():.2f}, sd {a.std():.2f}, p5/p50/p95 {p[0]:.2f}/{p[1]:.2f}/{p[2]:.2f}"
 
 
+def _num(x) -> str:
+    """Compact numeric rendering for event fields (120.0 -> '120'); tolerant of odd values."""
+    try:
+        return f"{float(x):g}"
+    except (TypeError, ValueError):
+        return str(x)
+
+
+def _event_plain(e: dict) -> str:
+    """One scenario-timeline event -> a plain-language datasheet line."""
+    et = e.get("type")
+    t, until = e.get("t"), e.get("until")
+    span = f"t={_num(t)}s" + (f" until {_num(until)}s" if until is not None else "")
+    if et == "demand":
+        return f"{span}: demand surge — vehicle arrival rate x{_num(e.get('mult'))}"
+    if et == "weather":
+        return f"{span}: weather front — conditions become {e.get('value')}"
+    if et == "close_edge":
+        return f"{span}: road closure — edge {e.get('edge')} shut to new trips (traffic reroutes)"
+    if et == "attack_wave":
+        return f"{span}: attack wave — attackers falsify only during this window"
+    if et == "attack_zone":
+        return (f"{span}: geofenced attack zone — attacks only within {_num(e.get('radius'))} m "
+                f"of ({_num(e.get('x'))}, {_num(e.get('y'))})")
+    return f"{span}: {et}"
+
+
 def build(dataset_dir: str) -> str:
     man = {}
     mp = os.path.join(dataset_dir, "manifest.json")
@@ -91,6 +118,36 @@ def build(dataset_dir: str) -> str:
         for k, v in cfg.items():
             L.append(f"    - `{k}` = {v}")
     L.append("")
+
+    # --- scenario provenance: a non-default road topology and/or a scenario-event timeline ---
+    road = cfg.get("road_network") or "linear"
+    ev_field = cfg.get("events") or ""
+    try:
+        evs = (ev_field if isinstance(ev_field, list)
+               else json.loads(ev_field) if str(ev_field).strip() else [])
+    except Exception:
+        evs = []
+    if not isinstance(evs, list):
+        evs = []
+    if road != "linear" or evs:
+        gw, gh, blk = cfg.get("grid_w"), cfg.get("grid_h"), cfg.get("grid_block_m")
+        topo = {
+            "grid": f"routed street grid, {gw} x {gh} intersections, {blk} m blocks",
+            "ring": f"ring road with {gw} intersections spaced {blk} m apart",
+            "spider": f"radial 'spider' city, {gw} arms x {gh} concentric rings, {blk} m spacing",
+            "custom": "custom user/AI-designed road graph (see `custom_network` in the config)",
+            "linear": "straight-line corridors (default)",
+        }.get(road, str(road))
+        L.append("## Scenario provenance")
+        L.append(f"- Road topology: **{road}** — {topo}")
+        if evs:
+            L.append(f"- Scenario timeline: **{len(evs)}** deterministic event(s):")
+            for e in evs:
+                if isinstance(e, dict):
+                    L.append(f"    - {_event_plain(e)}")
+        else:
+            L.append("- Scenario timeline: none (conditions are static throughout the run)")
+        L.append("")
 
     L.append("## Composition")
     L.append(f"- Vehicles: **{n_veh}**  (attackers **{n_att}**, faulty **{n_fault}**, "
