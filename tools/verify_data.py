@@ -5,7 +5,7 @@ reconciliation, split integrity, value sanity, and cryptographic file integrity.
 Exit code 0 iff every non-skipped check passes across every dataset.
 """
 from __future__ import annotations
-import json, sys, csv, hashlib
+import json, sys, csv, hashlib, re
 from pathlib import Path
 from collections import Counter, defaultdict
 
@@ -349,9 +349,13 @@ def audit(ds_dir: Path):
         need_resolve = {r.get("dst_entity") for r in edge_rows}
         need_resolve |= {r.get("src_entity") for r in edge_rows if not _is_infra(r)}
         orphan = (need_resolve - {None}) - node_ids
-        # infrastructure edges must carry an opaque rsu_ src (never a real/enrolled id)
+        # infrastructure edges must carry an opaque rsu_ src (never a real/enrolled id). A merged
+        # corpus (datagen.massive) namespaces every id column with a "d<idx>_" domain prefix, so the
+        # rsu_ marker may be prefixed -- strip an optional leading domain namespace before checking.
+        def _is_rsu_src(s):
+            return re.match(r"^(d\d+_)?rsu_", str(s or "")) is not None
         infra_bad = {r.get("src_entity") for r in edge_rows
-                     if _is_infra(r) and not str(r.get("src_entity") or "").startswith("rsu_")}
+                     if _is_infra(r) and not _is_rsu_src(r.get("src_entity"))}
         if ma_reports and digest2true:
             known = set(digest2true)
             if "is_infrastructure" in edge_cols:         # RSU-graph regime: edge per subject-resolving report

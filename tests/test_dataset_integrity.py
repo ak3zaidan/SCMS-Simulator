@@ -101,6 +101,33 @@ def test_extended_invariants_pass_on_clean_dataset(_fresh_corpus):
     assert status_by_check.get(_SCHEMA1) in ("PASS", "FAIL")
 
 
+def test_e3_tolerates_domain_namespaced_rsu_edges(tmp_path):
+    """datagen.massive namespaces every id column with a 'd<idx>_' prefix, so a merged corpus's
+    infrastructure-edge src becomes 'd3_rsu_...'. E3 must accept that (strip the domain prefix) --
+    otherwise it false-fails on every merged corpus containing RSU domains."""
+    import csv
+    import json
+    ds = tmp_path / "merged"
+    (ds / "ml").mkdir(parents=True)
+    (ds / "manifest.json").write_text(json.dumps({"config": {}, "counts": {}}), encoding="utf-8")
+    # two vehicle nodes + one vehicle edge + one RSU (infrastructure) edge, all domain-namespaced
+    for tbl in ("vehicle_features", "vehicle_labels"):
+        with open(ds / "ml" / f"{tbl}.csv", "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh); w.writerow(["entity_id"])
+            w.writerow(["d3_ent_aaaa"]); w.writerow(["d3_ent_bbbb"])
+    with open(ds / "ml" / "graph_edges.csv", "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh); w.writerow(["src_entity", "dst_entity", "is_infrastructure"])
+        w.writerow(["d3_ent_bbbb", "d3_ent_aaaa", "0"])       # vehicle->vehicle
+        w.writerow(["d3_rsu_deadbeef", "d3_ent_aaaa", "1"])   # namespaced RSU infrastructure edge
+    status = {c: s for _, c, s, _ in verify_data.run_audit(tmp_path)}
+    assert status.get("E3_graph_integrity") == "PASS", status
+    # a genuinely bad infra src (a real-looking entity, not rsu_) still FAILs
+    with open(ds / "ml" / "graph_edges.csv", "a", newline="", encoding="utf-8") as fh:
+        csv.writer(fh).writerow(["d3_ent_cccc", "d3_ent_aaaa", "1"])   # infra edge w/ non-rsu src
+    status2 = {c: s for _, c, s, _ in verify_data.run_audit(tmp_path)}
+    assert status2.get("E3_graph_integrity") == "FAIL", status2
+
+
 def _write_synthetic_dataset(root, schema):
     """A minimal on-disk dataset (manifest + ml/schema.json) that isolates the SCHEMA1 checker."""
     import json
