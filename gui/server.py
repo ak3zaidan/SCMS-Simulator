@@ -892,6 +892,8 @@ class Handler(BaseHTTPRequestHandler):
                                         "current": AGENT_PROGRESS["current"],
                                         "steps": list(AGENT_PROGRESS["steps"]),
                                         "turn": AGENT_PROGRESS["turn"]})
+        if self.path == "/api/scenarios":             # saved scenario library (copilot chips)
+            return self._send(200, {"ok": True, "scenarios": agent.scenario_library()})
         if self.path == "/api/schema":               # every PipelineConfig field (advanced full control)
             defaults = {k: (list(v) if isinstance(v, tuple) else v)
                         for k, v in pipeline_mod.PipelineConfig().__dict__.items()}

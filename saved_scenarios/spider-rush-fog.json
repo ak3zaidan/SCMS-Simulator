@@ -1,0 +1,15 @@
+{
+  "name": "spider-rush-fog",
+  "description": "Radial city rush hour; fog front at t=45s",
+  "saved_config": {
+    "road_network": "spider",
+    "grid_w": 8,
+    "grid_h": 3,
+    "traffic_flow": true,
+    "duration_s": 90,
+    "arrival_rate": 2.0,
+    "demand_profile": "rush",
+    "attacker_pct": 0.25,
+    "events": "[{\"t\":45,\"type\":\"weather\",\"value\":\"fog\"}]"
+  }
+}

@@ -327,3 +327,80 @@ def test_live_agent_runs_an_experiment(tmp_path, monkeypatch):
         assert res.get("runs") and res.get("best"), res
     assert out["results"] and out["results"].get("recall") is not None
     assert isinstance(out["reply"], str) and len(out["reply"]) > 0
+
+
+# ---------------- scenario library (save / load / list) ----------------
+def _scenario_lib(tmp_path, monkeypatch):
+    lib = tmp_path / "saved_scenarios"
+    monkeypatch.setattr(agent, "SCENARIO_DIR", lib)
+    return lib
+
+
+def test_scenario_round_trip_preserves_network_and_events(tmp_path, monkeypatch):
+    _scenario_lib(tmp_path, monkeypatch)
+    s = agent.AgentSession()
+    agent._exec_tool(s, "design_network", {"nodes": [[0, 0], [0, 200], [200, 200], [200, 0]],
+                                           "edges": [[0, 1], [1, 2], [2, 3], [3, 0]]})
+    agent._exec_tool(s, "set_events", {"events": [{"t": 10, "type": "weather", "value": "fog"}]})
+    agent._exec_tool(s, "set_config", {"overrides": {"duration_s": 60, "arrival_rate": 1.5,
+                                                     "attacker_pct": 0.2, "seed": 7}})
+    saved_cfg = dict(s.config)
+    r = agent._exec_tool(s, "save_scenario", {"name": "river-town", "description": "test world"})
+    assert r["ok"] and r["name"] == "river-town" and r["n_fields"] == len(saved_cfg)
+    # a FRESH session reloads exactly the same overrides (custom map + timeline included)
+    s2 = agent.AgentSession()
+    r2 = agent._exec_tool(s2, "load_scenario", {"name": "river-town"})
+    assert r2["ok"] and r2["name"] == "river-town"
+    assert s2.config == saved_cfg
+    assert s2.config["custom_network"] == saved_cfg["custom_network"]
+    assert s2.config["events"] == saved_cfg["events"]
+    # list is sorted by name and carries description + n_fields
+    agent._exec_tool(s2, "save_scenario", {"name": "a-first", "description": "sorts first"})
+    ls = agent._exec_tool(s2, "list_scenarios", {})
+    assert ls["ok"] and [x["name"] for x in ls["scenarios"]] == ["a-first", "river-town"]
+    by_name = {x["name"]: x for x in ls["scenarios"]}
+    assert by_name["river-town"]["description"] == "test world"
+    assert by_name["river-town"]["n_fields"] == len(saved_cfg)
+
+
+def test_scenario_bad_names_rejected(tmp_path, monkeypatch):
+    lib = _scenario_lib(tmp_path, monkeypatch)
+    s = agent.AgentSession()
+    agent._exec_tool(s, "set_config", {"overrides": {"attacker_pct": 0.3}})
+    for bad in ("../evil", "a b", "a" * 50, "", None, "dot.dot"):
+        r = agent._exec_tool(s, "save_scenario", {"name": bad, "description": "x"})
+        assert "error" in r and "name" in r["error"], (bad, r)
+        r2 = agent._exec_tool(s, "load_scenario", {"name": bad})
+        assert "error" in r2, (bad, r2)
+    assert not lib.exists() or not list(lib.iterdir())   # nothing was ever written
+    # a well-formed name that simply doesn't exist is a clean error too
+    missing = agent._exec_tool(s, "load_scenario", {"name": "no-such-scenario"})
+    assert "error" in missing and "no-such-scenario" in missing["error"]
+
+
+def test_load_scenario_with_invalid_value_errors_and_preserves_config(tmp_path, monkeypatch):
+    lib = _scenario_lib(tmp_path, monkeypatch)
+    lib.mkdir(parents=True)
+    (lib / "broken.json").write_text(json.dumps({
+        "name": "broken", "description": "invalid enum inside",
+        "saved_config": {"road_network": "hyperloop", "attacker_pct": 0.4}}), encoding="utf-8")
+    s = agent.AgentSession()
+    agent._exec_tool(s, "set_config", {"overrides": {"attacker_pct": 0.3, "traffic_flow": True}})
+    before = dict(s.config)
+    r = agent._exec_tool(s, "load_scenario", {"name": "broken"})
+    assert "error" in r and "road_network" in r["error"]
+    assert s.config == before                            # failed load left the session untouched
+
+
+def test_shipped_example_scenario_loads():
+    """saved_scenarios/spider-rush-fog.json (committed) loads through the real executor."""
+    s = agent.AgentSession()
+    ls = agent._exec_tool(s, "list_scenarios", {})
+    assert ls["ok"] and "spider-rush-fog" in [x["name"] for x in ls["scenarios"]]
+    r = agent._exec_tool(s, "load_scenario", {"name": "spider-rush-fog"})
+    assert r["ok"], r
+    assert s.config["road_network"] == "spider" and s.config["grid_w"] == 8
+    assert s.config["grid_h"] == 3 and s.config["traffic_flow"] is True
+    assert s.config["attacker_pct"] == 0.25 and s.config["demand_profile"] == "rush"
+    ev = json.loads(s.config["events"])
+    assert ev == [{"t": 45, "type": "weather", "value": "fog"}]
