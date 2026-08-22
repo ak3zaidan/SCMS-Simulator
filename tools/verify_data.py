@@ -24,13 +24,25 @@ results = []  # (dataset, check, status, detail)
 def rec(ds, check, ok, detail=""):
     results.append((ds, check, "PASS" if ok else ("SKIP" if ok is None else "FAIL"), detail))
 
-def run_audit(datasets_dir=None):
+def _find_datasets(dsroot: Path, recursive: bool = False):
+    """Dataset dirs (those containing a manifest.json) under `dsroot`.
+    Non-recursive (default): immediate children only -- the historical behaviour.
+    Recursive: any nested dataset dir, so nested corpora (datasets/campaign/merged,
+    datasets/<x>/dom_00N) are audited too."""
+    if recursive:
+        if not dsroot.exists():
+            return []
+        return sorted({m.parent for m in dsroot.rglob("manifest.json") if m.is_file()})
+    return sorted(p for p in dsroot.iterdir() if p.is_dir() and (p / "manifest.json").exists())
+
+
+def run_audit(datasets_dir=None, recursive=False):
     """Audit every dataset under `datasets_dir`; return the results list.
-    Each item is (dataset, check, status in {PASS,FAIL,SKIP}, detail)."""
+    Each item is (dataset, check, status in {PASS,FAIL,SKIP}, detail).
+    `recursive` (default False -> unchanged behaviour) also descends into nested corpora."""
     results.clear()
     dsroot = Path(datasets_dir) if datasets_dir else (ROOT / "datasets")
-    targets = sorted(p for p in dsroot.iterdir() if p.is_dir() and (p / "manifest.json").exists())
-    for p in targets:
+    for p in _find_datasets(dsroot, recursive):
         try:
             audit(p)
         except Exception as e:
@@ -72,6 +84,7 @@ def audit(ds_dir: Path):
     gt_attacks = read_jsonl(gt / "gt_attacks.jsonl")
     gt_labels = read_jsonl(gt / "gt_report_labels.jsonl")
     gt_revoc = read_jsonl(gt / "gt_linkage_revocation.jsonl")
+    gt_emissions = read_jsonl(gt / "gt_emissions_sample.jsonl")
     ma_reports = read_jsonl(ma / "ma_reports.jsonl")
     ma_status = read_jsonl(ma / "ma_cert_status.jsonl")
     ma_invest = read_jsonl(ma / "ma_investigations.jsonl")
@@ -307,6 +320,157 @@ def audit(ds_dir: Path):
         rec(ds, "I1_file_digests_match_manifest", None, "no outputs list")
         rec(ds, "I2_aggregate_data_digest", None, "")
 
+    # ============ H. GRAPH / SCHEMA / COLLUSION / EMISSIONS / WORLD ============
+    cfg = man.get("config") or {}
+    attackers = {tid for tid, a in veh_attacker.items() if a}
+    attackers |= {a.get("true_vehicle_id") for a in gt_attacks if a.get("true_vehicle_id")}
+    faulty = {tid for tid, f in veh_faulty.items() if f}
+
+    # E3: graph integrity -- every edge endpoint is a known entity id, and the edge count reconciles
+    # with the reports that survived featurization. featurize.build() emits a reporter->subject edge
+    # iff BOTH pseudonym certs resolve to a true vehicle via the identity map (RSU-reported certs are
+    # infrastructure and do NOT resolve), so #edges == #reports whose reporter AND subject both resolve.
+    ge_path = ml / "graph_edges.csv"
+    edge_cols, edge_rows = read_csv(ge_path)
+    node_ids = set()
+    for tbl in ("vehicle_features", "vehicle_labels"):
+        ncols, nrows = read_csv(ml / f"{tbl}.csv")
+        if "entity_id" in ncols:
+            node_ids |= {r["entity_id"] for r in nrows}
+    if not ge_path.exists() or not node_ids:
+        rec(ds, "E3_graph_integrity", None, "no graph_edges/node tables")
+    else:
+        edge_ents = ({r.get("src_entity") for r in edge_rows}
+                     | {r.get("dst_entity") for r in edge_rows}) - {None}
+        orphan = edge_ents - node_ids
+        if ma_reports and digest2true:
+            known = set(digest2true)
+            expected = sum(1 for r in ma_reports
+                           if r.get("subject_cert_digest") in known
+                           and r.get("reporter_cert_digest") in known)
+            count_ok = len(edge_rows) == expected
+        else:
+            expected, count_ok = None, True
+        rec(ds, "E3_graph_integrity", (not orphan) and count_ok,
+            f"orphan_edge_entities={len(orphan)} edges={len(edge_rows)} expected_from_reports={expected}")
+
+    # SCHEMA1: ml/schema.json must not advertise as a model feature any column the benchmark drops.
+    # benchmark._feature_matrix() excludes benchmark._DROP from the feature matrix, so schema.json
+    # labelling any of those columns kind:"feature" is a contract violation -- it tells an ML consumer
+    # to train on a column the shipped benchmark deliberately ignores. Kept strict on purpose: on the
+    # current featurize.py this correctly FLAGS detection_time & crl_active_at_report, which are in
+    # _DROP yet emitted as kind:"feature" (a real featurize labelling bug, fixed on a separate branch).
+    sch_path = ml / "schema.json"
+    if not sch_path.exists():
+        rec(ds, "SCHEMA1_no_dropped_col_as_feature", None, "no schema.json")
+    else:
+        try:
+            from scms_sim_ref.datagen import benchmark as _bench
+            drop = set(_bench._DROP)
+        except Exception as e:
+            drop = None
+            rec(ds, "SCHEMA1_no_dropped_col_as_feature", None, f"benchmark import failed: {e}")
+        if drop is not None:
+            schema = json.loads(sch_path.read_text(encoding="utf-8"))
+            bad = []
+            for tbl, cols in schema.items():
+                if tbl == "_legend" or not isinstance(cols, list):
+                    continue
+                for c in cols:
+                    if (isinstance(c, dict) and c.get("kind") == "feature"
+                            and c.get("name") in drop):
+                        bad.append(f"{tbl}.{c.get('name')}")
+            rec(ds, "SCHEMA1_no_dropped_col_as_feature", not bad, "; ".join(bad[:6]))
+
+    # C6: collusion consistency -- with collude_pct>0 some attackers file false reports; every
+    # malicious_false_report was PRODUCED by its reporter, which must therefore be a true attacker.
+    coll = cfg.get("collude_pct")
+    try:
+        coll = float(coll) if coll not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        coll = 0.0
+    if coll <= 0:
+        rec(ds, "C6_collusion_consistency", None, "no collusion (collude_pct=0)")
+    elif not gt_labels:
+        rec(ds, "C6_collusion_consistency", None, "no gt_report_labels")
+    else:
+        mfr = [r for r in gt_labels if r.get("report_correctness") == "malicious_false_report"]
+        bad = [r.get("report_id") for r in mfr if r.get("reporter_true_id") not in attackers]
+        rec(ds, "C6_collusion_consistency", not bad,
+            f"malicious_false_report={len(mfr)} reporter_not_attacker={len(bad)}")
+
+    # V4: emissions truth -- a falsified sampled CAM must belong to an attacker (never to a benign,
+    # non-faulty vehicle) and, when its attack window is recoverable from gt_attacks, fall inside it.
+    if not gt_emissions:
+        rec(ds, "V4_emissions_truth", None, "no emissions sample")
+    else:
+        fals = [e for e in gt_emissions if e.get("falsified")]
+        win = {a.get("true_vehicle_id"): (a.get("start_time"), a.get("end_time")) for a in gt_attacks}
+        non_attacker = benign_nonfaulty = outside = 0
+        EPS = 0.05
+        for e in fals:
+            v = e.get("true_vehicle_id")
+            if v not in attackers:
+                non_attacker += 1
+                if v not in faulty:
+                    benign_nonfaulty += 1
+            w = win.get(v)
+            if w and w[0] is not None and w[1] is not None:
+                t = float(e.get("t", 0) or 0)
+                if not (float(w[0]) - EPS <= t <= float(w[1]) + EPS):
+                    outside += 1
+        rec(ds, "V4_emissions_truth", non_attacker == 0 and outside == 0,
+            f"falsified={len(fals)} non_attacker={non_attacker} "
+            f"benign_nonfaulty={benign_nonfaulty} outside_window={outside}")
+
+    # N1: world provenance -- network.json (written for live/GUI runs) must be internally consistent
+    # (every edge endpoint indexes an existing node); and for a custom map, the manifest's
+    # custom_network must parse and its node/edge counts must match the exported geometry (edges are
+    # canonicalised the way CustomNetwork does: undirected, de-duplicated, self-loops dropped).
+    net_path = ds_dir / "network.json"
+    if not net_path.exists():
+        rec(ds, "N1_world_provenance", None, "no network.json")
+    else:
+        try:
+            net = json.loads(net_path.read_text(encoding="utf-8"))
+            nodes = net.get("nodes") or []
+            edges = net.get("edges") or []
+            problems = []
+            if not isinstance(nodes, list) or len(nodes) < 1:
+                problems.append("nodes missing/empty")
+            n = len(nodes)
+            bad_ep = 0
+            for e in edges:
+                try:
+                    a, b = int(e[0]), int(e[1])
+                except (TypeError, ValueError, IndexError):
+                    bad_ep += 1
+                    continue
+                if not (0 <= a < n and 0 <= b < n):
+                    bad_ep += 1
+            if bad_ep:
+                problems.append(f"{bad_ep} edges with out-of-range endpoints")
+            cnet_raw = cfg.get("custom_network")
+            if cfg.get("road_network") == "custom" and str(cnet_raw or "").strip():
+                try:
+                    doc = json.loads(cnet_raw) if isinstance(cnet_raw, str) else cnet_raw
+                    cnodes, cedges = doc.get("nodes"), doc.get("edges")
+                    if not (isinstance(cnodes, list) and isinstance(cedges, list)):
+                        problems.append("custom_network missing nodes/edges")
+                    else:
+                        if len(cnodes) != n:
+                            problems.append(f"custom nodes {len(cnodes)} != network.json {n}")
+                        canon = {(min(int(x[0]), int(x[1])), max(int(x[0]), int(x[1])))
+                                 for x in cedges if int(x[0]) != int(x[1])}
+                        if len(canon) != len(edges):
+                            problems.append(f"custom edges {len(canon)} != network.json {len(edges)}")
+                except Exception as ce:
+                    problems.append(f"custom_network parse: {type(ce).__name__}: {ce}")
+            rec(ds, "N1_world_provenance", not problems,
+                f"nodes={len(nodes)} edges={len(edges)}" + ("; " + "; ".join(problems[:4]) if problems else ""))
+        except Exception as e:
+            rec(ds, "N1_world_provenance", False, f"network.json error: {type(e).__name__}: {e}")
+
 def _all_keys(obj, out=None):
     out = [] if out is None else out
     if isinstance(obj, dict):
@@ -322,10 +486,17 @@ def _boolstr(v):
     if s in ("0", "false", "no", ""): return "false"
     return s
 
-def main():
-    dsroot = ROOT / "datasets"
-    targets = sorted(p for p in dsroot.iterdir() if p.is_dir() and (p / "manifest.json").exists())
-    run_audit(dsroot)
+def main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(description="Full data-correctness audit over datasets on disk.")
+    ap.add_argument("--datasets-root", default=str(ROOT / "datasets"),
+                    help="root directory to scan for datasets (default: ./datasets)")
+    ap.add_argument("--recursive", action="store_true",
+                    help="descend into nested corpora (default: immediate child datasets only)")
+    args = ap.parse_args(argv)
+    dsroot = Path(args.datasets_root)
+    targets = _find_datasets(dsroot, args.recursive)
+    run_audit(dsroot, recursive=args.recursive)
 
     # ---- report ----
     by_status = Counter(r[2] for r in results)

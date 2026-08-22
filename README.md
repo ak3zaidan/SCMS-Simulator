@@ -37,7 +37,7 @@ The built-in generator is a full microscopic traffic simulator: routed trips on 
 (grid, ring, radial spider city, or a fully **custom node/edge map** via `--road custom
 --custom-network map.json`) with IDM car-following (queues/congestion), signalized intersections,
 time-of-day demand, a mixed fleet (car/moto/truck/bus), weather, range-limited lossy radio,
-21 attack types across 8 families, and a 13-signal detector suite with a windowed
+21 attack types across 7 families, and a 13-signal detector suite with a windowed
 Misbehavior-Authority. A JSON `--events` timeline adds deterministic mid-run dynamics: demand
 surges, weather fronts, road closures, and coordinated attack waves. In the GUI, the AI Copilot
 designs custom maps and timelines from plain language. Deterministic (same seed + config →
@@ -65,7 +65,9 @@ interruptible — Ctrl-C finalizes a valid partial dataset.
 
 ### Full control (RSUs / traffic / network)
 
-Every simulation parameter is directly controllable. Highlights:
+The CLI exposes the most-used flags (below); **every** config field is controllable via the
+GUI **"⚙ Advanced: all fields"** panel or a `--config` JSON (both described at the end of this
+section). Highlights:
 
 ```powershell
 # RSUs: how many, where, and how far they hear (or place them by hand)
