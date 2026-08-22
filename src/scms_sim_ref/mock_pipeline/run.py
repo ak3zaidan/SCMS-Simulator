@@ -152,6 +152,12 @@ _SYBIL_MIN = 4        # distinct certs at NEARLY the same point before sybilCoLo
 _CELL_M = 3.0         # co-location cell: small enough that a bumper-to-bumper queue (~7 m spacing)
 _RSU_VID_BASE = 10_000_000   # Road-Side Unit vids start here (never collide with vehicle vids)
                       # never fills it, but tightly co-located Sybil ghosts (spoofing one point) do
+# log-distance radio model (opt-in; radio_model="logdistance"): a favourable shadow can pull a link
+# past radio_range_m, so the candidate window widens to the distance where the MEAN received power is
+# RADIO_CAP_SIGMA shadow-std below sensitivity (a link closing beyond that is astronomically rare),
+# bounded to RADIO_CAP_MAX_MULT * range so the spatial-bucket search stays O(local). Disc uses neither.
+RADIO_CAP_SIGMA = 4.0        # candidate cap headroom in shadow standard deviations
+RADIO_CAP_MAX_MULT = 6.0     # hard ceiling on cap / range (bounds the cell-search neighbourhood)
 
 
 # --------------------------------------------------------------------------- #
@@ -214,6 +220,17 @@ class PipelineConfig:
     packet_loss_base: float = 0.0        # baseline per-message loss
     nlos_loss: float = 0.0               # 0..1 obstruction loss, growing with distance/range
     chan_capacity: int = 40              # in-range CAMs/step before congestion (CBR) loss kicks in
+    # opt-in log-distance path-loss + log-normal shadowing radio model. "disc" (default) = the hard
+    # d<=range cutoff above, BYTE-IDENTICAL to today. "logdistance" replaces that cutoff with a SOFT
+    # probabilistic range: mean received power = -10*n*log10(d/range) dB relative to the sensitivity
+    # threshold (so it is 0 dB exactly at d==range -> median range == radio_range_m), plus a per-link
+    # log-normal shadowing draw (dB); a link is HEARD iff received power >= sensitivity(+margin). The
+    # existing packet_loss_base/nlos_loss/congestion/weather losses then compose ON TOP as per-packet
+    # drops on the links that do close. The three tunables below are consulted ONLY when logdistance.
+    radio_model: str = "disc"            # "disc" (hard range) | "logdistance" (soft path-loss+shadowing)
+    pathloss_exponent: float = 2.7       # log-distance exponent n (urban ~2.7-3.5; free space 2.0)
+    shadowing_sigma_db: float = 4.0      # log-normal shadowing std (dB); 0 -> near-hard cutoff at range
+    rx_sensitivity_margin_db: float = 0.0  # + shrinks / - extends the effective range vs radio_range_m
     art_max_m: float = 150.0             # tolerance for claiming a position beyond the radio range
     offroad_tol_m: float = 15.0          # map check: claimed distance from the nearest road tolerated
     max_accel_mps2: float = 12.0         # implausible-acceleration threshold
@@ -658,6 +675,12 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"jmax must be >= 1 (got {cfg.jmax})")
     if cfg.radio_range_m <= 0:
         raise ValueError(f"radio_range_m must be > 0 (got {cfg.radio_range_m})")
+    if cfg.radio_model not in ("disc", "logdistance"):
+        raise ValueError(f"radio_model must be disc|logdistance (got {cfg.radio_model!r})")
+    if cfg.pathloss_exponent <= 0:
+        raise ValueError(f"pathloss_exponent must be > 0 (got {cfg.pathloss_exponent})")
+    if cfg.shadowing_sigma_db < 0:
+        raise ValueError(f"shadowing_sigma_db must be >= 0 (got {cfg.shadowing_sigma_db})")
     if cfg.idm_accel <= 0 or cfg.idm_decel <= 0:
         raise ValueError(f"idm_accel and idm_decel must be > 0 (got {cfg.idm_accel}, {cfg.idm_decel})")
     if cfg.weather not in WEATHER_MULT:
@@ -765,7 +788,8 @@ def _field_group(name: str) -> str:
                      "arterial", "local_speed")),
         ("Scenario events", ("events",)),
         ("GNSS/sensor", ("gps_", "faulty", "weather")),
-        ("Radio", ("radio", "packet", "nlos", "chan", "freq", "art_max", "stale")),
+        ("Radio", ("radio", "packet", "nlos", "chan", "freq", "art_max", "stale", "pathloss",
+                   "shadowing", "rx_sensitivity")),
         ("Detection/MA", ("consistency", "heading", "detector", "report", "revoke", "reputation",
                           "ma_defense", "max_accel", "offroad", "rotate", "beacon", "net_delay",
                           "crl_")),
@@ -781,6 +805,7 @@ def _field_group(name: str) -> str:
 # Enumerated fields -> their valid options (sourced from the live constants so they never drift).
 _ENUM_OPTIONS = {
     "weather": list(WEATHER_MULT),
+    "radio_model": ["disc", "logdistance"],
     "road_network": ["linear", "grid", "ring", "spider", "custom"],
     "demand_profile": ["uniform", "rush", "night"],
     "od_model": ["uniform", "gravity"],
@@ -907,6 +932,13 @@ _FIELD_META = {
     "report_budget": dict(h="A reporter filing more than this is rate-limited", lo=1),
     # Radio
     "radio_range_m": dict(h="Vehicle reception range", lo=10, hi=2000, u="m"),
+    "radio_model": dict(h="Reachability model: disc (hard range) | logdistance (soft path-loss + shadowing)"),
+    "pathloss_exponent": dict(h="Log-distance path-loss exponent n (urban ~2.7-3.5; logdistance only)",
+                              lo=1.5, hi=6.0, st=0.1),
+    "shadowing_sigma_db": dict(h="Log-normal shadowing std in dB (0 = near-hard cutoff; logdistance only)",
+                               lo=0, hi=12, st=0.5, u="dB"),
+    "rx_sensitivity_margin_db": dict(h="Sensitivity margin dB: + shrinks / - extends range (logdistance only)",
+                                     lo=-20, hi=20, st=0.5, u="dB"),
     "packet_loss_base": dict(h="Baseline per-message packet loss", lo=0, hi=1, st=0.01),
     "nlos_loss": dict(h="Distance-growing obstruction (NLOS) loss", lo=0, hi=1, st=0.05),
     "chan_capacity": dict(h="In-range CAMs/step before congestion loss", lo=1),
@@ -1845,6 +1877,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # size = range means the 3x3 neighbourhood provably contains every in-range pair; candidates
         # are re-sorted into broadcast order so packet-loss RNG (hence output) is byte-identical.
         rng_cell = max(cfg.radio_range_m, 1.0)
+        # opt-in soft radio (log-distance path loss + per-link log-normal shadowing): governs whether
+        # a link physically closes, replacing the hard d<=rr disc. radio_model=="disc" takes NONE of
+        # this branch and draws NO extra rng -> byte-identical to today. See PipelineConfig.radio_model.
+        radio_logdist = (cfg.radio_model == "logdistance")
         bcell: dict = {}
         for bi, b in enumerate(broadcasts):
             bcell.setdefault((int(b["x"] // rng_cell), int(b["y"] // rng_cell)), []).append(bi)
@@ -1856,7 +1892,17 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             # window (radius = ceil(range/cell)). Vehicles keep rx_range=0 -> range=radio_range_m ->
             # radius 1 -> the original 3x3 -> byte-identical.
             rr = rx.rx_range or cfg.radio_range_m
-            rad = max(1, int(math.ceil(rr / rng_cell)))
+            if radio_logdist:
+                # a favourable shadow can pull a link past rr: widen the candidate window to the cap
+                # distance (mean signal RADIO_CAP_SIGMA shadow-std below sensitivity), bounded so the
+                # search stays O(local). A - margin (range-extending) widens it further.
+                cap = rr * 10.0 ** ((RADIO_CAP_SIGMA * cfg.shadowing_sigma_db
+                                     - min(0.0, cfg.rx_sensitivity_margin_db))
+                                    / (10.0 * cfg.pathloss_exponent))
+                cap = max(rr, min(cap, rr * RADIO_CAP_MAX_MULT))
+                rad = max(1, int(math.ceil(cap / rng_cell)))
+            else:
+                rad = max(1, int(math.ceil(rr / rng_cell)))
             cx0, cy0 = int(rxx // rng_cell), int(rxy // rng_cell)
             cand = []
             for dcx in range(-rad, rad + 1):
@@ -1869,7 +1915,23 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 if b["veh"].vid == rx.vid:
                     continue
                 d = math.hypot(b["x"] - rxx, b["y"] - rxy)
-                if d <= rr:
+                if not radio_logdist:
+                    if d <= rr:                                 # hard range disc (default; unchanged)
+                        in_range.append((b, d))
+                    continue
+                # --- log-distance path loss + log-normal shadowing (soft probabilistic range) ---
+                if d > cap:
+                    continue                                    # cheap distance cap before the dB math
+                # mean received power relative to sensitivity: +10*n*log10(rr/d) dB, so exactly 0 dB at
+                # d==rr (calibration -> median range == rr), positive closer, negative past rr. A + margin
+                # raises the sensitivity bar (shrinks range); - lowers it (extends). d floored at 1 m.
+                mean_db = (10.0 * cfg.pathloss_exponent * math.log10(rr / max(d, 1.0))
+                           - cfg.rx_sensitivity_margin_db)
+                # per-LINK log-normal shadowing from a dedicated string-keyed stream (seed+tx+rx+step);
+                # NOT the global rng, so the disc path's rng sequence stays byte-identical.
+                shadow_db = random.Random(
+                    f"{cfg.seed}:shadow:{b['digest']}:{rx.vid}:{step}").gauss(0.0, cfg.shadowing_sigma_db)
+                if mean_db + shadow_db >= 0.0:                  # received power >= sensitivity(+margin)
                     in_range.append((b, d))
             load = sum(b["msg_count"] for b, _ in in_range)
             cong = min(0.8, max(0.0, (load - cfg.chan_capacity) / max(1, cfg.chan_capacity)) * 0.5)
@@ -2201,6 +2263,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--packet-loss", type=float, default=0.0, help="baseline per-message loss")
     p.add_argument("--nlos", type=float, default=0.0, help="distance-growing obstruction loss (0..1)")
     p.add_argument("--chan-capacity", type=int, default=40, help="in-range CAMs/step before congestion")
+    p.add_argument("--radio-model", choices=["disc", "logdistance"], default="disc",
+                   help="reachability: disc (hard range) | logdistance (soft path-loss + shadowing)")
+    p.add_argument("--pathloss-exponent", type=float, default=2.7,
+                   help="log-distance path-loss exponent n (logdistance only)")
+    p.add_argument("--shadowing-sigma-db", type=float, default=4.0,
+                   help="log-normal shadowing std in dB; 0 = near-hard cutoff (logdistance only)")
+    p.add_argument("--rx-sensitivity-margin-db", type=float, default=0.0,
+                   help="sensitivity margin dB: + shrinks / - extends range (logdistance only)")
     # long-running traffic flow
     p.add_argument("--flow", action="store_true", help="traffic-flow mode: vehicles spawn/despawn over time")
     p.add_argument("--duration", type=float, default=0.0, help="flow: sim length in seconds")
@@ -2320,6 +2390,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                          crl_aware_pct=args.crl_aware_pct, crl_dormant_s=args.crl_dormant_s,
                          radio_range_m=args.radio_range, packet_loss_base=args.packet_loss,
                          nlos_loss=args.nlos, chan_capacity=args.chan_capacity,
+                         radio_model=args.radio_model, pathloss_exponent=args.pathloss_exponent,
+                         shadowing_sigma_db=args.shadowing_sigma_db,
+                         rx_sensitivity_margin_db=args.rx_sensitivity_margin_db,
                          traffic_flow=args.flow, duration_s=args.duration, arrival_rate=args.arrival_rate,
                          road_network=("grid" if (args.flow and args.road == "linear") else args.road),
                          custom_network=_inline_or_file(args.custom_network),
