@@ -37,7 +37,7 @@ _OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 
 # Scenario library: designed worlds/timelines saved as JSON so they can be reloaded by name.
 SCENARIO_DIR = REPO / "saved_scenarios"
-_SCENARIO_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,40}$")
+_SCENARIO_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,40}\Z")   # \Z (not $) so "abc\n" is rejected
 
 
 def _scenario_path(name: str) -> Path:

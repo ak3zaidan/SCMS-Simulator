@@ -367,7 +367,7 @@ def test_scenario_bad_names_rejected(tmp_path, monkeypatch):
     lib = _scenario_lib(tmp_path, monkeypatch)
     s = agent.AgentSession()
     agent._exec_tool(s, "set_config", {"overrides": {"attacker_pct": 0.3}})
-    for bad in ("../evil", "a b", "a" * 50, "", None, "dot.dot"):
+    for bad in ("../evil", "a b", "a" * 50, "", None, "dot.dot", "abc\n", "trail\ning"):
         r = agent._exec_tool(s, "save_scenario", {"name": bad, "description": "x"})
         assert "error" in r and "name" in r["error"], (bad, r)
         r2 = agent._exec_tool(s, "load_scenario", {"name": bad})
