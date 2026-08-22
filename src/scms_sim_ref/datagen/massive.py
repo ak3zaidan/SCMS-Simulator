@@ -43,6 +43,10 @@ sys.path.insert(0, str(REPO / "src"))
 from scms_sim_ref.mock_pipeline import PipelineConfig, run_pipeline   # noqa: E402
 from scms_sim_ref.datagen import featurize as featmod                 # noqa: E402
 from scms_sim_ref.datagen import validate as valmod                   # noqa: E402
+# corpus_report is the SINGLE SOURCE OF TRUTH for the attack family/type space (it derives
+# ALL_FAMILIES / ALL_TYPES / TYPE_TO_FAMILY from run.py's ATTACK_CATALOG+COMBINED_ATTACKS and
+# featurize._ATTACK_FAMILY). We reuse those + its build_report() rather than re-deriving anything.
+from scms_sim_ref.datagen import corpus_report as corpus_report_mod   # noqa: E402
 
 TABLES = ["report_features", "report_labels", "subject_features", "subject_labels",
           "vehicle_features", "vehicle_labels", "vehicle_features_ma", "vehicle_labels_ma",
@@ -152,16 +156,151 @@ def sample_world(base_seed: int, domain_idx: int, duration_s: float) -> dict:
     return {"road": road, "grid_w": gw, "grid_h": gh, "grid_block_m": block, "events": events}
 
 
+# ==================================================================================================
+# OPT-IN dataset-robustness planning (stratified attacks / class balancing / curriculum ordering).
+# Everything here is PURE + DETERMINISTIC and produces a per-domain "plan" that main() then runs.
+# With every opt-in OFF, build_domain_plan() returns the cells unchanged, so the default corpus (and
+# every existing massive test) is byte-identical. The family/type space is imported, never hardcoded.
+# ==================================================================================================
+
+# Difficulty proxies for the curriculum (cheap, a-priori, computed BEFORE any pipeline runs):
+# stealth = hard (low-and-slow, evades detectors); speed/timing/combined = medium; the "blatant"
+# families (position/heading/identity/credential) and the mixed "ALL" scenario = easy.
+_HARD_FAMILIES = frozenset({"stealth"})
+_MEDIUM_FAMILIES = frozenset({"speed", "timing", "combined"})
+
+
+def _stratified_schedule() -> list[str]:
+    """A families-first ordering of every renderable attack type (single source of truth:
+    corpus_report.ALL_TYPES / TYPE_TO_FAMILY / ALL_FAMILIES).
+
+    Round-robins across families, so the FIRST ``len(ALL_FAMILIES)`` entries hit each family exactly
+    once (including the opt-in "combined" family) and continuing on covers every individual type. Any
+    corpus with at least that many domains therefore covers every attack family; a larger corpus
+    additionally covers every type. Deterministic (sorted family order, stable within family).
+    """
+    by_fam: dict[str, list[str]] = {}
+    for t in corpus_report_mod.ALL_TYPES:
+        by_fam.setdefault(corpus_report_mod.TYPE_TO_FAMILY[t], []).append(t)
+    fams = list(corpus_report_mod.ALL_FAMILIES)            # sorted -> deterministic
+    schedule: list[str] = []
+    depth = 0
+    while len(schedule) < len(corpus_report_mod.ALL_TYPES):
+        for f in fams:
+            if depth < len(by_fam[f]):
+                schedule.append(by_fam[f][depth])
+        depth += 1
+    return schedule
+
+
+def _balanced_attacker_pct(base_seed: int, slot: int, target: float,
+                           jitter: float = 0.05, lo: float = 0.02, hi: float = 0.6) -> float:
+    """Draw one domain's attacker_pct centered on ``target`` (a small symmetric jitter so domains
+    still vary), from a per-domain seeded rng (a sibling of the world stream). Because the jitter is
+    zero-mean, the MEAN attacker_pct over the corpus -> ``target``, so the merged class balance lands
+    near the target instead of whatever the uniform grid axis yields. Deterministic; clamped sane."""
+    rng = random.Random(f"{base_seed}:balance:{slot}")
+    return round(max(lo, min(hi, target + rng.uniform(-jitter, jitter))), 4)
+
+
+def _plan_attack_family(entry: dict) -> str | None:
+    """The attack family a planned domain will actually produce: the stratified type's family if
+    stratifying, else the family of a single-type scenario. "ALL"/mixed/unknown -> None (treated as
+    blatant/easy for difficulty)."""
+    strat = entry.get("strat_type")
+    if strat:
+        return corpus_report_mod.TYPE_TO_FAMILY.get(strat)
+    scen = entry.get("scenario")
+    if scen and scen != "ALL":
+        return corpus_report_mod.TYPE_TO_FAMILY.get(scen)
+    return None
+
+
+def _difficulty_score(entry: dict, flow: bool) -> float:
+    """Cheap a-priori difficulty proxy (higher = harder), from fields known before running:
+    stealth family (+2) > speed/timing/combined (+0.5) > blatant/mixed (+0); FEWER attackers are
+    harder (attacker_pct < 0.15 -> +1, < 0.25 -> +0.5); under --flow, subtle (intensity < 1) and
+    pulsed/evasive (duty < 1) attackers each add +1."""
+    fam = _plan_attack_family(entry)
+    s = 0.0
+    if fam in _HARD_FAMILIES:
+        s += 2.0
+    elif fam in _MEDIUM_FAMILIES:
+        s += 0.5
+    ap = float(entry.get("attacker_pct", 0.0) or 0.0)
+    if ap < 0.15:
+        s += 1.0
+    elif ap < 0.25:
+        s += 0.5
+    if flow:
+        if float(entry.get("intensity", 1.0) or 1.0) < 1.0:
+            s += 1.0
+        if float(entry.get("duty", 1.0) or 1.0) < 1.0:
+            s += 1.0
+    return s
+
+
+def _difficulty_tier(score: float) -> int:
+    """Bin a difficulty score into a tier 0..3 (0 = easiest, 3 = hardest)."""
+    if score <= 0.0:
+        return 0
+    if score <= 1.0:
+        return 1
+    if score <= 2.0:
+        return 2
+    return 3
+
+
+def build_domain_plan(cells: list[dict], base_seed: int, *, flow: bool = False,
+                      stratify: bool = False, balance_target: float | None = None,
+                      curriculum: bool = False) -> list[dict]:
+    """Turn enumerated grid cells into the per-domain PLAN, applying the opt-in robustness controls.
+
+    Pure + deterministic (runs no pipeline). Each returned entry is a copy of a cell, optionally
+    augmented with:
+      * ``strat_type`` / ``strat_family`` -- when ``stratify`` is on (attack forced per domain so
+        every family, then every type, is covered; source of truth = corpus_report's type space);
+      * a biased ``attacker_pct`` -- when ``balance_target`` is set (draws centered on the target);
+      * ``difficulty_tier`` (0..3), with the plan REORDERED easy->hard -- when ``curriculum`` is on.
+
+    With all three off it returns ``[dict(cell) for cell in cells]`` -- identical values, identical
+    order, no extra keys -- so the default corpus is unchanged.
+    """
+    schedule = _stratified_schedule() if stratify else None
+    entries: list[dict] = []
+    for slot, cell in enumerate(cells):
+        e = dict(cell)
+        if schedule is not None:
+            t = schedule[slot % len(schedule)]
+            e["strat_type"] = t
+            e["strat_family"] = corpus_report_mod.TYPE_TO_FAMILY[t]
+        if balance_target is not None:
+            e["attacker_pct"] = _balanced_attacker_pct(base_seed, slot, balance_target)
+        entries.append(e)
+    if curriculum:
+        # order easy->hard (stable: ties keep enumeration order) and stamp each domain's tier
+        scored = sorted(((_difficulty_score(e, flow), slot, e)
+                         for slot, e in enumerate(entries)), key=lambda x: (x[0], x[1]))
+        for score, _slot, e in scored:
+            e["difficulty_tier"] = _difficulty_tier(score)
+        entries = [e for _score, _slot, e in scored]
+    return entries
+
+
 def cell_config(cell: dict, idx: int, base_seed: int, n_steps: int, out_dir: Path,
                 flow: bool = False, flow_duration: float = 0.0,
                 world: dict | None = None) -> PipelineConfig:
     scen = cell["scenario"]
-    attack_types = tuple(ATTACK_TYPES) if scen == "ALL" else (scen,)
+    strat = cell.get("strat_type")                       # --stratify-attacks: forced per-domain type
+    if strat:
+        attack_types = (strat,)                          # 1-tuple != default -> pipeline uses it as-is
+    else:
+        attack_types = tuple(ATTACK_TYPES) if scen == "ALL" else (scen,)
     kw = dict(
         seed=(base_seed + idx * 100003) % 2_000_000_000,
         n_vehicles=cell["n_vehicles"], n_steps=n_steps,
         attacker_pct=cell["attacker_pct"], attack_types=attack_types,
-        attack_type=(scen if scen != "ALL" else "ConstPos"),
+        attack_type=(strat if strat else (scen if scen != "ALL" else "ConstPos")),
         faulty_pct=cell["faulty_pct"], weather=cell["weather"],
         rotate_period_s=cell["rotate_period_s"],
         collude_pct=cell["collude_pct"], victim_pct=0.12,
@@ -220,6 +359,20 @@ def main(argv=None) -> int:
     ap.add_argument("--parquet", action="store_true", help="also write merged parquet (memory-heavy at scale)")
     ap.add_argument("--flow", action="store_true", help="each domain is a long routed flow simulation")
     ap.add_argument("--flow-duration", type=float, default=300.0, help="flow: seconds per domain")
+    # --- OPT-IN dataset-robustness controls (all default OFF -> default corpus is byte-identical) ---
+    ap.add_argument("--stratify-attacks", action="store_true",
+                    help="deterministically force one attack type per domain so EVERY family (then "
+                         "every type) is covered, incl. the opt-in 'combined' family (default OFF)")
+    ap.add_argument("--balance-classes", type=float, default=None, metavar="TARGET",
+                    help="bias per-domain attacker_pct draws (seeded) so the merged attacker fraction "
+                         "lands near TARGET instead of the uniform grid value (default OFF)")
+    ap.add_argument("--curriculum", action="store_true",
+                    help="order domains easy->hard by cheap a-priori proxies and record a per-domain "
+                         "difficulty_tier (0..3) in domain_catalog.json (default OFF)")
+    ap.add_argument("--report", action=argparse.BooleanOptionalAction, default=True,
+                    help="after generation, write CORPUS_REPORT.md (balance/coverage) next to the "
+                         "manifest and print its warnings summary (read-only; default ON, "
+                         "--no-report disables)")
     ap.add_argument("--out", default=str(REPO / "datasets" / "massive"))
     a = ap.parse_args(argv)
 
@@ -243,9 +396,27 @@ def main(argv=None) -> int:
             cells = cells[:a.max_domains]
         dropped = total - len(cells)
 
-    print(f"== massive grid '{a.grid}': {total} cells in the product, running {len(cells)}"
+    # OPT-IN robustness planning: stratified attacks / class balancing / curriculum ordering.
+    # With all three off this is `[dict(c) for c in cells]` -- identical values + order -> unchanged.
+    plan = build_domain_plan(cells, a.seed, flow=a.flow, stratify=a.stratify_attacks,
+                             balance_target=a.balance_classes, curriculum=a.curriculum)
+
+    print(f"== massive grid '{a.grid}': {total} cells in the product, running {len(plan)}"
           + (f" (CAP dropped {dropped})" if dropped else "") + f", seed {a.seed} ==", flush=True)
     print(f"   axes: " + ", ".join(f"{k}({len(v)})" for k, v in grid.items()), flush=True)
+    if a.stratify_attacks:
+        fams = sorted({e["strat_family"] for e in plan})
+        print(f"   stratify-attacks ON: forcing per-domain types over {len(corpus_report_mod.ALL_TYPES)} "
+              f"types / {len(corpus_report_mod.ALL_FAMILIES)} families; plan covers families: "
+              f"{', '.join(fams)}", flush=True)
+    if a.balance_classes is not None:
+        print(f"   balance-classes ON: per-domain attacker_pct centered on target "
+              f"{a.balance_classes} (mean planned = "
+              f"{sum(e['attacker_pct'] for e in plan) / len(plan):.4f})", flush=True)
+    if a.curriculum:
+        tiers = sorted({e.get("difficulty_tier") for e in plan})
+        print(f"   curriculum ON: domains ordered easy->hard; difficulty tiers present: {tiers}",
+              flush=True)
     if a.flow:
         print(f"   worlds: road_network sampled per domain from {'/'.join(WORLD_TOPOLOGIES)} "
               f"(+ dims); ~half get 0-2 scenario events (seeded, byte-reproducible)", flush=True)
@@ -262,7 +433,7 @@ def main(argv=None) -> int:
 
     header_written: set = set()
     catalog, row_counts, failed = [], {t: 0 for t in TABLES}, []
-    for idx, cell in enumerate(cells):
+    for idx, entry in enumerate(plan):
         dom_dir = base / "domains" / f"d{idx:04d}"
         # flow: each domain gets a deterministically sampled world (topology + dims + events);
         # its parameters ride along into the catalog / failed record as per-domain provenance.
@@ -274,7 +445,7 @@ def main(argv=None) -> int:
         # Isolate each cell: one bad domain (e.g. a degenerate config) must not throw away the
         # thousands of good ones already merged. Failures are RECORDED (not silently dropped).
         try:
-            cfg = cell_config(cell, idx, a.seed, a.steps, dom_dir, flow=a.flow,
+            cfg = cell_config(entry, idx, a.seed, a.steps, dom_dir, flow=a.flow,
                               flow_duration=a.flow_duration, world=world)
             res = run_pipeline(cfg)
             featmod.build(str(dom_dir), split_seed=1234)
@@ -286,19 +457,19 @@ def main(argv=None) -> int:
             # per-domain difficulty labels (from its own ground truth, before the dir is deleted):
             # lets a trainer curriculum-weight or stratify the merged corpus by how hard each domain is.
             vs = valmod.validate(str(dom_dir))[0]
-            catalog.append({"domain_id": idx, **cell, **wrec, "seed": cfg.seed,
+            catalog.append({"domain_id": idx, **entry, **wrec, "seed": cfg.seed,
                             "reports": res.n_reports, "revoked": res.n_revoked,
                             "precision": vs.get("precision"), "recall": vs.get("recall"),
                             "recall_by_family": vs.get("recall_by_family", {}),
                             "recall_by_type": vs.get("recall_by_type", {})})
         except Exception as e:                       # noqa: BLE001 -- keep the campaign alive
-            failed.append({"domain_id": idx, **cell, **wrec, "error": f"{type(e).__name__}: {e}"})
-            print(f"   [{idx + 1}/{len(cells)}] FAILED domain {idx}: {type(e).__name__}: {e}", flush=True)
+            failed.append({"domain_id": idx, **entry, **wrec, "error": f"{type(e).__name__}: {e}"})
+            print(f"   [{idx + 1}/{len(plan)}] FAILED domain {idx}: {type(e).__name__}: {e}", flush=True)
         finally:
             if not a.keep_domains:
                 shutil.rmtree(dom_dir, ignore_errors=True)
-        if (idx + 1) % 25 == 0 or idx + 1 == len(cells):
-            print(f"   [{idx + 1}/{len(cells)}] merged; report rows so far={row_counts['report_features']}"
+        if (idx + 1) % 25 == 0 or idx + 1 == len(plan):
+            print(f"   [{idx + 1}/{len(plan)}] merged; report rows so far={row_counts['report_features']}"
                   + (f"; {len(failed)} failed" if failed else ""), flush=True)
 
     if not a.keep_domains:
@@ -338,8 +509,36 @@ def main(argv=None) -> int:
                       "close_edge on grid domains only), times within flow_duration",
             "rng": "random.Random(f'{seed}:world:{domain_idx}')",
         }
+    # OPT-IN robustness provenance: recorded ONLY when a control is active, so the DEFAULT manifest
+    # is byte-identical to before this feature (existing digests/tests unaffected).
+    if a.stratify_attacks or a.balance_classes is not None or a.curriculum:
+        manifest["dataset_robustness"] = {
+            "stratify_attacks": bool(a.stratify_attacks),
+            "balance_classes_target": a.balance_classes,
+            "curriculum": bool(a.curriculum),
+            "families_covered": sorted({e["strat_family"] for e in plan
+                                        if "strat_family" in e}) or None,
+            "difficulty_tiers": sorted({e["difficulty_tier"] for e in plan
+                                        if "difficulty_tier" in e}) or None,
+        }
     (base / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     (base / "domain_catalog.json").write_text(json.dumps(catalog, indent=2), encoding="utf-8")
+
+    # ADDITIVE, read-only balance/coverage report (default ON; --no-report disables). Runs on the
+    # merged corpus AFTER manifest + catalog are written so build_report() sees full provenance; it
+    # never mutates the corpus. Guarded so reporting can never abort a large campaign.
+    if a.report:
+        try:
+            rep = corpus_report_mod.build_report(str(base))
+            (base / "CORPUS_REPORT.md").write_text(
+                corpus_report_mod.render_markdown(rep), encoding="utf-8", newline="\n")
+            warns = rep.get("warnings", [])
+            print(f"\n== corpus report ({'no warnings -- well-balanced' if not warns else str(len(warns)) + ' warning(s)'}) "
+                  f"-> {base / 'CORPUS_REPORT.md'} ==", flush=True)
+            for w in warns:
+                print(f"   !! {w}", flush=True)
+        except Exception as e:                       # noqa: BLE001 -- reporting is additive, never fatal
+            print(f"   [report] skipped: {type(e).__name__}: {e}", flush=True)
 
     print(f"\n== merged dataset row counts ==")
     for t in TABLES:
@@ -368,7 +567,8 @@ def main(argv=None) -> int:
     nov = bench.get("generalization", {}).get("vehicle_novel_attack")
     if nov:
         print(f"   novel-attack (leave-one-family-out): mean_auc={nov.get('mean_novel_attack_auc')}")
-    print(f"\nDONE. Massive dataset at {base}  (ml/*, manifest.json, domain_catalog.json, merged_benchmark.json)")
+    print(f"\nDONE. Massive dataset at {base}  (ml/*, manifest.json, domain_catalog.json, "
+          f"merged_benchmark.json" + (", CORPUS_REPORT.md" if a.report else "") + ")")
     return 0
 
 
