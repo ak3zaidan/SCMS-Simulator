@@ -699,6 +699,16 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         if cfg.road_network == "spider" and (cfg.grid_w < 3 or cfg.grid_h < 1):
             raise ValueError(f"spider network needs grid_w >= 3 arms and grid_h >= 1 rings "
                              f"(got {cfg.grid_w} arms x {cfg.grid_h} rings)")
+    if cfg.attacker_ids:
+        bad = [a for a in cfg.attacker_ids if not isinstance(a, int) or isinstance(a, bool)]
+        if bad:
+            raise ValueError(f"attacker_ids must be integer vehicle ids (got non-int {bad!r}); a "
+                             f"JSON-loaded list of strings is coerced by config_from_dict")
+        if cfg.attacker_pct == 0 and not cfg.traffic_flow:   # attacker_ids used only here
+            oor = [a for a in cfg.attacker_ids if a < 0 or a >= cfg.n_vehicles]
+            if oor:
+                raise ValueError(f"attacker_ids {oor!r} out of range for n_vehicles={cfg.n_vehicles} "
+                                 f"(valid ids 0..{cfg.n_vehicles - 1})")
     for name in _PROB_FIELDS:                       # clamp fractions rather than produce nonsense
         setattr(cfg, name, min(1.0, max(0.0, float(getattr(cfg, name)))))
     return cfg
@@ -774,7 +784,8 @@ _FIELD_META = {
     "idm_decel": dict(h="IDM comfortable deceleration", lo=0.1, hi=6, st=0.1, u="m/s²"),
     "idm_time_headway": dict(h="IDM desired time gap to the leader", lo=0.3, hi=4, st=0.1, u="s"),
     "idm_min_gap": dict(h="IDM jam distance / minimum gap", lo=0.5, hi=10, st=0.5, u="m"),
-    "veh_length_m": dict(h="Default vehicle length", lo=1, hi=20, u="m"),
+    "veh_length_m": dict(h="Per-class fallback vehicle length; the per-vehicle-type length from the "
+                           "fleet mix overrides it in car-following/IDM", lo=1, hi=20, u="m"),
     "idm_lookahead_m": dict(h="IDM leader search distance", lo=10, hi=200, u="m"),
     "turn_slowdown": dict(h="Slow into sharp grid corners (more realistic, harder to detect)"),
     "turn_speed_mps": dict(h="Speed cap through a sharp bend", lo=1, hi=20, u="m/s"),
@@ -801,7 +812,9 @@ _FIELD_META = {
     # Attacks
     "attacker_ids": dict(h="Fixed-fleet attacker vehicle ids (used only when attacker_pct = 0)"),
     "attacker_pct": dict(h="Fraction of vehicles that are attackers", lo=0, hi=1, st=0.05),
-    "attack_type": dict(h="Single/default attack type"),
+    "attack_type": dict(h="Single attack type: a non-default value, with attack_types left at its "
+                          "default (full catalog), makes the whole run use only this type; otherwise "
+                          "it is the index-0 fallback and attack_types wins"),
     "attack_types": dict(h="Enabled attack types (round-robin), comma-separated"),
     "attack_start": dict(h="Fixed-fleet: attack begins at this time", lo=0, u="s"),
     "attack_end": dict(h="Fixed-fleet: attack ends at this time", lo=0, u="s"),
@@ -816,7 +829,9 @@ _FIELD_META = {
     "dos_burst": dict(h="CAMs per interval a DoS attacker floods", lo=1),
     "delay_s": dict(h="DelayedMessages staleness", lo=0, u="s"),
     "collude_pct": dict(h="Fraction of attackers that also file false reports", lo=0, hi=1, st=0.05),
-    "victim_pct": dict(h="Fraction of benign vehicles targeted by colluders", lo=0, hi=1, st=0.05),
+    "victim_pct": dict(h="Fraction of benign vehicles colluders frame (fixed fleet: of the whole "
+                         "fleet; flow: of in-range benign candidates; 0 = legacy 2-nearest)",
+                       lo=0, hi=1, st=0.05),
     "sybil_ghosts": dict(h="Ghost identities a Sybil attacker fabricates", lo=0, hi=20),
     # GNSS / sensor
     "gps_sigma_m": dict(h="White per-axis GNSS noise", lo=0, hi=20, st=0.1, u="m"),
@@ -912,8 +927,17 @@ def config_from_dict(d: dict) -> PipelineConfig:
         print(f"[config] ignoring {len(unknown)} unknown key(s): {', '.join(unknown)}", file=_sys.stderr)
     kw = {k: v for k, v in d.items() if k in known}
     for name in _TUPLE_FIELDS:
-        if name in kw and isinstance(kw[name], list):
-            kw[name] = tuple(kw[name])
+        if name in kw and isinstance(kw[name], (list, tuple)):
+            seq = kw[name]
+            # JSON has no int/tuple types, so a saved ("7",) round-trips as ["7"]. Coerce ELEMENT
+            # types too, else attacker_ids stays a tuple of strings and never matches integer vids
+            # (silent zero-attacker datasets from the GUI advanced panel). attack_types stays str.
+            if name == "attacker_ids":
+                kw[name] = tuple(int(x) for x in seq)
+            elif name == "attack_types":
+                kw[name] = tuple(str(x) for x in seq)
+            else:
+                kw[name] = tuple(seq)
     return PipelineConfig(**kw)
 
 
@@ -936,7 +960,15 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     la1, la2 = LinkageAuthority(1), LinkageAuthority(2)
     pca, ra = PseudonymCA(), RegistrationAuthority()
 
-    catalog = cfg.attack_types or (cfg.attack_type,)
+    # attack_type is otherwise only an index-0 fallback (attack_types defaults to the full catalog),
+    # so the GUI single-type dropdown would do nothing. Make it effective: when the user picks a
+    # NON-default attack_type AND leaves attack_types at its default (full catalog), narrow the
+    # catalog to just that type. The default attack_type keeps the full-catalog round-robin, so the
+    # default digest is unchanged; attack_types set explicitly still wins.
+    if cfg.attack_type != PipelineConfig.attack_type and cfg.attack_types == PipelineConfig.attack_types:
+        catalog = (cfg.attack_type,)
+    else:
+        catalog = cfg.attack_types or (cfg.attack_type,)
     fleet_weights = _parse_fleet_mix(cfg.fleet_mix)   # None -> default mixed weights (byte-identical)
     attack_weights = _parse_attack_mix(cfg.attack_mix)  # None -> round-robin catalog (byte-identical)
     total_time = cfg.n_steps * cfg.dt
@@ -1238,6 +1270,22 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     cert_first_seen: dict[str, float] = {}
     cert_last_seen: dict[str, float] = {}
     counters = {"report": 0, "case": 0, "crl": 0}
+    # Per-colluder RNG for FABRICATED false-report evidence: keyed by seed+vid (deterministic), one
+    # stream per colluder so draws accumulate across the run -> the fabricated detector score / pos
+    # confidence VARY per report (see the collusion pass) instead of a constant fingerprint. A
+    # dedicated stream (not the sensor vrng) leaves every other RNG-driven output byte-identical.
+    collude_fab_rng: dict[int, random.Random] = {}
+    # Flow-mode collusion victim designation (BUG 6): a STABLE per-vehicle coin decides whether a
+    # benign vehicle is a framing victim, so ~victim_pct of benign vehicles are targeted for the whole
+    # run (mirrors the fixed-fleet shared victim_pool). Cached per vid; only consulted when victim_pct>0.
+    _flow_victim_flag: dict[int, bool] = {}
+
+    def _is_flow_victim(vid: int) -> bool:
+        f = _flow_victim_flag.get(vid)
+        if f is None:
+            f = random.Random(f"{cfg.seed}:collude_victim:{vid}").random() < cfg.victim_pct
+            _flow_victim_flag[vid] = f
+        return f
 
     def measure(v: Vehicle, x: float, y: float, t: float) -> tuple[float, float, float]:
         """Advance the per-vehicle GNSS error state and return (mx, my, pos_conf)."""
@@ -1785,9 +1833,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 det["sybilCoLocation"] = cells[(round(cx / _CELL_M), round(cy / _CELL_M),
                                                 int(ch // 45) % 8)] / _SYBIL_MIN
                 # a receiver only physically hears in-range transmitters, so a claim placing the
-                # sender far BEYOND the radio range is implausible (excess distance / tolerance).
+                # sender far BEYOND THIS RECEIVER'S range is implausible (excess distance / tolerance).
+                # Use rr (the actual per-receiver range used for reception above), not the global
+                # radio_range_m: an RSU with a longer rsu_range_m legitimately hears distant honest
+                # vehicles and must not flag them as out-of-range.
                 det["acceptanceRangeThreshold"] = max(0.0, math.hypot(cx - rxx, cy - rxy)
-                                                      - cfg.radio_range_m) / cfg.art_max_m
+                                                      - rr) / cfg.art_max_m
                 det["beaconFrequency"] = b["msg_count"] / cfg.freq_max
                 det["staleOrReplay"] = max(det.get("staleOrReplay", 0.0), (t - b["cg"]) / cfg.stale_max_s)
                 det["mapOffRoad"] = _offroad(cx, cy) / cfg.offroad_tol_m
@@ -1831,17 +1882,32 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 txx, txy = rx_pos.get(tx.vid, tx.true_state(t)[:2])
                 cand = [v for v in active_list if not v.is_attacker and not enforced(v, t)
                         and math.hypot(rx_pos[v.vid][0] - txx, rx_pos[v.vid][1] - txy) <= cfg.radio_range_m]
-                victim_vehicles = cand[:2]
+                if cfg.victim_pct <= 0.0:
+                    victim_vehicles = cand[:2]                   # legacy default -> byte-identical
+                else:
+                    # honor victim_pct in flow too, mirroring the fixed-fleet victim_pool: a STABLE
+                    # fraction of benign vehicles are designated victims for the whole run (a per-
+                    # vehicle coin keyed by seed, shared across colluders), and a colluder frames the
+                    # designated victims currently in range. Stable targeting (vs re-sampling each
+                    # step) keeps a colluder's victim set persistent, as in fixed mode.
+                    victim_vehicles = [v for v in cand if _is_flow_victim(v.vid)]
             else:
                 victim_vehicles = [vehicles[vv] for vv in tx.victims if vv in active and not enforced(active[vv], t)]
             for victim in victim_vehicles:
                 subject_digest = victim.active_pseudonym(t, cfg.rotate_period_s)["digest"]
                 if rng.random() > cfg.report_prob:
                     continue
+                # Fabricate PLAUSIBLE evidence from the colluder's own keyed stream so the detector
+                # score and pos-confidence VARY per report within the range genuine misbehavior
+                # reports occupy (positionSpeedInconsistency ~1..4, conf ~2..9), instead of a constant
+                # fingerprint (was 1.3 / 5.0) an ML model could use as a free collusion oracle. The
+                # report still frames this victim; its label stays malicious_false_report.
+                cfab = collude_fab_rng.setdefault(tx.vid, random.Random(f"{cfg.seed}:collude_fab:{tx.vid}"))
                 det = {k: 0.0 for k in DET_KEYS}
-                det["positionSpeedInconsistency"] = 1.3         # plausible fabricated evidence
+                det["positionSpeedInconsistency"] = cfab.uniform(1.05, 4.0)
+                fab_conf = cfab.uniform(2.0, 9.0)
                 file_report(t, reporter_digest, subject_digest, victim,
-                            ["positionSpeedInconsistency"], det, 5.0, 0.0, 0.0, 0.0, 0.0, malicious=True)
+                            ["positionSpeedInconsistency"], det, fab_conf, 0.0, 0.0, 0.0, 0.0, malicious=True)
 
         # Online MA decision: revoke subjects with SUSTAINED, TRUSTED evidence in a RECENT window.
         # (Lifetime-accumulated evidence would let bursty benign faults spread over a long trip add
