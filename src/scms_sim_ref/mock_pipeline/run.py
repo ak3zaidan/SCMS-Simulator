@@ -242,6 +242,15 @@ class PipelineConfig:
     idm_lookahead_m: float = 70.0        # leader search distance ahead
     traffic_lights: bool = False         # signalized intersections (grid nodes) -> stops & queues
     light_cycle_s: float = 24.0          # full signal cycle (half green per axis)
+    # per-edge speed hierarchy (highway vs residential). OFF by default -> byte-identical output.
+    # GRID: every arterial_every-th row & column is an arterial posted at arterial_speed_mps; all
+    # other (local) roads are posted at local_speed_mps (0 for either tier = uncapped, i.e. the
+    # vehicle's desired speed). RING: arterial_speed_mps caps the whole ring (no rows/columns to
+    # tier), and arterial_every/local_speed_mps do not apply. arterial_every == 0 disables the grid
+    # rule; arterial_speed_mps == 0 disables the ring cap.
+    arterial_every: int = 0              # grid: spacing (in grid lines) of arterial roads (0 = off)
+    arterial_speed_mps: float = 0.0      # arterial cap (grid) / whole-ring cap (ring); 0 = uncapped
+    local_speed_mps: float = 0.0         # grid: local (non-arterial) road cap; 0 = uncapped
     # cornering: vehicles slow into sharp turns rather than taking 90-degree grid corners at full
     # speed -> realistic speed dips at intersections (opt-in; car-following + grid only). Off by
     # default: it makes benign kinematics harder to separate from attacks (more realistic, but it
@@ -665,6 +674,13 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"grid_block_m must be > 0 (got {cfg.grid_block_m})")
     if not (0.0 <= cfg.grid_dropout <= 1.0):
         raise ValueError(f"grid_dropout must be in [0,1] (got {cfg.grid_dropout})")
+    if cfg.arterial_every < 0:
+        raise ValueError(f"arterial_every must be >= 0 (0 = off) (got {cfg.arterial_every})")
+    for _nm in ("arterial_speed_mps", "local_speed_mps"):   # 0 = uncapped; else a posted limit
+        _sp = float(getattr(cfg, _nm))
+        if _sp and not (1.0 <= _sp <= 70.0):
+            raise ValueError(f"{_nm} must be 0 (uncapped) or 1-70 m/s "
+                             f"(33 ~ 120 km/h highway, 8.3 ~ 30 km/h zone) (got {_sp})")
     if cfg.fleet != "mixed" and cfg.fleet not in VEHICLE_TYPES:
         raise ValueError(f"fleet must be 'mixed' or one of {sorted(VEHICLE_TYPES)} (got {cfg.fleet!r})")
     _parse_fleet_mix(cfg.fleet_mix)      # raises ValueError on a bad class name / weight
@@ -727,7 +743,8 @@ def _field_group(name: str) -> str:
         ("Mobility", ("fleet", "trip_", "idm_", "demand", "arrival", "n_lanes", "lane_", "turn_",
                       "car_following", "veh_length", "od_", "boundary", "traffic_flow", "duration",
                       "max_total", "nominal_speed", "state_prune")),
-        ("Network", ("road_network", "grid", "custom_network", "traffic_lights", "light_cycle")),
+        ("Network", ("road_network", "grid", "custom_network", "traffic_lights", "light_cycle",
+                     "arterial", "local_speed")),
         ("Scenario events", ("events",)),
         ("GNSS/sensor", ("gps_", "faulty", "weather")),
         ("Radio", ("radio", "packet", "nlos", "chan", "freq", "art_max", "stale")),
@@ -809,6 +826,12 @@ _FIELD_META = {
     "grid_dropout": dict(h="Fraction of grid roads removed (irregular grid; stays connected)", lo=0, hi=1, st=0.05),
     "traffic_lights": dict(h="Signalized intersections (stops + queues)"),
     "light_cycle_s": dict(h="Full signal cycle; half green per axis", lo=2, hi=120, u="s"),
+    "arterial_every": dict(h="Grid: every Nth row & column is a faster arterial road (0 = off)",
+                           lo=0, hi=10, st=1),
+    "arterial_speed_mps": dict(h="Speed limit on arterial roads (grid) / the whole ring (0 = uncapped)",
+                               lo=0, hi=70, st=1, u="m/s"),
+    "local_speed_mps": dict(h="Grid: speed limit on local (non-arterial) roads (0 = uncapped)",
+                            lo=0, hi=70, st=1, u="m/s"),
     # Attacks
     "attacker_ids": dict(h="Fixed-fleet attacker vehicle ids (used only when attacker_pct = 0)"),
     "attacker_pct": dict(h="Fraction of vehicles that are attackers", lo=0, hi=1, st=0.05),
@@ -976,10 +999,13 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     if cfg.road_network == "grid":
         from .roads import GridNetwork
         net = GridNetwork(cfg.grid_w, cfg.grid_h, cfg.grid_block_m,
-                          dropout=cfg.grid_dropout, seed=cfg.seed)
+                          dropout=cfg.grid_dropout, seed=cfg.seed,
+                          arterial_every=cfg.arterial_every,
+                          arterial_speed=cfg.arterial_speed_mps, local_speed=cfg.local_speed_mps)
     elif cfg.road_network == "ring":
         from .roads import RingNetwork
-        net = RingNetwork(cfg.grid_w, cfg.grid_block_m)   # grid_w = number of ring intersections
+        net = RingNetwork(cfg.grid_w, cfg.grid_block_m,   # grid_w = number of ring intersections
+                          ring_speed=cfg.arterial_speed_mps)
     elif cfg.road_network == "spider":
         from .roads import CustomNetwork, spider_graph
         net = CustomNetwork(*spider_graph(cfg.grid_w, cfg.grid_h, cfg.grid_block_m))
@@ -1550,9 +1576,11 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     def _offroad(x, y):
         return net.dist_to_road(x, y) if net is not None else 0.0
 
-    def _light_green(nx: int, ny: int, axis_x: bool, t: float) -> bool:
-        # checkerboard phase offset so adjacent intersections alternate; each axis gets half the cycle
-        offset = ((nx + ny) % 2) * _half_cycle
+    def _light_green(phase: int, axis_x: bool, t: float) -> bool:
+        # `phase` (0/1) is a stable per-intersection 2-colouring from the network (net.node_phase),
+        # so adjacent intersections alternate on ANY topology; each axis gets half the cycle. (On a
+        # grid this equals the historical (i+j)%2 checkerboard -> grid signal timing is unchanged.)
+        offset = (phase % 2) * _half_cycle
         x_phase = int((t + offset) // _half_cycle) % 2 == 0
         return x_phase == axis_x
 
@@ -1596,10 +1624,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             if _lights:                                  # stop at a red signal on the next intersection
                 node, dnode = v.trip.next_node(v.s_pos)
                 if node is not None and dnode < cfg.idm_lookahead_m:
-                    ni = int(round(node[0] / cfg.grid_block_m))
-                    nj = int(round(node[1] / cfg.grid_block_m))
+                    phase = net.node_phase(node)         # stable 2-colouring (topology-agnostic)
                     axis_x = abs(cosh) >= abs(sinh)      # travelling mostly E-W vs N-S
-                    if not _light_green(ni, nj, axis_x, t):
+                    if not _light_green(phase, axis_x, t):
                         stop_gap = max(0.0, dnode - 2.0)  # halt ~2 m before the stop line
                         if stop_gap < best_gap:
                             best_gap, best_v, best_len = stop_gap, 0.0, 0.0
@@ -2128,6 +2155,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--lanes", type=int, default=1, help="parallel lanes per road (overtaking; reduces gridlock)")
     p.add_argument("--lane-width", type=float, default=3.5, help="lane width (m) for multi-lane offsets")
     p.add_argument("--light-cycle", type=float, default=24.0, help="traffic-light full cycle (s); half green per axis")
+    p.add_argument("--arterial-every", type=int, default=0,
+                   help="grid: every Nth row & column is a faster arterial road (0=off)")
+    p.add_argument("--arterial-speed", type=float, default=0.0,
+                   help="speed limit (m/s) on arterials (grid) / the whole ring (0=uncapped)")
+    p.add_argument("--local-speed", type=float, default=0.0,
+                   help="grid: speed limit (m/s) on local (non-arterial) roads (0=uncapped)")
     p.add_argument("--od-model", default="uniform", choices=["uniform", "gravity"],
                    help="trip destination law: uniform | gravity (realistic distance-decay trip lengths)")
     p.add_argument("--od-gravity-scale", type=float, default=2.0,
@@ -2231,6 +2264,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                          grid_w=args.grid, grid_h=(args.grid_h or args.grid), grid_block_m=args.grid_block,
                          n_lanes=args.lanes, lane_width_m=args.lane_width, light_cycle_s=args.light_cycle,
                          grid_dropout=args.grid_dropout,
+                         arterial_every=args.arterial_every, arterial_speed_mps=args.arterial_speed,
+                         local_speed_mps=args.local_speed,
                          demand_profile=args.demand, od_model=args.od_model,
                          od_gravity_scale=args.od_gravity_scale, boundary_origins=args.boundary_origins,
                          n_rsus=args.n_rsus, rsu_placement=args.rsu_placement, rsu_range_m=args.rsu_range,

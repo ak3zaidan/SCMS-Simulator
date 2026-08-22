@@ -102,8 +102,17 @@ class Trip:
 class GridNetwork:
     """A w x h grid of intersections spaced `block` metres apart, 4-neighbour roads."""
 
-    def __init__(self, w: int, h: int, block: float, dropout: float = 0.0, seed: int = 0):
+    def __init__(self, w: int, h: int, block: float, dropout: float = 0.0, seed: int = 0,
+                 arterial_every: int = 0, arterial_speed: float = 0.0, local_speed: float = 0.0):
         self.w, self.h, self.block = int(w), int(h), float(block)
+        # OPT-IN per-edge speed hierarchy (highway vs residential). arterial_every == 0 disables it
+        # entirely -> random_trip attaches NO caps -> byte-identical to a plain grid. When enabled,
+        # every arterial_every-th grid row and column is an arterial (through-road) posted at
+        # arterial_speed; all other (local) roads are posted at local_speed. A 0 speed means that
+        # tier is uncapped (vehicles drive their desired speed there).
+        self.arterial_every = max(0, int(arterial_every))
+        self.arterial_speed = float(arterial_speed)
+        self.local_speed = float(local_speed)
         self.nodes = [(i, j) for i in range(self.w) for j in range(self.h)]
         self.center = (self.w // 2, self.h // 2)
         # perimeter intersections: realistic traffic sources/sinks (edges of the modelled area)
@@ -149,6 +158,27 @@ class GridNetwork:
 
     def _coord(self, n: tuple[int, int]) -> tuple[float, float]:
         return (n[0] * self.block, n[1] * self.block)
+
+    def node_phase(self, node) -> int:
+        """Deterministic 2-colouring of an intersection for signal timing: the grid checkerboard
+        (i + j) % 2, recovered from the node's metre coordinate. `node` is an (x, y) waypoint (what
+        Trip.next_node returns), so a signal's phase is a STABLE property of the intersection rather
+        than something re-derived from arbitrary coordinates. Matches the historical grid phase
+        exactly (coords are integer multiples of `block`), so grid signal timing is byte-identical."""
+        ni = int(round(node[0] / self.block))
+        nj = int(round(node[1] / self.block))
+        return (ni + nj) % 2
+
+    def _edge_cap(self, n1: tuple[int, int], n2: tuple[int, int]):
+        """Posted speed limit (m/s) for the grid edge n1-n2, or None (uncapped). Arterials are the
+        every-Nth rows/columns; everything else is local. Only called when the feature is enabled."""
+        (i1, j1), (i2, j2) = n1, n2
+        if j1 == j2:                                     # horizontal edge -> runs along row j1
+            arterial = (j1 % self.arterial_every == 0)
+        else:                                            # vertical edge -> runs along column i1
+            arterial = (i1 % self.arterial_every == 0)
+        sp = self.arterial_speed if arterial else self.local_speed
+        return sp if sp > 0 else None
 
     def dist_to_road(self, x: float, y: float) -> float:
         """HD-map check: distance from (x,y) to the nearest road. On a grid the roads are the lines
@@ -262,8 +292,12 @@ class GridNetwork:
                 if abs(cand[0] - o[0]) + abs(cand[1] - o[1]) >= min_hops:
                     d = cand
                     break
-        wp = [self._coord(n) for n in self._bfs(o, d)]
-        return Trip(wp, speed, spawn_time)
+        path = self._bfs(o, d)
+        wp = [self._coord(n) for n in path]
+        caps = None
+        if self.arterial_every > 0 and (self.arterial_speed > 0 or self.local_speed > 0):
+            caps = [self._edge_cap(a, b) for a, b in zip(path, path[1:])]
+        return Trip(wp, speed, spawn_time, caps=caps)
 
 
 def _pt_seg_dist(px, py, ax, ay, bx, by):
@@ -278,9 +312,13 @@ class RingNetwork:
     """A ring road: `n` intersections evenly spaced on a circle, connected in a cycle. Vehicles route
     the shorter way round. Same Trip/coord interface as GridNetwork (topology-agnostic downstream)."""
 
-    def __init__(self, n: int, block: float):
+    def __init__(self, n: int, block: float, ring_speed: float = 0.0):
         self.n = max(3, int(n))
         self.block = float(block)
+        # OPT-IN single speed limit for the whole ring (m/s); 0 = uncapped -> no caps -> byte-identical.
+        # A ring has no row/column structure, so a per-edge arterial rule does not apply; a uniform
+        # posted limit is the natural analogue (documented deviation from the grid's tiered rule).
+        self.ring_speed = float(ring_speed)
         self.R = self.n * self.block / (2.0 * math.pi)     # circumference ~ n*block
         self.cx = self.cy = self.R                          # centre (keeps coords >= 0)
         self.nodes = list(range(self.n))
@@ -291,6 +329,14 @@ class RingNetwork:
     def _coord(self, i: int) -> tuple[float, float]:
         th = 2.0 * math.pi * (i % self.n) / self.n
         return (self.cx + self.R * math.cos(th), self.cy + self.R * math.sin(th))
+
+    def node_phase(self, node) -> int:
+        """Deterministic 2-colouring for signal timing: alternate around the ring by node index
+        parity. `node` is an (x, y) waypoint; recover the ring index from its polar angle. Adjacent
+        ring intersections alternate phase, giving coherent (not coordinate-noise) signal timing."""
+        th = math.atan2(node[1] - self.cy, node[0] - self.cx)
+        i = int(round(th / (2.0 * math.pi) * self.n)) % self.n
+        return i % 2
 
     def _arc(self, o: int, d: int) -> list[int]:
         cw, ccw = (d - o) % self.n, (o - d) % self.n
@@ -316,7 +362,8 @@ class RingNetwork:
                 d = cand
                 break
         wp = [self._coord(i) for i in self._arc(o, d)]
-        return Trip(wp, speed, spawn_time)
+        caps = [self.ring_speed] * (len(wp) - 1) if self.ring_speed > 0 else None
+        return Trip(wp, speed, spawn_time, caps=caps)
 
     def geometry(self) -> dict:
         return {"nodes": [[*self._coord(i)] for i in self.nodes],
@@ -425,9 +472,43 @@ class CustomNetwork:
         self._max_ring = int(max(self.bbox[2] - self.bbox[0], self.bbox[3] - self.bbox[1])
                              // self._cell) + 2
         self._d2r_cache: dict = {}
+        self._phase: dict | None = None        # lazily-built deterministic node 2-colouring
+        self._coord_idx: dict | None = None    # lazily-built coord -> node index (for node_phase)
 
     def _coord(self, i: int) -> tuple[float, float]:
         return self.coords[i]
+
+    def _colouring(self) -> dict[int, int]:
+        """Deterministic graph 2-colouring by BFS: the root of each component is colour 0 and every
+        step flips colour, so tree edges always join opposite colours (a proper 2-colouring on any
+        bipartite map; a stable, deterministic near-2-colouring otherwise). Nodes visited in index
+        order -> byte-stable. Used to phase traffic signals on arbitrary (spider/custom/OSM) maps."""
+        colour: dict[int, int] = {}
+        for start in self.nodes:
+            if start in colour:
+                continue
+            colour[start] = 0
+            q = deque([start])
+            while q:
+                u = q.popleft()
+                for v, _w in self.adj[u]:
+                    if v not in colour:
+                        colour[v] = colour[u] ^ 1
+                        q.append(v)
+        return colour
+
+    def node_phase(self, node) -> int:
+        """Deterministic 0/1 signal phase for the intersection at (x, y) = `node` (a Trip waypoint),
+        from the graph 2-colouring. Adjacent intersections alternate, so signals have a coherent
+        phase on any topology instead of the meaningless grid-coordinate arithmetic used before."""
+        if self._phase is None:
+            self._phase = self._colouring()
+        if self._coord_idx is None:
+            self._coord_idx = {}
+            for i, c in enumerate(self.coords):
+                self._coord_idx.setdefault(c, i)
+        i = self._coord_idx.get(tuple(node))
+        return 0 if i is None else self._phase.get(i, 0)
 
     def _open_adj(self, i: int):
         if not self._closed:
