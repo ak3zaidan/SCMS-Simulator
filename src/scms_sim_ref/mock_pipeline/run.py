@@ -160,6 +160,10 @@ class PipelineConfig:
     attack_duty_cycle: float = 1.0       # <1: attacker falsifies only in bursts (evades sustained-
                                          # evidence revocation); fraction of each pulse period "on"
     attack_pulse_period_s: float = 20.0  # length of one on/off pulse cycle when duty_cycle < 1
+    # CRL-aware evasion: an attacker that WATCHES the public CRL and lies low after an accomplice is
+    # revoked -- a realistic feedback-aware adversary that starves the detector of sustained evidence.
+    crl_aware_pct: float = 0.0           # fraction of ATTACKERS that monitor the (public) CRL
+    crl_dormant_s: float = 45.0          # dormancy after observing a new revocation (broadcast honestly)
     # --- GNSS / sensor realism ---
     gps_sigma_m: float = 1.2             # white per-axis noise (× per-vehicle quality × weather)
     gps_bias_sigma_m: float = 1.5        # OU-correlated slow bias amplitude
@@ -366,6 +370,9 @@ class Vehicle:
     attack_from: float = 0.0
     attack_to: float = 0.0
     pulse_phase: float = 0.0               # per-vehicle offset [0,1) for intermittent (pulsed) attacks
+    crl_aware: bool = False                 # watches the public CRL and goes dormant after a bust
+    dormant_until: float = 0.0             # CRL-aware: broadcast honestly (no falsification) while t < this
+    crl_seen: int = 0                      # last observed CRL size (excluding this vehicle's own entry)
     # vehicle class (heterogeneous fleet)
     veh_type: str = "car"
     veh_length: float = 4.5
@@ -429,6 +436,13 @@ class RunResult:
     revoked_cert_digests: list[str]
     data_digest: str
     counts: dict = field(default_factory=dict)
+
+
+@dataclass
+class _GtVehicleAware(R.GtVehicle):
+    """gt_vehicle row carrying the ORACLE-only is_crl_aware label. Emitted ONLY when crl_aware_pct>0
+    so the default path stays byte-identical (plain R.GtVehicle). Inherits to_dict()/asdict()."""
+    is_crl_aware: bool = False
 
 
 def _parse_rsu_coords(s: str) -> list:
@@ -577,7 +591,7 @@ def _ang_diff(a: float, b: float) -> float:
 
 _PROB_FIELDS = ("report_prob", "attacker_pct", "faulty_pct", "collude_pct", "victim_pct",
                 "packet_loss_base", "nlos_loss", "gps_outlier_rate", "gps_degrade_rate",
-                "attack_duty_cycle")
+                "attack_duty_cycle", "crl_aware_pct")
 
 # Named CLI scenario presets (mirror the GUI one-click presets). Keys are argparse dests, so any flag
 # the user also passes still overrides the preset (they are applied via parser.set_defaults). Reach a
@@ -629,6 +643,8 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"turn_speed_mps must be >= 0 (got {cfg.turn_speed_mps})")
     if cfg.attack_pulse_period_s <= 0:
         raise ValueError(f"attack_pulse_period_s must be > 0 (got {cfg.attack_pulse_period_s})")
+    if cfg.crl_dormant_s <= 0:
+        raise ValueError(f"crl_dormant_s must be > 0 (got {cfg.crl_dormant_s})")
     if cfg.od_gravity_scale <= 0:
         raise ValueError(f"od_gravity_scale must be > 0 (got {cfg.od_gravity_scale})")
     if cfg.n_rsus < 0:
@@ -696,7 +712,8 @@ def _field_group(name: str) -> str:
     """Category for a config field, so UIs/tools can group the ~97 knobs sensibly."""
     g = [
         ("RSU", ("n_rsus", "rsu_")),
-        ("Attacks", ("attack", "attacker", "sybil", "collude", "victim", "dos", "delay")),
+        ("Attacks", ("attack", "attacker", "sybil", "collude", "victim", "dos", "delay",
+                     "crl_aware", "crl_dormant")),
         ("Mobility", ("fleet", "trip_", "idm_", "demand", "arrival", "n_lanes", "lane_", "turn_",
                       "car_following", "veh_length", "od_", "boundary", "traffic_flow", "duration",
                       "max_total", "nominal_speed", "state_prune")),
@@ -792,6 +809,8 @@ _FIELD_META = {
     "attack_mix": dict(h="Per-type weights, e.g. ConstPos:0.6,Sybil:0.4 (blank = round-robin)"),
     "attack_duty_cycle": dict(h="Fraction of each pulse the attacker falsifies (<1 = intermittent)", lo=0, hi=1, st=0.05),
     "attack_pulse_period_s": dict(h="On/off cycle length for pulsed attacks", lo=1, u="s"),
+    "crl_aware_pct": dict(h="Fraction of attackers that watch the public CRL and lie low after a bust", lo=0, hi=1, st=0.05),
+    "crl_dormant_s": dict(h="How long a CRL-aware attacker broadcasts honestly after a new revocation", lo=1, u="s"),
     "attack_delay_s": dict(h="Flow: attacker starts falsifying this long after spawn", lo=0, u="s"),
     "attack_delay_jitter_s": dict(h="Spread attacker onset by up to this much", lo=0, u="s"),
     "dos_burst": dict(h="CAMs per interval a DoS attacker floods", lo=1),
@@ -1075,6 +1094,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         v.attack_to = (spawn_time + life) if cfg.traffic_flow else cfg.attack_end
         if is_att and cfg.attack_duty_cycle < 1.0:   # desync pulses across attackers (own rng stream)
             v.pulse_phase = random.Random(f"{cfg.seed}:pulse:{vid}").random()
+        if is_att and cfg.crl_aware_pct > 0:          # CRL-aware assignment (own rng; default draws none)
+            v.crl_aware = random.Random(f"{cfg.seed}:crlaware:{vid}").random() < cfg.crl_aware_pct
         if is_att and atype == "Sybil":
             for g in range(cfg.sybil_ghosts):
                 gj = (cfg.jmax - 1 - g) % cfg.jmax
@@ -1088,10 +1109,13 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                                                 i_period=0, valid_from=round(spawn_time, 3),
                                                 valid_to=round(spawn_time + life, 3)))
         vehicles.append(v)
-        gt_vehicle.append(R.GtVehicle(true_vehicle_id=true_id, spawn_time=round(spawn_time, 3),
-                                      is_attacker=is_att, attacker_role=(atype if is_att else "none"),
-                                      is_faulty=is_flt, veh_type=vtype,
-                                      colluding_group_id=("colluders" if is_coll else None)))
+        gt_kw = dict(true_vehicle_id=true_id, spawn_time=round(spawn_time, 3),
+                     is_attacker=is_att, attacker_role=(atype if is_att else "none"),
+                     is_faulty=is_flt, veh_type=vtype,
+                     colluding_group_id=("colluders" if is_coll else None))
+        # is_crl_aware is an ORACLE label; emit it ONLY when the feature is on -> default byte-identical
+        gt_vehicle.append(_GtVehicleAware(is_crl_aware=v.crl_aware, **gt_kw)
+                          if cfg.crl_aware_pct > 0 else R.GtVehicle(**gt_kw))
         return v
 
     if cfg.traffic_flow:
@@ -1605,6 +1629,13 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 period = max(1e-6, cfg.attack_pulse_period_s)
                 phase = ((t - tx.attack_from) / period + tx.pulse_phase) % 1.0
                 attacking = phase < cfg.attack_duty_cycle
+            if attacking and tx.crl_aware:            # CRL-aware: watch the PUBLIC CRL, lie low after a bust
+                seen = len(revoked_vehicles) - (1 if tx.vid in revoked_vehicles else 0)
+                if seen > tx.crl_seen:                # an accomplice was just revoked -> go dormant
+                    tx.dormant_until = t + cfg.crl_dormant_s
+                    tx.crl_seen = seen
+                if t < tx.dormant_until:              # broadcast honestly until the heat dies down
+                    attacking = False
             if (not attacking) and cfg.gps_jam_rate > 0:
                 r = vrng[tx.vid]
                 if t >= tx.jam_until and r.random() < cfg.gps_jam_rate:
@@ -2005,6 +2036,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--collude-pct", type=float, default=0.0, help="fraction of attackers that false-report")
     p.add_argument("--victim-pct", type=float, default=0.10, help="fraction of benign vehicles targeted")
     p.add_argument("--sybil-ghosts", type=int, default=6, help="ghost identities a Sybil attacker fakes")
+    p.add_argument("--crl-aware-pct", type=float, default=0.0,
+                   help="fraction of attackers that watch the public CRL and go dormant after a bust")
+    p.add_argument("--crl-dormant-s", type=float, default=45.0,
+                   help="how long a CRL-aware attacker lies low (broadcasts honestly) after a new revocation")
     p.add_argument("--no-ma-defense", action="store_true", help="disable trusted-reporter gating")
     p.add_argument("--radio-range", type=float, default=500.0, help="reception range (m)")
     p.add_argument("--packet-loss", type=float, default=0.0, help="baseline per-message loss")
@@ -2120,6 +2155,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                          weather=args.weather, rotate_period_s=args.rotate_period,
                          collude_pct=args.collude_pct, victim_pct=args.victim_pct,
                          sybil_ghosts=args.sybil_ghosts, ma_defense=not args.no_ma_defense,
+                         crl_aware_pct=args.crl_aware_pct, crl_dormant_s=args.crl_dormant_s,
                          radio_range_m=args.radio_range, packet_loss_base=args.packet_loss,
                          nlos_loss=args.nlos, chan_capacity=args.chan_capacity,
                          traffic_flow=args.flow, duration_s=args.duration, arrival_rate=args.arrival_rate,
