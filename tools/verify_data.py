@@ -326,10 +326,13 @@ def audit(ds_dir: Path):
     attackers |= {a.get("true_vehicle_id") for a in gt_attacks if a.get("true_vehicle_id")}
     faulty = {tid for tid, f in veh_faulty.items() if f}
 
-    # E3: graph integrity -- every edge endpoint is a known entity id, and the edge count reconciles
-    # with the reports that survived featurization. featurize.build() emits a reporter->subject edge
-    # iff BOTH pseudonym certs resolve to a true vehicle via the identity map (RSU-reported certs are
-    # infrastructure and do NOT resolve), so #edges == #reports whose reporter AND subject both resolve.
+    # E3: graph integrity -- every edge endpoint resolves, and the edge count reconciles with the
+    # reports that survived featurization. featurize emits a reporter->subject edge for each report
+    # whose SUBJECT cert resolves to a true vehicle. A VEHICLE reporter also resolves (its src is a
+    # known entity id); an RSU/infrastructure reporter does NOT resolve -- it is emitted as an opaque
+    # "rsu_" node flagged is_infrastructure=1, so its src is legitimately outside the vehicle node set.
+    # Datasets predating the RSU-graph feature have no is_infrastructure column and dropped RSU reports
+    # entirely (edge iff BOTH resolve); we reconcile against whichever regime the columns indicate.
     ge_path = ml / "graph_edges.csv"
     edge_cols, edge_rows = read_csv(ge_path)
     node_ids = set()
@@ -340,19 +343,29 @@ def audit(ds_dir: Path):
     if not ge_path.exists() or not node_ids:
         rec(ds, "E3_graph_integrity", None, "no graph_edges/node tables")
     else:
-        edge_ents = ({r.get("src_entity") for r in edge_rows}
-                     | {r.get("dst_entity") for r in edge_rows}) - {None}
-        orphan = edge_ents - node_ids
+        def _is_infra(r):
+            return str(r.get("is_infrastructure", "0")) in ("1", "True", "true")
+        # every dst (subject) resolves; every NON-infra src (vehicle reporter) resolves
+        need_resolve = {r.get("dst_entity") for r in edge_rows}
+        need_resolve |= {r.get("src_entity") for r in edge_rows if not _is_infra(r)}
+        orphan = (need_resolve - {None}) - node_ids
+        # infrastructure edges must carry an opaque rsu_ src (never a real/enrolled id)
+        infra_bad = {r.get("src_entity") for r in edge_rows
+                     if _is_infra(r) and not str(r.get("src_entity") or "").startswith("rsu_")}
         if ma_reports and digest2true:
             known = set(digest2true)
-            expected = sum(1 for r in ma_reports
-                           if r.get("subject_cert_digest") in known
-                           and r.get("reporter_cert_digest") in known)
+            if "is_infrastructure" in edge_cols:         # RSU-graph regime: edge per subject-resolving report
+                expected = sum(1 for r in ma_reports if r.get("subject_cert_digest") in known)
+            else:                                        # legacy regime: edge iff both resolve
+                expected = sum(1 for r in ma_reports
+                               if r.get("subject_cert_digest") in known
+                               and r.get("reporter_cert_digest") in known)
             count_ok = len(edge_rows) == expected
         else:
             expected, count_ok = None, True
-        rec(ds, "E3_graph_integrity", (not orphan) and count_ok,
-            f"orphan_edge_entities={len(orphan)} edges={len(edge_rows)} expected_from_reports={expected}")
+        rec(ds, "E3_graph_integrity", (not orphan) and (not infra_bad) and count_ok,
+            f"orphan_edge_entities={len(orphan)} infra_bad={len(infra_bad)} "
+            f"edges={len(edge_rows)} expected_from_reports={expected}")
 
     # SCHEMA1: ml/schema.json must not advertise as a model feature any column the benchmark drops.
     # benchmark._feature_matrix() excludes benchmark._DROP from the feature matrix, so schema.json
