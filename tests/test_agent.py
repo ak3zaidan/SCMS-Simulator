@@ -204,6 +204,23 @@ def test_get_network_supports_incremental_editing():
     assert r3["ok"] and r3["road_network"] == "spider" and len(r3["nodes"]) == 1 + 6 * 2
 
 
+def test_import_osm_activates_a_real_city(tmp_path, monkeypatch):
+    """import_osm loads a real street graph as the active custom map (skipped offline)."""
+    import urllib.error
+    s = agent.AgentSession()
+    try:
+        r = agent._exec_tool(s, "import_osm", {"city": "ingolstadt"})
+    except (urllib.error.URLError, OSError):             # no network and no cache yet
+        pytest.skip("no network access for the OSM fetch")
+    if "error" in r and ("urlopen" in r["error"].lower() or "timed" in r["error"].lower()):
+        pytest.skip(f"OSM fetch unavailable: {r['error'][:80]}")
+    assert r["ok"] and r["network"]["n_nodes"] > 50      # a real city core, not a toy
+    assert s.config["road_network"] == "custom" and s.config["traffic_flow"] is True
+    assert r["network"].get("speed_limited_edges", 0) > 10   # real speed limits came through
+    bad = agent._exec_tool(s, "import_osm", {})
+    assert "error" in bad
+
+
 def test_set_events_tool_validates_and_stores():
     s = agent.AgentSession()
     r = agent._exec_tool(s, "set_events", {"events": [

@@ -25,6 +25,7 @@ from scms_sim_ref.mock_pipeline import (PipelineConfig, run_pipeline, config_fro
                                         validate_config, config_schema)
 from scms_sim_ref.mock_pipeline.run import CLI_PRESETS, EVENT_TYPES, _parse_events        # noqa: E402
 from scms_sim_ref.mock_pipeline.roads import CustomNetwork                                # noqa: E402
+from scms_sim_ref.mock_pipeline.osm import CITY_BBOXES, import_city                       # noqa: E402
 from scms_sim_ref.datagen import validate as validate_mod, benchmark as benchmark_mod, featurize  # noqa: E402
 
 AGENT_OUT = REPO / "datasets" / "agent_run"
@@ -125,7 +126,10 @@ def system_prompt() -> str:
         "types, detector_reliability (report-level precision per detector), vehicle/subject ML AUCs, "
         "detection latency, and rsu_contribution. Higher attacker_pct/intensity = easier; stealth/"
         "pulsed/low-intensity = harder; RSUs help in sparse traffic; collusion lowers precision.\n\n"
-        "MAP DESIGN: you can create ANY environment. Built-ins: road_network=grid (grid_w x grid_h, "
+        "MAP DESIGN: you can create ANY environment -- including REAL cities: import_osm loads an "
+        "actual OpenStreetMap street graph (real geometry + speed limits) for the named city cores "
+        "or any small bbox; prefer it whenever the user names a real place. Built-ins: "
+        "road_network=grid (grid_w x grid_h, "
         "grid_block_m spacing, grid_dropout for irregularity), ring (grid_w nodes), spider (radial "
         "city: grid_w arms x grid_h rings). For everything else use the design_network tool to submit "
         "your own map: nodes = [[x,y], ...] intersection coordinates in METRES (60-250 m spacing is "
@@ -243,6 +247,18 @@ def tool_specs() -> list:
                           "pairs; the graph must be CONNECTED",
                           "items": {"type": "array", "items": {"type": "integer"}}}},
                 "required": ["nodes", "edges"]}}},
+        {"type": "function", "function": {
+            "name": "import_osm",
+            "description": "Import a REAL city's street network from OpenStreetMap as the active "
+                           "map (real geometry + real speed limits). Named city cores: "
+                           + ", ".join(sorted(CITY_BBOXES)) + "; or pass bbox "
+                           "[minLon,minLat,maxLon,maxLat] (keep it a city-core-sized area). "
+                           "Cached after the first download.",
+            "parameters": {"type": "object", "properties": {
+                "city": {"type": "string", "enum": sorted(CITY_BBOXES)},
+                "bbox": {"type": "array", "items": {"type": "number"},
+                         "description": "[minLon, minLat, maxLon, maxLat] (alternative to city)"}},
+                }}},
         {"type": "function", "function": {
             "name": "get_network",
             "description": "Read back the CURRENT road map (nodes/edges + stats) so you can edit it "
@@ -565,6 +581,19 @@ def _exec_tool(session: AgentSession, name: str, args: dict) -> dict:
                 out["note"] += (f"; {len(added)} edge(s) auto-added to connect isolated parts: "
                                 f"{added} -- adjust if that is not the design intent")
             return out
+        if name == "import_osm":
+            target = args.get("city") or _maybe_json(args.get("bbox"))
+            if not target:
+                return {"error": "pass city (one of the named cores) or bbox "
+                                 "[minLon,minLat,maxLon,maxLat]"}
+            nodes, edges, info = import_city(target, str(REPO / "datasets" / "_osmcache"))
+            net = CustomNetwork(nodes, edges)
+            doc = json.dumps({"nodes": nodes, "edges": edges}, separators=(",", ":"))
+            session.config = {**session.config, "road_network": "custom", "custom_network": doc,
+                              "traffic_flow": True}
+            return {"ok": True, "source": info, "network": net.stats(),
+                    "note": "real OSM street graph activated (road_network=custom, "
+                            "traffic_flow=true) -- set arrival_rate/duration_s and run"}
         if name == "get_network":
             eff = session.effective_config()
             rn = eff.get("road_network")

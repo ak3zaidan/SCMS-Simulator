@@ -869,6 +869,7 @@ function renderStats(st){
 /* ================= AI Copilot ================= */
 let COPILOT_ON=false, chatBusy=false;
 const SUGGESTIONS=[
+  "Import the real streets of central Paris and run rush hour with 20% attackers",
   "Design a river town: two districts joined by two bridges, then close one bridge mid-run and show the effect",
   "Spider city with 8 avenues and 3 ring roads, rush-hour demand, 25% attackers — run it",
   "Build a highway with 5 on-ramps feeding a small downtown grid; fog rolls in halfway through",
@@ -927,6 +928,9 @@ function stepDesc(st){
   if(st.tool==='reset_config') return {d:'config reset to defaults'};
   if(st.tool==='get_config') return {d:'read current config'};
   if(st.tool==='describe_fields') return {d:'looked up: '+((a.names||[]).join(', '))};
+  if(st.tool==='import_osm'){ const n=r.network||{}, src=r.source||{};
+    return {d:`imported real city map · ${n.n_nodes??'?'} intersections, ${n.n_edges??'?'} roads`+
+      (src.dropped_classes&&src.dropped_classes.length?` (dropped: ${src.dropped_classes.join(',')})`:'')}; }
   if(st.tool==='get_network'){ const n=r.stats||{};
     return {d:'read map · '+(n.n_nodes?`${n.n_nodes} intersections, ${n.n_edges} roads`
       :(r.road_network||'?'))}; }
@@ -974,7 +978,7 @@ const TOOL_VERB={set_config:'configuring',apply_preset:'loading preset',run_and_
   sweep:'sweeping parameter',compare:'comparing variants',reset_config:'resetting',
   get_config:'reading config',describe_fields:'looking up fields',
   design_network:'designing the road map',set_events:'scheduling scenario events',
-  get_network:'reading the current map'};
+  get_network:'reading the current map',import_osm:'importing the real city map'};
 function renderSteps(container,steps,current){    // live-updatable step list (+ optional running row)
   let html=(steps||[]).map(stepCardHtml).join('');
   if(current) html+=`<div class="step running"><div class="t">${escH(current)}</div>`+
