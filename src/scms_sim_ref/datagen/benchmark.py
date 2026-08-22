@@ -23,12 +23,19 @@ import pandas as pd
 
 from .models import fit_gbdt, predict_gbdt
 
-_DROP = {"split", "time_split", "domain_id", "report_id", "subject_cert_digest",
-         "true_vehicle_id", "entity_id",
-         # Kept in the tables (for per-subject sequence ordering / graph), but NEVER used as model
-         # features: detection_time lets a model exploit absolute wall-clock, and crl_active_at_report
-         # is downstream of the MA's OWN revoke decision (revoked==attacker), i.e. target leakage.
-         "detection_time", "crl_active_at_report"}
+# Columns the model feature matrix NEVER trains on. This is the SINGLE SOURCE OF TRUTH for the
+# feature/non-feature boundary: featurize.py imports it so ml/schema.json (the machine-readable
+# contract) can never advertise a column here as kind="feature" (see featurize._col_kind). It mixes
+# id/label/split columns with two genuine leakage traps kept in the tables but excluded from models:
+# detection_time lets a model exploit absolute wall-clock, and crl_active_at_report is downstream of
+# the MA's OWN revoke decision (revoked==attacker), i.e. target leakage.
+EXCLUDED_FEATURE_COLUMNS = frozenset({
+    "split", "time_split", "domain_id", "report_id", "subject_cert_digest",
+    "true_vehicle_id", "entity_id",
+    "detection_time", "crl_active_at_report"})
+
+# Backwards-compatible alias for the internal feature-matrix builders below.
+_DROP = EXCLUDED_FEATURE_COLUMNS
 
 
 def _load(dataset_dir: str, name: str) -> pd.DataFrame | None:
