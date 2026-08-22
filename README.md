@@ -34,14 +34,19 @@ python -m scms_sim_ref.mock_pipeline.run --out datasets/poc_run   # small refere
 ```
 
 The built-in generator is a full microscopic traffic simulator: routed trips on a road network
-(grid, ring, radial spider city, or a fully **custom node/edge map** via `--road custom
---custom-network map.json`) with IDM car-following (queues/congestion), signalized intersections,
-time-of-day demand, a mixed fleet (car/moto/truck/bus), weather, range-limited lossy radio,
-21 attack types across 7 families, and a 13-signal detector suite with a windowed
-Misbehavior-Authority. A JSON `--events` timeline adds deterministic mid-run dynamics: demand
-surges, weather fronts, road closures, and coordinated attack waves. In the GUI, the AI Copilot
-designs custom maps and timelines from plain language. Deterministic (same seed + config →
-byte-identical data) and memory-bounded via streaming.
+(`--road` ∈ linear, grid, ring, radial **spider** city, or a fully **custom node/edge map** via
+`--road custom --custom-network map.json` — including a **real city** imported from OpenStreetMap)
+with IDM car-following (queues/congestion), signalized intersections, time-of-day demand, a mixed
+fleet (car/moto/truck/bus), weather, and range-limited lossy radio. It renders **21 attack types
+across 7 families** (position / speed / heading / timing / stealth / identity / credential) plus an
+opt-in **combined** family of 4 more that falsify several fields at once — **25 renderable types
+across 8 families** — including **CRL-aware evasive** attackers that go dormant after a bust
+(`--crl-aware-pct` / `--crl-dormant-s`). Reports are scored by a **12-detector suite (13 `detnorm`
+signals, incl. one soft Kalman feature)** feeding a windowed Misbehavior-Authority. A JSON
+`--events` timeline adds deterministic mid-run dynamics: demand surges, weather fronts, road
+closures, attack waves, and geofenced attack zones. In the GUI, the AI Copilot designs custom maps
+and timelines from plain language. Deterministic (same seed + config → byte-identical data) and
+memory-bounded via streaming.
 
 ```powershell
 # long-running routed traffic-flow simulation (spawn/despawn over time)
@@ -54,6 +59,37 @@ python -m scms_sim_ref.datagen.massive --grid medium --flow --out datasets/massi
 # one-command named scenario (flags still override); reproduce any past run byte-for-byte from its manifest
 python -m scms_sim_ref.mock_pipeline.run --preset urban_rush --featurize --out datasets/urban
 python -m scms_sim_ref.mock_pipeline.run --config datasets/urban/manifest.json --out datasets/replay
+```
+
+#### Scenario recipes
+
+```powershell
+# --- Custom / OSM map: import a real city's streets from OpenStreetMap, then run on it ---
+# (11 named cities: amsterdam, berlin, chicago, ingolstadt, london, manhattan, munich,
+#  paris, rome, sanfrancisco, vienna — or pass --bbox minLon,minLat,maxLon,maxLat)
+python -m scms_sim_ref.mock_pipeline.osm --city paris --out paris.json
+python -m scms_sim_ref.mock_pipeline.run --road custom --custom-network paris.json `
+    --flow --duration 300 --arrival-rate 2 --attacker-pct 0.15 --out datasets/paris
+# (a hand-authored map works the same: --custom-network map.json, where map.json is
+#  {"nodes":[[x,y],...],"edges":[[a,b],...]} with node coords in metres)
+
+# --- Scenario-events timeline: deterministic mid-run dynamics from a JSON file ---
+# events.json = a chronological list, e.g.
+#   [{"t":30,"until":90,"type":"demand","mult":3},
+#    {"t":40,"type":"weather","value":"fog"},
+#    {"t":50,"until":100,"type":"attack_wave"}]
+python -m scms_sim_ref.mock_pipeline.run --flow --road grid --grid 6 --duration 300 `
+    --arrival-rate 2 --attacker-pct 0.15 --events events.json --out datasets/events_run
+
+# --- CRL-aware evasive attackers: watch the public CRL, go dormant after a bust ---
+python -m scms_sim_ref.mock_pipeline.run --flow --road grid --grid 6 --duration 600 `
+    --arrival-rate 2 --attacker-pct 0.2 --crl-aware-pct 0.5 --crl-dormant-s 60 `
+    --attack-duty-cycle 0.3 --out datasets/evasive
+
+# --- Combined attacks (opt-in): each attacker falsifies several fields at once ---
+python -m scms_sim_ref.mock_pipeline.run --flow --road grid --grid 6 --duration 300 `
+    --arrival-rate 2 --attacker-pct 0.2 `
+    --attack-mix "Disruptive:0.5,PosSpeedInconsistent:0.5" --out datasets/combined
 ```
 
 Presets: `urban_rush`, `highway`, `night_rain`, `gridlock`, `stealth_hard`. Other realism knobs:
@@ -79,7 +115,7 @@ python -m ... --flow --road grid --rsu-coords "300,300;600,300;300,600" --out da
 python -m ... --flow --road grid --fleet-mix "car:0.6,truck:0.3,bus:0.1" `
     --trip-speed-min 10 --trip-speed-max 22 --idm-accel 1.2 --idm-time-headway 1.6
 
-# Network: topology (grid / ring / linear), non-square grid, block spacing, lanes, lane width, signals
+# Network: topology (grid / ring / spider / linear / custom), non-square grid, block spacing, lanes, lane width, signals
 python -m ... --flow --road grid --grid 10 --grid-h 4 --grid-block 160 `
     --lanes 3 --lane-width 3.25 --traffic-lights --light-cycle 30
 python -m ... --flow --road ring --grid 24 --grid-block 120   # circular beltway of 24 intersections
@@ -105,6 +141,27 @@ Each run writes `ma/*.jsonl` (MA-visible features), a **separate** `ground_truth
 A dependency-free web panel: choose the generator, use one-click presets (urban rush / highway /
 sparse night / gridlock), watch the live congestion map, and read the full results dashboard
 (precision/recall, per-task ROC-AUC with GBDT + CIs, calibration, generalization).
+
+### AI Copilot (GUI)
+
+The GUI ships an AI Copilot that drives the whole panel from plain language (needs an
+`OPENAI_API_KEY` in the repo-root `.env`; model defaults to `gpt-4o-mini`, override with
+`OPENAI_MODEL`). Working only through the tools it is given, it can:
+
+- **Design maps** — build a connected custom road graph from scratch (`design_network`), read the
+  current map back to edit it incrementally (`get_network`), or **import a real city** from
+  OpenStreetMap (`import_osm`).
+- **Author timelines** — set a scenario-events timeline of demand surges, weather fronts, road
+  closures, and attack waves/zones (`set_events`).
+- **Configure runs** — set or reset any config field and apply named presets (`set_config`,
+  `reset_config`, `apply_preset`, `get_config`, `describe_fields`).
+- **Run & analyze** — run the current config and return a compact analysis: counts,
+  precision/recall, per-family & hardest-type recall, detector reliability, ML AUCs, latency, and
+  RSU contribution (`run_and_analyze`).
+- **Sweep & compare** — vary one field across values (`sweep`) or run labelled A/B variants side by
+  side (`compare`).
+- **Scenario library** — save, load, and list named scenarios (`save_scenario`, `load_scenario`,
+  `list_scenarios`).
 
 ## MOSAIC layer — build & run the custom app
 
