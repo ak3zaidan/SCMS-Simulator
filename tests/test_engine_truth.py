@@ -205,3 +205,45 @@ def test_collusion_and_rsu_config_is_deterministic(tmp_path):
                                            victim_pct=0.15, n_rsus=6, rsu_range_m=300.0,
                                            out_dir=o)).data_digest
     assert run(str(tmp_path / "a")) == run(str(tmp_path / "b"))
+
+
+# --------------------------------------------------------------------------- #
+# Consolidation-audit follow-ups (LOW findings #2/#4/#5): config-surface hygiene.
+# --------------------------------------------------------------------------- #
+import pytest  # noqa: E402
+
+
+def test_empty_attack_types_falls_back_to_constpos_not_sentinel(tmp_path):
+    """#2: an explicit attack_types=() must not inject the "" sentinel as a literal no-op 'attacker'
+    (which would poison ground truth with undetectable positives). It falls back to ConstPos."""
+    run_pipeline(PipelineConfig(seed=7, traffic_flow=True, road_network="grid", duration_s=40,
+                                arrival_rate=1.5, grid_w=5, grid_h=5, attacker_pct=0.3,
+                                attack_types=(), out_dir=str(tmp_path / "e")))
+    types = {a["attack_type"] for a in _jsonl(tmp_path / "e" / "ground_truth" / "gt_attacks.jsonl")}
+    assert types == {"ConstPos"} and "" not in types
+
+
+def test_speed_caps_rejected_on_topologies_that_ignore_them():
+    """#4: arterial_*/local_speed_mps are dead knobs off grid/ring -> validate_config rejects them."""
+    for rn in ("linear", "spider", "custom"):
+        with pytest.raises(ValueError, match="grid/ring|apply only"):
+            validate_config(PipelineConfig(
+                traffic_flow=True, road_network=rn, arterial_speed_mps=20.0,
+                custom_network='{"nodes":[[0,0],[100,0],[100,100]],"edges":[[0,1],[1,2],[2,0]]}'))
+    with pytest.raises(ValueError, match="ring uses only"):
+        validate_config(PipelineConfig(traffic_flow=True, road_network="ring", grid_w=10,
+                                       local_speed_mps=8.0))
+    # ring + a single whole-ring cap is allowed; grid + the full trio is allowed
+    validate_config(PipelineConfig(traffic_flow=True, road_network="ring", grid_w=10,
+                                   arterial_speed_mps=15.0))
+    validate_config(PipelineConfig(traffic_flow=True, road_network="grid", grid_w=6, grid_h=6,
+                                   arterial_every=3, arterial_speed_mps=25.0, local_speed_mps=9.0))
+
+
+def test_new_opt_in_fields_have_validate_bounds():
+    """#5: rx_sensitivity_margin_db and lane_change_threshold now have runtime guards."""
+    with pytest.raises(ValueError, match="rx_sensitivity_margin_db"):
+        validate_config(PipelineConfig(radio_model="logdistance", rx_sensitivity_margin_db=99.0))
+    with pytest.raises(ValueError, match="lane_change_threshold"):
+        validate_config(PipelineConfig(traffic_flow=True, n_lanes=3, lane_changes=True,
+                                       lane_change_threshold=-1.0))

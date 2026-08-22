@@ -767,6 +767,9 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"pathloss_exponent must be > 0 (got {cfg.pathloss_exponent})")
     if cfg.shadowing_sigma_db < 0:
         raise ValueError(f"shadowing_sigma_db must be >= 0 (got {cfg.shadowing_sigma_db})")
+    if not -20.0 <= cfg.rx_sensitivity_margin_db <= 20.0:
+        raise ValueError(f"rx_sensitivity_margin_db must be in [-20, 20] dB "
+                         f"(got {cfg.rx_sensitivity_margin_db})")
     if cfg.idm_accel <= 0 or cfg.idm_decel <= 0:
         raise ValueError(f"idm_accel and idm_decel must be > 0 (got {cfg.idm_accel}, {cfg.idm_decel})")
     if cfg.weather not in WEATHER_MULT:
@@ -804,6 +807,8 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
             raise ValueError(f"lane_change_time_s must be > 0 (got {cfg.lane_change_time_s})")
         if cfg.lane_change_politeness < 0:
             raise ValueError(f"lane_change_politeness must be >= 0 (got {cfg.lane_change_politeness})")
+        if cfg.lane_change_threshold < 0:
+            raise ValueError(f"lane_change_threshold must be >= 0 (got {cfg.lane_change_threshold})")
     if cfg.gap_acceptance:                                # yielding at unsignalized intersections:
         if not cfg.traffic_flow:                          # needs routed car-following on a real network
             raise ValueError("gap_acceptance needs traffic_flow=true (routed car-following mobility)")
@@ -825,6 +830,17 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         if _sp and not (1.0 <= _sp <= 70.0):
             raise ValueError(f"{_nm} must be 0 (uncapped) or 1-70 m/s "
                              f"(33 ~ 120 km/h highway, 8.3 ~ 30 km/h zone) (got {_sp})")
+    # Speed-cap knobs are consumed only by the topology that models them: grid uses all three, ring
+    # uses arterial_speed_mps (a single whole-ring cap) only. Reject them elsewhere so they are never
+    # silent dead knobs (custom maps carry per-edge speeds in the custom_network JSON instead).
+    if cfg.arterial_every or cfg.arterial_speed_mps or cfg.local_speed_mps:
+        if cfg.road_network == "ring" and (cfg.arterial_every or cfg.local_speed_mps):
+            raise ValueError("ring uses only arterial_speed_mps (whole-ring cap); arterial_every/"
+                             "local_speed_mps apply to a grid road only")
+        if cfg.road_network not in ("grid", "ring"):
+            raise ValueError(f"arterial_*/local_speed_mps speed caps apply only to grid/ring roads, "
+                             f"not road_network={cfg.road_network!r} (custom maps set per-edge speeds "
+                             f"in the custom_network JSON)")
     if cfg.fleet != "mixed" and cfg.fleet not in VEHICLE_TYPES:
         raise ValueError(f"fleet must be 'mixed' or one of {sorted(VEHICLE_TYPES)} (got {cfg.fleet!r})")
     _parse_fleet_mix(cfg.fleet_mix)      # raises ValueError on a bad class name / weight
@@ -1169,7 +1185,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     if cfg.attack_type and cfg.attack_types == PipelineConfig.attack_types:
         catalog = (cfg.attack_type,)
     else:
-        catalog = cfg.attack_types or (cfg.attack_type,)
+        # Fall back to ConstPos (not the "" sentinel) if BOTH are empty, so an explicit
+        # attack_types=() never injects "" as a literal no-op "attacker" that poisons ground truth
+        # with undetectable positives (audit F-#2). Default path (attack_types non-empty) unaffected.
+        catalog = cfg.attack_types or (cfg.attack_type or "ConstPos",)
     fleet_weights = _parse_fleet_mix(cfg.fleet_mix)   # None -> default mixed weights (byte-identical)
     attack_weights = _parse_attack_mix(cfg.attack_mix)  # None -> round-robin catalog (byte-identical)
     total_time = cfg.n_steps * cfg.dt
