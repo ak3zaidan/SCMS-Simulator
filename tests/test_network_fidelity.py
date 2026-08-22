@@ -233,4 +233,7 @@ def test_arterial_config_validation():
         validate_config(PipelineConfig(arterial_speed_mps=100.0))
     with pytest.raises(ValueError, match="local_speed_mps"):
         validate_config(PipelineConfig(local_speed_mps=0.5))
-    validate_config(PipelineConfig(arterial_every=2, arterial_speed_mps=16.0, local_speed_mps=5.0))
+    # a valid arterial config validates OK -- but the speed caps only apply to a grid road (the
+    # topology that models arterials); on the default 'linear' road they are a rejected dead knob.
+    validate_config(PipelineConfig(road_network="grid", arterial_every=2, arterial_speed_mps=16.0,
+                                   local_speed_mps=5.0))
