@@ -31,6 +31,7 @@ from typing import Any
 
 import pandas as pd
 
+from .benchmark import EXCLUDED_FEATURE_COLUMNS
 from .leakage_linter import lint_feature_frame
 
 REASON_VOCAB = [
@@ -99,6 +100,18 @@ def _report_fields(r: dict) -> tuple[float, bool, list[str], str]:
     return float(score or 0.0), bool(sig), list(reasons), str(crl)
 
 
+def _rsu_node(reporter_cert_digest: str) -> str:
+    """Stable OPAQUE graph-node id for an RSU (infrastructure) reporter.
+
+    RSUs are static, always-trusted receivers, not vehicles, so their reporter certs are absent from
+    the oracle identity map (see build()). We surface them as first-class graph nodes WITHOUT leaking
+    any real identity: the id is a truncated sha256 of the reporter cert digest, mirroring the opaque
+    ``ent_``/``ment_`` vehicle-node scheme. Never emit the raw cert (that would fail the leakage
+    linter). Deterministic: same cert -> same ``rsu_`` id every run.
+    """
+    return "rsu_" + hashlib.sha256(reporter_cert_digest.encode()).hexdigest()[:12]
+
+
 def _split_for(seed: int, vehicle_id: str) -> str:
     bucket = int(hashlib.sha256(f"{seed}|{vehicle_id}".encode()).hexdigest(), 16) % 100
     if bucket < 70:
@@ -124,6 +137,15 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
     base_by_vehicle = {a["true_vehicle_id"]: str(a.get("attack_type", "")).split("/")[0] for a in gt_attacks}
     family_by_vehicle = {v: _ATTACK_FAMILY.get(b, "other") for v, b in base_by_vehicle.items()}
     vehicle_by_digest = {m["pseudonym_cert_digest"]: m["true_vehicle_id"] for m in gt_idmap}
+
+    def _is_rsu_reporter(reporter_cert_digest: str | None) -> bool:
+        """A reporter cert absent from the oracle identity map is infrastructure (an RSU): every
+        VEHICLE pseudonym is enrolled in gt_identity_map, so a present-but-unmapped reporter cert is,
+        by construction, a static RSU receiver. Used only to (a) count RSU evidence into MA-visible
+        features and (b) route the reporter to an opaque rsu_* graph node -- never to expose identity.
+        """
+        return bool(reporter_cert_digest) and reporter_cert_digest not in vehicle_by_digest
+
     label_by_report = {r["report_id"]: r for r in gt_report_labels}
     lifetime_by_digest = {
         c["cert_digest"]: (float(c.get("last_seen", 0)) - float(c.get("first_seen", 0)))
@@ -188,6 +210,11 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         norms = [float(r.get("detector_score_norm", 0.0) or 0.0) for r in rs]
         times = [float(r.get("detection_time", 0)) for r in rs]
         reporters = {r.get("reporter_cert_digest") for r in rs}
+        # RSU (infrastructure) evidence, MA-visible: distinct RSU reporters + fraction of this
+        # subject's reports that came from RSUs. Counts/fractions only -> no identity leaks.
+        rsu_reporters = {r.get("reporter_cert_digest") for r in rs
+                         if _is_rsu_reporter(r.get("reporter_cert_digest"))}
+        n_rsu_reports = sum(1 for r in rs if _is_rsu_reporter(r.get("reporter_cert_digest")))
         n_reasons = len({c for r in rs for c in (r.get("reason_codes") or ["?"])})
         subj_true = vehicle_by_digest.get(digest, "unknown")
         split = _split_for(split_seed, subj_true)
@@ -195,6 +222,8 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
             "subject_cert_digest": digest,
             "n_reports": len(rs),
             "n_distinct_reporters": len(reporters),
+            "n_rsu_reporters": len(rsu_reporters),
+            "frac_rsu_reports": (n_rsu_reports / len(rs)) if rs else 0.0,
             "n_distinct_reasons": n_reasons,
             "score_mean": sum(scores) / len(scores) if scores else 0.0,
             "score_max": max(scores) if scores else 0.0,
@@ -246,6 +275,9 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         norms = [float(r.get("detector_score_norm", 0.0) or 0.0) for r in rs]
         times = [float(r.get("detection_time", 0)) for r in rs]
         reporters = {r.get("reporter_cert_digest") for r in rs}
+        rsu_reporters = {r.get("reporter_cert_digest") for r in rs
+                         if _is_rsu_reporter(r.get("reporter_cert_digest"))}
+        n_rsu_reports = sum(1 for r in rs if _is_rsu_reporter(r.get("reporter_cert_digest")))
         reasons = {c for r in rs for c in (r.get("reason_codes") or ["?"])}
         # Distinct subject certs among this vehicle's reports. NOTE: `rs` is grouped through the
         # oracle identity map (see block comment above), so this count assumes perfect linkage; it is
@@ -261,6 +293,8 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
             **{f"detmax_{d}": detmax[d] for d in DETECTORS},
             "n_reports": len(rs),
             "n_distinct_reporters": len(reporters),
+            "n_rsu_reporters": len(rsu_reporters),
+            "frac_rsu_reports": (n_rsu_reports / len(rs)) if rs else 0.0,
             "n_pseudonyms": n_pseudonyms,
             "n_distinct_reasons": len(reasons) if rs else 0,
             "score_norm_max": max(norms) if norms else 0.0,
@@ -292,19 +326,33 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
     reporters_of: dict[str, set] = {}
     for r in reports:
         stv = vehicle_by_digest.get(r.get("subject_cert_digest"))
-        rtv = vehicle_by_digest.get(r.get("reporter_cert_digest"))
-        if not stv or not rtv:
-            continue
-        se, re = _ent(stv), _ent(rtv)
-        indeg[se] = indeg.get(se, 0) + 1
-        reporters_of.setdefault(se, set()).add(re)
+        if not stv:
+            continue                                  # subjects are always vehicles; skip unresolved
+        se = _ent(stv)
+        rep_digest = r.get("reporter_cert_digest")
+        rtv = vehicle_by_digest.get(rep_digest)
+        if rtv:                                       # vehicle reporter -> opaque ent_ node
+            re, is_infra = _ent(rtv), 0
+            # in-degree / reporter-reputation is measured over VEHICLE edges only (unchanged): RSUs
+            # are trusted infrastructure with no collusion signal, so they stay out of this metric.
+            indeg[se] = indeg.get(se, 0) + 1
+            reporters_of.setdefault(se, set()).add(re)
+        elif _is_rsu_reporter(rep_digest):            # RSU (infrastructure) reporter -> opaque rsu_ node
+            re, is_infra = _rsu_node(rep_digest), 1   # BUG 3a: was dropped; now a first-class node
+        else:
+            continue                                  # no reporter at all -> nothing to add
         edge_rows.append({
             "src_entity": re, "dst_entity": se,
+            "is_infrastructure": is_infra,            # 1 = RSU-sourced edge (opaque rsu_* src)
             "t": round(float(r.get("detection_time", 0)), 3),
             "reason": (r.get("reason_codes") or ["?"])[0],
             "score_norm": round(float(r.get("detector_score_norm", 0.0) or 0.0), 3),
             "split": _split_for(split_seed, stv),
         })
+    # Deterministic edge ordering: RSU + vehicle edges are byte-stable run-to-run regardless of any
+    # dict/set iteration effects. Stable sort on a fully content-derived key.
+    edge_rows.sort(key=lambda e: (e["dst_entity"], e["t"], e["src_entity"],
+                                  e["is_infrastructure"], e["reason"], e["score_norm"]))
     # graph node feature: mean in-degree of an entity's reporters (a collusion / reporter-reputation
     # signal — are you flagged by entities that are themselves heavily flagged?).
     for row in vf_rows:
@@ -489,6 +537,9 @@ _FEATURE_DOCS = {
     "reports_per_reporter": "reports about a subject divided by its distinct reporters (collusion signal)",
     "n_pseudonyms": "distinct pseudonym certs the MA linked to this vehicle",
     "reporter_mean_indegree": "mean in-degree of this vehicle's reporters in the report graph",
+    "n_rsu_reporters": "distinct RSU (infrastructure) reporters that flagged this subject/vehicle",
+    "frac_rsu_reports": "fraction of this subject/vehicle's reports that came from RSU infrastructure",
+    "is_infrastructure": "1 if this report-graph edge came from an RSU (opaque rsu_* node), else 0",
     "score_norm_mean": "mean normalized detector score across a vehicle's reports",
     "score_norm_max": "max normalized detector score across a vehicle's reports",
     "detection_time": "time of the report (sequencing only; excluded from model features)",
@@ -518,6 +569,14 @@ def _col_kind(name: str) -> str:
         return "fusion_feature_agg"      # per-vehicle max of a detector across its reports
     if name.startswith("reason_"):
         return "reason_flag_feature"     # one-hot of which reason fired
+    # BUG 2 fix: benchmark.py EXCLUDES these columns from the model feature matrix. schema.json is
+    # THE machine-readable contract, so any column the benchmark refuses to train on MUST NOT be
+    # advertised as kind="feature". Id/label/split columns already returned above keep their kinds;
+    # the remainder (e.g. detection_time = absolute wall-clock, crl_active_at_report = downstream of
+    # the MA's own revoke decision) are "metadata": kept in the table for sequencing/joins, never a
+    # model input. Rule enforced: no benchmark-excluded column is ever kind="feature".
+    if name in EXCLUDED_FEATURE_COLUMNS:
+        return "metadata"
     return "feature"
 
 
@@ -538,7 +597,9 @@ def _write_schema(out: str, frames: dict) -> None:
     schema["_legend"] = {"feature": "MA-visible model input", "fusion_feature": "per-detector detnorm",
                          "fusion_feature_agg": "per-vehicle detector max", "reason_flag_feature":
                          "which reason fired (one-hot)", "label": "evaluation label (never a feature)",
-                         "id": "identifier (never a feature)", "split": "train/val/test assignment"}
+                         "id": "identifier (never a feature)", "split": "train/val/test assignment",
+                         "metadata": "kept in the table for sequencing/joins; benchmark EXCLUDES it "
+                         "from model features (target/absolute-time leakage), never a model input"}
     with open(os.path.join(out, "schema.json"), "w", encoding="utf-8", newline="\n") as fh:
         json.dump(schema, fh, indent=2)
         fh.write("\n")
