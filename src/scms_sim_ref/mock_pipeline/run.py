@@ -253,6 +253,14 @@ class PipelineConfig:
     duration_s: float = 0.0              # flow: sim length in seconds (overrides n_steps if > 0)
     arrival_rate: float = 2.0            # flow: mean vehicles spawned per second
     max_total_vehicles: int = 0          # flow: cap total spawns (0 = unlimited) -> bounds memory
+    # --- vulnerable road users (VRUs: pedestrians/cyclists carrying VAM-broadcasting devices) ---
+    # OPT-IN benign actor class. VRUs move slowly on/near the network but are NOT bound to vehicle
+    # car-following (IDM); their beacon SELF-DECLARES station_type=vru (an MA-visible field), and a
+    # receiver that sees that declaration suppresses the off-road + vehicle-kinematic detectors (a VRU
+    # is legitimately off the road centerline and moves slowly/erratically). vru_pct=0 (the default)
+    # spawns none, draws NO extra RNG, and is BYTE-IDENTICAL. See make_vru + the detection-pass note.
+    vru_pct: float = 0.0                  # fraction of spawned ACTORS that are VRUs (0 = none)
+    vru_speed_mps: float = 1.8           # VRU travel speed (~1.4 walking .. ~5 cycling)
     road_network: str = "linear"         # linear | grid | ring | spider | custom (see custom_network)
     grid_w: int = 6                      # grid width | ring nodes | spider arms
     grid_h: int = 6                      # grid height | spider rings
@@ -428,6 +436,9 @@ class Vehicle:
     gps_q: float = 1.0                   # per-vehicle GNSS quality multiplier
     is_faulty: bool = False
     is_rsu: bool = False                 # fixed Road-Side Unit: a static, always-trusted receiver
+    is_vru: bool = False                 # vulnerable road user (pedestrian/cyclist); ORACLE-only truth.
+                                         # Its beacon SELF-DECLARES station_type=vru (MA-visible); never
+                                         # an attacker/faulty/colluder.
     rx_range: float = 0.0                # receiver radio range override (0 = use cfg.radio_range_m)
     attack_type: str = "none"
     # pseudonyms / sybil / collusion
@@ -525,6 +536,43 @@ class _GtVehicleAware(R.GtVehicle):
     """gt_vehicle row carrying the ORACLE-only is_crl_aware label. Emitted ONLY when crl_aware_pct>0
     so the default path stays byte-identical (plain R.GtVehicle). Inherits to_dict()/asdict()."""
     is_crl_aware: bool = False
+
+
+@dataclass
+class _GtVehicleVru(R.GtVehicle):
+    """gt_vehicle row carrying the ORACLE-only is_vru label. Emitted ONLY when vru_pct>0 so the
+    default path stays byte-identical (plain R.GtVehicle). is_vru is GROUND TRUTH (never a feature);
+    the MA-visible signal is the SEPARATE, legitimately-transmitted station_type field on the beacon /
+    ma_cert_status. Mirrors the _GtVehicleAware precedent -- schema stays untouched."""
+    is_vru: bool = False
+
+
+@dataclass
+class _GtVehicleVruAware(_GtVehicleAware):
+    """gt_vehicle row when BOTH the VRU and CRL-aware opt-ins are active: carries both ORACLE labels."""
+    is_vru: bool = False
+
+
+def _make_gt_vehicle(cfg, v, is_vru: bool, gt_kw: dict):
+    """Build the gt_vehicle row, adding ORACLE-only labels ONLY for the opt-ins that are active so the
+    default (and each single-feature) path stays byte-identical. is_vru/is_crl_aware are ground truth;
+    they never reach a feature table (the MA-visible station_type does that job instead)."""
+    if cfg.vru_pct > 0 and cfg.crl_aware_pct > 0:
+        return _GtVehicleVruAware(is_vru=is_vru, is_crl_aware=v.crl_aware, **gt_kw)
+    if cfg.vru_pct > 0:
+        return _GtVehicleVru(is_vru=is_vru, **gt_kw)
+    if cfg.crl_aware_pct > 0:
+        return _GtVehicleAware(is_crl_aware=v.crl_aware, **gt_kw)
+    return R.GtVehicle(**gt_kw)
+
+
+@dataclass
+class _MaCertStatusVru(R.MaCertStatus):
+    """ma_cert_status row carrying the MA-VISIBLE self-declared station_type (vehicle|vru). Emitted
+    ONLY when vru_pct>0 so the default path stays byte-identical (plain R.MaCertStatus). This is the
+    legitimately-transmitted station type the MA observed on the cert's beacons -- NOT the oracle
+    is_vru label -- so it is safe to feed ML features."""
+    station_type: str = "vehicle"
 
 
 def _parse_rsu_coords(s: str) -> list:
@@ -673,7 +721,7 @@ def _ang_diff(a: float, b: float) -> float:
 
 _PROB_FIELDS = ("report_prob", "attacker_pct", "faulty_pct", "collude_pct", "victim_pct",
                 "packet_loss_base", "nlos_loss", "gps_outlier_rate", "gps_degrade_rate",
-                "attack_duty_cycle", "crl_aware_pct")
+                "attack_duty_cycle", "crl_aware_pct", "vru_pct")
 
 # Named CLI scenario presets (mirror the GUI one-click presets). Keys are argparse dests, so any flag
 # the user also passes still overrides the preset (they are applied via parser.set_defaults). Reach a
@@ -784,6 +832,8 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
     if cfg.trip_speed_min <= 0 or cfg.trip_speed_max < cfg.trip_speed_min:
         raise ValueError(f"need 0 < trip_speed_min <= trip_speed_max "
                          f"(got {cfg.trip_speed_min}, {cfg.trip_speed_max})")
+    if cfg.vru_pct > 0 and cfg.vru_speed_mps <= 0:      # VRUs must actually move (walking/cycling)
+        raise ValueError(f"vru_speed_mps must be > 0 when vru_pct > 0 (got {cfg.vru_speed_mps})")
     if cfg.road_network not in ("linear", "grid", "ring", "spider", "custom"):
         raise ValueError(f"road_network must be linear|grid|ring|spider|custom "
                          f"(got {cfg.road_network!r})")
@@ -838,7 +888,7 @@ def _field_group(name: str) -> str:
                      "crl_aware", "crl_dormant")),
         ("Mobility", ("fleet", "trip_", "idm_", "demand", "arrival", "n_lanes", "lane_", "turn_",
                       "gap_acceptance", "car_following", "veh_length", "od_", "boundary",
-                      "traffic_flow", "duration", "max_total", "nominal_speed", "state_prune")),
+                      "traffic_flow", "duration", "max_total", "nominal_speed", "state_prune", "vru_")),
         ("Network", ("road_network", "grid", "custom_network", "traffic_lights", "light_cycle",
                      "arterial", "local_speed")),
         ("Scenario events", ("events",)),
@@ -888,6 +938,9 @@ _FIELD_META = {
     "duration_s": dict(h="Traffic-flow length; overrides n_steps when > 0", lo=0, u="s"),
     "arrival_rate": dict(h="Mean vehicle arrivals per second (traffic-flow)", lo=0, hi=20, st=0.5, u="/s"),
     "max_total_vehicles": dict(h="Cap total spawns (0 = unlimited) — bounds memory on long runs", lo=0),
+    "vru_pct": dict(h="Fraction of spawned actors that are VRUs (pedestrians/cyclists; benign, "
+                      "self-declaring station_type=vru; 0 = none, byte-identical)", lo=0, hi=1, st=0.05),
+    "vru_speed_mps": dict(h="VRU travel speed (~1.4 walking .. ~5 cycling)", lo=0.1, hi=10, st=0.1, u="m/s"),
     "n_lanes": dict(h="Parallel lanes per road (overtaking; relieves gridlock)", lo=1, hi=6),
     "lane_width_m": dict(h="Lane width for multi-lane offsets", lo=1, hi=6, st=0.25, u="m"),
     "trip_speed_min": dict(h="Minimum desired trip speed", lo=1, hi=60, u="m/s"),
@@ -1298,9 +1351,67 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                      is_attacker=is_att, attacker_role=(atype if is_att else "none"),
                      is_faulty=is_flt, veh_type=vtype,
                      colluding_group_id=("colluders" if is_coll else None))
-        # is_crl_aware is an ORACLE label; emit it ONLY when the feature is on -> default byte-identical
-        gt_vehicle.append(_GtVehicleAware(is_crl_aware=v.crl_aware, **gt_kw)
-                          if cfg.crl_aware_pct > 0 else R.GtVehicle(**gt_kw))
+        # ORACLE labels (is_crl_aware / is_vru) are emitted ONLY when their opt-in is on -> a run with
+        # neither active is byte-identical (plain R.GtVehicle). Vehicles are never VRUs (is_vru=False).
+        gt_vehicle.append(_make_gt_vehicle(cfg, v, False, gt_kw))
+        return v
+
+    def make_vru(vid, spawn_time, life, nodes):
+        """Create one VRU (pedestrian/cyclist) actor: a slow, benign, SELF-DECLARING transmitter that
+        lives near the network but is NOT bound to vehicle car-following (IDM). It carries the same SCMS
+        credentials a vehicle does (so the MA sees + LINKS its cert like any device), and its beacon
+        declares station_type=vru (MA-visible; set in the broadcast pre-pass). It is never an attacker/
+        faulty/colluder and must never be revoked in a correct run. `vid` is its index in `vehicles` (a
+        valid list index, so digest_to_vehicle/vrng resolve it). Reached ONLY when vru_pct>0, and it
+        draws exclusively from its own string-keyed rng streams -> the vehicle path stays byte-identical."""
+        vr = random.Random(f"{cfg.seed}:vru:{vid}")
+        la_h1, la_h2 = f"lc1:{vid}", f"lc2:{vid}"
+        la_id1, la_id2 = 0x0001, 0x0002
+        ctx = DeviceLinkageContext(la_id1, la_id2,
+                                   cfg.derive(f"ls1:{vid}", 16), cfg.derive(f"ls2:{vid}", 16))
+        la1.register(la_h1, ctx.ls1_0, la_id1)
+        la2.register(la_h2, ctx.ls2_0, la_id2)
+        req_hash = hashlib.sha256(f"req|{cfg.seed}|{vid}".encode()).hexdigest()[:16]
+        true_id = f"veh_{vid:03d}"
+        ra.bind(req_hash, true_id)
+        j0 = vid % cfg.jmax
+        pk = ca.keypair_from_seed(cfg.derive(f"key:{vid}:0"))
+        dig = ca.hashed_id8(ca.public_bytes(pk)).hex()
+        pca.issue(dig, req_hash, 0, j0, la_h1, la_h2)
+        vf = spawn_time
+        vt = max(spawn_time + life, total_time + cfg.dt)   # cert covers the VRU's whole presence -> a
+        pseudonyms = [{"k": 0, "i": 0, "j": j0, "digest": dig,    # benign VRU never shows an expired cert
+                       "valid_from": vf, "valid_to": vt}]
+        pseudonym_info[dig] = {"i": 0, "j": j0, "lv": ctx.linkage_value_for(0, j0),
+                               "ghost": False, "veh_vid": vid}
+        gt_idmap.append(R.GtIdentityMap(true_vehicle_id=true_id, pseudonym_cert_digest=dig,
+                                        i_period=0, valid_from=round(vf, 3), valid_to=round(vt, 3)))
+        # placement: near a network node but DELIBERATELY off the road centerline (a plaza / pedestrian
+        # zone / separated path), i.e. > offroad_tol_m from any road in both axes, so a naive mapOffRoad
+        # check WOULD flag them -- which is exactly why a VRU-declared beacon suppresses that detector.
+        if nodes:
+            nx, ny = nodes[vr.randrange(len(nodes))]
+            dx = cfg.offroad_tol_m * (1.3 + 0.7 * vr.random()) * (1.0 if vr.random() < 0.5 else -1.0)
+            dy = cfg.offroad_tol_m * (1.3 + 0.7 * vr.random()) * (1.0 if vr.random() < 0.5 else -1.0)
+            sx, sy = float(nx) + dx, float(ny) + dy
+        else:                                              # no routed network (linear): just offset laterally
+            sx, sy = float(vid * 20), float(vid % 4) * 4.0 + cfg.offroad_tol_m * 2.0
+        v = Vehicle(
+            vid=vid, spawn_x=sx, lane_y=sy, speed=cfg.vru_speed_mps,
+            is_attacker=False, priv=None, pub=b"", cert_digest=dig, linkage_ctx=ctx,
+            i_period=0, j_index=j0, request_hash=req_hash,
+            direction=vr.random() * 6.283, wander_amp=0.5 + vr.random(),
+            wander_w=0.1 + vr.random() * 0.2, phase=vr.random() * 6.283,
+            gps_q=0.5 + vr.expovariate(1.2), is_faulty=False, attack_type="none",
+            pseudonyms=pseudonyms, colluder=False, spawn_time=spawn_time,
+            finish_time=(spawn_time + life if cfg.traffic_flow else None), trip=None)
+        v.is_vru = True
+        v.veh_type, v.veh_length = "vru", 0.5
+        vehicles.append(v)
+        gt_kw = dict(true_vehicle_id=true_id, spawn_time=round(spawn_time, 3),
+                     is_attacker=False, attacker_role="none", is_faulty=False,
+                     veh_type="vru", colluding_group_id=None)
+        gt_vehicle.append(_make_gt_vehicle(cfg, v, True, gt_kw))
         return v
 
     if cfg.traffic_flow:
@@ -1380,6 +1491,28 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         for v in vehicles:
             if v.colluder:
                 v.victims = list(victim_pool)
+
+    # ---- VRUs (opt-in): benign pedestrians/cyclists added AFTER the vehicle fleet so the vehicle RNG
+    # sequence is untouched. vids are assigned contiguously past the vehicles (== list index, so the
+    # digest_to_vehicle/vrng lookups below resolve them). vru_pct=0 -> this block is skipped entirely
+    # -> byte-identical. "fraction of spawned ACTORS" => n_vru/(n_veh+n_vru)=vru_pct, i.e. count/rate is
+    # scaled by vru_pct/(1-vru_pct). VRUs draw only from dedicated string-keyed streams. ----
+    if cfg.vru_pct > 0:
+        _vru_ratio = cfg.vru_pct / (1.0 - cfg.vru_pct)          # vru_pct clamped < 1 by validate_config
+        _vru_nodes = net.geometry()["nodes"] if net is not None else None
+        if cfg.traffic_flow:
+            _vru_rate = cfg.arrival_rate * _vru_ratio
+            _vru_flow_rng = random.Random(f"{cfg.seed}:vruflow")
+            _vtt = 0.0
+            while _vru_rate > 0:
+                _vtt += _vru_flow_rng.expovariate(_vru_rate)
+                if _vtt >= total_time:
+                    break
+                make_vru(len(vehicles), _vtt, 90.0, _vru_nodes)
+        else:
+            _n_vru = int(round(_vru_ratio * cfg.n_vehicles))
+            for _ in range(_n_vru):
+                make_vru(len(vehicles), 0.0, total_time, _vru_nodes)
 
     digest_to_vehicle = {d: vehicles[info["veh_vid"]] for d, info in pseudonym_info.items()}
     vrng = {v.vid: random.Random(f"{cfg.seed}:sensor:{v.vid}") for v in vehicles}
@@ -1597,7 +1730,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 and received_by.get(reporter_digest, 0) < cfg.reputation_max)
 
     def file_report(t, reporter_digest, subject_digest, subject_veh, reasons, det, conf,
-                    cx, cy, px, py, malicious, sig_valid=True):
+                    cx, cy, px, py, malicious, sig_valid=True, station_type="vehicle"):
         counters["report"] += 1
         rid = f"rpt_{counters['report']:05d}"
         delay = rng.uniform(0.0, cfg.net_delay_max)
@@ -1617,6 +1750,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         row["subject_pos_confidence"] = round(conf, 3)
         row["cert_crl_status"] = "active"
         row["sig_valid"] = bool(sig_valid)
+        if cfg.vru_pct > 0:                              # MA-VISIBLE self-declared station type on the
+            row["station_type"] = station_type          # subject's beacon; key absent by default (byte-identical)
         for k in (*DET_KEYS, *SOFT_KEYS):
             row[f"detnorm_{k}"] = round(det.get(k, 0.0), 3)
         ma_reports.append(row)
@@ -1890,6 +2025,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         return (v.lane_off - prev) / cfg.dt
 
     def car_follow(active_list, t):
+        # VRUs are not car-following actors (no trip/IDM state), so exclude them from the routed
+        # kinematics. When no VRUs are present every active vehicle is cf -> this filter is a no-op and
+        # the update is byte-identical.
+        active_list = [v for v in active_list if v.cf]
         # snapshot start-of-step positions so the update is order-independent (deterministic)
         snap = {v.vid: (v.cur_x, v.cur_y, v.cur_h, v.cur_v, v.veh_length) for v in active_list}
         buckets: dict = {}
@@ -2088,7 +2227,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 tx.onset = t
             broadcasts.append(dict(veh=tx, digest=digest, cx=cx, cy=cy, cs=cs, ch=ch, conf=conf,
                                    ghost=False, x=x, y=y, falsified=falsified, msg_count=msg_count,
-                                   cg=cg, sig_ok=sig_ok, cvf=cvf, cvt=cvt))
+                                   cg=cg, sig_ok=sig_ok, cvf=cvf, cvt=cvt,
+                                   station_type=("vru" if tx.is_vru else "vehicle")))
             if attacking and tx.attack_type == "Sybil":     # fabricate co-located ghost identities
                 sr = vrng[tx.vid]
                 for gdig in tx.ghosts:
@@ -2097,7 +2237,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     broadcasts.append(dict(veh=tx, digest=gdig, cx=cx + sr.uniform(-1, 1),
                                            cy=cy + sr.uniform(-1, 1), cs=cs, ch=ch, conf=conf,
                                            ghost=True, x=x, y=y, falsified=True, msg_count=1,
-                                           cg=t, sig_ok=True, cvf=0.0, cvt=total_time))
+                                           cg=t, sig_ok=True, cvf=0.0, cvt=total_time,
+                                           station_type="vehicle"))
 
         # per-message ground-truth emission sampling (real broadcasts only)
         for b in broadcasts:
@@ -2123,7 +2264,11 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # (reporters near the subject) instead of all-to-all, and far-away attackers go unobserved.
         # RSUs are static receivers: appended AFTER vehicles so vehicle-side reception (and its RNG
         # draws) is unchanged -> byte-identical when n_rsus=0 (rsus is empty).
-        receivers = active_list + rsus
+        # VRUs are self-declaring TRANSMITTERS only (they broadcast VAMs, they do NOT run the MA
+        # detector pipeline / file reports), so they are excluded from the receiver set. This keeps the
+        # reporter population -- hence vehicle revocation precision -- unaffected by adding VRUs. With no
+        # VRUs present the filter is a no-op -> byte-identical.
+        receivers = [v for v in active_list if not v.is_vru] + rsus
         rx_pos = {rx.vid: rx.true_state(t)[:2] for rx in receivers if not enforced(rx, t)}
         wx_loss = WEATHER_RADIO_LOSS.get(weather_at(t) if _weather_evs else cfg.weather, 0.0)
         # spatial index over broadcasts (cell = radio range) so each receiver only tests transmitters
@@ -2258,6 +2403,21 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     # are moot; the receiver only reports the crypto-verification failure itself.
                     det = {k: 0.0 for k in DET_KEYS}
                     det["signatureVerification"] = 1.5
+                elif b["station_type"] == "vru":
+                    # VRU-appropriate plausibility, gated on the SELF-DECLARED station type carried on
+                    # the received beacon (an MA-VISIBLE field, NOT the oracle is_vru): pedestrians/
+                    # cyclists legitimately travel OFF the road centerline and move slowly/erratically,
+                    # so the HD-map off-road check and the vehicle-kinematic (IDM-shaped) detectors would
+                    # raise benign false positives -> benign false revocations. Suppress exactly those
+                    # for a VRU-declared beacon. Detectors that are meaningful regardless of station type
+                    # stay ON: sybilCoLocation, signatureVerification, certValidity, acceptanceRange-
+                    # Threshold (impossible-distance claim), beaconFrequency (flooding/DoS), staleOrReplay.
+                    # NOTE: the gate trusts a self-declared field, so a vehicle SPOOFING station_type=vru
+                    # to dodge these checks is the (deferred) VRU-spoofing attack -- documented, not yet
+                    # generated. A phantom/spoofed VRU would still trip the retained detectors.
+                    for _mk in MOTION_KEYS:
+                        det[_mk] = 0.0
+                    det["mapOffRoad"] = 0.0
                 for k in DET_KEYS:
                     st["streak"][k] = st["streak"].get(k, 0) + 1 if det.get(k, 0.0) >= 1.0 else 0
                 fired = {k: det[k] for k in DET_KEYS if st["streak"].get(k, 0) >= MIN_CONSEC}
@@ -2267,7 +2427,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     continue
                 reasons = sorted(fired, key=lambda k: -det[k])
                 file_report(t, reporter_digest, digest, tx, reasons, det, conf,
-                            cx, cy, ref[0], ref[1], malicious=False, sig_valid=b["sig_ok"])
+                            cx, cy, ref[0], ref[1], malicious=False, sig_valid=b["sig_ok"],
+                            station_type=b["station_type"])
 
         # COLLUSION pass: colluders file fabricated reports against benign victims. In flow mode
         # victims are chosen dynamically (nearby active benign vehicles); in fixed mode from the list.
@@ -2277,7 +2438,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             reporter_digest = tx.active_pseudonym(t, cfg.rotate_period_s)["digest"]
             if cfg.traffic_flow:
                 txx, txy = rx_pos.get(tx.vid, tx.true_state(t)[:2])
-                cand = [v for v in active_list if not v.is_attacker and not enforced(v, t)
+                cand = [v for v in active_list if not v.is_attacker and not enforced(v, t) and not v.is_vru
                         and math.hypot(rx_pos[v.vid][0] - txx, rx_pos[v.vid][1] - txy) <= cfg.radio_range_m]
                 if cfg.victim_pct <= 0.0:
                     victim_vehicles = cand[:2]                   # legacy default -> byte-identical
@@ -2367,12 +2528,19 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 "CRL entry failed to revoke a pseudonym of its target device"
 
     # ---- Certificate status (MA-visible): a cert is revoked iff its vehicle is ----
-    ma_cert_status = [R.MaCertStatus(
-        cert_digest=d, first_seen=f, last_seen=cert_last_seen[d], valid_from=0.0,
-        valid_to=total_time, issuing_pca="PCA-1",
-        crl_status=("revoked" if pseudonym_info[d]["veh_vid"] in revoked_vehicles else "active"),
-        revocation_time=revoked_vehicles.get(pseudonym_info[d]["veh_vid"]))
-        for d, f in cert_first_seen.items()]
+    # When VRUs are present each row also carries the MA-VISIBLE self-declared station_type (vehicle|vru)
+    # the MA observed on the cert's beacons -- the leakage-safe signal a model may learn from, distinct
+    # from the ORACLE is_vru label in gt_vehicle. vru_pct=0 -> plain R.MaCertStatus -> byte-identical.
+    def _cert_status_row(d, f):
+        kw = dict(cert_digest=d, first_seen=f, last_seen=cert_last_seen[d], valid_from=0.0,
+                  valid_to=total_time, issuing_pca="PCA-1",
+                  crl_status=("revoked" if pseudonym_info[d]["veh_vid"] in revoked_vehicles else "active"),
+                  revocation_time=revoked_vehicles.get(pseudonym_info[d]["veh_vid"]))
+        if cfg.vru_pct > 0:
+            st = "vru" if getattr(digest_to_vehicle.get(d), "is_vru", False) else "vehicle"
+            return _MaCertStatusVru(station_type=st, **kw)
+        return R.MaCertStatus(**kw)
+    ma_cert_status = [_cert_status_row(d, f) for d, f in cert_first_seen.items()]
 
     # ---- Write outputs + manifest ----
     if stream:
@@ -2594,6 +2762,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "priority; needs --flow + a routed network; realistic slowing at junctions)")
     p.add_argument("--gps-jam-rate", type=float, default=0.0, help="per-step prob a benign vehicle loses GNSS fix")
     p.add_argument("--max-total-vehicles", type=int, default=0, help="flow: cap total spawns (0=unlimited)")
+    p.add_argument("--vru-pct", type=float, default=0.0,
+                   help="fraction of spawned actors that are VRUs (pedestrians/cyclists; benign, "
+                        "self-declaring station_type=vru; 0=none, byte-identical)")
+    p.add_argument("--vru-speed", type=float, default=1.8, help="VRU travel speed (m/s; ~1.4 walk .. ~5 cycle)")
     p.add_argument("--featurize", action="store_true", help="build ML tables after generation")
     p.add_argument("--grid-h", type=int, default=0, help="grid height (0 = square, = --grid)")
     p.add_argument("--config", default=None,
@@ -2685,7 +2857,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                          live_interval_s=args.live_interval,
                          traffic_lights=args.traffic_lights, gap_acceptance=args.gap_acceptance,
                          gps_jam_rate=args.gps_jam_rate,
-                         max_total_vehicles=args.max_total_vehicles, verbose=True,
+                         max_total_vehicles=args.max_total_vehicles,
+                         vru_pct=args.vru_pct, vru_speed_mps=args.vru_speed, verbose=True,
                          out_dir=(args.out or "datasets/poc_run"))
     res = run_pipeline(cfg)
     _emit_result(res, args.featurize)

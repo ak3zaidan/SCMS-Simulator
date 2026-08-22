@@ -146,6 +146,17 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         """
         return bool(reporter_cert_digest) and reporter_cert_digest not in vehicle_by_digest
 
+    # MA-VISIBLE self-declared station type (present ONLY when VRUs were simulated -> ma_cert_status /
+    # reports carry it). A leakage-SAFE feature so a model can learn VRU-vs-vehicle: it is the station
+    # type legitimately transmitted on the beacon and observed by the MA, NOT the ORACLE is_vru label
+    # (which lives only in gt_vehicle and never reaches a feature table). Absent -> no new columns, so
+    # non-VRU datasets are unchanged.
+    station_by_digest = {c["cert_digest"]: c.get("station_type") for c in cert_status
+                         if c.get("station_type") is not None}
+    has_station = bool(station_by_digest)
+    vru_declared_vehicles = {vehicle_by_digest[d] for d, st in station_by_digest.items()
+                             if st == "vru" and d in vehicle_by_digest}
+
     label_by_report = {r["report_id"]: r for r in gt_report_labels}
     lifetime_by_digest = {
         c["cert_digest"]: (float(c.get("last_seen", 0)) - float(c.get("first_seen", 0)))
@@ -181,6 +192,9 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         for name in REASON_VOCAB:
             feat[f"reason_{name}"] = int(name in reasons)
         feat["reason_other"] = int(not any(n in REASON_VOCAB for n in reasons))
+        if has_station:   # MA-visible declared station type of the report's subject
+            feat["is_vru_declared"] = int((r.get("station_type")
+                                           or station_by_digest.get(subj_digest)) == "vru")
         rf_rows.append(feat)
 
         gl = label_by_report.get(r["report_id"], {})
@@ -234,6 +248,8 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
             "cert_lifetime_s": float(lifetime_by_digest.get(digest, 0.0)),
             "split": split,
         })
+        if has_station:   # MA-visible declared station type of this subject certificate
+            sf_rows[-1]["is_vru_declared"] = int(station_by_digest.get(digest) == "vru")
         sl_rows.append({
             "subject_cert_digest": digest,
             "label_is_attacker": int(attacker_by_vehicle.get(subj_true, False)),
@@ -304,6 +320,8 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
             "split": split,
             "time_split": time_split,
         })
+        if has_station:   # MA-visible: does the MA see any of this vehicle's certs declare station=vru?
+            vf_rows[-1]["is_vru_declared"] = int(tv in vru_declared_vehicles)
         vl_rows.append({
             "entity_id": entity_id,
             "label_is_attacker": int(attacker_by_vehicle.get(tv, False)),
@@ -431,6 +449,9 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
             "reports_per_reporter": len(rs) / max(1, len(reporters)),
             "split": split,
         })
+        if has_station:   # MA-visible: any cert in this MA-linked cluster declared station=vru?
+            vfm_rows[-1]["is_vru_declared"] = int(any(station_by_digest.get(d) == "vru"
+                                                      for d in cluster_digests))
         vlm_rows.append({
             "entity_id": ment,
             "label_is_attacker": int(attacker_by_vehicle.get(maj_true, False)),
@@ -543,6 +564,8 @@ _FEATURE_DOCS = {
     "score_norm_mean": "mean normalized detector score across a vehicle's reports",
     "score_norm_max": "max normalized detector score across a vehicle's reports",
     "detection_time": "time of the report (sequencing only; excluded from model features)",
+    "is_vru_declared": "MA-visible self-declared station type flag (1 = beacon declares VRU); the "
+                       "legitimately-transmitted signal, NOT the oracle is_vru label",
 }
 
 
