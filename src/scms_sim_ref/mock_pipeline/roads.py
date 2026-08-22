@@ -1,12 +1,21 @@
-"""Grid road network + route-following trips for realistic, long-running mobility.
+"""Road networks + route-following trips for realistic, long-running mobility.
 
-A vehicle in flow mode gets a `Trip`: a shortest-path route between two intersections of a grid
-road network, driven at a desired speed. This gives finite journeys (the vehicle despawns at its
+A vehicle in flow mode gets a `Trip`: a shortest-path route between two intersections of a road
+network, driven at a desired speed. This gives finite journeys (the vehicle despawns at its
 destination), real intersections and turns, and heading that follows the road -- everything the
 straight-line model lacked for long simulations with continuous vehicle turnover.
+
+Topologies (all expose the same interface: nodes / boundary / center / _coord / dist_to_road /
+random_trip / geometry, so everything downstream is topology-agnostic):
+  - GridNetwork    w x h Manhattan grid (optional dropout for irregularity)
+  - RingNetwork    circular ring road
+  - CustomNetwork  an ARBITRARY node/edge graph -- lets a user (or the AI copilot) design any map:
+                   radial cities, highways with on-ramps, river towns with bridges, ...
+  - spider_graph() generator for the classic radial+ring "spider" city, fed to CustomNetwork
 """
 from __future__ import annotations
 
+import heapq
 import math
 from collections import deque
 
@@ -80,12 +89,14 @@ class GridNetwork:
     def __init__(self, w: int, h: int, block: float, dropout: float = 0.0, seed: int = 0):
         self.w, self.h, self.block = int(w), int(h), float(block)
         self.nodes = [(i, j) for i in range(self.w) for j in range(self.h)]
+        self.center = (self.w // 2, self.h // 2)
         # perimeter intersections: realistic traffic sources/sinks (edges of the modelled area)
         self.boundary = [(i, j) for (i, j) in self.nodes
                          if i in (0, self.w - 1) or j in (0, self.h - 1)]
         # optional irregularity: remove a fraction of roads while keeping the grid CONNECTED (only
         # redundant, non-spanning-tree edges are droppable). dropout=0 -> no edges removed -> unchanged.
         self._dropped: set = set()
+        self._closed: set = set()        # timed road closures (events); routing-only, road still exists
         if dropout > 0:
             self._dropped = self._pick_dropped(dropout, seed)
 
@@ -137,7 +148,50 @@ class GridNetwork:
         nb = self._full_neighbors(n)
         if self._dropped:
             nb = [m for m in nb if frozenset((n, m)) not in self._dropped]
+        if self._closed:
+            nb = [m for m in nb if frozenset((n, m)) not in self._closed]
         return nb
+
+    def set_closures(self, pairs) -> list:
+        """Replace the timed-closure set. Each pair ((i,j),(i2,j2)) is applied only if the road
+        exists and closing it keeps the network CONNECTED (a bridge closure is skipped). Returns
+        the list of pairs actually applied. Deterministic (pairs processed in the given order)."""
+        self._closed = set()
+        applied = []
+        for pair in pairs:
+            try:
+                a, b = tuple(pair[0]), tuple(pair[1])
+            except (TypeError, IndexError):
+                continue                        # wrong shape for a grid edge (e.g. [a,b] indices)
+            if a not in self.nodes or b not in self._full_neighbors(a):
+                continue
+            e = frozenset((a, b))
+            if e in self._dropped or e in self._closed:
+                continue
+            self._closed.add(e)
+            seen = {self.nodes[0]}
+            q = deque([self.nodes[0]])
+            while q:
+                for m in self._neighbors(q.popleft()):
+                    if m not in seen:
+                        seen.add(m)
+                        q.append(m)
+            if len(seen) == len(self.nodes):
+                applied.append((a, b))
+            else:                                   # closing this road would strand intersections
+                self._closed.discard(e)
+        return applied
+
+    def geometry(self) -> dict:
+        """Static road geometry for UIs: {'nodes': [[x,y]...], 'edges': [[i0,i1]...]} (dropout
+        respected; timed closures NOT removed -- a closed road still exists physically)."""
+        idx = {n: k for k, n in enumerate(self.nodes)}
+        edges = []
+        for n in self.nodes:
+            for m in self._full_neighbors(n):
+                if m > n and frozenset((n, m)) not in self._dropped:
+                    edges.append([idx[n], idx[m]])
+        return {"nodes": [[*self._coord(n)] for n in self.nodes], "edges": edges}
 
     def _bfs(self, o: tuple[int, int], d: tuple[int, int]) -> list[tuple[int, int]]:
         prev = {o: None}
@@ -214,6 +268,7 @@ class RingNetwork:
         self.R = self.n * self.block / (2.0 * math.pi)     # circumference ~ n*block
         self.cx = self.cy = self.R                          # centre (keeps coords >= 0)
         self.nodes = list(range(self.n))
+        self.center = self.n // 2                          # dest-hint compat (ignored by ring trips)
         self.boundary = list(self.nodes)                   # every node is on the ring
         self.w = self.h = self.n                            # for RSU-placement compatibility
 
@@ -246,3 +301,287 @@ class RingNetwork:
                 break
         wp = [self._coord(i) for i in self._arc(o, d)]
         return Trip(wp, speed, spawn_time)
+
+    def geometry(self) -> dict:
+        return {"nodes": [[*self._coord(i)] for i in self.nodes],
+                "edges": [[i, (i + 1) % self.n] for i in range(self.n)]}
+
+
+class CustomNetwork:
+    """An arbitrary road graph: nodes at metre coordinates + undirected edges. This is the
+    'AI designs the map' primitive -- any topology (radial city, highway with on-ramps, river town
+    with two bridges, ...) expressed as {nodes: [[x,y]...], edges: [[a,b]...]}.
+
+    Same interface as GridNetwork; routing = Dijkstra on edge length (deterministic tie-break).
+    dist_to_road uses an exact cell index over edge segments plus a memo cache (the same claimed
+    position is checked by every receiver in range, so caching is nearly free coverage)."""
+
+    MAX_NODES = 400
+    MAX_EDGES = 1600
+
+    def __init__(self, nodes, edges):
+        if not isinstance(nodes, (list, tuple)) or len(nodes) < 2:
+            raise ValueError("custom network needs at least 2 nodes ([[x,y], ...] in metres)")
+        if len(nodes) > self.MAX_NODES:
+            raise ValueError(f"custom network too large: {len(nodes)} nodes (max {self.MAX_NODES})")
+        self.coords: list[tuple[float, float]] = []
+        for k, p in enumerate(nodes):
+            try:
+                x, y = float(p[0]), float(p[1])
+            except (TypeError, ValueError, IndexError):
+                raise ValueError(f"node {k} must be [x, y] in metres (got {p!r})") from None
+            if not (math.isfinite(x) and math.isfinite(y)):
+                raise ValueError(f"node {k} has a non-finite coordinate")
+            self.coords.append((x, y))
+        if not isinstance(edges, (list, tuple)) or not edges:
+            raise ValueError("custom network needs at least 1 edge ([[a,b], ...] node indices)")
+        if len(edges) > self.MAX_EDGES:
+            raise ValueError(f"custom network too large: {len(edges)} edges (max {self.MAX_EDGES})")
+        n = len(self.coords)
+        seen: set = set()
+        for e in edges:
+            try:
+                a, b = int(e[0]), int(e[1])
+            except (TypeError, ValueError, IndexError):
+                raise ValueError(f"edge {e!r} must be [a, b] node indices") from None
+            if not (0 <= a < n and 0 <= b < n):
+                raise ValueError(f"edge [{a},{b}] references a missing node (have {n} nodes)")
+            if a == b:
+                raise ValueError(f"edge [{a},{b}] is a self-loop")
+            seen.add((min(a, b), max(a, b)))
+        self.edges: list[tuple[int, int]] = sorted(seen)
+        self.nodes = list(range(n))
+        self.adj: dict[int, list[tuple[int, float]]] = {i: [] for i in self.nodes}
+        for a, b in self.edges:
+            d = math.dist(self.coords[a], self.coords[b])
+            if d < 1.0:
+                raise ValueError(f"edge [{a},{b}] is shorter than 1 m -- merge those nodes")
+            self.adj[a].append((b, d))
+            self.adj[b].append((a, d))
+        # must be CONNECTED (unreachable islands would strand trips)
+        reach = {0}
+        q = deque([0])
+        while q:
+            for m, _ in self.adj[q.popleft()]:
+                if m not in reach:
+                    reach.add(m)
+                    q.append(m)
+        if len(reach) != n:
+            missing = sorted(set(self.nodes) - reach)
+            raise ValueError(f"custom network must be connected: node(s) "
+                             f"{missing[:12]}{'...' if len(missing) > 12 else ''} are unreachable "
+                             f"from node 0 -- add edges linking them to the rest (or remove them)")
+        xs = [c[0] for c in self.coords]
+        ys = [c[1] for c in self.coords]
+        self.bbox = (min(xs), min(ys), max(xs), max(ys))
+        cx, cy = sum(xs) / n, sum(ys) / n
+        self.center = min(self.nodes, key=lambda i: (math.dist(self.coords[i], (cx, cy)), i))
+        # boundary (sources/sinks): dead ends + nodes near the bounding-box rim; fallback all
+        margin = max(20.0, 0.12 * max(self.bbox[2] - self.bbox[0], self.bbox[3] - self.bbox[1]))
+        rim = [i for i in self.nodes if
+               self.coords[i][0] <= self.bbox[0] + margin or self.coords[i][0] >= self.bbox[2] - margin or
+               self.coords[i][1] <= self.bbox[1] + margin or self.coords[i][1] >= self.bbox[3] - margin]
+        dead_ends = [i for i in self.nodes if len(self.adj[i]) == 1]
+        self.boundary = sorted(set(dead_ends) | set(rim)) or list(self.nodes)
+        self.w = self.h = n                    # legacy attr compat (RSU spread/perimeter used instead)
+        self.block = (sum(math.dist(self.coords[a], self.coords[b]) for a, b in self.edges)
+                      / len(self.edges))       # mean road-segment length (informational)
+        self.total_road_m = sum(math.dist(self.coords[a], self.coords[b]) for a, b in self.edges)
+        self._closed: set = set()              # timed closures: {(a,b) sorted} routing-only
+        self._hops_cache: dict[int, dict] = {}
+        # exact spatial index over edge segments for dist_to_road
+        self._cell = max(100.0, max(math.dist(self.coords[a], self.coords[b]) for a, b in self.edges))
+        self._index: dict[tuple[int, int], list[int]] = {}
+        for k, (a, b) in enumerate(self.edges):
+            (ax, ay), (bx, by) = self.coords[a], self.coords[b]
+            for ci in range(int(min(ax, bx) // self._cell), int(max(ax, bx) // self._cell) + 1):
+                for cj in range(int(min(ay, by) // self._cell), int(max(ay, by) // self._cell) + 1):
+                    self._index.setdefault((ci, cj), []).append(k)
+        self._max_ring = int(max(self.bbox[2] - self.bbox[0], self.bbox[3] - self.bbox[1])
+                             // self._cell) + 2
+        self._d2r_cache: dict = {}
+
+    def _coord(self, i: int) -> tuple[float, float]:
+        return self.coords[i]
+
+    def _open_adj(self, i: int):
+        if not self._closed:
+            return self.adj[i]
+        return [(m, w) for m, w in self.adj[i] if (min(i, m), max(i, m)) not in self._closed]
+
+    def set_closures(self, pairs) -> list:
+        """Replace the timed-closure set (routing only -- the road still physically exists).
+        A closure that would disconnect the network is skipped. Returns applied [a,b] pairs."""
+        self._closed = set()
+        self._hops_cache = {}
+        applied = []
+        edge_set = set(self.edges)
+        for e in pairs:
+            try:
+                a, b = int(e[0]), int(e[1])
+            except (TypeError, ValueError, IndexError):
+                continue                        # wrong shape (e.g. grid-style [[i,j],[i,j]] pair)
+            key = (min(a, b), max(a, b))
+            if key not in edge_set or key in self._closed:
+                continue
+            self._closed.add(key)
+            reach = {0}
+            q = deque([0])
+            while q:
+                for m, _ in self._open_adj(q.popleft()):
+                    if m not in reach:
+                        reach.add(m)
+                        q.append(m)
+            if len(reach) == len(self.nodes):
+                applied.append([a, b])
+            else:
+                self._closed.discard(key)
+        return applied
+
+    def _hops_from(self, o: int) -> dict[int, int]:
+        h = self._hops_cache.get(o)
+        if h is None:
+            h = {o: 0}
+            q = deque([o])
+            while q:
+                cur = q.popleft()
+                for m, _ in self._open_adj(cur):
+                    if m not in h:
+                        h[m] = h[cur] + 1
+                        q.append(m)
+            self._hops_cache[o] = h
+        return h
+
+    def _route(self, o: int, d: int) -> list[int]:
+        """Shortest path by road length (Dijkstra; ties broken by node index -> deterministic)."""
+        dist = {o: 0.0}
+        prev: dict[int, int | None] = {o: None}
+        pq = [(0.0, o)]
+        while pq:
+            dd, cur = heapq.heappop(pq)
+            if cur == d:
+                break
+            if dd > dist.get(cur, math.inf) + 1e-9:
+                continue
+            for m, w in self._open_adj(cur):
+                nd = dd + w
+                if nd < dist.get(m, math.inf) - 1e-9:
+                    dist[m] = nd
+                    prev[m] = cur
+                    heapq.heappush(pq, (nd, m))
+        if d not in prev:                      # unreachable under closures -> stay at origin
+            return [o]
+        path: list[int] = []
+        cur: int | None = d
+        while cur is not None:
+            path.append(cur)
+            cur = prev[cur]
+        return list(reversed(path))
+
+    def dist_to_road(self, x: float, y: float) -> float:
+        """Exact distance to the nearest road segment (spatial rings + memo; a claim heard by many
+        receivers in one step is computed once)."""
+        key = (round(x, 2), round(y, 2))
+        hit = self._d2r_cache.get(key)
+        if hit is not None:
+            return hit
+        best = math.inf
+        ci, cj = int(x // self._cell), int(y // self._cell)
+        for r in range(self._max_ring + 1):
+            for i in range(ci - r, ci + r + 1):
+                for j in range(cj - r, cj + r + 1):
+                    if max(abs(i - ci), abs(j - cj)) != r:
+                        continue
+                    for k in self._index.get((i, j), ()):
+                        a, b = self.edges[k]
+                        (ax, ay), (bx, by) = self.coords[a], self.coords[b]
+                        d = _pt_seg_dist(x, y, ax, ay, bx, by)
+                        if d < best:
+                            best = d
+            if best <= r * self._cell:         # nothing in farther rings can be closer
+                break
+        if best is math.inf:                   # far outside the indexed extent: exact full scan
+            for a, b in self.edges:
+                (ax, ay), (bx, by) = self.coords[a], self.coords[b]
+                d = _pt_seg_dist(x, y, ax, ay, bx, by)
+                if d < best:
+                    best = d
+        if len(self._d2r_cache) > 200_000:     # deterministic, bounded memo
+            self._d2r_cache.clear()
+        self._d2r_cache[key] = best
+        return best
+
+    def _gravity_dest(self, rng, o: int, hops: dict, min_hops: int, scale: float) -> int:
+        cands, weights = [], []
+        s = max(0.5, scale)
+        for m in self.nodes:
+            hd = hops.get(m)
+            if hd is not None and hd >= min_hops:
+                cands.append(m)
+                weights.append(math.exp(-(hd - min_hops) / s))
+        if not cands:
+            return o
+        r = rng.random() * sum(weights)
+        acc = 0.0
+        for m, w in zip(cands, weights):
+            acc += w
+            if r <= acc:
+                return m
+        return cands[-1]
+
+    def random_trip(self, rng, speed: float, spawn_time: float, min_hops: int = 3,
+                    dest_hint=None, od_model: str = "uniform", gravity_scale: float = 2.0,
+                    boundary_origin: bool = False) -> Trip:
+        o = rng.choice(self.boundary if (boundary_origin and self.boundary) else self.nodes)
+        hops = self._hops_from(o)
+        mh = min(min_hops, max(hops.values()) if hops else 0)   # small nets may lack 3-hop pairs
+        if dest_hint is not None and dest_hint != o and dest_hint in self.adj \
+                and dest_hint in hops:
+            d = dest_hint
+        elif od_model == "gravity":
+            d = self._gravity_dest(rng, o, hops, mh, gravity_scale)
+        else:
+            d = o
+            for _ in range(8):
+                cand = rng.choice(self.nodes)
+                if hops.get(cand, -1) >= mh and cand != o:
+                    d = cand
+                    break
+        wp = [self.coords[i] for i in self._route(o, d)]
+        return Trip(wp, speed, spawn_time)
+
+    def geometry(self) -> dict:
+        return {"nodes": [[x, y] for x, y in self.coords],
+                "edges": [[a, b] for a, b in self.edges]}
+
+    def stats(self) -> dict:
+        """Design feedback for the AI/user: size, extent, road length, connectivity facts."""
+        return {"n_nodes": len(self.nodes), "n_edges": len(self.edges),
+                "total_road_m": round(self.total_road_m, 1),
+                "mean_segment_m": round(self.block, 1),
+                "bbox_m": [round(v, 1) for v in self.bbox],
+                "n_dead_ends": sum(1 for i in self.nodes if len(self.adj[i]) == 1),
+                "boundary_nodes": len(self.boundary), "center_node": self.center}
+
+
+def spider_graph(arms: int, rings: int, block: float) -> tuple[list, list]:
+    """The classic radial city: `arms` spokes from a central plaza crossed by `rings` concentric
+    ring roads spaced `block` m apart. Returns (nodes, edges) for CustomNetwork."""
+    arms, rings = max(3, int(arms)), max(1, int(rings))
+    span = rings * float(block)                # shift so all coordinates are >= 0
+    nodes: list[list[float]] = [[span, span]]  # 0 = centre
+    edges: list[list[int]] = []
+    idx: dict[tuple[int, int], int] = {}
+    for r in range(1, rings + 1):
+        for a in range(arms):
+            th = 2.0 * math.pi * a / arms
+            nodes.append([span + r * block * math.cos(th), span + r * block * math.sin(th)])
+            idx[(r, a)] = len(nodes) - 1
+    for a in range(arms):
+        edges.append([0, idx[(1, a)]])                          # centre -> innermost ring
+        for r in range(1, rings):
+            edges.append([idx[(r, a)], idx[(r + 1, a)]])        # radial spokes
+    for r in range(1, rings + 1):
+        for a in range(arms):
+            edges.append([idx[(r, a)], idx[(r, (a + 1) % arms)]])   # ring roads
+    return nodes, edges

@@ -33,11 +33,15 @@ $env:PYTHONPATH = "src"
 python -m scms_sim_ref.mock_pipeline.run --out datasets/poc_run   # small reference run
 ```
 
-The built-in generator is a full microscopic traffic simulator: routed trips on a road grid with
-IDM car-following (queues/congestion), signalized intersections, time-of-day demand, a mixed fleet
-(car/moto/truck/bus), weather, range-limited lossy radio, 21 attack types across 8 families, and a
-13-signal detector suite with a windowed Misbehavior-Authority. It is deterministic (same seed +
-config → byte-identical data) and memory-bounded via streaming.
+The built-in generator is a full microscopic traffic simulator: routed trips on a road network
+(grid, ring, radial spider city, or a fully **custom node/edge map** via `--road custom
+--custom-network map.json`) with IDM car-following (queues/congestion), signalized intersections,
+time-of-day demand, a mixed fleet (car/moto/truck/bus), weather, range-limited lossy radio,
+21 attack types across 8 families, and a 13-signal detector suite with a windowed
+Misbehavior-Authority. A JSON `--events` timeline adds deterministic mid-run dynamics: demand
+surges, weather fronts, road closures, and coordinated attack waves. In the GUI, the AI Copilot
+designs custom maps and timelines from plain language. Deterministic (same seed + config →
+byte-identical data) and memory-bounded via streaming.
 
 ```powershell
 # long-running routed traffic-flow simulation (spawn/despawn over time)

@@ -140,6 +140,61 @@ def test_agent_loop_executes_scripted_tool_calls(tmp_path, monkeypatch):
     assert tools_used == ["set_config", "run_and_analyze"]
 
 
+def test_design_network_tool_activates_custom_map(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "AGENT_OUT", tmp_path / "agent_run")
+    s = agent.AgentSession()
+    nodes = [[0, 0], [0, 300], [300, 300], [300, 0], [600, 150]]
+    edges = [[0, 1], [1, 2], [2, 3], [3, 0], [2, 4], [3, 4]]
+    r = agent._exec_tool(s, "design_network", {"nodes": nodes, "edges": edges})
+    assert r["ok"] and r["network"]["n_nodes"] == 5 and r["network"]["n_edges"] == 6
+    assert s.config["road_network"] == "custom" and "custom_network" in s.config
+    # an invalid design surfaces a clean, actionable error (the AI's feedback loop)
+    bad = agent._exec_tool(s, "design_network",
+                           {"nodes": nodes, "edges": [[0, 1]], "auto_connect": False})
+    assert "error" in bad and "unreachable" in bad["error"]
+    assert s.config["road_network"] == "custom"          # failed design didn't clobber the good one
+    # the designed map runs end-to-end
+    agent._exec_tool(s, "set_config", {"overrides": dict(
+        traffic_flow=True, duration_s=40, arrival_rate=1.5, attacker_pct=0.25, seed=7)})
+    rr = agent._exec_tool(s, "run_and_analyze", {})
+    assert rr["ok"] and rr["analysis"]["vehicles"] > 0
+
+
+def test_design_network_auto_connects_islands():
+    """An LLM design with an isolated district gets bridged via the shortest link, visibly."""
+    s = agent.AgentSession()
+    nodes = [[0, 0], [0, 200], [200, 0], [1000, 0], [1000, 200]]   # nodes 3-4 are an island
+    edges = [[0, 1], [0, 2], [3, 4]]
+    r = agent._exec_tool(s, "design_network", {"nodes": nodes, "edges": edges})
+    assert r["ok"] and r["auto_connected"] == [[2, 3]]   # closest pair bridges the river
+    assert r["network"]["n_edges"] == 4
+    # strict mode refuses instead
+    r2 = agent._exec_tool(s, "design_network",
+                          {"nodes": nodes, "edges": edges, "auto_connect": False})
+    assert "error" in r2 and "unreachable" in r2["error"]
+
+
+def test_design_network_accepts_double_encoded_arrays():
+    """LLMs sometimes send arrays as JSON strings; the executor decodes them transparently."""
+    s = agent.AgentSession()
+    r = agent._exec_tool(s, "design_network", {
+        "nodes": "[[0,0],[0,200],[200,200],[200,0]]",
+        "edges": "[[0,1],[1,2],[2,3],[3,0]]"})
+    assert r["ok"] and r["network"]["n_nodes"] == 4
+
+
+def test_set_events_tool_validates_and_stores():
+    s = agent.AgentSession()
+    r = agent._exec_tool(s, "set_events", {"events": [
+        {"t": 10, "until": 30, "type": "demand", "mult": 2.0},
+        {"t": 20, "type": "weather", "value": "fog"}]})
+    assert r["ok"] and len(r["events"]) == 2 and "events" in s.config
+    bad = agent._exec_tool(s, "set_events", {"events": [{"t": 5, "type": "hurricane"}]})
+    assert "error" in bad and "events" in s.config       # bad timeline left the good one in place
+    cleared = agent._exec_tool(s, "set_events", {"events": []})
+    assert cleared["ok"] and "events" not in s.config
+
+
 def test_agent_reports_missing_key():
     s = agent.AgentSession()
     out = agent.run_agent(s, "hi", key="")

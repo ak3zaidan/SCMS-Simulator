@@ -632,33 +632,54 @@ function startLive(){ if(!liveTimer){ liveTimer=setInterval(drawLiveOnce,1200); 
 function stopLive(){ if(liveTimer){ clearInterval(liveTimer); liveTimer=null; } }
 async function drawLiveOnce(){
   try{ lastLive=await (await fetch('/api/live')).json(); }catch(e){}
+  if(Date.now()-netFetched>5000) await fetchNetwork();   // pick up the current run's road map
   drawMap(lastLive);
 }
 const COLORS=['#2dd4bf','#ff5d5d','#ffb020','#8892a0'];
+let NETWORK=null, netFetched=0;                 // road geometry of the current run (map background)
+async function fetchNetwork(){
+  try{ NETWORK=await (await fetch('/api/network')).json(); }catch(e){ NETWORK=null; }
+  netFetched=Date.now();
+}
 function drawMap(live){
   const cv=$('#map'), ctx=cv.getContext('2d');
   const w=cv.clientWidth, h=cv.clientHeight, dpr=window.devicePixelRatio||1;
   if(cv.width!==w*dpr||cv.height!==h*dpr){ cv.width=w*dpr; cv.height=h*dpr; }
   ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,w,h);
   const vs=(live&&live.vehicles)||[];
+  const nodes=(NETWORK&&NETWORK.nodes)||[];
   const counts=[0,0,0,0];
-  if(!vs.length){ $('#mapinfo').textContent='no live data yet'; return; }
+  if(!vs.length&&!nodes.length){ $('#mapinfo').textContent='no live data yet'; return; }
   let minX=1e18,minY=1e18,maxX=-1e18,maxY=-1e18;
   for(const v of vs){ minX=Math.min(minX,v[0]);maxX=Math.max(maxX,v[0]);
                       minY=Math.min(minY,v[1]);maxY=Math.max(maxY,v[1]); }
+  for(const p of nodes){ minX=Math.min(minX,p[0]);maxX=Math.max(maxX,p[0]);   // stable framing:
+                         minY=Math.min(minY,p[1]);maxY=Math.max(maxY,p[1]); } // include the roads
   const pad=24, sx=(w-2*pad)/Math.max(1,maxX-minX), sy=(h-2*pad)/Math.max(1,maxY-minY);
   const sc=Math.min(sx,sy);
   const ox=pad+((w-2*pad)-(maxX-minX)*sc)/2, oy=pad+((h-2*pad)-(maxY-minY)*sc)/2;
+  const px=x=>ox+(x-minX)*sc, py=y=>h-(oy+(y-minY)*sc);   // flip Y so north is up
+  if(nodes.length&&NETWORK.edges){                        // roads first, under the vehicles
+    ctx.lineWidth=Math.max(1.5,Math.min(5,sc*8)); ctx.strokeStyle='#243044'; ctx.lineCap='round';
+    ctx.beginPath();
+    for(const [a,b] of NETWORK.edges){
+      if(!nodes[a]||!nodes[b]) continue;
+      ctx.moveTo(px(nodes[a][0]),py(nodes[a][1])); ctx.lineTo(px(nodes[b][0]),py(nodes[b][1]));
+    }
+    ctx.stroke();
+    ctx.fillStyle='#2e3c55';                              // intersections
+    for(const p of nodes){ ctx.beginPath(); ctx.arc(px(p[0]),py(p[1]),1.6,0,7); ctx.fill(); }
+  }
   // draw non-benign last so they sit on top
   const order=[...vs].sort((a,b)=>(a[2]||0)-(b[2]||0));
   for(const v of order){
     const s=v[2]|0; counts[s]++;
-    const px=ox+(v[0]-minX)*sc, py=h-(oy+(v[1]-minY)*sc); // flip Y so north is up
-    ctx.beginPath(); ctx.arc(px,py,s===0?2.4:3.6,0,7); ctx.fillStyle=COLORS[s]||COLORS[0];
+    ctx.beginPath(); ctx.arc(px(v[0]),py(v[1]),s===0?2.4:3.6,0,7); ctx.fillStyle=COLORS[s]||COLORS[0];
     ctx.globalAlpha=s===0?0.85:1; ctx.fill(); ctx.globalAlpha=1;
   }
-  $('#mapinfo').textContent=`t=${(live.t||0).toFixed(0)}s · ${vs.length} vehicles · `+
-    `${counts[1]} attacker · ${counts[2]} reported · ${counts[3]} revoked`;
+  $('#mapinfo').textContent=(vs.length?`t=${(live.t||0).toFixed(0)}s · ${vs.length} vehicles · `+
+    `${counts[1]} attacker · ${counts[2]} reported · ${counts[3]} revoked`
+    :`road network · ${nodes.length} intersections`);
 }
 window.addEventListener('resize',()=>drawMap(lastLive));
 
@@ -819,11 +840,12 @@ function renderStats(st){
 /* ================= AI Copilot ================= */
 let COPILOT_ON=false, chatBusy=false;
 const SUGGESTIONS=[
-  "Ring road, 12 intersections, 25% attackers, 60s — run it and report precision & recall",
+  "Design a river town: two districts joined by two bridges, then close one bridge mid-run and show the effect",
+  "Spider city with 8 avenues and 3 ring roads, rush-hour demand, 25% attackers — run it",
+  "Build a highway with 5 on-ramps feeding a small downtown grid; fog rolls in halfway through",
   "Tune attacker_pct to get revocation recall above 0.85, then confirm the final run",
   "Sweep attacker_pct from 0.1 to 0.5 and show how recall changes",
-  "Compare a clear-weather run to a foggy one at 30% attackers and tell me which is harder to detect",
-  "Sparse rural grid where mobile reporters are scarce; add 8 RSUs and show the RSU contribution",
+  "Simulate a coordinated attack wave from t=60s to t=120s during a demand surge — how fast is revocation?",
 ];
 
 async function initCopilot(){
@@ -876,6 +898,12 @@ function stepDesc(st){
   if(st.tool==='reset_config') return {d:'config reset to defaults'};
   if(st.tool==='get_config') return {d:'read current config'};
   if(st.tool==='describe_fields') return {d:'looked up: '+((a.names||[]).join(', '))};
+  if(st.tool==='design_network'){ const n=r.network||{};
+    return {d:`designed map · ${n.n_nodes??'?'} intersections, ${n.n_edges??'?'} roads, `+
+      `${((n.total_road_m||0)/1000).toFixed(1)} km of road`}; }
+  if(st.tool==='set_events'){ const evs=r.events||[];
+    return {d:evs.length?('timeline: '+evs.map(e=>`${e.type}@${e.t}s`+(e.until?`–${e.until}s`:''))
+      .join(', ')):'timeline cleared'}; }
   if(st.tool==='sweep'){ const b=r.best;
     return {d:`swept ${r.field} (${(r.runs||[]).length} runs)`+
       (b?` · best ${r.metric}=${fmtMetric(r.metric,b[r.metric])} at ${r.field}=${b.value}`:'')}; }
@@ -912,7 +940,8 @@ function stepCardHtml(st){
 }
 const TOOL_VERB={set_config:'configuring',apply_preset:'loading preset',run_and_analyze:'running simulation',
   sweep:'sweeping parameter',compare:'comparing variants',reset_config:'resetting',
-  get_config:'reading config',describe_fields:'looking up fields'};
+  get_config:'reading config',describe_fields:'looking up fields',
+  design_network:'designing the road map',set_events:'scheduling scenario events'};
 function renderSteps(container,steps,current){    // live-updatable step list (+ optional running row)
   let html=(steps||[]).map(stepCardHtml).join('');
   if(current) html+=`<div class="step running"><div class="t">${escH(current)}</div>`+

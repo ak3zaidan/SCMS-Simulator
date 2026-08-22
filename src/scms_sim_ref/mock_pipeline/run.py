@@ -214,11 +214,13 @@ class PipelineConfig:
     duration_s: float = 0.0              # flow: sim length in seconds (overrides n_steps if > 0)
     arrival_rate: float = 2.0            # flow: mean vehicles spawned per second
     max_total_vehicles: int = 0          # flow: cap total spawns (0 = unlimited) -> bounds memory
-    road_network: str = "linear"         # "linear" (straight lines) | "grid" (routed trips)
-    grid_w: int = 6
-    grid_h: int = 6
+    road_network: str = "linear"         # linear | grid | ring | spider | custom (see custom_network)
+    grid_w: int = 6                      # grid width | ring nodes | spider arms
+    grid_h: int = 6                      # grid height | spider rings
     grid_block_m: float = 120.0
     grid_dropout: float = 0.0            # remove this fraction of grid roads (irregular/incomplete grid)
+    custom_network: str = ""             # road_network="custom": JSON {"nodes":[[x,y]...m],
+                                         # "edges":[[a,b]...]} -- an arbitrary user/AI-designed map
     n_lanes: int = 1                     # >1: parallel lanes per road -> overtaking, less gridlock
     lane_width_m: float = 3.5
     trip_speed_min: float = 8.0
@@ -258,6 +260,11 @@ class PipelineConfig:
     state_prune_ttl: int = 20            # flow: evict detection state untouched this many steps
     live_interval_s: float = 0.0         # >0: write a throttled live_state.json for the GUI map
                                          # (best-effort viz; NOT part of the data digest)
+    events: str = ""                     # JSON scenario timeline (deterministic mid-run dynamics):
+                                         # [{"t":120,"until":240,"type":"demand","mult":3.0},
+                                         #  {"t":60,"type":"weather","value":"fog"},
+                                         #  {"t":90,"until":150,"type":"close_edge","edge":[3,7]},
+                                         #  {"t":100,"until":200,"type":"attack_wave"}]
     verbose: bool = False                # print a flow progress heartbeat (CLI/GUI set this True)
     jmax: int = 20
     out_dir: str = "datasets/poc_run"
@@ -440,6 +447,85 @@ def _parse_rsu_coords(s: str) -> list:
     return out
 
 
+def _parse_custom_network(s) -> tuple[list, list]:
+    """Parse + sanity-check the custom_network JSON -> (nodes, edges). Raises ValueError with a
+    design-actionable message (this is the feedback loop for AI/user map design). Accepts an
+    already-parsed dict too (tool layers sometimes hand the object through)."""
+    if isinstance(s, dict):
+        doc = s
+    else:
+        if not s or not str(s).strip():
+            raise ValueError('road_network="custom" needs custom_network JSON: '
+                             '{"nodes": [[x,y], ...metres], "edges": [[a,b], ...node indices]}')
+        try:
+            doc = json.loads(s)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"custom_network is not valid JSON: {e}") from None
+    if not isinstance(doc, dict) or "nodes" not in doc or "edges" not in doc:
+        raise ValueError('custom_network JSON must be an object with "nodes" and "edges"')
+    return doc["nodes"], doc["edges"]
+
+
+# Scenario-event timeline: each event type, its required keys, and what it changes mid-run.
+EVENT_TYPES = {
+    "demand": "arrival-rate multiplier while active: {t, until, mult}",
+    "weather": "weather changes at t (sensor noise, radio loss, new drivers' speed): {t, value}",
+    "close_edge": "road closed to NEW trips while active (navigation avoidance): {t, edge, [until]}",
+    "attack_wave": "attackers only falsify inside attack_wave windows (if any are defined): {t, until}",
+}
+
+
+def _parse_events(s) -> list[dict]:
+    """Parse + validate the events JSON timeline -> chronologically sorted list. Empty -> [].
+    Accepts an already-parsed list too (tool layers sometimes hand the object through)."""
+    if isinstance(s, list):
+        evs = s
+    else:
+        if not s or not str(s).strip():
+            return []
+        try:
+            evs = json.loads(s)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"events is not valid JSON: {e}") from None
+    if not isinstance(evs, list):
+        raise ValueError("events must be a JSON list of event objects")
+    out = []
+    for k, e in enumerate(evs):
+        if not isinstance(e, dict) or "type" not in e or "t" not in e:
+            raise ValueError(f"event {k} must be an object with at least 't' and 'type'")
+        et = e["type"]
+        if et not in EVENT_TYPES:
+            raise ValueError(f"event {k}: unknown type {et!r}; valid: {sorted(EVENT_TYPES)}")
+        t0 = float(e["t"])
+        until = float(e["until"]) if e.get("until") is not None else None
+        if t0 < 0 or (until is not None and until <= t0):
+            raise ValueError(f"event {k}: need 0 <= t < until (got t={t0}, until={until})")
+        ev = {"t": t0, "until": until, "type": et}
+        if et == "demand":
+            if until is None:
+                raise ValueError(f"event {k}: demand needs 'until'")
+            ev["mult"] = float(e.get("mult", 1.0))
+            if ev["mult"] < 0:
+                raise ValueError(f"event {k}: demand mult must be >= 0")
+        elif et == "weather":
+            v = e.get("value")
+            if v not in WEATHER_MULT:
+                raise ValueError(f"event {k}: weather value must be one of {sorted(WEATHER_MULT)}")
+            ev["value"] = v
+        elif et == "close_edge":
+            edge = e.get("edge")
+            if not isinstance(edge, (list, tuple)) or len(edge) != 2:
+                raise ValueError(f"event {k}: close_edge needs 'edge': [a,b] (custom/spider node "
+                                 f"indices) or [[i,j],[i2,j2]] (grid intersections)")
+            ev["edge"] = edge
+        elif et == "attack_wave":
+            if until is None:
+                raise ValueError(f"event {k}: attack_wave needs 'until'")
+        out.append(ev)
+    out.sort(key=lambda e: (e["t"], e["type"]))
+    return out
+
+
 def _rsu_spots(cfg: "PipelineConfig", net) -> list:
     """Placement coordinates for the RSUs. Explicit rsu_coords wins; else per cfg.rsu_placement."""
     explicit = _parse_rsu_coords(cfg.rsu_coords)
@@ -560,8 +646,20 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
     if cfg.trip_speed_min <= 0 or cfg.trip_speed_max < cfg.trip_speed_min:
         raise ValueError(f"need 0 < trip_speed_min <= trip_speed_max "
                          f"(got {cfg.trip_speed_min}, {cfg.trip_speed_max})")
-    if cfg.road_network not in ("linear", "grid", "ring"):
-        raise ValueError(f"road_network must be linear|grid|ring (got {cfg.road_network!r})")
+    if cfg.road_network not in ("linear", "grid", "ring", "spider", "custom"):
+        raise ValueError(f"road_network must be linear|grid|ring|spider|custom "
+                         f"(got {cfg.road_network!r})")
+    if cfg.road_network == "custom":
+        from .roads import CustomNetwork
+        CustomNetwork(*_parse_custom_network(cfg.custom_network))   # full design validation
+    if cfg.road_network in ("spider", "custom") and not cfg.traffic_flow:
+        raise ValueError(f"road_network={cfg.road_network!r} needs traffic_flow=true: fixed-fleet "
+                         f"vehicles drive straight lines, which would put them off the designed "
+                         f"roads (set traffic_flow=true and an arrival_rate)")
+    ev = _parse_events(cfg.events)                                  # raises on a malformed timeline
+    if any(e["type"] == "close_edge" for e in ev):
+        if cfg.road_network in ("linear", "ring"):
+            raise ValueError("close_edge events need a grid, spider, or custom road network")
     if cfg.traffic_flow:
         if cfg.arrival_rate < 0:
             raise ValueError(f"arrival_rate must be >= 0 (got {cfg.arrival_rate})")
@@ -572,6 +670,9 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
                              f"(got {cfg.grid_w}x{cfg.grid_h})")
         if cfg.road_network == "ring" and cfg.grid_w < 3:
             raise ValueError(f"ring road network needs grid_w >= 3 nodes (got {cfg.grid_w})")
+        if cfg.road_network == "spider" and (cfg.grid_w < 3 or cfg.grid_h < 1):
+            raise ValueError(f"spider network needs grid_w >= 3 arms and grid_h >= 1 rings "
+                             f"(got {cfg.grid_w} arms x {cfg.grid_h} rings)")
     for name in _PROB_FIELDS:                       # clamp fractions rather than produce nonsense
         setattr(cfg, name, min(1.0, max(0.0, float(getattr(cfg, name)))))
     return cfg
@@ -589,7 +690,8 @@ def _field_group(name: str) -> str:
         ("Mobility", ("fleet", "trip_", "idm_", "demand", "arrival", "n_lanes", "lane_", "turn_",
                       "car_following", "veh_length", "od_", "boundary", "traffic_flow", "duration",
                       "max_total", "nominal_speed", "state_prune")),
-        ("Network", ("road_network", "grid", "traffic_lights", "light_cycle")),
+        ("Network", ("road_network", "grid", "custom_network", "traffic_lights", "light_cycle")),
+        ("Scenario events", ("events",)),
         ("GNSS/sensor", ("gps_", "faulty", "weather")),
         ("Radio", ("radio", "packet", "nlos", "chan", "freq", "art_max", "stale")),
         ("Detection/MA", ("consistency", "heading", "detector", "report", "revoke", "reputation",
@@ -607,7 +709,7 @@ def _field_group(name: str) -> str:
 # Enumerated fields -> their valid options (sourced from the live constants so they never drift).
 _ENUM_OPTIONS = {
     "weather": list(WEATHER_MULT),
-    "road_network": ["linear", "grid", "ring"],
+    "road_network": ["linear", "grid", "ring", "spider", "custom"],
     "demand_profile": ["uniform", "rush", "night"],
     "od_model": ["uniform", "gravity"],
     "fleet": ["mixed", *VEHICLE_TYPES],
@@ -657,7 +759,12 @@ _FIELD_META = {
     "state_prune_every": dict(h="Steps between detection-state prunes (flow memory)", lo=1),
     "state_prune_ttl": dict(h="Evict detection state untouched this many steps", lo=1),
     # Network
-    "road_network": dict(h="Road topology: straight lines, routed grid, or a circular ring"),
+    "road_network": dict(h="Road topology: straight lines, routed grid, ring, radial spider city, "
+                           "or a fully custom node/edge map (see custom_network)"),
+    "custom_network": dict(h='Custom map JSON {"nodes":[[x,y]...metres],"edges":[[a,b]...]} — any '
+                             'connected road graph (AI/user-designed); used when road_network=custom'),
+    "events": dict(h='Scenario timeline JSON: [{"t":s,"type":"demand|weather|close_edge|attack_wave",'
+                     '...}] — mid-run demand surges, weather fronts, road closures, attack waves'),
     "grid_w": dict(h="Grid columns (grid) / number of intersections (ring)", lo=2, hi=40),
     "grid_h": dict(h="Grid rows (0 = square, equal to grid_w)", lo=0, hi=40),
     "grid_block_m": dict(h="Spacing between adjacent intersections", lo=20, hi=500, u="m"),
@@ -812,6 +919,41 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     elif cfg.road_network == "ring":
         from .roads import RingNetwork
         net = RingNetwork(cfg.grid_w, cfg.grid_block_m)   # grid_w = number of ring intersections
+    elif cfg.road_network == "spider":
+        from .roads import CustomNetwork, spider_graph
+        net = CustomNetwork(*spider_graph(cfg.grid_w, cfg.grid_h, cfg.grid_block_m))
+    elif cfg.road_network == "custom":
+        from .roads import CustomNetwork
+        net = CustomNetwork(*_parse_custom_network(cfg.custom_network))
+    events = _parse_events(cfg.events)                     # validated timeline (possibly empty)
+
+    # ---- scenario-event timeline (deterministic mid-run dynamics; empty -> byte-identical) ----
+    _weather_evs = [e for e in events if e["type"] == "weather"]        # chronological
+    _demand_evs = [e for e in events if e["type"] == "demand"]
+    _closure_evs = [e for e in events if e["type"] == "close_edge"]
+    _wave_evs = [e for e in events if e["type"] == "attack_wave"]
+
+    def weather_at(t: float) -> str:
+        w = cfg.weather
+        for e in _weather_evs:                             # last front at/before t wins
+            if e["t"] <= t:
+                w = e["value"]
+            else:
+                break
+        return w
+
+    def ev_demand_mult(t: float) -> float:
+        m = 1.0
+        for e in _demand_evs:
+            if e["t"] <= t < e["until"]:
+                m *= e["mult"]
+        return m
+
+    def attack_wave_active(t: float) -> bool:
+        # no attack_wave events -> attacks follow their own windows (unchanged default)
+        if not _wave_evs:
+            return True
+        return any(e["t"] <= t < e["until"] for e in _wave_evs)
     pseudonym_info: dict[str, dict] = {}   # digest -> {i,j,lv,ghost,veh_vid}
     vehicles: list[Vehicle] = []
     gt_vehicle, gt_idmap = [], []
@@ -876,7 +1018,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         base_speed = trip.speed if trip is not None else cfg.nominal_speed * (0.85 + 0.3 * vr.random())
         vtype = _pick_vehicle_type(vr, cfg.fleet, fleet_weights)
         tp = VEHICLE_TYPES[vtype]
-        speed = base_speed * tp["speed_mult"] * WEATHER_SPEED_MULT.get(cfg.weather, 1.0)
+        speed = base_speed * tp["speed_mult"] * WEATHER_SPEED_MULT.get(
+            weather_at(spawn_time) if _weather_evs else cfg.weather, 1.0)
         v = Vehicle(
             vid=vid, spawn_x=float(vid * 20), lane_y=float(vid % 4) * 4.0, speed=speed,
             is_attacker=is_att, priv=None, pub=b"", cert_digest=p0["digest"],
@@ -936,18 +1079,30 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 return 0.15 + 0.25 * frac
             return 1.0                            # uniform
 
-        center = (net.w // 2, net.h // 2) if net is not None else None
+        center = net.center if net is not None else None
+        # demand surges above the base arrival rate need a faster candidate stream; the extra
+        # candidates are thinned back out outside surge windows. No events -> cand_boost = 1.0 ->
+        # identical draw sequence -> byte-identical output.
+        cand_boost = max([1.0] + [ev_demand_mult(b) for b in sorted({e["t"] for e in _demand_evs})])
+        cand_rate = cfg.arrival_rate * cand_boost
+        closure_sig: tuple = ()
         rrng = random.Random(f"{cfg.seed}:flow")
         vid, tt = 0, 0.0
         while True:                              # thinning: candidates at max rate, kept per demand
-            tt += rrng.expovariate(cfg.arrival_rate) if cfg.arrival_rate > 0 else total_time
+            tt += rrng.expovariate(cand_rate) if cand_rate > 0 else total_time
             if tt >= total_time:
                 break
             if cfg.max_total_vehicles and vid >= cfg.max_total_vehicles:
                 break                            # cap total spawns (predictable memory bound)
             frac = tt / total_time
-            if rrng.random() > demand_mult(frac):
-                continue                          # thinned out (off-peak)
+            if rrng.random() > demand_mult(frac) * ev_demand_mult(tt) / cand_boost:
+                continue                          # thinned out (off-peak / outside a surge)
+            if _closure_evs and net is not None:  # timed road closures divert NEW trips (navigation)
+                sig = tuple(e["t"] <= tt and (e["until"] is None or tt < e["until"])
+                            for e in _closure_evs)
+                if sig != closure_sig and hasattr(net, "set_closures"):
+                    closure_sig = sig
+                    net.set_closures([e["edge"] for e, on in zip(_closure_evs, sig) if on])
             is_att = rrng.random() < cfg.attacker_pct
             is_flt = (not is_att) and rrng.random() < cfg.faulty_pct
             is_coll = is_att and rrng.random() < cfg.collude_pct
@@ -961,6 +1116,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     if net is not None else None)
             make_vehicle(vid, tt, is_att, is_flt, is_coll, trip, life_hint=90.0)
             vid += 1
+        if _closure_evs and net is not None and hasattr(net, "set_closures"):
+            net.set_closures([])                 # routing closures only affect the spawn pre-pass
     else:
         # ---- FIXED FLEET: N vehicles present for the whole run (the default model) ----
         n_steps = cfg.n_steps
@@ -1042,7 +1199,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # SUSTAINED large residuals for a few seconds, the realistic source of benign false positives
         if not v.is_attacker and t >= v.degrade_until and r.random() < cfg.gps_degrade_rate:
             v.degrade_until = t + cfg.gps_degrade_dur_s
-        sigma_nom = cfg.gps_sigma_m * v.gps_q * wmult
+        w_now = wmult if not _weather_evs else WEATHER_MULT.get(weather_at(t), 1.0)
+        sigma_nom = cfg.gps_sigma_m * v.gps_q * w_now
         sigma = sigma_nom * (cfg.gps_degrade_factor if t < v.degrade_until else 1.0)
         mx = x + v.bias_x + r.gauss(0, sigma)
         my = y + v.bias_y + r.gauss(0, sigma)
@@ -1255,6 +1413,13 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     live_every = max(1, int(round(cfg.live_interval_s / cfg.dt))) if cfg.live_interval_s > 0 else 0
     if live_every:
         os.makedirs(cfg.out_dir, exist_ok=True)
+        # static road geometry for the GUI map (drawn under the vehicles; viz-only, not digested)
+        try:
+            geo = net.geometry() if net is not None else {"nodes": [], "edges": []}
+            with open(os.path.join(cfg.out_dir, "network.json"), "w", encoding="utf-8") as fh:
+                json.dump({**geo, "road_network": cfg.road_network}, fh)
+        except OSError:
+            pass
 
     def write_live(active_list, t):
         # throttled live snapshot for the GUI map: [x, y, state]; state 0 benign/1 attacker/2 reported/
@@ -1401,7 +1566,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             cert_last_seen[digest] = t
             x, y, tspeed, theading = tx.true_state(t)
             mx, my, conf = measure(tx, x, y, t)
-            attacking = tx.is_attacker and tx.attack_from <= t <= tx.attack_to
+            attacking = (tx.is_attacker and tx.attack_from <= t <= tx.attack_to
+                         and attack_wave_active(t))
             if attacking and cfg.attack_duty_cycle < 1.0:  # intermittent: falsify only in bursts
                 period = max(1e-6, cfg.attack_pulse_period_s)
                 phase = ((t - tx.attack_from) / period + tx.pulse_phase) % 1.0
@@ -1480,7 +1646,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # draws) is unchanged -> byte-identical when n_rsus=0 (rsus is empty).
         receivers = active_list + rsus
         rx_pos = {rx.vid: rx.true_state(t)[:2] for rx in receivers if not enforced(rx, t)}
-        wx_loss = WEATHER_RADIO_LOSS.get(cfg.weather, 0.0)
+        wx_loss = WEATHER_RADIO_LOSS.get(weather_at(t) if _weather_evs else cfg.weather, 0.0)
         # spatial index over broadcasts (cell = radio range) so each receiver only tests transmitters
         # in its own + adjacent cells -> reception is O(active x local density), not O(active^2). Cell
         # size = range means the 3x3 neighbourhood provably contains every in-range pair; candidates
@@ -1815,7 +1981,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--flow", action="store_true", help="traffic-flow mode: vehicles spawn/despawn over time")
     p.add_argument("--duration", type=float, default=0.0, help="flow: sim length in seconds")
     p.add_argument("--arrival-rate", type=float, default=2.0, help="flow: mean vehicles spawned per second")
-    p.add_argument("--road", default="linear", choices=["linear", "grid", "ring"], help="road network model")
+    p.add_argument("--road", default="linear", choices=["linear", "grid", "ring", "spider", "custom"],
+                   help="road network model (spider: --grid = arms, --grid-h = rings)")
+    p.add_argument("--custom-network", default="", metavar="JSON_OR_FILE",
+                   help='custom map: inline JSON {"nodes":[[x,y]...],"edges":[[a,b]...]} or a file path')
+    p.add_argument("--events", default="", metavar="JSON_OR_FILE",
+                   help="scenario timeline: inline JSON list of events or a file path")
     p.add_argument("--grid", type=int, default=6, help="grid road network dimension (grid x grid)")
     p.add_argument("--grid-block", type=float, default=120.0, help="grid block spacing (m)")
     p.add_argument("--grid-dropout", type=float, default=0.0,
@@ -1920,6 +2091,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                          nlos_loss=args.nlos, chan_capacity=args.chan_capacity,
                          traffic_flow=args.flow, duration_s=args.duration, arrival_rate=args.arrival_rate,
                          road_network=("grid" if (args.flow and args.road == "linear") else args.road),
+                         custom_network=_inline_or_file(args.custom_network),
+                         events=_inline_or_file(args.events),
                          grid_w=args.grid, grid_h=(args.grid_h or args.grid), grid_block_m=args.grid_block,
                          n_lanes=args.lanes, lane_width_m=args.lane_width, light_cycle_s=args.light_cycle,
                          grid_dropout=args.grid_dropout,
@@ -1943,6 +2116,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.dump_config:
         _dump_config(cfg, args.dump_config)
     return 0
+
+
+def _inline_or_file(s: str) -> str:
+    """CLI convenience: a JSON-looking value is used inline; anything else is read as a file path."""
+    s = (s or "").strip()
+    if not s or s.startswith("{") or s.startswith("["):
+        return s
+    with open(s, encoding="utf-8") as fh:
+        return fh.read()
 
 
 def _emit_result(res, featurize: bool) -> None:

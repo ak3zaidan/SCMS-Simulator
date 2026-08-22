@@ -102,9 +102,11 @@ CONFIG_SPEC = [
     {"group": "Python flow", "name": "pf_arrival", "label": "Arrival rate (veh/s)", "type": "float",
      "default": 2.5, "step": 0.5, "gen": "python-flow", "arg": "--arrival-rate"},
     {"group": "Python flow", "name": "pf_road", "label": "Road network", "type": "choice",
-     "default": "grid", "options": ["grid", "ring", "linear"], "gen": "python-flow", "arg": "--road",
-     "help": "grid = routed NxN grid; ring = circular beltway; linear = straight roads"},
-    {"group": "Python flow", "name": "pf_grid", "label": "Grid size (N) / ring nodes", "type": "int",
+     "default": "grid", "options": ["grid", "ring", "spider", "linear"], "gen": "python-flow",
+     "arg": "--road",
+     "help": "grid = routed NxN grid; ring = circular beltway; spider = radial city (N arms x "
+             "grid-H rings); linear = straight roads. Fully custom maps: ask the AI Copilot"},
+    {"group": "Python flow", "name": "pf_grid", "label": "Grid size (N) / ring nodes / arms", "type": "int",
      "default": 6, "min": 2, "max": 40, "gen": "python-flow", "arg": "--grid",
      "help": "grid: intersections per side; ring: number of intersections on the circle"},
     {"group": "Python flow", "name": "pf_attacker", "label": "Attacker fraction", "type": "float",
@@ -754,6 +756,18 @@ def live_state() -> dict:
         return {"vehicles": [], "t": 0, "n": 0}
 
 
+def network_geometry() -> dict:
+    """Static road geometry of the current run (drawn under the vehicles on the GUI map)."""
+    out_dir = RUN["out_dir"]
+    if out_dir is None:
+        return {"nodes": [], "edges": []}
+    try:
+        with open(Path(out_dir) / "network.json", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"nodes": [], "edges": []}
+
+
 def compute_stats(out_dir: Path) -> dict | None:
     manifest = out_dir / "manifest.json"
     if not manifest.exists():
@@ -860,6 +874,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, status())
         if self.path == "/api/live":
             return self._send(200, live_state())
+        if self.path == "/api/network":               # road geometry for the map background
+            return self._send(200, network_geometry())
         if self.path == "/api/config":               # effective config of the last run (download)
             return self._send(200, {"config": last_effective_config()})
         if self.path == "/api/agent/info":            # copilot availability for the UI

@@ -13,6 +13,7 @@ unit-tested with a scripted LLM.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import urllib.request
@@ -22,7 +23,8 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 from scms_sim_ref.mock_pipeline import (PipelineConfig, run_pipeline, config_from_dict,   # noqa: E402
                                         validate_config, config_schema)
-from scms_sim_ref.mock_pipeline.run import CLI_PRESETS                                     # noqa: E402
+from scms_sim_ref.mock_pipeline.run import CLI_PRESETS, EVENT_TYPES, _parse_events        # noqa: E402
+from scms_sim_ref.mock_pipeline.roads import CustomNetwork                                # noqa: E402
 from scms_sim_ref.datagen import validate as validate_mod, benchmark as benchmark_mod, featurize  # noqa: E402
 
 AGENT_OUT = REPO / "datasets" / "agent_run"
@@ -123,6 +125,27 @@ def system_prompt() -> str:
         "types, detector_reliability (report-level precision per detector), vehicle/subject ML AUCs, "
         "detection latency, and rsu_contribution. Higher attacker_pct/intensity = easier; stealth/"
         "pulsed/low-intensity = harder; RSUs help in sparse traffic; collusion lowers precision.\n\n"
+        "MAP DESIGN: you can create ANY environment. Built-ins: road_network=grid (grid_w x grid_h, "
+        "grid_block_m spacing, grid_dropout for irregularity), ring (grid_w nodes), spider (radial "
+        "city: grid_w arms x grid_h rings). For everything else use the design_network tool to submit "
+        "your own map: nodes = [[x,y], ...] intersection coordinates in METRES (60-250 m spacing is "
+        "realistic), edges = [[a,b], ...] node-index pairs, and the graph MUST be connected. Design "
+        "what the user describes -- a river town with two bridges, a highway with on-ramps feeding a "
+        "downtown grid, an airport loop -- dead ends and bounding-box-rim nodes become traffic "
+        "sources/sinks, and the map is drawn live in the GUI. Node 0's index matters only as a "
+        "reference; the centre-most node receives rush-hour commute bias automatically. Design "
+        "CAREFULLY on the first attempt: list the nodes, then write edges checking every index "
+        "exists (0..n-1) and every node appears in at least one edge. If validation fails, fix "
+        "EXACTLY the reported problem (e.g. connect the listed unreachable nodes) instead of "
+        "redesigning from scratch. Prefer 10-40 nodes unless the user asks for more. Custom and "
+        "spider maps REQUIRE traffic_flow=true (routed trips) with an arrival_rate (~1-3/s) and a "
+        "duration_s -- set those with set_config in the same turn.\n\n"
+        "SCENARIO TIMELINE: use set_events for mid-run dynamics (all deterministic): demand surges "
+        "({t,until,mult} -- stadium emptying, rush pulse), weather fronts ({t,value} -- fog rolls in, "
+        "degrading GNSS + radio and slowing NEW drivers), road closures ({t,until,edge} -- new trips "
+        "divert around the closure; bridges that would disconnect the map are refused), and attack "
+        "waves ({t,until} -- attackers only falsify inside wave windows: coordinated campaigns). "
+        "Combine map + timeline for realistic story scenarios.\n\n"
         "EXPERIMENTS: when the user asks to vary/sweep/try ONE field across specific values, or asks how "
         "a metric changes with a field, you MUST use the sweep tool in a SINGLE call (never emulate it "
         "with repeated set_config+run_and_analyze) — it varies the field, runs each, and returns the "
@@ -198,6 +221,36 @@ def tool_specs() -> list:
                                  "label": {"type": "string"},
                                  "overrides": {"type": "object"}}}}},
                 "required": ["variants"]}}},
+        {"type": "function", "function": {
+            "name": "design_network",
+            "description": "DESIGN A CUSTOM ROAD MAP: submit any connected road graph (nodes in metres, "
+                           "undirected edges by node index). Validates the design, activates it "
+                           "(road_network=custom), and returns design stats (road length, bbox, dead "
+                           "ends, boundary). Isolated parts are auto-connected via the shortest link "
+                           "and reported back (set auto_connect=false for strict validation). Use for "
+                           "any geography the built-in topologies can't express: highways with "
+                           "on-ramps, river towns with bridges, radial avenues... Keep it <= 400 nodes.",
+            "parameters": {"type": "object", "properties": {
+                "nodes": {"type": "array", "description": "[[x,y], ...] intersection coordinates in "
+                          "METRES (typical spacing 60-250 m)",
+                          "items": {"type": "array", "items": {"type": "number"}}},
+                "edges": {"type": "array", "description": "[[a,b], ...] road segments as node-index "
+                          "pairs; the graph must be CONNECTED",
+                          "items": {"type": "array", "items": {"type": "integer"}}}},
+                "required": ["nodes", "edges"]}}},
+        {"type": "function", "function": {
+            "name": "set_events",
+            "description": "Set the scenario TIMELINE: deterministic mid-run events. Types: "
+                           + "; ".join(f"{k}: {v}" for k, v in EVENT_TYPES.items())
+                           + ". Replaces the whole timeline; [] clears it.",
+            "parameters": {"type": "object", "properties": {
+                "events": {"type": "array", "description": "chronological list of event objects, e.g. "
+                           '[{"t":120,"until":240,"type":"demand","mult":3}, '
+                           '{"t":60,"type":"weather","value":"fog"}, '
+                           '{"t":90,"until":150,"type":"close_edge","edge":[3,7]}, '
+                           '{"t":100,"until":200,"type":"attack_wave"}]',
+                           "items": {"type": "object"}}},
+                "required": ["events"]}}},
     ]
 
 
@@ -388,6 +441,55 @@ def _compare(session: AgentSession, variants: list) -> dict:
     return {"variants": rows}
 
 
+def _maybe_json(v):
+    """LLMs sometimes double-encode array arguments as JSON strings; decode transparently."""
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError:
+            return v
+    return v
+
+
+def _auto_connect(nodes, edges) -> tuple[list, list]:
+    """Bridge disconnected components with the geometrically shortest links (deterministic:
+    distance then lowest indices). Only called on structurally-valid edges. Returns
+    (edges_with_bridges, added_edges) -- the additions are reported back to the designer."""
+    n = len(nodes)
+    adj: dict[int, set] = {i: set() for i in range(n)}
+    for a, b in edges:
+        adj[int(a)].add(int(b))
+        adj[int(b)].add(int(a))
+    comps, seen = [], set()
+    for i in range(n):
+        if i in seen:
+            continue
+        comp, q = [i], [i]
+        seen.add(i)
+        while q:
+            for m in adj[q.pop()]:
+                if m not in seen:
+                    seen.add(m)
+                    comp.append(m)
+                    q.append(m)
+        comps.append(sorted(comp))
+    edges = [list(e) for e in edges]
+    added = []
+    main = list(comps[0])
+    for comp in comps[1:]:
+        best = None
+        for a in main:
+            for b in comp:
+                d = math.dist((float(nodes[a][0]), float(nodes[a][1])),
+                              (float(nodes[b][0]), float(nodes[b][1])))
+                if best is None or (d, a, b) < best:
+                    best = (d, a, b)
+        added.append([best[1], best[2]])
+        edges.append([best[1], best[2]])
+        main.extend(comp)
+    return edges, added
+
+
 def _exec_tool(session: AgentSession, name: str, args: dict) -> dict:
     """Run one tool call; returns a JSON-serialisable result (or {error:...})."""
     try:
@@ -399,6 +501,9 @@ def _exec_tool(session: AgentSession, name: str, args: dict) -> dict:
             known = set(_defaults())
             unknown = [k for k in overrides if k not in known]
             clean = {k: v for k, v in overrides.items() if k in known}   # keep only real fields
+            for jf in ("events", "custom_network"):      # JSON-typed fields may arrive as objects
+                if jf in clean and not isinstance(clean[jf], str):
+                    clean[jf] = json.dumps(clean[jf], separators=(",", ":"))
             merged = {**session.config, **clean}
             cfg = config_from_dict({**_defaults(), **merged})   # coerces types
             validate_config(cfg)                                # raises on bad values
@@ -426,15 +531,48 @@ def _exec_tool(session: AgentSession, name: str, args: dict) -> dict:
                           args.get("metric") or "recall")
         if name == "compare":
             return _compare(session, args.get("variants"))
+        if name == "design_network":
+            nodes = _maybe_json(args.get("nodes"))       # LLMs sometimes double-encode arrays
+            edges = _maybe_json(args.get("edges"))
+            added: list = []
+            try:
+                net = CustomNetwork(nodes, edges)        # raises with design-actionable feedback
+            except ValueError as e:
+                if args.get("auto_connect", True) and "unreachable" in str(e):
+                    edges, added = _auto_connect(nodes, edges)   # bridge isolated parts, visibly
+                    net = CustomNetwork(nodes, edges)
+                else:
+                    raise
+            doc = json.dumps({"nodes": nodes, "edges": edges}, separators=(",", ":"))
+            session.config = {**session.config, "road_network": "custom", "custom_network": doc}
+            out = {"ok": True, "network": net.stats(),
+                   "note": "map activated (road_network=custom); it will draw under the live map"}
+            if added:
+                out["auto_connected"] = added
+                out["note"] += (f"; {len(added)} edge(s) auto-added to connect isolated parts: "
+                                f"{added} -- adjust if that is not the design intent")
+            return out
+        if name == "set_events":
+            evs = _maybe_json(args.get("events"))
+            if not isinstance(evs, list):
+                return {"error": "events must be a list of event objects"}
+            doc = json.dumps(evs, separators=(",", ":"))
+            parsed = _parse_events(doc)                                  # raises on a malformed event
+            if not parsed:
+                session.config = {k: v for k, v in session.config.items() if k != "events"}
+                return {"ok": True, "events": [], "note": "timeline cleared"}
+            session.config = {**session.config, "events": doc}
+            return {"ok": True, "events": parsed,
+                    "note": f"{len(parsed)} event(s) scheduled (validated against the timeline rules)"}
         return {"error": f"unknown tool {name!r}"}
-    except (ValueError, TypeError) as e:
-        return {"error": f"{type(e).__name__}: {e}"}
+    except Exception as e:                       # noqa: BLE001 - the tool boundary must never kill a
+        return {"error": f"{type(e).__name__}: {e}"}   # turn; the error is the LLM's repair signal
 
 
 _CANCELLED_REPLY = "(stopped at your request)"
 
 
-def run_agent(session: AgentSession, user_msg: str, max_steps: int = 10,
+def run_agent(session: AgentSession, user_msg: str, max_steps: int = 14,
               model: str | None = None, key: str | None = None, on_event=None,
               should_cancel=None) -> dict:
     """Run one user turn through the tool-calling loop. Returns {reply, steps, config, results, error}.
@@ -478,8 +616,19 @@ def run_agent(session: AgentSession, user_msg: str, max_steps: int = 10,
                 fn = call["function"]["name"]
                 try:
                     fargs = json.loads(call["function"].get("arguments") or "{}")
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as je:
                     fargs = {}
+                    emit("tool_start", {"tool": fn, "args": fargs})
+                    result = {"error": f"your tool-call arguments were not valid JSON ({je}); "
+                                       f"resend the COMPLETE call with well-formed JSON"}
+                    step = {"tool": fn, "args": fargs, "result": result}
+                    steps.append(step)
+                    emit("tool_end", step)
+                    tool_msg = {"role": "tool", "tool_call_id": call["id"],
+                                "content": json.dumps(result)}
+                    messages.append(tool_msg)
+                    session.history.append(tool_msg)
+                    continue
                 emit("tool_start", {"tool": fn, "args": fargs})
                 result = _exec_tool(session, fn, fargs)
                 step = {"tool": fn, "args": fargs, "result": result}
