@@ -23,8 +23,14 @@ _spec.loader.exec_module(verify_data)
 
 @pytest.mark.skipif(not DATASETS.exists(), reason="no datasets/ directory")
 def test_all_datasets_pass_integrity_audit():
+    # Non-hermetic guard over whatever real datasets a dev has locally (datasets/ is gitignored, so
+    # CI sees none and the skipif above fires). A datasets/ that holds only non-dataset scratch such
+    # as the OSM cache (datasets/_osmcache) yields no auditable results -> skip rather than error, so
+    # OSM-test caching can't spuriously fail the build. Real hermetic coverage of every invariant is
+    # in test_extended_invariants_pass_on_clean_dataset (freshly generated).
     results = verify_data.run_audit(DATASETS)
-    assert results, "audit produced no results — datasets/ empty or unreadable"
+    if not results:
+        pytest.skip("no auditable datasets under datasets/ (empty or cache-only)")
     fails = [r for r in results if r[2] == "FAIL"]
     by_status = Counter(r[2] for r in results)
     msg = "\n".join(f"[{ds}] {check}: {detail}" for ds, check, _, detail in fails)
