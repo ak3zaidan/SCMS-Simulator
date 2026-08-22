@@ -69,7 +69,7 @@ ATTACK_TYPES = [
     # timing
     "DataReplay", "DelayedMessages", "OutOfOrder", "DoS", "DoSRandom",
     # identity
-    "Sybil",
+    "Sybil", "VruImpersonation",
     # stealth (hard to detect: subtle, plausible, detector-aware falsifications)
     "AlongRoadOffset", "SlowDrift", "LaggingPosition", "Adaptive",
 ]
