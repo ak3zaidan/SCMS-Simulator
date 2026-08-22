@@ -677,6 +677,27 @@ function drawMap(live){
     ctx.fillStyle='#2e3c55';                              // intersections
     for(const p of nodes){ ctx.beginPath(); ctx.arc(px(p[0]),py(p[1]),1.6,0,7); ctx.fill(); }
   }
+  // scenario-event overlay: attack zones (circles), closures (dashed), active-event labels
+  const evs=(NETWORK&&NETWORK.events)||[], tNow=(live&&live.t)||0, activeLbl=[];
+  for(const e of evs){
+    const active=e.t<=tNow&&(e.until==null||tNow<e.until);
+    if(e.type==='attack_zone'){
+      ctx.beginPath(); ctx.arc(px(e.x),py(e.y),Math.max(4,e.radius*sc),0,7);
+      ctx.setLineDash([5,4]); ctx.lineWidth=1.5;
+      ctx.strokeStyle=active?'rgba(255,93,93,.9)':'rgba(255,93,93,.25)'; ctx.stroke();
+      if(active){ ctx.fillStyle='rgba(255,93,93,.07)'; ctx.fill(); activeLbl.push('attack zone'); }
+      ctx.setLineDash([]);
+    }else if(e.type==='close_edge'&&Array.isArray(e.edge)&&typeof e.edge[0]==='number'){
+      const a=nodes[e.edge[0]], b=nodes[e.edge[1]];
+      if(a&&b){ ctx.setLineDash([6,5]); ctx.lineWidth=2.5;
+        ctx.strokeStyle=active?'rgba(255,176,32,.95)':'rgba(255,176,32,.3)';
+        ctx.beginPath(); ctx.moveTo(px(a[0]),py(a[1])); ctx.lineTo(px(b[0]),py(b[1]));
+        ctx.stroke(); ctx.setLineDash([]);
+        if(active) activeLbl.push('road closed'); }
+    }else if(active&&e.type==='weather') activeLbl.push(e.value);
+    else if(active&&e.type==='demand') activeLbl.push(`demand ×${e.mult}`);
+    else if(active&&e.type==='attack_wave') activeLbl.push('attack wave');
+  }
   // draw non-benign last so they sit on top
   const order=[...vs].sort((a,b)=>(a[2]||0)-(b[2]||0));
   for(const v of order){
@@ -685,7 +706,8 @@ function drawMap(live){
     ctx.globalAlpha=s===0?0.85:1; ctx.fill(); ctx.globalAlpha=1;
   }
   $('#mapinfo').textContent=(vs.length?`t=${(live.t||0).toFixed(0)}s · ${vs.length} vehicles · `+
-    `${counts[1]} attacker · ${counts[2]} reported · ${counts[3]} revoked`
+    `${counts[1]} attacker · ${counts[2]} reported · ${counts[3]} revoked`+
+    (activeLbl.length?` · ⚡ ${[...new Set(activeLbl)].join(', ')}`:'')
     :`road network · ${nodes.length} intersections`);
 }
 window.addEventListener('resize',()=>drawMap(lastLive));
@@ -905,6 +927,9 @@ function stepDesc(st){
   if(st.tool==='reset_config') return {d:'config reset to defaults'};
   if(st.tool==='get_config') return {d:'read current config'};
   if(st.tool==='describe_fields') return {d:'looked up: '+((a.names||[]).join(', '))};
+  if(st.tool==='get_network'){ const n=r.stats||{};
+    return {d:'read map · '+(n.n_nodes?`${n.n_nodes} intersections, ${n.n_edges} roads`
+      :(r.road_network||'?'))}; }
   if(st.tool==='design_network'){ const n=r.network||{};
     return {d:`designed map · ${n.n_nodes??'?'} intersections, ${n.n_edges??'?'} roads, `+
       `${((n.total_road_m||0)/1000).toFixed(1)} km of road`}; }
@@ -948,7 +973,8 @@ function stepCardHtml(st){
 const TOOL_VERB={set_config:'configuring',apply_preset:'loading preset',run_and_analyze:'running simulation',
   sweep:'sweeping parameter',compare:'comparing variants',reset_config:'resetting',
   get_config:'reading config',describe_fields:'looking up fields',
-  design_network:'designing the road map',set_events:'scheduling scenario events'};
+  design_network:'designing the road map',set_events:'scheduling scenario events',
+  get_network:'reading the current map'};
 function renderSteps(container,steps,current){    // live-updatable step list (+ optional running row)
   let html=(steps||[]).map(stepCardHtml).join('');
   if(current) html+=`<div class="step running"><div class="t">${escH(current)}</div>`+

@@ -244,6 +244,12 @@ def tool_specs() -> list:
                           "items": {"type": "array", "items": {"type": "integer"}}}},
                 "required": ["nodes", "edges"]}}},
         {"type": "function", "function": {
+            "name": "get_network",
+            "description": "Read back the CURRENT road map (nodes/edges + stats) so you can edit it "
+                           "incrementally -- add a bypass, close a district, retune speed limits -- "
+                           "then resubmit the modified design via design_network.",
+            "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {
             "name": "set_events",
             "description": "Set the scenario TIMELINE: deterministic mid-run events. Types: "
                            + "; ".join(f"{k}: {v}" for k, v in EVENT_TYPES.items())
@@ -549,14 +555,35 @@ def _exec_tool(session: AgentSession, name: str, args: dict) -> dict:
                 else:
                     raise
             doc = json.dumps({"nodes": nodes, "edges": edges}, separators=(",", ":"))
-            session.config = {**session.config, "road_network": "custom", "custom_network": doc}
+            session.config = {**session.config, "road_network": "custom", "custom_network": doc,
+                              "traffic_flow": True}      # custom maps require routed flow
             out = {"ok": True, "network": net.stats(),
-                   "note": "map activated (road_network=custom); it will draw under the live map"}
+                   "note": "map activated (road_network=custom, traffic_flow=true); it will draw "
+                           "under the live map -- still set arrival_rate/duration_s as needed"}
             if added:
                 out["auto_connected"] = added
                 out["note"] += (f"; {len(added)} edge(s) auto-added to connect isolated parts: "
                                 f"{added} -- adjust if that is not the design intent")
             return out
+        if name == "get_network":
+            eff = session.effective_config()
+            rn = eff.get("road_network")
+            if rn == "custom" and eff.get("custom_network"):
+                doc = json.loads(eff["custom_network"])
+                net = CustomNetwork(doc["nodes"], doc["edges"])
+                return {"ok": True, "road_network": "custom", "nodes": doc["nodes"],
+                        "edges": doc["edges"], "stats": net.stats()}
+            if rn == "spider":
+                from scms_sim_ref.mock_pipeline.roads import spider_graph
+                nd, ed = spider_graph(eff.get("grid_w", 6), eff.get("grid_h", 6),
+                                      eff.get("grid_block_m", 120.0))
+                net = CustomNetwork(nd, ed)
+                return {"ok": True, "road_network": "spider", "nodes": nd, "edges": ed,
+                        "stats": net.stats(),
+                        "note": "resubmit via design_network to customise it"}
+            return {"ok": True, "road_network": rn,
+                    "note": "procedural topology (grid_w/grid_h/grid_block_m control it); use "
+                            "design_network to switch to a fully custom map"}
         if name == "set_events":
             evs = _maybe_json(args.get("events"))
             if not isinstance(evs, list):

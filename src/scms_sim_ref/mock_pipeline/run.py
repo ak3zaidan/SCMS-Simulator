@@ -1445,7 +1445,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         try:
             geo = net.geometry() if net is not None else {"nodes": [], "edges": []}
             with open(os.path.join(cfg.out_dir, "network.json"), "w", encoding="utf-8") as fh:
-                json.dump({**geo, "road_network": cfg.road_network}, fh)
+                json.dump({**geo, "road_network": cfg.road_network, "events": events}, fh)
         except OSError:
             pass
 

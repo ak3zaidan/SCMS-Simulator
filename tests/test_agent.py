@@ -183,6 +183,27 @@ def test_design_network_accepts_double_encoded_arrays():
     assert r["ok"] and r["network"]["n_nodes"] == 4
 
 
+def test_get_network_supports_incremental_editing():
+    """The copilot reads the current map back (custom + spider), edits, and resubmits."""
+    s = agent.AgentSession()
+    r0 = agent._exec_tool(s, "get_network", {})
+    assert r0["ok"] and r0["road_network"] == "linear" and "nodes" not in r0
+    agent._exec_tool(s, "design_network", {
+        "nodes": [[0, 0], [0, 200], [200, 200], [200, 0]],
+        "edges": [[0, 1], [1, 2], [2, 3], [3, 0]]})
+    r1 = agent._exec_tool(s, "get_network", {})
+    assert r1["ok"] and len(r1["nodes"]) == 4 and r1["stats"]["n_edges"] == 4
+    # edit: add a diagonal shortcut and resubmit
+    r2 = agent._exec_tool(s, "design_network",
+                          {"nodes": r1["nodes"], "edges": r1["edges"] + [[0, 2]]})
+    assert r2["ok"] and r2["network"]["n_edges"] == 5
+    # spider is readable as an editable graph too
+    agent._exec_tool(s, "set_config", {"overrides": {"road_network": "spider", "grid_w": 6,
+                                                     "grid_h": 2, "traffic_flow": True}})
+    r3 = agent._exec_tool(s, "get_network", {})
+    assert r3["ok"] and r3["road_network"] == "spider" and len(r3["nodes"]) == 1 + 6 * 2
+
+
 def test_set_events_tool_validates_and_stores():
     s = agent.AgentSession()
     r = agent._exec_tool(s, "set_events", {"events": [
