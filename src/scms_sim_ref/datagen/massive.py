@@ -300,7 +300,11 @@ def cell_config(cell: dict, idx: int, base_seed: int, n_steps: int, out_dir: Pat
         seed=(base_seed + idx * 100003) % 2_000_000_000,
         n_vehicles=cell["n_vehicles"], n_steps=n_steps,
         attacker_pct=cell["attacker_pct"], attack_types=attack_types,
-        attack_type=(strat if strat else (scen if scen != "ALL" else "ConstPos")),
+        # "ALL" must keep the FULL round-robin catalog: attack_type MUST be the sentinel "" here,
+        # else the F2 narrowing (attack_type truthy AND attack_types==default) collapses these rich
+        # mixed-family cells to a single type. Single-scenario cells set attack_types=(scen,) which is
+        # already non-default, so attack_type is ignored there.
+        attack_type=(strat if strat else (scen if scen != "ALL" else "")),
         faulty_pct=cell["faulty_pct"], weather=cell["weather"],
         rotate_period_s=cell["rotate_period_s"],
         collude_pct=cell["collude_pct"], victim_pct=0.12,

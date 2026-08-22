@@ -8,10 +8,29 @@ end-to-end runs (2 short domains) to exercise the real merged-corpus output.
 
 import json
 import os
+import tempfile
+from pathlib import Path
 
 import pandas as pd
 
 from scms_sim_ref.datagen import corpus_report, massive
+from scms_sim_ref.mock_pipeline import PipelineConfig
+
+
+def test_all_scenario_keeps_full_catalog_not_collapsed_by_f2_sentinel():
+    """Regression: the F2 attack_type sentinel must not collapse massive's rich 'ALL' mixed cells.
+    An 'ALL' cell must yield attack_type='' (sentinel) + the default full attack_types, so the
+    pipeline's narrowing (attack_type truthy AND attack_types==default) does NOT fire; a single-
+    scenario cell keeps its 1-tuple so it still narrows."""
+    tmp = Path(tempfile.mkdtemp())
+    base = dict(weather="clear", rotate_period_s=0.0, collude_pct=0.0, faulty_pct=0.05,
+                attacker_pct=0.3, n_vehicles=30)
+    cfg_all = massive.cell_config({"scenario": "ALL", **base}, 0, 7, 120, tmp, flow=False)
+    assert cfg_all.attack_type == ""                                      # sentinel, not "ConstPos"
+    assert tuple(cfg_all.attack_types) == PipelineConfig().attack_types    # full catalog preserved
+    assert not (cfg_all.attack_type and tuple(cfg_all.attack_types) == PipelineConfig().attack_types)
+    cfg_one = massive.cell_config({"scenario": "RandomSpeed", **base}, 1, 7, 120, tmp, flow=False)
+    assert cfg_one.attack_types == ("RandomSpeed",)
 
 
 # ---------------------------------------------------------------------------- #
