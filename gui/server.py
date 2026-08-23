@@ -245,6 +245,49 @@ CONFIG_SPEC = [
      "default": 4.0, "step": 0.5, "min": 0, "max": 12, "gen": "python-flow", "arg": "--shadowing-sigma-db",
      "help": "log-normal shadowing std in dB; 0 = near-hard cutoff (logdistance model only)"},
 
+    # --- Curated detection-strictness / attack-magnitude / GNSS knobs (advanced, opt-in). Each
+    # default EQUALS its PipelineConfig default, so a default run stays byte-identical (passing
+    # "--flag <default>" is equivalent to omitting it). These were previously reachable only via the
+    # raw "all fields" panel / copilot. NB: the DENM/VRU CLI flags DROP the `_mps` suffix that the
+    # PipelineConfig fields keep (arg=--denm-implausible-speed <- denm_implausible_speed_mps). ---
+    {"group": "Detectors", "name": "pf_detector_z", "label": "Detector z-threshold", "type": "float",
+     "default": 3.0, "step": 0.5, "min": 0.5, "max": 12, "gen": "python-flow",
+     "arg": "--detector-z-threshold",
+     "help": "motion-residual firing point in broadcast-uncertainty sigmas (lower = stricter; the "
+             "headline detection-strictness knob)"},
+    {"group": "Detectors", "name": "pf_detector_consec", "label": "Detector consecutive violations",
+     "type": "int", "default": 2, "min": 1, "max": 10, "gen": "python-flow",
+     "arg": "--detector-min-consec",
+     "help": "consecutive per-detector violations before a reason fires (1 = fire on first; lower = stricter)"},
+    {"group": "Detectors", "name": "pf_sybil_min_certs", "label": "Sybil co-location min certs",
+     "type": "int", "default": 4, "min": 2, "max": 50, "gen": "python-flow",
+     "arg": "--sybil-min-certs",
+     "help": "distinct co-located certs before the Sybil detector fires (lower = fires readily)"},
+    {"group": "Detectors", "name": "pf_sybil_cell_m", "label": "Sybil co-location cell (m)",
+     "type": "float", "default": 3.0, "step": 0.5, "min": 0.5, "max": 50, "gen": "python-flow",
+     "arg": "--sybil-cell-m",
+     "help": "Sybil co-location cell size (m); smaller demands tighter co-location before flagging"},
+    {"group": "Detectors", "name": "pf_denm_implausible", "label": "DENM implausible speed (m/s)",
+     "type": "float", "default": 6.0, "step": 1, "min": 1, "max": 100, "gen": "python-flow",
+     "arg": "--denm-implausible-speed",
+     "help": "denmPlausibility bound: a DENM claiming a speed above this (m/s) is flagged (lower = more flags)"},
+    {"group": "Detectors", "name": "pf_vru_max_plausible", "label": "VRU max plausible speed (m/s)",
+     "type": "float", "default": 10.0, "step": 1, "min": 1, "max": 100, "gen": "python-flow",
+     "arg": "--vru-max-plausible-speed",
+     "help": "a VRU-declaring beacon claiming >= this speed (m/s) is flagged as a vehicle impersonating a VRU"},
+    {"group": "Attacks", "name": "pf_attack_magnitude", "label": "Attack magnitude scale", "type": "text",
+     "default": "", "gen": "python-flow", "arg": "--attack-magnitude-scale",
+     "help": "per-attack-type falsification-magnitude multiplier (Type:scale,...), e.g. "
+             "RandomPos:2.0,SlowDrift:0.5 (blank = uniform 1.0)"},
+    {"group": "Sensors & CAM timing", "name": "pf_gps_quality_floor", "label": "GNSS quality floor",
+     "type": "float", "default": 0.5, "step": 0.1, "min": 0, "max": 10, "gen": "python-flow",
+     "arg": "--gps-quality-floor",
+     "help": "best-case per-vehicle GNSS quality (noise-scale floor; higher = worse mean error)"},
+    {"group": "Sensors & CAM timing", "name": "pf_gps_quality_lambda", "label": "GNSS quality tail lambda",
+     "type": "float", "default": 1.2, "step": 0.1, "min": 0.1, "max": 10, "gen": "python-flow",
+     "arg": "--gps-quality-lambda",
+     "help": "rate of the exponential per-vehicle GNSS-quality tail (smaller = heavier tail / more bad-GPS vehicles)"},
+
     # --- Traffic ---
     {"group": "Traffic", "name": "max_vehicles", "label": "Max vehicles", "type": "int", "default": "",
      "env": None, "param": "MaxVehicles", "kind": "flow",
@@ -485,11 +528,14 @@ _PF_GROUP = {
                 "pf_lane_width", "pf_lights", "pf_light_cycle", "pf_arterial_every",
                 "pf_arterial_speed", "pf_local_speed"),
     "RSU (infrastructure)": ("pf_rsus", "pf_rsu_placement", "pf_rsu_range"),
-    "Attacks": ("pf_attacker", "pf_intensity", "pf_attack_mix", "pf_duty", "pf_jitter", "pf_pulse",
-                "pf_collude", "pf_victim", "pf_crl_aware", "pf_crl_dormant"),
+    "Attacks": ("pf_attacker", "pf_intensity", "pf_attack_mix", "pf_attack_magnitude", "pf_duty",
+                "pf_jitter", "pf_pulse", "pf_collude", "pf_victim", "pf_crl_aware", "pf_crl_dormant"),
     "SCMS policy": ("pf_rotate",),
     "Vehicle & radio": ("pf_radio", "pf_radio_model", "pf_pathloss", "pf_shadowing"),
-    "Sensors & CAM timing": ("pf_faulty", "pf_weather", "pf_jam"),
+    "Sensors & CAM timing": ("pf_faulty", "pf_weather", "pf_jam", "pf_gps_quality_floor",
+                             "pf_gps_quality_lambda"),
+    "Detectors": ("pf_detector_z", "pf_detector_consec", "pf_sybil_min_certs", "pf_sybil_cell_m",
+                  "pf_denm_implausible", "pf_vru_max_plausible"),
 }
 _PF_NAME_TO_GROUP = {name: grp for grp, names in _PF_GROUP.items() for name in names}
 for _c in CONFIG_SPEC:
@@ -591,6 +637,19 @@ PRESETS = {
         "pf_duration": 300, "pf_arrival": 2.0, "pf_attacker": 0.15, "pf_faulty": 0.05,
         "pf_rotate": 60, "pf_radio": 260, "pf_weather": "clear", "pf_demand": "uniform",
         "pf_fleet": "mixed", "pf_lanes": 2, "pf_rsus": 6},
+    "Strict detector": {   # showcases the new detector operating-point knobs: a HIGH-SENSITIVITY
+        # point — lower firing thresholds so the motion + Sybil detectors flag readily (more true
+        # catches, more false positives). Pinned to a GRID flow with modest attackers, arterial caps
+        # left at their 0 defaults, so validate_config never trips (z>0, min_consec>=1, min_certs>=2).
+        "generator": "python-flow", "pf_road": "grid", "pf_duration": 300, "pf_arrival": 2.5,
+        "pf_grid": 6, "pf_attacker": 0.12, "pf_faulty": 0.05, "pf_demand": "uniform",
+        "pf_fleet": "mixed", "pf_detector_z": 2.0, "pf_detector_consec": 1, "pf_sybil_min_certs": 2},
+    "Lenient detector": {   # the LOW-SENSITIVITY counterpart: higher thresholds so only blatant,
+        # sustained falsification is flagged (fewer false positives, more missed stealth attacks).
+        # Same grid flow so it validates and is directly comparable to "Strict detector".
+        "generator": "python-flow", "pf_road": "grid", "pf_duration": 300, "pf_arrival": 2.5,
+        "pf_grid": 6, "pf_attacker": 0.12, "pf_faulty": 0.05, "pf_demand": "uniform",
+        "pf_fleet": "mixed", "pf_detector_z": 5.0, "pf_detector_consec": 3},
 }
 
 
