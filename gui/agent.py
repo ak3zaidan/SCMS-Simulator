@@ -28,6 +28,7 @@ from scms_sim_ref.mock_pipeline.run import CLI_PRESETS, EVENT_TYPES, _parse_even
 from scms_sim_ref.mock_pipeline.roads import CustomNetwork                                # noqa: E402
 from scms_sim_ref.mock_pipeline.osm import CITY_BBOXES, import_city                       # noqa: E402
 from scms_sim_ref.datagen import validate as validate_mod, benchmark as benchmark_mod, featurize  # noqa: E402
+from scms_sim_ref.datagen import foundry                                                   # noqa: E402
 
 AGENT_OUT = REPO / "datasets" / "agent_run"
 AGENT_MAX_DURATION = 150.0     # cap traffic-flow seconds per agent run (keep turns interactive)
@@ -335,6 +336,24 @@ def tool_specs() -> list:
             "description": "List every saved scenario in the library (name, description, number "
                            "of saved config fields), sorted by name.",
             "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {
+            "name": "run_foundry",
+            "description": "Launch the misbehavior FOUNDRY: a detector-in-the-loop MAP-Elites "
+                           "quality-diversity search that builds an archive of DIVERSE + HARD-to-"
+                           "detect attack scenarios (one elite per attack_family x density x "
+                           "topology x attacker_band cell). It uses an AI semantic mutation operator "
+                           "to fill empty cells and intensify the detector's hardest (lowest-recall) "
+                           "cells, falling back to a random operator when the AI is unavailable. "
+                           "Returns coverage, QD-score and the hardest cells found. This is a heavy, "
+                           "MULTI-RUN search -- keep the budget small (<=12) when iterating live.",
+            "parameters": {"type": "object", "properties": {
+                "budget": {"type": "integer", "description": "mutation/evaluation iterations "
+                           "(1-40; each runs a full scenario). Keep <=12 for interactive use."},
+                "seed": {"type": "integer", "description": "master seed (deterministic random path)"},
+                "objective": {"type": "string", "description": "evade | family:<F> (e.g. "
+                              "family:stealth) | latency (default evade)"},
+                "duration_s": {"type": "number", "description": "per-scenario sim seconds "
+                               "(default 30; capped for interactivity)"}}}}},
     ]
 
 
@@ -574,6 +593,206 @@ def _auto_connect(nodes, edges) -> tuple[list, list]:
     return edges, added
 
 
+# --------------------------------------------------------------------------- #
+# LLM semantic mutation operator for the misbehavior foundry (datagen/foundry.py)
+#
+# This is where the LLM transport legitimately lives (gui/agent.py owns openai_chat/_CHAT_FN and
+# already imports datagen). The foundry stays LLM-agnostic: it exposes a generic
+# ``mutation_fn(parent_genome, archive_summary, rng) -> genome`` hook, and this module supplies an
+# LLM-backed operator for it. The operator proposes MEANINGFUL scenarios that fill the archive's
+# empty descriptor cells and intensify the detector's hardest (lowest-recall) cells -- then validates
+# them exactly like set_config; on ANY failure it falls back to foundry's deterministic random
+# mutate() so the search loop is never broken. (This is OFF the default foundry path.)
+# --------------------------------------------------------------------------- #
+
+# The knobs the operator may propose: adversary / environment / topology only -- mirrors the search
+# space of foundry.mutate and the 4 descriptor axes (family<-attack_types, density<-arrival_rate,
+# topology<-road_network, attacker_band<-attacker_pct) plus within-cell difficulty dials. The
+# detector is NEVER weakened (no thresholds / revocation gates / ma_defense here).
+_FOUNDRY_KNOBS = ("attack_types", "attacker_pct", "arrival_rate", "road_network", "grid_w", "grid_h",
+                  "attack_intensity", "attack_duty_cycle", "crl_aware_pct", "radio_range_m",
+                  "weather", "faulty_pct", "gps_degrade_rate", "n_lanes")
+
+
+def _foundry_knob_sheet() -> str:
+    """Compact 'field(spec)' cheat-sheet for just the foundry's mutable knobs (from the live schema)."""
+    sch = config_schema()
+    parts = []
+    for name in _FOUNDRY_KNOBS:
+        m = sch.get(name)
+        if not m:
+            continue
+        if m["options"]:
+            spec = "|".join(map(str, m["options"]))
+        elif m["widget"] == "bool":
+            spec = "true|false"
+        elif m["min"] is not None or m["max"] is not None:
+            lo = m["min"] if m["min"] is not None else "-inf"
+            hi = m["max"] if m["max"] is not None else "inf"
+            spec = f"{lo}..{hi}" + (m["unit"] or "")
+        else:
+            spec = m["widget"]
+        parts.append(f"{name}({spec})")
+    return ", ".join(parts)
+
+
+def _foundry_mutation_messages(parent_genome: dict, archive_summary: dict) -> list:
+    """Build the COMPACT chat prompt for one semantic mutation.
+
+    Inputs the operator gives the model: the descriptor axes/bins, the valid attack family->types
+    map, the EMPTY cells to fill + the HARDEST cells to intensify (from archive_summary), the parent
+    genome, and the valid config fields + bounds for the relevant knobs. It asks for ONE JSON object
+    of config overrides aimed at an empty (preferred) or hard cell.
+    """
+    axes = archive_summary.get("axes", {})
+    fam_types = {f: list(ts) for f, ts in foundry.FAMILY_TO_TYPES.items()}
+    payload = {
+        "descriptor_axes": axes,
+        "attack_family_to_types": fam_types,
+        "empty_cells_to_fill": (archive_summary.get("empty_cells") or [])[:12],
+        "hardest_cells_to_intensify": (archive_summary.get("hardest_cells") or [])[:6],
+        "coverage": {"filled": archive_summary.get("coverage_cells"),
+                     "empty": archive_summary.get("empty_count"),
+                     "grid_size": archive_summary.get("grid_size")},
+        "parent_genome": parent_genome,
+        "config_fields": _foundry_knob_sheet(),
+    }
+    system = (
+        "You are a red-team scenario designer for a V2X misbehavior-detection foundry that runs a "
+        "MAP-Elites quality-diversity search. Every scenario is scored by how well it EVADES a FIXED "
+        "detector; the archive keeps the single hardest scenario per descriptor cell "
+        "(attack_family x density_band x topology x attacker_band). Your job: propose ONE new "
+        "scenario, expressed as config overrides, that either FILLS an empty descriptor cell (to "
+        "widen coverage) or INTENSIFIES a hard cell (to push the detector's recall lower) while "
+        "staying a REALISTIC, valid misbehavior scenario.\n\n"
+        "Rules: (1) reply with ONLY a JSON object of config overrides -- no prose, no markdown "
+        "fences. (2) use ONLY the listed config_fields, within the given bounds/options. (3) choose "
+        "attack_types from attack_family_to_types so the scenario lands in the family you target; to "
+        "hit the 'mixed' family use types drawn from 2+ families. (4) set road_network for the target "
+        "topology, attacker_pct for the target attacker_band (low<0.15<=med<0.35<=high), and "
+        "arrival_rate to steer density. (5) NEVER weaken the detector. Prefer an empty cell; else "
+        "pick a hard cell and make it harder."
+    )
+    user = ("Archive state and constraints (JSON):\n"
+            + json.dumps(payload, separators=(",", ":"), default=str)
+            + "\n\nReturn ONE JSON object of config overrides for the next scenario.")
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _extract_json_object(text: str):
+    """Best-effort: pull the first top-level JSON object out of an LLM reply (tolerating markdown
+    fences / surrounding prose). Returns the parsed dict, or None if none is found."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    t = text.strip()
+    try:
+        return json.loads(t)                       # clean JSON is the common case
+    except json.JSONDecodeError:
+        pass
+    start = t.find("{")                            # otherwise scan for the first balanced {...}
+    while start != -1:
+        depth = 0
+        for i in range(start, len(t)):
+            if t[i] == "{":
+                depth += 1
+            elif t[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(t[start:i + 1])
+                    except json.JSONDecodeError:
+                        break
+        start = t.find("{", start + 1)
+    return None
+
+
+def _parse_genome_reply(msg: dict, parent_genome: dict):
+    """Parse the LLM reply into a VALIDATED genome, or return None if unusable.
+
+    Keeps only known config fields (exactly like set_config), merges the overrides onto a copy of the
+    parent genome (so the rest of the scenario carries over, like foundry.mutate does), and validates
+    via config_from_dict + validate_config. Returns the merged genome dict on success, else None."""
+    overrides = _extract_json_object((msg or {}).get("content") or "")
+    if not isinstance(overrides, dict) or not overrides:
+        return None
+    known = set(_defaults())
+    clean = {k: v for k, v in overrides.items() if k in known}     # drop unknown fields
+    if not clean:
+        return None
+    genome = dict(parent_genome)
+    genome.update(clean)
+    if isinstance(genome.get("attack_types"), list):
+        genome["attack_types"] = tuple(genome["attack_types"])
+    cfg = config_from_dict({**_defaults(), **genome})              # same coercion path as set_config
+    validate_config(cfg)                                           # raises on infeasible -> caller falls back
+    return genome
+
+
+def llm_mutation_fn(parent_genome: dict, archive_summary: dict, rng, *,
+                    chat_fn=None, model: str | None = None, key: str | None = None,
+                    timeout: float = 60.0) -> dict:
+    """LLM-backed semantic mutation operator matching foundry's ``mutation_fn`` hook signature.
+
+    Builds a compact prompt from ``archive_summary`` (the empty cells to fill, the hardest cells to
+    intensify, the descriptor axes, and the valid config fields/bounds), asks the model (via the
+    injectable ``_CHAT_FN`` / openai_chat) for a JSON config-overrides genome aimed at an empty/hard
+    cell, parses + filters + validates it (config_from_dict + validate_config), and returns it.
+
+    On ANY failure -- no API key, network/HTTP error, non-JSON reply, unknown or invalid config, or
+    any exception -- it FALLS BACK to foundry's deterministic random ``mutate(parent, rng)`` so the
+    search loop is never broken. ``chat_fn`` / ``model`` / ``key`` default to the module transport +
+    .env; tests inject a scripted ``chat_fn`` and an explicit ``key``.
+
+    Determinism: the LLM call is non-deterministic, so LLM-driven foundry runs are NOT byte-identical
+    across runs (that is expected). The rng is used only on the deterministic fallback path; the
+    default ``mutation_fn=None`` in run_foundry remains the fully deterministic path.
+    """
+    chat = chat_fn or _CHAT_FN
+    model = model or openai_model()
+    key = key if key is not None else openai_key()
+    try:
+        if not key:
+            raise RuntimeError("no OPENAI_API_KEY")
+        messages = _foundry_mutation_messages(parent_genome, archive_summary)
+        msg = chat(messages, None, model, key, timeout)           # tools=None: plain completion
+        genome = _parse_genome_reply(msg, parent_genome)
+        if genome is None:
+            raise ValueError("no usable genome in the LLM reply")
+        return genome
+    except Exception:  # noqa: BLE001 -- ANY failure => deterministic random fallback (never break loop)
+        return foundry.mutate(parent_genome, rng)
+
+
+def make_llm_mutation_fn(chat_fn=None, model: str | None = None, key: str | None = None):
+    """Bind an LLM mutation operator to a (chat_fn, model, key) and return a 3-arg callable matching
+    foundry's ``mutation_fn(parent_genome, archive_summary, rng)`` hook (which passes only 3 args)."""
+    def _fn(parent_genome, archive_summary, rng):
+        return llm_mutation_fn(parent_genome, archive_summary, rng,
+                               chat_fn=chat_fn, model=model, key=key)
+    return _fn
+
+
+def run_foundry_llm(budget: int = 60, seed: int = 7, base_duration: float = 40.0,
+                    out_dir: str | None = None, objective: str = "evade", verbose: bool = False,
+                    model: str | None = None, key: str | None = None, chat_fn=None):
+    """Headless entry: run the foundry MAP-Elites search driven by the LLM semantic mutation operator.
+
+    Reads the OpenAI key from .env unless one is passed. This is OFF the default foundry path -- it
+    calls ``foundry.run_foundry(mutation_fn=<LLM operator>)``. Because the LLM call is
+    non-deterministic the resulting archive is NOT byte-identical across runs (unlike the default
+    random operator); every candidate the LLM fails to produce validly falls back to the
+    deterministic random mutation, so the search always completes even with no key / no network.
+    Returns the ``foundry.Archive``.
+    """
+    key = key if key is not None else openai_key()
+    model = model or openai_model()
+    out_dir = out_dir or str(REPO / "datasets" / "foundry_llm")
+    mfn = make_llm_mutation_fn(chat_fn=chat_fn, model=model, key=key)
+    return foundry.run_foundry(budget=budget, seed=seed, base_duration=base_duration,
+                               out_dir=out_dir, objective=objective, verbose=verbose,
+                               mutation_fn=mfn)
+
+
 def _exec_tool(session: AgentSession, name: str, args: dict) -> dict:
     """Run one tool call; returns a JSON-serialisable result (or {error:...})."""
     try:
@@ -712,6 +931,25 @@ def _exec_tool(session: AgentSession, name: str, args: dict) -> dict:
             return {"ok": True, "name": sname, "config": session.config}
         if name == "list_scenarios":
             return {"ok": True, "scenarios": scenario_library()}
+        if name == "run_foundry":
+            budget = max(1, min(int(args.get("budget") or 8), 40))       # cap: a heavy multi-run search
+            seed = int(args.get("seed") or 7)
+            objective = str(args.get("objective") or "evade")
+            duration = max(8.0, min(float(args.get("duration_s") or 30.0), AGENT_MAX_DURATION))
+            out = str(AGENT_OUT.parent / "agent_foundry")
+            key = openai_key()
+            archive = run_foundry_llm(budget=budget, seed=seed, base_duration=duration,
+                                      out_dir=out, objective=objective, key=key)
+            m = archive.meta
+            hardest = sorted(archive.cells.values(), key=lambda c: -c["fitness"])[:5]
+            return {"ok": True, "objective": m["objective"], "seed": m["seed"], "budget": m["budget"],
+                    "coverage_cells": m["coverage_cells"], "grid_size": m["grid_size"],
+                    "coverage_pct": m["coverage_pct"], "qd_score": m["qd_score"],
+                    "best_fitness": m["best_fitness"], "out_dir": out,
+                    "ai_operator": bool(key),           # False -> ran on the random-fallback operator
+                    "hardest_cells": [{"descriptor": c["descriptor"], "fitness": c["fitness"],
+                                       "recall": (c.get("metrics") or {}).get("recall")}
+                                      for c in hardest]}
         return {"error": f"unknown tool {name!r}"}
     except Exception as e:                       # noqa: BLE001 - the tool boundary must never kill a
         return {"error": f"{type(e).__name__}: {e}"}   # turn; the error is the LLM's repair signal

@@ -428,6 +428,34 @@ class Archive:
     def qd_score(self) -> float:
         return round(sum(c["fitness"] for c in self.cells.values()), 6)
 
+    def summary(self, max_cells: int = 24) -> dict:
+        """Compact, LLM/GUI-agnostic snapshot of archive state for a mutation operator.
+
+        Reports the descriptor axes/bins, which cells are FILLED, which are EMPTY (the coverage gaps
+        an operator should fill), and which are HARDEST (highest fitness == lowest detector recall,
+        the failure clusters an operator should intensify). Each sample list is capped at
+        ``max_cells``. Pure data -- carries no knowledge of how an operator uses it.
+        """
+        def _cell_dict(cell: tuple) -> dict:
+            return {"attack_family": cell[0], "density_band": cell[1],
+                    "topology": cell[2], "attacker_band": cell[3]}
+        all_cells = [(f, d, t, a) for f in FAMILY_BINS for d in DENSITY_BINS
+                     for t in TOPO_BINS for a in ATTACKER_BINS]
+        empty = [c for c in all_cells if c not in self.cells]
+        hardest = sorted(self.cells.items(), key=lambda kv: (-kv[1]["fitness"], kv[0]))
+        return {
+            "axes": {"attack_family": list(FAMILY_BINS), "density_band": list(DENSITY_BINS),
+                     "topology": list(TOPO_BINS), "attacker_band": list(ATTACKER_BINS)},
+            "grid_size": grid_size(),
+            "coverage_cells": len(self.cells),
+            "empty_count": len(empty),
+            "filled_cells": [_cell_dict(c) for c in sorted(self.cells)[:max_cells]],
+            "empty_cells": [_cell_dict(c) for c in empty[:max_cells]],
+            "hardest_cells": [{**_cell_dict(cell), "fitness": round(float(rec["fitness"]), 6),
+                               "recall": (rec.get("metrics") or {}).get("recall")}
+                              for cell, rec in hardest[:max_cells]],
+        }
+
 
 def _candidate(cfg: PipelineConfig, seed: int, duration_s: float, summary: dict,
                fit: float, cell: tuple, genome: dict) -> dict:
@@ -467,16 +495,45 @@ def _evaluate(genome: dict, seed: int, duration_s: float, work_dir: str, objecti
     return cfg, summary, fit, valid
 
 
+def _apply_mutation_fn(mutation_fn, parent: dict, archive: Archive, rng: random.Random) -> dict:
+    """Call an injected mutation operator ``mutation_fn(parent, archive_summary, rng) -> genome``.
+
+    Generic and dependency-free -- NO LLM/GUI knowledge lives here. The operator is handed the parent
+    genome, a compact :meth:`Archive.summary` (filled / empty / hardest cells + the descriptor axes),
+    and the driver RNG. Its returned genome is validated + scored + inserted downstream exactly like a
+    random mutation (an infeasible genome is isolated per-candidate in ``_run_one``). If the operator
+    returns a non-dict / empty result OR raises, we fall back to the built-in random :func:`mutate`,
+    so an external operator can never break the (expensive) search loop.
+
+    This path runs ONLY when a caller passes ``mutation_fn`` to :func:`run_foundry`; the default
+    ``mutation_fn=None`` keeps the byte-identical pure-random behaviour. An operator that consults
+    external state (e.g. an LLM) makes the run non-deterministic by design.
+    """
+    try:
+        child = mutation_fn(parent, archive.summary(), rng)
+        if isinstance(child, dict) and child:
+            return child
+    except Exception:  # noqa: BLE001 -- a misbehaving operator must not kill the search
+        pass
+    return mutate(parent, rng)
+
+
 def run_foundry(budget: int = 60, seed: int = 7, base_duration: float = 40.0,
                 out_dir: str = "datasets/foundry", objective: str = "evade",
-                verbose: bool = False) -> Archive:
+                verbose: bool = False, mutation_fn=None) -> Archive:
     """Run the MAP-Elites loop and write ``archive.json`` + ``FOUNDRY_REPORT.md`` to ``out_dir``.
 
     Init evaluates the 3 base genomes; then ``budget`` iterations each pick a parent (a base genome
     early on, a random elite later), mutate it, run the sim into a temp dir, score it, and
     ``insert_if_better``. Per-candidate run dirs are deleted to bound disk. Returns the Archive
     (``archive.meta`` carries base-vs-best fitness, coverage and QD-score for programmatic callers).
-    Deterministic: same (budget, seed, base_duration, objective) -> byte-identical archive.json.
+
+    ``mutation_fn`` is an OPTIONAL dependency-injected mutation operator with the signature
+    ``mutation_fn(parent_genome, archive_summary, rng) -> genome`` (see :func:`_apply_mutation_fn`
+    and :meth:`Archive.summary`). When ``None`` (the default) the built-in random :func:`mutate` is
+    used and the run is DETERMINISTIC: same (budget, seed, base_duration, objective) -> byte-identical
+    archive.json. When provided (e.g. an LLM semantic operator), candidates are proposed by the hook
+    but still validated + scored + inserted identically; such runs are NOT byte-identical by design.
     """
     os.makedirs(out_dir, exist_ok=True)
     work_root = os.path.join(out_dir, "_work")
@@ -526,7 +583,10 @@ def run_foundry(budget: int = 60, seed: int = 7, base_duration: float = 40.0,
         else:
             key = sorted(archive.cells.keys())[rng.randrange(len(archive.cells))]
             parent = archive.cells[key]["genome"]
-        child = mutate(parent, rng)
+        if mutation_fn is None:
+            child = mutate(parent, rng)                    # default: byte-identical random operator
+        else:
+            child = _apply_mutation_fn(mutation_fn, parent, archive, rng)   # injected (e.g. LLM)
         _run_one(child)
         if verbose and (it + 1) % 20 == 0:
             print(f"   [{it + 1}/{budget}] coverage={archive.coverage()} "
