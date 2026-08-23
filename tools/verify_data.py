@@ -488,6 +488,141 @@ def audit(ds_dir: Path):
         except Exception as e:
             rec(ds, "N1_world_provenance", False, f"network.json error: {type(e).__name__}: {e}")
 
+    # ============ VRU / DENM: LEAKAGE + CONSISTENCY (all SKIP-graceful) ============
+    # The VRU-actor (station_type / is_vru_declared), VRU-impersonation, and DENM (event-message)
+    # layers are opt-in; a dataset predating them has none of these files and every check below
+    # SKIPs so pre-feature corpora stay green.
+    gt_denm = read_jsonl(gt / "gt_denm_emissions.jsonl")
+    ma_denm = read_jsonl(ma / "ma_denm_log.jsonl")
+    veh_is_vru = {r["true_vehicle_id"]: r.get("is_vru") for r in gt_vehicle if "is_vru" in r}
+
+    # VRU1: the ORACLE VRU/DENM labels -- is_vru (gt_vehicle) and is_fake (gt_denm_emissions) --
+    # must NEVER reach the MA side or a feature table; only the MA-visible *declarations*
+    # (station_type / is_vru_declared) may. Reuses is_forbidden_feature_key, and -- unlike L1/L2 --
+    # also sweeps ma/ma_denm_log.jsonl (and any other ma/*.jsonl), which the original MA-leakage
+    # check never inspected. FAIL on any forbidden key or ORACLE-visibility record on the MA/feature
+    # side. Applicable whenever ANY VRU/DENM artefact is present.
+    vru_feat_cols = set()
+    for name in FEATURE_FILES:
+        cols, _ = read_csv(ml / f"{name}.csv")
+        vru_feat_cols |= {c for c in cols
+                          if c in ("is_vru_declared", "n_denms_sent", "n_denms_implausible")}
+    vru_active = bool(veh_is_vru) or bool(gt_denm) or bool(ma_denm) or bool(vru_feat_cols)
+    if not vru_active:
+        rec(ds, "VRU1_vru_denm_no_oracle_leak", None, "no VRU/DENM feature in dataset")
+    else:
+        vleaks = []
+        ma_files = sorted(ma.glob("*.jsonl")) if ma.exists() else []
+        for fp in ma_files:
+            for i, r in enumerate(read_jsonl(fp)):
+                if isinstance(r, dict) and r.get("_visibility") == ORACLE:
+                    vleaks.append(f"{fp.name}[{i}] ORACLE visibility")
+                bad = [k for k in _all_keys(r) if is_forbidden_feature_key(k)]
+                if bad:
+                    vleaks.append(f"{fp.name}[{i}] keys {bad}")
+        for name in FEATURE_FILES:
+            cols, _ = read_csv(ml / f"{name}.csv")
+            bad = [c for c in cols if is_forbidden_feature_key(c)]
+            if bad:
+                vleaks.append(f"ml/{name} cols {bad}")
+        rec(ds, "VRU1_vru_denm_no_oracle_leak", not vleaks, "; ".join(vleaks[:6]))
+
+    # VRU2: if VruImpersonation was configured, (a) gt marks those vehicles attackers (they belong to
+    # the identity family) and (b) every cert that DECLARED station_type="vru" resolves to a genuine
+    # VRU (gt is_vru) or an attacker -- never a benign, non-VRU, non-attacker. A benign non-VRU that
+    # declared "vru" would betray a mislabelled/leaked declaration. Unresolved digests are R3's remit.
+    def _cfg_uses(cfg_, name):
+        if str(cfg_.get("attack_type") or "") == name:
+            return True
+        if name in str(cfg_.get("attack_mix") or ""):
+            return True
+        ats = cfg_.get("attack_types")
+        return isinstance(ats, (list, tuple)) and name in ats
+    if not _cfg_uses(cfg, "VruImpersonation"):
+        rec(ds, "VRU2_impersonation_sanity", None, "no VruImpersonation configured")
+    elif not (gt_vehicle and digest2true):
+        rec(ds, "VRU2_impersonation_sanity", None, "no gt_vehicle/identity_map")
+    else:
+        imp_veh = {a.get("true_vehicle_id") for a in gt_attacks
+                   if a.get("attack_type") == "VruImpersonation"}
+        imp_not_attacker = sorted(v for v in imp_veh if v and not veh_attacker.get(v))
+        vru_digests = {r.get("cert_digest") for r in ma_status if r.get("station_type") == "vru"}
+        vru_digests |= {r.get("subject_cert_digest") for r in ma_reports
+                        if r.get("station_type") == "vru"}
+        bad_decl = []
+        for dg in vru_digests - {None}:
+            tid = digest2true.get(dg)
+            if tid is None:
+                continue
+            if not (veh_is_vru.get(tid) or veh_attacker.get(tid)):
+                bad_decl.append(tid)
+        rec(ds, "VRU2_impersonation_sanity",
+            (not imp_not_attacker) and (not bad_decl),
+            f"imp_vehicles={len(imp_veh)} imp_not_attacker={len(imp_not_attacker)} "
+            f"vru_declaring_certs={len(vru_digests - {None})} "
+            f"benign_nonvru_declared_vru={len(bad_decl)}")
+
+    # DENM1: the MA DENM log is well-formed evidence -- each row carries an event type, a sender
+    # handle (cert_digest) and a denm id, holds NO oracle flag (is_fake / true id / attack label),
+    # and -- when the oracle emissions exist -- its observed denm ids reconcile (are a subset) with
+    # them. SKIP when no DENM layer is present.
+    if not ma_denm and not gt_denm:
+        rec(ds, "DENM1_denm_log_integrity", None, "no DENM layer")
+    elif not ma_denm:
+        rec(ds, "DENM1_denm_log_integrity", None, "no ma_denm_log")
+    else:
+        dproblems = []
+        malformed = 0
+        for r in ma_denm:
+            if not isinstance(r, dict):
+                malformed += 1
+                continue
+            has_event = bool(r.get("event_type") or r.get("msg_type"))
+            has_sender = bool(r.get("cert_digest") or r.get("sender") or r.get("sender_cert_digest"))
+            has_id = r.get("denm_id") is not None
+            if not (has_event and has_sender and has_id):
+                malformed += 1
+        if malformed:
+            dproblems.append(f"{malformed} malformed rows")
+        leak_keys = sorted({k for r in ma_denm if isinstance(r, dict)
+                            for k in _all_keys(r) if is_forbidden_feature_key(k)})
+        if leak_keys:
+            dproblems.append(f"oracle keys {leak_keys}")
+        if gt_denm:
+            ma_ids = {r.get("denm_id") for r in ma_denm if isinstance(r, dict)} - {None}
+            gt_ids = {r.get("denm_id") for r in gt_denm if isinstance(r, dict)} - {None}
+            extra = ma_ids - gt_ids
+            if extra:
+                dproblems.append(f"{len(extra)} ma denm ids absent from emissions")
+        rec(ds, "DENM1_denm_log_integrity", not dproblems,
+            f"ma_denm={len(ma_denm)} " + ("; ".join(dproblems[:4]) if dproblems else "clean"))
+
+    # DENM2: when a DENM layer is active (denm_rate>0 or a DENM attack such as FakeHazard),
+    # gt_denm_emissions exists, is_fake is boolean, and every FAKE DENM was sent by a gt attacker
+    # (attacker set = gt_vehicle.is_attacker | gt_attacks). The converse (benign DENM => non-attacker)
+    # is intentionally NOT asserted: an attacker vehicle legitimately emits genuine DENMs outside its
+    # attack window, so that direction would false-FAIL a valid dataset.
+    denm_rate = cfg.get("denm_rate")
+    try:
+        denm_rate = float(denm_rate) if denm_rate not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        denm_rate = 0.0
+    if denm_rate <= 0 and not _cfg_uses(cfg, "FakeHazard"):
+        rec(ds, "DENM2_fake_denm_label_consistency", None, "no DENM layer configured")
+    elif not gt_denm:
+        rec(ds, "DENM2_fake_denm_label_consistency",
+            None if not ma_denm else False,
+            "no gt_denm_emissions" + ("" if not ma_denm else " but ma_denm_log present"))
+    else:
+        non_bool = sum(1 for r in gt_denm if not isinstance(r.get("is_fake"), bool))
+        fake_from_nonattacker = [r.get("denm_id") for r in gt_denm
+                                 if r.get("is_fake") and r.get("true_vehicle_id") is not None
+                                 and r.get("true_vehicle_id") not in attackers]
+        rec(ds, "DENM2_fake_denm_label_consistency",
+            non_bool == 0 and not fake_from_nonattacker,
+            f"emissions={len(gt_denm)} non_bool_is_fake={non_bool} "
+            f"fake_from_nonattacker={len(fake_from_nonattacker)}")
+
 def _all_keys(obj, out=None):
     out = [] if out is None else out
     if isinstance(obj, dict):
