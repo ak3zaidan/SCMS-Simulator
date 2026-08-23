@@ -197,13 +197,16 @@ def test_run_foundry_tool_executor_routes_and_caps(monkeypatch):
         return _FakeArchive()
 
     monkeypatch.setattr(agent, "run_foundry_llm", fake_run_foundry_llm)
+    # Force the keyless (random-fallback) path so the ai_operator assertion is environment-independent:
+    # a real checkout has a repo-root .env, a worktree does not -- without this the field flips with env.
+    monkeypatch.setattr(agent, "openai_key", lambda: "")
     s = agent.AgentSession()
     r = agent._exec_tool(s, "run_foundry", {"budget": 999, "seed": 5, "objective": "evade",
                                             "duration_s": 30})
     assert r["ok"] and r["coverage_cells"] == 2 and r["qd_score"] == 1.5
     assert r["best_fitness"] == 0.9 and r["grid_size"] == foundry.grid_size()
     assert r["out_dir"].endswith("agent_foundry")
-    assert r["ai_operator"] is False                         # no key in this worktree -> random-fallback
+    assert r["ai_operator"] is False                         # forced keyless above -> random-fallback
     assert len(r["hardest_cells"]) == 2 and r["hardest_cells"][0]["fitness"] == 0.9   # hardest first
     # the executor caps a runaway budget and forwards the other knobs
     assert captured["budget"] == 40 and captured["seed"] == 5
