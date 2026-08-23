@@ -152,8 +152,8 @@ def _materialize(config_dict: dict, domain_id: int, work_dir: str,
     run_pipeline(cfg)
     featmod.build(work_dir, split_seed=split_seed)
     summary = valmod.validate(work_dir)[0]
-    if not (int(summary.get("attackers", 0) or 0) > 0 and int(summary.get("ma_rows", 0) or 0) > 0):
-        return None, {}
+    if not foundry_mod._base_valid(summary):     # SINGLE source of truth: the exact foundry validity gate
+        return None, {}                          # (attackers>0 AND >=1 report filed) -- skip degenerate samples
 
     cell = foundry_mod.descriptor(config_dict, summary)
     frames: dict[str, pd.DataFrame] = {}

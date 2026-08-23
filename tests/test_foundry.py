@@ -21,33 +21,46 @@ from scms_sim_ref.mock_pipeline import config_from_dict, run_pipeline, validate_
 # Fast unit tests (no simulation) -- lock the fitness gate + descriptor contracts
 # --------------------------------------------------------------------------- #
 def test_fitness_validity_gate():
-    # no attackers -> invalid (empty scenario)
-    assert foundry.fitness("evade", {"attackers": 0, "ma_rows": 100, "recall": 0.0}, 40)[1] is False
-    # no reports -> invalid (nothing happening)
-    assert foundry.fitness("evade", {"attackers": 5, "ma_rows": 0, "recall": 0.0}, 40)[1] is False
-    # VALID and recall==0 -> fitness 1.0: the perfect-evasion jackpot must NOT be gated out
-    f, valid = foundry.fitness("evade", {"attackers": 5, "ma_rows": 100, "recall": 0.0}, 40)
+    # the report-activity signal the corrected gate reads (>=1 filed report); reused across the cases
+    reports = {"detector_reliability": {"posPlausibility": {"reports": 12, "precision": 0.5}}}
+    # no attackers -> invalid (empty scenario), even with reports present
+    assert foundry.fitness("evade", {"attackers": 0, "recall": 0.0, **reports}, 40)[1] is False
+    # attackers but NO reports filed -> invalid; a big ma_rows must NOT rescue it (ma_rows is vacuous)
+    assert foundry.fitness("evade", {"attackers": 5, "ma_rows": 100, "recall": 0.0}, 40)[1] is False
+    # VALID and recall==0 -> fitness 1.0: the jackpot (reports fired but MISSED the attackers) is kept
+    f, valid = foundry.fitness("evade", {"attackers": 5, "recall": 0.0, **reports}, 40)
     assert valid and abs(f - 1.0) < 1e-9
     # evade fitness == 1 - recall
-    f, valid = foundry.fitness("evade", {"attackers": 5, "ma_rows": 100, "recall": 0.3}, 40)
+    f, valid = foundry.fitness("evade", {"attackers": 5, "recall": 0.3, **reports}, 40)
     assert valid and abs(f - 0.7) < 1e-9
 
 
 def test_fitness_family_and_latency_gates():
+    reports = {"detector_reliability": {"posPlausibility": {"reports": 12, "precision": 0.5}}}
     # family objective: family absent -> invalid
-    s = {"attackers": 5, "ma_rows": 100, "recall_by_family": {"position": 0.5}}
+    s = {"attackers": 5, "recall_by_family": {"position": 0.5}, **reports}
     assert foundry.fitness("family:stealth", s, 40)[1] is False
     # family present -> fitness = 1 - recall_by_family[F]
-    s2 = {"attackers": 5, "ma_rows": 100, "recall_by_family": {"stealth": 0.25}}
+    s2 = {"attackers": 5, "recall_by_family": {"stealth": 0.25}, **reports}
     f, valid = foundry.fitness("family:stealth", s2, 40)
     assert valid and abs(f - 0.75) < 1e-9
     # latency: no measured latency (n==0) -> invalid
-    s3 = {"attackers": 5, "ma_rows": 100, "detection_latency_s": {}}
+    s3 = {"attackers": 5, "detection_latency_s": {}, **reports}
     assert foundry.fitness("latency", s3, 40)[1] is False
     # latency: normalized median / duration
-    s4 = {"attackers": 5, "ma_rows": 100, "detection_latency_s": {"n": 3, "median_s": 20.0}}
+    s4 = {"attackers": 5, "detection_latency_s": {"n": 3, "median_s": 20.0}, **reports}
     f, valid = foundry.fitness("latency", s4, 40)
     assert valid and abs(f - 0.5) < 1e-9
+
+
+def test_run_foundry_rejects_bad_objective(tmp_path):
+    """F2: a bad objective / typo'd family fails FAST (ValueError) BEFORE running the budget, instead of
+    silently writing an empty archive + exit 0 (which a swallowed per-candidate raise used to produce).
+    'mixed' is a descriptor bin, NOT a real attack family, so family:mixed is a typo and is rejected too."""
+    for bad in ("bogus", "family:NotAFamily", "family:mixed"):
+        with pytest.raises(ValueError):
+            foundry.run_foundry(budget=3, seed=1, base_duration=20.0,
+                                out_dir=str(tmp_path / bad.replace(":", "_")), objective=bad)
 
 
 def test_descriptor_bins():
@@ -134,11 +147,14 @@ def test_diversity_multiple_cells(evade_archive):
 
 
 def test_no_degenerate_elites(evade_archive):
-    """Every archived elite is a real misbehavior scenario (attackers + reports)."""
+    """Every archived elite is a real misbehavior scenario: attackers AND >=1 filed report. The report
+    check is the one that matters -- ma_rows alone is vacuous (it counts cert-status rows), so we assert
+    the corrected gate's n_reports signal directly."""
     arch, _ = evade_archive
     for cell, elite in arch.cells.items():
         assert elite["metrics"]["attackers"] > 0, cell
         assert elite["metrics"]["ma_rows"] > 0, cell
+        assert elite["metrics"]["n_reports"] > 0, cell     # the report-activity gate that actually matters
 
 
 def test_roundtrip_reproducibility(evade_archive, tmp_path):

@@ -40,7 +40,7 @@ BEHAVIOR DESCRIPTOR  (the QD axes -> an archive cell), :func:`descriptor` -> 4-t
     (b) density band    -- realized ``vehicles`` bucketed sparse (<60) / medium (<120) / dense.
     (c) topology        -- ``road_network`` in {grid, ring, spider}.
     (d) attacker band   -- ``attacker_pct`` bucketed low (<0.15) / med (<0.35) / high.
-    Cell space = 10 x 3 x 3 x 3 = 90 x ... (see :func:`grid_size`); coverage% = filled / that.
+    Cell space = 10 x 3 x 3 x 3 = 270 cells (see :func:`grid_size`); coverage% = filled / that.
 
 MUTATION  (:func:`mutate`): perturb ONE knob within ``config_schema`` bounds (numeric jitter on
     attacker_pct / arrival_rate / attack_intensity / duty-cycle / crl-aware / radio range / grid dims;
@@ -181,9 +181,31 @@ def _family_bin(genome: dict) -> str:
 # --------------------------------------------------------------------------- #
 # Objective / fitness + validity gate
 # --------------------------------------------------------------------------- #
+def _n_reports(summary: dict) -> int:
+    """Total misbehavior reports the detectors actually filed this run (summed over all reason codes).
+
+    Read from ``detector_reliability`` (validate.py), NOT ``ma_rows``: ``ma_rows`` counts EVERY ``ma/``
+    row -- including one ``ma_cert_status`` row per observed certificate -- so it is ~always > 0 whenever
+    any vehicle exists and cannot tell "the detectors engaged" from "nobody ever looked".
+    """
+    dr = summary.get("detector_reliability", {}) or {}
+    return sum(int(d.get("reports", 0) or 0) for d in dr.values())
+
+
 def _base_valid(summary: dict) -> bool:
-    """Realism/validity gate shared by every objective: a real misbehavior scenario, not an empty one."""
-    return int(summary.get("attackers", 0) or 0) > 0 and int(summary.get("ma_rows", 0) or 0) > 0
+    """Realism/validity gate shared by every objective: a real misbehavior scenario, not an empty one.
+
+    Requires (a) at least one true attacker AND (b) the reporting pipeline actually fired at least one
+    misbehavior report (:func:`_n_reports`, not the vacuous ``ma_rows``). This rejects the degenerate
+    "attackers present but never observed/reported" scenario, which would otherwise score recall=0 ->
+    ``evade`` fitness=1.0 and get archived as the "hardest" elite -- polluting the blind-spot map with
+    "nobody looked" cells the objective would then actively chase. A GENUINE detector blind spot (reports
+    DID fire but missed the attackers -> recall=0) is intentionally preserved: that is the jackpot the
+    search is meant to find. NOTE: with only aggregate report counts we cannot distinguish "attackers
+    unobserved but benign false-positives fired" from "attackers observed but unflagged"; a stricter
+    observed-attacker gate would need an observation signal validate.py does not emit today.
+    """
+    return int(summary.get("attackers", 0) or 0) > 0 and _n_reports(summary) > 0
 
 
 def fitness(objective: str, summary: dict, duration_s: float) -> tuple[float, bool]:
@@ -476,6 +498,7 @@ def _candidate(cfg: PipelineConfig, seed: int, duration_s: float, summary: dict,
             "false_revocations": summary.get("false_revocations"),
             "vehicles": summary.get("vehicles"),
             "ma_rows": summary.get("ma_rows"),
+            "n_reports": _n_reports(summary),            # reports actually filed (the validity signal)
             "recall_by_family": summary.get("recall_by_family", {}),
             "recall_by_type": summary.get("recall_by_type", {}),
             "detection_latency_s": summary.get("detection_latency_s", {}),
@@ -535,6 +558,18 @@ def run_foundry(budget: int = 60, seed: int = 7, base_duration: float = 40.0,
     archive.json. When provided (e.g. an LLM semantic operator), candidates are proposed by the hook
     but still validated + scored + inserted identically; such runs are NOT byte-identical by design.
     """
+    # Fail fast on a bad objective BEFORE spending the whole (expensive) budget. Without this an unknown
+    # objective raises inside every _evaluate, is swallowed per-candidate, and leaves a SILENT empty
+    # archive + exit 0; and a family:<F> with F absent from ATTACK_FAMILIES is a typo (not a legitimately
+    # empty family run) -- reject it so the caller sees the mistake instead of a coverage=0 "success".
+    if objective not in ("evade", "latency"):
+        if objective.startswith("family:"):
+            fam = objective.split(":", 1)[1]
+            if fam not in ATTACK_FAMILIES:
+                raise ValueError(f"unknown attack family {fam!r} in objective "
+                                 f"(want family:<F> with F in {ATTACK_FAMILIES})")
+        else:
+            raise ValueError(f"unknown objective {objective!r} (want evade | family:<F> | latency)")
     os.makedirs(out_dir, exist_ok=True)
     work_root = os.path.join(out_dir, "_work")
     shutil.rmtree(work_root, ignore_errors=True)
