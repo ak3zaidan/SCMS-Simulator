@@ -77,9 +77,39 @@ COMBINED_ATTACKS = (
 IDENTITY_SPOOF_ATTACKS = (
     "VruImpersonation",
 )
-# Every attack type the engine can RENDER (default catalog + opt-in combined + opt-in identity-spoof).
-# Used to validate the opt-in selectors (attack_mix / attack_type) without widening the default set.
-KNOWN_ATTACK_TYPES = ATTACK_CATALOG + COMBINED_ATTACKS + IDENTITY_SPOOF_ATTACKS
+# The "event-message" (DENM) family: a DECENTRALIZED EVENT MESSAGE announces a road hazard/event
+# (emergency electronic brake light, stationary vehicle, ...). A "FakeHazard" attacker emits DENMs
+# announcing a hazard NOT backed by its own kinematics -- a phantom emergency brake while it is in
+# fact cruising -- to induce nearby vehicles to brake/reroute. Like COMBINED_ATTACKS /
+# IDENTITY_SPOOF_ATTACKS it is OPT-IN ONLY (excluded from ATTACK_CATALOG so the default data_digest is
+# byte-identical) and produced only when explicitly requested via attack_types / attack_mix /
+# attack_type. It requires the DENM layer, so it turns that layer on even when denm_rate==0 (mirroring
+# how VruImpersonation enables the station_type machinery). featurize._ATTACK_FAMILY folds it into the
+# new "event" family; the denmPlausibility detector catches it.
+DENM_ATTACKS = (
+    "FakeHazard",
+)
+# Every attack type the engine can RENDER (default catalog + opt-in combined + opt-in identity-spoof +
+# opt-in event/DENM). Used to validate the opt-in selectors (attack_mix / attack_type) without
+# widening the default set.
+KNOWN_ATTACK_TYPES = ATTACK_CATALOG + COMBINED_ATTACKS + IDENTITY_SPOOF_ATTACKS + DENM_ATTACKS
+
+# --- DENM (event-message) layer tunables (consulted only when the DENM layer is enabled) ---
+# denm_rate is expressed as expected DENMs per vehicle per 100 seconds of eligibility (a RATE, not a
+# probability); the per-step emission probability is denm_rate * dt / 100. 0 => no benign DENMs.
+DENM_RATE_WINDOW_S = 100.0
+# A FakeHazard attacker still needs a non-zero emission rate even if the benign rate (denm_rate) is 0,
+# so the attack is self-contained (selecting it never yields an is_attacker with no falsification).
+DENM_FAKE_FALLBACK_RATE = 40.0        # fake DENMs / attacker / 100 s when denm_rate == 0
+# A genuine emergency-brake / stationary-vehicle DENM is emitted by a sender that has actually slowed
+# to (at most) this speed, so a real event's CLAIMED sender speed sits at/below it. The plausibility
+# detector reads the noise-free claimed speed, so real DENMs never trip it (margin to the threshold).
+DENM_BENIGN_MAX_SPEED_MPS = 4.0       # benign DENM trigger: sender speed at/below this (post-brake/stop)
+DENM_DECEL_TRIG_MPS2 = 2.5            # ...reached via a hard deceleration of at least this magnitude
+# denmPlausibility fires when a brake/stationary hazard's sender CLAIMS a speed above this: a beacon
+# that announces "I am emergency-braking here" while still moving at vehicle speed contradicts itself.
+# Set above DENM_BENIGN_MAX_SPEED_MPS so benign (slow/stopped) senders stay below the firing line.
+DENM_IMPLAUSIBLE_SPEED_MPS = 6.0
 
 # A self-declared VRU (pedestrian/cyclist) travelling faster than this is not plausibly a VRU -- a fast
 # cyclist / e-bike tops out ~8-10 m/s -- so a beacon that DECLARES vru while moving above it is a
@@ -277,6 +307,15 @@ class PipelineConfig:
     # spawns none, draws NO extra RNG, and is BYTE-IDENTICAL. See make_vru + the detection-pass note.
     vru_pct: float = 0.0                  # fraction of spawned ACTORS that are VRUs (0 = none)
     vru_speed_mps: float = 1.8           # VRU travel speed (~1.4 walking .. ~5 cycling)
+    # --- DENM (event-message) layer (opt-in; default OFF -> byte-identical) ---
+    # DENMs are event-triggered messages (emergency electronic brake light, stationary vehicle, ...),
+    # distinct from the periodic CAM/beacon. A vehicle that experiences a REAL trigger (hard decel to a
+    # near-stop, or being stationary) occasionally broadcasts a signed DENM announcing that real event,
+    # at rate denm_rate. denm_rate is expected DENMs per vehicle per 100 s (a RATE, not a probability);
+    # 0 (the default) => no DENMs are ever emitted, NO extra RNG is drawn, and the dataset is
+    # BYTE-IDENTICAL. The opt-in "FakeHazard" attack turns the layer on even at denm_rate=0 (it emits
+    # phantom DENMs at a fallback rate) so the attack is self-contained. See the broadcast pre-pass.
+    denm_rate: float = 0.0               # expected benign DENMs per vehicle per 100 s (0 = none)
     road_network: str = "linear"         # linear | grid | ring | spider | custom (see custom_network)
     grid_w: int = 6                      # grid width | ring nodes | spider arms
     grid_h: int = 6                      # grid height | spider rings
@@ -866,6 +905,8 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
                          f"(got {cfg.trip_speed_min}, {cfg.trip_speed_max})")
     if cfg.vru_pct > 0 and cfg.vru_speed_mps <= 0:      # VRUs must actually move (walking/cycling)
         raise ValueError(f"vru_speed_mps must be > 0 when vru_pct > 0 (got {cfg.vru_speed_mps})")
+    if cfg.denm_rate < 0:                                # DENMs/veh/100s (a rate, not a probability)
+        raise ValueError(f"denm_rate must be >= 0 (got {cfg.denm_rate})")
     if cfg.road_network not in ("linear", "grid", "ring", "spider", "custom"):
         raise ValueError(f"road_network must be linear|grid|ring|spider|custom "
                          f"(got {cfg.road_network!r})")
@@ -924,6 +965,7 @@ def _field_group(name: str) -> str:
         ("Network", ("road_network", "grid", "custom_network", "traffic_lights", "light_cycle",
                      "arterial", "local_speed")),
         ("Scenario events", ("events",)),
+        ("Messages", ("denm",)),
         ("GNSS/sensor", ("gps_", "faulty", "weather")),
         ("Radio", ("radio", "packet", "nlos", "chan", "freq", "art_max", "stale", "pathloss",
                    "shadowing", "rx_sensitivity")),
@@ -948,7 +990,8 @@ _ENUM_OPTIONS = {
     "od_model": ["uniform", "gravity"],
     "fleet": ["mixed", *VEHICLE_TYPES],
     "rsu_placement": ["spread", "perimeter", "center", "corners", "all"],
-    "attack_type": ["", *ATTACK_CATALOG, *COMBINED_ATTACKS, *IDENTITY_SPOOF_ATTACKS],  # "" = unset
+    "attack_type": ["", *ATTACK_CATALOG, *COMBINED_ATTACKS, *IDENTITY_SPOOF_ATTACKS,
+                    *DENM_ATTACKS],  # "" = unset
 }
 
 # Per-field documentation + ranges/units so every knob is self-describing in UIs and tooling.
@@ -973,6 +1016,11 @@ _FIELD_META = {
     "vru_pct": dict(h="Fraction of spawned actors that are VRUs (pedestrians/cyclists; benign, "
                       "self-declaring station_type=vru; 0 = none, byte-identical)", lo=0, hi=1, st=0.05),
     "vru_speed_mps": dict(h="VRU travel speed (~1.4 walking .. ~5 cycling)", lo=0.1, hi=10, st=0.1, u="m/s"),
+    # Messages (DENM event-message layer)
+    "denm_rate": dict(h="Benign event-message (DENM) rate: expected DENMs per vehicle per 100 s from a "
+                        "REAL trigger (hard brake to a near-stop / stationary); 0 = none, byte-identical. "
+                        "The opt-in FakeHazard attack emits phantom DENMs regardless of this rate.",
+                      lo=0, hi=200, st=5, u="/100s"),
     "n_lanes": dict(h="Parallel lanes per road (overtaking; relieves gridlock)", lo=1, hi=6),
     "lane_width_m": dict(h="Lane width for multi-lane offsets", lo=1, hi=6, st=0.25, u="m"),
     "trip_speed_min": dict(h="Minimum desired trip speed", lo=1, hi=60, u="m/s"),
@@ -1214,6 +1262,19 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     _impersonation_enabled = ("VruImpersonation" in catalog
                               or (attack_weights is not None and "VruImpersonation" in attack_weights))
     _emit_station_type = cfg.vru_pct > 0 or _impersonation_enabled
+    # The DENM (event-message) layer is active when benign DENMs are requested (denm_rate>0) OR the
+    # opt-in FakeHazard attack is selected via any selector (it emits phantom DENMs even at denm_rate=0,
+    # so it turns the layer on -- exactly as VruImpersonation enables the station_type machinery). When
+    # NEITHER holds, no DENM is ever built, no DENM RNG stream is drawn, and the extra detector key /
+    # output files are gated off -> the DEFAULT path is byte-identical.
+    _fakehazard_enabled = ("FakeHazard" in catalog
+                           or (attack_weights is not None and "FakeHazard" in attack_weights))
+    _denm_enabled = cfg.denm_rate > 0 or _fakehazard_enabled
+    # per-step emission probabilities (rate/100s -> per-step); benign uses denm_rate, a FakeHazard
+    # attacker falls back to a fixed rate when denm_rate==0 so the attack is never a silent no-op.
+    _denm_p = cfg.denm_rate * cfg.dt / DENM_RATE_WINDOW_S
+    _denm_fake_p = ((cfg.denm_rate if cfg.denm_rate > 0 else DENM_FAKE_FALLBACK_RATE)
+                    * cfg.dt / DENM_RATE_WINDOW_S)
     total_time = cfg.n_steps * cfg.dt
     net = None
     if cfg.road_network == "grid":
@@ -1558,6 +1619,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
 
     digest_to_vehicle = {d: vehicles[info["veh_vid"]] for d, info in pseudonym_info.items()}
     vrng = {v.vid: random.Random(f"{cfg.seed}:sensor:{v.vid}") for v in vehicles}
+    # Dedicated per-vehicle DENM RNG stream (string-keyed), created + drawn ONLY when the DENM layer is
+    # enabled, so every other RNG-driven output is untouched and the DEFAULT path is byte-identical.
+    vdenm_rng = ({v.vid: random.Random(f"{cfg.seed}:denm:{v.vid}") for v in vehicles}
+                 if _denm_enabled else {})
 
     # ---- Road-Side Units (opt-in): fixed, always-trusted receivers ----
     # RSUs never move and never transmit; they only OBSERVE in-range CAMs and file reports like any
@@ -1584,6 +1649,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     ma_reports: list[dict] = []
     gt_report_labels: list[R.GtReportLabel] = []
     gt_emissions: list[dict] = []
+    # DENM (event-message) records. gt_denm carries the ORACLE real-vs-fake flag (label side only);
+    # ma_denm_log is the MA-VISIBLE log of observed DENMs (no real/fake flag) that featurize turns into
+    # leakage-safe per-subject DENM-count features. Both stay empty (and unwritten) on the default path.
+    gt_denm: list[dict] = []
+    ma_denm_log: list[dict] = []
+    _denm_prev_v: dict[int, float] = {}   # per-vehicle previous true speed -> benign hard-brake trigger
     ma_investigations: list[R.MaInvestigation] = []
     ma_crl_events: list[R.MaCrlEvent] = []
     gt_linkage_rev: list[R.GtLinkageRevocation] = []
@@ -1601,7 +1672,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     # VRUs always, a VruImpersonation attacker while attacking). Drives the cert_status station type so
     # it reflects the OBSERVED declaration, never the oracle is_vru. Empty on the default path.
     vru_declared_digests: set[str] = set()
-    counters = {"report": 0, "case": 0, "crl": 0}
+    counters = {"report": 0, "case": 0, "crl": 0, "denm": 0}
     # Per-colluder RNG for FABRICATED false-report evidence: keyed by seed+vid (deterministic), one
     # stream per colluder so draws accumulate across the run -> the fabricated detector score / pos
     # confidence VARY per report (see the collusion pass) instead of a constant fingerprint. A
@@ -1727,6 +1798,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # NOTE: "VruImpersonation" deliberately has NO branch here -- it drives HONESTLY (position/speed/
         # heading are the true values) and falsifies only its self-declared station_type (set to "vru" in
         # the broadcast pre-pass) to steal the VRU detector exemptions. It is caught by vruImpersonation.
+        # NOTE: "FakeHazard" likewise has NO branch here -- its CAMs are honest; the falsification is a
+        # PHANTOM DENM (emitted in the broadcast pre-pass) announcing a hazard its own kinematics do not
+        # back. It is caught by the denmPlausibility detector.
         return cx, cy, cs, ch
 
     Z = 3.0                     # residual must exceed ~3x the broadcast uncertainty to count
@@ -1763,6 +1837,11 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     # byte-identical, mirroring how the station_type report field is gated on _emit_station_type.
     if _emit_station_type:
         DET_KEYS = DET_KEYS + ("vruImpersonation",)
+    # denmPlausibility is added ONLY when the DENM layer is enabled. Otherwise no DENM is ever received,
+    # the detector is always 0.0, and appending its detnorm_* to every report would perturb the DEFAULT
+    # digest -- so it is gated here to stay byte-identical, mirroring the vruImpersonation gate above.
+    if _denm_enabled:
+        DET_KEYS = DET_KEYS + ("denmPlausibility",)
     # SOFT features: carried in the fusion fingerprint (detnorm_*) for ML, but NEVER trigger a report
     # on their own -- a constant-velocity tracker false-positives on curves, so it must stay soft.
     SOFT_KEYS = ("kalmanConsistency",)
@@ -1826,6 +1905,37 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         filed_by[reporter_digest] = filed_by.get(reporter_digest, 0) + 1
         received_by[subject_digest] = received_by.get(subject_digest, 0) + 1
         touched_subjects.add(subject_digest)
+
+    def emit_denm(tx: Vehicle, b_cam: dict, real: bool, event_type: str, t: float) -> None:
+        """Append a DECENTRALIZED EVENT MESSAGE (DENM) broadcast for `tx` this step, plus its MA-visible
+        log row and its ORACLE ground-truth row. A DENM is a distinct, SIGNED broadcast kind
+        (msg_type="denm") announcing a road hazard at a claimed location; it reuses the sender's cert
+        (b_cam["digest"]) and its current claimed kinematics, so a receiver can check the announced
+        event against the sender's OWN observed CAM state. `real` (a benign vehicle's true event vs a
+        FakeHazard attacker's phantom one) is ORACLE-only -- it never touches the broadcast content the
+        MA sees. Reached only when the DENM layer is enabled -> no effect on the default path."""
+        counters["denm"] += 1
+        did = f"dnm_{counters['denm']:06d}"
+        ev_x, ev_y, ev_spd = b_cam["cx"], b_cam["cy"], b_cam["cs"]
+        # MA-visible plausibility of a brake/stationary hazard from the sender's OWN claimed speed:
+        # a real (slow/stopped) sender scores < 1; a phantom hazard from a cruising sender scores > 1.
+        plaus = max(0.0, ev_spd) / DENM_IMPLAUSIBLE_SPEED_MPS
+        broadcasts.append(dict(
+            veh=tx, digest=b_cam["digest"], cx=ev_x, cy=ev_y, cs=ev_spd, ch=b_cam["ch"],
+            conf=b_cam["conf"], ghost=False, x=b_cam["x"], y=b_cam["y"], falsified=(not real),
+            msg_count=1, cg=t, sig_ok=True, cvf=b_cam["cvf"], cvt=b_cam["cvt"],
+            station_type=b_cam["station_type"], msg_type="denm", event_type=event_type, denm_id=did))
+        ma_denm_log.append(dict(                           # MA-VISIBLE (no real/fake flag): observed DENM
+            denm_id=did, cert_digest=b_cam["digest"], detection_time=round(t, 3),
+            event_type=event_type, claimed_x=round(ev_x, 3), claimed_y=round(ev_y, 3),
+            claimed_speed=round(ev_spd, 3), denm_plausibility=round(plaus, 3)))
+        gt_denm.append(dict(                               # ORACLE: real-vs-fake flag lives ONLY here
+            denm_id=did, t=round(t, 3), true_vehicle_id=f"veh_{tx.vid:03d}", cert_digest=b_cam["digest"],
+            event_type=event_type, claimed_x=round(ev_x, 3), claimed_y=round(ev_y, 3),
+            sender_speed=round(ev_spd, 3), is_attacker=tx.is_attacker, is_fake=(not real),
+            _visibility=R.ORACLE))
+        if not real and tx.onset is None:                  # the phantom DENM is this attacker's onset
+            tx.onset = t
 
     def resolve_and_revoke(veh: Vehicle, trigger_digest: str, t: float) -> None:
         counters["case"] += 1
@@ -2216,6 +2326,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         for vid in [vid for vid, v in active.items() if v.finish_time is not None and t > v.finish_time]:
             active.pop(vid).hist.clear()
             vrng.pop(vid, None)              # a despawned vehicle never transmits again -> free its RNG
+            vdenm_rng.pop(vid, None)         # (empty/no-op unless the DENM layer is on -> digest-safe)
             lc_rng.pop(vid, None)            # (empty/no-op unless lane_changes is on -> digest-safe)
         active_list = [active[vid] for vid in sorted(active)]
         if cf_active:
@@ -2290,10 +2401,33 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 tx.onset = t
             if declared_station == "vru":                # remember the MA-observed declaration per cert
                 vru_declared_digests.add(digest)
-            broadcasts.append(dict(veh=tx, digest=digest, cx=cx, cy=cy, cs=cs, ch=ch, conf=conf,
-                                   ghost=False, x=x, y=y, falsified=falsified, msg_count=msg_count,
-                                   cg=cg, sig_ok=sig_ok, cvf=cvf, cvt=cvt,
-                                   station_type=declared_station))
+            b_cam = dict(veh=tx, digest=digest, cx=cx, cy=cy, cs=cs, ch=ch, conf=conf,
+                         ghost=False, x=x, y=y, falsified=falsified, msg_count=msg_count,
+                         cg=cg, sig_ok=sig_ok, cvf=cvf, cvt=cvt, station_type=declared_station)
+            broadcasts.append(b_cam)
+            # ---- DENM (event-message) emission (opt-in; only when the DENM layer is enabled) ----
+            # A FakeHazard attacker emits a PHANTOM hazard (emergency brake) while cruising -- its own
+            # claimed speed contradicts the announced event. A benign vehicle emits a DENM only on a
+            # REAL trigger: a hard deceleration to a near-stop, or being stationary -- so the announced
+            # event corroborates its own low claimed speed. VRUs/RSUs never emit DENMs. Draws come from
+            # the dedicated per-vehicle DENM RNG only, so every other output is unchanged.
+            if _denm_enabled and not tx.is_rsu and not tx.is_vru:
+                dr = vdenm_rng[tx.vid]
+                if attacking and tx.attack_type == "FakeHazard":
+                    if _denm_fake_p > 0.0 and dr.random() < _denm_fake_p:
+                        emit_denm(tx, b_cam, real=False,
+                                  event_type="emergencyElectronicBrakeLight", t=t)
+                elif _denm_p > 0.0:
+                    prev = _denm_prev_v.get(tx.vid)
+                    _denm_prev_v[tx.vid] = tspeed
+                    decel = ((prev - tspeed) / cfg.dt) if prev is not None else 0.0
+                    stationary = tspeed < 0.5
+                    hard_brake = (decel >= DENM_DECEL_TRIG_MPS2
+                                  and tspeed <= DENM_BENIGN_MAX_SPEED_MPS)
+                    if (stationary or hard_brake) and dr.random() < _denm_p:
+                        emit_denm(tx, b_cam, real=True,
+                                  event_type=("stationaryVehicle" if stationary
+                                              else "emergencyElectronicBrakeLight"), t=t)
             if attacking and tx.attack_type == "Sybil":     # fabricate co-located ghost identities
                 sr = vrng[tx.vid]
                 for gdig in tx.ghosts:
@@ -2305,9 +2439,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                                            cg=t, sig_ok=True, cvf=0.0, cvt=total_time,
                                            station_type="vehicle"))
 
-        # per-message ground-truth emission sampling (real broadcasts only)
+        # per-message ground-truth emission sampling (real CAM broadcasts only; DENMs have their own
+        # dedicated ground-truth stream gt_denm, so they are excluded here)
         for b in broadcasts:
-            if b["ghost"]:
+            if b["ghost"] or b.get("msg_type") == "denm":
                 continue
             if rng.random() < cfg.emit_sample_prob:
                 tx = b["veh"]
@@ -2322,7 +2457,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # too means crossing traffic converging at an intersection (different headings) is not
         # mistaken for a Sybil (whose ghosts copy the attacker's single position + heading).
         cells = Counter((round(b["cx"] / _CELL_M), round(b["cy"] / _CELL_M), int(b["ch"] // 45) % 8)
-                        for b in broadcasts)
+                        for b in broadcasts if b.get("msg_type") != "denm")
 
         # DETECTION pass (receiver-outer): a receiver only hears in-range transmitters, with
         # distance/NLOS/weather/congestion packet loss -> the report graph becomes spatially LOCAL
@@ -2404,6 +2539,25 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 loss = cfg.packet_loss_base + cfg.nlos_loss * (dist / rr) + cong + wx_loss
                 if loss > 0 and rng.random() < loss:
                     continue                                    # packet dropped on the channel
+                if b.get("msg_type") == "denm":
+                    # DENM (event message): the receiver checks whether the announced brake/stationary
+                    # hazard CORROBORATES the sender's own observed kinematics. The DENM carries the
+                    # sender's claimed speed (its own CAM state); a genuine emergency-brake/stationary
+                    # sender is slow (score < 1 -> plausible), while a phantom hazard from a cruising
+                    # sender scores above 1 -> denmPlausibility fires. This reads MA-VISIBLE evidence
+                    # only (the claimed event + the sender's claimed speed); it never consults the oracle
+                    # real/fake flag, and benign DENMs (low claimed speed) never trip it -> no false
+                    # revocations. An unverifiable (bad-sig) DENM carries no trustworthy content -> skip.
+                    if b["sig_ok"]:
+                        score = max(0.0, b["cs"]) / DENM_IMPLAUSIBLE_SPEED_MPS
+                        if score >= 1.0 and rng.random() <= cfg.report_prob:
+                            det = {k: 0.0 for k in DET_KEYS}
+                            det["denmPlausibility"] = score
+                            file_report(t, reporter_digest, b["digest"], b["veh"],
+                                        ["denmPlausibility"], det, b["conf"],
+                                        b["cx"], b["cy"], b["cx"], b["cy"], malicious=False,
+                                        sig_valid=True, station_type=b["station_type"])
+                    continue
                 tx, digest, cx, cy, cs, ch, conf = (b["veh"], b["digest"], b["cx"], b["cy"],
                                                     b["cs"], b["ch"], b["conf"])
                 key = (rx.vid, digest)
@@ -2633,6 +2787,18 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                                     gt_vehicle, gt_idmap, gt_attacks, gt_report_labels, gt_linkage_rev,
                                     gt_emissions)
         n_reports, n_gt_reports = len(ma_reports), len(gt_report_labels)
+    # DENM (event-message) outputs: an MA-VISIBLE observed-DENM log + the ORACLE real/fake ground truth.
+    # Added to the digest ONLY when the DENM layer is enabled, so the DEFAULT file set (and digest) is
+    # byte-identical. Written from bounded accumulators (never streamed), which is fine given the rate.
+    if _denm_enabled:
+        os.makedirs(os.path.join(cfg.out_dir, "ma"), exist_ok=True)
+        os.makedirs(os.path.join(cfg.out_dir, "ground_truth"), exist_ok=True)
+        data_files["ma/ma_denm_log.jsonl"] = _write_jsonl(
+            os.path.join(cfg.out_dir, "ma", "ma_denm_log.jsonl"),
+            sorted(ma_denm_log, key=lambda r: r["denm_id"]))
+        data_files["ground_truth/gt_denm_emissions.jsonl"] = _write_jsonl(
+            os.path.join(cfg.out_dir, "ground_truth", "gt_denm_emissions.jsonl"),
+            sorted(gt_denm, key=lambda r: r["denm_id"]))
     data_digest = _data_digest(cfg.out_dir, data_files)
     _write_manifest(cfg, data_files, data_digest,
                     counts=dict(vehicles=len(vehicles), reports=n_reports,
@@ -2843,6 +3009,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="fraction of spawned actors that are VRUs (pedestrians/cyclists; benign, "
                         "self-declaring station_type=vru; 0=none, byte-identical)")
     p.add_argument("--vru-speed", type=float, default=1.8, help="VRU travel speed (m/s; ~1.4 walk .. ~5 cycle)")
+    p.add_argument("--denm-rate", type=float, default=0.0,
+                   help="benign event-message (DENM) rate: DENMs/veh/100s from a real trigger (0=off, "
+                        "byte-identical). FakeHazard emits phantom DENMs regardless of this rate.")
     p.add_argument("--featurize", action="store_true", help="build ML tables after generation")
     p.add_argument("--grid-h", type=int, default=0, help="grid height (0 = square, = --grid)")
     p.add_argument("--config", default=None,
@@ -2935,7 +3104,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                          traffic_lights=args.traffic_lights, gap_acceptance=args.gap_acceptance,
                          gps_jam_rate=args.gps_jam_rate,
                          max_total_vehicles=args.max_total_vehicles,
-                         vru_pct=args.vru_pct, vru_speed_mps=args.vru_speed, verbose=True,
+                         vru_pct=args.vru_pct, vru_speed_mps=args.vru_speed,
+                         denm_rate=args.denm_rate, verbose=True,
                          out_dir=(args.out or "datasets/poc_run"))
     res = run_pipeline(cfg)
     _emit_result(res, args.featurize)
