@@ -190,6 +190,29 @@ def _parse_attack_mix(s: str) -> dict | None:
     return {n: parsed[n] for n in KNOWN_ATTACK_TYPES if n in parsed}   # canonical order
 
 
+def _parse_magnitude_scale(s: str) -> dict[str, float]:
+    """Parse 'RandomPos:2.0,ConstPosOffset:0.5' -> {type: scale}: a per-type multiplier on that type's
+    falsification magnitude (applied ON TOP of the global attack_intensity dial). Empty/blank -> {}
+    (every type scale 1.0 -> byte-identical). Mirrors _parse_attack_mix: each name must be a known
+    attack type and each scale a float; raises ValueError on a bad name/value. Unlike a mix WEIGHT
+    (which must be > 0), a scale of exactly 0 is allowed -- it silences that type's falsification."""
+    if not s or not s.strip():
+        return {}
+    parsed = {}
+    for part in s.split(","):
+        name, _, sc = part.strip().partition(":")
+        name = name.strip()
+        if name not in KNOWN_ATTACK_TYPES:
+            raise ValueError(f"attack_magnitude_scale has unknown type {name!r}")
+        val = float(sc)
+        if val < 0:
+            raise ValueError(f"attack_magnitude_scale for {name!r} must be >= 0 (got {val})")
+        parsed[name] = val
+    if not parsed:
+        raise ValueError(f"attack_magnitude_scale parsed to nothing: {s!r}")
+    return {n: parsed[n] for n in KNOWN_ATTACK_TYPES if n in parsed}   # canonical order
+
+
 def _weighted_pick(rng, weights: dict) -> str:
     """Deterministic weighted choice over {name: weight} (order-stable) using one rng draw."""
     tot = sum(weights.values()) or 1.0
@@ -245,6 +268,10 @@ class PipelineConfig:
     attack_intensity: float = 1.0        # scales falsification magnitudes (subtle <1 .. blatant >1)
     attack_mix: str = ""                 # per-type weights, e.g. "ConstPos:0.6,Sybil:0.4"
                                          # (empty = round-robin over attack_types)
+    attack_magnitude_scale: str = ""     # per-type falsification-magnitude multiplier (on TOP of the
+                                         # global attack_intensity dial), e.g.
+                                         # "RandomPos:2.0,ConstPosOffset:0.5,HeadingOffset:1.5".
+                                         # Empty (default) => every type scale 1.0 => byte-identical.
     attack_duty_cycle: float = 1.0       # <1: attacker falsifies only in bursts (evades sustained-
                                          # evidence revocation); fraction of each pulse period "on"
     attack_pulse_period_s: float = 20.0  # length of one on/off pulse cycle when duty_cycle < 1
@@ -957,6 +984,7 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"fleet must be 'mixed' or one of {sorted(VEHICLE_TYPES)} (got {cfg.fleet!r})")
     _parse_fleet_mix(cfg.fleet_mix)      # raises ValueError on a bad class name / weight
     _parse_attack_mix(cfg.attack_mix)    # raises ValueError on an unknown attack type / weight
+    _parse_magnitude_scale(cfg.attack_magnitude_scale)  # raises on an unknown type / negative scale
     if cfg.trip_speed_min <= 0 or cfg.trip_speed_max < cfg.trip_speed_min:
         raise ValueError(f"need 0 < trip_speed_min <= trip_speed_max "
                          f"(got {cfg.trip_speed_min}, {cfg.trip_speed_max})")
@@ -1187,6 +1215,9 @@ _FIELD_META = {
     "attack_end": dict(h="Fixed-fleet: attack ends at this time", lo=0, u="s"),
     "attack_intensity": dict(h="Falsification magnitude scale (subtle <1 .. blatant >1)", lo=0, hi=5, st=0.25),
     "attack_mix": dict(h="Per-type weights, e.g. ConstPos:0.6,Sybil:0.4 (blank = round-robin)"),
+    "attack_magnitude_scale": dict(h="Per-type falsification-magnitude multiplier (on top of "
+                                     "attack_intensity), e.g. RandomPos:2.0,ConstPosOffset:0.5 "
+                                     "(blank = every type 1.0)"),
     "attack_duty_cycle": dict(h="Fraction of each pulse the attacker falsifies (<1 = intermittent)", lo=0, hi=1, st=0.05),
     "attack_pulse_period_s": dict(h="On/off cycle length for pulsed attacks", lo=1, u="s"),
     "crl_aware_pct": dict(h="Fraction of attackers that watch the public CRL and lie low after a bust", lo=0, hi=1, st=0.05),
@@ -1375,6 +1406,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         catalog = cfg.attack_types or (cfg.attack_type or "ConstPos",)
     fleet_weights = _parse_fleet_mix(cfg.fleet_mix)   # None -> default mixed weights (byte-identical)
     attack_weights = _parse_attack_mix(cfg.attack_mix)  # None -> round-robin catalog (byte-identical)
+    mag_scale = _parse_magnitude_scale(cfg.attack_magnitude_scale)  # {} -> every type scale 1.0 (byte-identical)
     # A run carries the MA-visible self-declared station_type (and the vruImpersonation detector) when
     # EITHER genuine VRUs are present (vru_pct>0) OR the opt-in VRU-impersonation attack is selected via
     # any of the attack selectors. When NEITHER holds no beacon ever declares "vru", so gating the
@@ -1842,7 +1874,11 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         """Falsified claim for an active attacker; returns (cx, cy, cspeed, cheading)."""
         r = vrng[v.vid]
         typ = v.attack_type
-        k = cfg.attack_intensity                             # scales falsification magnitude
+        scale = mag_scale.get(typ, 1.0)                      # per-type magnitude multiplier (1.0 = default)
+        k = cfg.attack_intensity * scale                     # fold the per-type scale into the global dial:
+        # every "* k" branch below is now scaled per-type for free, and at scale==1.0 k is unchanged.
+        # The rng draws (r.uniform(...)) happen BEFORE the "* k" multiply, so folding scale into k never
+        # alters the rng stream OR the draw count -> the default (scale 1.0) stays byte-identical.
         cx, cy, cs, ch = mx, my, mspeed, mheading
         if typ == "ConstPos":
             if v.frozen is None:
@@ -1860,14 +1896,27 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         elif typ == "ConstSpeedOffset":
             cs = mspeed + 12.0 * k
         elif typ == "RandomSpeed":
-            cs = r.uniform(0, 40)
+            # NOT k-scaled historically (an absolute claimed speed, not a "* k" magnitude). The uniform
+            # draw is taken UNCONDITIONALLY (same rng-draw count for any scale); the per-type scale then
+            # widens/narrows the claimed speed's DEVIATION from the true speed. At scale==1.0 cs is the
+            # exact historic r.uniform(0, 40) -> byte-identical (the branch avoids any float re-rounding).
+            u = r.uniform(0, 40)
+            cs = u if scale == 1.0 else max(0.0, mspeed + (u - mspeed) * scale)
         elif typ == "StopAndGo":
-            cs = 0.0 if int(t) % 2 == 0 else 35.0
+            # NOT k-scaled historically (fixed 0/35 alternation, no rng draw). The per-type scale widens/
+            # narrows each phase's deviation from the true speed. At scale==1.0 cs is the exact historic
+            # 0.0 / 35.0 -> byte-identical.
+            go = 0.0 if int(t) % 2 == 0 else 35.0
+            cs = go if scale == 1.0 else max(0.0, mspeed + (go - mspeed) * scale)
         elif typ == "ReversedHeading":
+            # Left UNSCALED: the falsification is a semantic 180 deg reversal, not an amplitude -- a
+            # "partial" reversal would not be a reversal, so there is no magnitude to scale.
             ch = (mheading + 180.0) % 360.0
         elif typ == "HeadingOffset":
             ch = (mheading + 45.0 * k) % 360.0
         elif typ == "DataReplay":
+            # Left UNSCALED: it REPLAYS real historical state verbatim; the falsification is the staleness
+            # (a stored past fix presented as current), not an amplitude, so there is nothing to scale.
             if len(v.hist) >= 5:
                 cx, cy, cs, ch = v.hist[-5]
         elif typ == "SlowDrift":
@@ -3067,6 +3116,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--attacker-pct", type=float, default=0.0)
     p.add_argument("--attack-intensity", type=float, default=1.0, help="scale falsification magnitude (subtle<1)")
     p.add_argument("--attack-mix", default="", help="per-type attack weights, e.g. 'ConstPos:0.6,Sybil:0.4'")
+    p.add_argument("--attack-magnitude-scale", default="",
+                   help="per-type falsification-magnitude multiplier, e.g. 'RandomPos:2.0,ConstPosOffset:0.5'")
     p.add_argument("--attack-duty-cycle", type=float, default=1.0,
                    help="<1: attacker falsifies only in bursts (intermittent/pulsed, evades revocation)")
     p.add_argument("--attack-pulse-period", type=float, default=20.0, help="pulse cycle length (s) when duty<1")
@@ -3251,6 +3302,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     cfg = PipelineConfig(seed=args.seed, n_vehicles=args.vehicles, n_steps=args.steps,
                          attacker_pct=args.attacker_pct, attack_intensity=args.attack_intensity,
                          attack_mix=args.attack_mix,
+                         attack_magnitude_scale=args.attack_magnitude_scale,
                          attack_duty_cycle=args.attack_duty_cycle,
                          attack_pulse_period_s=args.attack_pulse_period,
                          attack_delay_jitter_s=args.attack_delay_jitter,
