@@ -69,7 +69,7 @@ ATTACK_TYPES = [
     # timing
     "DataReplay", "DelayedMessages", "OutOfOrder", "DoS", "DoSRandom",
     # identity
-    "Sybil", "VruImpersonation",
+    "Sybil", "VruImpersonation", "VruPositionSpoof",
     # event / DENM (opt-in; needs the DENM layer active)
     "FakeHazard",
     # stealth (hard to detect: subtle, plausible, detector-aware falsifications)
