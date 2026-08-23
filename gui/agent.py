@@ -636,21 +636,45 @@ def _foundry_knob_sheet() -> str:
     return ", ".join(parts)
 
 
-def _foundry_mutation_messages(parent_genome: dict, archive_summary: dict) -> list:
-    """Build the COMPACT chat prompt for one semantic mutation.
+def _pick_target_cell(archive_summary: dict):
+    """Choose ONE concrete descriptor cell for this mutation to aim at, favouring COVERAGE.
 
-    Inputs the operator gives the model: the descriptor axes/bins, the valid attack family->types
-    map, the EMPTY cells to fill + the HARDEST cells to intensify (from archive_summary), the parent
-    genome, and the valid config fields + bounds for the relevant knobs. It asks for ONE JSON object
-    of config overrides aimed at an empty (preferred) or hard cell.
+    Returns ``(target_cell, mode)``. Picks an as-yet-EMPTY cell (rotating through the reported empty
+    cells by the current coverage count, so successive calls aim at DIFFERENT gaps and the operator
+    does not fixate on one region -- the empirically-observed failure mode where the LLM over-exploited
+    the hardest cell and collapsed diversity). Only when no empty cell is reported does it fall to the
+    hardest filled cell (``mode="intensify"``). Deterministic -- it does NOT draw from the search rng,
+    so the fallback path's rng stays pristine (the deterministic-fallback contract is preserved).
+    """
+    empty = archive_summary.get("empty_cells") or []
+    if empty:
+        idx = int(archive_summary.get("coverage_cells", 0) or 0) % len(empty)
+        return empty[idx], "fill"
+    hardest = archive_summary.get("hardest_cells") or []
+    if hardest:
+        return hardest[0], "intensify"
+    return None, "free"
+
+
+def _foundry_mutation_messages(parent_genome: dict, archive_summary: dict,
+                               target_cell=None, mode: str = "fill") -> list:
+    """Build the COMPACT chat prompt for one semantic mutation, aimed at ONE specific target cell.
+
+    The operator's PRIMARY objective is COVERAGE (illumination): the model is told to produce a
+    scenario that lands EXACTLY in ``target_cell`` -- a specific not-yet-covered cell chosen by
+    :func:`_pick_target_cell` -- rather than being free to keep intensifying the hardest region (which
+    collapses diversity: measured coverage 4.3 vs random 8.3 on the free-choice prompt). Only when no
+    empty cell exists is ``mode == "intensify"``. Inputs given to the model: the target cell + goal,
+    the descriptor axes, the attack family->types map, the parent genome, and the valid config fields.
     """
     axes = archive_summary.get("axes", {})
     fam_types = {f: list(ts) for f, ts in foundry.FAMILY_TO_TYPES.items()}
     payload = {
+        "target_cell": target_cell,                    # the ONE cell to produce a scenario for
+        "goal": ("fill_this_empty_cell" if mode == "fill"
+                 else "make_this_hard_cell_harder" if mode == "intensify" else "explore"),
         "descriptor_axes": axes,
         "attack_family_to_types": fam_types,
-        "empty_cells_to_fill": (archive_summary.get("empty_cells") or [])[:12],
-        "hardest_cells_to_intensify": (archive_summary.get("hardest_cells") or [])[:6],
         "coverage": {"filled": archive_summary.get("coverage_cells"),
                      "empty": archive_summary.get("empty_count"),
                      "grid_size": archive_summary.get("grid_size")},
@@ -658,24 +682,26 @@ def _foundry_mutation_messages(parent_genome: dict, archive_summary: dict) -> li
         "config_fields": _foundry_knob_sheet(),
     }
     system = (
-        "You are a red-team scenario designer for a V2X misbehavior-detection foundry that runs a "
-        "MAP-Elites quality-diversity search. Every scenario is scored by how well it EVADES a FIXED "
-        "detector; the archive keeps the single hardest scenario per descriptor cell "
-        "(attack_family x density_band x topology x attacker_band). Your job: propose ONE new "
-        "scenario, expressed as config overrides, that either FILLS an empty descriptor cell (to "
-        "widen coverage) or INTENSIFIES a hard cell (to push the detector's recall lower) while "
-        "staying a REALISTIC, valid misbehavior scenario.\n\n"
-        "Rules: (1) reply with ONLY a JSON object of config overrides -- no prose, no markdown "
-        "fences. (2) use ONLY the listed config_fields, within the given bounds/options. (3) choose "
-        "attack_types from attack_family_to_types so the scenario lands in the family you target; to "
-        "hit the 'mixed' family use types drawn from 2+ families. (4) set road_network for the target "
-        "topology, attacker_pct for the target attacker_band (low<0.15<=med<0.35<=high), and "
-        "arrival_rate to steer density. (5) NEVER weaken the detector. Prefer an empty cell; else "
-        "pick a hard cell and make it harder."
+        "You are a red-team scenario designer for a V2X misbehavior-detection foundry running a "
+        "MAP-Elites quality-diversity search. The search is scored on ILLUMINATION -- covering as many "
+        "distinct descriptor cells (attack_family x density_band x topology x attacker_band) as "
+        "possible, each with a hard-to-detect scenario. Your PRIMARY job is COVERAGE: produce ONE new "
+        "scenario, expressed as config overrides, that lands EXACTLY in the given target_cell (a cell "
+        "not yet covered) so the search reaches a NEW region. Diversity matters MORE than making any "
+        "single cell extreme -- do NOT just re-create the parent or the hardest scenario.\n\n"
+        "Map target_cell -> config: (a) attack_family -> pick attack_types from attack_family_to_types "
+        "for that family (for 'mixed', draw types from 2+ families); (b) topology -> road_network; "
+        "(c) attacker_band -> attacker_pct (low<0.15<=med<0.35<=high); (d) density_band -> arrival_rate "
+        "(higher = denser). Keep it a REALISTIC, valid misbehavior scenario and NEVER weaken the "
+        "detector.\n\n"
+        "Rules: (1) reply with ONLY a JSON object of config overrides -- no prose, no markdown fences. "
+        "(2) use ONLY the listed config_fields, within their bounds/options. (3) HIT the target_cell's "
+        "family/topology/attacker_band exactly. (4) if goal is make_this_hard_cell_harder, keep that "
+        "cell's family/topology/attacker_band and push the scenario to lower the detector's recall."
     )
-    user = ("Archive state and constraints (JSON):\n"
+    user = ("Target and constraints (JSON):\n"
             + json.dumps(payload, separators=(",", ":"), default=str)
-            + "\n\nReturn ONE JSON object of config overrides for the next scenario.")
+            + "\n\nReturn ONE JSON object of config overrides that lands in target_cell.")
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
@@ -733,10 +759,11 @@ def llm_mutation_fn(parent_genome: dict, archive_summary: dict, rng, *,
                     timeout: float = 60.0) -> dict:
     """LLM-backed semantic mutation operator matching foundry's ``mutation_fn`` hook signature.
 
-    Builds a compact prompt from ``archive_summary`` (the empty cells to fill, the hardest cells to
-    intensify, the descriptor axes, and the valid config fields/bounds), asks the model (via the
-    injectable ``_CHAT_FN`` / openai_chat) for a JSON config-overrides genome aimed at an empty/hard
-    cell, parses + filters + validates it (config_from_dict + validate_config), and returns it.
+    Aims at ONE specific target cell chosen by :func:`_pick_target_cell` (a not-yet-covered cell for
+    COVERAGE, or the hardest cell to intensify only when none are empty), builds a compact prompt via
+    :func:`_foundry_mutation_messages`, asks the model (via the injectable ``_CHAT_FN`` / openai_chat)
+    for a JSON config-overrides genome that lands in that cell, then parses + filters + validates it
+    (config_from_dict + validate_config) and returns it.
 
     On ANY failure -- no API key, network/HTTP error, non-JSON reply, unknown or invalid config, or
     any exception -- it FALLS BACK to foundry's deterministic random ``mutate(parent, rng)`` so the
@@ -753,7 +780,8 @@ def llm_mutation_fn(parent_genome: dict, archive_summary: dict, rng, *,
     try:
         if not key:
             raise RuntimeError("no OPENAI_API_KEY")
-        messages = _foundry_mutation_messages(parent_genome, archive_summary)
+        target_cell, mode = _pick_target_cell(archive_summary)     # coverage-first: aim at ONE empty cell
+        messages = _foundry_mutation_messages(parent_genome, archive_summary, target_cell, mode)
         msg = chat(messages, None, model, key, timeout)           # tools=None: plain completion
         genome = _parse_genome_reply(msg, parent_genome)
         if genome is None:

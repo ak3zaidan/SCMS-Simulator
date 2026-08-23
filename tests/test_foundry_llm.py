@@ -95,7 +95,7 @@ def test_llm_mutation_fn_success_via_mocked_chat(monkeypatch):
 
     def scripted(messages, tools, model, key, timeout=90.0):
         assert tools is None                                 # plain completion, no tool-calling
-        assert any("empty_cells_to_fill" in (m.get("content") or "") for m in messages)
+        assert any("target_cell" in (m.get("content") or "") for m in messages)  # coverage-first prompt
         return {"content": json.dumps({"attack_types": stealth_types, "road_network": "ring",
                                        "grid_w": 12, "grid_h": 6, "attacker_pct": 0.45})}
 
