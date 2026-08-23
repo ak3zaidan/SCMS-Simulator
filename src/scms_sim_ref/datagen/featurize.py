@@ -49,6 +49,7 @@ REASON_VOCAB = [
     "certValidity",
     "mapOffRoad",
     "vruImpersonation",
+    "denmPlausibility",
 ]
 
 # Detectors whose per-report normalized score is carried as a multi-detector FUSION fingerprint
@@ -57,7 +58,7 @@ DETECTORS = [
     "acceptanceRangeThreshold", "positionJump", "positionSpeedInconsistency",
     "headingInconsistency", "implausibleAcceleration", "staleOrReplay",
     "beaconFrequency", "sybilCoLocation", "constantPositionFrozen", "kalmanConsistency",
-    "signatureVerification", "certValidity", "mapOffRoad", "vruImpersonation",
+    "signatureVerification", "certValidity", "mapOffRoad", "vruImpersonation", "denmPlausibility",
 ]
 
 
@@ -73,6 +74,7 @@ for _fam, _bases in {
     "combined": ["Disruptive", "PosSpeedInconsistent", "PosHeadingInconsistent", "EventualStop"],
     "timing": ["DataReplay", "DelayedMessages", "OutOfOrder", "DoS", "DoSRandom"],
     "identity": ["Sybil", "VruImpersonation"],
+    "event": ["FakeHazard"],
     "stealth": ["AlongRoadOffset", "SlowDrift", "LaggingPosition"],
     "credential": ["InvalidSignature", "ExpiredCert", "NotYetValid"],
 }.items():
@@ -127,6 +129,15 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
     gt = os.path.join(dataset_dir, "ground_truth")
     reports = _load_jsonl(os.path.join(ma, "ma_reports.jsonl"))
     cert_status = _load_jsonl(os.path.join(ma, "ma_cert_status.jsonl"))
+    # MA-VISIBLE observed-DENM log (present ONLY when the DENM event-message layer was enabled). It
+    # carries NO real/fake flag (that oracle label lives in ground_truth/gt_denm_emissions.jsonl); we
+    # turn it into leakage-safe per-subject COUNTS: how many DENMs a cert sent and how many were
+    # implausible (a brake/stationary hazard whose claimed sender speed exceeded the firing threshold).
+    denm_log = _load_jsonl(os.path.join(ma, "ma_denm_log.jsonl"))
+    has_denm = bool(denm_log)
+    denm_count_by_digest = Counter(d.get("cert_digest") for d in denm_log)
+    denm_implausible_by_digest = Counter(d.get("cert_digest") for d in denm_log
+                                         if float(d.get("denm_plausibility", 0.0) or 0.0) >= 1.0)
     gt_idmap = _load_jsonl(os.path.join(gt, "gt_identity_map.jsonl"))
     gt_vehicle = _load_jsonl(os.path.join(gt, "gt_vehicle.jsonl"))
     gt_report_labels = _load_jsonl(os.path.join(gt, "gt_report_labels.jsonl"))
@@ -138,6 +149,18 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
     base_by_vehicle = {a["true_vehicle_id"]: str(a.get("attack_type", "")).split("/")[0] for a in gt_attacks}
     family_by_vehicle = {v: _ATTACK_FAMILY.get(b, "other") for v, b in base_by_vehicle.items()}
     vehicle_by_digest = {m["pseudonym_cert_digest"]: m["true_vehicle_id"] for m in gt_idmap}
+
+    # per-true-vehicle DENM counts (MA-visible aggregate of the observed-DENM log; label-free).
+    denm_count_by_vehicle: Counter = Counter()
+    denm_implausible_by_vehicle: Counter = Counter()
+    for _d, _n in denm_count_by_digest.items():
+        _tv = vehicle_by_digest.get(_d)
+        if _tv:
+            denm_count_by_vehicle[_tv] += _n
+    for _d, _n in denm_implausible_by_digest.items():
+        _tv = vehicle_by_digest.get(_d)
+        if _tv:
+            denm_implausible_by_vehicle[_tv] += _n
 
     def _is_rsu_reporter(reporter_cert_digest: str | None) -> bool:
         """A reporter cert absent from the oracle identity map is infrastructure (an RSU): every
@@ -251,6 +274,9 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         })
         if has_station:   # MA-visible declared station type of this subject certificate
             sf_rows[-1]["is_vru_declared"] = int(station_by_digest.get(digest) == "vru")
+        if has_denm:      # MA-visible: how many DENMs this cert sent, and how many were implausible
+            sf_rows[-1]["n_denms_sent"] = int(denm_count_by_digest.get(digest, 0))
+            sf_rows[-1]["n_denms_implausible"] = int(denm_implausible_by_digest.get(digest, 0))
         sl_rows.append({
             "subject_cert_digest": digest,
             "label_is_attacker": int(attacker_by_vehicle.get(subj_true, False)),
@@ -323,6 +349,9 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         })
         if has_station:   # MA-visible: does the MA see any of this vehicle's certs declare station=vru?
             vf_rows[-1]["is_vru_declared"] = int(tv in vru_declared_vehicles)
+        if has_denm:      # MA-visible: DENMs this vehicle's certs sent + how many were implausible
+            vf_rows[-1]["n_denms_sent"] = int(denm_count_by_vehicle.get(tv, 0))
+            vf_rows[-1]["n_denms_implausible"] = int(denm_implausible_by_vehicle.get(tv, 0))
         vl_rows.append({
             "entity_id": entity_id,
             "label_is_attacker": int(attacker_by_vehicle.get(tv, False)),
@@ -453,6 +482,11 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
         if has_station:   # MA-visible: any cert in this MA-linked cluster declared station=vru?
             vfm_rows[-1]["is_vru_declared"] = int(any(station_by_digest.get(d) == "vru"
                                                       for d in cluster_digests))
+        if has_denm:      # MA-visible: DENMs sent by certs in this MA-linked cluster + implausible ones
+            vfm_rows[-1]["n_denms_sent"] = int(sum(denm_count_by_digest.get(d, 0)
+                                                   for d in cluster_digests))
+            vfm_rows[-1]["n_denms_implausible"] = int(sum(denm_implausible_by_digest.get(d, 0)
+                                                          for d in cluster_digests))
         vlm_rows.append({
             "entity_id": ment,
             "label_is_attacker": int(attacker_by_vehicle.get(maj_true, False)),
@@ -552,6 +586,8 @@ _DETECTOR_DOCS = {
     "mapOffRoad": "claimed position far from any road (HD-map plausibility check)",
     "kalmanConsistency": "constant-velocity tracker residual (soft fusion feature, never a hard reason)",
     "vruImpersonation": "beacon self-declares VRU yet moves at vehicle speed (VRU-impersonation spoof)",
+    "denmPlausibility": "received event message (DENM) announces a brake/stationary hazard while its "
+                        "sender's own claimed speed shows it is still moving fast (phantom hazard)",
 }
 _FEATURE_DOCS = {
     "pos_confidence": "reported 95% GNSS position-uncertainty radius (m)",
@@ -568,6 +604,9 @@ _FEATURE_DOCS = {
     "detection_time": "time of the report (sequencing only; excluded from model features)",
     "is_vru_declared": "MA-visible self-declared station type flag (1 = beacon declares VRU); the "
                        "legitimately-transmitted signal, NOT the oracle is_vru label",
+    "n_denms_sent": "count of event messages (DENMs) the MA observed this subject/vehicle broadcast",
+    "n_denms_implausible": "of those DENMs, how many were implausible (claimed a brake/stationary "
+                           "hazard while the sender's own claimed speed was still high)",
 }
 
 
