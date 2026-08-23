@@ -202,6 +202,43 @@ CONFIG_SPEC = [
     {"group": "Python flow", "name": "pf_seed", "label": "Seed", "type": "int", "default": 7,
      "gen": "python-flow", "arg": "--seed"},
 
+    # --- Realism (advanced) opt-in knobs. Each default EQUALS its PipelineConfig default, so a
+    # default run stays byte-identical (passing "--flag <default>" is equivalent to omitting it).
+    # These surface knobs that previously were only reachable via the raw "all fields" panel. ---
+    {"group": "Traffic", "name": "pf_lane_changes", "label": "Lane changes (MOBIL)", "type": "bool",
+     "default": False, "gen": "python-flow", "arg": "--lane-changes",
+     "help": "discretionary lane changes (needs Lanes > 1 + flow); realistic lateral moves + heading swing"},
+    {"group": "Traffic", "name": "pf_lane_change_time", "label": "Lane-change time (s)", "type": "float",
+     "default": 2.5, "step": 0.5, "min": 0.5, "gen": "python-flow", "arg": "--lane-change-time",
+     "help": "smooth lane-change lateral transition duration (only used when lane changes are on)"},
+    {"group": "Traffic", "name": "pf_gap", "label": "Gap acceptance", "type": "bool",
+     "default": False, "gen": "python-flow", "arg": "--gap-acceptance",
+     "help": "yield to cross-traffic at UNSIGNALIZED intersections (needs flow + a routed network)"},
+    {"group": "Traffic", "name": "pf_vru_pct", "label": "VRU fraction", "type": "float",
+     "default": 0.0, "step": 0.05, "min": 0, "max": 0.9, "gen": "python-flow", "arg": "--vru-pct",
+     "help": "fraction of spawned actors that are VRUs (pedestrians/cyclists; 0 = none, byte-identical)"},
+    {"group": "Traffic", "name": "pf_vru_speed", "label": "VRU speed (m/s)", "type": "float",
+     "default": 1.8, "step": 0.1, "min": 0.1, "max": 15, "gen": "python-flow", "arg": "--vru-speed",
+     "help": "VRU travel speed (~1.4 walk .. ~5 cycle); must be > 0 when VRU fraction > 0"},
+    {"group": "Network", "name": "pf_arterial_every", "label": "Arterial spacing (grid)", "type": "int",
+     "default": 0, "min": 0, "max": 20, "gen": "python-flow", "arg": "--arterial-every",
+     "help": "grid only: every Nth row & column is a faster arterial road (0 = off)"},
+    {"group": "Network", "name": "pf_arterial_speed", "label": "Arterial speed (m/s)", "type": "float",
+     "default": 0.0, "step": 1, "min": 0, "max": 70, "gen": "python-flow", "arg": "--arterial-speed",
+     "help": "grid arterials / whole-ring cap; 0 = uncapped, else 1-70 (grid or ring road only)"},
+    {"group": "Network", "name": "pf_local_speed", "label": "Local road speed (m/s)", "type": "float",
+     "default": 0.0, "step": 1, "min": 0, "max": 70, "gen": "python-flow", "arg": "--local-speed",
+     "help": "grid only: local (non-arterial) road cap; 0 = uncapped, else 1-70"},
+    {"group": "Vehicle & radio", "name": "pf_radio_model", "label": "Radio model", "type": "choice",
+     "default": "disc", "options": ["disc", "logdistance"], "gen": "python-flow", "arg": "--radio-model",
+     "help": "disc = hard range; logdistance = soft path-loss + shadowing (realistic patchy reception)"},
+    {"group": "Vehicle & radio", "name": "pf_pathloss", "label": "Path-loss exponent", "type": "float",
+     "default": 2.7, "step": 0.1, "min": 1.0, "max": 6.0, "gen": "python-flow", "arg": "--pathloss-exponent",
+     "help": "log-distance path-loss exponent n (logdistance model only)"},
+    {"group": "Vehicle & radio", "name": "pf_shadowing", "label": "Shadowing sigma (dB)", "type": "float",
+     "default": 4.0, "step": 0.5, "min": 0, "max": 12, "gen": "python-flow", "arg": "--shadowing-sigma-db",
+     "help": "log-normal shadowing std in dB; 0 = near-hard cutoff (logdistance model only)"},
+
     # --- Traffic ---
     {"group": "Traffic", "name": "max_vehicles", "label": "Max vehicles", "type": "int", "default": "",
      "env": None, "param": "MaxVehicles", "kind": "flow",
@@ -436,14 +473,16 @@ CONFIG_SPEC = [
 _PF_GROUP = {
     "Scenario": ("pf_duration", "pf_seed"),
     "Traffic": ("pf_arrival", "pf_demand", "pf_od", "pf_boundary", "pf_fleet", "pf_fleet_mix",
-                "pf_tmin", "pf_tmax", "pf_maxveh", "pf_turn"),
+                "pf_tmin", "pf_tmax", "pf_maxveh", "pf_turn", "pf_lane_changes",
+                "pf_lane_change_time", "pf_gap", "pf_vru_pct", "pf_vru_speed"),
     "Network": ("pf_road", "pf_grid", "pf_grid_h", "pf_block", "pf_dropout", "pf_lanes",
-                "pf_lane_width", "pf_lights", "pf_light_cycle"),
+                "pf_lane_width", "pf_lights", "pf_light_cycle", "pf_arterial_every",
+                "pf_arterial_speed", "pf_local_speed"),
     "RSU (infrastructure)": ("pf_rsus", "pf_rsu_placement", "pf_rsu_range"),
     "Attacks": ("pf_attacker", "pf_intensity", "pf_attack_mix", "pf_duty", "pf_jitter", "pf_pulse",
                 "pf_collude", "pf_victim", "pf_crl_aware", "pf_crl_dormant"),
     "SCMS policy": ("pf_rotate",),
-    "Vehicle & radio": ("pf_radio",),
+    "Vehicle & radio": ("pf_radio", "pf_radio_model", "pf_pathloss", "pf_shadowing"),
     "Sensors & CAM timing": ("pf_faulty", "pf_weather", "pf_jam"),
 }
 _PF_NAME_TO_GROUP = {name: grp for grp, names in _PF_GROUP.items() for name in names}
@@ -528,14 +567,19 @@ PRESETS = {
         "pf_radio": 200, "pf_weather": "fog", "pf_demand": "rush", "pf_fleet": "mixed",
         "pf_lights": True},
     "Max realism (hard)": {   # showcases every realism/evasion knob: gravity trips, cornering, pulsed
-        "generator": "python-flow", "pf_duration": 300, "pf_arrival": 2.5, "pf_grid": 6,
-        "pf_attacker": 0.2, "pf_faulty": 0.06, "pf_collude": 0.3, "pf_rotate": 60,
+        # attacks, MOBIL lane changes, gap-acceptance, log-distance radio, and VRUs. Pinned to a GRID
+        # road (needed by lane_changes/gap_acceptance's routed-network requirement) with the arterial/
+        # local speed caps left at their 0 defaults, so validate_config never trips the
+        # arterial/topology guard (which only fires on a NONZERO cap off a grid/ring road).
+        "generator": "python-flow", "pf_road": "grid", "pf_duration": 300, "pf_arrival": 2.5,
+        "pf_grid": 6, "pf_attacker": 0.2, "pf_faulty": 0.06, "pf_collude": 0.3, "pf_rotate": 60,
         "pf_radio": 250, "pf_weather": "rain", "pf_demand": "rush", "pf_fleet": "mixed",
         "pf_lights": True, "pf_od": "gravity", "pf_turn": True, "pf_intensity": 0.7,
         "pf_duty": 0.5, "pf_jitter": 15, "pf_pulse": 20, "pf_boundary": True,
         "pf_fleet_mix": "car:0.6,truck:0.25,bus:0.1,motorcycle:0.05",
         "pf_attack_mix": "ConstPos:0.3,Sybil:0.2,SlowDrift:0.2,HeadingOffset:0.15,DoS:0.15",
-        "pf_rsus": 8, "pf_rsu_placement": "spread", "pf_lanes": 2},
+        "pf_rsus": 8, "pf_rsu_placement": "spread", "pf_lanes": 2,
+        "pf_lane_changes": True, "pf_gap": True, "pf_radio_model": "logdistance", "pf_vru_pct": 0.1},
     "Ring beltway": {
         "generator": "python-flow", "pf_road": "ring", "pf_grid": 24, "pf_block": 130,
         "pf_duration": 300, "pf_arrival": 2.0, "pf_attacker": 0.15, "pf_faulty": 0.05,
