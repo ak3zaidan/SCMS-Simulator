@@ -165,3 +165,157 @@ def test_schema1_passes_when_dropped_column_labelled_correctly(tmp_path):
         {"name": "detector_score_norm", "kind": "feature", "dtype": "float64"},
     ]})
     assert _schema1_status(tmp_path) == "PASS"
+
+
+# --- VRU / DENM invariants (VRU1 / VRU2 / DENM1 / DENM2) ---------------------------------------
+# These four invariants cover the opt-in VRU-actor (station_type / is_vru_declared),
+# VRU-impersonation, and DENM (event-message) layers. They SKIP on the older corpus above, so we
+# (a) generate ONE feature-rich dataset that exercises them all -- VRUs + DENMs + FakeHazard +
+# VruImpersonation via attack_mix -- and assert they PASS, and (b) hand-write tiny broken datasets
+# to prove each checker actually FAILs on a real leak / inconsistency (i.e. that it has teeth).
+_VRU_DENM_INVARIANTS = ("VRU1_vru_denm_no_oracle_leak", "VRU2_impersonation_sanity",
+                        "DENM1_denm_log_integrity", "DENM2_fake_denm_label_consistency")
+
+
+@pytest.fixture(scope="module")
+def _vru_denm_corpus(tmp_path_factory):
+    from scms_sim_ref.mock_pipeline import PipelineConfig, run_pipeline
+    from scms_sim_ref.datagen import featurize
+
+    ds_dir = tmp_path_factory.mktemp("vru_denm") / "ds"      # nested so the parent is the scan root
+    run_pipeline(PipelineConfig(
+        seed=11, traffic_flow=True, road_network="grid", duration_s=90, arrival_rate=1.5,
+        grid_w=5, grid_h=5, attacker_pct=0.25, vru_pct=0.2, denm_rate=60.0,
+        attack_mix="FakeHazard:0.4,RandomPos:0.3,VruImpersonation:0.3", out_dir=str(ds_dir)))
+    featurize.build(str(ds_dir))
+    return ds_dir.parent
+
+
+def test_vru_denm_invariants_pass_on_feature_rich_dataset(_vru_denm_corpus):
+    results = verify_data.run_audit(_vru_denm_corpus)
+    assert results, "audit produced no results"
+    status = {check: st for _, check, st, _ in results}
+    detail = {check: d for _, check, _, d in results}
+    for inv in _VRU_DENM_INVARIANTS:
+        assert status.get(inv) == "PASS", (
+            f"{inv} expected PASS, got {status.get(inv)} ({detail.get(inv)})")
+    # The four new invariants must not regress anything else. SCHEMA1 is the one tolerated FAIL
+    # (the known, separately-fixed featurize labelling bug -- see the notes above).
+    unexpected = [r for r in results if r[2] == "FAIL" and r[1] != _SCHEMA1]
+    assert not unexpected, "unexpected failures:\n" + "\n".join(
+        f"[{ds}] {check}: {detail}" for ds, check, _, detail in unexpected)
+
+
+def _write_min_dataset(root, *, manifest, gt=None, ma=None, ml=None):
+    """A minimal on-disk dataset for fault injection. `gt`/`ma` map *.jsonl -> list-of-dicts;
+    `ml` maps *.csv -> (header_list, list-of-row-lists). Only the given files are written."""
+    import csv
+    import json
+    ds = root / "syn"
+    ds.mkdir(parents=True, exist_ok=True)
+    (ds / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    for sub, files in (("ground_truth", gt), ("ma", ma)):
+        if not files:
+            continue
+        d = ds / sub
+        d.mkdir(exist_ok=True)
+        for name, rows in files.items():
+            (d / name).write_text("\n".join(json.dumps(x) for x in rows), encoding="utf-8")
+    if ml:
+        d = ds / "ml"
+        d.mkdir(exist_ok=True)
+        for name, (header, body) in ml.items():
+            with open(d / name, "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(header)
+                for r in body:
+                    w.writerow(r)
+    return root
+
+
+def _status(root):
+    return {check: st for _, check, st, _ in verify_data.run_audit(root)}
+
+
+def test_vru1_denm1_catch_is_fake_leak_in_denm_log(tmp_path):
+    # is_fake is an ORACLE label; leaking it into ma/ma_denm_log.jsonl must be caught by BOTH VRU1
+    # and DENM1 -- the DENM log is a file the original L2 MA-leakage check never inspected.
+    common = dict(
+        manifest={"config": {"denm_rate": 60.0}, "counts": {}},
+        gt={"gt_vehicle.jsonl": [{"true_vehicle_id": "veh_a", "is_attacker": True, "is_vru": False}],
+            "gt_denm_emissions.jsonl": [
+                {"denm_id": "dnm_1", "event_type": "brake", "is_fake": True, "true_vehicle_id": "veh_a"}]})
+    # BAD: the MA-side DENM row carries the oracle is_fake flag
+    _write_min_dataset(tmp_path, ma={"ma_denm_log.jsonl": [
+        {"denm_id": "dnm_1", "event_type": "brake", "cert_digest": "aa", "is_fake": True}]}, **common)
+    st = _status(tmp_path)
+    assert st.get("VRU1_vru_denm_no_oracle_leak") == "FAIL", st
+    assert st.get("DENM1_denm_log_integrity") == "FAIL", st
+    # GOOD control: same dataset with a clean DENM log -> both PASS
+    _write_min_dataset(tmp_path, ma={"ma_denm_log.jsonl": [
+        {"denm_id": "dnm_1", "event_type": "brake", "cert_digest": "aa", "denm_plausibility": 2.1}]},
+        **common)
+    st = _status(tmp_path)
+    assert st.get("VRU1_vru_denm_no_oracle_leak") == "PASS", st
+    assert st.get("DENM1_denm_log_integrity") == "PASS", st
+
+
+def test_vru1_catches_is_vru_leak_in_feature_table(tmp_path):
+    # is_vru is an ORACLE label; it must never appear as a feature column (only is_vru_declared may).
+    _write_min_dataset(
+        tmp_path,
+        manifest={"config": {}, "counts": {}},
+        gt={"gt_vehicle.jsonl": [{"true_vehicle_id": "veh_a", "is_attacker": False, "is_vru": True}]},
+        ml={"vehicle_features.csv": (["entity_id", "is_vru_declared", "is_vru"], [["e1", "1", "1"]])})
+    assert _status(tmp_path).get("VRU1_vru_denm_no_oracle_leak") == "FAIL"
+    # GOOD control: only the MA-visible declaration column -> PASS
+    _write_min_dataset(
+        tmp_path,
+        manifest={"config": {}, "counts": {}},
+        gt={"gt_vehicle.jsonl": [{"true_vehicle_id": "veh_a", "is_attacker": False, "is_vru": True}]},
+        ml={"vehicle_features.csv": (["entity_id", "is_vru_declared"], [["e1", "1"]])})
+    assert _status(tmp_path).get("VRU1_vru_denm_no_oracle_leak") == "PASS"
+
+
+def test_denm2_catches_fake_denm_from_nonattacker(tmp_path):
+    # every FAKE DENM must originate from a gt attacker; a fake DENM from a benign vehicle is a
+    # label contradiction DENM2 must FAIL on.
+    _write_min_dataset(
+        tmp_path,
+        manifest={"config": {"denm_rate": 60.0}, "counts": {}},
+        gt={"gt_vehicle.jsonl": [{"true_vehicle_id": "veh_a", "is_attacker": False, "is_vru": False}],
+            "gt_denm_emissions.jsonl": [
+                {"denm_id": "d1", "event_type": "brake", "is_fake": True, "true_vehicle_id": "veh_a"}]})
+    assert _status(tmp_path).get("DENM2_fake_denm_label_consistency") == "FAIL"
+    # GOOD control: same fake DENM but its sender is a gt attacker -> PASS
+    _write_min_dataset(
+        tmp_path,
+        manifest={"config": {"denm_rate": 60.0}, "counts": {}},
+        gt={"gt_vehicle.jsonl": [{"true_vehicle_id": "veh_a", "is_attacker": True, "is_vru": False}],
+            "gt_denm_emissions.jsonl": [
+                {"denm_id": "d1", "event_type": "brake", "is_fake": True, "true_vehicle_id": "veh_a"}]})
+    assert _status(tmp_path).get("DENM2_fake_denm_label_consistency") == "PASS"
+
+
+def test_vru2_catches_benign_nonvru_declaring_vru(tmp_path):
+    # under VruImpersonation, a cert declaring station_type="vru" must resolve to a genuine VRU or an
+    # attacker; a benign non-VRU that declared "vru" is a mislabelled declaration VRU2 must FAIL on.
+    base_ma = {"ma_cert_status.jsonl": [
+        {"cert_digest": "cc", "station_type": "vru", "crl_status": "active"}]}
+    idmap = {"gt_identity_map.jsonl": [
+        {"true_vehicle_id": "veh_a", "pseudonym_cert_digest": "cc"}]}
+    _write_min_dataset(
+        tmp_path,
+        manifest={"config": {"attack_mix": "VruImpersonation:1.0"}, "counts": {}},
+        gt={"gt_vehicle.jsonl": [{"true_vehicle_id": "veh_a", "is_attacker": False, "is_vru": False}],
+            **idmap},
+        ma=base_ma)
+    assert _status(tmp_path).get("VRU2_impersonation_sanity") == "FAIL"
+    # GOOD control: the same declaration made by an attacker (a real impersonator) -> PASS
+    _write_min_dataset(
+        tmp_path,
+        manifest={"config": {"attack_mix": "VruImpersonation:1.0"}, "counts": {}},
+        gt={"gt_vehicle.jsonl": [{"true_vehicle_id": "veh_a", "is_attacker": True, "is_vru": False}],
+            **idmap},
+        ma=base_ma)
+    assert _status(tmp_path).get("VRU2_impersonation_sanity") == "PASS"
