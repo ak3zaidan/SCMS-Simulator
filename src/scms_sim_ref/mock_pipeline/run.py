@@ -263,6 +263,11 @@ class PipelineConfig:
     gps_degrade_dur_s: float = 3.0       # burst length (< the revocation persistence gate)
     gps_jam_rate: float = 0.0            # per-step prob a benign vehicle loses GNSS fix entirely
     gps_jam_dur_s: float = 4.0           # outage length; it HONESTLY broadcasts huge uncertainty
+    # per-vehicle GNSS quality spread: quality = floor + Exp(lambda) drawn once per vehicle at spawn.
+    # The floor is the best achievable quality; the exponential tail gives a few vehicles markedly
+    # worse fixes (a larger noise scale). Defaults reproduce the historic 0.5 + expovariate(1.2) draw.
+    gps_quality_floor: float = 0.5       # best-case per-vehicle GNSS quality (noise-scale floor)
+    gps_quality_lambda: float = 1.2      # rate of the exponential quality tail (smaller = heavier tail)
     faulty_pct: float = 0.05             # malfunctioning-sensor (non-attacker) fraction
     faulty_bias_mult: float = 5.0        # faulty = large SUSTAINED bias (smooth, self-consistent)
     weather: str = "clear"
@@ -270,6 +275,15 @@ class PipelineConfig:
     consistency_threshold_m: float = 5.0
     heading_threshold_deg: float = 35.0
     detector_lag_s: float = 1.5          # compare each fix to one ~this old (robust to turns/outliers)
+    # detector operating point (strictness of the motion + Sybil detectors). Defaults reproduce the
+    # historic hardcoded values, so the DEFAULT config stays byte-identical.
+    detector_z_threshold: float = 3.0    # motion-residual firing point: a residual must exceed ~this
+                                         # many broadcast-uncertainty sigmas to count as a violation
+    detector_min_consec: int = 2         # consecutive per-detector violations required before a reason fires
+    sybil_min_certs: int = _SYBIL_MIN    # distinct co-located certs (same cell+heading) before
+                                         # sybilCoLocation reaches its firing score of 1.0
+    sybil_cell_m: float = _CELL_M        # sybil co-location cell size (m): certs are binned to this grid
+                                         # (used BOTH when building the cell counts and on lookup)
     report_prob: float = 0.9
     report_threshold_k: int = 3          # distinct reporters to open an investigation
     revoke_min_seconds: int = 4          # AND reports in >= this many distinct seconds
@@ -295,6 +309,10 @@ class PipelineConfig:
     pathloss_exponent: float = 2.7       # log-distance exponent n (urban ~2.7-3.5; free space 2.0)
     shadowing_sigma_db: float = 4.0      # log-normal shadowing std (dB); 0 -> near-hard cutoff at range
     rx_sensitivity_margin_db: float = 0.0  # + shrinks / - extends the effective range vs radio_range_m
+    # candidate-window cap for logdistance reception (see the RADIO_CAP_* module notes). Consulted ONLY
+    # when radio_model=="logdistance"; the "disc" default takes neither, so it is byte-identical regardless.
+    radio_cap_sigma: float = RADIO_CAP_SIGMA        # candidate cap headroom in shadow standard deviations
+    radio_cap_max_mult: float = RADIO_CAP_MAX_MULT  # hard ceiling on cap / range (bounds the cell search)
     art_max_m: float = 150.0             # tolerance for claiming a position beyond the radio range
     offroad_tol_m: float = 15.0          # map check: claimed distance from the nearest road tolerated
     max_accel_mps2: float = 12.0         # implausible-acceleration threshold
@@ -325,6 +343,11 @@ class PipelineConfig:
     # spawns none, draws NO extra RNG, and is BYTE-IDENTICAL. See make_vru + the detection-pass note.
     vru_pct: float = 0.0                  # fraction of spawned ACTORS that are VRUs (0 = none)
     vru_speed_mps: float = 1.8           # VRU travel speed (~1.4 walking .. ~5 cycling)
+    # a beacon DECLARING station_type=vru but CLAIMING a speed at/above this is a vehicle impersonating
+    # a VRU (a fast e-bike tops out ~8-10 m/s); drives the vruImpersonation speed arm. Genuine VRUs
+    # (~vru_speed_mps) stay far below it. Consulted only when station types are in play (byte-identical
+    # otherwise). Default reproduces the historic VRU_MAX_PLAUSIBLE_SPEED_MPS.
+    vru_max_plausible_speed_mps: float = VRU_MAX_PLAUSIBLE_SPEED_MPS
     # --- DENM (event-message) layer (opt-in; default OFF -> byte-identical) ---
     # DENMs are event-triggered messages (emergency electronic brake light, stationary vehicle, ...),
     # distinct from the periodic CAM/beacon. A vehicle that experiences a REAL trigger (hard decel to a
@@ -334,6 +357,18 @@ class PipelineConfig:
     # BYTE-IDENTICAL. The opt-in "FakeHazard" attack turns the layer on even at denm_rate=0 (it emits
     # phantom DENMs at a fallback rate) so the attack is self-contained. See the broadcast pre-pass.
     denm_rate: float = 0.0               # expected benign DENMs per vehicle per 100 s (0 = none)
+    # DENM plausibility / trigger thresholds (consulted only when the DENM layer is enabled -> the
+    # default path is byte-identical). Defaults reproduce the historic module constants. The brake-
+    # specific implausibility bound stays DERIVED at the use site as denm_benign_max_speed_mps + 0.5
+    # (kept just above the benign bound, so a real brake DENM is never flagged) -- no separate field.
+    denm_rate_window_s: float = DENM_RATE_WINDOW_S       # window (s) that denm_rate is expressed per
+    denm_fake_fallback_rate: float = DENM_FAKE_FALLBACK_RATE  # fake DENMs/attacker/window when denm_rate==0
+    denm_benign_max_speed_mps: float = DENM_BENIGN_MAX_SPEED_MPS  # benign DENM trigger: sender speed
+                                         # at/below this (post-brake/stop); also the base of the derived
+                                         # brake-implausible bound (this + 0.5)
+    denm_decel_trig_mps2: float = DENM_DECEL_TRIG_MPS2   # ...reached via a hard decel of at least this
+    denm_implausible_speed_mps: float = DENM_IMPLAUSIBLE_SPEED_MPS  # denmPlausibility fires when a
+                                         # hazard's sender CLAIMS a speed above this (generic bound)
     road_network: str = "linear"         # linear | grid | ring | spider | custom (see custom_network)
     grid_w: int = 6                      # grid width | ring nodes | spider arms
     grid_h: int = 6                      # grid height | spider rings
@@ -843,6 +878,10 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
     if not -20.0 <= cfg.rx_sensitivity_margin_db <= 20.0:
         raise ValueError(f"rx_sensitivity_margin_db must be in [-20, 20] dB "
                          f"(got {cfg.rx_sensitivity_margin_db})")
+    if cfg.radio_cap_sigma <= 0:
+        raise ValueError(f"radio_cap_sigma must be > 0 (got {cfg.radio_cap_sigma})")
+    if cfg.radio_cap_max_mult < 1:
+        raise ValueError(f"radio_cap_max_mult must be >= 1 (got {cfg.radio_cap_max_mult})")
     if cfg.idm_accel <= 0 or cfg.idm_decel <= 0:
         raise ValueError(f"idm_accel and idm_decel must be > 0 (got {cfg.idm_accel}, {cfg.idm_decel})")
     if cfg.weather not in WEATHER_MULT:
@@ -927,6 +966,33 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"vru_speed_mps must be > 0 when vru_pct > 0 (got {cfg.vru_speed_mps})")
     if cfg.denm_rate < 0:                                # DENMs/veh/100s (a rate, not a probability)
         raise ValueError(f"denm_rate must be >= 0 (got {cfg.denm_rate})")
+    # DENM / VRU thresholds (defaults reproduce the historic module constants)
+    if cfg.denm_rate_window_s <= 0:
+        raise ValueError(f"denm_rate_window_s must be > 0 (got {cfg.denm_rate_window_s})")
+    if cfg.denm_fake_fallback_rate < 0:
+        raise ValueError(f"denm_fake_fallback_rate must be >= 0 (got {cfg.denm_fake_fallback_rate})")
+    if cfg.denm_benign_max_speed_mps <= 0:
+        raise ValueError(f"denm_benign_max_speed_mps must be > 0 (got {cfg.denm_benign_max_speed_mps})")
+    if cfg.denm_decel_trig_mps2 <= 0:
+        raise ValueError(f"denm_decel_trig_mps2 must be > 0 (got {cfg.denm_decel_trig_mps2})")
+    if cfg.denm_implausible_speed_mps <= 0:
+        raise ValueError(f"denm_implausible_speed_mps must be > 0 (got {cfg.denm_implausible_speed_mps})")
+    if cfg.vru_max_plausible_speed_mps <= 0:
+        raise ValueError(f"vru_max_plausible_speed_mps must be > 0 (got {cfg.vru_max_plausible_speed_mps})")
+    # detector operating point (strictness of the motion + Sybil detectors)
+    if cfg.detector_z_threshold <= 0:
+        raise ValueError(f"detector_z_threshold must be > 0 (got {cfg.detector_z_threshold})")
+    if cfg.detector_min_consec < 1:
+        raise ValueError(f"detector_min_consec must be >= 1 (got {cfg.detector_min_consec})")
+    if cfg.sybil_min_certs < 2:
+        raise ValueError(f"sybil_min_certs must be >= 2 (got {cfg.sybil_min_certs})")
+    if cfg.sybil_cell_m <= 0:
+        raise ValueError(f"sybil_cell_m must be > 0 (got {cfg.sybil_cell_m})")
+    # per-vehicle GNSS quality spread
+    if cfg.gps_quality_floor < 0:
+        raise ValueError(f"gps_quality_floor must be >= 0 (got {cfg.gps_quality_floor})")
+    if cfg.gps_quality_lambda <= 0:
+        raise ValueError(f"gps_quality_lambda must be > 0 (got {cfg.gps_quality_lambda})")
     if cfg.road_network not in ("linear", "grid", "ring", "spider", "custom"):
         raise ValueError(f"road_network must be linear|grid|ring|spider|custom "
                          f"(got {cfg.road_network!r})")
@@ -977,7 +1043,7 @@ def _field_group(name: str) -> str:
     """Category for a config field, so UIs/tools can group the ~97 knobs sensibly."""
     g = [
         ("RSU", ("n_rsus", "rsu_")),
-        ("Attacks", ("attack", "attacker", "sybil", "collude", "victim", "dos", "delay",
+        ("Attacks", ("attack", "attacker", "sybil_ghosts", "collude", "victim", "dos", "delay",
                      "crl_aware", "crl_dormant")),
         ("Mobility", ("fleet", "trip_", "idm_", "demand", "arrival", "n_lanes", "lane_", "turn_",
                       "gap_acceptance", "car_following", "veh_length", "od_", "boundary",
@@ -991,7 +1057,7 @@ def _field_group(name: str) -> str:
                    "shadowing", "rx_sensitivity")),
         ("Detection/MA", ("consistency", "heading", "detector", "report", "revoke", "reputation",
                           "ma_defense", "max_accel", "offroad", "rotate", "beacon", "net_delay",
-                          "crl_")),
+                          "crl_", "sybil_min_certs", "sybil_cell_m")),
         ("Run", ("seed", "n_vehicles", "n_steps", "dt", "jmax", "out_dir", "verbose",
                  "live_interval", "emit_sample")),
     ]
@@ -1036,11 +1102,27 @@ _FIELD_META = {
     "vru_pct": dict(h="Fraction of spawned actors that are VRUs (pedestrians/cyclists; benign, "
                       "self-declaring station_type=vru; 0 = none, byte-identical)", lo=0, hi=1, st=0.05),
     "vru_speed_mps": dict(h="VRU travel speed (~1.4 walking .. ~5 cycling)", lo=0.1, hi=10, st=0.1, u="m/s"),
+    "vru_max_plausible_speed_mps": dict(h="A beacon declaring station_type=vru but claiming a speed "
+                                          "at/above this is a vehicle impersonating a VRU (drives the "
+                                          "vruImpersonation speed arm; lower fires more readily)",
+                                        lo=1, hi=30, st=0.5, u="m/s"),
     # Messages (DENM event-message layer)
     "denm_rate": dict(h="Benign event-message (DENM) rate: expected DENMs per vehicle per 100 s from a "
                         "REAL trigger (hard brake to a near-stop / stationary); 0 = none, byte-identical. "
                         "The opt-in FakeHazard attack emits phantom DENMs regardless of this rate.",
                       lo=0, hi=200, st=5, u="/100s"),
+    "denm_rate_window_s": dict(h="Time window that denm_rate / denm_fake_fallback_rate are expressed "
+                                 "per (rate normalizer)", lo=1, u="s"),
+    "denm_fake_fallback_rate": dict(h="Phantom DENMs per attacker per window a FakeHazard emits when "
+                                      "denm_rate == 0 (keeps the attack self-contained)", lo=0, u="/100s"),
+    "denm_benign_max_speed_mps": dict(h="Benign DENM trigger: sender speed at/below this (post-brake/"
+                                        "stop); also the base of the derived brake-implausible bound "
+                                        "(this + 0.5)", lo=0.1, hi=30, st=0.5, u="m/s"),
+    "denm_decel_trig_mps2": dict(h="Hard-deceleration magnitude that arms a benign brake DENM", lo=0.1,
+                                 hi=10, st=0.5, u="m/s²"),
+    "denm_implausible_speed_mps": dict(h="denmPlausibility fires when a hazard's sender CLAIMS a speed "
+                                         "above this generic bound (lower flags more DENMs)", lo=0.1,
+                                       hi=30, st=0.5, u="m/s"),
     "n_lanes": dict(h="Parallel lanes per road (overtaking; relieves gridlock)", lo=1, hi=6),
     "lane_width_m": dict(h="Lane width for multi-lane offsets", lo=1, hi=6, st=0.25, u="m"),
     "trip_speed_min": dict(h="Minimum desired trip speed", lo=1, hi=60, u="m/s"),
@@ -1129,6 +1211,11 @@ _FIELD_META = {
     "gps_degrade_dur_s": dict(h="Bad-GNSS burst length", lo=0, u="s"),
     "gps_jam_rate": dict(h="Per-step prob a benign vehicle loses GNSS fix (goes silent)", lo=0, hi=1, st=0.01),
     "gps_jam_dur_s": dict(h="GNSS outage length", lo=0, u="s"),
+    "gps_quality_floor": dict(h="Best-case per-vehicle GNSS quality: the noise-scale floor added to the "
+                                "exponential draw (higher raises mean GNSS error across the fleet)",
+                              lo=0, hi=10, st=0.1),
+    "gps_quality_lambda": dict(h="Rate of the exponential per-vehicle GNSS-quality tail (smaller = "
+                                 "heavier tail, more vehicles with poor fixes)", lo=0.1, hi=10, st=0.1),
     "faulty_pct": dict(h="Fraction of benign vehicles with a malfunctioning sensor", lo=0, hi=1, st=0.05),
     "faulty_bias_mult": dict(h="Faulty-sensor sustained bias multiplier", lo=1, hi=20),
     "weather": dict(h="Weather — degrades GNSS accuracy, radio, and speed"),
@@ -1149,6 +1236,15 @@ _FIELD_META = {
     "ma_defense": dict(h="Trusted-reporter gating (reputation + rate limit)"),
     "reputation_max": dict(h="A reporter itself reported more than this is distrusted", lo=1),
     "report_budget": dict(h="A reporter filing more than this is rate-limited", lo=1),
+    "detector_z_threshold": dict(h="Motion-residual firing point: a residual must exceed ~this many "
+                                   "broadcast-uncertainty sigmas to count as a violation (lower = "
+                                   "stricter, more violations)", lo=0.5, hi=10, st=0.25),
+    "detector_min_consec": dict(h="Consecutive per-detector violations required before a reason fires "
+                                  "(1 = fire on the first, higher needs a sustained streak)", lo=1, hi=10),
+    "sybil_min_certs": dict(h="Distinct co-located certs (same cell + heading) before sybilCoLocation "
+                              "reaches its firing score of 1.0 (lower fires more readily)", lo=2, hi=20),
+    "sybil_cell_m": dict(h="Sybil co-location cell size: certs are binned to this grid; smaller demands "
+                           "tighter co-location to flag", lo=0.5, hi=20, st=0.5, u="m"),
     # Radio
     "radio_range_m": dict(h="Vehicle reception range", lo=10, hi=2000, u="m"),
     "radio_model": dict(h="Reachability model: disc (hard range) | logdistance (soft path-loss + shadowing)"),
@@ -1158,6 +1254,10 @@ _FIELD_META = {
                                lo=0, hi=12, st=0.5, u="dB"),
     "rx_sensitivity_margin_db": dict(h="Sensitivity margin dB: + shrinks / - extends range (logdistance only)",
                                      lo=-20, hi=20, st=0.5, u="dB"),
+    "radio_cap_sigma": dict(h="logdistance candidate-window cap headroom in shadow standard deviations "
+                              "(disc ignores it)", lo=0.5, hi=12, st=0.5),
+    "radio_cap_max_mult": dict(h="logdistance hard ceiling on candidate cap / range, bounding the cell "
+                                 "search (disc ignores it)", lo=1, hi=20, st=0.5),
     "packet_loss_base": dict(h="Baseline per-message packet loss", lo=0, hi=1, st=0.01),
     "nlos_loss": dict(h="Distance-growing obstruction (NLOS) loss", lo=0, hi=1, st=0.05),
     "chan_capacity": dict(h="In-range CAMs/step before congestion loss", lo=1),
@@ -1293,9 +1393,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     _denm_enabled = cfg.denm_rate > 0 or _fakehazard_enabled
     # per-step emission probabilities (rate/100s -> per-step); benign uses denm_rate, a FakeHazard
     # attacker falls back to a fixed rate when denm_rate==0 so the attack is never a silent no-op.
-    _denm_p = cfg.denm_rate * cfg.dt / DENM_RATE_WINDOW_S
-    _denm_fake_p = ((cfg.denm_rate if cfg.denm_rate > 0 else DENM_FAKE_FALLBACK_RATE)
-                    * cfg.dt / DENM_RATE_WINDOW_S)
+    _denm_p = cfg.denm_rate * cfg.dt / cfg.denm_rate_window_s
+    _denm_fake_p = ((cfg.denm_rate if cfg.denm_rate > 0 else cfg.denm_fake_fallback_rate)
+                    * cfg.dt / cfg.denm_rate_window_s)
     total_time = cfg.n_steps * cfg.dt
     net = None
     if cfg.road_network == "grid":
@@ -1433,7 +1533,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             linkage_ctx=ctx, i_period=p0["i"], j_index=p0["j"], request_hash=req_hash,
             direction=(vr.random() - 0.5) * 0.5,
             wander_amp=vr.random() * 1.5, wander_w=0.15 + vr.random() * 0.25,
-            phase=vr.random() * 6.283, gps_q=0.5 + vr.expovariate(1.2),
+            phase=vr.random() * 6.283, gps_q=cfg.gps_quality_floor + vr.expovariate(cfg.gps_quality_lambda),
             is_faulty=is_flt, attack_type=atype, pseudonyms=pseudonyms, colluder=is_coll,
             spawn_time=spawn_time, finish_time=finish_time, trip=trip)
         v.veh_type, v.veh_length = vtype, tp["length"]
@@ -1526,7 +1626,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             i_period=0, j_index=j0, request_hash=req_hash,
             direction=vr.random() * 6.283, wander_amp=0.5 + vr.random(),
             wander_w=0.1 + vr.random() * 0.2, phase=vr.random() * 6.283,
-            gps_q=0.5 + vr.expovariate(1.2), is_faulty=False, attack_type="none",
+            gps_q=cfg.gps_quality_floor + vr.expovariate(cfg.gps_quality_lambda), is_faulty=False, attack_type="none",
             pseudonyms=pseudonyms, colluder=False, spawn_time=spawn_time,
             finish_time=(spawn_time + life if cfg.traffic_flow else None), trip=None)
         v.is_vru = True
@@ -1836,8 +1936,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # back. It is caught by the denmPlausibility detector.
         return cx, cy, cs, ch
 
-    Z = 3.0                     # residual must exceed ~3x the broadcast uncertainty to count
-    MIN_CONSEC = 2              # consecutive violations required before a reason fires
+    Z = cfg.detector_z_threshold        # residual must exceed ~this x the broadcast uncertainty to count
+    MIN_CONSEC = cfg.detector_min_consec  # consecutive violations required before a reason fires
 
     def detectors(ref, cx, cy, cs, ch, t, conf) -> dict:
         """Confidence-normalized residuals (detnorm ~1 at the firing threshold). A single GNSS
@@ -1952,7 +2052,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         ev_x, ev_y, ev_spd = b_cam["cx"], b_cam["cy"], b_cam["cs"]
         # MA-visible plausibility of a brake/stationary hazard from the sender's OWN claimed speed:
         # a real (slow/stopped) sender scores < 1; a phantom hazard from a cruising sender scores > 1.
-        plaus = max(0.0, ev_spd) / DENM_IMPLAUSIBLE_SPEED_MPS
+        plaus = max(0.0, ev_spd) / cfg.denm_implausible_speed_mps
         broadcasts.append(dict(
             veh=tx, digest=b_cam["digest"], cx=ev_x, cy=ev_y, cs=ev_spd, ch=b_cam["ch"],
             conf=b_cam["conf"], ghost=False, x=b_cam["x"], y=b_cam["y"], falsified=(not real),
@@ -2456,8 +2556,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     _denm_prev_v[tx.vid] = tspeed
                     decel = ((prev - tspeed) / cfg.dt) if prev is not None else 0.0
                     stationary = tspeed < 0.5
-                    hard_brake = (decel >= DENM_DECEL_TRIG_MPS2
-                                  and tspeed <= DENM_BENIGN_MAX_SPEED_MPS)
+                    hard_brake = (decel >= cfg.denm_decel_trig_mps2
+                                  and tspeed <= cfg.denm_benign_max_speed_mps)
                     if (stationary or hard_brake) and dr.random() < _denm_p:
                         emit_denm(tx, b_cam, real=True,
                                   event_type=("stationaryVehicle" if stationary
@@ -2490,7 +2590,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # sybil co-location: distinct certs at nearly the same point AND heading. Keying on heading
         # too means crossing traffic converging at an intersection (different headings) is not
         # mistaken for a Sybil (whose ghosts copy the attacker's single position + heading).
-        cells = Counter((round(b["cx"] / _CELL_M), round(b["cy"] / _CELL_M), int(b["ch"] // 45) % 8)
+        cells = Counter((round(b["cx"] / cfg.sybil_cell_m), round(b["cy"] / cfg.sybil_cell_m),
+                         int(b["ch"] // 45) % 8)
                         for b in broadcasts if b.get("msg_type") != "denm")
 
         # DETECTION pass (receiver-outer): a receiver only hears in-range transmitters, with
@@ -2529,10 +2630,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 # a favourable shadow can pull a link past rr: widen the candidate window to the cap
                 # distance (mean signal RADIO_CAP_SIGMA shadow-std below sensitivity), bounded so the
                 # search stays O(local). A - margin (range-extending) widens it further.
-                cap = rr * 10.0 ** ((RADIO_CAP_SIGMA * cfg.shadowing_sigma_db
+                cap = rr * 10.0 ** ((cfg.radio_cap_sigma * cfg.shadowing_sigma_db
                                      - min(0.0, cfg.rx_sensitivity_margin_db))
                                     / (10.0 * cfg.pathloss_exponent))
-                cap = max(rr, min(cap, rr * RADIO_CAP_MAX_MULT))
+                cap = max(rr, min(cap, rr * cfg.radio_cap_max_mult))
                 rad = max(1, int(math.ceil(cap / rng_cell)))
             else:
                 rad = max(1, int(math.ceil(rr / rng_cell)))
@@ -2591,9 +2692,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                         # 6 m/s line -- closing the slow-in-congestion phantom-brake gap. A stationary/
                         # other hazard keeps the generic bound. Benign DENMs (brake speed <= the benign
                         # max with margin, stationary < 0.5) stay below their bound -> never flagged.
-                        thresh = (DENM_BRAKE_IMPLAUSIBLE_SPEED_MPS
+                        thresh = (cfg.denm_benign_max_speed_mps + 0.5  # brake bound DERIVED just above benign
                                   if b.get("event_type") == "emergencyElectronicBrakeLight"
-                                  else DENM_IMPLAUSIBLE_SPEED_MPS)
+                                  else cfg.denm_implausible_speed_mps)
                         score = denm_speed / thresh
                         if score >= 1.0 and rng.random() <= cfg.report_prob:
                             det = {k: 0.0 for k in DET_KEYS}
@@ -2636,8 +2737,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     while len(h) > 1 and t - h[0][4] > cfg.detector_lag_s + 2 * cfg.dt:
                         h.pop(0)
                 # radio-dependent detectors (need the receiver position + per-message metadata)
-                det["sybilCoLocation"] = cells[(round(cx / _CELL_M), round(cy / _CELL_M),
-                                                int(ch // 45) % 8)] / _SYBIL_MIN
+                det["sybilCoLocation"] = cells[(round(cx / cfg.sybil_cell_m), round(cy / cfg.sybil_cell_m),
+                                                int(ch // 45) % 8)] / cfg.sybil_min_certs
                 # a receiver only physically hears in-range transmitters, so a claim placing the
                 # sender far BEYOND THIS RECEIVER'S range is implausible (excess distance / tolerance).
                 # Use rr (the actual per-receiver range used for reception above), not the global
@@ -2696,9 +2797,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     #       scales with the VRU's own GNSS noise) PLUS a full multipath-outlier magnitude,
                     #       so GNSS jitter/outliers on a real VRU can NEVER push a genuine VRU to fire.
                     if "vruImpersonation" in DET_KEYS:
-                        speed_arm = max(0.0, cs) / VRU_MAX_PLAUSIBLE_SPEED_MPS
+                        speed_arm = max(0.0, cs) / cfg.vru_max_plausible_speed_mps
                         dtt_v = max(cfg.dt, t - ref[4])
-                        vru_allow = (VRU_MAX_PLAUSIBLE_SPEED_MPS * dtt_v
+                        vru_allow = (cfg.vru_max_plausible_speed_mps * dtt_v
                                      + Z * max(conf, 0.5 * cfg.consistency_threshold_m)
                                      + cfg.gps_outlier_mag_m)
                         jump_arm = math.hypot(cx - ref[0], cy - ref[1]) / max(1e-6, vru_allow)
@@ -2754,7 +2855,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 # structural zeros (the collusion "oracle" the varied score/conf did NOT remove). Fill
                 # them from the SAME formulas genuine reports use with plausible inputs, kept below
                 # each detector's fire threshold so positionSpeedInconsistency stays the fired reason.
-                det["sybilCoLocation"] = cfab.randint(1, 2) / _SYBIL_MIN
+                det["sybilCoLocation"] = cfab.randint(1, 2) / cfg.sybil_min_certs
                 det["beaconFrequency"] = cfab.randint(1, 3) / cfg.freq_max
                 det["staleOrReplay"] = cfab.uniform(0.0, 0.15)
                 fab_conf = cfab.uniform(2.0, 9.0)
@@ -2977,6 +3078,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--collude-pct", type=float, default=0.0, help="fraction of attackers that false-report")
     p.add_argument("--victim-pct", type=float, default=0.10, help="fraction of benign vehicles targeted")
     p.add_argument("--sybil-ghosts", type=int, default=6, help="ghost identities a Sybil attacker fakes")
+    p.add_argument("--detector-z-threshold", type=float, default=3.0,
+                   help="motion-residual firing point in broadcast-uncertainty sigmas (lower=stricter)")
+    p.add_argument("--detector-min-consec", type=int, default=2,
+                   help="consecutive per-detector violations before a reason fires (1=fire on first)")
+    p.add_argument("--sybil-min-certs", type=int, default=_SYBIL_MIN,
+                   help="distinct co-located certs before sybilCoLocation fires (lower=fires readily)")
+    p.add_argument("--sybil-cell-m", type=float, default=_CELL_M,
+                   help="sybil co-location cell size (m); smaller demands tighter co-location")
     p.add_argument("--crl-aware-pct", type=float, default=0.0,
                    help="fraction of attackers that watch the public CRL and go dormant after a bust")
     p.add_argument("--crl-dormant-s", type=float, default=45.0,
@@ -2994,6 +3103,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="log-normal shadowing std in dB; 0 = near-hard cutoff (logdistance only)")
     p.add_argument("--rx-sensitivity-margin-db", type=float, default=0.0,
                    help="sensitivity margin dB: + shrinks / - extends range (logdistance only)")
+    p.add_argument("--radio-cap-sigma", type=float, default=RADIO_CAP_SIGMA,
+                   help="logdistance candidate-cap headroom in shadow std devs (disc ignores it)")
+    p.add_argument("--radio-cap-max-mult", type=float, default=RADIO_CAP_MAX_MULT,
+                   help="logdistance hard ceiling on candidate cap / range (disc ignores it)")
     # long-running traffic flow
     p.add_argument("--flow", action="store_true", help="traffic-flow mode: vehicles spawn/despawn over time")
     p.add_argument("--duration", type=float, default=0.0, help="flow: sim length in seconds")
@@ -3062,6 +3175,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="yield to conflicting cross-traffic at UNSIGNALIZED intersections (first-come "
                         "priority; needs --flow + a routed network; realistic slowing at junctions)")
     p.add_argument("--gps-jam-rate", type=float, default=0.0, help="per-step prob a benign vehicle loses GNSS fix")
+    p.add_argument("--gps-quality-floor", type=float, default=0.5,
+                   help="best-case per-vehicle GNSS quality (noise-scale floor; higher=worse mean error)")
+    p.add_argument("--gps-quality-lambda", type=float, default=1.2,
+                   help="rate of the exponential per-vehicle GNSS-quality tail (smaller=heavier tail)")
     p.add_argument("--max-total-vehicles", type=int, default=0, help="flow: cap total spawns (0=unlimited)")
     p.add_argument("--vru-pct", type=float, default=0.0,
                    help="fraction of spawned actors that are VRUs (pedestrians/cyclists; benign, "
@@ -3070,6 +3187,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--denm-rate", type=float, default=0.0,
                    help="benign event-message (DENM) rate: DENMs/veh/100s from a real trigger (0=off, "
                         "byte-identical). FakeHazard emits phantom DENMs regardless of this rate.")
+    p.add_argument("--denm-rate-window-s", type=float, default=DENM_RATE_WINDOW_S,
+                   help="window (s) the DENM rate is expressed per (rate normalizer)")
+    p.add_argument("--denm-fake-fallback-rate", type=float, default=DENM_FAKE_FALLBACK_RATE,
+                   help="phantom DENMs/attacker/window a FakeHazard emits when denm-rate==0")
+    p.add_argument("--denm-benign-max-speed", type=float, default=DENM_BENIGN_MAX_SPEED_MPS,
+                   help="benign DENM trigger: sender speed at/below this (m/s); base of brake bound +0.5")
+    p.add_argument("--denm-decel-trig", type=float, default=DENM_DECEL_TRIG_MPS2,
+                   help="hard-decel magnitude (m/s^2) that arms a benign brake DENM")
+    p.add_argument("--denm-implausible-speed", type=float, default=DENM_IMPLAUSIBLE_SPEED_MPS,
+                   help="denmPlausibility generic bound: fires above this claimed speed (m/s; lower=more flags)")
+    p.add_argument("--vru-max-plausible-speed", type=float, default=VRU_MAX_PLAUSIBLE_SPEED_MPS,
+                   help="a vru-declaring beacon claiming >= this speed (m/s) is a vehicle impersonating a VRU")
     p.add_argument("--featurize", action="store_true", help="build ML tables after generation")
     p.add_argument("--grid-h", type=int, default=0, help="grid height (0 = square, = --grid)")
     p.add_argument("--config", default=None,
@@ -3163,7 +3292,21 @@ def main(argv: Optional[list[str]] = None) -> int:
                          gps_jam_rate=args.gps_jam_rate,
                          max_total_vehicles=args.max_total_vehicles,
                          vru_pct=args.vru_pct, vru_speed_mps=args.vru_speed,
-                         denm_rate=args.denm_rate, verbose=True,
+                         vru_max_plausible_speed_mps=args.vru_max_plausible_speed,
+                         denm_rate=args.denm_rate,
+                         denm_rate_window_s=args.denm_rate_window_s,
+                         denm_fake_fallback_rate=args.denm_fake_fallback_rate,
+                         denm_benign_max_speed_mps=args.denm_benign_max_speed,
+                         denm_decel_trig_mps2=args.denm_decel_trig,
+                         denm_implausible_speed_mps=args.denm_implausible_speed,
+                         detector_z_threshold=args.detector_z_threshold,
+                         detector_min_consec=args.detector_min_consec,
+                         sybil_min_certs=args.sybil_min_certs, sybil_cell_m=args.sybil_cell_m,
+                         gps_quality_floor=args.gps_quality_floor,
+                         gps_quality_lambda=args.gps_quality_lambda,
+                         radio_cap_sigma=args.radio_cap_sigma,
+                         radio_cap_max_mult=args.radio_cap_max_mult,
+                         verbose=True,
                          out_dir=(args.out or "datasets/poc_run"))
     res = run_pipeline(cfg)
     _emit_result(res, args.featurize)
