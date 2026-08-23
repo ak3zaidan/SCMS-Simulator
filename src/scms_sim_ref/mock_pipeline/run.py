@@ -190,12 +190,22 @@ def _parse_attack_mix(s: str) -> dict | None:
     return {n: parsed[n] for n in KNOWN_ATTACK_TYPES if n in parsed}   # canonical order
 
 
+# Attack types whose falsification has NO amplitude to scale: ConstPos freezes to first-seen position,
+# ReversedHeading is a fixed 180-degree flip, DataReplay replays real past state (the lie is staleness),
+# and VruImpersonation/FakeHazard broadcast HONEST CAMs (they falsify a declared flag / emit phantom
+# DENMs, not a magnitude). attack_magnitude_scale is meaningless for these -> reject it rather than
+# silently no-op, so the control is honest.
+_UNSCALABLE_MAGNITUDE_TYPES = frozenset({
+    "ConstPos", "ReversedHeading", "DataReplay", "VruImpersonation", "FakeHazard"})
+
+
 def _parse_magnitude_scale(s: str) -> dict[str, float]:
-    """Parse 'RandomPos:2.0,ConstPosOffset:0.5' -> {type: scale}: a per-type multiplier on that type's
-    falsification magnitude (applied ON TOP of the global attack_intensity dial). Empty/blank -> {}
-    (every type scale 1.0 -> byte-identical). Mirrors _parse_attack_mix: each name must be a known
-    attack type and each scale a float; raises ValueError on a bad name/value. Unlike a mix WEIGHT
-    (which must be > 0), a scale of exactly 0 is allowed -- it silences that type's falsification."""
+    """Parse 'RandomPos:2.0,ConstPosOffset:0.5' -> {type: scale}: a per-type POSITIVE multiplier on that
+    type's falsification magnitude (applied ON TOP of the global attack_intensity dial). Empty/blank ->
+    {} (every type scale 1.0 -> byte-identical). Mirrors _parse_attack_mix: each name must be a known,
+    magnitude-bearing attack type and each scale a float > 0; raises ValueError on a bad name/value.
+    To DROP a type entirely use attack_types/attack_mix, not a scale of 0 (a 0-magnitude attacker would
+    be labelled an attacker yet emit no falsification -> mislabelled ground truth)."""
     if not s or not s.strip():
         return {}
     parsed = {}
@@ -204,9 +214,13 @@ def _parse_magnitude_scale(s: str) -> dict[str, float]:
         name = name.strip()
         if name not in KNOWN_ATTACK_TYPES:
             raise ValueError(f"attack_magnitude_scale has unknown type {name!r}")
+        if name in _UNSCALABLE_MAGNITUDE_TYPES:
+            raise ValueError(f"attack_magnitude_scale cannot scale {name!r}: it has no falsification "
+                             f"magnitude (fixed/honest). Scalable types only.")
         val = float(sc)
-        if val < 0:
-            raise ValueError(f"attack_magnitude_scale for {name!r} must be >= 0 (got {val})")
+        if val <= 0:
+            raise ValueError(f"attack_magnitude_scale for {name!r} must be > 0 (got {val}); "
+                             f"to drop a type use attack_types/attack_mix, not a 0 scale")
         parsed[name] = val
     if not parsed:
         raise ValueError(f"attack_magnitude_scale parsed to nothing: {s!r}")
@@ -992,6 +1006,12 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"vru_pct must be < 1.0 (it is a fraction of actors; got {cfg.vru_pct})")
     if cfg.vru_pct > 0 and cfg.vru_speed_mps <= 0:      # VRUs must actually move (walking/cycling)
         raise ValueError(f"vru_speed_mps must be > 0 when vru_pct > 0 (got {cfg.vru_speed_mps})")
+    if cfg.vru_pct > 0 and cfg.vru_speed_mps >= cfg.vru_max_plausible_speed_mps:
+        # genuine VRUs declare station_type=vru; the vruImpersonation SPEED arm fires at
+        # claimed speed >= vru_max_plausible_speed_mps, so a VRU travelling at/above that bound would
+        # flag ITSELF every step -> false revocation of benign actors. Keep VRU speed below the bound.
+        raise ValueError(f"vru_speed_mps ({cfg.vru_speed_mps}) must be < vru_max_plausible_speed_mps "
+                         f"({cfg.vru_max_plausible_speed_mps}) or genuine VRUs self-flag as impersonators")
     if cfg.denm_rate < 0:                                # DENMs/veh/100s (a rate, not a probability)
         raise ValueError(f"denm_rate must be >= 0 (got {cfg.denm_rate})")
     # DENM / VRU thresholds (defaults reproduce the historic module constants)
@@ -1005,20 +1025,27 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"denm_decel_trig_mps2 must be > 0 (got {cfg.denm_decel_trig_mps2})")
     if cfg.denm_implausible_speed_mps <= 0:
         raise ValueError(f"denm_implausible_speed_mps must be > 0 (got {cfg.denm_implausible_speed_mps})")
+    if cfg.denm_benign_max_speed_mps >= cfg.denm_implausible_speed_mps:
+        # the benign DENM trigger must sit BELOW the implausibility line, else a benign (slow) sender
+        # crosses its own detector, and raising benign_max above attacker cruising speed hides FakeHazard.
+        raise ValueError(f"denm_benign_max_speed_mps ({cfg.denm_benign_max_speed_mps}) must be < "
+                         f"denm_implausible_speed_mps ({cfg.denm_implausible_speed_mps})")
     if cfg.vru_max_plausible_speed_mps <= 0:
         raise ValueError(f"vru_max_plausible_speed_mps must be > 0 (got {cfg.vru_max_plausible_speed_mps})")
-    # detector operating point (strictness of the motion + Sybil detectors)
-    if cfg.detector_z_threshold <= 0:
-        raise ValueError(f"detector_z_threshold must be > 0 (got {cfg.detector_z_threshold})")
-    if cfg.detector_min_consec < 1:
-        raise ValueError(f"detector_min_consec must be >= 1 (got {cfg.detector_min_consec})")
+    # detector operating point (strictness of the motion + Sybil detectors). Upper bounds are generous
+    # -- they only reject values so extreme the run is degenerate (nothing ever fires / everything does).
+    if not (0 < cfg.detector_z_threshold <= 50):
+        raise ValueError(f"detector_z_threshold must be in (0, 50] (got {cfg.detector_z_threshold})")
+    if not (1 <= cfg.detector_min_consec <= 100):
+        raise ValueError(f"detector_min_consec must be in [1, 100] (got {cfg.detector_min_consec})")
     if cfg.sybil_min_certs < 2:
         raise ValueError(f"sybil_min_certs must be >= 2 (got {cfg.sybil_min_certs})")
     if cfg.sybil_cell_m <= 0:
         raise ValueError(f"sybil_cell_m must be > 0 (got {cfg.sybil_cell_m})")
-    # per-vehicle GNSS quality spread
-    if cfg.gps_quality_floor < 0:
-        raise ValueError(f"gps_quality_floor must be >= 0 (got {cfg.gps_quality_floor})")
+    # per-vehicle GNSS quality spread. Cap the floor: a huge floor makes EVERY benign vehicle read as
+    # an attacker (mass false positives) -- reject the degenerate regime rather than emit a misleading set.
+    if not (0 <= cfg.gps_quality_floor <= 20):
+        raise ValueError(f"gps_quality_floor must be in [0, 20] (got {cfg.gps_quality_floor})")
     if cfg.gps_quality_lambda <= 0:
         raise ValueError(f"gps_quality_lambda must be > 0 (got {cfg.gps_quality_lambda})")
     if cfg.road_network not in ("linear", "grid", "ring", "spider", "custom"):

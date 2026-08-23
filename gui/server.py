@@ -220,8 +220,9 @@ CONFIG_SPEC = [
      "default": 0.0, "step": 0.05, "min": 0, "max": 0.9, "gen": "python-flow", "arg": "--vru-pct",
      "help": "fraction of spawned actors that are VRUs (pedestrians/cyclists; 0 = none, byte-identical)"},
     {"group": "Traffic", "name": "pf_vru_speed", "label": "VRU speed (m/s)", "type": "float",
-     "default": 1.8, "step": 0.1, "min": 0.1, "max": 15, "gen": "python-flow", "arg": "--vru-speed",
-     "help": "VRU travel speed (~1.4 walk .. ~5 cycle); must be > 0 when VRU fraction > 0"},
+     "default": 1.8, "step": 0.1, "min": 0.1, "max": 9.5, "gen": "python-flow", "arg": "--vru-speed",
+     "help": "VRU travel speed (~1.4 walk .. ~5 cycle); must be > 0 and BELOW the VRU max-plausible "
+             "speed (default 10) or genuine VRUs self-flag as impersonators"},
     {"group": "Traffic", "name": "pf_denm_rate", "label": "DENM rate (per veh / 100s)", "type": "float",
      "default": 0.0, "step": 5.0, "min": 0, "max": 200, "gen": "python-flow", "arg": "--denm-rate",
      "help": "event-message (DENM) emission rate; 0 = off (byte-identical). Enables benign hazard "

@@ -156,8 +156,14 @@ def test_parse_magnitude_scale_basics():
     parsed = _parse_magnitude_scale("RandomPos:2.0,ConstPosOffset:0.5")
     assert parsed == {"ConstPosOffset": 0.5, "RandomPos": 2.0}
     assert list(parsed) == ["ConstPosOffset", "RandomPos"]
-    # a scale of exactly 0 is allowed (silences that type's falsification)
-    assert _parse_magnitude_scale("HeadingOffset:0") == {"HeadingOffset": 0.0}
+    # a scale of 0 is REJECTED (a 0-magnitude attacker would be mislabelled ground truth); to drop a
+    # type use attack_types/attack_mix. Scales must be strictly positive.
+    with pytest.raises(ValueError, match="must be > 0"):
+        _parse_magnitude_scale("HeadingOffset:0")
+    # unscalable (fixed/honest) types are rejected rather than silently no-op
+    for t in ("ConstPos", "ReversedHeading", "DataReplay", "VruImpersonation", "FakeHazard"):
+        with pytest.raises(ValueError, match="cannot scale"):
+            _parse_magnitude_scale(f"{t}:2.0")
 
 
 def test_validate_rejects_unknown_type():

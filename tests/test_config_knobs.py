@@ -162,8 +162,11 @@ def test_sybil_cell_larger_fires_sybil_more_readily(tmp_path):
 
 # GROUP 2: VRU / DENM thresholds
 def test_denm_implausible_speed_lower_flags_more_denms(tmp_path):
+    # pin benign_max low so both swept implausible bounds (2 and 15) stay above it (invariant:
+    # denm_benign_max_speed_mps < denm_implausible_speed_mps)
     base = dict(seed=9, traffic_flow=True, road_network="grid", duration_s=60, arrival_rate=1.6,
-                grid_w=5, grid_h=5, attacker_pct=0.3, attack_type="FakeHazard")
+                grid_w=5, grid_h=5, attacker_pct=0.3, attack_type="FakeHazard",
+                denm_benign_max_speed_mps=1.0)
     high = _run(tmp_path, "di15", denm_implausible_speed_mps=15.0, **base)
     low = _run(tmp_path, "di2", denm_implausible_speed_mps=2.0, **base)
     assert high.data_digest != low.data_digest       # the stored plausibility score actually changes
@@ -174,8 +177,11 @@ def test_denm_implausible_speed_lower_flags_more_denms(tmp_path):
 def test_denm_benign_max_speed_lower_fires_brake_plausibility_more(tmp_path):
     """The brake-implausible bound is DERIVED as denm_benign_max_speed_mps + 0.5; lowering it flags
     more phantom brake DENMs (FakeHazard emits emergencyElectronicBrakeLight)."""
+    # pin implausible high so both swept benign_max values (20 and 1) stay below it (invariant:
+    # denm_benign_max_speed_mps < denm_implausible_speed_mps)
     base = dict(seed=9, traffic_flow=True, road_network="grid", duration_s=60, arrival_rate=1.6,
-                grid_w=5, grid_h=5, attacker_pct=0.3, attack_type="FakeHazard")
+                grid_w=5, grid_h=5, attacker_pct=0.3, attack_type="FakeHazard",
+                denm_implausible_speed_mps=25.0)
     high = _reason_counts(_run(tmp_path, "bm20", denm_benign_max_speed_mps=20.0, **base))["denmPlausibility"]
     low = _reason_counts(_run(tmp_path, "bm1", denm_benign_max_speed_mps=1.0, **base))["denmPlausibility"]
     assert low > high
@@ -325,3 +331,37 @@ def test_every_new_cli_flag_parses_and_wires_through(tmp_path):
     }
     for k, v in expected.items():
         assert eff[k] == v, (k, eff.get(k), v)
+
+
+# --------------------------------------------------------------------------- #
+# Guardrails from the configurability consolidation audit: the new knobs must
+# reject config combinations that would silently produce a degenerate dataset.
+# --------------------------------------------------------------------------- #
+import pytest  # noqa: E402
+
+
+def test_vru_speed_must_be_below_max_plausible():
+    """A VRU at/above vru_max_plausible_speed_mps would self-flag as an impersonator every step."""
+    with pytest.raises(ValueError, match="vru_speed_mps"):
+        validate_config(PipelineConfig(traffic_flow=True, vru_pct=0.2, vru_speed_mps=12.0,
+                                       vru_max_plausible_speed_mps=10.0))
+    validate_config(PipelineConfig(traffic_flow=True, vru_pct=0.2, vru_speed_mps=1.8,
+                                   vru_max_plausible_speed_mps=10.0))          # default: fine
+
+
+def test_denm_benign_max_must_be_below_implausible():
+    with pytest.raises(ValueError, match="denm_benign_max_speed_mps"):
+        validate_config(PipelineConfig(denm_benign_max_speed_mps=8.0, denm_implausible_speed_mps=6.0))
+    validate_config(PipelineConfig(denm_benign_max_speed_mps=4.0, denm_implausible_speed_mps=6.0))
+
+
+def test_operating_point_knobs_have_upper_bounds():
+    """Degenerate extremes (nothing ever fires / everything reads as an attacker) are rejected."""
+    with pytest.raises(ValueError, match="detector_min_consec"):
+        validate_config(PipelineConfig(detector_min_consec=500))
+    with pytest.raises(ValueError, match="detector_z_threshold"):
+        validate_config(PipelineConfig(detector_z_threshold=999.0))
+    with pytest.raises(ValueError, match="gps_quality_floor"):
+        validate_config(PipelineConfig(gps_quality_floor=50.0))
+    # sane values still validate
+    validate_config(PipelineConfig(detector_min_consec=3, detector_z_threshold=5.0, gps_quality_floor=1.0))
