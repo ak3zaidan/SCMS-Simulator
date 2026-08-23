@@ -69,13 +69,21 @@ COMBINED_ATTACKS = (
 )
 # The "identity-spoofing" family (VRU-impersonation gap): a moving VEHICLE fraudulently self-declares
 # station_type="vru" on its beacon so a receiver grants it the VRU detector exemptions (off-road +
-# vehicle-kinematic checks) -- while it otherwise drives like a vehicle. It is caught by the
-# vruImpersonation detector (declared VRU + vehicle-grade speed). Like COMBINED_ATTACKS it is OPT-IN
-# ONLY -- excluded from ATTACK_CATALOG (the default round-robin) so the default data_digest is
-# byte-identical -- and produced only when explicitly requested via attack_types / attack_mix /
-# attack_type. featurize._ATTACK_FAMILY folds it into the "identity" family (alongside Sybil).
+# vehicle-kinematic checks) -- while it otherwise drives like a vehicle. Both members declare vru and
+# are caught by the vruImpersonation detector; they differ in which VRU-implausibility they exhibit:
+#   * "VruImpersonation"  -- drives HONESTLY but at VEHICLE speed (claimed speed >= the VRU bound), so
+#     the detector's speed arm fires.
+#   * "VruPositionSpoof"  -- audit GAP #6: CLAIMS a VRU-plausible slow speed (staying UNDER the speed
+#     bound) while TELEPORTING its claimed position, a jump no genuine (slow, smoothly-moving) VRU
+#     could make, so the detector's position-plausibility arm fires. This is the slow-and-falsifying
+#     impersonator that the speed arm alone could not catch.
+# Like COMBINED_ATTACKS the family is OPT-IN ONLY -- excluded from ATTACK_CATALOG (the default
+# round-robin) so the default data_digest is byte-identical -- and produced only when explicitly
+# requested via attack_types / attack_mix / attack_type. featurize._ATTACK_FAMILY folds both into the
+# "identity" family (alongside Sybil).
 IDENTITY_SPOOF_ATTACKS = (
     "VruImpersonation",
+    "VruPositionSpoof",
 )
 # The "event-message" (DENM) family: a DECENTRALIZED EVENT MESSAGE announces a road hazard/event
 # (emergency electronic brake light, stationary vehicle, ...). A "FakeHazard" attacker emits DENMs
@@ -110,6 +118,16 @@ DENM_DECEL_TRIG_MPS2 = 2.5            # ...reached via a hard deceleration of at
 # that announces "I am emergency-braking here" while still moving at vehicle speed contradicts itself.
 # Set above DENM_BENIGN_MAX_SPEED_MPS so benign (slow/stopped) senders stay below the firing line.
 DENM_IMPLAUSIBLE_SPEED_MPS = 6.0
+# Audit GAP #5 event-type cross-check. A GENUINE emergencyElectronicBrakeLight sender has actually
+# braked to a near stop: the benign trigger fires ONLY at speed <= DENM_BENIGN_MAX_SPEED_MPS, and the
+# claimed speed is the (noise-free) true speed -- so a real brake DENM's claimed speed is at most that
+# post-brake bound. A brake DENM whose sender is STILL MOVING NORMALLY (claimed speed above the bound)
+# therefore contradicts the very event it announces, EVEN when it stays under the generic 6 m/s
+# DENM_IMPLAUSIBLE_SPEED_MPS line (the recall gap: a phantom brake from a sender crawling in
+# congestion). This brake-specific bound sits just ABOVE DENM_BENIGN_MAX_SPEED_MPS, so a real brake
+# (<= that bound, with margin) is NEVER flagged while a still-moving phantom is. Only emergency-brake
+# DENMs use it; stationary/other hazards keep the generic bound.
+DENM_BRAKE_IMPLAUSIBLE_SPEED_MPS = DENM_BENIGN_MAX_SPEED_MPS + 0.5
 
 # A self-declared VRU (pedestrian/cyclist) travelling faster than this is not plausibly a VRU -- a fast
 # cyclist / e-bike tops out ~8-10 m/s -- so a beacon that DECLARES vru while moving above it is a
@@ -1261,8 +1279,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     # EITHER genuine VRUs are present (vru_pct>0) OR the opt-in VRU-impersonation attack is selected via
     # any of the attack selectors. When NEITHER holds no beacon ever declares "vru", so gating the
     # station_type field + the extra detector key on this flag keeps the DEFAULT path byte-identical.
-    _impersonation_enabled = ("VruImpersonation" in catalog
-                              or (attack_weights is not None and "VruImpersonation" in attack_weights))
+    _impersonation_enabled = (any(a in catalog for a in IDENTITY_SPOOF_ATTACKS)
+                              or (attack_weights is not None
+                                  and any(a in attack_weights for a in IDENTITY_SPOOF_ATTACKS)))
     _emit_station_type = cfg.vru_pct > 0 or _impersonation_enabled
     # The DENM (event-message) layer is active when benign DENMs are requested (denm_rate>0) OR the
     # opt-in FakeHazard attack is selected via any selector (it emits phantom DENMs even at denm_rate=0,
@@ -1797,6 +1816,18 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     v.frozen = (mx, my)
                 cx, cy = v.frozen
                 cs = 0.8 + 2.0 * k                           # residual > 0.5 so the frozen detector stays live
+        # ---- "identity-spoof" position variant (opt-in; audit GAP #6) ----
+        elif typ == "VruPositionSpoof":
+            # Declares station_type="vru" (set in the broadcast pre-pass) and CLAIMS a VRU-plausible
+            # slow speed -- so the SPEED arm of vruImpersonation (claimed speed >= VRU_MAX_PLAUSIBLE_
+            # SPEED_MPS) never trips and the beacon stays "under the bound" -- while TELEPORTING its
+            # claimed position on a wide circle each step. The per-interval displacement implies a speed
+            # far above any VRU, so the VRU POSITION-plausibility arm of vruImpersonation catches it even
+            # though its claimed speed is slow. The mapOffRoad + vehicle-kinematic detectors are gated
+            # off for a vru-declared beacon, so this arm is what closes the slow-impersonator gap.
+            cs = 2.0                                          # plausible VRU crawl (< the VRU speed bound)
+            ang = 2.0 * t
+            cx, cy = mx + 60.0 * k * math.cos(ang), my + 60.0 * k * math.sin(ang)
         # NOTE: "VruImpersonation" deliberately has NO branch here -- it drives HONESTLY (position/speed/
         # heading are the true values) and falsifies only its self-declared station_type (set to "vru" in
         # the broadcast pre-pass) to steal the VRU detector exemptions. It is caught by vruImpersonation.
@@ -2387,11 +2418,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             else:
                 cx, cy, cs, ch = mx, my, tspeed, theading
             # MA-VISIBLE self-declared station type carried on the beacon. Genuine VRUs always declare
-            # "vru"; a VruImpersonation attacker is a moving VEHICLE that FRAUDULENTLY declares "vru"
-            # while attacking (so a receiver grants it the VRU detector exemptions), driving otherwise
-            # honestly -- the only field it falsifies. Everyone else declares "vehicle".
+            # "vru"; an IDENTITY_SPOOF_ATTACKS attacker is a moving VEHICLE that FRAUDULENTLY declares
+            # "vru" while attacking (so a receiver grants it the VRU detector exemptions) -- either
+            # driving honestly at vehicle speed (VruImpersonation) or falsifying its position while
+            # claiming a slow speed (VruPositionSpoof). Everyone else declares "vehicle".
             declared_station = "vru" if tx.is_vru else "vehicle"
-            if attacking and tx.attack_type == "VruImpersonation":
+            if attacking and tx.attack_type in IDENTITY_SPOOF_ATTACKS:
                 declared_station = "vru"
             tx.hist.append((cx, cy, cs, ch))
             cert_bad = (t > cvt + 1.0) or (t < cvf - 1.0)
@@ -2551,7 +2583,18 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     # real/fake flag, and benign DENMs (low claimed speed) never trip it -> no false
                     # revocations. An unverifiable (bad-sig) DENM carries no trustworthy content -> skip.
                     if b["sig_ok"]:
-                        score = max(0.0, b["cs"]) / DENM_IMPLAUSIBLE_SPEED_MPS
+                        denm_speed = max(0.0, b["cs"])
+                        # Audit GAP #5: the plausibility bound is now EVENT-TYPE aware. An
+                        # emergencyElectronicBrakeLight sender that has truly braked is at/below the
+                        # post-brake bound (DENM_BENIGN_MAX_SPEED_MPS); one still MOVING NORMALLY above
+                        # it announces a brake its own kinematics contradict, EVEN below the generic
+                        # 6 m/s line -- closing the slow-in-congestion phantom-brake gap. A stationary/
+                        # other hazard keeps the generic bound. Benign DENMs (brake speed <= the benign
+                        # max with margin, stationary < 0.5) stay below their bound -> never flagged.
+                        thresh = (DENM_BRAKE_IMPLAUSIBLE_SPEED_MPS
+                                  if b.get("event_type") == "emergencyElectronicBrakeLight"
+                                  else DENM_IMPLAUSIBLE_SPEED_MPS)
+                        score = denm_speed / thresh
                         if score >= 1.0 and rng.random() <= cfg.report_prob:
                             det = {k: 0.0 for k in DET_KEYS}
                             det["denmPlausibility"] = score
@@ -2637,16 +2680,29 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                         det[_mk] = 0.0
                     det["mapOffRoad"] = 0.0
                     # The gate above trusts a SELF-DECLARED field, so a moving VEHICLE that declares
-                    # station_type="vru" (the VruImpersonation attack) would otherwise dodge every
-                    # suppressed detector for free. Close it: a self-declared VRU travelling at VEHICLE
-                    # speed is impersonating a VRU. Fire vruImpersonation on the DECLARED type + the
-                    # CLAIMED speed cs -- a plausible-VRU beacon claims a few m/s, so a claim well above
-                    # the cyclist bound (VRU_MAX_PLAUSIBLE_SPEED_MPS) is a vehicle. cs is the noise-free
-                    # broadcast value (NOT a displacement estimate), so GNSS jitter/outliers on a slow
-                    # genuine VRU never inflate it -> this NEVER fires on real VRUs, while an honest-
-                    # driving impersonator (claiming its true vehicle speed) trips it and is revocable.
+                    # station_type="vru" would otherwise dodge every suppressed detector for free. Close
+                    # it with TWO arms, both keyed on the DECLARED type + MA-VISIBLE claimed kinematics:
+                    #   (1) SPEED arm -- a plausible-VRU beacon claims a few m/s, so a CLAIMED speed
+                    #       above the cyclist bound (VRU_MAX_PLAUSIBLE_SPEED_MPS) is a vehicle. cs is the
+                    #       noise-free broadcast value (NOT a displacement estimate), so GNSS jitter on a
+                    #       slow genuine VRU never inflates it. Catches VruImpersonation (honest driving).
+                    #   (2) POSITION arm (audit GAP #6) -- a genuine VRU moves SMOOTHLY at ~vru speed, so
+                    #       the displacement of its claimed position since the lagged reference implies at
+                    #       most a VRU-grade speed. A declared-VRU whose claimed position JUMPS/teleports
+                    #       implies a speed far above the VRU bound even while it CLAIMS a slow speed (so
+                    #       the speed arm stays quiet). Catches VruPositionSpoof -- the slow-and-position-
+                    #       falsifying impersonator the speed arm alone missed. The tolerance is the VRU
+                    #       speed bound over the interval PLUS the broadcast confidence (Z*conf, which
+                    #       scales with the VRU's own GNSS noise) PLUS a full multipath-outlier magnitude,
+                    #       so GNSS jitter/outliers on a real VRU can NEVER push a genuine VRU to fire.
                     if "vruImpersonation" in DET_KEYS:
-                        det["vruImpersonation"] = max(0.0, cs) / VRU_MAX_PLAUSIBLE_SPEED_MPS
+                        speed_arm = max(0.0, cs) / VRU_MAX_PLAUSIBLE_SPEED_MPS
+                        dtt_v = max(cfg.dt, t - ref[4])
+                        vru_allow = (VRU_MAX_PLAUSIBLE_SPEED_MPS * dtt_v
+                                     + Z * max(conf, 0.5 * cfg.consistency_threshold_m)
+                                     + cfg.gps_outlier_mag_m)
+                        jump_arm = math.hypot(cx - ref[0], cy - ref[1]) / max(1e-6, vru_allow)
+                        det["vruImpersonation"] = max(speed_arm, jump_arm)
                 for k in DET_KEYS:
                     st["streak"][k] = st["streak"].get(k, 0) + 1 if det.get(k, 0.0) >= 1.0 else 0
                 fired = {k: det[k] for k in DET_KEYS if st["streak"].get(k, 0) >= MIN_CONSEC}
