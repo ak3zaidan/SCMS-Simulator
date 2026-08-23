@@ -37,20 +37,21 @@ import numpy as np
 import pandas as pd
 
 # --- SINGLE SOURCE OF TRUTH for the attack family/type space (imported, never hardcoded) ---
-# The engine renders exactly ATTACK_CATALOG (the default round-robin) + COMBINED_ATTACKS (opt-in);
-# featurize._ATTACK_FAMILY maps each base type to its family. We measure coverage against THESE, so
+# KNOWN_ATTACK_TYPES is every renderable type: the default round-robin ATTACK_CATALOG plus every
+# OPT-IN tuple (COMBINED_ATTACKS, IDENTITY_SPOOF_ATTACKS=VruImpersonation, DENM_ATTACKS=FakeHazard).
+# featurize._ATTACK_FAMILY maps each to its family. Measuring coverage against KNOWN_ATTACK_TYPES means
 # the report tracks the code automatically -- add a type/family in run.py and it shows up as a gap.
-from scms_sim_ref.mock_pipeline.run import ATTACK_CATALOG, COMBINED_ATTACKS
+from scms_sim_ref.mock_pipeline.run import ATTACK_CATALOG, KNOWN_ATTACK_TYPES
 from scms_sim_ref.datagen.featurize import _ATTACK_FAMILY
 
-ALL_TYPES: tuple[str, ...] = tuple(ATTACK_CATALOG) + tuple(COMBINED_ATTACKS)   # ~25 renderable types
+ALL_TYPES: tuple[str, ...] = tuple(KNOWN_ATTACK_TYPES)   # every renderable type (catalog + opt-in)
 TYPE_TO_FAMILY: dict[str, str] = {t: _ATTACK_FAMILY.get(t, "other") for t in ALL_TYPES}
 ALL_FAMILIES: tuple[str, ...] = tuple(sorted({TYPE_TO_FAMILY[t] for t in ALL_TYPES}))
-# Families reachable only via the opt-in COMBINED_ATTACKS (i.e. NOT produced by the default catalog):
-# by construction this is the {"combined"} family. Derived, so it never drifts from the code.
+# Families NOT produced by the default catalog (reachable only via an opt-in tuple): combined, the
+# identity-spoof (VruImpersonation) and event (FakeHazard) families. Derived, so it never drifts.
 _CATALOG_FAMILIES = {_ATTACK_FAMILY.get(t, "other") for t in ATTACK_CATALOG}
-_COMBINED_FAMILIES = {_ATTACK_FAMILY.get(t, "other") for t in COMBINED_ATTACKS}
-OPT_IN_FAMILIES: tuple[str, ...] = tuple(sorted(_COMBINED_FAMILIES - _CATALOG_FAMILIES))
+_ALL_FAMILIES_SET = {_ATTACK_FAMILY.get(t, "other") for t in ALL_TYPES}
+OPT_IN_FAMILIES: tuple[str, ...] = tuple(sorted(_ALL_FAMILIES_SET - _CATALOG_FAMILIES))
 BASE_FAMILIES: tuple[str, ...] = tuple(sorted(_CATALOG_FAMILIES))
 
 # --- balance/coverage thresholds (module-level so they are documented + testable) ---

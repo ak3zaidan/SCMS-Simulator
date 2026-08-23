@@ -70,6 +70,8 @@ ATTACK_TYPES = [
     "DataReplay", "DelayedMessages", "OutOfOrder", "DoS", "DoSRandom",
     # identity
     "Sybil", "VruImpersonation",
+    # event / DENM (opt-in; needs the DENM layer active)
+    "FakeHazard",
     # stealth (hard to detect: subtle, plausible, detector-aware falsifications)
     "AlongRoadOffset", "SlowDrift", "LaggingPosition", "Adaptive",
 ]
@@ -220,6 +222,10 @@ CONFIG_SPEC = [
     {"group": "Traffic", "name": "pf_vru_speed", "label": "VRU speed (m/s)", "type": "float",
      "default": 1.8, "step": 0.1, "min": 0.1, "max": 15, "gen": "python-flow", "arg": "--vru-speed",
      "help": "VRU travel speed (~1.4 walk .. ~5 cycle); must be > 0 when VRU fraction > 0"},
+    {"group": "Traffic", "name": "pf_denm_rate", "label": "DENM rate (per veh / 100s)", "type": "float",
+     "default": 0.0, "step": 5.0, "min": 0, "max": 200, "gen": "python-flow", "arg": "--denm-rate",
+     "help": "event-message (DENM) emission rate; 0 = off (byte-identical). Enables benign hazard "
+             "DENMs; pair with the FakeHazard attack for phantom-hazard scenarios"},
     {"group": "Network", "name": "pf_arterial_every", "label": "Arterial spacing (grid)", "type": "int",
      "default": 0, "min": 0, "max": 20, "gen": "python-flow", "arg": "--arterial-every",
      "help": "grid only: every Nth row & column is a faster arterial road (0 = off)"},

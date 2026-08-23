@@ -37,6 +37,8 @@ FORBIDDEN_FEATURE_KEYS = frozenset({
     "true_x", "true_y", "true_speed", "true_heading", "true_accel",
     "is_attacker", "attacker_role", "attack_type", "attack_id",
     "is_faulty", "attack_family", "falsified",  # fault/attack labels (added post-audit)
+    "is_vru", "is_fake",                         # VRU / DENM oracle labels (exact-match only, so the
+                                                 # MA-visible feature is_vru_declared is NOT caught)
     "colluding_group_id", "true_linkage_seed", "true_revocation_time",
     "should_have_been_revoked", "report_correctness",
 })

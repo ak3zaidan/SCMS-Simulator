@@ -112,11 +112,11 @@ def _imbalanced_corpus(root):
 # family/type space is sourced from code (sanity on the imported single source of truth)
 # --------------------------------------------------------------------------------------------------
 def test_family_type_space_is_from_code():
-    # ~25 renderable types, 8 families (7 base + the opt-in "combined")
+    # every renderable type: catalog + opt-in (combined + VruImpersonation + FakeHazard) => 27 / 9 fam.
     assert len(ALL_TYPES) >= 24
-    assert "combined" in ALL_FAMILIES
-    assert OPT_IN_FAMILIES == ("combined",)
-    assert len(ALL_FAMILIES) == 8
+    assert "combined" in ALL_FAMILIES and "event" in ALL_FAMILIES
+    assert OPT_IN_FAMILIES == ("combined", "event")   # families reachable only via an opt-in tuple
+    assert len(ALL_FAMILIES) == 9
     assert TYPE_TO_FAMILY["ConstPos"] == "position"
     assert TYPE_TO_FAMILY["Sybil"] == "identity"
     # every combined attack maps to the opt-in family
@@ -131,12 +131,14 @@ def test_class_balance_ratios(tmp_path):
     root = _balanced_corpus(str(tmp_path / "balanced"))
     rep = build_report(root)
     vb = rep["class_balance"]["vehicle"]
-    assert vb["total"] == 90
-    assert (vb["benign"], vb["attacker"], vb["faulty"]) == (60, 24, 6)
-    assert vb["attacker_frac"] == round(24 / 90, 4)
-    assert vb["faulty_frac"] == round(6 / 90, 4)
-    assert vb["attacker_benign_ratio"] == round(24 / 60, 4)
-    # report-level: 27 attacker reports of 90
+    n_att = 3 * len(ALL_FAMILIES)               # 3 attackers per family (derives from the code space)
+    total = 60 + 6 + n_att
+    assert vb["total"] == total
+    assert (vb["benign"], vb["attacker"], vb["faulty"]) == (60, n_att, 6)
+    assert vb["attacker_frac"] == round(n_att / total, 4)
+    assert vb["faulty_frac"] == round(6 / total, 4)
+    assert vb["attacker_benign_ratio"] == round(n_att / 60, 4)
+    # report-level attacker labels are family-independent (9 of 30 per domain -> 27 of 90)
     rl = rep["class_balance"]["report"]
     assert rl["total"] == 90 and rl["attacker"] == 27
 
@@ -236,7 +238,7 @@ def test_size_section(tmp_path):
     rep = build_report(root)
     sz = rep["size"]
     assert sz["n_domains"] == 3
-    assert sz["row_counts"]["vehicle_labels"] == 90
+    assert sz["row_counts"]["vehicle_labels"] == 60 + 6 + 3 * len(ALL_FAMILIES)
     # even per-domain rows -> min == median == max, no dominance warning
     assert sz["per_domain_rows"]["max"] == sz["per_domain_rows"]["min"]
 

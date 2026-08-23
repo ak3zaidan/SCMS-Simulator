@@ -903,6 +903,8 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
     if cfg.trip_speed_min <= 0 or cfg.trip_speed_max < cfg.trip_speed_min:
         raise ValueError(f"need 0 < trip_speed_min <= trip_speed_max "
                          f"(got {cfg.trip_speed_min}, {cfg.trip_speed_max})")
+    if cfg.vru_pct >= 1.0:                              # VRUs are a FRACTION of actors; ratio vru/(1-vru)
+        raise ValueError(f"vru_pct must be < 1.0 (it is a fraction of actors; got {cfg.vru_pct})")
     if cfg.vru_pct > 0 and cfg.vru_speed_mps <= 0:      # VRUs must actually move (walking/cycling)
         raise ValueError(f"vru_speed_mps must be > 0 when vru_pct > 0 (got {cfg.vru_speed_mps})")
     if cfg.denm_rate < 0:                                # DENMs/veh/100s (a rate, not a probability)
