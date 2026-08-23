@@ -73,7 +73,7 @@ for _fam, _bases in {
     "heading": ["ReversedHeading", "RandomHeading", "PerpendicularHeading", "HeadingOffset"],
     "combined": ["Disruptive", "PosSpeedInconsistent", "PosHeadingInconsistent", "EventualStop"],
     "timing": ["DataReplay", "DelayedMessages", "OutOfOrder", "DoS", "DoSRandom"],
-    "identity": ["Sybil", "VruImpersonation"],
+    "identity": ["Sybil", "VruImpersonation", "VruPositionSpoof"],
     "event": ["FakeHazard"],
     "stealth": ["AlongRoadOffset", "SlowDrift", "LaggingPosition"],
     "credential": ["InvalidSignature", "ExpiredCert", "NotYetValid"],
