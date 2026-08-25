@@ -17,6 +17,7 @@ import math
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -93,17 +94,39 @@ def openai_model() -> str:
     return load_env().get("OPENAI_MODEL") or os.environ.get("OPENAI_MODEL") or DEFAULT_MODEL
 
 
-def openai_chat(messages: list, tools: list | None, model: str, key: str, timeout: float = 90.0) -> dict:
-    """One Chat Completions call. Returns the assistant message dict (may carry tool_calls)."""
-    body = {"model": model, "messages": messages, "temperature": 0.2}
-    if tools:
-        body["tools"] = tools
-        body["tool_choice"] = "auto"
+def _openai_post(body: dict, key: str, timeout: float) -> dict:
     req = urllib.request.Request(_OPENAI_URL, data=json.dumps(body).encode("utf-8"),
                                  headers={"Authorization": "Bearer " + key,
                                           "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = json.loads(r.read())
+        return json.loads(r.read())
+
+
+def openai_chat(messages: list, tools: list | None, model: str, key: str, timeout: float = 90.0) -> dict:
+    """One Chat Completions call. Returns the assistant message dict (may carry tool_calls).
+
+    Model-agnostic: some newer tiers (reasoning / 'pro' models) reject a non-default ``temperature`` or
+    an ``unsupported_value`` on it. On a 400 that names ``temperature`` we retry once WITHOUT it, so the
+    copilot works across gpt-4o-mini .. gpt-5.x without per-model wiring. Models that accept temperature
+    keep the historic 0.2 (byte-identical request), so nothing changes for them.
+    """
+    body = {"model": model, "messages": messages, "temperature": 0.2}
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+    try:
+        data = _openai_post(body, key, timeout)
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            pass
+        if e.code == 400 and "temperature" in detail and "temperature" in body:
+            body.pop("temperature", None)                # this model wants the default temperature
+            data = _openai_post(body, key, timeout)
+        else:
+            raise
     return data["choices"][0]["message"]
 
 
