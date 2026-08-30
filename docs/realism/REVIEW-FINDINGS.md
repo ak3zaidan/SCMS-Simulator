@@ -117,6 +117,37 @@ Also: `tools/lateral_jump.py` and `realism_bench.py` disagree on the worst resid
 essentially unimproved, versus 6.4169 → 4.5007 m) because they use different heading references, and
 `PROGRESS.md:200` quotes only the more favourable pair.
 
+## Planned fixes (PM design, 2026-08-30)
+
+**C1 + C2 share a root cause and share a fix.** Both invent a parametric null for a quantity we can
+simply *measure*. The seed-to-seed behaviour of this scenario is observable: run K seeds once and
+look at the distribution. So:
+
+- Replace the assumed `Bin(n, ½)` null and the assumed 3 % flow tolerance with an **empirically
+  calibrated null**. Run K ≥ 10 seeds of the scenario, compute the per-station GEH distribution and
+  the network-total spread, take the desired quantile as the threshold, and persist the result as
+  scenario-scoped refdata alongside the seed list and SUMO version used to derive it.
+- This fixes both failures at once: the flow tolerance stops false-alarming (it will be calibrated
+  near the measured 7.1 % spread rather than an assumed 3 %), and the per-station bound regains
+  power (calibrated ≈1.24 at the measured dispersion φ ≈ 0.20, versus the shipped 2.7718 which lets
+  a 2× flow change pass).
+- Keep a documented parametric fallback for scenarios with no calibration on disk, but mark any
+  result produced that way as `uncalibrated` so it can never be quoted as a gate.
+- Add a power check to the test suite: inject a synthetic regression (halve one station's count) and
+  assert the gate **fails**. C2 exists because nothing ever tested that the gate can fail.
+
+**M1** — do not apply the dt mask to the numerator. Add `thin` to the `lat_few` condition at
+`realism_bench.py:1050` so the metric returns `na` on thinned traces, matching headway and FD. Fix
+the value quoted in `PROGRESS.md:274-275`: ground truth is **0.5872**, not 0.0788.
+
+**M2** — decouple `lateral_screen` from the `stable` witness at `realism_bench.py:493`. A step whose
+lateral displacement is large should screen the acceleration sample regardless of whether the
+heading witness was stable, since junctions produce both conditions simultaneously.
+
+**M3** — correct the cornering attribution in `PROGRESS.md:200` and quote both estimators, not the
+more favourable one. Reconcile `tools/lateral_jump.py` with `realism_bench.py` so they use the same
+heading reference.
+
 ## Minor
 
 - `docs/FEATURES.md:144` — still claims "GEH statistic + the four FHWA calibration gates" with no
