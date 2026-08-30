@@ -8,10 +8,18 @@
  * actually receives and reports suspects to the (in-JVM) MA back-end. Detectors:
  *   staleOrReplay, beaconFrequency, acceptanceRangeThreshold, positionJump, sybilCoLocation,
  *   positionSpeedInconsistency, headingInconsistency, constantPositionFrozen.
+ *
+ * Realism components ported from VeReMi-NextGen (EPL-2.0, attribution in the source headers of
+ * org.scms.realism.DriverProfile / org.scms.realism.SensorErrorModel), both opt-in:
+ *   SCMS_DRIVER_PROFILES=1  10/80/10 aggressive/normal/passive driver parameterisation, applied
+ *                           per vehicle via requestVehicleParametersUpdate (keyed on seed+vehicle id)
+ *   SCMS_SENSOR_MODEL=nextgen  correlated GNSS error / relative speed error / speed-decaying heading
+ *                           error on the transmitted CAM (keyed per vehicle, driven by sim time)
+ *   SCMS_PSEUDONYM_POLICY=distance  NextGen's 800-1500 m + 120-360 s pseudonym change, re-based on
+ *                           simulation time (upstream used the wall clock, see ScmsBackend)
  */
 package org.scms.app;
 
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -33,22 +41,17 @@ import org.eclipse.mosaic.lib.util.scheduling.Event;
 
 import org.scms.attacks.AttackLib;
 import org.scms.backend.ScmsBackend;
+import org.scms.realism.DriverProfile;
+import org.scms.realism.SensorErrorModel;
 
 public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         implements VehicleApplication, CommunicationApplication {
 
+    // Detector thresholds live in CamDetector (the suite is shared with the RSU receiver app), and
+    // are re-exported here only so appParams() keeps publishing the same replay-parity key set.
     private static final double CAM_INTERVAL_S = envD("SCMS_CAM_INTERVAL", 1.0);   // ETSI T_GenCamMax
     private static final double CAM_MIN_S = envD("SCMS_CAM_MIN", 0.1);             // ETSI T_GenCamMin
     private static final int FLOOD_BURST = envI("SCMS_FLOOD_BURST", 10);           // DoS msgs per tick
-    private static final double MOVING_SPEED_MS = 5.0;
-    private static final double FROZEN_EPS_M = 0.5;
-    private static final int FROZEN_COUNT = envI("SCMS_FROZEN_COUNT", 3);
-    private static final double ART_MAX_M = envD("SCMS_ART_MAX_M", 1000.0);
-    private static final double STALE_MAX_S = envD("SCMS_STALE_MAX", 5.0);
-    private static final int FREQ_MAX = envI("SCMS_FREQ_MAX", 12);
-    private static final double SPEED_TOL_M = envD("SCMS_SPEED_TOL", 10.0);
-    private static final double HEADING_DIFF = envD("SCMS_HEADING_DIFF", 120.0);
-    private static final int SYBIL_MIN = envI("SCMS_SYBIL_MIN", 5);
     private static final int CHAN_CAPACITY = envI("SCMS_CHAN_CAPACITY", 25);   // CAMs/100ms before congestion loss (0 = off)
     private static final double CHAN_WINDOW_S = 0.1;
     private static final double WEATHER_DROP = weatherDrop();                   // 802.11p attenuation by weather
@@ -83,29 +86,13 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
     private ScmsBackend.Cred cred;
     private double selfX, selfY;
     private boolean haveSelf = false;
+    // On-board sensor chain (VeReMi-NextGen port, opt-in via SCMS_SENSOR_MODEL=nextgen): the vehicle
+    // MEASURES its own state before the CAM is built, so honest beacons carry realistic GNSS/odometry
+    // error instead of SUMO-perfect truth. Seeded per vehicle from the scenario seed.
+    private SensorErrorModel sensors;
+    private static boolean scenarioNoted = false;   // resolve the scenario dir once per JVM
 
-    private static final double MIN_REF_GAP_S = 0.5;   // motion-consistency baseline (rate-independent)
-    private static final double MAX_ACCEL_MS2 = 9.0;   // physical accel/decel bound for plausibility
-    private static final int MIN_CONSEC = envI("SCMS_MIN_CONSEC", 2);   // consecutive violations before flagging
-    private static final double MAX_PLAUSIBLE_ACCEL = envD("SCMS_MAX_ACCEL", 12.0);   // m/s^2 (ETSI/F2MD accel check)
-    private static final double KF_ALPHA = 0.5, KF_BETA = 0.3;                        // alpha-beta tracker gains
-    private static final double KF_THRESH = envD("SCMS_KF_THRESH", 4.0);             // normalized-residual gate
-
-    private static final class Rx {
-        double lastX, lastY, lastT, lastHeading;       // most recent CAM (frequency, sybil, live)
-        double refX, refY, refT, refHeading, refSpeed;  // lagged >=0.5 s reference (motion checks)
-        boolean hasRef = false;
-        int frozenCount;
-        int psiStreak, hdgStreak, kfStreak;    // consecutive motion-inconsistency violations
-        double kfX, kfY, kfVx, kfVy, kfLastT;   // constant-velocity (alpha-beta) tracker state
-        boolean kfInit = false;
-        double winStart;
-        int winCount;
-        boolean hasPrev = false;
-    }
-
-    private final Map<String, Rx> senders = new HashMap<>();
-    private final Map<String, Map<String, Double>> sybilGrid = new HashMap<>();  // cell -> (digest -> lastSeen)
+    private final CamDetector detector = new CamDetector();
     private double chanWinStart = Double.NEGATIVE_INFINITY;
     private int chanCount = 0, chanLoad = 0;      // local channel load (CBR proxy)
     private java.util.Random chanRng;             // deterministic contention-loss RNG
@@ -113,12 +100,94 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
     @Override
     public void onStartup() {
         String id = getOperatingSystem().getId();
-        ScmsBackend.instance().register(id);
-        cred = ScmsBackend.instance().getCredential(id);
+        ScmsBackend backend = ScmsBackend.instance();
+        backend.register(id);
+        cred = backend.getCredential(id);
         myDigest = cred.certDigest;
         chanRng = new java.util.Random(0x9E3779B97F4A7C15L ^ (long) id.hashCode());
+        noteScenario(backend);
+        if ("nextgen".equals(ScmsBackend.SENSOR_MODEL)) {
+            // Weather scales the GNSS/compass error magnitudes exactly as it scales the built-in
+            // model's sigma (SCMS_WEATHER: rain 1.5x, snow 2.0x, fog 2.5x), so the transmitted
+            // position-confidence radius stays consistent with the error actually injected.
+            double w = ScmsBackend.WEATHER_SENSOR_MULT;
+            sensors = new SensorErrorModel(ScmsBackend.streamSeed("sensor", id),
+                    ScmsBackend.SENSOR_POS_ERR_M * w, ScmsBackend.SENSOR_SPEED_ERR,
+                    ScmsBackend.SENSOR_HEAD_ERR_DEG * w, ScmsBackend.SENSOR_POS_SIGMA_FRAC,
+                    ScmsBackend.SENSOR_HEAD_DECAY);
+        }
+        if (ScmsBackend.DRIVER_PROFILES) {
+            applyDriverProfile(backend, id);
+        }
         getOperatingSystem().getAdHocModule().enable(new AdHocModuleConfiguration()
                 .addRadio().channel(AdHocChannel.CCH).power(50).create());
+    }
+
+    /**
+     * VeReMi-NextGen driver heterogeneity (VehicleCamSendingApp.java:72-88, 293-304): 10% aggressive,
+     * 80% normal, 10% passive, re-parameterising SUMO's car-following/lane-change model per vehicle
+     * through MOSAIC's requestVehicleParametersUpdate API.
+     *
+     * <p>Upstream draws the profile from an unseeded {@code new Random()} — different every run.
+     * Here the draw is a pure function of (scenario seed, vehicle id), so the fleet composition is
+     * reproducible and independent of vehicle-spawn ORDER (a wall-clock- and order-free key).
+     */
+    private void applyDriverProfile(ScmsBackend backend, String id) {
+        DriverProfile profile = DriverProfile.pick(ScmsBackend.keyedUniform("driver-profile", id),
+                ScmsBackend.DRIVER_AGGRESSIVE_FRAC, ScmsBackend.DRIVER_PASSIVE_FRAC);
+        backend.noteDriverProfile(id, profile.name());
+        try {
+            getOperatingSystem().requestVehicleParametersUpdate()
+                    .changeReactionTime(profile.getTau())
+                    .changeMaxAcceleration(profile.getAccel())
+                    .changeMaxDeceleration(profile.getDecel())
+                    .changeSpeedFactor(profile.getSpeedFactor())
+                    .changeImperfection(profile.getSigma())
+                    .changeMinimumGap(profile.getMinGap())
+                    .changeLaneChangeMode(profile.getLaneChangeMode())
+                    .changeSpeedMode(profile.getSpeedMode())
+                    .apply();
+        } catch (RuntimeException ex) {
+            // Never let a parameter-update rejection kill the run: the vehicle simply keeps its
+            // prototype dynamics (and the manifest still records which profile it was assigned).
+            getLog().warn("driver profile {} not applied to {}: {}", profile, id, ex.toString());
+        }
+    }
+
+    /** Hand the back-end the scenario directory once, so the manifest can pick up input hashes. */
+    private void noteScenario(ScmsBackend backend) {
+        if (scenarioNoted) {
+            return;
+        }
+        scenarioNoted = true;
+        try {
+            backend.noteScenarioDir(org.eclipse.mosaic.fed.application.ambassador.SimulationKernel
+                    .SimulationKernel.getConfigurationPath());
+        } catch (Throwable ignored) {
+            // best-effort: without it the manifest just omits the inputs section
+        }
+        backend.noteAppParams(appParams());
+    }
+
+    /** App-layer knobs as resolved by THIS run, for manifest.effective_params (replay parity). */
+    private static Map<String, Object> appParams() {
+        Map<String, Object> p = new LinkedHashMap<>();
+        p.put("SCMS_CAM_INTERVAL", CAM_INTERVAL_S);
+        p.put("SCMS_CAM_MIN", CAM_MIN_S);
+        p.put("SCMS_FLOOD_BURST", FLOOD_BURST);
+        p.put("SCMS_FROZEN_COUNT", CamDetector.FROZEN_COUNT);
+        p.put("SCMS_ART_MAX_M", CamDetector.ART_MAX_M);
+        p.put("SCMS_STALE_MAX", CamDetector.STALE_MAX_S);
+        p.put("SCMS_FREQ_MAX", CamDetector.FREQ_MAX);
+        p.put("SCMS_SPEED_TOL", CamDetector.SPEED_TOL_M);
+        p.put("SCMS_HEADING_DIFF", CamDetector.HEADING_DIFF);
+        p.put("SCMS_SYBIL_MIN", CamDetector.SYBIL_MIN);
+        p.put("SCMS_CHAN_CAPACITY", CHAN_CAPACITY);
+        p.put("SCMS_NLOS", NLOS_INTENSITY);
+        p.put("SCMS_MIN_CONSEC", CamDetector.MIN_CONSEC);
+        p.put("SCMS_MAX_ACCEL", CamDetector.MAX_PLAUSIBLE_ACCEL);
+        p.put("SCMS_KF_THRESH", CamDetector.KF_THRESH);
+        return p;
     }
 
     @Override
@@ -162,10 +231,22 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         haveSentBefore = true;
         sendCount++;
         ScmsBackend backend = ScmsBackend.instance();
-        cred = backend.beaconCred(getOperatingSystem().getId(), tNs);   // rotates pseudonym if due
+        // Pseudonym change: period policy (default), or NextGen's distance+time privacy policy, which
+        // needs the odometer. getDistanceDriven() is SUMO's true odometer, and the elapsed-time half
+        // of the criterion runs on SIMULATION time in the back-end (upstream used the wall clock).
+        cred = backend.beaconCred(getOperatingSystem().getId(), tNs, updated.getDistanceDriven());
         myDigest = cred.certDigest;
+        // Sensor chain: the vehicle measures its own state (NextGen SensorErrorModel) BEFORE the
+        // attack layer falsifies anything, and the TRUE state still goes to the back-end, so the
+        // ground-truth tables keep the real trajectory and only the transmitted CAM carries noise.
+        SensorErrorModel.Sample measured = null;
+        if (sensors != null) {
+            Double accel = updated.getLongitudinalAcceleration();
+            measured = sensors.sample(selfX, selfY, updated.getSpeed(), updated.getHeading(),
+                    accel != null ? accel : 0.0, tNs);
+        }
         AttackLib.Claim c = backend.claim(getOperatingSystem().getId(), sendCount,
-                selfX, selfY, updated.getSpeed(), updated.getHeading(), tNs);
+                selfX, selfY, updated.getSpeed(), updated.getHeading(), tNs, measured);
         backend.onCamSent(cred.certDigest, tS);
         send(backend, cred.certDigest, c.x, c.y, c.speed, c.heading, c.posConf, c.genTimeNs);
         if (c.flood) {   // DoS: emit a burst so receivers/channel actually see flooding
@@ -207,16 +288,26 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
             return;
         }
         double t = getOperatingSystem().getSimulationTime() / 1e9;
+        ScmsBackend backend = ScmsBackend.instance();
         // Weather (rain/fog/snow) attenuates the 802.11p link — a fraction of frames are lost.
         if (WEATHER_DROP > 0 && chanRng.nextDouble() < WEATHER_DROP) {
             return;
         }
         // NLOS: buildings obstruct more-distant links in urban areas — loss grows with distance.
+        // The obstruction is a property of the PHYSICAL link, so the geometry must come from the
+        // TRUE sender position (back-end ORACLE), never from cam.claimedX/Y: a position-falsifying
+        // attacker claiming a far-away location would otherwise drive its OWN reception probability
+        // — inventing packet loss that the radio never applied, and (for a ghost claiming to be
+        // nearby) making Sybil frames MORE reliable than honest ones. Ground truth is consumed here
+        // for channel physics only; nothing derived from it reaches a report or an MA-visible field.
         if (NLOS_INTENSITY > 0 && haveSelf) {
-            double dist = Math.hypot(cam.claimedX - selfX, cam.claimedY - selfY);
-            double pn = NLOS_INTENSITY * Math.min(1.0, Math.max(0.0, (dist - 150.0) / 300.0));
-            if (pn > 0 && chanRng.nextDouble() < pn) {
-                return;
+            double[] txTrue = backend.truePositionOf(dg);
+            if (txTrue != null) {
+                double dist = Math.hypot(txTrue[0] - selfX, txTrue[1] - selfY);
+                double pn = NLOS_INTENSITY * Math.min(1.0, Math.max(0.0, (dist - 150.0) / 300.0));
+                if (pn > 0 && chanRng.nextDouble() < pn) {
+                    return;
+                }
             }
         }
         // Channel congestion (CSMA/CA contention / CBR collapse): under high local channel load a
@@ -233,7 +324,6 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
                 return; // frame lost to channel contention
             }
         }
-        ScmsBackend backend = ScmsBackend.instance();
         if (backend.isRevoked(dg, t)) {
             return; // ENFORCEMENT: drop revoked certificates
         }
@@ -241,156 +331,11 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
             return;
         }
 
-        Rx s = senders.get(dg);
-        if (s == null) {
-            s = new Rx();
-            s.winStart = t;
-            senders.put(dg, s);
-        }
-        if (t - s.winStart >= 1.0) {
-            s.winStart = t;
-            s.winCount = 1;
-        } else {
-            s.winCount++;
-        }
-
-        // Motion consistency is evaluated against a lagged reference (>= MIN_REF_GAP old) rather
-        // than the immediately-previous CAM, so detection is independent of the CAM rate (which
-        // now varies 1-10 Hz under the ETSI generation rules).
-        double gapRef = s.hasRef ? (t - s.refT) : 0;
-        double movedRef = s.hasRef ? Math.hypot(cam.claimedX - s.refX, cam.claimedY - s.refY) : 0;
-        boolean refReady = s.hasRef && gapRef >= MIN_REF_GAP_S;
-        if (refReady) {
-            s.frozenCount = (cam.claimedSpeed > MOVING_SPEED_MS && movedRef < FROZEN_EPS_M)
-                    ? s.frozenCount + 1 : 0;
-        }
-
-        // Sybil co-location: many distinct identities claiming ~one 5 m cell within 1.5 s.
-        String cell = ((long) Math.floor(cam.claimedX / 5)) + ":" + ((long) Math.floor(cam.claimedY / 5));
-        Map<String, Double> cd = sybilGrid.computeIfAbsent(cell, k -> new HashMap<>());
-        cd.put(dg, t);
-        cd.values().removeIf(v -> t - v > 1.5);
-        int cellDistinct = cd.size();
-
-        double staleSec = t - cam.genTimeNs / 1e9;
-        double artDist = haveSelf ? Math.hypot(cam.claimedX - selfX, cam.claimedY - selfY) : 0;
-
-        // Motion-consistency candidates on the lagged reference. Physical plausibility: you cannot
-        // travel FARTHER than your claimed speed allows over the gap (+ accel + confidence margin);
-        // moving LESS (braking, turning, a lost CAM) is legitimate, so it is one-sided.
-        double maxDist = 0, hd = 0;
-        boolean psiViol = false, hdgViol = false;
-        if (refReady && gapRef <= 1.5) {
-            maxDist = cam.claimedSpeed * gapRef + 0.5 * MAX_ACCEL_MS2 * gapRef * gapRef
-                    + SPEED_TOL_M + cam.posConf;
-            psiViol = movedRef > maxDist;
-        }
-        if (refReady && movedRef > 20 && gapRef <= 1.0) {
-            double bearing = norm360(Math.toDegrees(Math.atan2(cam.claimedX - s.refX, cam.claimedY - s.refY)));
-            hd = angleDiff(cam.claimedHeading, bearing);
-            hdgViol = hd > HEADING_DIFF;
-        }
-        // Consecutive-violation gating: a single GPS outlier / fault glitch is ONE sample, but a
-        // real kinematic attack persists across references. Requiring a streak removes the bulk of
-        // outlier- and fault-driven false positives (which otherwise dominate this detector).
-        if (refReady) {
-            s.psiStreak = psiViol ? s.psiStreak + 1 : 0;
-            s.hdgStreak = hdgViol ? s.hdgStreak + 1 : 0;
-        }
-
-        // Model-based (constant-velocity alpha-beta / Kalman-like) consistency SCORE. Predict this
-        // CAM's position from the tracked position+velocity and normalize the residual by the plausible
-        // uncertainty (confidence + unmodelled acceleration). This is a SOFT anomaly score carried in
-        // the fusion fingerprint (detnorm_kalmanConsistency) — NOT a hard trigger, because a CV tracker
-        // false-positives on sustained curving; an ML fusion model can weight it. The estimate is not
-        // updated toward a violating sample (so a spike can't poison the track); it re-inits if stale.
-        double kfNorm = 0;
-        boolean kfViol = false;
-        if (!s.kfInit) {
-            s.kfInit = true; s.kfX = cam.claimedX; s.kfY = cam.claimedY; s.kfVx = 0; s.kfVy = 0; s.kfLastT = t;
-        } else {
-            double dtk = t - s.kfLastT;
-            if (dtk <= 0 || dtk > 5) {   // stale / out-of-order: re-init the track
-                s.kfX = cam.claimedX; s.kfY = cam.claimedY; s.kfVx = 0; s.kfVy = 0; s.kfLastT = t; s.kfStreak = 0;
-            } else {
-                double px = s.kfX + s.kfVx * dtk, py = s.kfY + s.kfVy * dtk;
-                double resx = cam.claimedX - px, resy = cam.claimedY - py;
-                double sigma = cam.posConf + 0.5 * MAX_ACCEL_MS2 * dtk * dtk + 1.0;
-                kfNorm = Math.hypot(resx, resy) / sigma;
-                kfViol = kfNorm > KF_THRESH;
-                s.kfStreak = kfViol ? s.kfStreak + 1 : 0;
-                if (!kfViol) {           // update the track only on a consistent sample
-                    s.kfX = px + KF_ALPHA * resx; s.kfY = py + KF_ALPHA * resy;
-                    s.kfVx += KF_BETA * resx / dtk; s.kfVy += KF_BETA * resy / dtk;
-                    s.kfLastT = t;
-                } else if (s.kfStreak >= 4) {   // persistent new course: re-baseline to keep tracking
-                    s.kfX = cam.claimedX; s.kfY = cam.claimedY; s.kfVx = 0; s.kfVy = 0;
-                    s.kfLastT = t; s.kfStreak = 0;
-                }
-            }
-        }
-
-        // A normalized score (~>=1 at the detector's threshold) so it is comparable across
-        // detectors, unlike the raw score whose units differ (metres / degrees / seconds / counts).
-        String reason = null;
-        double score = 0, scoreNorm = 0;
-        if (staleSec > STALE_MAX_S) {
-            reason = "staleOrReplay"; score = staleSec; scoreNorm = staleSec / STALE_MAX_S;
-        } else if (s.winCount > FREQ_MAX) {
-            reason = "beaconFrequency"; score = s.winCount; scoreNorm = (double) s.winCount / FREQ_MAX;
-        } else if (haveSelf && artDist > ART_MAX_M) {
-            reason = "acceptanceRangeThreshold"; score = artDist; scoreNorm = artDist / ART_MAX_M;
-        } else if (refReady && gapRef <= 5 && movedRef > 50 + 60 * gapRef) {
-            reason = "positionJump"; score = movedRef; scoreNorm = movedRef / (50 + 60 * gapRef);
-        } else if (cellDistinct >= SYBIL_MIN) {
-            reason = "sybilCoLocation"; score = cellDistinct; scoreNorm = (double) cellDistinct / SYBIL_MIN;
-        } else if (psiViol && s.psiStreak >= MIN_CONSEC) {
-            reason = "positionSpeedInconsistency"; score = movedRef - maxDist; scoreNorm = movedRef / maxDist;
-        } else if (hdgViol && s.hdgStreak >= MIN_CONSEC) {
-            reason = "headingInconsistency"; score = hd; scoreNorm = hd / HEADING_DIFF;
-        } else if (refReady && gapRef <= 3
-                && Math.abs(cam.claimedSpeed - s.refSpeed) / gapRef > MAX_PLAUSIBLE_ACCEL) {
-            // implied acceleration exceeds physical limits (ETSI/F2MD accel-plausibility check) —
-            // catches jumpy claimed-speed attacks (RandomSpeed, StopAndGo). One-sided => low FP.
-            double acc = Math.abs(cam.claimedSpeed - s.refSpeed) / gapRef;
-            reason = "implausibleAcceleration"; score = acc; scoreNorm = acc / MAX_PLAUSIBLE_ACCEL;
-        } else if (s.frozenCount >= FROZEN_COUNT) {
-            reason = "constantPositionFrozen"; score = cam.claimedSpeed; scoreNorm = (double) s.frozenCount / FROZEN_COUNT;
-        }
-
-        s.lastX = cam.claimedX;
-        s.lastY = cam.claimedY;
-        s.lastT = t;
-        s.lastHeading = cam.claimedHeading;
-        s.hasPrev = true;
-        // Advance the reference to a CLEAN sample (not a kinematic violation), so a single GPS
-        // outlier can't pollute the reference and manufacture a second consecutive violation when
-        // the vehicle moves back. Force-advance if the reference gets stale (keeps evaluating a
-        // persistent attacker, whose every sample violates).
-        if (!s.hasRef || (gapRef >= MIN_REF_GAP_S && (!psiViol || gapRef >= 2.0))) {
-            s.refX = cam.claimedX; s.refY = cam.claimedY; s.refT = t; s.refHeading = cam.claimedHeading;
-            s.refSpeed = cam.claimedSpeed;
-            s.hasRef = true;
-        }
-
-        if (reason != null) {
-            // Full multi-detector fingerprint (every check's normalized score, not just the first that
-            // fired) — this is what a real ML-based MDS / global-MA fusion model consumes.
-            // LinkedHashMap: the on-disk detnorm_* column order is INSERTION order, not JDK-dependent
-            // HashMap bucket order — keeps "same seed -> byte-identical" robust across JDK versions.
-            Map<String, Double> det = new LinkedHashMap<>();
-            det.put("acceptanceRangeThreshold", (haveSelf && ART_MAX_M > 0) ? artDist / ART_MAX_M : 0.0);
-            det.put("staleOrReplay", staleSec / STALE_MAX_S);
-            det.put("beaconFrequency", (double) s.winCount / FREQ_MAX);
-            det.put("sybilCoLocation", (double) cellDistinct / SYBIL_MIN);
-            det.put("positionJump", refReady ? movedRef / (50 + 60 * gapRef) : 0.0);
-            det.put("positionSpeedInconsistency", (refReady && maxDist > 0) ? movedRef / maxDist : 0.0);
-            det.put("headingInconsistency", refReady ? hd / HEADING_DIFF : 0.0);
-            det.put("implausibleAcceleration",
-                    refReady ? Math.abs(cam.claimedSpeed - s.refSpeed) / gapRef / MAX_PLAUSIBLE_ACCEL : 0.0);
-            det.put("constantPositionFrozen", (double) s.frozenCount / FROZEN_COUNT);
-            det.put("kalmanConsistency", kfNorm / KF_THRESH);
-            backend.onDetection(myDigest, dg, score, t, reason, cam.posConf, scoreNorm, det);
+        // The detector suite itself is shared with the RSU receiver app (CamDetector), so vehicle
+        // and infrastructure evidence come from exactly the same checks and the same thresholds.
+        CamDetector.Detection d = detector.evaluate(dg, cam, t, selfX, selfY, haveSelf);
+        if (d != null) {
+            backend.onDetection(myDigest, dg, d.score, t, d.reason, cam.posConf, d.scoreNorm, d.detNorms);
         }
     }
 

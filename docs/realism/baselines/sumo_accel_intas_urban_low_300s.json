@@ -1,0 +1,76 @@
+{
+  "refdata_dir": "C:\\Users\\Administrator\\Documents\\SCMS-Simulator\\src\\scms_sim_ref\\datagen\\refdata",
+  "refdata_sets": [
+    "etsi_cam_dcc",
+    "fundamental_diagram",
+    "geh",
+    "kinematics",
+    "pathloss_37885",
+    "traffic_regimes",
+    "v2x_awareness"
+  ],
+  "sections": {
+    "accel": {
+      "n_accel_samples": 781091,
+      "n_vehicles": 334,
+      "native_accel_samples": 0,
+      "accel_min": -9.0,
+      "accel_max": 3.0,
+      "accel_p01": -3.5,
+      "accel_p99": 2.5,
+      "speed_max_mps": 55.6,
+      "gates": [
+        {
+          "id": "accel.within_hard_bound_frac",
+          "title": "Accelerations inside the human plausibility bound",
+          "value": 0.9999,
+          "unit": "fraction",
+          "n": 781091,
+          "status": "fail",
+          "reference": {
+            "ref_id": "kinematics.accel_hard_bound_mps2",
+            "threshold": ">= 1.0",
+            "cite": "Punzo et al. 2011 / Coifman & Li 2017 (NGSIM critique)",
+            "source": "Physical-plausibility gate on trajectory data. Punzo, Borzacchiello & Ciuffo, 'On the assessment of vehicle trajectory data accuracy and application to the Next Generation SIMulation (NGSIM) program data', Transportation Research Part C 19(6), 2011; Coifman & Li, 'A critical evaluation of the Next Generation Simulation (NGSIM) vehicle trajectory dataset', Transportation Research Part B 105, 2017. Raw NGSIM violated this band massively, which is the canonical trajectory-realism failure."
+          },
+          "details": {
+            "band_mps2": [
+              -8.0,
+              4.0
+            ]
+          }
+        },
+        {
+          "id": "accel.within_comfort_frac",
+          "title": "Accelerations inside the comfort band",
+          "value": 0.9791,
+          "unit": "fraction",
+          "n": 781091,
+          "status": "pass",
+          "reference": {
+            "ref_id": "kinematics.accel_comfort_min_fraction",
+            "threshold": ">= 0.95",
+            "cite": "ROADMAP section 5 gate (Punzo/Coifman lineage)",
+            "source": "Project-adopted gate: >= 95% of benign accelerations within +/-3 m/s^2 (docs/realism/ROADMAP.md section 5, 'Accel plausibility' row, and Phase 1 benchmark gate)."
+          },
+          "details": {
+            "band_mps2": [
+              -3.0,
+              3.0
+            ]
+          }
+        }
+      ],
+      "file": "C:/Users/ADMINI~1/AppData/Local/Temp/2/claude/c--Users-Administrator-Documents-SCMS-Simulator/d4c49856-8d66-4c40-b761-aceaae48f7f8/scratchpad/geh/intas_fcd.xml"
+    }
+  },
+  "summary": {
+    "n_gates": 2,
+    "pass": 1,
+    "fail": 1,
+    "na": 0,
+    "failures": [
+      "accel.within_hard_bound_frac"
+    ]
+  }
+}

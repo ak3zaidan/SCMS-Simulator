@@ -67,7 +67,7 @@ public final class ScmsBackend {
     static final double GPS_DEGRADE_FACTOR = envDouble("SCMS_GPS_DEGRADE_FACTOR", 5.0);
     static final double GPS_DEGRADE_MIN_S = 3.0, GPS_DEGRADE_MAX_S = 8.0;
     // Weather (SCMS_WEATHER = clear|rain|fog|snow) degrades sensors (and radio, in the app).
-    static final double WEATHER_SENSOR_MULT = weatherSensorMult();
+    public static final double WEATHER_SENSOR_MULT = weatherSensorMult();
 
     private static double weatherSensorMult() {
         String w = System.getenv("SCMS_WEATHER");
@@ -112,6 +112,30 @@ public final class ScmsBackend {
     static final double INGEST_DELAY_S = envDouble("SCMS_INGEST_DELAY", 0.15);   // MA report-channel latency
     static final String OUT_DIR = resolveOutDir();
 
+    /** Version of the MOSAIC application layer, recorded in the manifest (jar name is unchanged). */
+    public static final String APP_VERSION = "0.1.0+realism.p1";
+
+    // ---------------------------------------------------------------- Phase-1 realism (VeReMi-NextGen ports)
+    // Every knob below is OPT-IN and defaults to the pre-port behaviour, so an existing seed still
+    // reproduces its dataset byte-for-byte (no extra RNG draws are taken on the default path).
+    /** builtin = the OU-correlated GNSS model in claim(); nextgen = VeReMi-NextGen SensorErrorModel. */
+    public static final String SENSOR_MODEL = envStr("SCMS_SENSOR_MODEL", "builtin");
+    public static final double SENSOR_POS_ERR_M = envDouble("SCMS_SENSOR_POS_ERR_M", 5.0);
+    public static final double SENSOR_SPEED_ERR = envDouble("SCMS_SENSOR_SPEED_ERR", 0.00016);
+    public static final double SENSOR_HEAD_ERR_DEG = envDouble("SCMS_SENSOR_HEAD_ERR_DEG", 20.0);
+    public static final double SENSOR_POS_SIGMA_FRAC = envDouble("SCMS_SENSOR_POS_SIGMA_FRAC", 0.03);
+    public static final double SENSOR_HEAD_DECAY = envDouble("SCMS_SENSOR_HEAD_DECAY", 0.1);
+    /** Per-vehicle driver profiles (10/80/10 aggressive/normal/passive) via requestVehicleParametersUpdate. */
+    public static final boolean DRIVER_PROFILES = envInt("SCMS_DRIVER_PROFILES", 0) != 0;
+    public static final double DRIVER_AGGRESSIVE_FRAC = envDouble("SCMS_DRIVER_AGGRESSIVE_PCT", 10.0) / 100.0;
+    public static final double DRIVER_PASSIVE_FRAC = envDouble("SCMS_DRIVER_PASSIVE_PCT", 10.0) / 100.0;
+    /** period = fixed ROTATE_PERIOD_S; distance = NextGen's privacy model (distance, then distance+time). */
+    public static final String PSEUDONYM_POLICY = envStr("SCMS_PSEUDONYM_POLICY", "period");
+    static final double PSN_DIST_MIN_M = envDouble("SCMS_PSN_DIST_MIN_M", 800.0);
+    static final double PSN_DIST_MAX_M = envDouble("SCMS_PSN_DIST_MAX_M", 1500.0);
+    static final double PSN_TIME_MIN_S = envDouble("SCMS_PSN_TIME_MIN_S", 120.0);
+    static final double PSN_TIME_MAX_S = envDouble("SCMS_PSN_TIME_MAX_S", 360.0);
+
     // Config is read from environment variables first (so the GUI can change it without a
     // recompile and with no JVM "Picked up ..." banner), then -D system properties, then defaults.
     private static long resolveSeed() {
@@ -141,6 +165,30 @@ public final class ScmsBackend {
         } catch (NumberFormatException ex) {
             return dflt;
         }
+    }
+
+    private static String envStr(String name, String dflt) {
+        String e = System.getenv(name);
+        return (e != null && !e.isBlank()) ? e.trim().toLowerCase(java.util.Locale.ROOT) : dflt;
+    }
+
+    /**
+     * Deterministic 64-bit seed for a per-vehicle RNG stream, keyed on the SCENARIO SEED and the
+     * vehicle id — never on wall-clock time or object identity. SHA-256 based, so it is stable
+     * across JVM versions and platforms (String.hashCode mixes are only spec-stable, and collide).
+     */
+    public static long streamSeed(String label, String unitId) {
+        byte[] h = sha(label + "|" + MASTER_SEED + "|" + unitId);
+        long v = 0;
+        for (int k = 0; k < 8; k++) {
+            v = (v << 8) | (h[k] & 0xffL);
+        }
+        return v;
+    }
+
+    /** Deterministic U[0,1) keyed on (label, scenario seed, vehicle id): stateless, order-independent. */
+    public static double keyedUniform(String label, String unitId) {
+        return (streamSeed(label, unitId) >>> 11) * 0x1.0p-53;
     }
 
     private static final ScmsBackend INSTANCE = new ScmsBackend();
@@ -197,9 +245,16 @@ public final class ScmsBackend {
         java.util.Random sRng;                     // per-vehicle sensor-noise RNG (seeded)
         double nextRotateT = Double.MAX_VALUE;     // next pseudonym rotation time
         int rotCount = 0;
+        String driverProfile;                      // DriverProfile name (null unless DRIVER_PROFILES)
+        // NextGen-style distance/time pseudonym policy (sim time only — see rotateByDistance)
+        double psnOdoRef = Double.NaN;             // odometer reading at the last change
+        double psnLastChangeT = 0;                 // SIM time of the last change
+        boolean psnFirstChange = true;
+        double psnDistM, psnTimeS;
         double gpsQ = 1.0;                          // per-vehicle GNSS quality factor (heterogeneous)
         boolean revoked = false;                   // vehicle-level revocation (covers all pseudonyms)
         double revokeT = -1;
+        boolean isRsu = false;                     // static infrastructure receiver, never a vehicle
     }
 
     private final Map<String, Dev> devByUnit = new HashMap<>();
@@ -223,6 +278,8 @@ public final class ScmsBackend {
     private int reportCounter = 0;
     private int caseCounter = 0;
     private boolean written = false;
+    private volatile java.io.File scenarioDir;   // set once by the app (MOSAIC configuration path)
+    private final Map<String, Object> appParams = new TreeMap<>();   // app-layer effective knobs
     private double lastLiveWriteT = -1e9;
     private final List<String> victims = new ArrayList<>();          // benign collusion targets
     private final Map<String, double[]> subjAgg = new HashMap<>();   // subject -> {firstT, lastT}
@@ -313,19 +370,152 @@ public final class ScmsBackend {
         return new Cred(d.certDigest, d.i, d.j, d.lvHex, d.attacker, d.attackType);
     }
 
+    /**
+     * Provision a ROAD-SIDE UNIT as an always-trusted reporter (see {@link org.scms.app.ScmsRsuApp}).
+     *
+     * <p>Deliberately NOT {@link #register}: an RSU is infrastructure, not a vehicle. It never draws
+     * an attacker/faulty/colluder role, never beacons, and gets no ``gt_vehicle`` /
+     * ``gt_identity_map`` / ``gt_enrollment`` row. That absence is exactly the signal the downstream
+     * feature builder uses -- ``featurize._is_rsu_reporter`` classifies a reporter cert that the
+     * oracle identity map does not know as infrastructure -- so RSU evidence lands on an opaque
+     * ``rsu_*`` graph node with no identity anywhere near it. The Dev entry exists only so
+     * {@link #onDetection} can resolve the reporter and apply the ordinary trust bookkeeping.
+     *
+     * <p>An RSU is enrolled with the PCA under its own request hash so its certificate is a real
+     * SCMS credential, but it carries no linkage seeds: infrastructure is not pseudonymous, and
+     * there is nothing for the LAs to link.
+     */
+    public synchronized Cred rsuCredential(String unitId) {
+        Dev d = devByUnit.get(unitId);
+        if (d == null) {
+            d = new Dev();
+            d.unitId = unitId;
+            d.isRsu = true;
+            d.i = 0;
+            d.j = 0;
+            d.certDigest = hex(sha("rsucert|" + MASTER_SEED + "|" + unitId), 8);
+            d.requestHash = hex(sha("rsureq|" + MASTER_SEED + "|" + unitId), 8);
+            d.lvHex = "";
+            d.nextRotateT = Double.MAX_VALUE;      // infrastructure does not rotate pseudonyms
+            scms.dcm.attest(unitId);
+            String enrollmentId = scms.eca.issue(unitId);
+            scms.pca.issue(d.certDigest, d.requestHash, d.i, d.j, "lc1:" + unitId, "lc2:" + unitId);
+            scms.ra.bind(d.requestHash, enrollmentId);
+            devByUnit.put(unitId, d);
+            devByDigest.put(d.certDigest, d);
+        }
+        return new Cred(d.certDigest, d.i, d.j, d.lvHex, false, "none");
+    }
+
+    /** Road-side units provisioned this run (manifest counts; excluded from the vehicle count). */
+    private synchronized int rsuCount() {
+        int n = 0;
+        for (Dev d : devByUnit.values()) {
+            if (d.isRsu) {
+                n++;
+            }
+        }
+        return n;
+    }
+
     /** Current pseudonym for a vehicle's next beacon, rotating it if the lifetime has elapsed. */
     public synchronized Cred beaconCred(String unitId, long tNs) {
+        return beaconCred(unitId, tNs, Double.NaN);
+    }
+
+    /**
+     * As {@link #beaconCred(String, long)}, but also accepting the vehicle's odometer (m) so the
+     * NextGen distance-based privacy policy can be evaluated (ignored by the default period policy).
+     */
+    public synchronized Cred beaconCred(String unitId, long tNs, double odometerM) {
         Dev d = devByUnit.get(unitId);
         if (d == null) {
             register(unitId);
             d = devByUnit.get(unitId);
         }
         double t = tNs / 1e9;
-        while (ROTATE_PERIOD_S > 0 && t >= d.nextRotateT) {
-            rotate(d);
-            d.nextRotateT += ROTATE_PERIOD_S;
+        if ("distance".equals(PSEUDONYM_POLICY)) {
+            rotateByDistance(d, t, odometerM);
+        } else {
+            while (ROTATE_PERIOD_S > 0 && t >= d.nextRotateT) {
+                rotate(d);
+                d.nextRotateT += ROTATE_PERIOD_S;
+            }
         }
         return new Cred(d.certDigest, d.i, d.j, d.lvHex, d.attacker, d.attackType);
+    }
+
+    /**
+     * VeReMi-NextGen's privacy-realistic pseudonym change model (VehicleCamSendingApp.java:172-200):
+     * the FIRST change happens after D ~ U(800, 1500) m have been driven; every later change needs
+     * BOTH that distance again AND T ~ U(120, 360) s of elapsed time.
+     *
+     * <p>Upstream measures the elapsed time with {@code LocalDateTime.now()} — wall clock — so the
+     * policy fires on how long the SIMULATOR ran, not on how long the vehicle drove: at 100x real
+     * time no vehicle ever reaches the time criterion, and no run is reproducible. Here the timer is
+     * MOSAIC simulation time, and D/T are drawn from SHA-256(seed|vehicle|cycle) instead of
+     * {@code Math.random()}, so the whole policy is a pure function of (scenario seed, vehicle id).
+     */
+    private void rotateByDistance(Dev d, double t, double odometerM) {
+        if (Double.isNaN(odometerM)) {
+            return;   // no odometer available (e.g. a unit that never reported vehicle data)
+        }
+        if (Double.isNaN(d.psnOdoRef)) {
+            d.psnOdoRef = odometerM;
+            d.psnLastChangeT = t;
+            d.psnDistM = PSN_DIST_MIN_M + (PSN_DIST_MAX_M - PSN_DIST_MIN_M)
+                    * keyedUniform("psn-dist", d.unitId);
+            d.psnTimeS = PSN_TIME_MIN_S + (PSN_TIME_MAX_S - PSN_TIME_MIN_S)
+                    * keyedUniform("psn-time|0", d.unitId);
+        }
+        if (odometerM - d.psnOdoRef <= d.psnDistM) {
+            return;
+        }
+        if (!d.psnFirstChange && (t - d.psnLastChangeT) <= d.psnTimeS) {
+            return;   // distance reached, but the privacy dwell time has not elapsed yet
+        }
+        rotate(d);
+        d.psnFirstChange = false;
+        d.psnOdoRef = odometerM;
+        d.psnLastChangeT = t;
+        d.psnTimeS = PSN_TIME_MIN_S + (PSN_TIME_MAX_S - PSN_TIME_MIN_S)
+                * keyedUniform("psn-time|" + d.rotCount, d.unitId);
+    }
+
+    /**
+     * ORACLE channel oracle: the TRUE position of the vehicle behind a pseudonym (Sybil ghosts
+     * resolve to their puppeteer, which is where the frame is physically emitted from).
+     *
+     * <p>This exists for RADIO PHYSICS ONLY — LOS/NLOS geometry, path loss, ranging — where the
+     * receiver-side model must not be steered by attacker-controlled content. It must never reach a
+     * misbehaviour report, an ma/* row, or any feature: those stay derived from the CLAIMED state.
+     *
+     * @return {trueX, trueY} in projected metres, or null before the vehicle's first beacon
+     */
+    public synchronized double[] truePositionOf(String certDigest) {
+        Dev d = devByDigest.get(certDigest);
+        if (d == null || d.lastSeenT < 0) {
+            return null;
+        }
+        return new double[] {d.lastX, d.lastY};
+    }
+
+    /** Records the driver profile a vehicle applied (ground truth + manifest fleet composition). */
+    public synchronized void noteDriverProfile(String unitId, String profile) {
+        Dev d = devByUnit.get(unitId);
+        if (d == null) {
+            register(unitId);
+            d = devByUnit.get(unitId);
+        }
+        d.driverProfile = profile;
+    }
+
+    /** Scenario directory (parent of scenario_config.json), used to locate the input-hash manifest. */
+    public void noteScenarioDir(java.io.File f) {
+        if (f == null || scenarioDir != null) {
+            return;
+        }
+        scenarioDir = f.isDirectory() ? f : f.getParentFile();
     }
 
     /** Roll the vehicle to a fresh pseudonym under the SAME LA linkage seeds (privacy), so the
@@ -347,6 +537,20 @@ public final class ScmsBackend {
     /** Compute the claimed CAM (content + timing/flood/sybil flags) for one broadcast. */
     public synchronized AttackLib.Claim claim(String unitId, int sendCount, double x, double y,
                                               double speed, double heading, long tNs) {
+        return claim(unitId, sendCount, x, y, speed, heading, tNs, null);
+    }
+
+    /**
+     * As {@link #claim(String, int, double, double, double, double, long)}, but with the sender's own
+     * MEASURED state supplied by the app-side VeReMi-NextGen sensor model (SCMS_SENSOR_MODEL=nextgen).
+     * The TRUE state is still passed in x/y/speed/heading, so the ground-truth tables and the
+     * "falsified" test keep comparing the attack against the honest measurement, never against noise.
+     * When {@code measured} is null the built-in OU/GNSS model runs exactly as before (identical RNG
+     * draw order — the default path is unchanged, bit for bit).
+     */
+    public synchronized AttackLib.Claim claim(String unitId, int sendCount, double x, double y,
+                                              double speed, double heading, long tNs,
+                                              org.scms.realism.SensorErrorModel.Sample measured) {
         Dev d = devByUnit.get(unitId);
         if (d == null) {
             register(unitId);
@@ -371,12 +575,35 @@ public final class ScmsBackend {
         }
         double sigma = GPS_SIGMA_M * q;
         double bias = GPS_BIAS_M * q;
-        double a = Math.exp(-GPS_THETA * dt);                 // OU bias update over dt
-        double qv = bias * Math.sqrt(Math.max(0.0, 1 - a * a));
-        d.sBiasX = a * d.sBiasX + qv * d.sRng.nextGaussian();
-        d.sBiasY = a * d.sBiasY + qv * d.sRng.nextGaussian();
-        double mx = x + d.sBiasX + sigma * d.sRng.nextGaussian();
-        double my = y + d.sBiasY + sigma * d.sRng.nextGaussian();
+        double mx;
+        double my;
+        // 2-D 95% position-confidence radius: sqrt(-2 ln 0.05) ≈ 2.448 × per-axis sigma
+        // (the 1-D z-score 1.96 would under-cover a 2-D error — a real calibration fix).
+        // TRANSMITTED COARSELY (SensorErrorModel.quantisedConfidence, applied below): a raw radius is
+        // a monotone function of this vehicle's own 256-level gpsQ, i.e. a near-unique value that is
+        // stable across pseudonym rotations, and it reaches the MA as ma_reports.subject_pos_confidence
+        // and ml/report_features.csv's pos_confidence. That is a linkage key, not an accuracy report.
+        double conf;
+        if (measured == null) {
+            double a = Math.exp(-GPS_THETA * dt);                 // OU bias update over dt
+            double qv = bias * Math.sqrt(Math.max(0.0, 1 - a * a));
+            d.sBiasX = a * d.sBiasX + qv * d.sRng.nextGaussian();
+            d.sBiasY = a * d.sBiasY + qv * d.sRng.nextGaussian();
+            mx = x + d.sBiasX + sigma * d.sRng.nextGaussian();
+            my = y + d.sBiasY + sigma * d.sRng.nextGaussian();
+            conf = 2.448 * Math.sqrt(sigma * sigma + bias * bias);
+        } else {
+            // NextGen sensor model: the app already produced the measurement (correlated GNSS bias,
+            // relative speed error, speed-decaying heading error) from the TRUE state. The outlier /
+            // degradation / fault machinery below still applies — those are hardware pathologies the
+            // upstream model does not have, and they are what makes benign false positives realistic.
+            mx = measured.x;
+            my = measured.y;
+            conf = measured.posConf;   // already weather-scaled: the app sizes the model by WEATHER_SENSOR_MULT
+        }
+        // one choke point for every producer of a transmitted confidence (idempotent, so the
+        // already-quantised NextGen value passes through unchanged)
+        conf = org.scms.realism.SensorErrorModel.quantisedConfidence(conf);
         // Faulty units glitch more often (a malfunctioning sensor, not an attack).
         double outRate = (d.faulty && d.faultMode == 0 ? GPS_OUTLIER_RATE * 6.0 : GPS_OUTLIER_RATE) * q;
         if (d.sRng.nextDouble() < Math.min(0.6, outRate * dt)) {   // rare multipath spike
@@ -392,11 +619,15 @@ public final class ScmsBackend {
             d.driftAccum = Math.min(60.0, d.driftAccum + 0.2);   // grows ~0.2 m per CAM, capped
             mx += Math.cos(d.faultAngle) * d.driftAccum; my += Math.sin(d.faultAngle) * d.driftAccum;
         }
-        double mspeed = Math.max(0.0, speed + SPEED_SIGMA_MS * d.sRng.nextGaussian());
-        double mheading = ((heading + HEADING_SIGMA_DEG * d.sRng.nextGaussian()) % 360 + 360) % 360;
-        // 2-D 95% position-confidence radius: sqrt(-2 ln 0.05) ≈ 2.448 × per-axis sigma
-        // (the 1-D z-score 1.96 would under-cover a 2-D error — a real calibration fix).
-        double conf = 2.448 * Math.sqrt(sigma * sigma + bias * bias);
+        double mspeed;
+        double mheading;
+        if (measured == null) {
+            mspeed = Math.max(0.0, speed + SPEED_SIGMA_MS * d.sRng.nextGaussian());
+            mheading = ((heading + HEADING_SIGMA_DEG * d.sRng.nextGaussian()) % 360 + 360) % 360;
+        } else {
+            mspeed = Math.max(0.0, measured.speed);
+            mheading = ((measured.heading % 360) + 360) % 360;
+        }
         AttackLib.Claim c;
         if (!d.attacker) {
             c = new AttackLib.Claim();
@@ -417,12 +648,21 @@ public final class ScmsBackend {
         }
         // per-message ground-truth sample (true vs claimed) for message-level benchmarks
         if (emitRng.nextDouble() < EMIT_SAMPLE) {
-            gtEmit.add(gtRow("emit_id", String.format(java.util.Locale.ROOT, "emt_%08d", gtEmit.size()), "t", round3(t),
+            Map<String, Object> em = gtRow("emit_id", String.format(java.util.Locale.ROOT, "emt_%08d", gtEmit.size()), "t", round3(t),
                     "true_vehicle_id", unitId,
                     "true_x", round3(x), "true_y", round3(y),
                     "claimed_x", round3(c.x), "claimed_y", round3(c.y), "claimed_speed", round3(c.speed),
                     "pos_conf", round3(conf),
-                    "is_attacker", d.attacker, "is_faulty", d.faulty, "falsified", falsified));
+                    "is_attacker", d.attacker, "is_faulty", d.faulty, "falsified", falsified);
+            if (measured != null) {
+                // ORACLE-only: the honest MEASUREMENT (sensor error applied, attack not yet) — lets a
+                // message-level benchmark separate GNSS/odometry error from attack magnitude. Only
+                // present when the NextGen sensor model is on, so default datasets are unchanged.
+                em.put("measured_x", round3(mx));
+                em.put("measured_y", round3(my));
+                em.put("measured_speed", round3(mspeed));
+            }
+            gtEmit.add(em);
         }
         return c;
     }
@@ -571,6 +811,14 @@ public final class ScmsBackend {
                 Dev d = devByUnit.get(row.get("true_vehicle_id"));
                 row.put("attack_onset_time", (d != null && d.onsetT >= 0) ? round3(d.onsetT) : null);
             }
+            // ORACLE fleet composition: which driver profile each vehicle actually applied. Only
+            // emitted when the profiles are on, so datasets generated without them are unchanged.
+            if (DRIVER_PROFILES) {
+                for (Map<String, Object> row : gtVeh) {
+                    Dev d = devByUnit.get(row.get("true_vehicle_id"));
+                    row.put("driver_profile", (d != null && d.driverProfile != null) ? d.driverProfile : "UNKNOWN");
+                }
+            }
             // one row per pseudonym the MA observed (rotation + ghosts), with vehicle-level
             // revocation status — the LA linkage revokes every pseudonym of a caught vehicle.
             for (Map.Entry<String, Dev> e : devByDigest.entrySet()) {
@@ -611,10 +859,30 @@ public final class ScmsBackend {
             Map<String, Object> manifest = new LinkedHashMap<>();
             manifest.put("dataset_version", "0.3.0");
             manifest.put("generator", "scms_sim_ref (MOSAIC layer, full-entity back-end v4)");
+            manifest.put("app_version", APP_VERSION);
             manifest.put("seed", MASTER_SEED);
             manifest.put("scms_entities", Scms.ENTITY_NAMES);
+            Map<String, Object> inputs = inputManifest();
             Map<String, Object> cfg = new LinkedHashMap<>();
             cfg.put("reception", "MOSAIC AdHoc ITS-G5 CCH via SNS (range/delay)");
+            // Analysis constants datagen.realism_bench needs to score a MOSAIC dataset without being
+            // told the scenario by hand: the emission-sampling fraction (below 1.0 most traffic
+            // metrics are unscoreable), the SNS single-hop radius and the acceptanceRangeThreshold
+            // normaliser (both drive the link-distance reconstruction), and the road-network class
+            // that selects the reference speed/headway bands. road_network comes from the generator's
+            // scms_inputs.json params block (SCMS_ROAD_NETWORK overrides), never guessed here.
+            cfg.put("emit_sample_prob", EMIT_SAMPLE);
+            cfg.put("radio_range_m", envDouble("SCMS_RADIO_RANGE", 709.4));
+            cfg.put("art_max_m", envDouble("SCMS_ART_MAX_M", 1000.0));
+            String roadNetwork = inputParam(inputs, "road_network", envStr("SCMS_ROAD_NETWORK", ""));
+            if (!roadNetwork.isEmpty()) {
+                cfg.put("road_network", roadNetwork);
+                cfg.put("regime", inputParam(inputs, "regime",
+                        "linear".equals(roadNetwork) ? "highway" : "urban"));
+            }
+            cfg.put("sensor_model", SENSOR_MODEL);
+            cfg.put("driver_profiles", DRIVER_PROFILES);
+            cfg.put("pseudonym_policy", PSEUDONYM_POLICY);
             cfg.put("report_threshold_k", REPORT_THRESHOLD_K);
             cfg.put("attacker_pct", ATTACKER_PCT);
             cfg.put("report_prob", REPORT_PROB);
@@ -627,11 +895,33 @@ public final class ScmsBackend {
             cfg.put("attack_bases_enabled", new ArrayList<>(bases));
             cfg.put("attack_variants_total", AttackLib.CATALOG.size());
             manifest.put("config", cfg);
+            // REPLAY PARITY: every knob this JVM actually resolved (defaults included) plus the raw
+            // SCMS_* environment as it was set, so a run can be reproduced from the manifest alone.
+            manifest.put("effective_params", effectiveParams());
+            manifest.put("env_scms", rawScmsEnv());
+            if (inputs != null) {
+                manifest.put("inputs", inputs);   // scenario input files + their sha256 (see gen_scenario)
+            }
+            int nRsu = rsuCount();
             Map<String, Object> counts = new LinkedHashMap<>();
-            counts.put("vehicles", devByUnit.size());
+            counts.put("vehicles", devByUnit.size() - nRsu);   // RSUs are infrastructure, not vehicles
+            if (nRsu > 0) {
+                counts.put("rsus", nRsu);
+            }
             counts.put("reports", maReports.size());
             counts.put("investigations", maInvest.size());
             counts.put("revoked", scms.crlg.size());
+            if (DRIVER_PROFILES) {
+                Map<String, Integer> profiles = new TreeMap<>();
+                for (Dev d : devByUnit.values()) {
+                    if (d.isRsu) {
+                        continue;                    // infrastructure has no driver
+                    }
+                    String p = (d.driverProfile != null) ? d.driverProfile : "UNKNOWN";
+                    profiles.merge(p, 1, Integer::sum);
+                }
+                counts.put("driver_profiles", profiles);
+            }
             manifest.put("counts", counts);
             manifest.put("data_digest_sha256", hex(all.digest(), 32));
             manifest.put("outputs", digests);
@@ -641,11 +931,198 @@ public final class ScmsBackend {
                     (new GsonBuilder().setPrettyPrinting().create().toJson(manifest) + "\n")
                             .getBytes(StandardCharsets.UTF_8));
             System.out.println("[ScmsBackend] wrote dataset to " + OUT_DIR
-                    + " (vehicles=" + devByUnit.size() + " reports=" + maReports.size()
+                    + " (vehicles=" + (devByUnit.size() - nRsu)
+                    + (nRsu > 0 ? " rsus=" + nRsu : "")
+                    + " reports=" + maReports.size()
                     + " revoked=" + scms.crlg.size() + ")");
         } catch (Exception ex) {
             ex.printStackTrace();
         }
+    }
+
+    // ------------------------------------------------------- manifest parity (replayable runs)
+
+    /** App-layer knobs, pushed once by ScmsBeaconApp so the manifest records the WHOLE Java config. */
+    public void noteAppParams(Map<String, Object> params) {
+        if (params == null) {
+            return;
+        }
+        synchronized (appParams) {
+            if (appParams.isEmpty()) {
+                appParams.putAll(params);
+            }
+        }
+    }
+
+    /**
+     * Every parameter this JVM actually resolved — defaults included — keyed by the environment
+     * variable that sets it, so `manifest.effective_params` alone is enough to replay the run.
+     */
+    private Map<String, Object> effectiveParams() {
+        Map<String, Object> p = new TreeMap<>();
+        p.put("SCMS_SEED", MASTER_SEED);
+        p.put("SCMS_JMAX", JMAX);
+        p.put("SCMS_REPORT_K", REPORT_THRESHOLD_K);
+        p.put("SCMS_ATTACKER_PCT", ATTACKER_PCT);
+        p.put("SCMS_FAULTY_PCT", FAULTY_PCT);
+        p.put("SCMS_REPORT_PROB", REPORT_PROB);
+        p.put("SCMS_CRL_DELAY", CRL_PROP_DELAY_S);
+        p.put("SCMS_INGEST_DELAY", INGEST_DELAY_S);
+        p.put("SCMS_EMIT_SAMPLE", EMIT_SAMPLE);
+        p.put("SCMS_MIN_SECONDS", REVOKE_MIN_SECONDS);
+        p.put("SCMS_PERSIST_S", REVOKE_PERSIST_S);
+        p.put("SCMS_MA_DEFENSE", MA_DEFENSE);
+        p.put("SCMS_REPUTATION_MAX", REPUTATION_MAX);
+        p.put("SCMS_REPORT_BUDGET", REPORT_BUDGET);
+        p.put("SCMS_ROTATE_PERIOD", ROTATE_PERIOD_S);
+        p.put("SCMS_COLLUDE_PCT", COLLUDE_PCT);
+        p.put("SCMS_VICTIM_PCT", VICTIM_PCT);
+        p.put("SCMS_FALSE_REPORT_INTERVAL", FALSE_REPORT_INTERVAL_S);
+        p.put("SCMS_GPS_SIGMA", GPS_SIGMA_M);
+        p.put("SCMS_GPS_BIAS", GPS_BIAS_M);
+        p.put("SCMS_GPS_THETA", GPS_THETA);
+        p.put("SCMS_SPEED_SIGMA", SPEED_SIGMA_MS);
+        p.put("SCMS_HEADING_SIGMA", HEADING_SIGMA_DEG);
+        p.put("SCMS_GPS_OUTLIER_RATE", GPS_OUTLIER_RATE);
+        p.put("SCMS_GPS_OUTLIER_M", GPS_OUTLIER_M);
+        p.put("SCMS_GPS_DEGRADE_RATE", GPS_DEGRADE_RATE);
+        p.put("SCMS_GPS_DEGRADE_FACTOR", GPS_DEGRADE_FACTOR);
+        p.put("SCMS_WEATHER", envStr("SCMS_WEATHER", "clear"));
+        // Set by the generator, read by the SNS federate rather than by this JVM -- recorded here
+        // because the manifest is the replay contract and a run is not reproducible without them.
+        p.put("SCMS_RADIO_RANGE", envDouble("SCMS_RADIO_RANGE", 709.4));
+        p.put("SCMS_RADIO_LOSS", envDouble("SCMS_RADIO_LOSS", 0.0));
+        p.put("SCMS_SENSOR_MODEL", SENSOR_MODEL);
+        p.put("SCMS_SENSOR_POS_ERR_M", SENSOR_POS_ERR_M);
+        p.put("SCMS_SENSOR_SPEED_ERR", SENSOR_SPEED_ERR);
+        p.put("SCMS_SENSOR_HEAD_ERR_DEG", SENSOR_HEAD_ERR_DEG);
+        p.put("SCMS_SENSOR_POS_SIGMA_FRAC", SENSOR_POS_SIGMA_FRAC);
+        p.put("SCMS_SENSOR_HEAD_DECAY", SENSOR_HEAD_DECAY);
+        p.put("SCMS_DRIVER_PROFILES", DRIVER_PROFILES);
+        p.put("SCMS_DRIVER_AGGRESSIVE_PCT", DRIVER_AGGRESSIVE_FRAC * 100.0);
+        p.put("SCMS_DRIVER_PASSIVE_PCT", DRIVER_PASSIVE_FRAC * 100.0);
+        p.put("SCMS_PSEUDONYM_POLICY", PSEUDONYM_POLICY);
+        p.put("SCMS_PSN_DIST_MIN_M", PSN_DIST_MIN_M);
+        p.put("SCMS_PSN_DIST_MAX_M", PSN_DIST_MAX_M);
+        p.put("SCMS_PSN_TIME_MIN_S", PSN_TIME_MIN_S);
+        p.put("SCMS_PSN_TIME_MAX_S", PSN_TIME_MAX_S);
+        p.putAll(attackCfg.effective());
+        synchronized (appParams) {
+            p.putAll(appParams);
+        }
+        return p;
+    }
+
+    /** The SCMS_* environment as the launcher actually set it (output path excluded: machine-local). */
+    private static Map<String, String> rawScmsEnv() {
+        Map<String, String> env = new TreeMap<>();
+        for (Map.Entry<String, String> e : System.getenv().entrySet()) {
+            if (e.getKey().startsWith("SCMS_") && !"SCMS_OUT_DIR".equals(e.getKey())) {
+                env.put(e.getKey(), e.getValue());
+            }
+        }
+        return env;
+    }
+
+    /**
+     * Scenario input-file hashes, read from a JSON side-car the scenario generator writes next to
+     * scenario_config.json (or pointed at by SCMS_INPUTS_JSON). Contract (schema "scms.inputs/1"):
+     *
+     * <pre>{ "schema": "scms.inputs/1", "scenario_key": "...", "generator": "...",
+     *   "params": {...}, "tool_versions": {...},
+     *   "inputs": { "sumo/ingolstadt.net.xml": "&lt;sha256&gt;", ... } }</pre>
+     *
+     * The list form {@code "inputs": [{"path": ..., "sha256": ...}, ...]} is accepted too. Absent
+     * file -> the key is simply omitted from the manifest, so nothing depends on the generator side.
+     */
+    private Map<String, Object> inputManifest() {
+        for (Path p : inputManifestCandidates()) {
+            try {
+                if (p == null || !Files.isRegularFile(p)) {
+                    continue;
+                }
+                byte[] raw = Files.readAllBytes(p);
+                Map<?, ?> parsed = new Gson().fromJson(new String(raw, StandardCharsets.UTF_8), Map.class);
+                if (parsed == null) {
+                    continue;
+                }
+                Map<String, Object> out = new LinkedHashMap<>();
+                out.put("source", p.toAbsolutePath().normalize().toString().replace('\\', '/'));
+                out.put("inputs_file_sha256", sha256Hex(raw));
+                for (String k : new String[] {"schema", "scenario_key", "generator", "generated_utc",
+                        "params", "tool_versions"}) {
+                    Object v = parsed.get(k);
+                    if (v != null) {
+                        out.put(k, v);
+                    }
+                }
+                out.put("files", inputFileHashes(parsed.get("inputs")));
+                return out;
+            } catch (Exception ex) {
+                System.err.println("[ScmsBackend] input manifest unreadable (" + p + "): " + ex);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * One value out of the generator side-car's ``params`` block, as a string.
+     *
+     * <p>Used for the scenario facts the Java layer cannot know but a downstream consumer needs --
+     * chiefly ``road_network``, which the generator derives from the actual SUMO net (see
+     * mapgen.road_network_token) and which datagen.realism_bench turns into its reference-band
+     * regime. Falls back to ``dflt`` when there is no side-car or no such key.
+     */
+    private static String inputParam(Map<String, Object> inputs, String key, String dflt) {
+        Object params = (inputs == null) ? null : inputs.get("params");
+        if (params instanceof Map) {
+            Object v = ((Map<?, ?>) params).get(key);
+            if (v != null && !String.valueOf(v).isBlank()) {
+                return String.valueOf(v).trim();
+            }
+        }
+        return dflt == null ? "" : dflt.trim();
+    }
+
+    private List<Path> inputManifestCandidates() {
+        List<Path> cands = new ArrayList<>();
+        String explicit = System.getenv("SCMS_INPUTS_JSON");
+        if (explicit != null && !explicit.isBlank()) {
+            cands.add(Paths.get(explicit.trim()));
+        }
+        java.io.File dir = scenarioDir;
+        if (dir != null) {
+            // MOSAIC hands the app its <scenario>/application directory, so also look one and two
+            // levels up (the scenario root, where scenario_config.json lives).
+            Path base = dir.toPath().toAbsolutePath().normalize();
+            for (int up = 0; up < 3 && base != null; up++) {
+                cands.add(base.resolve("scms_inputs.json"));
+                base = base.getParent();
+            }
+        }
+        return cands;
+    }
+
+    /** Normalise either {"path": "sha"} or [{"path":..,"sha256":..}] into a sorted path -> sha map. */
+    private static Map<String, String> inputFileHashes(Object inputs) {
+        Map<String, String> files = new TreeMap<>();
+        if (inputs instanceof Map) {
+            for (Map.Entry<?, ?> e : ((Map<?, ?>) inputs).entrySet()) {
+                files.put(String.valueOf(e.getKey()), String.valueOf(e.getValue()));
+            }
+        } else if (inputs instanceof List) {
+            for (Object o : (List<?>) inputs) {
+                if (o instanceof Map) {
+                    Map<?, ?> m = (Map<?, ?>) o;
+                    Object path = m.get("path");
+                    Object sha = m.get("sha256");
+                    if (path != null && sha != null) {
+                        files.put(String.valueOf(path), String.valueOf(sha));
+                    }
+                }
+            }
+        }
+        return files;
     }
 
     /** Throttled snapshot of active vehicles for the live dashboard map (state: 0 benign,

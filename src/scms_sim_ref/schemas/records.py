@@ -41,6 +41,11 @@ FORBIDDEN_FEATURE_KEYS = frozenset({
                                                  # MA-visible feature is_vru_declared is NOT caught)
     "colluding_group_id", "true_linkage_seed", "true_revocation_time",
     "should_have_been_revoked", "report_correctness",
+    # MOSAIC realism layer (opt-in, ORACLE-side only): the NextGen sensor-error model logs the
+    # HONEST measurement before falsification into gt_emissions_sample, and the ported NextGen
+    # DriverProfile lands the latent driver class on gt_vehicle. A receiver can observe neither
+    # (it sees only the claimed CAM), so both are ground truth and must never become features.
+    "measured_x", "measured_y", "measured_speed", "driver_profile",
 })
 
 

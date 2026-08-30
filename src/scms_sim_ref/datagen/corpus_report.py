@@ -14,6 +14,7 @@ to "unavailable" rather than crashing.
 
     python -m scms_sim_ref.datagen.corpus_report --corpus datasets/massive
     python -m scms_sim_ref.datagen.corpus_report --corpus datasets/massive --out report.md
+    python -m scms_sim_ref.datagen.corpus_report --corpus datasets/massive --realism   # + realism gate
 
 Programmatic use::
 
@@ -25,6 +26,13 @@ Programmatic use::
 The attack family/type SPACE is imported from the code (single source of truth), never hardcoded:
 ``ATTACK_CATALOG`` + ``COMBINED_ATTACKS`` from the engine give the ~25 renderable types, and
 ``featurize._ATTACK_FAMILY`` maps them to the family set (7 base families + the opt-in "combined").
+
+REALISM GATE (opt-in). Balance and coverage say nothing about whether the traffic and the radio look
+real. Passing ``--realism`` scores every dataset directory under the corpus with
+``datagen.realism_bench`` and folds its findings in as a separate section plus a separate warning
+list; a HARD realism failure (physical-plausibility gates: teleports, vehicle overlap, acceleration
+bounds, plus a liveness gate the other three cannot supply) then makes the CLI exit non-zero. Without the flag NOTHING changes -- no realism section, no
+extra warnings, and the historical exit code (non-zero iff a balance/coverage warning fired).
 """
 from __future__ import annotations
 
@@ -43,6 +51,7 @@ import pandas as pd
 # the report tracks the code automatically -- add a type/family in run.py and it shows up as a gap.
 from scms_sim_ref.mock_pipeline.run import ATTACK_CATALOG, KNOWN_ATTACK_TYPES
 from scms_sim_ref.datagen.featurize import _ATTACK_FAMILY
+from scms_sim_ref.datagen import realism_bench
 
 ALL_TYPES: tuple[str, ...] = tuple(KNOWN_ATTACK_TYPES)   # every renderable type (catalog + opt-in)
 TYPE_TO_FAMILY: dict[str, str] = {t: _ATTACK_FAMILY.get(t, "other") for t in ALL_TYPES}
@@ -367,15 +376,71 @@ def _analyze_size(corpus_dir: str, veh: pd.DataFrame | None,
     return out, warnings
 
 
+def find_dataset_dirs(corpus_dir: str) -> list[str]:
+    """Dataset directories (a ``manifest.json`` beside ``ground_truth/``) at or under `corpus_dir`.
+
+    Sorted, so the realism section is deterministic. Only the corpus root and its immediate children
+    are probed: ``massive`` streams and deletes per-domain directories, so a merged corpus normally
+    exposes either itself or a handful of retained domain dirs, never a deep tree.
+    """
+    corpus_dir = os.fspath(corpus_dir)
+    cands = [corpus_dir]
+    if os.path.isdir(corpus_dir):
+        cands += [os.path.join(corpus_dir, n) for n in sorted(os.listdir(corpus_dir))]
+    return [c for c in cands
+            if os.path.isdir(os.path.join(c, "ground_truth"))
+            and os.path.exists(os.path.join(c, "manifest.json"))]
+
+
+def _analyze_realism(corpus_dir: str, dataset_dirs: list[str] | None) -> tuple[dict, list[str]]:
+    """Score each dataset directory with datagen.realism_bench and turn failures into warnings.
+
+    HARD failures (physical-plausibility gates) are the CI gate; SOFT ones are reported as warnings
+    too but recorded separately so a caller can grade them differently.
+    """
+    warnings: list[str] = []
+    dirs = list(dataset_dirs) if dataset_dirs else find_dataset_dirs(corpus_dir)
+    if not dirs:
+        return ({"available": False,
+                 "reason": "no dataset directory (manifest.json + ground_truth/) at or under the "
+                           "corpus root; realism needs the raw dataset, not the merged ml/ tables.",
+                 "datasets": []},
+                ["Realism gate requested but no dataset directory was found under the corpus "
+                 "(merged ml/ tables alone cannot be scored for realism)."])
+    entries, hard_all = [], []
+    for d in dirs:
+        try:
+            card = realism_bench.scorecard(d)
+        except Exception as exc:                    # never let a bad dataset kill the report
+            entries.append({"dataset_dir": d, "error": f"{type(exc).__name__}: {exc}"})
+            warnings.append(f"Realism scoring failed for {d}: {type(exc).__name__}: {exc}")
+            continue
+        s = card["summary"]
+        entries.append({"dataset_dir": d, "engine": card["probe"]["engine"], "summary": s,
+                        "metrics": [{k: m[k] for k in ("id", "value", "unit", "status", "severity")}
+                                    for m in card["panels"]["traffic"] + card["panels"]["comm"]]})
+        hard_all.extend(s["hard_failures"])
+        for line in realism_bench.warning_lines(card):
+            warnings.append(f"{os.path.basename(d) or d}: {line}")
+    return ({"available": True, "n_datasets": len(dirs), "datasets": entries,
+             "hard_failures": sorted(set(hard_all))}, warnings)
+
+
 # --------------------------------------------------------------------------------------------------
 # public API
 # --------------------------------------------------------------------------------------------------
-def build_report(corpus_dir: str) -> dict:
+def build_report(corpus_dir: str, realism_dirs: list[str] | None = None,
+                 realism: bool = False) -> dict:
     """Analyze a corpus directory and return a balance/coverage report as a dict.
 
     Read-only and deterministic. Missing optional files (domain_catalog.json / manifest.json) degrade
     gracefully. ``report["warnings"]`` aggregates every section's warnings; an empty list means the
     corpus is well-balanced and well-covered by these checks.
+
+    Realism is OPT-IN: pass ``realism=True`` (optionally with explicit ``realism_dirs``) to also score
+    every dataset directory with ``datagen.realism_bench``. Its findings land in ``report["realism"]``
+    and ``report["realism_warnings"]`` -- deliberately NOT in ``report["warnings"]``, so the default
+    balance/coverage verdict and exit code are unchanged.
     """
     corpus_dir = os.fspath(corpus_dir)
     ml = os.path.join(corpus_dir, "ml")
@@ -402,6 +467,11 @@ def build_report(corpus_dir: str) -> dict:
     warnings = [w for sect in ("class_balance", "attack_coverage", "domain_diversity",
                                "difficulty_spread", "size") for w in warnings_by_section[sect]]
 
+    realism_section: dict | None = None
+    realism_warnings: list[str] = []
+    if realism or realism_dirs:
+        realism_section, realism_warnings = _analyze_realism(corpus_dir, realism_dirs)
+
     return {
         "corpus_dir": corpus_dir,
         "has_domain_catalog": catalog is not None,
@@ -413,7 +483,14 @@ def build_report(corpus_dir: str) -> dict:
         "size": size,
         "warnings": warnings,
         "warnings_by_section": warnings_by_section,
+        "realism": realism_section,
+        "realism_warnings": realism_warnings,
     }
+
+
+def realism_hard_failures(report: dict) -> list[str]:
+    """Hard (physical-plausibility) realism failures -- the only realism finding that gates CI."""
+    return list(((report.get("realism") or {}).get("hard_failures")) or [])
 
 
 # --------------------------------------------------------------------------------------------------
@@ -526,6 +603,33 @@ def render_markdown(report: dict) -> str:
                  f"min={int(pdr['min'])}, median={int(pdr['median'])}, max={int(pdr['max'])}.")
     L.append("")
 
+    # -- realism (opt-in; absent unless build_report was asked for it) --
+    rl = report.get("realism")
+    if rl is not None:
+        L.append("## Realism")
+        if not rl.get("available"):
+            L.append(f"_Unavailable -- {rl.get('reason')}._")
+        else:
+            L.append(f"{rl['n_datasets']} dataset director(ies) scored with "
+                     f"`datagen.realism_bench` (traffic + comm panels vs pinned reference "
+                     f"summaries in `datagen/refdata/`).")
+            L.append("")
+            L.append("| dataset | engine | pass | fail | n/a | hard failures |")
+            L.append("| --- | --- | ---: | ---: | ---: | --- |")
+            for d in rl["datasets"]:
+                if "error" in d:
+                    L.append(f"| {os.path.basename(d['dataset_dir'])} | - | - | - | - | "
+                             f"ERROR: {d['error']} |")
+                    continue
+                s = d["summary"]
+                L.append(f"| {os.path.basename(d['dataset_dir']) or d['dataset_dir']} | "
+                         f"{d['engine']} | {s['pass']} | {s['fail']} | {s['na']} | "
+                         f"{', '.join(s['hard_failures']) or '-'} |")
+            L.append("")
+            L.append(f"Hard realism failures across the corpus: "
+                     f"{', '.join(rl['hard_failures']) or 'none'}.")
+        L.append("")
+
     # -- warnings --
     L.append("## Warnings")
     if report["warnings"]:
@@ -534,6 +638,16 @@ def render_markdown(report: dict) -> str:
     else:
         L.append("None -- the corpus is well-balanced and well-covered by these checks.")
     L.append("")
+
+    if report.get("realism") is not None:
+        L.append("## Realism warnings")
+        if report.get("realism_warnings"):
+            for w in report["realism_warnings"]:
+                L.append(f"- {w}")
+        else:
+            L.append("None -- every scored realism metric is inside its reference range "
+                     "(or reported as not-applicable for this dataset).")
+        L.append("")
 
     return "\n".join(L)
 
@@ -547,12 +661,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--corpus", required=True, help="corpus directory (as written by datagen.massive)")
     ap.add_argument("--out", default=None, help="write the Markdown report to this path")
     ap.add_argument("--json", action="store_true", help="also print the report dict as JSON")
+    ap.add_argument("--realism", nargs="*", metavar="DATASET_DIR", default=None,
+                    help="also score dataset realism (datagen.realism_bench) and gate on HARD "
+                         "failures; with no argument, dataset dirs are discovered under --corpus. "
+                         "Omitting the flag leaves behaviour and exit code exactly as before.")
     a = ap.parse_args(argv)
 
     if not os.path.isdir(a.corpus):
         ap.error(f"corpus directory not found: {a.corpus}")
+    for d in (a.realism or []):
+        if not os.path.isdir(d):
+            ap.error(f"realism dataset directory not found: {d}")
 
-    report = build_report(a.corpus)
+    report = build_report(a.corpus, realism_dirs=(a.realism or None),
+                          realism=(a.realism is not None))
     md = render_markdown(report)
     print(md)
     if a.json:
@@ -561,8 +683,11 @@ def main(argv: list[str] | None = None) -> int:
         with open(a.out, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(md)
         print(f"\n[wrote {a.out}]")
-    # exit non-zero when there are warnings, so the tool is usable as a CI balance gate
-    return 1 if report["warnings"] else 0
+    # exit non-zero when there are warnings, so the tool is usable as a CI balance gate.
+    # HARD realism failures gate too, but ONLY when --realism was passed (default is unchanged).
+    if report["warnings"]:
+        return 1
+    return 1 if realism_hard_failures(report) else 0
 
 
 if __name__ == "__main__":

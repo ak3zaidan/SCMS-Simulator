@@ -1,0 +1,85 @@
+{
+  "reference_set": "geh",
+  "title": "FHWA microsimulation calibration/validation acceptance criteria (GEH, link flows, travel times)",
+  "scope": "SUMO-side detector validation (tools/sumo_realism.py): simulated induction-loop counts vs reference counts.",
+  "curated_from": "docs/realism/investigation/research-realism-benchmarks.json (benchmarks[0,1,2,3], findings A.1) and docs/realism/ROADMAP.md sections 4 (Phase-1 gate) and 5.",
+  "formula": "GEH = sqrt(2*(m-c)^2/(m+c)) with m = modelled flow and c = counted flow, both in veh/h over the same interval",
+  "entries": {
+    "geh_link_max": {
+      "max": 5.0,
+      "unit": "GEH",
+      "confidence": "anchored",
+      "cite": "FHWA Traffic Analysis Toolbox Vol III (2004) section 5",
+      "source": "FHWA Traffic Analysis Toolbox Volume III: Guidelines for Applying Traffic Microsimulation Modeling Software (FHWA-HRT-04-040, 2004), section 5 Calibration, https://ops.fhwa.dot.gov/trafficanalysistools/tat_vol3/sect5.htm ; Wisconsin DOT freeway criteria / UK DMRB-TAG lineage; restated by TxDOT Microsimulation Analysis manual section 13-5.",
+      "note": "GEH < 5 for individual link flows."
+    },
+    "geh_link_min_pass_fraction": {
+      "min": 0.85,
+      "unit": "fraction",
+      "confidence": "anchored",
+      "cite": "FHWA Traffic Analysis Toolbox Vol III (2004) section 5",
+      "source": "Same FHWA Traffic Analysis Toolbox Volume III table (FHWA-HRT-04-040, 2004, section 5): the GEH < 5 criterion must hold for more than 85% of individual link flow cases.",
+      "note": "The primary Phase-1 gate: 'GEH < 5 on >= 85% of InTAS induction-loop stations' (ROADMAP Phase-1 benchmark gate)."
+    },
+    "geh_total_max": {
+      "max": 4.0,
+      "unit": "GEH",
+      "confidence": "anchored",
+      "cite": "FHWA Traffic Analysis Toolbox Vol III (2004) section 5",
+      "source": "Same FHWA Traffic Analysis Toolbox Volume III table (FHWA-HRT-04-040, 2004, section 5): GEH < 4 for the sum of all link flows across the modelled network.",
+      "note": "Evaluated on the summed modelled vs summed reference flow across all stations."
+    },
+    "geh_calibration_target": {
+      "max": 3.0,
+      "unit": "GEH",
+      "confidence": "anchored",
+      "cite": "TxDOT Microsimulation Analysis manual section 13-5",
+      "source": "Agencies commonly adopt GEH <= 3 as the stricter CALIBRATION (rather than validation) target: https://www.txdot.gov/manuals/des/tsp/chapter-13-microsimulation-analysis/13-5-calibration.html .",
+      "note": "Reported as a stretch target alongside the GEH < 5 validation gate; not a pass/fail gate here."
+    },
+    "total_flow_tolerance_fraction": {
+      "max": 0.05,
+      "unit": "fraction",
+      "confidence": "anchored",
+      "cite": "FHWA Traffic Analysis Toolbox Vol III (2004) section 5",
+      "source": "Same FHWA Traffic Analysis Toolbox Volume III table (FHWA-HRT-04-040, 2004, section 5): the sum of all link flows must be within 5% of the counted total.",
+      "note": "Evaluated as |sum(m) - sum(c)| / sum(c)."
+    },
+    "link_flow_tolerance_bands": {
+      "value": {
+        "below_700": {"max_abs_veh_h": 100.0},
+        "700_to_2700": {"max_rel": 0.15},
+        "above_2700": {"max_abs_veh_h": 400.0}
+      },
+      "unit": "mixed",
+      "confidence": "anchored",
+      "cite": "FHWA Traffic Analysis Toolbox Vol III (2004) section 5",
+      "source": "Same FHWA Traffic Analysis Toolbox Volume III table (FHWA-HRT-04-040, 2004, section 5): individual link flows within 100 veh/h for counts below 700 veh/h; within 15% for 700 < q < 2700 veh/h; within 400 veh/h for q > 2700 veh/h -- each for more than 85% of cases.",
+      "note": "Band selection uses the REFERENCE (counted) flow, which is the FHWA convention."
+    },
+    "link_flow_min_pass_fraction": {
+      "min": 0.85,
+      "unit": "fraction",
+      "confidence": "anchored",
+      "cite": "FHWA Traffic Analysis Toolbox Vol III (2004) section 5",
+      "source": "Same FHWA Traffic Analysis Toolbox Volume III table (FHWA-HRT-04-040, 2004, section 5): the per-link flow tolerance must hold for more than 85% of cases.",
+      "note": "Companion pass-rate for link_flow_tolerance_bands."
+    },
+    "travel_time_tolerance": {
+      "value": {"max_rel": 0.15, "max_abs_s": 60.0, "min_pass_fraction": 0.85},
+      "unit": "mixed",
+      "confidence": "anchored",
+      "cite": "FHWA Traffic Analysis Toolbox Vol III (2004) section 5",
+      "source": "Same FHWA Traffic Analysis Toolbox Volume III table (FHWA-HRT-04-040, 2004, section 5): journey times within 15% (or 1 minute, whichever is higher) for more than 85% of routes.",
+      "note": "PINNED FOR LATER PHASES; tools/sumo_realism.py does not read tripinfo/route travel times in Phase 0."
+    },
+    "fhwa_2019_distribution_criteria": {
+      "value": {"within_2sigma_fraction": 0.95, "within_1sigma_fraction": 0.66},
+      "unit": "fraction",
+      "confidence": "anchored",
+      "cite": "FHWA-HOP-18-036 (2019 update)",
+      "source": "FHWA 2019 update (FHWA-HOP-18-036, https://ops.fhwa.dot.gov/publications/fhwahop18036/index.htm) replaces single-number matching with distribution-based criteria against a multi-day field variation envelope: (I) 95% of simulated time-series points inside the 2-sigma band; (II) 66% inside the 1-sigma band, plus a critical-interval condition; (III) Bounded Dynamic Absolute Error; (IV) Bounded Dynamic Systematic Error.",
+      "note": "PINNED FOR LATER PHASES: it requires >= 10 seeds per scenario to build the simulated distribution, which Phase 0 does not run."
+    }
+  }
+}

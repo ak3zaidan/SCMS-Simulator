@@ -377,6 +377,11 @@ def main(argv=None) -> int:
                     help="after generation, write CORPUS_REPORT.md (balance/coverage) next to the "
                          "manifest and print its warnings summary (read-only; default ON, "
                          "--no-report disables)")
+    ap.add_argument("--realism", action="store_true",
+                    help="score each domain with datagen.realism_bench before its directory is "
+                         "deleted and record the scorecard summary in domain_catalog.json "
+                         "(read-only, deterministic; default OFF because it re-reads every "
+                         "domain's ground truth)")
     ap.add_argument("--out", default=str(REPO / "datasets" / "massive"))
     a = ap.parse_args(argv)
 
@@ -460,12 +465,17 @@ def main(argv=None) -> int:
                     row_counts[tbl] += _append(df, idx, base / "ml" / f"{tbl}.csv", header_written)
             # per-domain difficulty labels (from its own ground truth, before the dir is deleted):
             # lets a trainer curriculum-weight or stratify the merged corpus by how hard each domain is.
-            vs = valmod.validate(str(dom_dir))[0]
-            catalog.append({"domain_id": idx, **entry, **wrec, "seed": cfg.seed,
-                            "reports": res.n_reports, "revoked": res.n_revoked,
-                            "precision": vs.get("precision"), "recall": vs.get("recall"),
-                            "recall_by_family": vs.get("recall_by_family", {}),
-                            "recall_by_type": vs.get("recall_by_type", {})})
+            # --realism additionally scores the domain's TRAFFIC/COMM realism here, i.e. while the
+            # domain dir still exists (it is deleted in the finally: below).
+            vs = valmod.validate(str(dom_dir), realism=a.realism)[0]
+            rec = {"domain_id": idx, **entry, **wrec, "seed": cfg.seed,
+                   "reports": res.n_reports, "revoked": res.n_revoked,
+                   "precision": vs.get("precision"), "recall": vs.get("recall"),
+                   "recall_by_family": vs.get("recall_by_family", {}),
+                   "recall_by_type": vs.get("recall_by_type", {})}
+            if a.realism:
+                rec["realism"] = vs.get("realism", {})
+            catalog.append(rec)
         except Exception as e:                       # noqa: BLE001 -- keep the campaign alive
             failed.append({"domain_id": idx, **entry, **wrec, "error": f"{type(e).__name__}: {e}"})
             print(f"   [{idx + 1}/{len(plan)}] FAILED domain {idx}: {type(e).__name__}: {e}", flush=True)

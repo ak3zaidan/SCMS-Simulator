@@ -180,4 +180,35 @@ cd $env:MOSAIC_HOME
 
 `mosaic.bat` builds a relative classpath, so always run it with the MOSAIC bundle
 as the working directory. `ScmsBeaconApp` receives SUMO-driven vehicle updates —
-the hook point for signing, detection, and reporting.
+the hook point for signing, detection, and reporting. `ScmsRsuApp` is its static
+counterpart on road-side units: it never beacons, and runs the same detector suite
+(`CamDetector`, shared by both) from a surveyed position.
+
+## Quality gates
+
+There is no hosted CI runner in this repository; these are the commands a CI job (or a
+pre-push hook) should run. All of them are read-only and exit non-zero on failure.
+
+```powershell
+# 1. Determinism + everything else. The golden data digests are pinned inside the suite,
+#    so a change that perturbs the default config fails here.
+python -m pytest -q
+
+# 2. Data correctness over every dataset on disk (leakage, referential integrity, label
+#    correctness, count reconciliation, splits, provenance, per-file digests).
+python tools/verify_data.py                     # add --recursive for nested corpora
+
+# 3. Realism. HARD metrics are physical plausibility (acceleration bounds, teleports,
+#    vehicle overlap); soft ones only warn.
+python -m scms_sim_ref.datagen.realism_bench datasets/smoke --markdown --fail-on-hard
+python -m scms_sim_ref.datagen.corpus_report --corpus datasets/massive --realism
+```
+
+Both realism commands are **opt-in**: without `--fail-on-hard` / `--realism` nothing about
+the existing exit codes or output changes. Scoring the distribution metrics needs a full
+emission trace — `emit_sample_prob=1.0` (Python) or `SCMS_EMIT_SAMPLE=1.0` (MOSAIC);
+otherwise the harness reports those metrics as `na` with the reason, rather than guessing.
+
+A SUMO-side traffic-calibration gate (GEH plus the four FHWA criteria over induction loops)
+lives in `tools/sumo_realism.py`; it needs reference counts, which are not yet on disk —
+see `docs/realism/PROGRESS.md`.

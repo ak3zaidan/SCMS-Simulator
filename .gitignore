@@ -32,3 +32,13 @@ gui/last_run.log
 # Secrets — never commit API keys
 .env
 .env.*
+
+# Extracted MOSAIC/SUMO jar contents + stray tool output from inspecting federates
+/org/
+/META-INF/
+/trafficsigns/
+/CSumoScheme.json
+/routes.rou.xml
+/*.rou.xml
+/*.net.xml
+/*.trips.xml

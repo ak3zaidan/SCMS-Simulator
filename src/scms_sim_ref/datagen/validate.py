@@ -20,7 +20,28 @@ def _read(path: str) -> list[dict]:
         return [json.loads(line) for line in fh if line.strip()]
 
 
-def validate(dataset_dir: str) -> tuple[dict, list]:
+def realism_summary(dataset_dir: str) -> dict:
+    """Compact realism verdict for a dataset: ``datagen.realism_bench``'s scorecard summary.
+
+    Read-only and deterministic (the harness never writes into the dataset). Returned as a plain
+    dict so campaign/massive/foundry can record it per domain next to precision/recall. A dataset
+    the harness cannot score at all degrades to ``{"error": ...}`` rather than raising -- realism is
+    a reporting signal here, never a reason to fail a whole corpus run.
+    """
+    from . import realism_bench
+    try:
+        card = realism_bench.scorecard(dataset_dir)
+    except Exception as exc:                              # noqa: BLE001 -- never break a corpus run
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    s = dict(card["summary"])
+    s["engine"] = card["probe"]["engine"]
+    s["emit_sample_prob"] = card["probe"]["emit_sample_prob"]
+    return s
+
+
+def validate(dataset_dir: str, realism: bool = False) -> tuple[dict, list]:
+    """Validate a dataset. ``realism=True`` additionally folds ``realism_summary()`` into the
+    summary under a ``realism`` key -- OPT-IN, so the historical summary shape is unchanged."""
     ma = os.path.join(dataset_dir, "ma")
     gt = os.path.join(dataset_dir, "ground_truth")
 
@@ -134,6 +155,8 @@ def validate(dataset_dir: str) -> tuple[dict, list]:
         "rsu_contribution": rsu_contribution,
         "detection_latency_s": latency,
     }
+    if realism:
+        summary["realism"] = realism_summary(dataset_dir)
     return summary, leaks
 
 
@@ -141,8 +164,10 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
     p = argparse.ArgumentParser(description="Validate a generated SCMS dataset.")
     p.add_argument("dataset_dir")
+    p.add_argument("--realism", action="store_true",
+                   help="also record the datagen.realism_bench scorecard summary (opt-in)")
     args = p.parse_args(argv)
-    summary, leaks = validate(args.dataset_dir)
+    summary, leaks = validate(args.dataset_dir, realism=args.realism)
     print(json.dumps(summary, indent=2))
     if leaks:
         print("LEAKAGE DETECTED:", json.dumps(leaks, indent=2))

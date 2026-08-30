@@ -208,6 +208,32 @@ def _base_valid(summary: dict) -> bool:
     return int(summary.get("attackers", 0) or 0) > 0 and _n_reports(summary) > 0
 
 
+def realism_valid(dataset_dir: str) -> tuple[bool, dict]:
+    """Physical-plausibility gate: reject a candidate whose TRAFFIC is kinematically absurd.
+
+    The search maximises "hard to detect", and one cheap way to be hard to detect is to be
+    unphysical -- vehicles that teleport, overlap, or brake at 30 m/s^2 produce evidence no real
+    detector was ever calibrated against, so an elite won on that basis is a simulator artefact,
+    not a blind spot. This is the realism sibling of :func:`_base_valid`'s report-activity gate:
+    it rejects only ``datagen.realism_bench``'s HARD metrics (accel bounds, teleports, overlaps and
+    the liveness fraction -- the first three are impossibility checks that a scenario in which
+    nothing moves would pass trivially), never the SOFT distribution-shape ones, which legitimately
+    vary with the scenario.
+
+    Returns ``(valid, realism_summary)``. A dataset the harness cannot score (e.g. sub-sampled
+    emissions leave every hard metric ``na``) is NOT rejected -- absence of evidence is not a
+    failure -- so the gate is conservative by construction.
+    """
+    from . import realism_bench
+    try:
+        card = realism_bench.scorecard(dataset_dir)
+    except Exception as exc:                    # noqa: BLE001 -- scoring must never kill the search
+        return True, {"error": f"{type(exc).__name__}: {exc}"}
+    s = dict(card["summary"])
+    s["engine"] = card["probe"]["engine"]
+    return not s.get("hard_failures"), s
+
+
 def fitness(objective: str, summary: dict, duration_s: float) -> tuple[float, bool]:
     """Return ``(fitness, valid)``. Higher fitness == harder-to-detect (better adversarial) scenario.
 
@@ -509,12 +535,23 @@ def _candidate(cfg: PipelineConfig, seed: int, duration_s: float, summary: dict,
 # --------------------------------------------------------------------------- #
 # Search driver
 # --------------------------------------------------------------------------- #
-def _evaluate(genome: dict, seed: int, duration_s: float, work_dir: str, objective: str):
-    """Run one candidate to completion and score it. Returns (cfg, summary, fitness, valid)."""
+def _evaluate(genome: dict, seed: int, duration_s: float, work_dir: str, objective: str,
+              realism_gate: bool = False):
+    """Run one candidate to completion and score it. Returns (cfg, summary, fitness, valid).
+
+    ``realism_gate`` (opt-in) additionally runs :func:`realism_valid` over the candidate's dataset
+    and vetoes archiving on any HARD physical-plausibility failure, recording the realism summary on
+    the run summary either way. Default OFF so the pure-random search stays byte-identical.
+    """
     cfg = build_config(genome, seed, duration_s, work_dir)      # may raise -> caller isolates
     run_pipeline(cfg)
     summary = validate_mod.validate(work_dir)[0]
     fit, valid = fitness(objective, summary, duration_s)
+    if realism_gate:
+        r_ok, r_sum = realism_valid(work_dir)
+        summary["realism"] = r_sum
+        if not r_ok:
+            fit, valid = 0.0, False
     return cfg, summary, fit, valid
 
 
@@ -543,7 +580,7 @@ def _apply_mutation_fn(mutation_fn, parent: dict, archive: Archive, rng: random.
 
 def run_foundry(budget: int = 60, seed: int = 7, base_duration: float = 40.0,
                 out_dir: str = "datasets/foundry", objective: str = "evade",
-                verbose: bool = False, mutation_fn=None) -> Archive:
+                verbose: bool = False, mutation_fn=None, realism_gate: bool = False) -> Archive:
     """Run the MAP-Elites loop and write ``archive.json`` + ``FOUNDRY_REPORT.md`` to ``out_dir``.
 
     Init evaluates the 3 base genomes; then ``budget`` iterations each pick a parent (a base genome
@@ -557,6 +594,11 @@ def run_foundry(budget: int = 60, seed: int = 7, base_duration: float = 40.0,
     used and the run is DETERMINISTIC: same (budget, seed, base_duration, objective) -> byte-identical
     archive.json. When provided (e.g. an LLM semantic operator), candidates are proposed by the hook
     but still validated + scored + inserted identically; such runs are NOT byte-identical by design.
+
+    ``realism_gate`` (default OFF, so the historical archive is byte-identical) adds
+    :func:`realism_valid` next to the report-activity validity gate: an elite that only "evades"
+    because its traffic teleports, overlaps or accelerates outside [-8, +4] m/s^2 is rejected
+    instead of archived as a blind spot.
     """
     # Fail fast on a bad objective BEFORE spending the whole (expensive) budget. Without this an unknown
     # objective raises inside every _evaluate, is swallowed per-candidate, and leaves a SILENT empty
@@ -588,7 +630,8 @@ def run_foundry(budget: int = 60, seed: int = 7, base_duration: float = 40.0,
         cseed = _derive_seed(seed, counter)
         wdir = os.path.join(work_root, f"c{counter:05d}")
         try:
-            cfg, summary, fit, valid = _evaluate(genome, cseed, base_duration, wdir, objective)
+            cfg, summary, fit, valid = _evaluate(genome, cseed, base_duration, wdir, objective,
+                                                 realism_gate=realism_gate)
             if valid:
                 cell = descriptor(_config_dict(cfg), summary)
                 archive.insert_if_better(cell, _candidate(cfg, cseed, base_duration, summary,
@@ -670,6 +713,8 @@ def _write_archive(archive: Archive, out_dir: str) -> str:
             "evade": "1 - recall", "family:<F>": "1 - recall_by_family[F]",
             "latency": "clamp(median_detection_latency_s / duration_s, 0, 1)",
             "validity_gate": "attackers>0 AND ma_rows>0 (+ family present / latency n>0)",
+            "realism_gate": ("realism_bench HARD metrics (accel bounds / teleports / overlaps) "
+                             "when run_foundry(realism_gate=True); OFF by default"),
         },
         "grid_size": m["grid_size"], "coverage_cells": m["coverage_cells"],
         "coverage_pct": m["coverage_pct"], "qd_score": m["qd_score"],
@@ -768,10 +813,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="evade | family:<F> (e.g. family:stealth) | latency")
     ap.add_argument("--out", default="datasets/foundry", help="output dir (archive.json + report)")
     ap.add_argument("--verbose", action="store_true", help="print progress heartbeat")
+    ap.add_argument("--realism-gate", action="store_true",
+                    help="also reject candidates that fail datagen.realism_bench's HARD "
+                         "physical-plausibility metrics (teleports / overlaps / accel bounds), so an "
+                         "elite cannot win by being kinematically absurd (default OFF)")
     a = ap.parse_args(argv)
 
     archive = run_foundry(budget=a.budget, seed=a.seed, base_duration=a.duration,
-                          out_dir=a.out, objective=a.objective, verbose=a.verbose)
+                          out_dir=a.out, objective=a.objective, verbose=a.verbose,
+                          realism_gate=a.realism_gate)
     m = archive.meta
     print(f"[foundry] objective={m['objective']} seed={m['seed']} budget={m['budget']}")
     print(f"[foundry] coverage={m['coverage_cells']}/{m['grid_size']} ({m['coverage_pct']}%)  "

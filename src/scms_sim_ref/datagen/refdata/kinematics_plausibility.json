@@ -1,0 +1,108 @@
+{
+  "reference_set": "kinematics",
+  "title": "Physical-plausibility bounds on vehicle kinematics",
+  "scope": "Any microscopic traffic simulation output (trajectory-level). Regime-independent.",
+  "curated_from": "docs/realism/investigation/research-realism-benchmarks.json (benchmarks[5], findings A.3) and docs/realism/ROADMAP.md section 5.",
+  "entries": {
+    "accel_hard_bound_mps2": {
+      "range": [-8.0, 4.0],
+      "unit": "m/s^2",
+      "confidence": "anchored",
+      "cite": "Punzo et al. 2011 / Coifman & Li 2017 (NGSIM critique)",
+      "source": "Physical-plausibility gate on trajectory data. Punzo, Borzacchiello & Ciuffo, 'On the assessment of vehicle trajectory data accuracy and application to the Next Generation SIMulation (NGSIM) program data', Transportation Research Part C 19(6), 2011; Coifman & Li, 'A critical evaluation of the Next Generation Simulation (NGSIM) vehicle trajectory dataset', Transportation Research Part B 105, 2017. Raw NGSIM violated this band massively, which is the canonical trajectory-realism failure.",
+      "note": "Applied as a HARD gate at exactly 1.0: 100% of the measured accelerations must fall inside this band. What is measured is the LONGITUDINAL second difference (see realism_bench.track_kinematics) with position discontinuities screened out and attributed to their own metrics, so the gate scores driving dynamics rather than lane-change geometry. The gate stays HARD and keeps the 1.0 threshold -- no tolerance -- because after every artefact class is removed the pure-Python engine still leaves 20 of 32517 samples outside the band at pair_dt = 1.0 s exactly (accel_min -8.98, accel_max +4.87 m/s^2, measured 2026-08-30 on datasets/realism_baseline/python_flow_grid6_fulltrace). Those cannot be small-interval differentiation noise, and true_x/true_y are recorded to 1 mm, so position quantisation contributes ~0.2 m/s^2 at dt=0.1 s and cannot explain a residual either."
+    },
+    "accel_comfort_band_mps2": {
+      "range": [-3.0, 3.0],
+      "unit": "m/s^2",
+      "confidence": "anchored",
+      "cite": "Punzo et al. 2011 / Coifman & Li 2017 (NGSIM critique)",
+      "source": "Same lineage as accel_hard_bound_mps2: human driving is 'mostly within +/-3 m/s^2'. Summarised in docs/realism/investigation/research-realism-benchmarks.json benchmarks[5].",
+      "note": "Companion fraction gate is accel_comfort_min_fraction."
+    },
+    "accel_comfort_min_fraction": {
+      "min": 0.95,
+      "unit": "fraction",
+      "confidence": "anchored",
+      "cite": "ROADMAP section 5 gate (Punzo/Coifman lineage)",
+      "source": "Project-adopted gate: >= 95% of benign accelerations within +/-3 m/s^2 (docs/realism/ROADMAP.md section 5, 'Accel plausibility' row, and Phase 1 benchmark gate).",
+      "note": "Threshold is a project gate; the underlying band is the cited NGSIM-critique plausibility range."
+    },
+    "lane_change_duration_s": {
+      "range": [2.0, 4.0],
+      "unit": "s",
+      "confidence": "coarse",
+      "cite": "lane-change duration is seconds, not one simulation step (NGSIM/highD trajectory literature)",
+      "source": "A real vehicle crosses the ~3.2 m between two lane centrelines over a lane-change manoeuvre lasting a few seconds, not instantaneously: the manoeuvre is the unit of observation in every trajectory-dataset lane-change study (NGSIM I-80/US-101 and highD are the two vendored-provenance sources named in docs/realism/investigation/research-realism-benchmarks.json section D). The 2-4 s band is the commonly quoted central range and is used here only to derive an upper bound on lateral speed, never to score a duration.",
+      "derivation": "NOT a transcribed measurement. The Phase-0 research report pins no lane-change duration distribution (highd_percentile_summary below is deliberately empty for the same reason), so this entry states the coarse band the derived thresholds rest on and labels itself accordingly.",
+      "note": "Used only to derive lateral_speed_max_mps. Replace with a licensed highD/NGSIM extraction if a duration distribution is ever needed as a score."
+    },
+    "lateral_speed_max_mps": {
+      "max": 2.0,
+      "unit": "m/s",
+      "confidence": "coarse",
+      "cite": "derived from lane_change_duration_s; SUMO caps lateral speed with vType maxSpeedLat",
+      "source": "Derived plausibility ceiling on how fast a vehicle can move ACROSS its lane. A 3.2 m lane width traversed over a 2-4 s lane change (lane_change_duration_s) is a sustained 0.8-1.6 m/s; 2.0 m/s is set above that band so that only clearly non-physical single-sample offsets are counted. SUMO's own continuous-lateral (sublane) model bounds lateral motion by the vType attribute maxSpeedLat for exactly this reason, i.e. the simulator treats unbounded lateral speed as impossible as soon as continuous lateral motion is switched on.",
+      "derivation": "3.2 m / 2.0 s = 1.6 m/s upper end of the plausible band; the threshold is rounded up to 2.0 m/s so that the metric cannot fire on a fast but real lane change.",
+      "note": "Threshold, not a measurement. Paired with lateral_discontinuity_per_vehicle_km_max."
+    },
+    "lateral_discontinuity_per_vehicle_km_max": {
+      "max": 0.0,
+      "unit": "events/vehicle-km",
+      "confidence": "coarse",
+      "cite": "SUMO 1.25.0 `--lanechange.duration` default 0 (instantaneous lane change)",
+      "source": "A physically continuous mobility model produces NO single-sample lateral position jumps at all, so the reference is zero. SUMO does not: with the sublane model off, a lane change is a discrete re-assignment of the vehicle from one lane centreline to the next, and the local toolchain confirms the default -- `sumo --help` (SUMO 1.25.0, C:/Users/Administrator/tools/sumo/sumo-1.25.0) reports `--lanechange.duration TIME  Duration of a lane change maneuver (default 0)` and `--lateral-resolution FLOAT ... with -1 all vehicles drive at the center of their lane`. The vehicle therefore appears one whole lane width (~3.2 m) sideways between two consecutive CAM samples, which is precisely the signature a V2X position-plausibility detector keys on -- so this is a dataset-realism defect, not a cosmetic one.",
+      "derivation": "Zero is the physical target, not a tolerance: any non-zero rate is a known-open defect. Scored SOFT on purpose -- every current MOSAIC/SUMO run is non-zero by construction and gating CI on it would only wedge the pipeline. Promote to HARD once `--lanechange.duration`/`--lateral-resolution` are set and the measured rate reaches zero.",
+      "note": "Tracked, not gated. This is the metric that must fall to 0 when continuous lateral motion is enabled."
+    },
+    "speed_hard_bound_mps": {
+      "range": [0.0, 60.0],
+      "unit": "m/s",
+      "confidence": "coarse",
+      "cite": "coarse plausibility envelope",
+      "source": "Derived plausibility envelope, not a measured percentile: 60 m/s = 216 km/h exceeds the free-flow speed of every vehicle class present in the Phase-0 reference scenarios (highD German motorway trajectories; InTAS Ingolstadt urban/motorway demand). Used only to flag teleport / parse artefacts.",
+      "note": "Deliberately coarse. Regime-specific speed bands live in traffic_regimes.json."
+    },
+    "teleport_events_max": {
+      "max": 0,
+      "unit": "count",
+      "confidence": "anchored",
+      "cite": "ROADMAP section 5 'Sim health' row",
+      "source": "docs/realism/ROADMAP.md section 5 traffic panel: 'teleports=0, overlap events=0, jam removals=0' (SUMO statistics / internal conflict metric).",
+      "note": "A teleport is a consecutive-sample displacement implying a speed above speed_hard_bound_mps."
+    },
+    "overlap_events_max": {
+      "max": 0,
+      "unit": "count",
+      "confidence": "anchored",
+      "cite": "ROADMAP section 5 'Sim health' row",
+      "source": "docs/realism/ROADMAP.md section 5 traffic panel (overlap events = 0). Two distinct vehicles occupying the same point at the same instant is a modelling failure, not a rare event.",
+      "note": "Measured as distinct-vehicle pairs closer than the overlap distance at an identical timestamp."
+    },
+    "moving_vehicle_min_fraction": {
+      "min": 0.5,
+      "unit": "fraction",
+      "confidence": "coarse",
+      "cite": "project-adopted liveness gate (converse of the ROADMAP 'Sim health' row)",
+      "source": "Project-adopted LIVENESS gate, added because every other hard gate in docs/realism/ROADMAP.md section 5 is an IMPOSSIBILITY check: 'teleports=0, overlap events=0, jam removals=0' and 100% of accelerations inside [-8,+4] m/s^2 are all satisfied trivially by a dataset in which no vehicle ever moves (no displacement, hence no teleport, no acceleration and, for a parked fleet, no overlap), while the headway metrics degrade to 'na' because a stationary follower is skipped. At least half the tracked vehicles must therefore average above a walking-pace floor over their own track before the traffic panel means anything.",
+      "derivation": "0.5 m/s (1.8 km/h) sits below any moving road vehicle and above the position jitter of a stationary one. The 0.5 fraction tolerates a heavily congested or signal-metered network in which half the fleet is queued for the whole of its (short) observation window.",
+      "note": "Threshold is a project gate, not a published measurement. Applied as a HARD gate."
+    },
+    "car_following_gap_rmspe_pct": {
+      "range": [5.0, 30.0],
+      "unit": "percent",
+      "confidence": "anchored",
+      "cite": "Kurtc 2020 TRR; Treiber & Kesting",
+      "source": "Kurtc, 'Studying Car-Following Dynamics on the Basis of the HighD Dataset', Transportation Research Record, 2020, doi:10.1177/0361198120925063 (IDM per-pair calibration on highD: 5.2-6.9% mean gap error); Treiber & Kesting: 10-30% calibration error is the inter/intra-driver variability floor.",
+      "note": "PINNED FOR LATER PHASES ONLY. Phase 0 does not compute per-pair car-following calibration; this entry exists so Phase 1/3 use the same audited number."
+    },
+    "highd_percentile_summary": {
+      "available": false,
+      "unit": "n/a",
+      "confidence": "unavailable",
+      "cite": "highD (Krajewski et al., ITSC 2018)",
+      "source": "highD: Krajewski, Bock, Kloeker & Eckstein, 'The highD Dataset: A Drone Dataset of Naturalistic Vehicle Trajectories on German Highways', IEEE ITSC 2018, doi:10.1109/ITSC.2018.8569552 (25 Hz, ~110,000 vehicles, ~44,500 driven km, position error typically < 10 cm; academic licence).",
+      "note": "DELIBERATELY EMPTY. The Phase-0 research report (docs/realism/investigation/research-realism-benchmarks.json) records highD's provenance and the car-following gap-error anchors but publishes NO headway/acceleration percentile table, and highD itself is licence-gated and not vendored in this repo. Inventing percentiles here would fabricate precision beyond the sources, so headway realism is scored against the shape model in traffic_regimes.json instead. Populate this entry only from a licensed highD extraction."
+    }
+  }
+}

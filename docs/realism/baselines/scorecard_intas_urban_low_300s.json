@@ -1,0 +1,824 @@
+{
+  "dataset_dir": "C:\\Users\\Administrator\\Documents\\SCMS-Simulator\\datasets\\mosaic_intas_urban_low_gate",
+  "panels": {
+    "comm": [
+      {
+        "details": {
+          "art_censored_links": 0,
+          "candidate_reports": 818,
+          "gt_endpoint_lookup_failures": 804,
+          "note": "distance-triggered reports (acceptanceRangeThreshold) are excluded so the report-trigger probability is distance-independent",
+          "reconstruction_method": "art_reconstruction",
+          "total_reports": 30098
+        },
+        "id": "comm.honest_links",
+        "n": 818,
+        "panel": "comm",
+        "reason": "informational: sample size for every other comm metric",
+        "severity": "soft",
+        "status": "na",
+        "title": "Honest (false-positive) report links usable for the PDR curve",
+        "unit": "count",
+        "value": 818
+      },
+      {
+        "details": {
+          "normalization": "ratio of observed honest links to co-presence opportunities, divided by the same ratio in the nearest populated bin",
+          "reconstruction_method": "art_reconstruction",
+          "regime": "urban"
+        },
+        "id": "comm.awareness_ratio_100m",
+        "n": 110,
+        "panel": "comm",
+        "reason": "no reference gate at this distance/regime (v2x_awareness pins 200 m urban and 500 m highway)",
+        "severity": "soft",
+        "status": "na",
+        "title": "Neighbour awareness ratio at 100 m (normalised)",
+        "unit": "fraction",
+        "value": 1.1912
+      },
+      {
+        "details": {
+          "normalization": "ratio of observed honest links to co-presence opportunities, divided by the same ratio in the nearest populated bin",
+          "reconstruction_method": "art_reconstruction",
+          "regime": "urban"
+        },
+        "id": "comm.awareness_ratio_200m",
+        "n": 105,
+        "panel": "comm",
+        "reference": {
+          "cite": "ROADMAP Phase-2 gate (Boban & d'Orey measurement campaign)",
+          "confidence": "anchored",
+          "min": 0.9,
+          "note": "The 0.90 threshold is a PROJECT-ADOPTED gate; the underlying campaign is cited for the metric definition and the qualitative level, not for a transcribed 0.90 figure.",
+          "ref_id": "v2x_awareness.awareness_ratio_200m_urban_min",
+          "source": "Project-adopted gate from docs/realism/ROADMAP.md section 5 comm panel and the Phase-2 benchmark gate: '>= 90% neighbor-awareness at 200 m urban ... under low load (reference: Boban & d'Orey 2015 measurement campaign)'. Neighbour-awareness ratio is defined as detected neighbours / neighbours physically present within a nominal range inside a freshness window -- EURECOM, 'Rethinking Cooperative Awareness for Future V2X Safety-critical Applications', https://www.eurecom.fr/publication/5365/download/comsys-publi-5365.pdf.",
+          "unit": "fraction"
+        },
+        "severity": "soft",
+        "status": "pass",
+        "title": "Neighbour awareness ratio at 200 m (normalised)",
+        "unit": "fraction",
+        "value": 1.2973
+      },
+      {
+        "details": {
+          "normalization": "ratio of observed honest links to co-presence opportunities, divided by the same ratio in the nearest populated bin",
+          "reconstruction_method": "art_reconstruction",
+          "regime": "urban"
+        },
+        "id": "comm.awareness_ratio_300m",
+        "n": 102,
+        "panel": "comm",
+        "reason": "no reference gate at this distance/regime (v2x_awareness pins 200 m urban and 500 m highway)",
+        "severity": "soft",
+        "status": "na",
+        "title": "Neighbour awareness ratio at 300 m (normalised)",
+        "unit": "fraction",
+        "value": 1.2257
+      },
+      {
+        "details": {
+          "crossing_method": "levels are crossed on the least non-increasing majorant of the measured curve (running maximum from the far end), so a single Poisson-noise dip cannot manufacture a gray zone",
+          "curve": [
+            {
+              "d_hi_m": 50.0,
+              "d_lo_m": 0.0,
+              "links": 57,
+              "normalized_ratio": 1.0,
+              "opportunities": 150,
+              "usable": true
+            },
+            {
+              "d_hi_m": 100.0,
+              "d_lo_m": 50.0,
+              "links": 65,
+              "normalized_ratio": 1.2577,
+              "opportunities": 136,
+              "usable": true
+            },
+            {
+              "d_hi_m": 150.0,
+              "d_lo_m": 100.0,
+              "links": 45,
+              "normalized_ratio": 1.1067,
+              "opportunities": 107,
+              "usable": true
+            },
+            {
+              "d_hi_m": 200.0,
+              "d_lo_m": 150.0,
+              "links": 84,
+              "normalized_ratio": 1.8119,
+              "opportunities": 122,
+              "usable": true
+            },
+            {
+              "d_hi_m": 250.0,
+              "d_lo_m": 200.0,
+              "links": 21,
+              "normalized_ratio": 0.6073,
+              "opportunities": 91,
+              "usable": true
+            },
+            {
+              "d_hi_m": 300.0,
+              "d_lo_m": 250.0,
+              "links": 26,
+              "normalized_ratio": 0.6055,
+              "opportunities": 113,
+              "usable": true
+            },
+            {
+              "d_hi_m": 350.0,
+              "d_lo_m": 300.0,
+              "links": 76,
+              "normalized_ratio": 1.8868,
+              "opportunities": 106,
+              "usable": true
+            },
+            {
+              "d_hi_m": 400.0,
+              "d_lo_m": 350.0,
+              "links": 47,
+              "normalized_ratio": 1.1143,
+              "opportunities": 111,
+              "usable": true
+            },
+            {
+              "d_hi_m": 450.0,
+              "d_lo_m": 400.0,
+              "links": 49,
+              "normalized_ratio": 1.5351,
+              "opportunities": 84,
+              "usable": true
+            },
+            {
+              "d_hi_m": 500.0,
+              "d_lo_m": 450.0,
+              "links": 37,
+              "normalized_ratio": 0.7728,
+              "opportunities": 126,
+              "usable": true
+            },
+            {
+              "d_hi_m": 550.0,
+              "d_lo_m": 500.0,
+              "links": 48,
+              "normalized_ratio": 0.9868,
+              "opportunities": 128,
+              "usable": true
+            },
+            {
+              "d_hi_m": 600.0,
+              "d_lo_m": 550.0,
+              "links": 71,
+              "normalized_ratio": 1.5441,
+              "opportunities": 121,
+              "usable": true
+            },
+            {
+              "d_hi_m": 650.0,
+              "d_lo_m": 600.0,
+              "links": 88,
+              "normalized_ratio": 1.6308,
+              "opportunities": 142,
+              "usable": true
+            },
+            {
+              "d_hi_m": 700.0,
+              "d_lo_m": 650.0,
+              "links": 81,
+              "normalized_ratio": 1.4211,
+              "opportunities": 150,
+              "usable": true
+            },
+            {
+              "d_hi_m": 750.0,
+              "d_lo_m": 700.0,
+              "links": 23,
+              "normalized_ratio": 0.4692,
+              "opportunities": 129,
+              "usable": true
+            },
+            {
+              "d_hi_m": 800.0,
+              "d_lo_m": 750.0,
+              "links": 0,
+              "normalized_ratio": 0.0,
+              "opportunities": 130,
+              "usable": true
+            },
+            {
+              "d_hi_m": 850.0,
+              "d_lo_m": 800.0,
+              "links": 0,
+              "normalized_ratio": 0.0,
+              "opportunities": 150,
+              "usable": true
+            },
+            {
+              "d_hi_m": 900.0,
+              "d_lo_m": 850.0,
+              "links": 0,
+              "normalized_ratio": 0.0,
+              "opportunities": 141,
+              "usable": true
+            },
+            {
+              "d_hi_m": 950.0,
+              "d_lo_m": 900.0,
+              "links": 0,
+              "normalized_ratio": 0.0,
+              "opportunities": 143,
+              "usable": true
+            },
+            {
+              "d_hi_m": 1000.0,
+              "d_lo_m": 950.0,
+              "links": 0,
+              "normalized_ratio": 0.0,
+              "opportunities": 176,
+              "usable": true
+            }
+          ],
+          "d_at_0p20_m": 753.7,
+          "d_at_0p90_m": 702.4,
+          "min_bin_opportunities": 30
+        },
+        "id": "comm.pdr_gray_zone_width_m",
+        "n": 818,
+        "panel": "comm",
+        "reference": {
+          "cite": "ROADMAP section 5 (Bai/Stancil/Krishnan MobiCom 2010 shape)",
+          "confidence": "anchored",
+          "min": 100.0,
+          "note": "A step-function (unit-disc) range model FAILS this by construction -- that is the intended Phase-0 baseline finding, not a harness defect.",
+          "ref_id": "v2x_awareness.pdr_gray_zone_width_min_m",
+          "source": "Project-adopted gate from docs/realism/ROADMAP.md section 5: 'PDR gray-zone width (90% -> 20%) >= 100 m', referencing the DSRC empirical characterisation of Bai, Stancil & Krishnan, 'Toward understanding characteristics of dedicated short range communications (DSRC) from a perspective of vehicular network engineers', ACM MobiCom 2010, doi:10.1145/1859995.1860033, which establishes the reliable-zone / stochastic-gray-zone / cutoff shape.",
+          "unit": "m"
+        },
+        "severity": "soft",
+        "status": "fail",
+        "title": "PDR gray-zone width (awareness 90% -> 20%)",
+        "unit": "m",
+        "value": 51.3166
+      },
+      {
+        "details": {
+          "nominal_radio_range_m": 709.4
+        },
+        "id": "comm.effective_range_m",
+        "n": 818,
+        "panel": "comm",
+        "reason": "informational: tracked, no pass/fail band (the curve is proportional-to-PDR, not absolute -- see v2x_awareness.los_high_pdr_range_m for the pinned anchor)",
+        "severity": "soft",
+        "status": "na",
+        "title": "Effective range (awareness ratio crosses 0.5)",
+        "unit": "m",
+        "value": 723.3819
+      },
+      {
+        "details": {
+          "gap_min_s": 0.1,
+          "gap_p95_s": 51.025,
+          "note": "one CAM per vehicle per step in the Python engine (1 Hz at dt=1.0 s); the MOSAIC layer implements ETSI dynamic triggering (1-10 Hz)"
+        },
+        "id": "comm.cam_inter_packet_gap_p50_s",
+        "n": 4346,
+        "panel": "comm",
+        "reason": "emissions are a 0.02 sample, so observed CAM gaps are inflated by 1/emit_sample_prob; rerun with full emission tracing",
+        "reference": {
+          "cite": "ETSI EN 302 637-2 (T_GenCamMin / T_GenCamMax)",
+          "confidence": "anchored",
+          "note": "The MOSAIC layer implements this triggering (ScmsBeaconApp T_GenCamMin 0.1 s / T_GenCamMax 1.0 s); the pure-Python engine emits exactly one CAM per vehicle per step (1 Hz at the default dt = 1.0 s), which sits at the upper edge of the band.",
+          "range": [
+            0.1,
+            1.0
+          ],
+          "ref_id": "etsi_cam_dcc.cam_interval_s",
+          "source": "ETSI EN 302 637-2 V1.4.1, Intelligent Transport Systems (ITS); Vehicular Communications; Basic Set of Applications; Part 2: Specification of Cooperative Awareness Basic Service. T_GenCamMin = 100 ms, T_GenCamMax = 1000 ms, i.e. a CAM rate between 1 Hz and 10 Hz.",
+          "unit": "s"
+        },
+        "severity": "soft",
+        "status": "na",
+        "title": "CAM inter-packet gap (median, per vehicle)",
+        "unit": "s",
+        "value": 9.7
+      }
+    ],
+    "traffic": [
+      {
+        "details": {
+          "emit_sample_prob": 0.02,
+          "max_finite_difference_dt_s": 2.0,
+          "segments_dropped_sampling_gap": 3716,
+          "vehicles_with_track": 325
+        },
+        "id": "traffic.trace_segments",
+        "n": 630,
+        "panel": "traffic",
+        "reason": "informational: sample size for every other traffic metric",
+        "severity": "soft",
+        "status": "na",
+        "title": "Usable trajectory segments (finite-difference pairs)",
+        "unit": "count",
+        "value": 630
+      },
+      {
+        "details": {
+          "regime": "urban",
+          "source_field": "longitudinal component of the true_x/true_y finite difference"
+        },
+        "id": "traffic.speed_p50_mps",
+        "n": 630,
+        "panel": "traffic",
+        "reference": {
+          "cite": "pNEUMA urban corpus (coarse envelope)",
+          "confidence": "coarse",
+          "derivation": "Upper bound 14.0 m/s ~= the 50 km/h posted urban limit (13.9 m/s): a network median above the limit is implausible. Lower bound 3.0 m/s ~= 11 km/h, a heavily congested urban network mean. No published percentile is asserted.",
+          "range": [
+            3.0,
+            14.0
+          ],
+          "ref_id": "traffic_regimes.urban.speed_p50_mps",
+          "source": "Coarse envelope anchored on pNEUMA as the urban reference corpus: Barmpounakis & Geroliminis, 'On the new era of urban traffic monitoring with massive drone data: The pNEUMA large-scale field experiment', Transportation Research Part C 111, 2020, doi:10.1016/j.trc.2019.11.023 (Athens CBD, 10 drones, ~500,000 trajectories, open on Zenodo 10491409).",
+          "unit": "m/s"
+        },
+        "severity": "soft",
+        "status": "pass",
+        "title": "Benign true speed p50 (urban)",
+        "unit": "m/s",
+        "value": 13.3895
+      },
+      {
+        "details": {
+          "regime": "urban",
+          "source_field": "longitudinal component of the true_x/true_y finite difference"
+        },
+        "id": "traffic.speed_p95_mps",
+        "n": 630,
+        "panel": "traffic",
+        "reference": {
+          "cite": "pNEUMA urban corpus (coarse envelope)",
+          "confidence": "coarse",
+          "derivation": "Upper bound 22.0 m/s ~= 79 km/h, allowing urban arterials/limited-access links above the 50 km/h core limit. Lower bound 8.0 m/s ~= 29 km/h: a p95 below this means the whole network is in permanent gridlock.",
+          "range": [
+            8.0,
+            22.0
+          ],
+          "ref_id": "traffic_regimes.urban.speed_p95_mps",
+          "source": "Same provenance as urban.speed_p50_mps: pNEUMA (Barmpounakis & Geroliminis, Transportation Research Part C 111, 2020, doi:10.1016/j.trc.2019.11.023) as the urban reference corpus, with no published percentile table.",
+          "unit": "m/s"
+        },
+        "severity": "soft",
+        "status": "fail",
+        "title": "Benign true speed p95 (urban)",
+        "unit": "m/s",
+        "value": 55.2813
+      },
+      {
+        "details": {
+          "note": "value is longitudinal; the raw chord speed is shown for comparison",
+          "speed_max_raw_chord_mps": 55.5846
+        },
+        "id": "traffic.speed_max_mps",
+        "n": 630,
+        "panel": "traffic",
+        "reference": {
+          "cite": "coarse plausibility envelope",
+          "confidence": "coarse",
+          "note": "Deliberately coarse. Regime-specific speed bands live in traffic_regimes.json.",
+          "range": [
+            0.0,
+            60.0
+          ],
+          "ref_id": "kinematics.speed_hard_bound_mps",
+          "source": "Derived plausibility envelope, not a measured percentile: 60 m/s = 216 km/h exceeds the free-flow speed of every vehicle class present in the Phase-0 reference scenarios (highD German motorway trajectories; InTAS Ingolstadt urban/motorway demand). Used only to flag teleport / parse artefacts.",
+          "unit": "m/s"
+        },
+        "severity": "soft",
+        "status": "pass",
+        "title": "Maximum finite-difference speed",
+        "unit": "m/s",
+        "value": 55.5846
+      },
+      {
+        "details": {
+          "events": 535,
+          "events_per_1000_sample_pairs": 123.1017,
+          "full_lane_steps": 2114,
+          "half_lane_steps": 2383,
+          "lane_step_counts_note": "half_lane_steps/full_lane_steps are the RAW lateral-offset distribution with no physical guard applied -- they include cornering, so they exceed `events` on any engine that turns through 90 degrees inside one sample. Only `events` is the metric",
+          "lateral_jump_threshold_m": 1.6,
+          "lateral_offset_p99_m": 342.0787,
+          "lateral_speed_threshold_mps": 2.0,
+          "longitudinal_reversal_events": 68,
+          "longitudinal_reversal_note": "the same discrete lane/edge position remapping seen along the road instead of across it: the next sample lands more than 0.5 m BEHIND this one",
+          "longitudinal_reversal_per_vehicle_km": 0.0864,
+          "max_lateral_step_m": 1139.187,
+          "method": "per consecutive-sample step, the displacement component ACROSS the smoothed direction of travel (circular median over +-3 steps). A step counts when it moves >= 1.6 m sideways at more than 2 m/s AND the RAW headings of the steps either side agree within 45 deg -- a lane change does not turn the vehicle, a corner does, so cornering is not counted. A track's first and last step are not scanned (no evidence on one side). Normalised per vehicle-km of path, which is invariant to the CAM trigger rate; the per-1000-step rate is given alongside and is not",
+          "sample_pairs": 4346,
+          "sub_lane_note": "steps with a non-physical lateral speed but under 1.6 m of offset (>= 0.25 m) are NOT counted in the headline rate -- they are partial lane offsets, not lane changes -- but they are screened out of the acceleration series for the same reason",
+          "sub_lane_screen_threshold_m": 0.25,
+          "sub_lane_screened_steps": 15,
+          "vehicle_km": 786.931,
+          "vehicle_km_note": "longitudinal path length, so a jump's sideways component does not pad the denominator of the rate it is counted against"
+        },
+        "id": "traffic.lateral_discontinuity_events",
+        "n": 4346,
+        "panel": "traffic",
+        "reference": {
+          "cite": "SUMO 1.25.0 `--lanechange.duration` default 0 (instantaneous lane change)",
+          "confidence": "coarse",
+          "derivation": "Zero is the physical target, not a tolerance: any non-zero rate is a known-open defect. Scored SOFT on purpose -- every current MOSAIC/SUMO run is non-zero by construction and gating CI on it would only wedge the pipeline. Promote to HARD once `--lanechange.duration`/`--lateral-resolution` are set and the measured rate reaches zero.",
+          "max": 0.0,
+          "note": "Tracked, not gated. This is the metric that must fall to 0 when continuous lateral motion is enabled.",
+          "ref_id": "kinematics.lateral_discontinuity_per_vehicle_km_max",
+          "source": "A physically continuous mobility model produces NO single-sample lateral position jumps at all, so the reference is zero. SUMO does not: with the sublane model off, a lane change is a discrete re-assignment of the vehicle from one lane centreline to the next, and the local toolchain confirms the default -- `sumo --help` (SUMO 1.25.0, C:/Users/Administrator/tools/sumo/sumo-1.25.0) reports `--lanechange.duration TIME  Duration of a lane change maneuver (default 0)` and `--lateral-resolution FLOAT ... with -1 all vehicles drive at the center of their lane`. The vehicle therefore appears one whole lane width (~3.2 m) sideways between two consecutive CAM samples, which is precisely the signature a V2X position-plausibility detector keys on -- so this is a dataset-realism defect, not a cosmetic one.",
+          "unit": "events/vehicle-km"
+        },
+        "severity": "soft",
+        "status": "fail",
+        "title": "Lane-change teleports (a lane-width sideways step inside one sample), per vehicle-km",
+        "unit": "events/vehicle-km",
+        "value": 0.6799
+      },
+      {
+        "details": {
+          "accel_max": 2.7142,
+          "accel_min": -3.3982,
+          "accel_p01": -3.3779,
+          "accel_p99": 2.7034,
+          "band_mps2": [
+            -8.0,
+            4.0
+          ],
+          "by_pair_dt_s": [
+            {
+              "accel_max": 0.0,
+              "accel_min": 0.0,
+              "frac_within_band": 1.0,
+              "n": 1,
+              "pair_dt_hi_s": 0.15,
+              "pair_dt_lo_s": 0.0
+            },
+            {
+              "accel_max": 0.0099,
+              "accel_min": -3.305,
+              "frac_within_band": 1.0,
+              "n": 2,
+              "pair_dt_hi_s": 0.35,
+              "pair_dt_lo_s": 0.15
+            },
+            {
+              "accel_max": 2.7142,
+              "accel_min": -3.3982,
+              "frac_within_band": 1.0,
+              "n": 19,
+              "pair_dt_hi_s": 0.75,
+              "pair_dt_lo_s": 0.35
+            },
+            {
+              "accel_max": 1.2433,
+              "accel_min": -3.368,
+              "frac_within_band": 1.0,
+              "n": 40,
+              "pair_dt_hi_s": 1.5,
+              "pair_dt_lo_s": 0.75
+            },
+            {
+              "accel_max": 0.0814,
+              "accel_min": -2.6224,
+              "frac_within_band": 1.0,
+              "n": 6,
+              "pair_dt_hi_s": 2.0,
+              "pair_dt_lo_s": 1.5
+            }
+          ],
+          "method": "second difference of the LONGITUDINAL speed (displacement projected on the direction of travel, smoothed over +-3 steps), over the exact midpoint separation (dt_i + dt_i+1)/2",
+          "samples_before_screening": 92,
+          "sampling_note": "each acceleration sample carries equal weight; the by_pair_dt_s breakdown is what makes an interval-dependent artefact visible",
+          "screened_note": "position DISCONTINUITIES are not accelerations: lane-change teleports go to traffic.lateral_discontinuity_events, teleports to traffic.teleport_events, and a track's first/last step is a partial insertion/arrival step, not a second of driving. screened_out.lateral uses the lower 0.25 m sub-lane threshold, so it exceeds the reported event count",
+          "screened_out": {
+            "boundary": 14,
+            "lateral": 9,
+            "reversal": 1,
+            "teleport": 0
+          },
+          "unscreened_accel_max": 3.0822,
+          "unscreened_accel_min": -3.3982,
+          "unscreened_frac_within_band": 1.0,
+          "unscreened_note": "the SAME longitudinal estimator with the discontinuity screen switched off (not the pre-fix raw-chord estimator)"
+        },
+        "id": "traffic.accel_within_hard_bound_frac",
+        "n": 68,
+        "panel": "traffic",
+        "reference": {
+          "cite": "Punzo et al. 2011 / Coifman & Li 2017 (NGSIM critique)",
+          "confidence": "anchored",
+          "min": 1.0,
+          "note": "hard gate: the fraction inside the band must be exactly 1.0",
+          "ref_id": "kinematics.accel_hard_bound_mps2",
+          "source": "Physical-plausibility gate on trajectory data. Punzo, Borzacchiello & Ciuffo, 'On the assessment of vehicle trajectory data accuracy and application to the Next Generation SIMulation (NGSIM) program data', Transportation Research Part C 19(6), 2011; Coifman & Li, 'A critical evaluation of the Next Generation Simulation (NGSIM) vehicle trajectory dataset', Transportation Research Part B 105, 2017. Raw NGSIM violated this band massively, which is the canonical trajectory-realism failure.",
+          "unit": "fraction"
+        },
+        "severity": "hard",
+        "status": "pass",
+        "title": "Accelerations inside the human plausibility bound",
+        "unit": "fraction",
+        "value": 1.0
+      },
+      {
+        "details": {
+          "band_mps2": [
+            -3.0,
+            3.0
+          ]
+        },
+        "id": "traffic.accel_within_comfort_frac",
+        "n": 68,
+        "panel": "traffic",
+        "reference": {
+          "cite": "ROADMAP section 5 gate (Punzo/Coifman lineage)",
+          "confidence": "anchored",
+          "min": 0.95,
+          "note": "Threshold is a project gate; the underlying band is the cited NGSIM-critique plausibility range.",
+          "ref_id": "kinematics.accel_comfort_min_fraction",
+          "source": "Project-adopted gate: >= 95% of benign accelerations within +/-3 m/s^2 (docs/realism/ROADMAP.md section 5, 'Accel plausibility' row, and Phase 1 benchmark gate).",
+          "unit": "fraction"
+        },
+        "severity": "soft",
+        "status": "fail",
+        "title": "Accelerations inside the comfort band (+/-3 m/s^2)",
+        "unit": "fraction",
+        "value": 0.9412
+      },
+      {
+        "details": {
+          "method": "mean speed over EVERY consecutive sample pair, including gaps longer than max_finite_difference_dt_s (2 s)",
+          "pairs_examined": 4346,
+          "speed_bound_mps": 60.0
+        },
+        "id": "traffic.teleport_events",
+        "n": 4346,
+        "panel": "traffic",
+        "reference": {
+          "cite": "ROADMAP section 5 'Sim health' row",
+          "confidence": "anchored",
+          "max": 0,
+          "note": "A teleport is a consecutive-sample displacement implying a speed above speed_hard_bound_mps.",
+          "ref_id": "kinematics.teleport_events_max",
+          "source": "docs/realism/ROADMAP.md section 5 traffic panel: 'teleports=0, overlap events=0, jam removals=0' (SUMO statistics / internal conflict metric).",
+          "unit": "count"
+        },
+        "severity": "hard",
+        "status": "pass",
+        "title": "Teleports (displacement implying a speed above the bound)",
+        "unit": "count",
+        "value": 0
+      },
+      {
+        "details": {
+          "instants_examined": 240,
+          "overlap_distance_m": 1.0
+        },
+        "id": "traffic.overlap_events",
+        "n": 240,
+        "panel": "traffic",
+        "reference": {
+          "cite": "ROADMAP section 5 'Sim health' row",
+          "confidence": "anchored",
+          "max": 0,
+          "note": "Measured as distinct-vehicle pairs closer than the overlap distance at an identical timestamp.",
+          "ref_id": "kinematics.overlap_events_max",
+          "source": "docs/realism/ROADMAP.md section 5 traffic panel (overlap events = 0). Two distinct vehicles occupying the same point at the same instant is a modelling failure, not a rare event.",
+          "unit": "count"
+        },
+        "severity": "hard",
+        "status": "pass",
+        "title": "Distinct vehicles overlapping (< 1 m apart at one instant)",
+        "unit": "count",
+        "value": 0
+      },
+      {
+        "details": {
+          "liveness_min_speed_mps": 0.5,
+          "method": "path length / track span per vehicle, so a vehicle queued for part of its trip still counts as moving",
+          "vehicles_with_track": 325
+        },
+        "id": "traffic.moving_vehicle_frac",
+        "n": 325,
+        "panel": "traffic",
+        "reference": {
+          "cite": "project-adopted liveness gate (converse of the ROADMAP 'Sim health' row)",
+          "confidence": "coarse",
+          "derivation": "0.5 m/s (1.8 km/h) sits below any moving road vehicle and above the position jitter of a stationary one. The 0.5 fraction tolerates a heavily congested or signal-metered network in which half the fleet is queued for the whole of its (short) observation window.",
+          "min": 0.5,
+          "note": "Threshold is a project gate, not a published measurement. Applied as a HARD gate.",
+          "ref_id": "kinematics.moving_vehicle_min_fraction",
+          "source": "Project-adopted LIVENESS gate, added because every other hard gate in docs/realism/ROADMAP.md section 5 is an IMPOSSIBILITY check: 'teleports=0, overlap events=0, jam removals=0' and 100% of accelerations inside [-8,+4] m/s^2 are all satisfied trivially by a dataset in which no vehicle ever moves (no displacement, hence no teleport, no acceleration and, for a parked fleet, no overlap), while the headway metrics degrade to 'na' because a stationary follower is skipped. At least half the tracked vehicles must therefore average above a walking-pace floor over their own track before the traffic panel means anything.",
+          "unit": "fraction"
+        },
+        "severity": "hard",
+        "status": "pass",
+        "title": "Vehicles that actually move (track mean speed >= 0.5 m/s)",
+        "unit": "fraction",
+        "value": 1.0
+      },
+      {
+        "details": {
+          "heading_tolerance_deg": 22.5,
+          "headway_p15_s": null,
+          "headway_p85_s": null,
+          "lane_width_m": 3.2,
+          "lateral_tolerance_m": 1.6,
+          "leader_rule": "nearest vehicle ahead in the follower's own heading frame, within half a lane width laterally (no spatial cell, so long headways are not censored)",
+          "max_headway_s": 60.0
+        },
+        "id": "traffic.headway_p50_s",
+        "n": 0,
+        "panel": "traffic",
+        "reason": "emissions are a 0.02 sample (emit_sample_prob < 0.999); per-vehicle trajectories are lossy -- rerun with emit_sample_prob=1.0 (python) / SCMS_EMIT_SAMPLE=1.0 (MOSAIC)",
+        "reference": {
+          "cite": "derived from the lane-capacity anchor",
+          "confidence": "anchored",
+          "derivation": "3600/2400 = 1.5 s and 3600/1800 = 2.0 s. This is the mean time headway AT CAPACITY, i.e. the lower edge of a realistic headway distribution -- free-flow medians are larger. Reported for context; not used as a pass/fail band on the run-wide median.",
+          "range": [
+            1.5,
+            2.0
+          ],
+          "ref_id": "traffic_regimes.saturation_headway_s",
+          "source": "Derived arithmetically from fundamental_diagram.json capacity_veh_per_h_per_lane = 1800-2400 veh/h/lane.",
+          "unit": "s"
+        },
+        "severity": "soft",
+        "status": "na",
+        "title": "Time headway median (spacing / follower speed)",
+        "unit": "s",
+        "value": null
+      },
+      {
+        "details": {
+          "floor_s": 0.5,
+          "floor_source_ref": "traffic_regimes.headway_implausible_below_s"
+        },
+        "id": "traffic.headway_below_floor_frac",
+        "n": 0,
+        "panel": "traffic",
+        "reason": "emissions are a 0.02 sample (emit_sample_prob < 0.999); per-vehicle trajectories are lossy -- rerun with emit_sample_prob=1.0 (python) / SCMS_EMIT_SAMPLE=1.0 (MOSAIC)",
+        "reference": {
+          "cite": "project-adopted tolerance",
+          "confidence": "coarse",
+          "max": 0.05,
+          "note": "Tolerance value is a project gate, not a published measurement.",
+          "ref_id": "traffic_regimes.headway_implausible_max_fraction",
+          "source": "Project-adopted tolerance on headway_implausible_below_s: a small tail is expected from lane-abstraction and finite-difference noise, but more than 5% of headways below the 0.5 s floor indicates a systematically non-physical following model.",
+          "unit": "fraction"
+        },
+        "severity": "soft",
+        "status": "na",
+        "title": "Time headways below the physical floor (0.5 s)",
+        "unit": "fraction",
+        "value": null
+      },
+      {
+        "details": {
+          "fit": "h_min = sample minimum, scale = mean - h_min (shape test, like calibration.ks_vs_fitted_rayleigh)",
+          "model_ref": "traffic_regimes.time_headway_model"
+        },
+        "id": "traffic.headway_ks_shifted_exponential",
+        "n": 0,
+        "panel": "traffic",
+        "reason": "emissions are a 0.02 sample (emit_sample_prob < 0.999); per-vehicle trajectories are lossy -- rerun with emit_sample_prob=1.0 (python) / SCMS_EMIT_SAMPLE=1.0 (MOSAIC)",
+        "reference": {
+          "cite": "ROADMAP section 5 headway row (urban)",
+          "confidence": "anchored",
+          "max": 0.15,
+          "note": "Applied against the shifted-exponential (Cowan M3 family) headway model fitted to the run itself -- a SHAPE test, mirroring calibration.py's ks_vs_fitted_rayleigh. See time_headway_model.",
+          "ref_id": "traffic_regimes.urban.time_headway_ks_max",
+          "source": "Project-adopted acceptance threshold, docs/realism/ROADMAP.md section 5: 'Headway distribution KS vs reference <= 0.15 (urban)'. The distributional-test methodology (KS/Anderson-Darling on time-headway distributions vs loop-event or trajectory data) is the standard cited in docs/realism/investigation/research-realism-benchmarks.json benchmarks[7] and in the SUMO saturation-headway validation doi:10.3390/su18147025.",
+          "unit": "KS statistic"
+        },
+        "severity": "soft",
+        "status": "na",
+        "title": "Headway shape: KS vs a fitted shifted-exponential (Cowan M3 family)",
+        "unit": "KS statistic",
+        "value": null
+      },
+      {
+        "details": {
+          "cell_m": 100.0,
+          "density_p99_veh_km_lane": 0.781,
+          "flow_max_veh_h_lane": 54.0657,
+          "lanes_manifest_floor": 1,
+          "lanes_per_cell_max": 1.0,
+          "lanes_per_cell_p50": 1.0,
+          "method": "Edie generalised definitions over DIRECTIONAL space-time cells (space cell x time window x heading octant); a square cell is treated as a road section of side length (per-lane-group approximation, the dataset schema carries no edge id). The per-lane divisor is measured from the lateral spread inside each cell, floored at the manifest's n_lanes",
+          "window_s": 60.0
+        },
+        "id": "traffic.fd_capacity_veh_h_lane",
+        "n": 3,
+        "panel": "traffic",
+        "reason": "emissions are a 0.02 sample (emit_sample_prob < 0.999); per-vehicle trajectories are lossy -- rerun with emit_sample_prob=1.0 (python) / SCMS_EMIT_SAMPLE=1.0 (MOSAIC)",
+        "reference": {
+          "cite": "classic freeway FD anchors (Cassidy & Bertini lineage)",
+          "confidence": "anchored",
+          "note": "Scored against a robust maximum (p99) of per-cell Edie flow, so a single noisy cell cannot pass or fail the gate.",
+          "range": [
+            1800.0,
+            2400.0
+          ],
+          "ref_id": "fundamental_diagram.capacity_veh_per_h_per_lane",
+          "source": "Standard freeway lane-capacity anchor, ~1800-2400 veh/h/lane, as summarised in docs/realism/investigation/research-realism-benchmarks.json benchmarks[6] and findings section A.4; the queue-discharge / capacity lineage is Cassidy & Bertini, 'Some traffic features at freeway bottlenecks', Transportation Research Part B 33(1), 1999, doi:10.1016/S0191-2615(98)00014-0.",
+          "unit": "veh/h/lane"
+        },
+        "severity": "soft",
+        "status": "na",
+        "title": "Fundamental diagram: capacity (p99 of cell flow)",
+        "unit": "veh/h/lane",
+        "value": 53.779
+      },
+      {
+        "details": {
+          "method": "negative slope of a least-squares line through cells denser than the flow-maximising density"
+        },
+        "id": "traffic.fd_backward_wave_speed_kmh",
+        "n": 0,
+        "panel": "traffic",
+        "reason": "emissions are a 0.02 sample (emit_sample_prob < 0.999); per-vehicle trajectories are lossy -- rerun with emit_sample_prob=1.0 (python) / SCMS_EMIT_SAMPLE=1.0 (MOSAIC)",
+        "reference": {
+          "cite": "classic congested-branch wave speed",
+          "confidence": "anchored",
+          "note": "Estimated as the negative slope of a least-squares line through the congested branch (cells denser than the flow-maximising density) of the reconstructed flow-density scatter.",
+          "range": [
+            15.0,
+            20.0
+          ],
+          "ref_id": "fundamental_diagram.backward_wave_speed_kmh",
+          "source": "Congested/backward wave speed ~15-20 km/h, summarised in docs/realism/investigation/research-realism-benchmarks.json benchmarks[6]; same Cassidy & Bertini 1999 lineage.",
+          "unit": "km/h"
+        },
+        "severity": "soft",
+        "status": "na",
+        "title": "Fundamental diagram: backward wave speed",
+        "unit": "km/h",
+        "value": null
+      }
+    ]
+  },
+  "probe": {
+    "art_censored": false,
+    "art_max_m": 1000.0,
+    "dataset_version": "0.3.0",
+    "dt_s": null,
+    "emit_sample_prob": 0.02,
+    "engine": "mosaic",
+    "full_trace": false,
+    "generator": "scms_sim_ref (MOSAIC layer, full-entity back-end v4)",
+    "has_emissions": true,
+    "has_report_labels": true,
+    "has_reports": true,
+    "n_lanes": 1,
+    "radio_range_m": 709.4,
+    "regime": "urban",
+    "road_network": "osm",
+    "seed": 20260809
+  },
+  "refdata": {
+    "dir": "C:\\Users\\Administrator\\Documents\\SCMS-Simulator\\src\\scms_sim_ref\\datagen\\refdata",
+    "n_entries": 58,
+    "sets": [
+      "etsi_cam_dcc",
+      "fundamental_diagram",
+      "geh",
+      "kinematics",
+      "pathloss_37885",
+      "traffic_regimes",
+      "v2x_awareness"
+    ]
+  },
+  "settings": {
+    "dist_bin_m": 50.0,
+    "fd_cell_m": 100.0,
+    "fd_window_s": 60.0,
+    "max_dist_m": 1000.0,
+    "max_finite_difference_dt_s": 2.0,
+    "min_samples": 30,
+    "regime": "auto",
+    "t_bucket_s": 1.0
+  },
+  "summary": {
+    "fail": 4,
+    "hard_failures": [],
+    "na": 11,
+    "pass": 7,
+    "soft_failures": [
+      "traffic.speed_p95_mps",
+      "traffic.lateral_discontinuity_events",
+      "traffic.accel_within_comfort_frac",
+      "comm.pdr_gray_zone_width_m"
+    ],
+    "total": 22
+  }
+}

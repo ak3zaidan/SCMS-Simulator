@@ -1,0 +1,73 @@
+{
+  "reference_set": "pathloss_37885",
+  "title": "3GPP TR 37.885 V2X path-loss constants and shadowing parameters",
+  "scope": "Reference constants for the Phase-2 geometric radio model. No Phase-0 dataset carries an RSSI/path-loss observable, so nothing here is scored yet -- these entries exist so the Phase-2 implementation and its unit tests grade against ONE audited copy of the constants.",
+  "curated_from": "docs/realism/ROADMAP.md section 3.2 item 1 (transcribed from 3GPP TR 37.885) and the Phase-2 benchmark gate 'implemented 37.885 formulas match published constants to 0.01 dB at d=100/500 m'.",
+  "formula": "PL_dB = a + b*log10(d_m) + c*log10(fc_GHz)",
+  "entries": {
+    "urban_los": {
+      "value": {"a": 38.77, "b": 16.7, "c": 18.2},
+      "unit": "dB",
+      "confidence": "anchored",
+      "cite": "3GPP TR 37.885 (urban LOS V2V path loss)",
+      "source": "3GPP TR 37.885, 'Study on evaluation methodology of new Vehicle-to-Everything (V2X) use cases for LTE and NR', V2V channel models. Constants as transcribed in docs/realism/ROADMAP.md section 3.2 item 1: Urban LOS = 38.77 + 16.7*log10(d) + 18.2*log10(fc).",
+      "note": "d in metres, fc in GHz."
+    },
+    "urban_nlos": {
+      "value": {"a": 36.85, "b": 30.0, "c": 18.9},
+      "unit": "dB",
+      "confidence": "anchored",
+      "cite": "3GPP TR 37.885 (urban NLOS V2V path loss)",
+      "source": "Same 3GPP TR 37.885 V2V channel-model transcription as urban_los (via docs/realism/ROADMAP.md section 3.2 item 1): Urban NLOS = 36.85 + 30*log10(d) + 18.9*log10(fc).",
+      "note": "d in metres, fc in GHz."
+    },
+    "highway_los": {
+      "value": {"a": 32.4, "b": 20.0, "c": 20.0},
+      "unit": "dB",
+      "confidence": "anchored",
+      "cite": "3GPP TR 37.885 (highway LOS V2V path loss)",
+      "source": "Same 3GPP TR 37.885 V2V channel-model transcription as urban_los (via docs/realism/ROADMAP.md section 3.2 item 1): Highway LOS = 32.4 + 20*log10(d) + 20*log10(fc).",
+      "note": "d in metres, fc in GHz. This is the free-space form."
+    },
+    "nlosv_extra_loss_db": {
+      "value": {"mu_min": 5.0, "mu_max": 9.0, "distance_term": "max(0, 15*log10(d) - 41)", "floor": 0.0},
+      "unit": "dB",
+      "confidence": "anchored",
+      "cite": "3GPP TR 37.885 (NLOSv vehicle-blockage loss)",
+      "source": "NLOSv (vehicle-blocked) additional loss modelled as max(0, N(mu, sigma)) with mu = 5..9 + max(0, 15*log10(d) - 41), per docs/realism/ROADMAP.md section 3.2 item 1.",
+      "note": "The mu base (5/9 dB) selects on blocker height class in TR 37.885; the ROADMAP records the range, so no single value is asserted here."
+    },
+    "shadowing_sigma_db": {
+      "value": {"los": 3.0, "nlos": 4.0},
+      "unit": "dB",
+      "confidence": "anchored",
+      "cite": "3GPP TR 37.885 shadowing std. dev. (via ROADMAP section 3.2 item 3)",
+      "source": "Log-normal shadowing standard deviation sigma = 3 dB (LOS) / 4 dB (NLOS), adopted in docs/realism/ROADMAP.md section 3.2 item 3 together with a Gudmundson AR(1) correlation process.",
+      "note": "The decorrelation distance for the AR(1) process is in v2x_awareness.shadowing_decorrelation_distance_m."
+    },
+    "nakagami_m_by_distance": {
+      "points": [[50.0, 3.0], [150.0, 1.5], [null, 1.0]],
+      "unit": "[distance upper bound m, Nakagami m]",
+      "confidence": "anchored",
+      "cite": "ROADMAP section 3.2 item 4 (per-packet fading)",
+      "source": "Per-packet Nakagami-m fading with m = 3 / 1.5 / 1.0 over 0-50 / 50-150 / >150 m, adopted in docs/realism/ROADMAP.md section 3.2 item 4 (the standard VANET Nakagami parameterisation used by Veins/NS-3 802.11p studies).",
+      "note": "A null upper bound means 'beyond the previous bound'."
+    },
+    "pathloss_conformance_tolerance_db": {
+      "max": 0.01,
+      "unit": "dB",
+      "confidence": "anchored",
+      "cite": "ROADMAP Phase-2 benchmark gate",
+      "source": "docs/realism/ROADMAP.md Phase-2 benchmark gate: 'Pathloss unit test: implemented 37.885 formulas match published constants to 0.01 dB at d=100/500 m'.",
+      "note": "PINNED FOR PHASE 2 unit tests."
+    },
+    "reference_frequency_ghz": {
+      "value": 5.9,
+      "unit": "GHz",
+      "confidence": "anchored",
+      "cite": "ITS-G5 / DSRC 5.9 GHz band",
+      "source": "The ITS-G5 / DSRC control channel sits in the 5.9 GHz band; TR 37.885's fc term is evaluated in GHz.",
+      "note": "Used as the default fc when evaluating the formulas above."
+    }
+  }
+}

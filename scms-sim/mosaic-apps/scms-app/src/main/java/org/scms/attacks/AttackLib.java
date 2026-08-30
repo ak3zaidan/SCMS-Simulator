@@ -248,6 +248,27 @@ public final class AttackLib {
                 return d;
             }
         }
+
+        /** Effective (resolved) magnitudes keyed by env-var name, for the manifest's replay record. */
+        public java.util.Map<String, Object> effective() {
+            java.util.Map<String, Object> m = new java.util.TreeMap<>();
+            m.put("SCMS_OFFSET_M", offsetM);
+            m.put("SCMS_SPEED_OFFSET", speedOffsetMs);
+            m.put("SCMS_RANDOM_RADIUS", randomRadiusM);
+            m.put("SCMS_RANDOM_SPEED_MAX", randomSpeedMax);
+            m.put("SCMS_HEADING_OFFSET", headingOffsetDeg);
+            m.put("SCMS_FREEZE_UPDATES", freezeAfter);
+            m.put("SCMS_STALE_DELAY", staleDelayS);
+            m.put("SCMS_SYBIL_GHOSTS", sybilGhosts);
+            m.put("SCMS_RAMP_UPDATES", rampUpdates);
+            m.put("SCMS_DUTY_ON", dutyOnS);
+            m.put("SCMS_DUTY_OFF", dutyOffS);
+            m.put("SCMS_START_DELAY", startDelayS);
+            m.put("SCMS_ALONGROAD_M", alongRoadM);
+            m.put("SCMS_DRIFT_RATE", driftRateM);
+            m.put("SCMS_LAG_S", lagS);
+            return m;
+        }
     }
 
     /** Ghost identities a Sybil variant emits (tier scales the base count). */

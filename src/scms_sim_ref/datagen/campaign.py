@@ -74,9 +74,28 @@ def sample_domain(rng: random.Random, idx: int, base_seed: int, osm: bool) -> di
         "SCMS_COLLUDE_PCT": rng.choice([0, 0, 0, 15, 30, 45]),
         "SCMS_VICTIM_PCT": rng.choice([2, 3, 4]),
         # traffic / fleet
+        # NB: SCMS_VEH_SPEEDFACTOR is now the MEAN of the per-driver speedFactor distribution
+        # (normc(mean, SCMS_SPEED_DEV, ...)), not a fixed factor for the whole fleet.
         "SCMS_VEH_SPEEDFACTOR": round(rng.uniform(0.85, 1.2), 2),
         "SCMS_FLEET": rng.choice(["mixed", "car"]),
         "SCMS_DEMAND": rng.choice(["uniform", "rush", "night"]),
+        # MOSAIC<->SUMO coupling. The 100 ms default is what lets the ETSI CAM rules fire above
+        # 1 Hz, but it costs ~10x the MOSAIC steps; a campaign runs 120-180 s windows on maps as
+        # big as InTAS, so the sampler MUST span the range instead of paying 10x on every domain.
+        "SCMS_SYNC_MS": rng.choice([100, 100, 250, 1000]),
+        # driver model / fleet heterogeneity (SUMO side)
+        "SCMS_CF_MODEL": rng.choice(["eidm", "eidm", "krauss"]),
+        "SCMS_SPEED_DEV": round(rng.uniform(0.0, 0.2), 3),
+        "SCMS_VTYPE_SAMPLES": rng.choice([1, 4, 8, 16]),
+        "SCMS_OD": rng.choice(["gravity", "uniform"]),
+        "SCMS_DEPART_PROFILE": rng.choice(["", "", "morning", "evening", "diurnal"]),
+        "SCMS_TLS": rng.choice(["guess", "guess", "off"]),
+        # Java-side realism layer (ported VeReMi-NextGen models; all default-off in the engine)
+        "SCMS_SENSOR_MODEL": rng.choice(["builtin", "builtin", "nextgen"]),
+        "SCMS_DRIVER_PROFILES": rng.choice([0, 1, 1]),
+        # NB: 'distance' makes SCMS_ROTATE_PERIOD inert (the two policies are mutually exclusive),
+        # so these are NOT independent knobs -- the period above is only honoured under 'period'.
+        "SCMS_PSEUDONYM_POLICY": rng.choice(["period", "period", "distance"]),
         # detector thresholds jittered, so the model can't memorise one fixed operating point
         "SCMS_ART_MAX_M": rng.choice([600, 1000, 1500]),
         "SCMS_STALE_MAX": rng.choice([3, 5, 8]),
@@ -103,8 +122,11 @@ def run_domain(dom: dict, out_dir: Path, skip_build: bool) -> dict:
         try:
             sys.path.insert(0, str(REPO / "src"))
             from scms_sim_ref.datagen import validate as vmod
-            metrics, _ = vmod.validate(str(out_dir))
-            metrics = {k: metrics[k] for k in ("vehicles", "attackers", "precision", "recall") if k in metrics}
+            metrics, _ = vmod.validate(str(out_dir), realism=True)
+            # realism rides alongside precision/recall so a domain that scores well on detection but
+            # produces physically absurd traffic is visible in the campaign manifest, not hidden.
+            metrics = {k: metrics[k] for k in ("vehicles", "attackers", "precision", "recall",
+                                               "realism") if k in metrics}
         except Exception:
             pass
     return {"ok": man.exists(), "returncode": r.returncode, "metrics": metrics}

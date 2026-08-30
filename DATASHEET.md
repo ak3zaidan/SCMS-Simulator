@@ -72,10 +72,55 @@ the shipped benchmark evaluates generalization *as protocols over these splits/l
 leave-one-attack-family-out (novel-attack), forward-in-time, and — for multi-condition
 campaign corpora that carry a `domain_id` — leave-one-domain-out.
 
+## Measured realism, and known unrealisms
+Every dataset's own `DATASHEET.md` carries a **measured realism scorecard**
+(`datagen.realism_bench`): 14 traffic + 7 comm metrics scored against reference summaries pinned
+with citations in `datagen/refdata/`. Metrics are split by severity — **HARD** metrics are physical
+plausibility (acceleration inside [−8, +4] m/s², zero teleports, zero overlapping vehicles) plus one
+**liveness** gate (at least half the fleet actually moves — every other hard gate is an
+impossibility check that a frozen dataset passes trivially), and are the CI gate; everything else
+warns. A metric the dataset cannot support reports `na` **with a machine-readable reason**, never a
+guess — including when its own sample size is below the floor.
+
+Score any dataset yourself:
+
+```bash
+python -m scms_sim_ref.datagen.realism_bench <dataset_dir> --markdown --fail-on-hard
+```
+
+Measured hard failures are printed in each datasheet's "Realism benchmark" section rather than
+hidden. As of the Phase-0/1 baseline (`docs/realism/PROGRESS.md`) the standing ones are:
+
+- **Acceleration plausibility** — ~0.2–0.5 % of finite-difference accelerations fall outside
+  [−8, +4] m/s² on both engines.
+- **Vehicle overlap** — the pure-Python engine has **no collision detection**; distinct vehicles can
+  occupy the same point. The MOSAIC/SUMO path scores 0 (SUMO enforces separation).
+- **Fundamental diagram** — capacity misses the 1800–2400 veh/h/lane anchor from both sides. It is a
+  space-time *cell* approximation (the emission schema carries no edge id): cells are directional
+  and the per-lane divisor is measured from the lateral spread inside each cell, but parallel lanes
+  of the same carriageway inside one cell are still only estimated. Treat it as a tracked trend, not
+  an absolute.
+- **Comm panel** — the PDR curve is *proportional* to PDR (reconstructed from honest report links
+  normalised at the nearest band), not an absolute PDR: there is no per-reception observable (RSSI,
+  delivered-vs-attempted) in the schema yet. Effective range is tracked without a pass/fail band.
+- **PDR gray zone** — both engines still ship a hard-cutoff (unit-disc / range-threshold) radio, so
+  the 90 %→20 % band is a few tens of metres against the ≥ 100 m gate. That failure is the intended
+  Phase-0 baseline: level crossings are read off the non-increasing majorant of the measured curve
+  precisely so a step-function radio cannot pass on Poisson noise in one distance bin.
+- **Single radio stack, no real RF** — one analytic/SNS channel model, no measured interference, no
+  hardware-in-the-loop. Sim-to-real transfer must be argued, not assumed.
+- Reference bands for speed are **coarse envelopes** (posted-limit / corpus-provenance derived), not
+  measured percentile tables; licence-gated corpora are pinned as explicit `available: false`
+  placeholders rather than invented numbers.
+
 ## Reproducibility
 - Every build ships `manifest.json`: seed, full config, generator + schema versions,
   per-file SHA-256, an aggregate data digest, and the standards profile. Same seed + config
   → byte-identical data (CI-verified).
+- MOSAIC/SUMO datasets additionally ship `scenario_provenance.json` — the effective `SCMS_*`
+  environment, the resolved realism knobs (sync period, car-following model, speed-factor
+  distribution, OD mode, RSU count) and a SHA-256 per scenario input file — and the Java manifest
+  inlines the same input hashes under `inputs`, so a MOSAIC run is replayable from the dataset alone.
 
 ## Distribution / license
 - Code: **Apache-2.0** (see `LICENSE`). Redistribute generated datasets under the terms you

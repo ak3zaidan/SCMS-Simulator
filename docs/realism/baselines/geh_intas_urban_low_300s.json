@@ -1,0 +1,359 @@
+{
+  "comparison_kind": "seed_stability",
+  "warning": "NOT A VALIDATION RESULT AND NOT A CALIBRATION RESULT. This report compares one SUMO run against ANOTHER SUMO RUN of the same scenario (--ref-det-out). It measures only the run-to-run / seed-to-seed reproducibility of the simulator against itself; nothing in it states that the model resembles real traffic. No real-world measured count data for the Ingolstadt (InTAS) induction loops is vendored in this repository -- the InTAS route files are DEMAND (model input, so grading against them would be circular) and every vendored InTAS_Detectors_Output.xml under third_party/veremi-nextgen is a config-echo stub with zero <interval> rows. Do NOT cite these gates as FHWA calibration/validation evidence, and do not quote the FHWA 'GEH < 5 on >= 85% of links' criterion from them. To obtain a real validation result, supply measured counts via --ref-counts; see src/scms_sim_ref/datagen/refdata/geh_reference_counts.README.md.",
+  "modelled": {
+    "file": "C:/Users/Administrator/Documents/SCMS-Simulator/scms-sim/scenarios/gen_intas_urban_low/sumo/gate_InTAS_Detectors_Output.xml",
+    "n_intervals": 194,
+    "begin_s": 0.0,
+    "end_s": 300.0,
+    "duration_s": 300.0,
+    "n_keys": 25,
+    "group_by": "station",
+    "seed": "unset (SUMO built-in default, 23423)"
+  },
+  "reference": {
+    "source": "rep2_InTAS_Detectors_Output.xml -- ANOTHER SUMO RUN of the same scenario (simulated, NOT measured real-world counts)",
+    "file": "C:/Users/Administrator/Documents/SCMS-Simulator/scms-sim/scenarios/gen_intas_urban_low/sumo/rep2_InTAS_Detectors_Output.xml",
+    "n_keys": 25,
+    "kind": "sumo_detector_output_of_another_run",
+    "is_real_world_counts": false,
+    "is_simulation_output": true,
+    "duration_s": 300.0,
+    "seed": "987654",
+    "schema_doc": "src/scms_sim_ref/datagen/refdata/geh_reference_counts.README.md"
+  },
+  "detector_layout": {
+    "file": "C:/Users/Administrator/Documents/SCMS-Simulator/scms-sim/scenarios/gen_intas_urban_low/sumo/InTAS_E1.add.xml",
+    "n_detectors": 196,
+    "n_stations": 27,
+    "n_named_stations": 25,
+    "named_stations": [
+      "1010",
+      "1011",
+      "3021",
+      "3022",
+      "3100",
+      "3120",
+      "3130",
+      "3150",
+      "4050",
+      "4070",
+      "4140",
+      "4160",
+      "4210",
+      "4240",
+      "4250",
+      "5012",
+      "5030",
+      "5050",
+      "5060",
+      "6022",
+      "6030",
+      "8001",
+      "8002",
+      "8005",
+      "8604"
+    ],
+    "unnamed_detectors": [
+      "income",
+      "outgoing"
+    ],
+    "n_edges": 98,
+    "note": "n_stations counts distinct grouping keys; detectors without an @name fall back to their own id. Only named_stations are valid --ref-counts keys."
+  },
+  "refdata_dir": "C:\\Users\\Administrator\\Documents\\SCMS-Simulator\\src\\scms_sim_ref\\datagen\\refdata",
+  "refdata_sets": [
+    "etsi_cam_dcc",
+    "fundamental_diagram",
+    "geh",
+    "kinematics",
+    "pathloss_37885",
+    "traffic_regimes",
+    "v2x_awareness"
+  ],
+  "sections": {
+    "geh": {
+      "comparison_kind": "seed_stability",
+      "comparison_summary": "modelled SUMO run vs ANOTHER SUMO RUN of the same scenario (--ref-det-out) -- reproducibility only, NOT validation",
+      "warning": "NOT A VALIDATION RESULT AND NOT A CALIBRATION RESULT. This report compares one SUMO run against ANOTHER SUMO RUN of the same scenario (--ref-det-out). It measures only the run-to-run / seed-to-seed reproducibility of the simulator against itself; nothing in it states that the model resembles real traffic. No real-world measured count data for the Ingolstadt (InTAS) induction loops is vendored in this repository -- the InTAS route files are DEMAND (model input, so grading against them would be circular) and every vendored InTAS_Detectors_Output.xml under third_party/veremi-nextgen is a config-echo stub with zero <interval> rows. Do NOT cite these gates as FHWA calibration/validation evidence, and do not quote the FHWA 'GEH < 5 on >= 85% of links' criterion from them. To obtain a real validation result, supply measured counts via --ref-counts; see src/scms_sim_ref/datagen/refdata/geh_reference_counts.README.md.",
+      "criteria_source": "tools/sumo_realism.py SEED_STABILITY_BASIS (derived in-tool; the FHWA criteria in refdata/geh_criteria.json are deliberately NOT applied)",
+      "units": "vehicles_per_window",
+      "window_s": 300.0,
+      "veh_h_inflation_factor": 3.4641,
+      "veh_h_scaling_note": "Per-station 'modelled'/'counted' are the vehicles recorded over the common 300 s window. Multiply a GEH by 3.4641 to get the value the veh/h extrapolation would have produced; that inflated form is what an FHWA-style GEH < 5 gate would have been scoring.",
+      "n_stations_modelled": 25,
+      "n_stations_counted": 25,
+      "n_stations_shared": 25,
+      "n_stations_compared": 22,
+      "stations_only_in_modelled": [],
+      "stations_only_in_reference": [],
+      "both_zero_stations": [
+        "4070",
+        "4160",
+        "4210"
+      ],
+      "n_both_zero_excluded": 3,
+      "geh": {
+        "n_stations": 22,
+        "n_both_zero": 0,
+        "pass_fraction": 1.0,
+        "geh_max_threshold": 2.7718,
+        "geh_median": 0.4314,
+        "geh_p85": 1.1204,
+        "total_modelled": 243.0,
+        "total_counted": 242.0,
+        "total_geh": 0.0642,
+        "total_rel_error": 0.00413,
+        "stations": [
+          {
+            "station": "1010",
+            "modelled": 10.0,
+            "counted": 10.0,
+            "geh": 0.0,
+            "geh_veh_h": 0.0
+          },
+          {
+            "station": "1011",
+            "modelled": 9.0,
+            "counted": 5.0,
+            "geh": 1.5119,
+            "geh_veh_h": 5.2374
+          },
+          {
+            "station": "3021",
+            "modelled": 1.0,
+            "counted": 1.0,
+            "geh": 0.0,
+            "geh_veh_h": 0.0
+          },
+          {
+            "station": "3022",
+            "modelled": 4.0,
+            "counted": 4.0,
+            "geh": 0.0,
+            "geh_veh_h": 0.0
+          },
+          {
+            "station": "3100",
+            "modelled": 11.0,
+            "counted": 9.0,
+            "geh": 0.6325,
+            "geh_veh_h": 2.191
+          },
+          {
+            "station": "3120",
+            "modelled": 29.0,
+            "counted": 28.0,
+            "geh": 0.1873,
+            "geh_veh_h": 0.6488
+          },
+          {
+            "station": "3130",
+            "modelled": 18.0,
+            "counted": 18.0,
+            "geh": 0.0,
+            "geh_veh_h": 0.0
+          },
+          {
+            "station": "3150",
+            "modelled": 22.0,
+            "counted": 21.0,
+            "geh": 0.2157,
+            "geh_veh_h": 0.7472
+          },
+          {
+            "station": "4050",
+            "modelled": 4.0,
+            "counted": 2.0,
+            "geh": 1.1547,
+            "geh_veh_h": 4.0
+          },
+          {
+            "station": "4140",
+            "modelled": 9.0,
+            "counted": 17.0,
+            "geh": 2.2188,
+            "geh_veh_h": 7.6861
+          },
+          {
+            "station": "4240",
+            "modelled": 11.0,
+            "counted": 12.0,
+            "geh": 0.2949,
+            "geh_veh_h": 1.0216
+          },
+          {
+            "station": "4250",
+            "modelled": 21.0,
+            "counted": 22.0,
+            "geh": 0.2157,
+            "geh_veh_h": 0.7472
+          },
+          {
+            "station": "5012",
+            "modelled": 2.0,
+            "counted": 3.0,
+            "geh": 0.6325,
+            "geh_veh_h": 2.191
+          },
+          {
+            "station": "5030",
+            "modelled": 2.0,
+            "counted": 3.0,
+            "geh": 0.6325,
+            "geh_veh_h": 2.191
+          },
+          {
+            "station": "5050",
+            "modelled": 5.0,
+            "counted": 6.0,
+            "geh": 0.4264,
+            "geh_veh_h": 1.4771
+          },
+          {
+            "station": "5060",
+            "modelled": 2.0,
+            "counted": 1.0,
+            "geh": 0.8165,
+            "geh_veh_h": 2.8284
+          },
+          {
+            "station": "6022",
+            "modelled": 6.0,
+            "counted": 5.0,
+            "geh": 0.4264,
+            "geh_veh_h": 1.4771
+          },
+          {
+            "station": "6030",
+            "modelled": 20.0,
+            "counted": 22.0,
+            "geh": 0.4364,
+            "geh_veh_h": 1.5117
+          },
+          {
+            "station": "8001",
+            "modelled": 12.0,
+            "counted": 9.0,
+            "geh": 0.9258,
+            "geh_veh_h": 3.2071
+          },
+          {
+            "station": "8002",
+            "modelled": 13.0,
+            "counted": 7.0,
+            "geh": 1.8974,
+            "geh_veh_h": 6.5728
+          },
+          {
+            "station": "8005",
+            "modelled": 27.0,
+            "counted": 32.0,
+            "geh": 0.9206,
+            "geh_veh_h": 3.1891
+          },
+          {
+            "station": "8604",
+            "modelled": 5.0,
+            "counted": 5.0,
+            "geh": 0.0,
+            "geh_veh_h": 0.0
+          }
+        ]
+      },
+      "exact_match_fraction": 0.2273,
+      "strict_agreement_fraction": 0.8636,
+      "strict_agreement_geh": 1.4142,
+      "gates": [
+        {
+          "id": "seed_stability.link_geh_pass_fraction",
+          "title": "SEED-STABILITY: stations whose two-seed count split is inside the alpha=0.05 band (window-native GEH < 2.7718)",
+          "value": 1.0,
+          "unit": "fraction",
+          "n": 22,
+          "status": "pass",
+          "reference": {
+            "ref_id": "seed_stability.link_geh_alpha",
+            "threshold": ">= 0.85",
+            "cite": "tools/sumo_realism.py SEED_STABILITY_BASIS (derived; NOT an external standard and NOT the FHWA criteria)",
+            "source": "Exact conditional null for two runs of the SAME scenario with different RNG seeds: at a station the two runs record m and c vehicles over the same window; conditional on the total n = m + c, an unbiased split gives m ~ Binomial(n, 1/2), so (m - c)/sqrt(n) ~ N(0,1) and the window-native GEH = sqrt(2*(m-c)^2/(m+c)) = sqrt(2) * |Z| exactly. A per-station GEH bound is therefore a two-sided z-test with a known false-alarm rate, and the bounds below are quoted as such. These are derived thresholds local to tools/sumo_realism.py; they are NOT an external standard and are deliberately NOT the FHWA criteria. Bound 2.7718 = sqrt(2)*z_(1-alpha/2) at alpha=0.05, so under the null each station fails with probability 0.05; requiring 0.85 of N stations leaves a small documented false-alarm budget (~1.5% at N=22). This is 1.80x tighter than the FHWA GEH < 5 link bound ON THE SAME WINDOW-NATIVE SCALE."
+          },
+          "details": {
+            "geh_median": 0.4314,
+            "geh_p85": 1.1204,
+            "geh_max": 2.2188,
+            "n_both_zero_excluded": 3
+          }
+        },
+        {
+          "id": "seed_stability.max_link_geh",
+          "title": "SEED-STABILITY: worst station's window-native GEH (Bonferroni family-wise alpha=0.05 over N stations)",
+          "value": 2.2188,
+          "unit": "GEH",
+          "n": 22,
+          "status": "pass",
+          "reference": {
+            "ref_id": "seed_stability.max_link_geh_fwer",
+            "threshold": "<= 4.3163",
+            "cite": "tools/sumo_realism.py SEED_STABILITY_BASIS (derived; NOT an external standard and NOT the FHWA criteria)",
+            "source": "Exact conditional null for two runs of the SAME scenario with different RNG seeds: at a station the two runs record m and c vehicles over the same window; conditional on the total n = m + c, an unbiased split gives m ~ Binomial(n, 1/2), so (m - c)/sqrt(n) ~ N(0,1) and the window-native GEH = sqrt(2*(m-c)^2/(m+c)) = sqrt(2) * |Z| exactly. A per-station GEH bound is therefore a two-sided z-test with a known false-alarm rate, and the bounds below are quoted as such. These are derived thresholds local to tools/sumo_realism.py; they are NOT an external standard and are deliberately NOT the FHWA criteria. Bound 4.3163 = sqrt(2)*z_(1-alpha/(2N)) with alpha=0.05 and N=22: under the null the WHOLE gate raises a false alarm with probability <= 0.05. This is the gate that catches a change localised to one loop."
+          },
+          "details": {
+            "worst_station": "4140",
+            "modelled": 9.0,
+            "reference": 17.0
+          }
+        },
+        {
+          "id": "seed_stability.total_flow_rel_error",
+          "title": "SEED-STABILITY: relative difference of the network-total loop count",
+          "value": 0.0041,
+          "unit": "fraction",
+          "n": 22,
+          "status": "pass",
+          "reference": {
+            "ref_id": "seed_stability.total_flow_rel_tol",
+            "threshold": "<= 0.03",
+            "cite": "tools/sumo_realism.py SEED_STABILITY_BASIS (derived; NOT an external standard and NOT the FHWA criteria)",
+            "source": "Exact conditional null for two runs of the SAME scenario with different RNG seeds: at a station the two runs record m and c vehicles over the same window; conditional on the total n = m + c, an unbiased split gives m ~ Binomial(n, 1/2), so (m - c)/sqrt(n) ~ N(0,1) and the window-native GEH = sqrt(2*(m-c)^2/(m+c)) = sqrt(2) * |Z| exactly. A per-station GEH bound is therefore a two-sided z-test with a known false-alarm rate, and the bounds below are quoted as such. These are derived thresholds local to tools/sumo_realism.py; they are NOT an external standard and are deliberately NOT the FHWA criteria. 0.03 vs the 0.05 FHWA VALIDATION allows: demand is a fixed route file, so the network-wide loop total is not free to drift with the seed -- only crossing times shift. The 0.6 ratio mirrors FHWA's own calibration-to-validation tightening (GEH 3 vs 5)."
+          },
+          "details": {
+            "total_modelled_vehicles": 243.0,
+            "total_reference_vehicles": 242.0,
+            "total_split_z": 0.0454
+          }
+        },
+        {
+          "id": "seed_stability.link_count_tolerance_pass_fraction",
+          "title": "SEED-STABILITY: stations inside the per-station count band |delta| <= max(3 veh, 0.25*max(m,c))",
+          "value": 0.8636,
+          "unit": "fraction",
+          "n": 22,
+          "status": "pass",
+          "reference": {
+            "ref_id": "seed_stability.link_count_tolerance",
+            "threshold": ">= 0.8",
+            "cite": "tools/sumo_realism.py SEED_STABILITY_BASIS (derived; NOT an external standard and NOT the FHWA criteria)",
+            "source": "Exact conditional null for two runs of the SAME scenario with different RNG seeds: at a station the two runs record m and c vehicles over the same window; conditional on the total n = m + c, an unbiased split gives m ~ Binomial(n, 1/2), so (m - c)/sqrt(n) ~ N(0,1) and the window-native GEH = sqrt(2*(m-c)^2/(m+c)) = sqrt(2) * |Z| exactly. A per-station GEH bound is therefore a two-sided z-test with a known false-alarm rate, and the bounds below are quoted as such. These are derived thresholds local to tools/sumo_realism.py; they are NOT an external standard and are deliberately NOT the FHWA criteria. An ENGINEERING equivalence bound, complementary to the z-calibrated GEH gate: a relative-only tolerance is meaningless at 1-3 vehicles, hence the absolute floor. Every station in this layout sits in FHWA's below_700 band, whose tolerance is +-100 veh/h (= +-8.33 vehicles over this window), so the band is far tighter than FHWA's. The required pass rate is 0.8 rather than 0.85 because pure counting noise at these station counts (~+-30% at 10 vehicles) already pushes some stations outside the band; the gate targets a systematic drift that moves many stations together, not per-station equality."
+          },
+          "details": {
+            "abs_floor_vehicles": 3.0,
+            "rel_tolerance": 0.25,
+            "stations_outside_band": [
+              "1011",
+              "4140",
+              "8002"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "summary": {
+    "n_gates": 4,
+    "pass": 4,
+    "fail": 0,
+    "na": 0,
+    "failures": []
+  }
+}

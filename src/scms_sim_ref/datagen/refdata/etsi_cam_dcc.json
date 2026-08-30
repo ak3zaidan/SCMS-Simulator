@@ -1,0 +1,48 @@
+{
+  "reference_set": "etsi_cam_dcc",
+  "title": "ETSI CAM generation rules and DCC channel-busy-ratio bands",
+  "scope": "Message-rate realism (inter-packet gap) and channel-load realism (CBR / DCC).",
+  "curated_from": "docs/realism/investigation/research-realism-benchmarks.json (benchmarks[13], findings B.2), docs/realism/investigation/determinism-io.json (CAM triggering as implemented in ScmsBeaconApp) and docs/realism/ROADMAP.md section 3.2 item 6.",
+  "entries": {
+    "cam_interval_s": {
+      "range": [0.1, 1.0],
+      "unit": "s",
+      "confidence": "anchored",
+      "cite": "ETSI EN 302 637-2 (T_GenCamMin / T_GenCamMax)",
+      "source": "ETSI EN 302 637-2 V1.4.1, Intelligent Transport Systems (ITS); Vehicular Communications; Basic Set of Applications; Part 2: Specification of Cooperative Awareness Basic Service. T_GenCamMin = 100 ms, T_GenCamMax = 1000 ms, i.e. a CAM rate between 1 Hz and 10 Hz.",
+      "note": "The MOSAIC layer implements this triggering (ScmsBeaconApp T_GenCamMin 0.1 s / T_GenCamMax 1.0 s); the pure-Python engine emits exactly one CAM per vehicle per step (1 Hz at the default dt = 1.0 s), which sits at the upper edge of the band."
+    },
+    "cam_trigger_thresholds": {
+      "value": {"position_m": 4.0, "heading_deg": 4.0, "speed_mps": 0.5},
+      "unit": "mixed",
+      "confidence": "anchored",
+      "cite": "ETSI EN 302 637-2 CAM dynamics triggering",
+      "source": "ETSI EN 302 637-2 V1.4.1 CAM generation triggering conditions: position change > 4 m, heading change > 4 degrees, or speed change > 0.5 m/s since the previous CAM.",
+      "note": "PINNED FOR PHASE 2 (ETSI CAM triggering in the Python engine for dt <= 0.5 runs)."
+    },
+    "cbr_satisfactory_range": {
+      "range": [0.55, 0.75],
+      "unit": "fraction",
+      "confidence": "anchored",
+      "cite": "ETSI TS 102 687 / TS 103 175 (DCC)",
+      "source": "ETSI TS 102 687 (Decentralized Congestion Control mechanisms for ITS operating in the 5 GHz range) and ETSI TS 103 175 (Cross-layer DCC management entity, https://www.etsi.org/deliver/etsi_ts/103100_103199/103175/01.01.01_60/ts_103175v010101p.pdf): the satisfactory DCC operating range for channel busy ratio is 0.55-0.75, with control loops holding ~0.6. CBR is measured as the busy fraction over 1 s probes.",
+      "note": "PINNED FOR PHASE 2. No CBR observable exists in the Phase-0 dataset schema, so no CBR metric is scored."
+    },
+    "cbr_control_target": {
+      "value": 0.60,
+      "unit": "fraction",
+      "confidence": "anchored",
+      "cite": "ETSI TS 102 687 / TS 103 175 (DCC)",
+      "source": "Same ETSI DCC sources as cbr_satisfactory_range (TS 102 687 / TS 103 175): the control algorithms hold channel busy ratio around 0.6, the centre of the 0.55-0.75 satisfactory range.",
+      "note": "PINNED FOR PHASE 2."
+    },
+    "dcc_reactive_rate_table": {
+      "points": [[0.30, 10.0], [0.40, 5.0], [0.50, 2.5], [0.60, 2.0], [0.65, 1.0]],
+      "unit": "[CBR fraction, CAM rate Hz]",
+      "confidence": "coarse",
+      "cite": "ETSI reactive DCC state table as adopted in ROADMAP section 3.2",
+      "source": "Reactive-DCC step table (CAM rate 10 / 5 / 2.5 / 2 / 1 Hz as CBR crosses 0.30 / 0.40 / 0.50 / 0.60) transcribed in docs/realism/ROADMAP.md section 3.2 item 6 from ETSI TS 102 687 reactive DCC.",
+      "note": "PINNED FOR PHASE 2. The final (0.65, 1.0) point is the ROADMAP's terminal 1 Hz state; the CBR breakpoint for it is a project reading of the table, hence confidence='coarse'."
+    }
+  }
+}

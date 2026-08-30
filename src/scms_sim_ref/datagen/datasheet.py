@@ -16,6 +16,7 @@ import numpy as np
 
 from . import benchmark as bench
 from . import calibration as calib
+from . import realism_bench as realism
 from . import validate as validate_mod
 
 
@@ -129,6 +130,39 @@ def build(dataset_dir: str) -> str:
         evs = []
     if not isinstance(evs, list):
         evs = []
+    # MOSAIC runs additionally carry the generator's provenance side-car (run.ps1 copies
+    # scms_scenario_manifest.json in as scenario_provenance.json). Surfacing the resolved realism
+    # knobs here is what makes the realism claims auditable per dataset instead of per shell history.
+    prov = {}
+    pp = os.path.join(dataset_dir, "scenario_provenance.json")
+    if os.path.exists(pp):
+        try:
+            prov = json.load(open(pp, encoding="utf-8")) or {}
+        except Exception:
+            prov = {}
+    res = prov.get("resolved") or {}
+    if res:
+        tools = prov.get("tools") or {}
+        L.append("## Scenario realism provenance (MOSAIC/SUMO)")
+        L.append(f"- Scenario: **{prov.get('scenario_key')}** ({prov.get('kind')} map, "
+                 f"source `{res.get('source')}`)")
+        L.append(f"- MOSAIC<->SUMO sync: **{res.get('mosaic_sync_ms')} ms** "
+                 f"(SUMO step {res.get('sumo_step_ms')} ms) — 1000 ms caps CAM generation at 1 Hz")
+        L.append(f"- Car-following: **{res.get('car_follow_model')}**; desired-speed factor "
+                 f"`{res.get('speed_factor')}` (speedDev {res.get('speed_dev')})")
+        protos = res.get("prototypes") or res.get("vtypes") or []   # curated vs mapgen key name
+        L.append(f"- Driver prototypes: **{len(protos)}** "
+                 f"({res.get('vtype_samples')} samples/class, jitter {res.get('vtype_jitter')})")
+        if res.get("od_mode") or res.get("depart_profile"):
+            L.append(f"- Demand: OD **{res.get('od_mode')}**, departure profile "
+                     f"`{res.get('depart_profile') or 'flat'}`")
+        L.append(f"- RSUs: **{res.get('rsus', 0)}** ({res.get('rsu_app') or 'no RSU application'})")
+        L.append(f"- Tool versions: SUMO `{tools.get('sumo')}`, MOSAIC `{tools.get('mosaic')}`, "
+                 f"Python `{tools.get('python')}`")
+        L.append(f"- Scenario inputs hashed: **{len(prov.get('inputs') or [])}** "
+                 f"(sha256 per file, see `scenario_provenance.json`)")
+        L.append("")
+
     if road != "linear" or evs:
         gw, gh, blk = cfg.get("grid_w"), cfg.get("grid_h"), cfg.get("grid_block_m")
         topo = {
@@ -214,6 +248,19 @@ def build(dataset_dir: str) -> str:
     L.append("")
 
     # --- realism scorecard: key distributions vs published real-world reference ranges ---
+    # The measured realism panels (datagen.realism_bench) come first; the wide sanity bands below are
+    # kept ONLY for the quantities no measured metric covers. Where a real metric exists -- benign
+    # speed -- the wide band is dropped in favour of the finite-difference TRUE speed scored against
+    # the pinned per-regime reference, so the datasheet never shows two competing speed verdicts.
+    try:
+        rcard = realism.scorecard(dataset_dir)
+    except Exception:
+        rcard = None
+    speed_measured = False
+    if rcard:
+        speed_measured = any(m["id"].startswith("traffic.speed_p") and m["status"] != "na"
+                             for m in rcard["panels"]["traffic"])
+
     L.append("## Realism scorecard (vs real-world reference ranges)")
     total_rep = max(1, len(rlbl))
     fp_rate = correctness.get("false_positive", 0) / total_rep
@@ -222,13 +269,16 @@ def build(dataset_dir: str) -> str:
     checks = [
         ("GNSS 95% position confidence (m)", np.median(confs) if confs else None, 2.0, 20.0,
          "real urban GNSS horizontal accuracy"),
-        ("Benign speed p95 (m/s)", float(np.percentile(benign_speeds, 95)) if benign_speeds else None,
-         5.0, 45.0, "urban→motorway vehicle speeds"),
         ("Attacker prevalence", (n_att / n_veh) if n_veh else None, 0.03, 0.45,
          "misbehaviour-study attacker fractions"),
         ("Faulty prevalence", (n_fault / n_veh) if n_veh else None, 0.0, 0.20, "sensor-fault rates"),
         ("Report false-positive rate", fp_rate, 0.0, 0.30, "tuned MBD detector FP rates"),
     ]
+    if not speed_measured:
+        checks.insert(1, ("Benign speed p95 (m/s)",
+                          float(np.percentile(benign_speeds, 95)) if benign_speeds else None,
+                          5.0, 45.0, "urban→motorway vehicle speeds (wide sanity band — the "
+                                     "measured realism panel could not score this run)"))
     for name, val, lo, hi, ref in checks:
         ok = "✅" if (val is not None and lo <= val <= hi) else "⚠️"
         vs = f"{val:.3f}" if val is not None else "n/a"
@@ -250,6 +300,23 @@ def build(dataset_dir: str) -> str:
         L.append(f"- {ok} Confidence calibration: 95% radius empirically covers "
                  f"**{cc['empirical_coverage_of_95pct_radius']}** of benign error (target 0.95)")
     L.append("")
+
+    # --- measured realism benchmark (datagen.realism_bench): traffic + comm panels ---
+    if rcard:
+        s = rcard["summary"]
+        L.append("### Realism benchmark (measured, vs pinned reference summaries)")
+        L.append(f"*Engine `{rcard['probe']['engine']}`; {s['pass']} pass / {s['fail']} fail / "
+                 f"{s['na']} not-applicable over {s['total']} metrics. Reference numbers are pinned "
+                 f"in `datagen/refdata/` and every one carries a source citation; "
+                 f"`na` means the signal is absent from this dataset (the reason is stated), not "
+                 f"that the check was skipped.*")
+        L.extend(realism.render_lines(rcard, include_na=True))
+        if s["hard_failures"]:
+            L.append(f"- **Hard realism failures ({len(s['hard_failures'])}):** "
+                     + ", ".join(f"`{h}`" for h in s["hard_failures"])
+                     + " — these are physical-plausibility gates; a failure is a known unrealism of "
+                       "this dataset, recorded here rather than hidden.")
+        L.append("")
 
     L.append("## Leakage-safe splits & revocation quality")
     L.append(f"- Split counts: {man.get('split_counts', vsum.get('split_counts', 'see ml/'))}")

@@ -1,0 +1,40 @@
+{
+  "reference_set": "fundamental_diagram",
+  "title": "Macroscopic fundamental-diagram anchors (flow / density / wave speed)",
+  "scope": "Aggregate flow-density-speed behaviour reconstructed with Edie's generalised definitions over space-time cells.",
+  "curated_from": "docs/realism/investigation/research-realism-benchmarks.json (benchmarks[6], findings A.4) and docs/realism/ROADMAP.md section 5.",
+  "entries": {
+    "capacity_veh_per_h_per_lane": {
+      "range": [1800.0, 2400.0],
+      "unit": "veh/h/lane",
+      "confidence": "anchored",
+      "cite": "classic freeway FD anchors (Cassidy & Bertini lineage)",
+      "source": "Standard freeway lane-capacity anchor, ~1800-2400 veh/h/lane, as summarised in docs/realism/investigation/research-realism-benchmarks.json benchmarks[6] and findings section A.4; the queue-discharge / capacity lineage is Cassidy & Bertini, 'Some traffic features at freeway bottlenecks', Transportation Research Part B 33(1), 1999, doi:10.1016/S0191-2615(98)00014-0.",
+      "note": "Scored against a robust maximum (p99) of per-cell Edie flow, so a single noisy cell cannot pass or fail the gate."
+    },
+    "capacity_drop_fraction": {
+      "range": [0.05, 0.15],
+      "unit": "fraction",
+      "confidence": "anchored",
+      "cite": "Cassidy & Bertini 1999 (queue-discharge capacity drop)",
+      "source": "Queue-discharge capacity drop of ~5-15% relative to pre-queue capacity: Cassidy & Bertini, Transportation Research Part B 33(1), 1999, and follow-ups; summarised in research-realism-benchmarks.json benchmarks[6].",
+      "note": "PINNED FOR LATER PHASES. Phase 0 does not identify bottleneck activation times, so the capacity drop is not computed; the number is pinned here so Phase 1/3 use the same audited value."
+    },
+    "backward_wave_speed_kmh": {
+      "range": [15.0, 20.0],
+      "unit": "km/h",
+      "confidence": "anchored",
+      "cite": "classic congested-branch wave speed",
+      "source": "Congested/backward wave speed ~15-20 km/h, summarised in docs/realism/investigation/research-realism-benchmarks.json benchmarks[6]; same Cassidy & Bertini 1999 lineage.",
+      "note": "Estimated as the negative slope of a least-squares line through the congested branch (cells denser than the flow-maximising density) of the reconstructed flow-density scatter."
+    },
+    "min_congested_cells_for_wave_speed": {
+      "min": 10,
+      "unit": "count",
+      "confidence": "coarse",
+      "cite": "project-adopted sample-size floor",
+      "source": "Project-adopted minimum number of congested space-time cells before a backward-wave-speed regression is reported. Below it the metric degrades to 'na' rather than fitting a line to noise.",
+      "note": "Sample-size floor, not a published measurement."
+    }
+  }
+}

@@ -124,6 +124,46 @@ Flag: `--events JSON_OR_FILE`.
 | Leakage linter | Guards against identity/label leakage into MA-visible features | `scms_sim_ref.datagen.leakage_linter` |
 | Training corpus | Factorial "massive" corpus: every scenario × permutation, merged with `domain_id`; `--flow` samples randomized worlds (topology + events) | `python -m scms_sim_ref.datagen.massive --grid {quick,medium,full} [--flow] [--dry-run] [--parquet]` |
 
+## Realism benchmark
+
+Measures whether the generated traffic and radio actually look real, against reference summaries
+pinned **with citations** in `datagen/refdata/` (7 sets, 55 entries; every entry carries a `source`,
+a short `cite` and a `confidence` ∈ {anchored, coarse, unavailable}). Read-only, deterministic,
+numpy-only — it never writes into a dataset and takes no RNG draws.
+
+| Feature | What it does | Flag / command |
+|---|---|---|
+| Realism scorecard | 21 metrics (14 traffic + 7 comm) with pass/fail/na, each carrying its reference range, citation and — when `na` — a machine-readable reason | `python -m scms_sim_ref.datagen.realism_bench <dataset> [--markdown] [--json out]` |
+| HARD physical gate | Acceleration inside [−8, +4] m/s², zero teleports, zero overlapping vehicles, **plus a liveness gate** (≥ 50 % of the fleet actually moves — the other three are impossibility checks a frozen dataset passes) — the CI gate; everything else warns | `--fail-on-hard` (exit 1 on any HARD failure) |
+| Traffic panel | Speed percentiles, acceleration plausibility + comfort band, teleports (scanned across *every* consecutive sample pair, not just short gaps), vehicle overlap, moving-vehicle fraction, time-headway median / sub-floor fraction / KS vs a fitted Cowan-M3 shape (leader found in the follower's own lane, so adjacent-lane traffic cannot fake a near-zero headway and no headway is censored by a grouping cell), Edie fundamental diagram over *directional* cells with a measured per-lane divisor (capacity + backward wave speed) | (automatic) |
+| Comm panel | Neighbour-awareness ratio at 100 / 200 / 300 m, PDR gray-zone width (90 %→20 %), effective range, CAM inter-packet gap | (automatic) |
+| Engine-agnostic | Auto-detects the pure-Python and MOSAIC/SUMO producers and their differing `acceptanceRangeThreshold` conventions; needs a full trace (`emit_sample_prob=1.0` / `SCMS_EMIT_SAMPLE=1.0`) to score the distribution metrics | `--regime {auto,urban,highway}` to override |
+| Corpus realism gate | Folds the scorecard into the corpus report as a separate section + warning list; HARD failures make the CLI exit non-zero | `python -m scms_sim_ref.datagen.corpus_report --corpus <dir> --realism` |
+| Per-domain realism | Records the scorecard summary alongside precision/recall in the campaign / massive per-domain catalog | `campaign` (automatic), `massive --realism` |
+| Foundry realism gate | Rejects evolved scenarios that "evade" only by being kinematically absurd | `python -m scms_sim_ref.datagen.foundry --realism-gate` |
+| SUMO-side GEH | GEH statistic + the four FHWA calibration gates over SUMO E1 induction loops, plus an acceleration-plausibility gate over an fcd/emission trace | `python tools/sumo_realism.py --det-out <out.xml> --det-add <E1.add.xml> --ref-counts <ref.json>` |
+
+## MOSAIC/SUMO realism (Java + scenario layer)
+
+Applies to the `mosaic` generator only (needs the SUMO/MOSAIC toolchain). Everything is reversible
+through `SCMS_*` environment variables and recorded in `<dataset>/scenario_provenance.json`.
+
+| Feature | What it does | Env knob |
+|---|---|---|
+| 100 ms MOSAIC↔SUMO sync | Default on every map, so the ETSI EN 302 637-2 CAM rules fire at 1–10 Hz instead of a 1 Hz spike. ~10× the MOSAIC steps. MOSAIC launches SUMO with `--step-length <sync>`, which beats the sumocfg — so this knob is also the SUMO integration step, every generated sumocfg is rewritten to match, and `resolved.sumo_step_ms` records what SUMO really ran | `SCMS_SYNC_MS` (`1000` restores the old behaviour) |
+| EIDM car-following | Human-like extended IDM instead of Krauss, on generated, curated and InTAS maps alike | `SCMS_CF_MODEL` |
+| Driver heterogeneity | Per-driver `speedFactor` distribution + jittered `tau`/`accel`/`decel`/`minGap`/`length` prototypes (MOSAIC otherwise hard-writes `speedDev="0.0"`) | `SCMS_SPEED_DEV`, `SCMS_VTYPE_SAMPLES`, `SCMS_VTYPE_JITTER` |
+| Driver profiles | VeReMi-NextGen 10/80/10 aggressive/normal/passive, applied per vehicle at runtime; keyed on (seed, vehicle id) so the fleet mix is reproducible | `SCMS_DRIVER_PROFILES`, `SCMS_DRIVER_AGGRESSIVE_PCT`, `SCMS_DRIVER_PASSIVE_PCT` |
+| NextGen sensor-error model | Temporally-correlated GNSS error, relative speed error, speed-decaying heading error. The CAM carries only an ETSI-style 95 % confidence radius — never the realised error vector — and that radius is **quantised onto a coarse fleet-shared ladder** so a constant per-vehicle confidence cannot act as a cross-pseudonym linkage key | `SCMS_SENSOR_MODEL=nextgen`, `SCMS_SENSOR_*` |
+| Distance-based pseudonym change | NextGen's privacy model (800–1500 m driven, then distance **and** 120–360 s), re-based on simulation time. Makes `SCMS_ROTATE_PERIOD` inert | `SCMS_PSEUDONYM_POLICY=distance`, `SCMS_PSN_*` |
+| Road-side units | `org.scms.app.ScmsRsuApp`: static, always-trusted receivers running the same detector suite as vehicles, placed on real junctions with correct WGS-84 positions | `SCMS_RSUS`, `SCMS_RSU_PLACEMENT`, `SCMS_RSU_APP` |
+| Gravity OD + departure profiles | Capacity-weighted origin/destination sampling and per-interval departure-rate shapes on generated maps | `SCMS_OD`, `SCMS_DEPART_PROFILE` |
+| Traffic-signal guessing | `--tls.guess`/`-signals`, `--tls.join`, `--junctions.join`, `--ramps.guess` on procedural/OSM imports | `SCMS_TLS` |
+| Scenario provenance | `scenario_provenance.json` (effective env + resolved knobs + SHA-256 per input) and a `scms_inputs.json` side-car the Java back-end inlines into `manifest.inputs` | (automatic) |
+
+> The two ported VeReMi-NextGen components (`org.scms.realism.DriverProfile`,
+> `org.scms.realism.SensorErrorModel`) are **EPL-2.0** — see `THIRD_PARTY_LICENSES.md`.
+
 ## GUI & Copilot
 
 Launch with `.\gui.ps1` → `http://127.0.0.1:8710`. Dependency-free web panel (Python stdlib server).

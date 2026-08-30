@@ -1,0 +1,89 @@
+{
+  "reference_set": "v2x_awareness",
+  "title": "V2X reception: awareness ratio, PDR-vs-distance shape, effective range, latency",
+  "scope": "Communication panel. Awareness/PDR curves are reconstructed from MA reports joined to ground-truth emission positions, so they are proportional-to-PDR curves normalised at the near band, not absolute PDR.",
+  "curated_from": "docs/realism/investigation/research-realism-benchmarks.json (benchmarks[10,11,12,14], findings section B) and docs/realism/ROADMAP.md sections 4 (Phase 2 gate) and 5.",
+  "entries": {
+    "awareness_ratio_200m_urban_min": {
+      "min": 0.90,
+      "unit": "fraction",
+      "confidence": "anchored",
+      "cite": "ROADMAP Phase-2 gate (Boban & d'Orey measurement campaign)",
+      "source": "Project-adopted gate from docs/realism/ROADMAP.md section 5 comm panel and the Phase-2 benchmark gate: '>= 90% neighbor-awareness at 200 m urban ... under low load (reference: Boban & d'Orey 2015 measurement campaign)'. Neighbour-awareness ratio is defined as detected neighbours / neighbours physically present within a nominal range inside a freshness window -- EURECOM, 'Rethinking Cooperative Awareness for Future V2X Safety-critical Applications', https://www.eurecom.fr/publication/5365/download/comsys-publi-5365.pdf.",
+      "note": "The 0.90 threshold is a PROJECT-ADOPTED gate; the underlying campaign is cited for the metric definition and the qualitative level, not for a transcribed 0.90 figure."
+    },
+    "awareness_ratio_500m_highway_min": {
+      "min": 0.90,
+      "unit": "fraction",
+      "confidence": "anchored",
+      "cite": "ROADMAP Phase-2 gate (Boban & d'Orey measurement campaign)",
+      "source": "Same source and caveat as awareness_ratio_200m_urban_min: docs/realism/ROADMAP.md Phase-2 gate, '>= 90% neighbor-awareness ... at 500 m highway under low load'.",
+      "note": "Not evaluated by the Phase-0 anchors (100/200/300 m); pinned so Phase 2 uses the same audited number."
+    },
+    "awareness_anchor_distances_m": {
+      "points": [100.0, 200.0, 300.0],
+      "unit": "m",
+      "confidence": "anchored",
+      "cite": "EURECOM cooperative-awareness metric; ROADMAP section 5",
+      "source": "docs/realism/investigation/research-realism-benchmarks.json benchmarks[14] (awareness metrics: neighbor awareness ratio, EURECOM 'Rethinking Cooperative Awareness'): 'Track NAR at 100/200/300 m vs density'; adopted verbatim in docs/realism/ROADMAP.md Phase 0 task list.",
+      "note": "The three distances at which the normalised awareness ratio is reported."
+    },
+    "pdr_gray_zone_width_min_m": {
+      "min": 100.0,
+      "unit": "m",
+      "confidence": "anchored",
+      "cite": "ROADMAP section 5 (Bai/Stancil/Krishnan MobiCom 2010 shape)",
+      "source": "Project-adopted gate from docs/realism/ROADMAP.md section 5: 'PDR gray-zone width (90% -> 20%) >= 100 m', referencing the DSRC empirical characterisation of Bai, Stancil & Krishnan, 'Toward understanding characteristics of dedicated short range communications (DSRC) from a perspective of vehicular network engineers', ACM MobiCom 2010, doi:10.1145/1859995.1860033, which establishes the reliable-zone / stochastic-gray-zone / cutoff shape.",
+      "note": "A step-function (unit-disc) range model FAILS this by construction -- that is the intended Phase-0 baseline finding, not a harness defect."
+    },
+    "los_high_pdr_range_m": {
+      "range": [500.0, 700.0],
+      "unit": "m",
+      "confidence": "anchored",
+      "cite": "Bai/Stancil/Krishnan MobiCom 2010; Sensors 2021 urban V2I benchmark",
+      "source": "IEEE 802.11p / DSRC line-of-sight open-road measurements sustain high PDR out to ~500-700 m at ~20 dBm (GM campaigns, Bai/Stancil/Krishnan MobiCom 2010; urban V2I benchmark, Sensors 2021, PMC8347901). Summarised in research-realism-benchmarks.json benchmarks[10] (V2X PDR-vs-distance reference points).",
+      "note": "PINNED FOR LATER PHASES; Phase 0 reports an effective range (normalised awareness crossing 0.5) for tracking, without a pass/fail band, because the reconstructed curve is proportional-to-PDR rather than absolute."
+    },
+    "nlos_urban_effective_range_m": {
+      "value": 100.0,
+      "unit": "m",
+      "confidence": "coarse",
+      "cite": "Bai/Stancil/Krishnan MobiCom 2010; Sensors 2021",
+      "source": "Urban NLoS reception collapses to an effective range 'on the order of only ~100 m at obstructed intersections' (research-realism-benchmarks.json benchmarks[10], V2X PDR-vs-distance reference points).",
+      "note": "Order-of-magnitude anchor only; no precision beyond one significant figure is claimed."
+    },
+    "cv2x_mode4_pdr95_range_m": {
+      "points": [[0.1, 380.0], [0.2, 300.0], [0.3, 280.0]],
+      "unit": "[veh/m, m]",
+      "confidence": "anchored",
+      "cite": "Springer 978-3-031-21967-2_45 (C-V2X Mode 4 simulation benchmark)",
+      "source": "C-V2X Mode 4 simulation benchmark: PDR >= 95% out to 380/300/280 m at densities 0.1/0.2/0.3 veh/m (MCS 9, keep-probability 0.8), doi:10.1007/978-3-031-21967-2_45. Summarised in research-realism-benchmarks.json benchmarks[11] (C-V2X Mode 4).",
+      "note": "PINNED FOR REFERENCE. This project's stacks model ITS-G5/802.11p, not C-V2X; the entry exists so a future C-V2X profile is graded against an audited number."
+    },
+    "latency_p50_ms_80211p": {
+      "range": [5.0, 9.0],
+      "unit": "ms",
+      "confidence": "anchored",
+      "cite": "DLR Cohda MK5 field measurements (ITS World Congress 2021)",
+      "source": "de Ponte Mueller et al., 'ITS-G5 and C-V2X link level performance measurements', ITS World Congress 2021, https://elib.dlr.de/142341/ : ITS-G5/802.11p minimum end-to-end latency ~5 ms at 200 B payload rising to 8-9 ms at 800/1000 B. Summarised in research-realism-benchmarks.json benchmarks[12] (latency CDF anchors).",
+      "note": "PINNED FOR LATER PHASES. Phase 0 datasets carry detection_time == generation_time (no latency model), so no latency metric is scored."
+    },
+    "latency_p50_ms_cv2x": {
+      "range": [25.0, 45.0],
+      "unit": "ms",
+      "confidence": "anchored",
+      "cite": "DLR Cohda MK6c field measurements (ITS World Congress 2021)",
+      "source": "Same DLR Cohda MK5/MK6c field campaign as latency_p50_ms_80211p (de Ponte Mueller et al., ITS World Congress 2021, https://elib.dlr.de/142341/): C-V2X (LTE PC5 mode 4, SPS) end-to-end latency ~25 ms typical, rising to 40-45 ms (1-sigma) for 800-1000 B packets.",
+      "note": "PINNED FOR REFERENCE; not scored in Phase 0."
+    },
+    "shadowing_decorrelation_distance_m": {
+      "range": [7.0, 13.0],
+      "unit": "m",
+      "confidence": "anchored",
+      "cite": "ETSI TR 103 257-1 / Gudmundson correlation model (ROADMAP section 3.2)",
+      "source": "Gudmundson-style AR(1) shadowing with a 10-13 m decorrelation distance, adopted in docs/realism/ROADMAP.md section 3.2 item 3 and gated in the Phase-2 benchmark list as 'empirical link-level autocorrelation e-folding distance 10 +/- 3 m (ETSI TR 103 257-1)'.",
+      "derivation": "Range [7, 13] m is the ROADMAP's '10 +/- 3 m' gate written out as an interval.",
+      "note": "PINNED FOR PHASE 2 (channel model); no shadowing autocorrelation is observable in the Phase-0 dataset schema."
+    }
+  }
+}

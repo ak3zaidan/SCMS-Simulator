@@ -1,0 +1,89 @@
+{
+  "reference_set": "traffic_regimes",
+  "title": "Per-regime (urban / highway) speed and time-headway anchors",
+  "scope": "Aggregate distribution checks on benign vehicle kinematics. Regime is chosen from the scenario's road network (grid/ring/spider/custom/osm -> urban; linear corridor -> highway) or forced with --regime.",
+  "curated_from": "docs/realism/investigation/research-realism-benchmarks.json (section D reference corpora) and docs/realism/ROADMAP.md section 5.",
+  "honesty_note": "The Phase-0 research report names pNEUMA (urban) and highD (highway) as the reference corpora but publishes NO percentile tables for either, and neither corpus is vendored in this repo. The speed bands below are therefore COARSE plausibility envelopes derived from posted limits and corpus provenance, explicitly flagged confidence='coarse'. They are not measured percentiles and must be replaced by extracted percentiles when a licensed corpus is available.",
+  "entries": {
+    "urban.speed_p50_mps": {
+      "range": [3.0, 14.0],
+      "unit": "m/s",
+      "confidence": "coarse",
+      "cite": "pNEUMA urban corpus (coarse envelope)",
+      "source": "Coarse envelope anchored on pNEUMA as the urban reference corpus: Barmpounakis & Geroliminis, 'On the new era of urban traffic monitoring with massive drone data: The pNEUMA large-scale field experiment', Transportation Research Part C 111, 2020, doi:10.1016/j.trc.2019.11.023 (Athens CBD, 10 drones, ~500,000 trajectories, open on Zenodo 10491409).",
+      "derivation": "Upper bound 14.0 m/s ~= the 50 km/h posted urban limit (13.9 m/s): a network median above the limit is implausible. Lower bound 3.0 m/s ~= 11 km/h, a heavily congested urban network mean. No published percentile is asserted."
+    },
+    "urban.speed_p95_mps": {
+      "range": [8.0, 22.0],
+      "unit": "m/s",
+      "confidence": "coarse",
+      "cite": "pNEUMA urban corpus (coarse envelope)",
+      "source": "Same provenance as urban.speed_p50_mps: pNEUMA (Barmpounakis & Geroliminis, Transportation Research Part C 111, 2020, doi:10.1016/j.trc.2019.11.023) as the urban reference corpus, with no published percentile table.",
+      "derivation": "Upper bound 22.0 m/s ~= 79 km/h, allowing urban arterials/limited-access links above the 50 km/h core limit. Lower bound 8.0 m/s ~= 29 km/h: a p95 below this means the whole network is in permanent gridlock."
+    },
+    "highway.speed_p50_mps": {
+      "range": [18.0, 38.0],
+      "unit": "m/s",
+      "confidence": "coarse",
+      "cite": "highD German-motorway corpus (coarse envelope)",
+      "source": "Coarse envelope anchored on highD as the highway reference corpus: Krajewski et al., IEEE ITSC 2018, doi:10.1109/ITSC.2018.8569552 (German motorway sections, drone, 25 Hz).",
+      "derivation": "Upper bound 38.0 m/s ~= 137 km/h (free-flow German motorway); lower bound 18.0 m/s ~= 65 km/h (dense but moving motorway traffic). No published percentile is asserted."
+    },
+    "highway.speed_p95_mps": {
+      "range": [28.0, 55.0],
+      "unit": "m/s",
+      "confidence": "coarse",
+      "cite": "highD German-motorway corpus (coarse envelope)",
+      "source": "Same provenance as highway.speed_p50_mps: highD (Krajewski et al., IEEE ITSC 2018, doi:10.1109/ITSC.2018.8569552) as the highway reference corpus, with no published percentile table.",
+      "derivation": "Upper bound 55.0 m/s ~= 198 km/h (fast lane on unrestricted sections, below the 60 m/s hard plausibility bound); lower bound 28.0 m/s ~= 101 km/h."
+    },
+    "urban.time_headway_ks_max": {
+      "max": 0.15,
+      "unit": "KS statistic",
+      "confidence": "anchored",
+      "cite": "ROADMAP section 5 headway row (urban)",
+      "source": "Project-adopted acceptance threshold, docs/realism/ROADMAP.md section 5: 'Headway distribution KS vs reference <= 0.15 (urban)'. The distributional-test methodology (KS/Anderson-Darling on time-headway distributions vs loop-event or trajectory data) is the standard cited in docs/realism/investigation/research-realism-benchmarks.json benchmarks[7] and in the SUMO saturation-headway validation doi:10.3390/su18147025.",
+      "note": "Applied against the shifted-exponential (Cowan M3 family) headway model fitted to the run itself -- a SHAPE test, mirroring calibration.py's ks_vs_fitted_rayleigh. See time_headway_model."
+    },
+    "highway.time_headway_ks_max": {
+      "max": 0.10,
+      "unit": "KS statistic",
+      "confidence": "anchored",
+      "cite": "ROADMAP section 5 headway row (highway)",
+      "source": "Project-adopted acceptance threshold, docs/realism/ROADMAP.md section 5: 'Headway distribution KS vs reference <= 0.10 (highway)'.",
+      "note": "Same shape test as urban.time_headway_ks_max, stricter because motorway headways are far closer to the shifted-exponential ideal than signal-metered urban ones."
+    },
+    "time_headway_model": {
+      "value": "shifted_exponential",
+      "unit": "model",
+      "confidence": "anchored",
+      "cite": "Cowan M3 / negative-exponential headway family",
+      "source": "Cowan, 'Useful headway models', Transportation Research 9(6), 1975 (M3 model: a fraction of vehicles at a minimum tracking headway, the rest exponentially distributed). The shifted/negative-exponential family is the standard free-flow headway model validated against urban-freeway loop event data (see 'Examining Headway Distribution Models with Urban Freeway Loop Event Data', Transportation Research Record 1802).",
+      "note": "F(h) = 1 - exp(-(h - h_min) / (h_mean - h_min)) for h >= h_min, with h_min and h_mean fitted to the observed sample. Fitting to the sample makes this a shape test, not a location test -- the location is graded separately by headway_implausible_below_s."
+    },
+    "headway_implausible_below_s": {
+      "value": 0.5,
+      "unit": "s",
+      "confidence": "anchored",
+      "cite": "derived from the lane-capacity anchor (see derivation)",
+      "source": "Derived arithmetically from the empirical lane-capacity anchor in fundamental_diagram.json (1800-2400 veh/h/lane; Cassidy & Bertini 1999 lineage via docs/realism/investigation/research-realism-benchmarks.json benchmarks[6]).",
+      "derivation": "A 0.5 s time headway corresponds to 3600/0.5 = 7200 veh/h/lane, roughly 3x the highest empirically observed lane capacity. Headways below it are not physical car-following; they indicate vehicles passing through one another or a broken spacing model."
+    },
+    "headway_implausible_max_fraction": {
+      "max": 0.05,
+      "unit": "fraction",
+      "confidence": "coarse",
+      "cite": "project-adopted tolerance",
+      "source": "Project-adopted tolerance on headway_implausible_below_s: a small tail is expected from lane-abstraction and finite-difference noise, but more than 5% of headways below the 0.5 s floor indicates a systematically non-physical following model.",
+      "note": "Tolerance value is a project gate, not a published measurement."
+    },
+    "saturation_headway_s": {
+      "range": [1.5, 2.0],
+      "unit": "s",
+      "confidence": "anchored",
+      "cite": "derived from the lane-capacity anchor",
+      "source": "Derived arithmetically from fundamental_diagram.json capacity_veh_per_h_per_lane = 1800-2400 veh/h/lane.",
+      "derivation": "3600/2400 = 1.5 s and 3600/1800 = 2.0 s. This is the mean time headway AT CAPACITY, i.e. the lower edge of a realistic headway distribution -- free-flow medians are larger. Reported for context; not used as a pass/fail band on the run-wide median."
+    }
+  }
+}

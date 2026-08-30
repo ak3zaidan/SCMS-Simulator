@@ -301,15 +301,55 @@ CONFIG_SPEC = [
     {"group": "Traffic", "name": "scale", "label": "Density scale", "type": "float", "default": "",
      "step": 0.1, "min": 0, "max": 10, "env": None, "param": "Scale", "kind": "route",
      "help": "Route maps (InTAS): SUMO traffic-density multiplier, e.g. 0.4 or 1.5"},
-    {"group": "Traffic", "name": "sim_step", "label": "Sim step (s)", "type": "float", "default": "",
+    {"group": "Traffic", "name": "sim_step", "label": "SUMO step (s)", "type": "float", "default": "",
      "min": 0.05, "max": 1.0, "step": 0.05, "env": "SCMS_SIM_STEP",
-     "help": "Blank = map default (generated maps 0.1 s = 10 Hz CAMs; curated stay native). Set to override both."},
+     "help": "SUMO integration step on generated maps (blank = 0.1 s). NOTE: MOSAIC always launches "
+             "SUMO with --step-length equal to the sync period below, which overrides the sumocfg, "
+             "so the sync period is what SUMO actually integrates at."},
+    {"group": "Traffic", "name": "sync_ms", "label": "MOSAIC↔SUMO sync (ms)", "type": "int",
+     "default": 100, "min": 50, "max": 1000, "env": "SCMS_SYNC_MS",
+     "help": "How often MOSAIC pulls vehicle state from SUMO, and (because MOSAIC passes it as "
+             "--step-length) the step SUMO actually integrates at. 100 ms lets the ETSI CAM rules "
+             "fire at 1–10 Hz; 1000 ms is the old behaviour and runs ~10× faster on InTAS."},
+    {"group": "Traffic", "name": "road_network", "label": "Road-network class", "type": "choice",
+     "default": "auto", "options": ["auto", "osm", "linear", "grid", "spider", "custom", "ring"],
+     "env": "SCMS_ROAD_NETWORK",
+     "help": "Which reference speed/headway bands datagen.realism_bench scores this run against "
+             "('linear' = highway, everything else = urban). 'auto' classifies from the SUMO net's "
+             "speed limits, except the InTAS variants, which share one net and are classified from "
+             "their route set. Override when the net cannot tell the regimes apart."},
     {"group": "Traffic", "name": "fleet", "label": "Fleet mix", "type": "choice", "default": "mixed",
      "options": ["mixed", "car"], "env": "SCMS_FLEET",
      "help": "Generated maps: mixed = car/truck/bus/motorcycle; car = homogeneous"},
     {"group": "Traffic", "name": "demand", "label": "Demand profile", "type": "choice", "default": "uniform",
      "options": ["uniform", "rush", "night"], "env": "SCMS_DEMAND",
      "help": "Generated maps: rush front-loads departures (peak then quiet); night is sparse (~35%)"},
+    {"group": "Traffic", "name": "od", "label": "OD sampling", "type": "choice", "default": "gravity",
+     "options": ["gravity", "uniform"], "env": "SCMS_OD",
+     "help": "Generated maps: gravity = trips start/end where the network has capacity "
+             "(production/attraction ∝ capacity-weighted node degree); uniform = plain randomTrips"},
+    {"group": "Traffic", "name": "depart_profile", "label": "Departure-rate profile", "type": "text",
+     "default": "", "env": "SCMS_DEPART_PROFILE",
+     "help": "Generated maps: per-interval arrival-rate shape — a name (morning/evening/diurnal/peak) "
+             "or a comma list like 1,3,2,1. Blank = flat. Keeps the total vehicle count."},
+    {"group": "Traffic", "name": "tls", "label": "Traffic-signal guessing", "type": "choice",
+     "default": "guess", "options": ["guess", "off"], "env": "SCMS_TLS",
+     "help": "Generated maps: guess/join signals on import (--tls.guess / --tls.guess-signals, "
+             "--tls.join, --junctions.join, --ramps.guess). 'off' = signal-free networks"},
+    # Driver heterogeneity applied by the APP at runtime (VeReMi-NextGen DriverProfile, ported into
+    # org.scms.realism). Off by default: enabling it changes the MOSAIC dataset digest by design.
+    {"group": "Traffic", "name": "driver_profiles", "label": "Driver profiles (aggressive/normal/passive)",
+     "type": "bool", "default": False, "env": "SCMS_DRIVER_PROFILES",
+     "help": "Assign each vehicle a VeReMi-NextGen driver profile at runtime (tau / accel / decel / "
+             "speedFactor / imperfection / minGap + lane-change & speed modes). Off = one uniform "
+             "driver model for the whole fleet."},
+    {"group": "Traffic", "name": "driver_aggressive_pct", "label": "Aggressive drivers %", "type": "int",
+     "default": 10, "min": 0, "max": 100, "env": "SCMS_DRIVER_AGGRESSIVE_PCT",
+     "help": "Share of AGGRESSIVE profiles (upstream NextGen default 10%); the remainder after "
+             "passive is NORMAL"},
+    {"group": "Traffic", "name": "driver_passive_pct", "label": "Passive drivers %", "type": "int",
+     "default": 10, "min": 0, "max": 100, "env": "SCMS_DRIVER_PASSIVE_PCT",
+     "help": "Share of PASSIVE profiles (upstream NextGen default 10%)"},
 
     # --- SCMS policy ---
     {"group": "SCMS policy", "name": "attacker_pct", "label": "Attacker %", "type": "int",
@@ -357,6 +397,26 @@ CONFIG_SPEC = [
     {"group": "SCMS policy", "name": "ingest_delay", "label": "Report ingest delay (s)", "type": "float",
      "default": 0.15, "min": 0, "max": 10, "step": 0.05, "env": "SCMS_INGEST_DELAY",
      "help": "Mean MA report-channel latency (detection → ingest)"},
+    # Pseudonym-change policy. 'distance' is the VeReMi-NextGen model (a change needs distance
+    # driven AND, after the first, elapsed time) and makes the fixed lifetime above INERT.
+    {"group": "SCMS policy", "name": "pseudonym_policy", "label": "Pseudonym change policy",
+     "type": "choice", "default": "period", "options": ["period", "distance"],
+     "env": "SCMS_PSEUDONYM_POLICY",
+     "help": "period = change every 'Pseudonym lifetime' seconds; distance = VeReMi-NextGen model "
+             "(first change after 800–1500 m driven, later ones need distance AND 120–360 s). "
+             "'distance' makes the lifetime knob above inert."},
+    {"group": "SCMS policy", "name": "psn_dist_min", "label": "Pseudonym: min distance (m)",
+     "type": "float", "default": 800.0, "min": 0, "max": 20000, "step": 50, "env": "SCMS_PSN_DIST_MIN_M",
+     "help": "distance policy: lower bound of the per-cycle distance draw"},
+    {"group": "SCMS policy", "name": "psn_dist_max", "label": "Pseudonym: max distance (m)",
+     "type": "float", "default": 1500.0, "min": 0, "max": 20000, "step": 50, "env": "SCMS_PSN_DIST_MAX_M",
+     "help": "distance policy: upper bound of the per-cycle distance draw"},
+    {"group": "SCMS policy", "name": "psn_time_min", "label": "Pseudonym: min time (s)",
+     "type": "float", "default": 120.0, "min": 0, "max": 3600, "step": 10, "env": "SCMS_PSN_TIME_MIN_S",
+     "help": "distance policy: lower bound of the additional time condition (after the 1st change)"},
+    {"group": "SCMS policy", "name": "psn_time_max", "label": "Pseudonym: max time (s)",
+     "type": "float", "default": 360.0, "min": 0, "max": 3600, "step": 10, "env": "SCMS_PSN_TIME_MAX_S",
+     "help": "distance policy: upper bound of the additional time condition"},
 
     # --- Attacks ---
     {"group": "Attacks", "name": "attacks", "label": "Enabled attack behaviours", "type": "multi",
@@ -462,6 +522,34 @@ CONFIG_SPEC = [
     {"group": "Vehicle & radio", "name": "veh_length", "label": "Vehicle length (m)", "type": "float",
      "default": 5.0, "min": 2, "max": 20, "step": 0.5, "env": "SCMS_VEH_LENGTH",
      "help": "Vehicle length"},
+    {"group": "Vehicle & radio", "name": "cf_model", "label": "Car-following model", "type": "choice",
+     "default": "eidm", "options": ["eidm", "krauss", "idm", "acc", "w99"], "env": "SCMS_CF_MODEL",
+     "help": "SUMO driver model. EIDM is the human-like extended IDM (drive-off dynamics validated "
+             "against drone trajectories); krauss is SUMO's stock model and the historical default"},
+    {"group": "Vehicle & radio", "name": "speed_dev", "label": "Desired-speed spread σ", "type": "float",
+     "default": 0.1, "min": 0, "max": 0.4, "step": 0.01, "env": "SCMS_SPEED_DEV",
+     "help": "Per-driver speedFactor deviation, normc(1,σ,1-3σ,1+3σ). 0 = every vehicle drives "
+             "exactly at the speed limit (what MOSAIC's generated vTypes did before)"},
+    {"group": "Vehicle & radio", "name": "vtype_samples", "label": "Driver prototypes / class",
+     "type": "int", "default": 8, "min": 1, "max": 64, "env": "SCMS_VTYPE_SAMPLES",
+     "help": "Generated maps: size of each class's vTypeDistribution (1 = one uniform vType). Also "
+             "enables MOSAIC per-vehicle parameter deviations on curated flow maps"},
+    {"group": "Vehicle & radio", "name": "vtype_jitter", "label": "Driver-parameter jitter",
+     "type": "float", "default": 0.15, "min": 0, "max": 0.5, "step": 0.01, "env": "SCMS_VTYPE_JITTER",
+     "help": "Relative spread of tau / accel / decel / minGap / length across driver prototypes"},
+    {"group": "Vehicle & radio", "name": "lateral_res", "label": "Sublane resolution (m)",
+     "type": "text", "default": "0.8", "env": "SCMS_LATERAL_RES",
+     "help": "SUMO --lateral-resolution: turns on the sublane model so a lane change is a "
+             "continuous ~3 s lateral traverse instead of a single-step teleport across a full "
+             "3.2 m lane (the jump a V2X position-plausibility detector keys on). 0.8 m splits "
+             "SUMO's default 3.2 m lane into exactly 4 sublanes and stays under the narrowest "
+             "motorised vehicle (motorcycle 0.9 m). 'off' restores instant centreline snapping; "
+             "smaller values cost more wall clock"},
+    {"group": "Vehicle & radio", "name": "lateral_speed", "label": "Max lateral speed (m/s)",
+     "type": "float", "default": 1.0, "min": 0.1, "max": 5, "step": 0.1, "env": "SCMS_LATERAL_SPEED",
+     "help": "vType maxSpeedLat under the sublane model. 1.0 m/s (SUMO's default) crosses a 3.2 m "
+             "lane in ~3 s, inside the 2-4 s a real lane change takes. Only reaches vTypes we "
+             "own (generated maps + MOSAIC flow maps); route maps such as InTAS own their vTypes"},
     {"group": "Vehicle & radio", "name": "radio_range", "label": "Radio range (m)", "type": "float",
      "default": 709.4, "min": 50, "max": 3000, "step": 10, "env": "SCMS_RADIO_RANGE",
      "help": "ITS-G5 single-hop communication radius (SNS)"},
@@ -477,6 +565,21 @@ CONFIG_SPEC = [
     {"group": "Vehicle & radio", "name": "nlos", "label": "NLOS obstruction", "type": "float",
      "default": 0.0, "min": 0, "max": 1, "step": 0.05, "env": "SCMS_NLOS",
      "help": "Building-obstruction reception loss that grows with distance (urban NLOS). 0 = off"},
+
+    # --- Infrastructure (RSUs) ---
+    {"group": "RSU (infrastructure)", "name": "rsus", "label": "Road-side units", "type": "text",
+     "default": "auto", "env": "SCMS_RSUS",
+     "help": "MOSAIC RSU count. 'auto' = 8 as soon as the app jar ships an RSU application, "
+             "0 = none. RSUs used to be stripped from every mapping unconditionally."},
+    {"group": "RSU (infrastructure)", "name": "rsu_placement", "label": "RSU placement",
+     "type": "choice", "default": "junction", "options": ["junction", "grid", "keep"],
+     "env": "SCMS_RSU_PLACEMENT",
+     "help": "junction = signalised/high-degree intersections, spread for coverage; grid = regular "
+             "lattice over the network; keep = only whatever the source scenario shipped"},
+    {"group": "RSU (infrastructure)", "name": "rsu_app", "label": "RSU application", "type": "text",
+     "default": "", "env": "SCMS_RSU_APP",
+     "help": "Fully-qualified MOSAIC application class for RSU units "
+             "(blank = org.scms.app.ScmsRsuApp)"},
 
     # --- Sensors & CAM timing (data realism) ---
     {"group": "Sensors & CAM timing", "name": "gps_sigma", "label": "GPS noise σ (m)", "type": "float",
@@ -514,7 +617,36 @@ CONFIG_SPEC = [
      "help": "How many CAMs a DoS attacker emits per simulation step"},
     {"group": "Sensors & CAM timing", "name": "emit_sample", "label": "Per-msg GT sample rate", "type": "float",
      "default": 0.02, "min": 0, "max": 1, "step": 0.01, "env": "SCMS_EMIT_SAMPLE",
-     "help": "Fraction of CAMs logged to gt_emissions_sample (true-vs-claimed, message-level labels)"},
+     "help": "Fraction of CAMs logged to gt_emissions_sample (true-vs-claimed, message-level labels). "
+             "Set to 1.0 for a run the realism benchmark can fully score (headway / fundamental "
+             "diagram / CAM-rate metrics all need a complete trace)."},
+    # Sensor-error model: the built-in GNSS/odometry noise, or the ported VeReMi-NextGen model
+    # (temporally-correlated position error, relative speed error, speed-decaying heading error).
+    # Either way the CAM carries only an ETSI-style 95% confidence radius, never the realised error.
+    {"group": "Sensors & CAM timing", "name": "sensor_model", "label": "Sensor-error model",
+     "type": "choice", "default": "builtin", "options": ["builtin", "nextgen"],
+     "env": "SCMS_SENSOR_MODEL",
+     "help": "builtin = this project's GNSS/odometry noise (white + drifting bias + outliers); "
+             "nextgen = the ported VeReMi-NextGen SensorErrorModel. Hardware pathologies (outlier "
+             "spikes, degradation bursts, sustained faults) still apply on top of either."},
+    {"group": "Sensors & CAM timing", "name": "sensor_pos_err", "label": "NextGen: position error E₀ (m)",
+     "type": "float", "default": 5.0, "min": 0, "max": 50, "step": 0.5, "env": "SCMS_SENSOR_POS_ERR_M",
+     "help": "nextgen model: half-width of the per-vehicle uniform base position error per axis"},
+    {"group": "Sensors & CAM timing", "name": "sensor_speed_err", "label": "NextGen: speed error σ",
+     "type": "float", "default": 0.00016, "min": 0, "max": 0.01, "step": 0.00002,
+     "env": "SCMS_SENSOR_SPEED_ERR",
+     "help": "nextgen model: std-dev of the RELATIVE speed-error factor (dimensionless)"},
+    {"group": "Sensors & CAM timing", "name": "sensor_head_err", "label": "NextGen: heading error (deg)",
+     "type": "float", "default": 20.0, "min": 0, "max": 180, "step": 1, "env": "SCMS_SENSOR_HEAD_ERR_DEG",
+     "help": "nextgen model: heading-error half-width at standstill (decays with speed)"},
+    {"group": "Sensors & CAM timing", "name": "sensor_pos_sigma_frac", "label": "NextGen: position σ fraction",
+     "type": "float", "default": 0.03, "min": 0, "max": 1, "step": 0.01,
+     "env": "SCMS_SENSOR_POS_SIGMA_FRAC",
+     "help": "nextgen model: per-step noise σ as a fraction of |E₀| (drives the temporal correlation)"},
+    {"group": "Sensors & CAM timing", "name": "sensor_head_decay", "label": "NextGen: heading decay (s/m)",
+     "type": "float", "default": 0.1, "min": 0, "max": 2, "step": 0.01, "env": "SCMS_SENSOR_HEAD_DECAY",
+     "help": "nextgen model: heading error is scaled by exp(-decay × speed) — fast vehicles have a "
+             "well-determined heading, a standing one does not"},
 ]
 
 # Regroup the python-flow controls into the same semantic sections as the MOSAIC controls, so the
@@ -695,6 +827,10 @@ def start_run(config: dict) -> dict:
             elif c["type"] == "choice":
                 if val in c.get("options", []):     # only accept a listed option
                     env[c["env"]] = str(val)
+            elif c["type"] == "bool":
+                # The Java layer reads booleans as 0/1 ints; str(False) == "False" would not parse
+                # and would silently fall back to the default (an ON checkbox reading as OFF).
+                env[c["env"]] = "1" if val else "0"
             elif val != "":
                 env[c["env"]] = str(val)
 

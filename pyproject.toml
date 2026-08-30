@@ -20,5 +20,12 @@ scms-poc = "scms_sim_ref.mock_pipeline.run:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# The realism benchmark scores every metric against pinned reference summaries shipped as data
+# files. Without this a wheel omits them and realism_bench silently reports every metric as
+# "na (no reference entry)" instead of failing loudly. (In-tree runs are unaffected: conftest.py
+# puts src/ on sys.path, so the JSONs are found either way.)
+[tool.setuptools.package-data]
+"scms_sim_ref.datagen" = ["refdata/*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -148,6 +148,10 @@ def audit(ds_dir: Path):
         coords = str(cfg.get("rsu_coords", "") or "").strip()
         if coords:                                   # explicit placement may exceed n_rsus
             n_rsus = max(n_rsus, sum(1 for p in coords.split(";") if p.strip()))
+        # The MOSAIC layer provisions RSUs as units in the scenario mapping, not through a
+        # PipelineConfig knob, so it publishes the realised count under counts.rsus. Take the
+        # larger of the two so a dataset from either engine is measured against its own RSU fleet.
+        n_rsus = max(n_rsus, int(((man.get("counts") or {}).get("rsus")) or 0))
         ok = (not subj_unresolved) and (len(rep_unresolved) <= n_rsus)
         rec(ds, "R3_cert_digests_resolve", ok,
             f"subj_unresolved={len(subj_unresolved)} reporter_unresolved={len(rep_unresolved)} "
@@ -487,6 +491,57 @@ def audit(ds_dir: Path):
                 f"nodes={len(nodes)} edges={len(edges)}" + ("; " + "; ".join(problems[:4]) if problems else ""))
         except Exception as e:
             rec(ds, "N1_world_provenance", False, f"network.json error: {type(e).__name__}: {e}")
+
+    # RL1: MOSAIC realism layer (Phase 1) containment. Two ORACLE-only fields appear ONLY in the
+    # opt-in realism modes: gt_vehicle.driver_profile (the ported NextGen DriverProfile class) and
+    # gt_emissions_sample.measured_{x,y,speed} (the honest sensor measurement BEFORE falsification,
+    # from the ported NextGen SensorErrorModel). A receiver observes neither, so both are ground
+    # truth: they must never reach an ml/ feature table or any ma/ row. SKIPs on datasets that
+    # predate the modes (or ran with them off), so the historical corpus stays green.
+    rl_fields = ("driver_profile", "measured_x", "measured_y", "measured_speed")
+    rl_present = sorted({f for f in rl_fields
+                         if any(f in r for r in gt_vehicle) or any(f in e for e in gt_emissions)})
+    if not rl_present:
+        rec(ds, "RL1_realism_oracle_containment", None, "no realism-layer oracle fields in dataset")
+    else:
+        rl_leaks = []
+        for name in FEATURE_FILES:
+            cols, _ = read_csv(ml / f"{name}.csv")
+            bad = [c for c in cols if c in rl_fields]
+            if bad:
+                rl_leaks.append(f"ml/{name}.csv cols {bad}")
+        for fp in (sorted(ma.glob("*.jsonl")) if ma.exists() else []):
+            for i, r in enumerate(read_jsonl(fp)):
+                bad = [k for k in _all_keys(r) if k in rl_fields]
+                if bad:
+                    rl_leaks.append(f"{fp.name}[{i}] keys {bad}")
+                    break                      # one hit per file is enough to fail it
+        rec(ds, "RL1_realism_oracle_containment", not rl_leaks,
+            f"present={rl_present} " + ("; ".join(rl_leaks[:5]) if rl_leaks else "contained"))
+
+    # PROV1: scenario provenance. run.ps1 parks the generator's scms_scenario_manifest.json next to
+    # a MOSAIC dataset as scenario_provenance.json (effective SCMS_* env + resolved realism knobs +
+    # a sha256 per scenario input). When present it must parse and carry the resolved-knob block, so
+    # the realism claims a datasheet prints are actually auditable. SKIPs when absent (python-flow
+    # datasets never have one).
+    prov_p = ds_dir / "scenario_provenance.json"
+    if not prov_p.exists():
+        rec(ds, "PROV1_scenario_provenance", None, "no scenario_provenance.json")
+    else:
+        try:
+            prov = json.loads(prov_p.read_text(encoding="utf-8"))
+            resolved = prov.get("resolved") or {}
+            missing = [k for k in ("schema", "scenario_key", "resolved", "env", "inputs")
+                       if k not in prov]
+            if not isinstance(resolved, dict) or "mosaic_sync_ms" not in resolved:
+                missing.append("resolved.mosaic_sync_ms")
+            rec(ds, "PROV1_scenario_provenance", not missing,
+                f"schema={prov.get('schema')} inputs={len(prov.get('inputs') or [])} "
+                f"sync_ms={resolved.get('mosaic_sync_ms')} cf={resolved.get('car_follow_model')}"
+                + ("; missing " + ", ".join(missing) if missing else ""))
+        except Exception as e:
+            rec(ds, "PROV1_scenario_provenance", False,
+                f"scenario_provenance.json error: {type(e).__name__}: {e}")
 
     # ============ VRU / DENM: LEAKAGE + CONSISTENCY (all SKIP-graceful) ============
     # The VRU-actor (station_type / is_vru_declared), VRU-impersonation, and DENM (event-message)
