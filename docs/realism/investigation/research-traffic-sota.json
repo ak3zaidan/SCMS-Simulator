@@ -1,0 +1,141 @@
+{
+ "area": "Microscopic traffic simulation realism SOTA (2024-2026): SUMO toolchain, calibrated real-city scenarios, driver heterogeneity, demand realism, Python control on Windows, determinism",
+ "benchmarks": [
+  "GEH statistic on link/detector counts: GEH < 5 for >= 85% of measured links, 100% < 10 = acceptable calibration (UK DMRB/WebTAG, WSDOT, FHWA-derived guidelines; https://handwiki.org/wiki/Engineering:GEH_statistic)",
+  "Individual link flows within +/-15% of observed for >= 85% of links (UKDoT 2014 / WSDoT 2014 microsimulation guidelines)",
+  "Route travel times within +/-15% (or +/-1 minute if shorter) of floating-car/probe measurements (FHWA Traffic Analysis Toolbox Vol. III family of criteria; see also VTRC 22-R7 https://vtrc.virginia.gov/media/vtrc/vtrc-pdf/vtrc-pdf/22-R7.pdf)",
+  "RMSE / RMSNE / SQV on time-sliced detector counts and speeds across all count stations (used by InTAS: 24 stations; HaTS: 7 count sites; BeST: Berlin induction loops)",
+  "Distributional realism vs trajectory data: KS-test / Jensen-Shannon divergence on speed, time-headway, time-gap and acceleration distributions; 2024 roadside-radar calibration found DEFAULT SUMO models produce systematically shorter time headways than reality until calibrated (https://www.researchgate.net/publication/382345459)",
+  "WOSAC (Waymo Open Sim Agents Challenge) realism meta-metric [0-1], combining kinematic (speed/accel), interactive (collision, TTC, nearest-object distance) and map-based (offroad, distance-to-edge) components, plus minADE; benchmark values: SUMO 0.653 vs best learned simulator SMART 0.751 at 8 s horizon; at 60 s SUMO collision rate 0.0047 / offroad 0.0073 beats most learned models (TrafficBots v1.5: 0.2507 / 0.1526) (arXiv 2512.18537)",
+  "Fundamental diagram / MFD shape agreement \u2014 SNMF-SPSA (Transportmetrica B 2025) embeds the macroscopic fundamental diagram in the OD-calibration objective (https://www.tandfonline.com/doi/abs/10.1080/21680566.2025.2459928)",
+  "Simulation-health counters as realism red flags: SUMO teleport count, emergency-braking events, collisions, and jam-caused vehicle removals should be ~0 in a well-calibrated scenario (SUMO statistics output)",
+  "Detector-coverage validation protocol: hold out a subset of count stations from calibration and report GEH/correlation on held-out stations (done in arXiv 2606.03823 genetic calibration of Greensboro, which generalized to unseen road segments)",
+  "Daily-profile validation: 24 h simulated volume curve vs observed diurnal loop-count curve per station (LuST, TAPASCologne, BeST all validate against 24 h profiles rather than single-hour counts)"
+ ],
+ "findings": "CONTEXT NOTE: this repo (SCMS-Simulator) already runs Eclipse MOSAIC + VeReMi NextGen on Windows, driving SUMO through MOSAIC's TraCI-based SumoAmbassador, and already wires InTAS urban/highway time-slice variants plus MOSAIC bundle maps (Barnim, Tiergarten, Highway) and procedural grid/spider/rand/OSM maps (scms-sim/scenarios/gen_scenario.py, docs/adr/0001-stack-and-approach.md). Findings below are selected for that stack.\n\n== 1. Where SUMO realism stands overall (2025 benchmark) ==\n\"Systematic Benchmarking of SUMO Against Data-Driven Traffic Simulators\" (arXiv 2512.18537, Dec 2025, https://arxiv.org/html/2512.18537v1) evaluated SUMO on the Waymo Open Sim Agents Challenge (WOSAC) against six learned simulators (SMART, BehaviorGPT, GUMP, MVTE, VBD, TrafficBots v1.5). SUMO scored 0.653 on the WOSAC realism meta-metric vs 0.751 for SMART \u2014 i.e., 86.9% of SOTA with <100 tunable parameters vs millions \u2014 and on 60 s horizons SUMO was MORE stable than learned models (collision rate 0.0047, offroad 0.0073 vs TrafficBots 0.2507/0.1526). Implication: a carefully calibrated SUMO remains a defensible SOTA substrate for city-scale V2X; the realism gap vs learned models is in short-horizon kinematic micro-behavior (accelerations, headways), which is exactly what EIDM + heterogeneous vType distributions + sublane model target.\n\n== 2. Network realism: netconvert OSM import ==\nDocs: https://sumo.dlr.de/docs/Networks/Import/OpenStreetMap.html . Known OSM import defects: dual carriageways produce doubled junctions; traffic_signals nodes mapped ahead of the real intersection; every crossing node becomes an independent TLS; missing turn lanes. Standard mitigation set: --junctions.join (default in osmBuild.py), --tls.guess-signals, --try-join-tls / --tls.join, --ramps.guess, --geometry.remove, plus typemaps (osmNetconvert*.typ.xml) and manual repair in netedit. osmWebWizard is convenience-only and does not expose the accurate-import options (https://sumo.dlr.de/docs/Tutorials/Import_from_OpenStreetMap.html). Every published calibrated city scenario (LuST, InTAS, HaTS, BeST) did substantial MANUAL network correction (lane counts, TLS programs, junction topology) in netedit \u2014 the field's consensus is that raw OSM import alone is NOT publication-grade realism; real signal plans are the single biggest manual win (InTAS encodes the 20 real deployed TLS programs of Ingolstadt).\n\n== 3. Demand calibration toolchain (SUMO-native) ==\n- routeSampler.py (since 1.5.0; https://sumo.dlr.de/docs/Tools/Turns.html and Demand/Routes_from_Observation_Points.html): samples from a candidate route set (e.g., randomTrips output) to satisfy edge counts, turn counts and/or OD relations per time interval; supports GEH-based optimization and mode-specific counts. Currently the recommended count-based method for urban nets. A SUMO UC 2024 paper (https://sumo.dlr.de/pdf/2024/1-3.pdf) shows an ILP formulation beats stock flowrouter/routeSampler fits.\n- dfrouter (Demand/Routes_from_Observation_Points.html): derives flows AND routes purely from induction-loop data; works well only with dense detector coverage, i.e., motorways \u2014 used for highway scenarios, poor for urban grids.\n- od2trips: converts (time-sliced) VISUM/Vissim-format OD matrices over TAZ polygons into trips \u2014 the entry point for classic 4-step/gravity-model demand.\n- Calibrators (https://sumo.dlr.de/docs/Simulation/Calibrator.html): online per-edge flow/speed enforcement \u2014 insert vehicles when flow is below target, remove when above or jammed (jamThreshold default 0.5); paired with routeProbe detectors so injected vehicles get realistic route distributions. Caveat from SUMO devs: realism downstream of a calibrator depends on how well the underlying route set matches real routes (https://www.eclipse.org/lists/sumo-user/msg06322.html).\n- Rerouters: mid-simulation route/destination/parking reassignment zones; used with --device.rerouting.* options for dynamic en-route rerouting (note thread caveat in \u00a77).\n- Assignment: duaIterate.py (iterative dynamic user assignment, Gawron) and marouter; TAPASCologne used Gawron DUA; LuST ships both a shortest-path+rerouting variant and a DUE variant.\n- SOTA calibration research 2024-2026: SNMF-SPSA (spectral-clustering SPSA + MFD objective, Transportmetrica B 2025, https://www.tandfonline.com/doi/abs/10.1080/21680566.2025.2459928); hybrid neural real-time OD calibration under disruptions (arXiv 2408.06659); Google-scale multi-city metropolitan highway calibration (arXiv 2501.04783); genetic-algorithm calibration of a full SUMO city (Greensboro NC) from sparse counts, inferring job distributions that matched census employment and generalizing to held-out segments (arXiv 2606.03823); simulation-free flow estimation from sparse counts (arXiv 2606.23536); MG-TuRBO high-dimensional Bayesian optimization for simulator calibration (arXiv 2604.08569); dynamic real-time SUMO calibration framework (https://sumo.dlr.de/preprints/pre-print-3321.pdf).\n\n== 4. Behavioral models ==\n- Car-following: default Krauss (sigma=0.5 driver imperfection). EIDM (Extended IDM, Salles et al., SUMO Conf 2020, https://sumo.dlr.de/docs/Car-Following-Models/EIDM.html) is the designated human-like model: adds drive-off dynamics validated against aerial drone trajectories; still evolving (reaction time, spatial anticipation planned). 2024 SUMO-in-the-loop calibration with roadside-radar trajectories on a 1.5 km signalized corridor recalibrated Krauss/IDM/W99 and found default SUMO headways too short vs reality (https://www.researchgate.net/publication/382345459). 2025 MDPI paper calibrated CF+LC jointly for heterogeneous traffic (https://doi.org/10.3390/su18147025).\n- Lane change: LC2013 (default) executes instantaneous lateral jumps; SL2015 + sublane model (--lateral-resolution) gives continuous lateral dynamics (maxSpeedLat, minGapLat, latAlignment, lcSublane, lcPushy, lcImpatience) and is what recent digital-twin/work-zone papers use for realistic merging (https://sumo.dlr.de/docs/Simulation/SublaneModel.html, arXiv 2508.06544). MOBIL is not a stock SUMO model (it is IDM's companion in the literature; SUMO's equivalents are LC2013/SL2015).\n- Junctions (https://sumo.dlr.de/docs/Simulation/Intersections.html): internal lanes + internal junctions (waiting inside intersection), right-of-way with minor links and gap acceptance (jmTimegapMinor, jmDriveAfterRedTime, dynamic impatience growing with waiting time), zipper merges, keep-clear heuristic. Docs concede no empirical validation of junction dynamics is published \u2014 junction realism comes mostly from correct TLS programs and network geometry.\n- Pedestrians (https://sumo.dlr.de/docs/Simulation/Pedestrians.html): models nonInteracting, striping (default; 2D stripes on sidewalks/crossings), and since ~1.19 a coupled JuPedSim (Julich social-force simulator) for crowd-level realism (https://sumo.dlr.de/docs/jupedsim.html).\n- Perception errors: SUMO's DriverState device injects Wiener-process perception errors (speed/gap) per driver \u2014 relevant for misbehavior-detection ground truth vs honest-driver noise.\n\n== 5. Driver heterogeneity / stochasticity ==\nPer-vehicle speedFactor is drawn from a truncated normal by default (\"normc(mean,dev,min,max)\"; default dev 0.1 for road vehicles) \u2014 this alone creates realistic desired-speed spread (https://sumo.dlr.de/docs/Definition_of_Vehicles,_Vehicle_Types,_and_Routes.html, https://sumo.dlr.de/docs/Simulation/VehicleSpeed.html). vTypeDistribution elements plus tools/createVehTypeDistribution.py let you sample whole correlated parameter sets (accel, decel, tau, sigma, lc* params, lengths) from normal/uniform/gamma distributions per driver \u2014 the published-scenario practice for driver heterogeneity. VeReMi NextGen itself advertises \"multiple driver profiles\" as one of its realism additions over VeReMi/VeReMi-Extension (https://oparu.uni-ulm.de/items/a1a874b1-c15a-4f8d-9fae-082368353aaf). Randomness sources are cleanly separable: independent Mersenne-Twister streams for vehicle loading, probabilistic flows, driving dynamics and devices, all controlled by one seed (default 23423) (https://sumo.dlr.de/docs/Simulation/Randomness.html).\n\n== 6. Calibrated real-city scenarios (what each was calibrated against) ==\n- LuST (Luxembourg, Codeca/Frank/Engel VNC 2015; https://github.com/lcodeca/LuSTScenario): 24 h city scenario; demand built from real demographic/mobility data, validated against real traffic data from University of Luxembourg VehicularLab; ships DUA-with-rerouting and DUE variants. CRITICAL: generated/validated with SUMO 0.26 \u2014 on modern SUMO the mobility \"cannot be considered validated\"; authors point users to MoST. VeReMi and VeReMi-Extension are built on a LuST subnetwork (https://veremi-dataset.github.io/).\n- TAPASCologne (https://sumo.dlr.de/docs/Data/Scenarios/TAPASCologne.html): Cologne, 400 km2, 24 h, >700k car trips; demand from the TAPAS activity-based system (German travel-habit surveys + infrastructure data from the German Federal Statistical Office), OSM network, Gawron dynamic user assignment (http://kolntrace.project.citi-lab.fr/). The canonical activity-based (not gravity/OD) large scenario.\n- MoST (Monaco, Codeca & Harri 2017/18; https://github.com/lcodeca/MoSTScenario): 3D (elevation) multimodal C-ITS playground \u2014 cars, PT, vulnerable road users; the maintained successor to LuST.\n- InTAS (Ingolstadt, Lobo et al. SUMO Conf 2020; arXiv 2011.11995, https://github.com/silaslobo/InTAS): manually corrected network with buildings; 20 TLS with the REAL deployed signal programs; demand via activitygen from demographic data + real-traffic info; buses per real timetables; validated against 24 real measurement points. A TUM variant exists (https://github.com/TUM-VT/sumo_ingolstadt). Already integrated in this repo via VeReMi NextGen.\n- BeST (Berlin, 2023, https://github.com/mosaic-addons/best-scenario, https://eclipse.dev/mosaic/post/best-scenario-short/): 24 h, ~2.25M motorized-private trips, calibrated against real induction-loop data, and explicitly MOSAIC-compatible (same stack as this project); 2025 follow-up adds modeled bus traffic (Fraunhofer FOKUS, https://publica.fraunhofer.de/entities/publication/e26e598e-5539-445e-a299-c23ca681e7ef).\n- HaTS (Hannover, Bosch Research, SUMO Conf 2024; https://www.tib-op.org/ojs/index.php/scp/article/view/2605, https://github.com/boschresearch/HanoverTrafficScenario): 06:00-19:00 vehicles + high-density bicycle traffic, network/TLS refined for the city center, flows from 7 real intersection counts.\n- Bologna (COLOMBO/iTETRIS; https://github.com/DLR-TS/sumo-scenarios/tree/main/bologna/): small district (\"Ringway\"), validated with navigation-service open data.\n- TuST (Turin, https://github.com/marcorapelli/TuSTScenario): 600 km2, mesoscopic. (The \"Manhattan\" name in SUMO circles is the synthetic Manhattan-grid mobility model, not a calibrated NYC scenario.)\n- Highway/V2X-relevant: Alicante-Murcia 97 km freeway, 9 full days calibrated from Spanish road authority (DGT) data (https://github.com/msepulcre/Alicante-Murcia-SUMO-Scenario); Stuttgart STOMP motorway (Bosch, https://github.com/boschresearch/stuttgart-sumo-traffic-scenario); Geneva motorway digital twin DT-GM driven by real-time counters (https://github.com/SiLab-group/DigitalTwin_GenevaMotorway); DLR germany-motorways mesoscopic. Full index: https://sumo.dlr.de/docs/Data/Scenarios.html (also ETH 24 h scenarios for Boston/Lisbon/LA/Rio/SF and a Toronto open-data multimodal net).\n\n== 7. Demand paradigms: gravity/OD vs activity-based ==\nTime-sliced OD matrices (od2trips) remain the workhorse where cities publish OD data, but the realism SOTA is activity-based: TAPAS (used for TAPASCologne), MATSim (co-evolutionary utility-maximizing daily plans per agent; retains person-level consistency that OD matrices destroy \u2014 delays propagate through an agent's day; https://sumo.dlr.de/docs/Demand/Activity-based_Demand_Generation.html, https://www.sciencedirect.com/science/article/pii/S2666691X25000296), SUMO's own activitygen (simple statistics-based), and SAGA (SUMO Activity GenerAtion, Codeca & Erdmann, SUMO Conf 2020; https://github.com/lcodeca/SUMOActivityGen): builds a multimodal activity-based scenario directly from an OSM extract (buildings, parking, PT) with iterative refinement hooks \u2014 the fastest route to \"activity-based demand for an arbitrary city\". MATSim-SUMO/MOSAIC couplings exist for large-scale multi-layer runs.\n\n== 8. TraCI vs libsumo on Windows; MOSAIC specifics ==\nlibsumo embeds SUMO in-process with the same API as TraCI; measured ~10x less overhead than socket TraCI (LibSignal, arXiv 2211.10649); `pip install libsumo` works on Windows; limitations: sumo-gui unusable on Windows, no multiple clients, some context-subscription limits, stricter typing; since 1.16 Windows needs library preloading (Simulation.preloadLibraries() wraps it since 1.24) (https://sumo.dlr.de/docs/Libsumo.html). IMPORTANT FOR THIS REPO: Eclipse MOSAIC's SumoAmbassador speaks socket TraCI by design \u2014 libsumo is only relevant for standalone Python calibration/analysis loops outside MOSAIC. MOSAIC passes `--seed 100000` to SUMO by default (CSumo config) and has its own scenario-level randomSeed for mapping \u2014 both must be varied together for replications (https://eclipse.dev/mosaic/docs/simulators/traffic_simulator_sumo/).\n\n== 9. Determinism ==\nSUMO with fixed seed, fixed inputs and single-threaded execution is deterministic and generally reproducible across platforms (https://sumo.dlr.de/docs/Simulation/Randomness.html). Documented exceptions: (a) --threads N makes results non-deterministic run-to-run; (b) --device.rerouting.threads combined with random weights; (c) EIDM and DriverState use log() whose libm results differ across platforms; (d) proj-library geo-transforms differ across proj versions/platforms (affects network building, so build networks once and version them, not per-run). TraCI itself does not break determinism if the client issues identical commands in identical order. SUMO releases relevant to 2024-2026: 1.23 (May 2025), 1.24 (Jul 2025), 1.25 (Nov 2025) (https://sumo.dlr.de/docs/ChangeLog.html); pin the version \u2014 scenario validation is version-bound (LuST/0.26 precedent).",
+ "tools": [
+  {
+   "name": "routeSampler.py (SUMO)",
+   "what": "Builds demand by sampling candidate routes to match real edge counts, turn counts, and OD relations per time interval; supports GEH-target optimization",
+   "maturity": "Mature, actively developed since SUMO 1.5; recommended count-calibration path",
+   "windows_feasibility": "Full (ships in SUMO tools/, pure Python)",
+   "integration_effort": "Low-medium: needs a candidate route set (randomTrips/duarouter) + count data files"
+  },
+  {
+   "name": "dfrouter (SUMO)",
+   "what": "Derives flows and routes purely from induction-loop detector data; motorway-grade only",
+   "maturity": "Mature/stable",
+   "windows_feasibility": "Full (SUMO binary)",
+   "integration_effort": "Low for highway scenarios with dense detectors; unsuitable for urban grids"
+  },
+  {
+   "name": "od2trips + duaIterate.py (SUMO)",
+   "what": "Time-sliced OD matrices over TAZs to trips, plus iterative dynamic user assignment (Gawron) to equilibrium routes",
+   "maturity": "Mature/stable (TAPASCologne pipeline)",
+   "windows_feasibility": "Full",
+   "integration_effort": "Medium: needs OD data and TAZ polygons; duaIterate is compute-heavy"
+  },
+  {
+   "name": "Calibrators + routeProbe (SUMO runtime objects)",
+   "what": "Online per-edge flow/speed enforcement matching detector data during the run; routeProbe supplies realistic routes for injected vehicles",
+   "maturity": "Mature",
+   "windows_feasibility": "Full",
+   "integration_effort": "Low (additional-file XML), but realism depends on quality of underlying route distribution"
+  },
+  {
+   "name": "SAGA (SUMOActivityGen)",
+   "what": "Activity-based multimodal scenario generator directly from an OSM extract (buildings, parking, PT, activity chains), with iterative refinement",
+   "maturity": "Research-grade but maintained; in SUMO contributed tools",
+   "windows_feasibility": "Full (Python)",
+   "integration_effort": "Medium: one command to first scenario, iterations to make it credible"
+  },
+  {
+   "name": "EIDM car-following model (SUMO)",
+   "what": "Extended IDM for human-like dynamics (drive-off validated vs drone trajectories); set per vType",
+   "maturity": "In active development; usable, planned reaction-time/anticipation features pending",
+   "windows_feasibility": "Full, but log()-based math is a documented cross-platform reproducibility caveat",
+   "integration_effort": "Low (vType attribute change) + calibration effort"
+  },
+  {
+   "name": "SL2015 sublane model (SUMO)",
+   "what": "Continuous lateral dynamics and gradual lane changes (lcSublane/lcPushy/latAlignment); required for realistic merging and lateral behavior",
+   "maturity": "Mature",
+   "windows_feasibility": "Full",
+   "integration_effort": "Low config (--lateral-resolution) but ~2-5x runtime cost and re-tuning of LC params"
+  },
+  {
+   "name": "vTypeDistribution + createVehTypeDistribution.py",
+   "what": "Per-driver heterogeneity: samples correlated vType parameter sets (speedFactor, accel, tau, sigma, lc*) from configured distributions",
+   "maturity": "Mature",
+   "windows_feasibility": "Full",
+   "integration_effort": "Low"
+  },
+  {
+   "name": "JuPedSim coupling (SUMO pedestrian model)",
+   "what": "Social-force pedestrian dynamics from Julich coupled into SUMO (alternative to default striping model)",
+   "maturity": "New (since ~1.19), functional basics",
+   "windows_feasibility": "Ships in Windows SUMO releases",
+   "integration_effort": "Medium; only worth it if VRU realism matters to the dataset"
+  },
+  {
+   "name": "InTAS scenario (Ingolstadt)",
+   "what": "Calibrated city scenario: real TLS programs (20 junctions), activitygen demand, bus timetables, validated vs 24 count stations; already wired into this repo via VeReMi NextGen",
+   "maturity": "Published, stable; TUM variant exists",
+   "windows_feasibility": "Full (data files)",
+   "integration_effort": "Already integrated (gen_scenario.py InTAS_* variants)"
+  },
+  {
+   "name": "BeST scenario (Berlin)",
+   "what": "24 h, ~2.25M trips calibrated vs real induction loops; explicitly Eclipse-MOSAIC-compatible; 2025 bus-traffic extension",
+   "maturity": "Published 2023, maintained (mosaic-addons)",
+   "windows_feasibility": "Full",
+   "integration_effort": "Low-medium for this repo: same MOSAIC scenario format as bundled maps; large (needs scaling/clipping for per-vehicle V2X runs)"
+  },
+  {
+   "name": "LuST scenario (Luxembourg)",
+   "what": "Classic 24 h validated city scenario underlying VeReMi/VeReMi-Extension",
+   "maturity": "Frozen; validated only on SUMO 0.26 \u2014 authors recommend MoST on modern SUMO",
+   "windows_feasibility": "Full",
+   "integration_effort": "Low, but validation claim does not transfer to current SUMO versions \u2014 cite with that caveat"
+  },
+  {
+   "name": "MoST scenario (Monaco)",
+   "what": "3D multimodal C-ITS scenario (elevation, VRUs, PT); maintained successor to LuST",
+   "maturity": "Published, maintained",
+   "windows_feasibility": "Full",
+   "integration_effort": "Medium (multimodal config; MOSAIC conversion needed)"
+  },
+  {
+   "name": "Alicante-Murcia freeway scenario",
+   "what": "97 km freeway, 9 full days, calibrated from Spanish road-authority data \u2014 strongest open highway-V2X realism",
+   "maturity": "Published (UWICORE)",
+   "windows_feasibility": "Full",
+   "integration_effort": "Medium (convert to MOSAIC scenario like InTAS was)"
+  },
+  {
+   "name": "libsumo (pip)",
+   "what": "In-process SUMO with TraCI-identical API, ~10x less control overhead; for standalone Python calibration/eval loops",
+   "maturity": "Mature",
+   "windows_feasibility": "pip install libsumo works; no sumo-gui on Windows; needs preloadLibraries since 1.16 (wrapped in 1.24)",
+   "integration_effort": "Low for standalone tooling; NOT usable inside MOSAIC (its ambassador requires socket TraCI)"
+  },
+  {
+   "name": "MATSim",
+   "what": "Agent-based activity-plan co-evolution for demand realism (person-consistent daily plans, delay propagation across trips); couple to SUMO/MOSAIC for micro-level",
+   "maturity": "Mature, large community",
+   "windows_feasibility": "Full (Java)",
+   "integration_effort": "High; only justified for building a new city-scale demand model from scratch"
+  }
+ ],
+ "recommendations": [
+  "1. Anchor headline datasets on published calibrated scenarios, not procedural maps: keep the InTAS time-slice variants (already wired) as the urban core, and add the BeST Berlin scenario \u2014 it is the only large loop-calibrated scenario that is natively Eclipse-MOSAIC-compatible (mosaic-addons/best-scenario), so integration cost in gen_scenario.py is the lowest of any option; use Alicante-Murcia (9 days of road-authority-calibrated freeway) for the highway attack scenarios instead of the synthetic MOSAIC Highway bundle.",
+  "2. Add per-driver heterogeneity to every scenario run: vTypeDistribution with truncated-normal speedFactor (normc) plus createVehTypeDistribution.py-sampled accel/tau/sigma/lc parameters, and distinct vClasses (car/truck/bus shares from scenario data). This is cheap, massively improves plausibility of position/speed traces in the emitted V2X messages, and matches VeReMi NextGen's own 'driver profiles' direction.",
+  "3. Build an automated realism report emitted alongside each dataset (fits DATASHEET.md): GEH per count location (target >=85% GEH<5), link flows within +/-15% for >=85% of measured links, JSD/KS of speed and time-headway distributions vs the scenario's reference data, plus SUMO health counters (teleports, emergency stops, collisions ~ 0). This turns the 'almost identical to a real city' claim into audited numbers.",
+  "4. For any custom-OSM city (osm_ keys in mapgen), adopt the published-scenario pipeline: netconvert with --junctions.join --tls.guess-signals --tls.join --ramps.guess --geometry.remove, manual netedit repair of key junctions, real signal plans where obtainable, then routeSampler.py against city open-data counts with time-of-day intervals (optionally the ILP variant from SUMO UC 2024); use SAGA when you want activity-based multimodal demand without an OD matrix.",
+  "5. Upgrade micro-behavior selectively: EIDM vTypes for human-like car-following and SL2015 sublane for merging-critical scenarios (highway attacks, work zones) \u2014 but benchmark runtime (sublane costs several x) and note EIDM's documented cross-platform reproducibility caveat before making it the default in a determinism-audited pipeline.",
+  "6. Determinism policy: pin the SUMO version per released dataset (scenario validation is version-bound \u2014 LuST is the cautionary tale), run SUMO single-threaded (no --threads, no --device.rerouting.threads), set both MOSAIC's scenario randomSeed and the SUMO --seed (MOSAIC default 100000) explicitly from your dataset seed, and version pre-built .net.xml files rather than rebuilding (proj-version differences change networks).",
+  "7. Control-plane choice: stay on TraCI inside MOSAIC (mandatory), but use pip libsumo for standalone Python calibration/eval loops (routeSampler iteration, realism-metric computation, headless parameter sweeps) \u2014 same API, ~10x faster stepping, Windows-supported (headless only).",
+  "8. Demand time realism: prefer the scenarios' native 24 h diurnal demand (InTAS/BeST curves) sliced to windows, over constant target-flow injection; where you must synthesize, use time-sliced OD via od2trips or routeSampler interval counts so arrival rates follow the real diurnal profile rather than a homogeneous Poisson process.",
+  "9. Track (not adopt yet) learned sim-agents: WOSAC-style realism meta-metrics are the emerging cross-simulator yardstick (SUMO 0.653 vs SMART 0.751), and a WOSAC-inspired kinematic-realism score computed on your emitted BSM traces would be a novel, publishable realism claim for a misbehavior dataset."
+ ]
+}
