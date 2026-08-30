@@ -42,3 +42,28 @@ rather than something to design around.
    `--tls.join` but rejects `--tls.guess-signals`, `--ramps.guess`, and `--junctions.join`.
    The Phase 1 flag set must be split by tool: procedural maps (netgenerate) get
    `--tls.guess --tls.join`; OSM maps (netconvert) get the full set.
+4. **`--tls.guess` does not signalize a procedural grid.** On a bare 6×6 netgenerate grid it
+   produced **0** traffic-light nodes (all 36 stayed `priority`) — its heuristic keys on traffic
+   volume, which a demand-free net does not have. Use `-j traffic_light`
+   (`--default-junction-type traffic_light`) instead: verified 36/36 nodes signalized. This matters
+   because "procedural/OSM maps get signals" is a Phase 1 deliverable and `--tls.guess` silently
+   no-ops.
+
+## sumolib `.net.xml` reader — capability confirmation (Phase 3 Agent B)
+
+`sumolib.net.readNet()` exposes everything the CustomNetwork importer needs, so there is no reason
+to re-parse OSM by hand:
+
+| Need | sumolib call | Verified |
+|---|---|---|
+| Node coords | `node.getCoord()` | (0.0, 0.0) |
+| Directed edges | `net.getEdges()` | 120 edges over 36 nodes (60 undirected × 2) |
+| Per-edge lane count | `edge.getLaneNumber()` | 1 |
+| Speed limit | `edge.getSpeed()` | 13.89 m/s |
+| Edge polyline | `edge.getShape()` | list of (x, y) points |
+| Lane width | `edge.getLane(0).getWidth()` | 3.2 m |
+| Signalized nodes | `node.getType() == "traffic_light"` | works |
+| Turn restrictions | `edge.getOutgoing()` | 3 permitted successors |
+| Geo-referencing | `net.hasGeoProj()` / `convertXY2LonLat()` | present on OSM-derived nets |
+
+One-way share is derived by testing whether the reverse (to, from) edge pair exists.
