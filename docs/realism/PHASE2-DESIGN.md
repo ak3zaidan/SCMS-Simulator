@@ -70,6 +70,44 @@ MA-visible, but must be computed from **true** geometry on the channel side; Syb
 the attacker's true-position RSSI, which is exactly what makes an RSSI-vs-claimed-distance detector
 possible. Requires an explicit leakage-linter assertion.
 
+## Building footprints are already on disk (verified 2026-08-30)
+
+The NLOSb building-blockage model needs no new network dependency, no new Overpass query and no new
+cache. `osm.py:49` fetches `https://overpass-api.de/api/map?bbox=`, which returns **all** raw OSM
+data in the bounding box; the importer then keeps only `highway` ways and discards everything else.
+The buildings are therefore already being downloaded and cached today.
+
+Measured on the existing cache (`datasets/_osmcache/osm_816d9f25303fea7e.xml`, 16.5 MB, Ingolstadt):
+
+| Property | Value |
+|---|---|
+| Building ways with **complete** geometry | **1482** (0 incomplete) |
+| Closed rings | 1482 / 1482 |
+| Nodes available for resolution | 22,248 |
+| Carrying `height` or `building:levels` | 208 (14%) |
+| Dominant kinds | `yes` 1141, `house` 139, `apartments` 63 |
+
+Overpass itself is reachable from this host (HTTP 200, rate limit 2, slots available), so re-fetching
+other cities works — but the Ingolstadt data needed for the InTAS scenarios is already local.
+
+Only 14% of footprints carry height, so the NLOSb model must default a building height. That is
+acceptable: the 3GPP TR 37.885 urban-NLOS formula is a function of distance only, and the
+LOS/NLOSb decision is a 2-D segment-vs-polygon blockage test. Height matters only if the optional
+per-wall Sommer attenuation variant is used.
+
+### Projection alignment — the trap to avoid
+
+`osm.py:107-116` builds a **local equirectangular projection** whose origin is
+`lat0, lon0 = min(lats), min(lons)` and whose scale is
+`kx = 111320·cos(mean_lat)`, `ky = 111320` — and those `lats`/`lons` are gathered **from the road
+ways only**. Projecting buildings with an independently-derived origin would misalign them against
+the road graph, silently corrupting every LOS/NLOS classification while still producing
+plausible-looking output.
+
+So `osm_to_network` must return (or persist alongside the network JSON) the exact tuple
+`(lat0, lon0, kx, ky)`, and the building extraction must reuse it verbatim. Add an assertion that
+projected building centroids fall inside the road network's bounding box.
+
 ## Reference curves to pin as refdata
 
 - 90% cooperative awareness up to ~200 m urban, >500 m highway (Boban & d'Orey 2015).
