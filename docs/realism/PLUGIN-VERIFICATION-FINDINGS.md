@@ -67,6 +67,49 @@ Claims made before this verification that must be withdrawn or qualified:
 The functional claim survives: a third-party channel model does run with zero engine edits, and the
 no-plugin reference digest is unaffected by all of this.
 
+## Round 2 — after the fixes (2026-08-31)
+
+**Four of six closed, independently re-measured. Two still open, and one of them is an attack the
+fix report declared fixed.**
+
+Closed and re-verified by a separate agent that reverted each fix and measured before/after:
+
+- **Critical 1** — the step term is live: fade variance 28.42 dB² across 4026 links, zero constant
+  series (previously *every* series was constant). The C9 PDR ladder moved from
+  1.000/1.000/1.000/1.000/0.969/0.885/0.792 to 1.000/1.000/0.979/0.948/0.844/0.698/0.615 — the
+  channel now actually fades. **The decisive measurement:** with the fix reverted, the conformance
+  CLI still reported 14 passed / 0 failed and the whole 49-test conformance file stayed green; only
+  the three newly-written regression tests failed. That is precisely why the defect survived review.
+- **Critical 2** — `package_sha256` is wired: the sibling +6 dB edit now takes `verify-plugins` from
+  exit 0 to exit 2, naming `package_sha256` alone (module and dist hashes provably unmoved), and the
+  replay exits 2 with no output directory.
+- **Critical 4** — five config-mutation vectors, including the behind-the-view and nested-dict ones,
+  all exit 2 with no manifest; the new `C13_config_not_mutated` check fails alone on a violator.
+- **Critical 3** in substance — every artifact-derived digest in the evidence document now reads back
+  correctly and its commands re-run.
+
+### Still open
+
+**Attestation runs after construction.** `build_channel` instantiates the plugin
+(`run.py:1169`) *before* calling `_attest` (`:1188`). A hostile plugin's `__init__` therefore runs
+before it is ever attested, so it can install whatever it likes and then pass the gate. The detector
+slot repeats the identical ordering defect (`run.py:1493` instantiates, `:1499` attests).
+
+**A time-delayed attack evades every conformance trap.** A `random.Random` class rebind installed at
+`frame.step >= 30` passes all four C3 traps, because conformance exercises a bounded window and the
+attack simply waits it out. This is not a hole in the traps; it is a property of any
+fixed-window contract test. **A conformance suite can only ever certify behaviour it observed.**
+The mitigations are runtime monitoring or a real out-of-process boundary — not a longer window.
+
+Also open: `check_outcome` (`api/channel.py:485`) validates by reading the caller's object and
+returning it unchanged, so an outcome whose `rssi_dbm` is a stateful property can return one value
+to the checker and another to the engine — a time-of-check/time-of-use gap.
+
+And the evidence document has recurrence of its own failure mode: two digests in the sibling-edit
+section do not reproduce from the diff the document itself prints, and one only reproduces because
+the acceptance script leaves a `.orig` backup **inside site-packages**, contaminating the package
+hash it is meant to verify.
+
 ## Lesson
 
 Both of these landed because their verifier agents were lost to a session limit and the work was
