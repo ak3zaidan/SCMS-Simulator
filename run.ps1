@@ -108,6 +108,13 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if (-not $env:MOSAIC_HOME) { . C:\Users\Administrator\tools\env.ps1 }
+# PYTHONHASHSEED must be set BEFORE the interpreter starts -- CPython reads it at startup, before
+# any user code, so nothing inside python can pin it for its own process. Setting it here is the
+# only mechanism that works, and it reaches EVERY python and java child this script launches.
+# It does not move any digest (the engine's keyed streams are sha512-seeded from string keys, hence
+# PYTHONHASHSEED-independent); it pins manifest["runtime"]["hash_randomization"] and removes
+# set/dict iteration order as a latent source of run-to-run variation.
+$env:PYTHONHASHSEED = '0'
 $repo = $PSScriptRoot
 
 Write-Host "== [1/6] Build MOSAIC app (javac, no Maven) =="

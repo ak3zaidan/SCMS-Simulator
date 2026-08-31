@@ -59,9 +59,17 @@ enum 0..15. The real fleet classes (car/motorcycle/truck/bus) are ORACLE-only an
 active vehicle per step at `dt = 1.0` — a rigid 1 Hz. The 4 m/4°/0.5 m/s thresholds are pinned in
 refdata but have **no consumer in Python**.
 
-## The claim that must change
+## The claim that must change — **DONE, 2026-08-30**
 
-`run.py:3794-3795` and `ScmsBackend.java:1028-1029` write
+Landed as PLUGIN-ARCHITECTURE.md phase 0. The Python engine now emits `run.STANDARDS_PROFILE`
+(five keys: `linkage` / `cert` / `security_envelope` / `message` / `report`) and the Java backend
+emits the matching block plus two claims that are genuinely stronger there (EN 302 637-2 CAM
+generation rules, TS 102 687 reactive DCC). `manifest.json` is excluded from `data_digest_sha256`
+by construction, so the correction moved **zero** digests. `DATASHEET.md`, `README.md`,
+`docs/FEATURES.md` and `schemas/records.py:MaReport` were corrected in the same change, split into
+IMPLEMENTED / INSPIRED-BY / ABSENT. The analysis below is preserved as the record of why.
+
+`run.py:3794-3795` and `ScmsBackend.java:1028-1029` used to write
 `standards_profile = {"report": "ETSI TS 103 759 (shape)", "cert": "IEEE 1609.2", "linkage": "CAMP SCP2"}`.
 
 - `linkage: CAMP SCP2` — **supportable**, the implementation is real and asserted.

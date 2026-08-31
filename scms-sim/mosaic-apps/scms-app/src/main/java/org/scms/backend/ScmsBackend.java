@@ -1025,8 +1025,30 @@ public final class ScmsBackend {
             manifest.put("counts", counts);
             manifest.put("data_digest_sha256", hex(all.digest(), 32));
             manifest.put("outputs", digests);
-            manifest.put("standards_profile", Map.of("report", "ETSI TS 103 759 (shape)",
-                    "cert", "IEEE 1609.2", "linkage", "CAMP SCP2", "messaging", "ETSI CAM over ITS-G5"));
+            // Standards profile, corrected 2026-08-30 to match the Python engine's
+            // run.py STANDARDS_PROFILE. The claim `cert: IEEE 1609.2` was NOT SUPPORTABLE and is
+            // withdrawn: there is no 1609.2 certificate structure here, and NO SIGNING happens --
+            // SignedCam carries a boolean and this backend passes a literal `true`. HashedId8 IS
+            // real, so the claim is downgraded to an identifier-only claim naming it. `linkage`
+            // is KEPT: LinkageEngine implements CAMP SCP2 for real. Two claims are STRONGER on
+            // this engine than on the Python one and are stated separately rather than hidden
+            // inside a vague "messaging": the EN 302 637-2 / TS 103 900 CAM GENERATION RULES
+            // (ScmsBeaconApp) and TS 102 687 reactive DCC (Dcc.java) are genuinely implemented --
+            // the message STRUCTURE and its ASN.1 encoding are not.
+            // manifest.json is excluded from data_digest_sha256, so this moves zero digests.
+            Map<String, String> stdProfile = new LinkedHashMap<>();
+            stdProfile.put("linkage", "CAMP SCP2 -- implemented and enforced (crypto/LinkageEngine.java)");
+            stdProfile.put("cert", "HashedId8 identifiers per IEEE 1609.2 6.4.3; NOT a 1609.2 certificate profile");
+            stdProfile.put("security_envelope", "none -- SignedCam's signature flag is a simulated boolean; "
+                    + "no signature is computed or verified");
+            stdProfile.put("message", "engine-private CAM DTO over ITS-G5; no ASN.1 encoding. "
+                    + "ETSI EN 302 637-2 / TS 103 900 GENERATION RULES are implemented "
+                    + "(app/ScmsBeaconApp.java); the message STRUCTURE is not.");
+            stdProfile.put("congestion_control", "ETSI TS 102 687 reactive DCC implemented "
+                    + "(radio/Dcc.java); opt-in");
+            stdProfile.put("report", "ETSI TS 103 759 V2.2.1: partial field-name correspondence only; "
+                    + "not encoded, not signed, and carrying no v2xPduEvidence");
+            manifest.put("standards_profile", stdProfile);
             Files.write(Paths.get(OUT_DIR, "manifest.json"),
                     (new GsonBuilder().setPrettyPrinting().create().toJson(manifest) + "\n")
                             .getBytes(StandardCharsets.UTF_8));

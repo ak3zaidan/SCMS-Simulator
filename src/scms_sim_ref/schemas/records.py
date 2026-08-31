@@ -93,7 +93,22 @@ class MaEvidenceMessage:
 
 @dataclass
 class MaReport:
-    """One ingested Misbehaviour Report (TS 103 759-shaped). Digests only."""
+    """One ingested Misbehaviour Report. Digests only.
+
+    INSPIRED BY ETSI TS 103 759 V2.2.1, NOT conformant to it, and the distinction is not pedantic.
+    The real report is three fields -- `TemplateAsr{observations, v2xPduEvidence,
+    nonV2xPduEvidence}` -- and `v2xPduEvidence` is `SEQUENCE (SIZE(1..MAX)) OF V2xPduStream`:
+    MANDATORY, minimum one. A report that does not carry the observed PDUs is structurally not a
+    TS 103 759 report under any encoding, and `evidence_msg_refs` here is a synthetic self-reference
+    (`MaEvidenceMessage`, below, exists and is never instantiated). The standard also has NO score,
+    confidence or severity field anywhere -- its observations are mostly `::= NULL` -- so
+    `detector_outputs[{check_id, score, verdict}]` is a private extension, and the reason codes are
+    F2MD names rather than the normative `(tgtId, obsId)` pairs.
+
+    So: field-name correspondence only. See docs/realism/PLUGIN-ARCHITECTURE.md 6.3 for the real
+    structure, the 55 normative identifiers, and the 6-of-15 detector mapping; closing this is the
+    single highest-value standards gap in the repository (roadmap phase 5).
+    """
     report_id: str
     ingest_time: float
     detection_time: float

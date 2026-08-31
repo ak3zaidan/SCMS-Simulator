@@ -130,7 +130,59 @@ python -m ... --flow --road grid --attacker-pct 0.2 --attack-mix "ConstPos:0.5,S
 
 Each run writes `ma/*.jsonl` (MA-visible features), a **separate** `ground_truth/*.jsonl`
 (oracle-only labels), `ml/*` (train/val/test ML tables via `--featurize`), a `DATASHEET.md`, and
-`manifest.json` (seed, config, per-file SHA-256, data digest, standards profile).
+`manifest.json` (seed, config, per-file SHA-256, data digest, interpreter/host runtime, the
+loaded-plugin lock, and a standards profile).
+
+**What the standards profile does and does not claim.** *Implemented:* CAMP SCP2 linkage values,
+and IEEE 1609.2 §6.4.3 **HashedId8** certificate *identifiers*. *Inspired-by:* misbehaviour-report
+field names (ETSI TS 103 759 V2.2.1, partial correspondence only). *Absent:* all message encodings
+(no ASN.1), all security envelopes, all certificate structures — **no signature is computed or
+verified anywhere**; `sig_ok` is a simulated boolean. The earlier `cert: IEEE 1609.2` claim was
+withdrawn on 2026-08-30 as unsupportable (`docs/realism/STANDARDS-AUDIT.md`).
+
+### Plugins — swap the channel model without forking
+
+The radio/channel seam is a published, dependency-free contract (`scms_sim_ref.api`), not a closed
+enum. `disc` / `logdistance` / `geometric` are entries in a built-in registry, and a third party
+selects their own model **with zero edits to the engine**:
+
+```powershell
+python -m scms_sim_ref.mock_pipeline.run --flow --duration 60 `
+  --plugins '{\"channel_model\": {\"ref\": \"myorg.radio:Rayleigh\", \"params\": {\"k_factor\": 3.0}}}'
+```
+
+`ref` resolves through three tiers — built-in name, installed entry point, then a dotted path
+`package.module:Class`. Activation is **always** config-declared (never discovery-driven), so it
+lands in `manifest["config"]` and replays. Implement either `LinkChannelModel` (one call per link,
+the simple analytic shape) or `BatchChannelModel` (one exchange per step — the only shape in which
+an out-of-process ns-3/OMNeT++ backend is affordable). A plugin **never receives the engine's global
+RNG**; it gets a seeded, namespaced `RngNamespace`. Every run records a content-addressed lock in
+`manifest["plugins"]`, and replaying a manifest whose plugin source has changed fails **before step
+0** with a non-zero exit (`--allow-plugin-drift` to override, which *records* the drift in the new
+manifest rather than silencing it). Declaring no plugins is the default and is byte-identical.
+
+**Grade a plugin before you trust it.** A versioned conformance suite (`scms_sim_ref.conformance`,
+checks C1–C12) is shipped for third parties to run against their own code — as a CLI, or as twelve
+pytest tests by subclassing `ChannelModelContract` and naming the plugin:
+
+```powershell
+python -m scms_sim_ref.mock_pipeline.run conformance --ref myorg.radio:Rayleigh --report conf.json
+python -m scms_sim_ref.mock_pipeline.run verify-plugins datasets/run/manifest.json   # CI gate, no run
+```
+
+It checks repeatability, call-order independence, that the engine's global RNG is untouched, that
+per-step state advances exactly once, no filesystem/network/subprocess I/O, **oracle invariance**,
+output ranges, reach honesty, monotonicity in distance, fail-fast on bad params, float hygiene, and
+a two-run pipeline digest. A model that legitimately cannot pass a check declares a **waiver with a
+written justification** (Django's `django_test_skips` doctrine) that lands in the report — the
+built-in `logdistance` is the first user of that, for a real `acceptanceRangeThreshold`
+false-positive channel the suite found.
+
+Declaring `{"channel_model": {"ref": "...", "conformance": "required"}}` makes the engine run the
+suite before step 0, **refuse** a failing plugin, and record the summary in the manifest. It is
+opt-in (measured 0.11 s per run) and does not change the data digest. Design and roadmap:
+`docs/realism/PLUGIN-ARCHITECTURE.md`; measured acceptance evidence for an out-of-repo plugin:
+`docs/realism/PLUGIN-CONFORMANCE-EVIDENCE.md`.
 
 ## GUI control panel
 

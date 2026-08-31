@@ -519,6 +519,17 @@ def audit(ds_dir: Path):
         rec(ds, "RL1_realism_oracle_containment", not rl_leaks,
             f"present={rl_present} " + ("; ".join(rl_leaks[:5]) if rl_leaks else "contained"))
 
+    # ============ PL. PLUGIN PROVENANCE LOCK (PLUGIN-ARCHITECTURE.md D4 / 4.2) ============
+    # This file already validated per-file digests and the recomputed aggregate but knew nothing
+    # about plugins, so a dataset produced by third-party code passed a full audit with its
+    # provenance unexamined. These checks read the LOCK (`manifest["plugins"]` -- what was actually
+    # loaded, content-addressed) rather than the INTENT (`config.plugins` -- what was asked for),
+    # which is the DVC dvc.lock/dvc.yaml split the design borrows.
+    #
+    # Every one SKIPs on a manifest written before the lock existed, so historical corpora stay
+    # green: an audit tool that retroactively fails old artifacts is one people stop running.
+    _audit_plugins(ds, man)
+
     # PROV1: scenario provenance. run.ps1 parks the generator's scms_scenario_manifest.json next to
     # a MOSAIC dataset as scenario_provenance.json (effective SCMS_* env + resolved realism knobs +
     # a sha256 per scenario input). When present it must parse and carry the resolved-knob block, so
@@ -677,6 +688,98 @@ def audit(ds_dir: Path):
             non_bool == 0 and not fake_from_nonattacker,
             f"emissions={len(gt_denm)} non_bool_is_fake={non_bool} "
             f"fake_from_nonattacker={len(fake_from_nonattacker)}")
+
+#: Grandfathering that exists ONLY so `disc`/`logdistance` keep digest 0bd93655..., and that the
+#: resolver refuses from anything that is not a built-in. Seeing it on a third-party entry means the
+#: dataset was produced by an engine whose capability gate was bypassed or patched out.
+_RESERVED_CAPABILITIES = frozenset({"legacy_global_rng", "loss_composition:additive_legacy"})
+
+
+def _canonical(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+
+
+def _audit_plugins(ds, man):
+    """PL1-PL6: the plugin lock, the runtime block, and what they are allowed to claim.
+
+    Deliberately self-contained -- it re-derives `provenance_digest` from the recorded `loaded` list
+    with the same canonicalisation `api.registry` uses, rather than importing the engine to ask.
+    An audit that trusts the code it is auditing is not an audit; this way an edited lock is caught
+    even by a checkout whose `run.py` was edited to write it.
+    """
+    plugins = man.get("plugins")
+    if not isinstance(plugins, dict):
+        for chk in ("PL1_plugin_lock_shape", "PL2_provenance_digest", "PL3_plugin_identity",
+                    "PL4_no_reserved_caps_third_party", "PL6_no_accepted_plugin_drift"):
+            rec(ds, chk, None, "manifest has no plugins block (predates the lock)")
+    else:
+        loaded = plugins.get("loaded")
+        missing = [k for k in ("api_version", "interface_versions", "loaded", "provenance_digest")
+                   if k not in plugins]
+        if not isinstance(loaded, list):
+            missing.append("loaded is not a list")
+        rec(ds, "PL1_plugin_lock_shape", not missing,
+            f"api_version={plugins.get('api_version')} loaded={len(loaded or [])}"
+            + ("; missing " + ", ".join(missing) if missing else ""))
+
+        loaded = loaded if isinstance(loaded, list) else []
+        h = hashlib.sha256()
+        for entry in loaded:
+            h.update(_canonical(entry))
+        want = plugins.get("provenance_digest")
+        rec(ds, "PL2_provenance_digest", bool(want) and h.hexdigest() == want,
+            f"recomputed={h.hexdigest()[:12]} manifest={str(want)[:12]}"
+            + ("" if want else " (absent)"))
+
+        # PL3: identity is RECORDED or explicitly declared incomplete -- never quietly absent.
+        # "Never fabricate" cuts both ways: a null hash with no `provenance_incomplete` flag is a
+        # lock that looks complete and is not.
+        unidentified = []
+        for entry in loaded:
+            if not isinstance(entry, dict):
+                unidentified.append("non-object entry"); continue
+            has_id = bool(entry.get("dist_sha256") or entry.get("module_sha256"))
+            if not has_id and not entry.get("provenance_incomplete"):
+                unidentified.append(f"{entry.get('slot')}:{entry.get('ref')} has no hash and no "
+                                    f"provenance_incomplete flag")
+        rec(ds, "PL3_plugin_identity", not unidentified, "; ".join(unidentified[:4])
+            or f"{len(loaded)} entr(y|ies) identified")
+
+        # PL4: reserved capabilities on a non-built-in entry.
+        bad_caps = []
+        for entry in loaded:
+            if not isinstance(entry, dict) or entry.get("resolved_via") == "builtin":
+                continue
+            hit = sorted(set(entry.get("capabilities") or []) & _RESERVED_CAPABILITIES)
+            if hit:
+                bad_caps.append(f"{entry.get('ref')} declares {hit}")
+        rec(ds, "PL4_no_reserved_caps_third_party", not bad_caps, "; ".join(bad_caps[:4]))
+
+        # PL6: a dataset produced by a replay that ACCEPTED plugin drift carries the record.
+        # `--allow-plugin-drift` is a legitimate, deliberate act, but the artifact it produces is
+        # permanently one whose code did not match the manifest it replayed -- so this FAILs rather
+        # than warns. The flag downgrades a hard stop to a loud one; it was never meant to make the
+        # dataset indistinguishable from a clean replay afterwards.
+        drift = plugins.get("drift_allowed") or []
+        rec(ds, "PL6_no_accepted_plugin_drift", not drift,
+            (f"produced by a replay that accepted {len(drift)} plugin drift(s): "
+             + "; ".join(str(d)[:120] for d in drift[:2])) if drift else "no drift recorded")
+
+    # PL5: the interpreter/host block. Not cosmetic: Python's documented reproducibility guarantee
+    # covers ONLY Random.random(); gauss(), uniform(), choice() and shuffle() carry no cross-version
+    # guarantee, and the pinned goldens depend on gauss and uniform. A digest is pinned to a CPython
+    # version as much as to a seed, and without this block a cross-machine mismatch is unattributable.
+    rt = man.get("runtime")
+    if not isinstance(rt, dict):
+        rec(ds, "PL5_runtime_recorded", None, "manifest has no runtime block (predates it)")
+    else:
+        missing = [k for k in ("python", "python_version", "implementation", "platform",
+                               "hash_randomization") if k not in rt]
+        rec(ds, "PL5_runtime_recorded", not missing,
+            f"{rt.get('implementation')} {rt.get('python_version')} on {rt.get('platform')} "
+            f"hash_randomization={rt.get('hash_randomization')}"
+            + ("; missing " + ", ".join(missing) if missing else ""))
+
 
 def _all_keys(obj, out=None):
     out = [] if out is None else out

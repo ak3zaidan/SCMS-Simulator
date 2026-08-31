@@ -1,0 +1,43 @@
+"""`scms_sim_ref.api` -- the published, dependency-free plugin contract.
+
+Stdlib only, and deliberately so: it is intended to split out later as a separate distribution
+(`scms-sim-api`) so a plugin author's install closure does not pull the whole engine. That is what
+makes "no fork" true in practice rather than in principle.
+
+What phase 1 ships (PLUGIN-ARCHITECTURE.md section 7):
+
+* :mod:`~scms_sim_ref.api.channel` -- the channel message vocabulary (`StationSnapshot`,
+  `Transmission`, `StepFrame`, `LinkOutcome`), the `BatchChannelModel` / `LinkChannelModel`
+  Protocols, and `PerLinkAdapter`.
+* :mod:`~scms_sim_ref.api.rng` -- `RngNamespace`. A plugin NEVER receives the engine's global
+  `random.Random(cfg.seed)`; capability by omission is the only enforceable control (D3).
+* :mod:`~scms_sim_ref.api.fields` -- `FieldSpec`, deliberately the exact shape `config_schema()`
+  already emits.
+* :mod:`~scms_sim_ref.api.registry` -- the three-tier resolver and the content-hash provenance lock.
+* :mod:`~scms_sim_ref.api.errors` -- every failure is a LOAD-TIME failure.
+
+Safety posture, stated honestly (section 10): in-process plugins are **attested and detected, not
+sandboxed**. Capability by omission is the only strong control. Arbitrary code execution, native
+nondeterminism, entropy/clock access and resource limits are NOT enforceable in-process at all --
+and Windows has no `RLIMIT` equivalent. Real isolation requires leaving the process, which is
+affordable only because the ABI is already batched per step.
+"""
+from __future__ import annotations
+
+from .channel import (BatchChannelModel, DELIVERED, INTERFACE_VERSION, LinkChannelModel,
+                      LinkChannelModelBase, LinkOutcome, LINK_STATES, PerLinkAdapter,
+                      StationSnapshot, StepFrame, Transmission, UNBOUND)
+from .errors import (ApiError, CapabilityError, ConfigError, InterfaceVersionError,
+                     PluginDriftError, SignatureError)
+from .fields import FieldSpec
+from .registry import API_VERSION, SLOTS, builtin_names, builtin_names_sorted, resolve
+from .rng import RngNamespace
+
+__all__ = [
+    "API_VERSION", "INTERFACE_VERSION", "SLOTS", "UNBOUND",
+    "ApiError", "BatchChannelModel", "CapabilityError", "ConfigError", "DELIVERED", "FieldSpec",
+    "InterfaceVersionError", "LINK_STATES", "LinkChannelModel", "LinkChannelModelBase",
+    "LinkOutcome", "PerLinkAdapter", "PluginDriftError", "RngNamespace", "SignatureError",
+    "StationSnapshot", "StepFrame", "Transmission",
+    "builtin_names", "builtin_names_sorted", "resolve",
+]

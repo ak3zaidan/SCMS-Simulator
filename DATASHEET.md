@@ -29,9 +29,21 @@ python -m scms_sim_ref.datagen.datasheet datasets/<run>   # writes datasets/<run
   Eclipse MOSAIC + SUMO layer exists for higher-fidelity mobility.
 - Same seed + config → **byte-identical** data (verified in CI); runs are memory-bounded
   via streaming and interruptible into a valid partial dataset.
-- **Standards profile** (recorded per run in `manifest.json → standards_profile`):
-  certificates profiled to **IEEE 1609.2**, linkage values to **CAMP SCP2**, and
-  misbehaviour reports **shaped to ETSI TS 103 759**.
+- **Standards profile** (recorded per run in `manifest.json → standards_profile`), split by what is
+  actually true. Corrected 2026-08-30: the previous claim that certificates were "profiled to
+  IEEE 1609.2" was **not supportable** and has been withdrawn — there is no 1609.2 certificate
+  structure in this repository and **no signature is ever computed or verified** (`sig_ok` is a
+  simulated boolean set by the attack switch). See `docs/realism/STANDARDS-AUDIT.md`.
+  - **IMPLEMENTED** — CAMP SCP2 linkage values (real seed hash-chain, Davies-Meyer pre-linkage,
+    `lv = plv1 ⊕ plv2`, forward-only matching, asserted in-run); IEEE 1609.2 §6.4.3 **HashedId8**
+    certificate *identifiers*; in the MOSAIC/Java layer only, ETSI EN 302 637-2 CAM *generation
+    rules* and TS 102 687 reactive DCC (opt-in).
+  - **INSPIRED-BY** — misbehaviour-report field names (ETSI TS 103 759 V2.2.1, partial
+    correspondence only), DENM cause-code names, station types.
+  - **ABSENT** — every message encoding (no ASN.1 UPER/COER anywhere), every security envelope,
+    every certificate structure, VAM, BSM, and ETSI TS 102 941. A TS 103 759 report is
+    structurally impossible without `v2xPduEvidence` (`SIZE(1..MAX)`), which is not emitted, so
+    these are **not** TS 103 759 reports.
 
 ## Composition — tables actually written
 Identifiers in MA-visible data appear **only** as opaque pseudonym-certificate digests;

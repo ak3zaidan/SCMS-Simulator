@@ -1,6 +1,36 @@
 # Plugin architecture and standards plan
 
-**Status:** design, not yet implemented. **Date:** 2026-08-30.
+**Status:** **phases 0, 1 and 2 implemented**; phases 3-6 remain design.
+
+**Phase 2 (2026-08-31).** `src/scms_sim_ref/conformance/` ships the v1 suite (C1-C12, thirteen rows
+— C6 has two arms), delivered both as a pytest-importable `ChannelModelContract` and as
+`scms-poc conformance`; `scms-poc verify-plugins` is a no-simulation CI gate; `tools/verify_data.py`
+gains six lock checks (`PL1`-`PL6`); and `--allow-plugin-drift` now **writes the drift into the new
+manifest** (`plugins.drift_allowed`), the half of section 4.3 phase 1 deferred. Headline gate, all
+five items measured and transcribed in **`PLUGIN-CONFORMANCE-EVIDENCE.md`**: an out-of-repo
+distribution (`scms-demo-channel 0.1.0`, installed as its own wheel, importing only
+`scms_sim_ref.api`) passes 13/13 checks and reproduces `9abe9eea…` across two processes with 10 of 11
+files byte-identical; one mutated byte of its source makes the manifest unreplayable **before step 0**
+(exit 2, no output directory created); a `time.time()`-seeded model fails C1 **and** separately
+yields `e3c94d7e…` vs `4275ef8a…` under an identical `provenance_digest`; and an oracle-reading model
+fails **only** C6b while being byte-reproducible — proving the two detection layers are independent
+rather than redundant. The suite also found two real defects: `logdistance` fails C8 (14.13 % of
+delivered links land beyond its declared reach; 4.19 % would score `>= 1.0` on
+`acceptanceRangeThreshold` for an honest sender) and now declares a quantified waiver; and phase 1's
+`dist_sha256` was `null` for **every** normally-installed wheel, not just editable installs. All 8
+pinned goldens unchanged; full suite **833 passed in 739.21 s**, exit 0.
+
+**Phases 0 and 1 (2026-08-30).**
+`src/scms_sim_ref/api/` ships the Protocols, `FieldSpec`, `RngNamespace`, the resolver and the
+provenance lock; `PipelineConfig.plugins` is live and defaults to `{}`; `disc` / `logdistance` /
+`geometric` are registry entries behind `PerLinkAdapter`; `manifest["standards_profile"]` is
+corrected, and `manifest["runtime"]` / `manifest["plugins"]` are written. Gate evidence:
+all 8 pinned goldens byte-identical (`0bd93655…`, `939b4faa…`, `b3a01d40…`, `48013901…`), the FULL
+RNG draw sequence identical for all three built-ins (V2: 45 647 / 383 742 / 384 707 draws, matching
+per-method counts and trace sha256), per-link outcomes identical (V3: 83 522 geometric link
+decisions, 28 342 delivered, identical trace sha256), `config_schema()` 138 → 139 fields with a
+one-block diff (V4), and `plugins.channel_model = {"ref": "geometric"}` byte-identical to
+`--radio-model geometric`. **Date:** 2026-08-30.
 **Commissioned by:** the directive that the simulator be *very modular, so a user can pick any
 network system and run a simulation with it*, and be *standards-compliant* — with the worked
 example "the user should be able to integrate thresholding into the simulator", i.e. plug in their
@@ -887,6 +917,43 @@ Every one of these is already load-bearing in the engine and must be restated in
 
 ## 5. The conformance suite
 
+> **AS IMPLEMENTED (2026-08-31).** `src/scms_sim_ref/conformance/` — `v1/channel.py` (the contract),
+> `v1/harness.py` (scenarios, `DrawCounter`, `audit_guard`), `runner.py` (the pytest-free driver and
+> `ConformanceReport`). Thirteen rows for the twelve numbered checks, because C6 has two arms.
+> `tests/test_conformance.py` grades the SUITE, with one deliberate violator per check, each of
+> which must fail its own check and (for C6b) *only* its own check.
+>
+> **Two deviations, both forced and both stated in the module docstring.**
+> **(1)** C6b is `C6b_oracle_invariance`, not `rssi_tracks_true_geometry_not_claimed`. The memo's
+> verbatim port cannot be written against this ABI: `StationSnapshot` carries **no claimed position**
+> — it is oracle-side by necessity and carries true geometry only — so "did the model use the claimed
+> position" is not a question the interface can pose. What ships is the strictly stronger statement
+> it *can* pose: two frame sequences identical in every DECLARED field, one additionally carrying
+> ground truth (`is_attacker` / `falsified` / `true_x` on the station objects and in `frame.env`),
+> must produce identical traces. It catches a laundered claimed position, a laundered attacker flag,
+> or anything else. The memo's dataset-level correlation test is untouched and still runs in
+> `tests/test_geometric_channel.py`.
+> **(2)** C10's first arm (an undeclared parameter name) is enforced by the framework and therefore
+> passes for any plugin; the report says so in its detail line rather than hiding it. The second arm
+> — a value outside a bound the plugin ITSELF declared through `FieldSpec` — is the plugin's own
+> declaration doing the work, and runs only when the plugin declares a bounded field.
+>
+> Waivers are implemented on BOTH sides of Django's doctrine: a contract subclass may set
+> `waivers = {check_id: justification}`, and an implementation may ship
+> `conformance_waivers = {...}` as a class attribute (this is `django_test_skips`). A waiver whose
+> justification is empty is refused. `LogDistanceChannel` is the first user of it — see
+> `PLUGIN-CONFORMANCE-EVIDENCE.md` §3.
+>
+> The third delivery route ships as a CONFIG DECLARATION, not the memo's `--unconformant` flag:
+> `plugins.channel_model.conformance = "required"` makes `build_channel` run the suite before step 0
+> and refuse a failing plugin, embedding the summary at
+> `manifest["plugins"]["loaded"][*]["conformance"]`. A config field replays; a flag does not. It is
+> off by default (measured 0.111 s per run, and C5's PEP 578 hook can never be uninstalled), and
+> **C12 is excluded from it BEFORE the suite runs** — C12 runs two pipelines, so running it from
+> inside one nests a pipeline in a pipeline. Excluding it properly rather than filtering its row out
+> afterwards is worth 0.19 s of the 0.30 s the first implementation cost. The exclusion is named in
+> the embedded summary rather than hidden.
+
 Shipped as importable base classes at `scms_sim_ref.conformance.v1`, **versioned with the
 interface**, so "passed conformance" is a checkable statement about a specific contract. Delivered
 three ways: subclass it in your own test suite; run `scms-poc conformance --slot check --ref
@@ -1254,20 +1321,38 @@ still works). Add `manifest["plugins"]`.
   to `--radio-model geometric`.
 - `config_schema()` returns the same 138 top-level fields plus exactly one new key (`plugins`).
 
-### Phase 2 — Conformance suite + provenance lock
+### Phase 2 — Conformance suite + provenance lock — **IMPLEMENTED 2026-08-31**
 
 **Work.** `scms_sim_ref.conformance.v1` (C1–C12). `strict_plugins` in `config_from_dict`.
 `scms-poc verify-plugins`. `scms-poc conformance`. Extend `tools/verify_data.py`.
 
-**Gate — the headline acceptance test.**
-- **A reference channel plugin living OUTSIDE the repo** (a separate wheel, installed from a
-  different directory, importing only `scms-sim-api`) passes all 12 checks and **reproduces
-  byte-identical output across two runs**.
-- Mutating one byte of that plugin's source and replaying its manifest raises `PluginDriftError`
-  **before step 0**, with exit code ≠ 0.
-- A deliberately nondeterministic plugin (draws from `time.time()`) **fails C1** and, separately,
-  produces two different digests — proving the two detection layers are independent.
-- A deliberately leaky plugin (returns `1.0` iff a hidden oracle flag is set) **fails D3**.
+**Gate — the headline acceptance test.** Every item below was measured; the transcript, the exit
+codes and the digests are in **`PLUGIN-CONFORMANCE-EVIDENCE.md`**, reproducible with one command
+(`C:\Temp\scms_plugin_demo\ACCEPTANCE.ps1`).
+- ✅ **A reference channel plugin living OUTSIDE the repo** (`scms-demo-channel 0.1.0`, its own
+  pyproject and wheel in `C:\Temp\scms_plugin_demo`, importing only `scms_sim_ref.api` — asserted by
+  a source scan in its own suite) passes all 12 checks (13 rows, exit 0) and **reproduces
+  byte-identical output across two runs**: `9abe9eeac07f947e…`, 10 of 11 files byte-identical,
+  `manifest.json` differing only by `build_utc`.
+- ✅ Mutating one byte of that plugin's source — inside a docstring, so behaviour is unchanged —
+  makes `verify-plugins` exit **2** and the replay exit **2** with `PluginDriftError`, **before
+  step 0**: no output directory is created. `--allow-plugin-drift` then reproduces the *identical*
+  digest and records the drift in the new manifest, which is the "harmless refactor" row of §4.3's
+  table, produced on demand.
+- ✅ A deliberately nondeterministic plugin (`time.time()`-seeded fade) **fails C1** and, separately,
+  produces `e3c94d7ee242…` vs `4275ef8acdec…` from two runs that both exit 0 — under an **identical**
+  `provenance_digest`, which is §4.3's "no identity drift + digest drift ⇒ nondeterministic" row.
+- ✅ A deliberately leaky plugin **fails the no-leakage check** while passing C1/C7/C8/C9/C11/C12 and
+  producing byte-identical datasets, so the pinned-golden layer is provably blind to it.
+  *(Restated from the memo's "fails D3": D3 is a DETECTOR check and the `Observation` DTO is phase 3.
+  The channel-side equivalent is C6b, which is the stronger form — see §5's deviation note.)*
+
+**Two defects the gate found**, neither of which was known before the suite existed:
+`logdistance` fails C8 and now declares a quantified waiver (14.13 % of delivered links beyond its
+declared reach; 4.19 % would score `>= 1.0` on `acceptanceRangeThreshold` for an honest sender at its
+true position — 0 in the default 5×5/120 m grid only because the map is smaller than
+`reach + art_max_m`); and phase 1's `dist_sha256`, the design's *strongest* identity, was `null` for
+**every** normally-installed wheel because the RECORD-hash walk bailed on `RECORD`'s own unhashed row.
 
 ### Phase 3 — The detector seam and the user's thresholding case
 

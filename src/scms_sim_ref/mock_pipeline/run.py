@@ -30,10 +30,12 @@ same seed+config -> byte-identical data.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 import os
 import random
+import types
 from collections import Counter
 import dataclasses
 from dataclasses import dataclass, field
@@ -41,6 +43,14 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .. import __version__
+from ..api import channel as _api_channel
+from ..api import registry as _api_registry
+from ..api.channel import (CAP_CBR, CAP_LEGACY_GLOBAL_RNG, CAP_LINK_STATE, CAP_REACH, CAP_RSSI,
+                           CAP_STATEFUL, DELIVERED, LOSS_ADDITIVE_LEGACY,
+                           LOSS_INDEPENDENT_SURVIVAL, LinkChannelModelBase, LinkOutcome,
+                           PerLinkAdapter, StationSnapshot, StepFrame, Transmission)
+from ..api.errors import ConfigError, PluginDriftError            # noqa: F401 (re-exported)
+from ..api.rng import RngNamespace
 from ..scms_core import crypto_abstract as ca
 from ..scms_core.linkage import CrlLinkageEntry, DeviceLinkageContext, linkage_seed_at
 from ..schemas import records as R
@@ -536,7 +546,148 @@ class _VehicleBlockerIndex:
         return best
 
 
-class GeometricChannel:
+# =========================================================================== #
+# The three built-in channel models, on the published `LinkChannelModel` interface.
+#
+# MIGRATION PRINCIPLE (PLUGIN-ARCHITECTURE.md 8.1): CODE MOTION ONLY. The refactor must not change
+# WHICH FUNCTION IS CALLED WITH WHICH ARGUMENTS IN WHICH ORDER. Everything else follows -- and the
+# five gates in 8.4 (goldens, global-RNG draw parity, per-link outcome parity, schema equality,
+# two-run determinism) are what make that reviewable rather than merely lucky.
+#
+# `disc` and `logdistance` are GRANDFATHERED: they draw the packet-loss coin from the engine's
+# global `rng` (the reception loop's `rng.random() < loss`) and compose loss ADDITIVELY (a sum that
+# can exceed 1.0), which is exactly what the plugin contract forbids. Rather than change it -- which
+# would move 0bd93655... -- they DECLARE `legacy_global_rng` + `loss_composition:additive_legacy`,
+# the resolver REFUSES both from any non-built-in, and the manifest records the grandfathering. A
+# deliberate, documented wart with a scheduled close (roadmap phase 6), not an oversight.
+#
+# Two engine facts the interface has to carry, and the memo's single `reach_m` does not:
+#   * reach is PER RECEIVER (an RSU's `rsu_range_m` legitimately exceeds a vehicle's), and
+#   * under `logdistance` the candidate-search WINDOW (shadow-widened) and the declared DELIVERY
+#     reach (`rr`, what `acceptanceRangeThreshold` bounds on) are DIFFERENT NUMBERS.
+# Hence `reach_m_for(rx)` and `window_m(rx)` as separate methods. Collapsing them moves 939b4faa...
+# =========================================================================== #
+
+#: Bytes on the wire for one native_v1 PDU. Both engines currently hard-code 300 B
+#: (`SignedCam.java:18`, `Dcc.java:81`); TS 103 097 signer alternation (digest vs certificate) is
+#: worth ~150-200 B, which is why every CBR estimate is systematically wrong and why the real number
+#: has to come from a `MessageCodec` (roadmap phase 5). Recorded here so the seam exists.
+NATIVE_WIRE_SIZE_BYTES = 300
+
+
+class DiscChannel(LinkChannelModelBase):
+    """`radio_model="disc"` (the DEFAULT): the hard range disc, `heard iff d <= rr`.
+
+    Draws nothing itself. The delivery coin is the engine's own global-`rng` additive-loss test,
+    which is precisely the grandfathered behaviour -- see the module note above.
+    """
+
+    plugin_id = "disc"
+    interface_version = _api_channel.INTERFACE_VERSION
+
+    def __init__(self, *, range_m: float):
+        self.reach_m = float(range_m)
+
+    @classmethod
+    def from_plugin(cls, *, params, rng, env):
+        return cls(range_m=float(params.get("range_m", env["radio_range_m"])))
+
+    def capabilities(self):
+        return frozenset({CAP_REACH, CAP_LEGACY_GLOBAL_RNG, LOSS_ADDITIVE_LEGACY})
+
+    def reach_m_for(self, rx: StationSnapshot) -> float:
+        # `rx.rx_range or cfg.radio_range_m` -- an RSU may reach further than a vehicle.
+        return rx.rx_range_m or self.reach_m
+
+    def evaluate(self, tx, rx, d_m, txn):
+        return DELIVERED if d_m <= (rx.rx_range_m or self.reach_m) else None
+
+
+class LogDistanceChannel(LinkChannelModelBase):
+    """`radio_model="logdistance"`: log-distance path loss + per-link log-normal shadowing.
+
+    Mean received power relative to sensitivity is `10*n*log10(rr/d) - margin` dB, so it is exactly
+    0 dB at `d == rr` (calibration: median range == `radio_range_m`); a link closes iff
+    `mean + shadow >= 0`.
+
+    The shadowing stream is keyed on the sender's CERT DIGEST and the step
+    (`f"{seed}:shadow:{digest}:{rx_vid}:{step}"`). That is a known correctness bug -- a pseudonym
+    rotation resamples the channel, and the draw is neither reciprocal nor persistent -- and it is
+    DELIBERATELY PRESERVED here because fixing it moves 939b4faa... It is scheduled for a re-pin,
+    not smuggled into a refactor.
+    """
+
+    plugin_id = "logdistance"
+    interface_version = _api_channel.INTERFACE_VERSION
+
+    #: Conformance waivers this implementation DECLARES -- Django's `django_test_skips` doctrine:
+    #: a backend states what it legitimately cannot pass as DATA it ships, with a written
+    #: justification that travels into `conformance_report.json` and from there into the manifest.
+    #: Never an edit to the suite. Measured 2026-08-31 by `scms-poc conformance --ref logdistance`.
+    conformance_waivers = {
+        "C8_reach_honesty":
+            "reach_m is a MEDIAN-range calibration, not an upper bound. The model is 0 dB at "
+            "d == radio_range_m by construction and a link closes iff mean + shadow >= 0, so a "
+            "favourable log-normal shadow legitimately closes links past it -- that IS the model. "
+            "Measured on the v1 harness at range_m=500, sigma=4 dB, n=2.7: 999 of 7071 delivered "
+            "links (14.13 %) land beyond the declared reach, worst excess 940.1 m, and 296 of them "
+            "(4.19 % of deliveries) exceed art_max_m=150 m and would therefore score >= 1.0 on "
+            "acceptanceRangeThreshold for an HONEST sender at its true position. That false-positive "
+            "channel is real but does not fire in the default 5x5 / 120 m grid (measured: 0 ART "
+            "false positives over 2953 reports, seed 17) because the whole map is smaller than "
+            "reach + tolerance. Closing it means either declaring the widened window as the reach "
+            "(which moves 939b4faa...) or giving the model a hard cutoff (which is a different "
+            "model); it is scheduled with the roadmap phase 6 re-pin, not smuggled into a refactor."}
+
+    def __init__(self, *, seed: int, range_m: float, pathloss_exponent: float,
+                 shadowing_sigma_db: float, rx_sensitivity_margin_db: float,
+                 cap_sigma: float, cap_max_mult: float):
+        self.seed = int(seed)
+        self.reach_m = float(range_m)
+        self.n = float(pathloss_exponent)
+        self.sigma_db = float(shadowing_sigma_db)
+        self.margin_db = float(rx_sensitivity_margin_db)
+        self.cap_sigma = float(cap_sigma)
+        self.cap_max_mult = float(cap_max_mult)
+        self.step = -1
+        # A favourable shadow can pull a link past rr, so the candidate window widens to the cap
+        # distance and is bounded so the cell search stays O(local). A - margin widens it further.
+        self._widen = 10.0 ** ((self.cap_sigma * self.sigma_db - min(0.0, self.margin_db))
+                               / (10.0 * self.n))
+
+    @classmethod
+    def from_plugin(cls, *, params, rng, env):
+        g = lambda k: params[k] if k in params else env[k]            # noqa: E731
+        return cls(seed=env["seed"], range_m=g("radio_range_m"),
+                   pathloss_exponent=g("pathloss_exponent"),
+                   shadowing_sigma_db=g("shadowing_sigma_db"),
+                   rx_sensitivity_margin_db=g("rx_sensitivity_margin_db"),
+                   cap_sigma=g("radio_cap_sigma"), cap_max_mult=g("radio_cap_max_mult"))
+
+    def capabilities(self):
+        return frozenset({CAP_REACH, CAP_LEGACY_GLOBAL_RNG, LOSS_ADDITIVE_LEGACY})
+
+    def begin_step(self, frame: StepFrame) -> None:
+        self.step = frame.step
+
+    def reach_m_for(self, rx: StationSnapshot) -> float:
+        # NOT the widened window: `acceptanceRangeThreshold` bounds on rr under this model
+        # (run.py's `art_reach = cap if geo_chan is not None else rr`).
+        return rx.rx_range_m or self.reach_m
+
+    def window_m(self, rx: StationSnapshot) -> float:
+        rr = rx.rx_range_m or self.reach_m
+        return max(rr, min(rr * self._widen, rr * self.cap_max_mult))
+
+    def evaluate(self, tx, rx, d_m, txn):
+        rr = rx.rx_range_m or self.reach_m
+        mean_db = 10.0 * self.n * math.log10(rr / max(d_m, 1.0)) - self.margin_db
+        shadow_db = random.Random(
+            f"{self.seed}:shadow:{txn.cert_digest}:{rx.vid}:{self.step}").gauss(0.0, self.sigma_db)
+        return DELIVERED if mean_db + shadow_db >= 0.0 else None
+
+
+class GeometricChannel(LinkChannelModelBase):
     """The `radio_model="geometric"` link model: classification -> path loss -> AR(1) shadowing ->
     per-packet Nakagami fade -> independent-survival composition.
 
@@ -553,6 +704,9 @@ class GeometricChannel:
       * canyon     : the synthetic-map NLOSb fallback shares the shadowing stream, so it is
                      re-decided on the same spatial cadence as the shadowing it accompanies.
     """
+
+    plugin_id = "geometric"
+    interface_version = _api_channel.INTERFACE_VERSION
 
     def __init__(self, cfg, buildings=None, dt: float = 1.0):
         self.seed = cfg.seed
@@ -580,17 +734,67 @@ class GeometricChannel:
         a, b, c = TR37885_PATHLOSS[self.los_state]
         budget = (self.tx_dbm - self.decode_floor_dbm
                   + cfg.radio_cap_sigma * TR37885_SHADOW_SIGMA_DB["LOS"] + GEO_FADING_HEADROOM_DB)
-        self.cap_m = 10.0 ** ((budget - a - c * math.log10(TR37885_FC_GHZ)) / b)
-        self.cap_m = max(1.0, min(self.cap_m, cfg.radio_range_m * cfg.radio_cap_max_mult))
+        reach = 10.0 ** ((budget - a - c * math.log10(TR37885_FC_GHZ)) / b)
+        # `reach_m` is the interface name; `cap_m` remains a read-only alias for one minor version.
+        self.reach_m = max(1.0, min(reach, cfg.radio_range_m * cfg.radio_cap_max_mult))
         # carrier-sense radius for the hidden-terminal term, on the same LOS budget at -85 dBm
         sense_budget = self.tx_dbm - PHY_CS_THRESHOLD_DBM
-        self.sense_m = min(self.cap_m,
+        self.sense_m = min(self.reach_m,
                            10.0 ** ((sense_budget - a - c * math.log10(TR37885_FC_GHZ)) / b))
 
+    @property
+    def cap_m(self) -> float:
+        """Deprecated alias for :attr:`reach_m` (kept for one minor version; PLUGIN-ARCH 8.2)."""
+        return self.reach_m
+
+    @classmethod
+    def from_plugin(cls, *, params, rng, env):
+        """Built-in construction contract. `rng` (an RngNamespace) is deliberately unused: this
+        model already carries its OWN string-keyed per-link streams and draws zero from any shared
+        object -- which is exactly the property the contract asks third parties to reproduce."""
+        return cls(env["config"], buildings=env.get("buildings"), dt=env["dt"])
+
+    def capabilities(self):
+        return frozenset({CAP_RSSI, CAP_LINK_STATE, CAP_REACH, CAP_CBR, CAP_STATEFUL,
+                          LOSS_INDEPENDENT_SURVIVAL})
+
     # -- per-step ---------------------------------------------------------------------------- #
-    def begin_step(self, step: int, blocker_entries) -> None:
+    def begin_step(self, frame, blocker_entries=None) -> None:
+        """ABI form `begin_step(StepFrame)`; legacy form `begin_step(step:int, blocker_entries)`.
+
+        A blocker is any station with a non-zero `blocker_h_m`: RSUs are receivers, not blockers,
+        and a pedestrian is not an obstruction, so both carry 0.0 and drop out here. The engine
+        supplies `frame.stations` in its own active-vehicle order, so the rebuilt index is entry-for-
+        entry identical to the list comprehension this replaced.
+        """
+        if isinstance(frame, StepFrame):
+            entries = [(s.vid, s.x, s.y, s.blocker_h_m)
+                       for s in frame.stations.values() if s.blocker_h_m > 0.0]
+            step = frame.step
+        else:
+            step, entries = frame, (blocker_entries if blocker_entries is not None else ())
         self.step = step
-        self.blockers.rebuild(blocker_entries)
+        self.blockers.rebuild(entries)
+
+    def channel_busy_ratio(self, rx_vid: int, offered: float) -> float:
+        """Interface name for :meth:`cbr`. `rx_vid` is unused: this estimator is a function of the
+        offered load the receiver decodes, not of which receiver it is."""
+        return self.cbr(offered)
+
+    def delivery_coin(self, tx_vid: int, rx_vid: int) -> float:
+        """The delivery coin, from THIS LINK's own keyed stream -- never the engine's global `rng`.
+
+        Looked up (not created) by ordered pair: `evaluate` has already put the stream in place for
+        every link that reached the composition site, so the draw is the same object, in the same
+        order, as the pre-refactor `_prng.random()`."""
+        return self._packet[(tx_vid, rx_vid)].random()
+
+    def prune(self, live_vids) -> None:
+        """Drop per-link state for pairs where NEITHER endpoint is still active."""
+        for k in [k for k in self._shadow if k[0] not in live_vids and k[1] not in live_vids]:
+            self._shadow.pop(k, None)
+        for k in [k for k in self._packet if k[0] not in live_vids and k[1] not in live_vids]:
+            self._packet.pop(k, None)
 
     def cbr(self, load_msgs_per_step: float) -> float:
         """Modelled channel busy ratio: offered frames per second x PPDU+MAC airtime, capped at 1.
@@ -685,7 +889,7 @@ class GeometricChannel:
         measures)."""
         return 0.0 if rx_dbm >= self.decode_floor_dbm else 1.0
 
-    def evaluate(self, tx_vid, rx_vid, txx, txy, rxx, rxy, d, tx_h, rx_h):
+    def evaluate_raw(self, tx_vid, rx_vid, txx, txy, rxx, rxy, d, tx_h, rx_h):
         """One packet on one link. Returns (heard, rssi_dbm, state, packet_rng).
 
         `rssi_dbm` is the FADED received power -- what the receiver's PHY actually measures for this
@@ -714,6 +918,227 @@ class GeometricChannel:
         rx_dbm = mean_rx + fade_db
         heard = self._per_from_rx_dbm(rx_dbm) <= 0.0
         return heard, rx_dbm, state, prng
+
+    def evaluate(self, tx, rx, d_m, txn):
+        """`LinkChannelModel.evaluate` -- the interface form of :meth:`evaluate_raw`.
+
+        Pure translation: identical arguments in identical order, so every draw on every per-link
+        stream is made at exactly the point it was made before the refactor."""
+        heard, rssi, state, _prng = self.evaluate_raw(
+            tx.vid, rx.vid, tx.x, tx.y, rx.x, rx.y, d_m, tx.ant_h_m, rx.ant_h_m)
+        return LinkOutcome(rssi_dbm=rssi, link_state=state) if heard else None
+
+
+# The built-in registry, in DISPLAY order. This tuple -- not a `switch`, not an array index -- is
+# what `radio_model` now selects through, and it is what `_ENUM_OPTIONS` / the argparse `choices` /
+# the GUI dropdown all read, so those four sites can never drift apart again. F2MD's
+# integer-indexed enum + `switch` (`MdAppTypes.h` + `F2MDVeinsApp.cc`) is the anti-pattern this
+# replaces; the registration shape comes from Artery / ns-3 / MOSAIC instead.
+for _name, _cls in (("disc", DiscChannel), ("logdistance", LogDistanceChannel),
+                    ("geometric", GeometricChannel)):
+    _api_registry.register_builtin("channel_model", _name, _cls)
+del _name, _cls
+
+#: Config scalars a channel model may read at construction. NOT the oracle: every one of these is
+#: user-supplied config that already appears verbatim in `manifest["config"]`. `config` and
+#: `buildings` are handed over for BUILT-IN construction (`GeometricChannel.from_plugin`); a third
+#: party should read `params` instead, which is the half that gets hashed into the manifest lock.
+_CHANNEL_ENV_KEYS = ("radio_range_m", "pathloss_exponent", "shadowing_sigma_db",
+                     "rx_sensitivity_margin_db", "radio_cap_sigma", "radio_cap_max_mult",
+                     "radio_env", "radio_tx_power_dbm", "radio_rx_sensitivity_dbm",
+                     "radio_nlosb_density_per_km", "chan_capacity", "packet_loss_base",
+                     "nlos_loss", "seed", "dt")
+
+
+def _channel_env(cfg, buildings, dt):
+    env = {k: getattr(cfg, k) for k in _CHANNEL_ENV_KEYS if hasattr(cfg, k)}
+    env["dt"] = dt
+    env["buildings"] = buildings
+    env["config"] = cfg
+    return env
+
+
+#: Keys a `plugins.channel_model` section may carry. Closed so a typo is an error, not a no-op.
+_CHANNEL_SECTION_KEYS = frozenset({"ref", "params", "conformance"})
+
+#: `plugins.<slot>.conformance`: "off" (default, and the only zero-cost setting) or "required".
+CONFORMANCE_MODES = ("off", "required")
+
+#: Checks the IN-RUN attestation cannot run. C12 runs two full pipelines; attestation happens inside
+#: one, so running C12 there would put a pipeline inside a pipeline. Excluded BEFORE the suite runs,
+#: not filtered out of its report afterwards, and named in the embedded summary.
+_ATTEST_EXCLUDES = ("C12_pipeline_two_run_digest",)
+
+
+def _channel_conformance(cfg) -> str:
+    sel = (cfg.plugins or {}).get("channel_model") if isinstance(cfg.plugins, dict) else None
+    mode = str(sel.get("conformance", "off")) if isinstance(sel, dict) else "off"
+    if mode not in CONFORMANCE_MODES:
+        raise ConfigError(f"plugins.channel_model.conformance must be one of "
+                          f"{list(CONFORMANCE_MODES)} (got {mode!r})")
+    return mode
+
+
+def _attest(slot: str, ref: str, params: dict) -> dict:
+    """Run the v1 conformance suite against this plugin BEFORE step 0 and refuse a failing one.
+
+    The design's third delivery route -- *"let the engine refuse an unattested plugin"* -- expressed
+    as a config declaration rather than a flag, so it lands in `manifest["config"]` and replays like
+    everything else. The resulting summary is written into
+    `manifest["plugins"]["loaded"][*]["conformance"]`, which is what turns *"this dataset was
+    produced by a conformant plugin"* into a machine-checkable property of the artifact.
+
+    OFF BY DEFAULT, and that is not timidity. Attestation costs a measured 0.111 s per run (1.268 s
+    vs 1.157 s, median of 3, on a 60 s grid) and, because C5 installs a PEP 578 audit hook that can
+    never be removed, it leaves a small permanent per-audit-event cost on the process. Neither
+    belongs on the engine path of a run that did not ask for it, and the honest home for a
+    twelve-check suite is a CI gate, not every `run_pipeline`.
+
+    **C12 is excluded, and it has to be**: C12 runs two full pipelines, so running it from inside
+    `build_channel` -- which is itself inside a pipeline -- nests a pipeline in a pipeline. It is
+    excluded BEFORE the suite runs, not filtered out of the report afterwards, and the distinction is
+    not academic: the first implementation filtered afterwards, cost 0.30 s, and was still quietly
+    running the two pipelines its own summary said were excluded. The exclusion is named in the
+    summary, so nobody reads `passed: 12` here and believes the artifact-level check ran.
+    """
+    from ..conformance.runner import run_ref
+    rep = run_ref(slot, ref, params, exclude=_ATTEST_EXCLUDES)
+    if not rep.ok:
+        failed = [r["check"] for r in rep.rows if r["status"] in ("FAIL", "ERROR")]
+        raise ConfigError(
+            f"plugins.{slot}.conformance=required and {ref!r} does not conform: {failed} failed.\n"
+            + rep.to_text())
+    summary = rep.summary()
+    summary["excluded"] = list(_ATTEST_EXCLUDES)
+    summary["excluded_reason"] = ("C12 runs two pipelines; running it from inside one would put a "
+                                  "pipeline inside a pipeline. Run it from the CLI or CI instead: "
+                                  "scms-poc conformance --ref <ref>")
+    return summary
+
+
+def _channel_selection(cfg):
+    """(ref, params) for the channel slot: the `plugins` block wins, else the `radio_model` enum.
+
+    D2: discovery may be automatic, ACTIVATION is always config-declared. Both spellings live in
+    `cfg`, so both land in `manifest["config"]` and replay through `config_from_dict` with no new
+    plumbing -- which is the whole reason a dotted path in config beats an entry point.
+    """
+    sel = (cfg.plugins or {}).get("channel_model") if isinstance(cfg.plugins, dict) else None
+    if not sel:
+        return str(cfg.radio_model), {}
+    if isinstance(sel, str):
+        sel = {"ref": sel}
+    if not isinstance(sel, dict) or "ref" not in sel:
+        raise ConfigError("plugins.channel_model must be a string or {'ref': ..., 'params': {...}}")
+    extra = sorted(set(sel) - _CHANNEL_SECTION_KEYS)
+    if extra:
+        # A mistyped key here is a plugin knob that silently did nothing -- refuse it, the same way
+        # an undeclared param is refused, rather than accept a config that does not mean what it says.
+        raise ConfigError(f"plugins.channel_model: unknown key(s) {extra}; "
+                          f"known: {sorted(_CHANNEL_SECTION_KEYS)}")
+    params = sel.get("params") or {}
+    if not isinstance(params, dict):
+        raise ConfigError("plugins.channel_model.params must be an object")
+    ref = str(sel["ref"])
+    if cfg.radio_model != PipelineConfig.radio_model and cfg.radio_model != ref:
+        raise ConfigError(
+            f"ambiguous channel selection: radio_model={cfg.radio_model!r} and "
+            f"plugins.channel_model.ref={ref!r} disagree; set only one")
+    return ref, params
+
+
+def build_channel(cfg, buildings=None, dt: float = 1.0):
+    """Resolve + construct the run's channel model. Once, before step 0; every failure fatal here.
+
+    Returns `(adapter, provenance)`. A `LinkChannelModel` is wrapped in `PerLinkAdapter`; a
+    `BatchChannelModel` is used as-is. A plugin instance is a PER-RUN object built inside the
+    pipeline, never a module global -- the in-process multi-run drivers (`datagen/foundry.py`,
+    `campaign.py`, `massive.py`, `gui/agent.py`) would otherwise cross-contaminate.
+    """
+    ref, params = _channel_selection(cfg)
+    cls, how, iv, shape = _api_registry.resolve("channel_model", ref)
+    pid = _api_registry.plugin_id_of(cls, ref if ":" not in ref else ref.rsplit(":", 1)[-1].lower())
+    rng_ns = RngNamespace(cfg.seed, pid)
+    model = _api_registry.instantiate(cls, params=params, rng=rng_ns,
+                                      env=_channel_env(cfg, buildings, dt))
+    caps = _api_registry.check_capabilities("channel_model", ref, cls, how, model.capabilities())
+    chan = _api_channel.BatchAdapter(model) if shape == "batch" else PerLinkAdapter(model)
+    # Attestation, when the config asked for it. Here rather than in `validate_config` because it is
+    # expensive and belongs with the one construction that actually happens, not with every
+    # validation pass the GUI and the copilot make.
+    conformance = (_attest("channel_model", ref, params)
+                   if _channel_conformance(cfg) == "required" else None)
+
+    def _provenance():
+        # Built AT THE END of the run, not here: `declared_streams` is the set of stream labels the
+        # plugin ACTUALLY consumed, and a model that draws only during the loop (which is all of
+        # them) has consumed none at construction time. Recording an always-empty list would be
+        # fabrication by omission -- D3's third property is that a plugin DECLARES the streams it
+        # uses, as a manifest field.
+        return _api_registry.make_provenance("channel_model", 0, ref, cls, how, iv, caps,
+                                             rng_ns.declared_streams(), params,
+                                             conformance=conformance)
+
+    return chan, _provenance
+
+
+#: Drift a replay was told to ACCEPT, waiting to be written into that replay's own manifest.
+#:
+#: Section 4.3 is explicit that `--allow-plugin-drift` *"writes the drift into the new manifest, it
+#: does not silence it"*, and that is the only version of the flag worth having: a silenced drift
+#: turns a replay into an unmarked different run, which is the exact failure the lock exists to
+#: prevent.
+#:
+#: BOUND TO THE CONFIG OBJECT, not merely to the process. `config_from_dict` records
+#: `{"cfg": <the config it just built>, "drifts": [...]}` and `run_pipeline` claims it only when the
+#: config it was handed IS that object. The weaker "consume at the start of the next run" design was
+#: tried and is wrong: a caller that builds a drifted config and never runs it (a `--check-config`,
+#: a GUI validation, a test) leaves a record that the NEXT unrelated `run_pipeline` then stamps into
+#: its manifest -- and the in-process multi-run drivers (`datagen/foundry.py`, `campaign.py`,
+#: `massive.py`, `gui/agent.py`) make that a routine occurrence, not a corner case. The strong
+#: reference is deliberate: it keeps the config alive so an `is` comparison cannot be fooled by
+#: address reuse, and it is bounded at exactly one object.
+#:
+#: A module global rather than a field on the config because `_write_manifest` serialises
+#: `cfg.__dict__` verbatim -- anything parked on the config becomes a config key and would then have
+#: to survive `config_from_dict` on the way back in.
+_PLUGIN_DRIFT_ALLOWED: dict = {"cfg": None, "drifts": []}
+
+
+def _claim_drift_record(cfg) -> list:
+    """Take the drift record belonging to `cfg`, if there is one. Idempotent, and a no-op for any
+    config that was not the one a drifted replay produced."""
+    if _PLUGIN_DRIFT_ALLOWED["cfg"] is not cfg:
+        return []
+    drifts = list(_PLUGIN_DRIFT_ALLOWED["drifts"])
+    _PLUGIN_DRIFT_ALLOWED["cfg"], _PLUGIN_DRIFT_ALLOWED["drifts"] = None, []
+    return drifts
+
+
+def plugin_block(records, drift=None) -> dict:
+    """`manifest["plugins"]` -- the LOCK (what was loaded), against `cfg.plugins` (what was asked).
+
+    Not part of `data_digest_sha256` (which by design covers data files only) and carrying its own
+    `provenance_digest`. Never fabricates: an identity that cannot be established is recorded as
+    `null` plus `provenance_incomplete: true`.
+    """
+    loaded = [r.to_dict() for r in records]
+    block = {"api_version": _api_registry.API_VERSION,
+             "interface_versions": {_api_channel.INTERFACE_NAME:
+                                    _api_channel.INTERFACE_VERSION.split("/", 1)[1]},
+             "loaded": loaded,
+             "provenance_digest": _api_registry.provenance_digest(records)}
+    if drift:
+        # Present ONLY when a replay actually accepted drift, so the default manifest shape is
+        # untouched. Its presence is the machine-readable statement "this dataset was produced by
+        # code that did not match the manifest it was replayed from", and `loaded` above records
+        # what ran, so the two locks diff cleanly.
+        block["drift_allowed"] = list(drift)
+    return block
+
+
+def empty_plugin_block() -> dict:
+    return plugin_block([])
 
 
 # --------------------------------------------------------------------------- #
@@ -974,6 +1399,18 @@ class PipelineConfig:
     verbose: bool = False                # print a flow progress heartbeat (CLI/GUI set this True)
     jmax: int = 20
     out_dir: str = "datasets/poc_run"
+    # --- plugins (D2) -------------------------------------------------------------------------
+    # THE activation surface. Added at the END of the dataclass so field order is stable, and
+    # DEFAULTING TO EMPTY so every pinned golden holds -- that is not a happy accident, it is the
+    # requirement that dictated the shape (registering is not enabling).
+    #
+    #   {"channel_model": {"ref": "geometric", "params": {}}}
+    #
+    # `ref` resolves through three tiers -- built-in registry name, installed entry point, then a
+    # dotted path "package.module:Class". Only a CONFIG FIELD lands in `manifest["config"]` and
+    # replays through `config_from_dict`; entry-point iteration order is machine state, which is
+    # why discovery may be automatic but activation never is.
+    plugins: dict = field(default_factory=dict)
 
     def derive(self, label: str, n: int = 32) -> bytes:
         return hashlib.sha256(f"{self.seed}|{label}".encode()).digest()[:n]
@@ -1418,8 +1855,16 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"jmax must be >= 1 (got {cfg.jmax})")
     if cfg.radio_range_m <= 0:
         raise ValueError(f"radio_range_m must be > 0 (got {cfg.radio_range_m})")
-    if cfg.radio_model not in ("disc", "logdistance", "geometric"):
-        raise ValueError(f"radio_model must be disc|logdistance|geometric (got {cfg.radio_model!r})")
+    # The closed enum is gone: `radio_model` is now a BUILT-IN REGISTRY KEY. The message is built
+    # from the live registry, so the four sites that used to hand-repeat the three names
+    # (this check, `_ENUM_OPTIONS`, the argparse `choices`, the GUI dropdown) cannot drift.
+    # A THIRD-PARTY model is selected through `plugins.channel_model`, not through this flag.
+    _radio_builtins = _api_registry.builtin_names("channel_model")
+    if cfg.radio_model not in _radio_builtins:
+        raise ValueError(f"radio_model must be {'|'.join(_radio_builtins)} "
+                         f"(got {cfg.radio_model!r}); a third-party channel model is declared via "
+                         f"plugins.channel_model, e.g. "
+                         f"{{'channel_model': {{'ref': 'pkg.mod:Class'}}}}")
     if cfg.radio_env not in ("urban", "highway"):
         raise ValueError(f"radio_env must be urban|highway (got {cfg.radio_env!r})")
     if not -20.0 <= cfg.radio_tx_power_dbm <= 40.0:
@@ -1607,9 +2052,61 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
             if oor:
                 raise ValueError(f"attacker_ids {oor!r} out of range for n_vehicles={cfg.n_vehicles} "
                                  f"(valid ids 0..{cfg.n_vehicles - 1})")
+    # Plugin declarations: shape-check here, then let each plugin's own validator speak. This runs
+    # AFTER the engine's own checks and BEFORE the _PROB_FIELDS clamp, exactly as the design places
+    # it, so a plugin's message is the FIRST thing a user sees about its own knobs -- and no `if` is
+    # added to this 200-line block per plugin knob.
+    _validate_plugins(cfg)
     for name in _PROB_FIELDS:                       # clamp fractions rather than produce nonsense
         setattr(cfg, name, min(1.0, max(0.0, float(getattr(cfg, name)))))
     return cfg
+
+
+def _validate_plugins(cfg) -> None:
+    # Accept a JSON STRING as well as an object, the same way `custom_network` and `events` do:
+    # a CLI flag, a GUI text field and a copilot tool call all deliver a string, and the alternative
+    # is a class of "invalid config" errors that say nothing useful. Normalised to a dict here, so
+    # what lands in manifest["config"] is always the object form.
+    if isinstance(cfg.plugins, str):
+        s = cfg.plugins.strip()
+        if not s:
+            cfg.plugins = {}
+        else:
+            try:
+                cfg.plugins = json.loads(s)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"plugins is not valid JSON: {e}") from None
+    if cfg.plugins in (None, {}):
+        cfg.plugins = {}
+        return                                      # DEFAULT EMPTY -> zero behaviour change
+    if not isinstance(cfg.plugins, dict):
+        raise ValueError(f"plugins must be an object (got {type(cfg.plugins).__name__})")
+    unknown = sorted(set(cfg.plugins) - set(_api_registry.SLOTS))
+    if unknown:
+        raise ValueError(f"plugins: unknown slot(s) {unknown}; known: {list(_api_registry.SLOTS)}")
+    unsupported = sorted(s for s in cfg.plugins if s != "channel_model" and cfg.plugins[s])
+    if unsupported:
+        # Say what is not there rather than accept it and silently ignore it -- an ignored plugin
+        # section is exactly the "replays as a different run with exit code 0" failure D4 closes.
+        raise ValueError(f"plugins: slot(s) {unsupported} are declared but not yet consumed by this "
+                         f"engine (phase 1 ships the channel seam only); remove them or upgrade")
+    ref, params = _channel_selection(cfg)
+    _channel_conformance(cfg)          # reject a bad `conformance` mode HERE, not at step 0
+    cls, how, _iv, _shape = _api_registry.resolve("channel_model", ref)
+    spec = _plugin_config_fields(cls)
+    for k, v in sorted(params.items()):
+        fs = spec.get(k)
+        if fs is None and spec:
+            raise ValueError(f"plugins.channel_model.params: {cls.__name__} declares no field {k!r}"
+                             f"; known: {sorted(spec)}")
+        if fs is not None:
+            fs.validate(f"plugins.channel_model.params.{k}", v)
+    # A plugin's OWN validator, raising its OWN message. Declared as a classmethod/staticmethod so
+    # it is reachable before construction; anything deeper belongs in __init__ (conformance C10
+    # requires invalid params to raise at CONSTRUCTION, never at step k > 0).
+    own = inspect.getattr_static(cls, "validate_params", None)
+    if isinstance(own, (classmethod, staticmethod)):
+        getattr(cls, "validate_params")(params)
 
 
 # tuple-typed config fields -- JSON has no tuples, so lists are coerced back on load
@@ -1628,6 +2125,7 @@ def _field_group(name: str) -> str:
         ("Network", ("road_network", "grid", "custom_network", "traffic_lights", "light_cycle",
                      "arterial", "local_speed")),
         ("Scenario events", ("events",)),
+        ("Plugins", ("plugins",)),
         ("Messages", ("denm",)),
         ("GNSS/sensor", ("gps_", "faulty", "weather")),
         ("Radio", ("radio", "packet", "nlos", "chan", "freq", "art_max", "stale", "pathloss",
@@ -1647,7 +2145,9 @@ def _field_group(name: str) -> str:
 # Enumerated fields -> their valid options (sourced from the live constants so they never drift).
 _ENUM_OPTIONS = {
     "weather": list(WEATHER_MULT),
-    "radio_model": ["disc", "logdistance", "geometric"],
+    # sourced from the BUILT-IN REGISTRY, in registration (display) order -- one source of truth for
+    # the validate_config check, this list, the argparse choices and the GUI dropdown
+    "radio_model": list(_api_registry.builtin_names("channel_model")),
     "radio_env": ["urban", "highway"],
     "road_network": ["linear", "grid", "ring", "spider", "custom"],
     "demand_profile": ["uniform", "rush", "night"],
@@ -1863,16 +2363,34 @@ _FIELD_META = {
     "rsu_placement": dict(h="Where RSUs are placed on the network"),
     "rsu_range_m": dict(h="RSU radio range (0 = same as radio_range_m)", lo=0, u="m"),
     "rsu_coords": dict(h="Explicit RSU positions x1,y1;x2,y2;... (overrides placement)"),
+    # Plugins
+    "plugins": dict(h="Component plugins to ACTIVATE, as {slot: {ref, params}}. `ref` resolves "
+                      "through the built-in registry, an installed entry point, then a dotted path "
+                      "'package.module:Class'. Empty (the default) = built-ins only, byte-identical. "
+                      "Example: {\"channel_model\": {\"ref\": \"geometric\"}}"),
 }
 
 
-def config_schema() -> dict:
+def config_schema(cfg: "Optional[PipelineConfig]" = None) -> dict:
     """Machine-readable schema of every PipelineConfig field: for each, {type, default, group, widget,
     help, options, min, max, step, unit}. widget in {bool, select, int, float, text}. Lets UIs/tools
-    render a fully self-describing form (dropdowns for enums, ranges/units for numbers)."""
+    render a fully self-describing form (dropdowns for enums, ranges/units for numbers).
+
+    With a `cfg` whose `plugins` block declares components, the DECLARED PLUGINS' OWN knobs are
+    merged in under `plugins.<slot>.<field>`, sorted, from each plugin's `config_fields()`
+    (:class:`~scms_sim_ref.api.fields.FieldSpec`). That is ns-3's `AddAttribute` idea mapped onto
+    machinery this repo already had: one declaration in the plugin, and the GUI advanced panel, the
+    copilot cheat-sheet and `--dump-config-schema` get its knobs for free -- collapsing the
+    4-to-6 hand-maintained declarations per knob down to one, for plugin knobs.
+
+    Called with NO argument (every existing caller) the output is exactly the dataclass's fields and
+    nothing else, which is what keeps the GUI/copilot contract and the phase-1 schema gate intact.
+    """
     out = {}
     for f in dataclasses.fields(PipelineConfig):
         default = f.default
+        if default is dataclasses.MISSING and f.default_factory is not dataclasses.MISSING:
+            default = f.default_factory()           # e.g. plugins -> {} rather than a bare null
         if default is dataclasses.MISSING:
             default = None
         elif isinstance(default, tuple):
@@ -1894,21 +2412,87 @@ def config_schema() -> dict:
                        "widget": widget, "help": meta.get("h", ""), "options": opts,
                        "min": meta.get("lo"), "max": meta.get("hi"),
                        "step": meta.get("st"), "unit": meta.get("u")}
+    if cfg is not None and getattr(cfg, "plugins", None):
+        out.update(_plugin_schema(cfg))
     return out
 
 
-def config_from_dict(d: dict) -> PipelineConfig:
+def _plugin_schema(cfg) -> dict:
+    """`plugins.<slot>.<field>` entries contributed by the DECLARED plugins, in sorted order."""
+    extra: dict = {}
+    plugins = cfg.plugins if isinstance(cfg.plugins, dict) else {}
+    for slot in sorted(plugins):
+        if slot not in _api_registry.SLOTS or not plugins[slot]:
+            continue
+        try:
+            ref = (_channel_selection(cfg)[0] if slot == "channel_model"
+                   else str(plugins[slot].get("ref")))
+            cls, _how, _iv, _shape = _api_registry.resolve(slot, ref)
+        except Exception:            # a schema query must never be the thing that fails a run
+            continue
+        for name, fs in sorted(_plugin_config_fields(cls).items()):
+            extra[f"plugins.{slot}.{name}"] = fs.to_schema(group="Plugins")
+    return extra
+
+
+def _plugin_config_fields(cls) -> dict:
+    """`cls.config_fields()` -> {name: FieldSpec}, or {} when the plugin declares none.
+
+    Reachable BEFORE construction, which is the point: a plugin's knobs have to be documentable and
+    validatable without first building the plugin out of the very params being validated. Declared
+    as a classmethod/staticmethod it is called directly; declared as a plain instance method it is
+    skipped (no instance exists yet) rather than raising.
+    """
+    fn = getattr(cls, "config_fields", None)
+    if not callable(fn):
+        return {}
+    try:
+        spec = fn()
+    except TypeError:
+        return {}
+    return dict(spec) if spec else {}
+
+
+def config_from_dict(d: dict, *, strict_plugins: bool = True,
+                     allow_plugin_drift: bool = False) -> PipelineConfig:
     """Build a PipelineConfig from a plain dict (e.g. a saved run's manifest).
 
     Accepts either a raw config dict or a full manifest.json (which nests the config under a
-    "config" key). Unknown keys are ignored with a stderr warning (forward/backward compatible
-    across config-schema changes); list values for tuple fields are coerced back to tuples. This
-    is the inverse of what `_write_manifest` serializes, so a saved run replays byte-for-byte."""
+    "config" key). Unknown *ordinary* keys are ignored with a stderr warning (forward/backward
+    compatible across config-schema changes); list values for tuple fields are coerced back to
+    tuples. This is the inverse of what `_write_manifest` serializes, so a saved run replays
+    byte-for-byte.
+
+    PLUGIN DRIFT (D4). Dropping unknown keys with a warning and continuing was the worst available
+    failure mode for a plugin-configured manifest: it would replay as A DIFFERENT RUN WITH EXIT
+    CODE 0. Two things close that hole:
+
+    * `plugins` is now a real config field, so it is never dropped;
+    * when a FULL MANIFEST is supplied, its `plugins` LOCK is re-resolved and its content hashes
+      re-checked BEFORE the run, raising :class:`PluginDriftError` on mismatch. Built-ins are
+      exempt from enforcement (their identity is `dataset_version` plus the pinned goldens; keying
+      on run.py's own file hash would make every manifest unreplayable after any engine edit) --
+      their hashes are still recorded. `allow_plugin_drift=True` proceeds AND RECORDS the drift in
+      the new manifest; it does not silence it.
+    * an unknown key that names a plugin slot is a hard error rather than a warning, because it can
+      only mean the manifest was written by an engine whose plugin surface this one cannot honour.
+    """
     import sys as _sys
+    drifts: list = []
+    lock = d.get("plugins") if isinstance(d.get("plugins"), dict) and "config" in d else None
     if "config" in d and isinstance(d["config"], dict):
         d = d["config"]
     known = {f.name for f in dataclasses.fields(PipelineConfig)}
     unknown = sorted(set(d) - known)
+    if strict_plugins:
+        plugin_shaped = [k for k in unknown if k == "plugins" or k.startswith("plugin")]
+        if plugin_shaped:
+            raise ConfigError(
+                f"config carries plugin key(s) {plugin_shaped} this engine does not understand; "
+                f"replaying it would silently produce a DIFFERENT run. Known slots: "
+                f"{list(_api_registry.SLOTS)}")
+        if lock is not None and lock.get("loaded"):
+            drifts = _api_registry.verify_lock(lock, allow_drift=allow_plugin_drift)
     if unknown:
         print(f"[config] ignoring {len(unknown)} unknown key(s): {', '.join(unknown)}", file=_sys.stderr)
     kw = {k: v for k, v in d.items() if k in known}
@@ -1924,7 +2508,12 @@ def config_from_dict(d: dict) -> PipelineConfig:
                 kw[name] = tuple(str(x) for x in seq)
             else:
                 kw[name] = tuple(seq)
-    return PipelineConfig(**kw)
+    cfg = PipelineConfig(**kw)
+    if drifts:
+        # Bound to THIS config object, so only the run of THIS config records it (see
+        # `_PLUGIN_DRIFT_ALLOWED`). A drifted config that is validated and never run records nothing.
+        _PLUGIN_DRIFT_ALLOWED["cfg"], _PLUGIN_DRIFT_ALLOWED["drifts"] = cfg, list(drifts)
+    return cfg
 
 
 # --------------------------------------------------------------------------- #
@@ -1949,6 +2538,9 @@ GAP_YIELD_HOOK = None
 def run_pipeline(cfg: PipelineConfig) -> RunResult:
     validate_config(cfg)
     _ABORT["flag"] = False                            # fresh per run (module state is not reentrant)
+    # CLAIMED BY IDENTITY, not merely consumed: a drift accepted by one replay is recorded in THAT
+    # run's manifest and in no other, even when the drifted config is built and never run.
+    _drift_allowed = _claim_drift_record(cfg)
     rng = random.Random(cfg.seed)
     wmult = WEATHER_MULT.get(cfg.weather, 1.0)
     la1, la2 = LinkageAuthority(1), LinkageAuthority(2)
@@ -1978,10 +2570,39 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                               or (attack_weights is not None
                                   and any(a in attack_weights for a in IDENTITY_SPOOF_ATTACKS)))
     _emit_station_type = cfg.vru_pct > 0 or _impersonation_enabled
-    # radio_model="geometric" is the only model that produces a received-power figure, so it is the
-    # only one that can carry an `rssi_dbm` evidence column. Gated exactly like station_type above:
-    # the key is ABSENT from every ma_reports row under disc/logdistance -> byte-identical default.
-    _emit_rssi = (cfg.radio_model == "geometric")
+    # ---- CHANNEL MODEL: resolved and constructed ONCE, before step 0 -----------------------------
+    # Resolution happens here and every failure is fatal here (PLUGIN-ARCH 3.2): a plugin that
+    # raises mid-loop would produce a partial dataset whose digest matches nothing, and it must NOT
+    # take the deliberate SIGINT path below, which finalises a VALID manifest for a partial run.
+    # The instance is a PER-RUN object, never a module global, so the in-process multi-run drivers
+    # (datagen/foundry.py, campaign.py, massive.py, gui/agent.py) cannot cross-contaminate.
+    # Building footprints come from the custom-network document's optional "buildings" layer
+    # (written by `osm.py --buildings`, projected with the ROAD graph's own projection tuple so the
+    # two layers are registered); a synthetic map has none and falls back to the canyon density.
+    _geo_buildings = _parse_buildings(cfg.custom_network) if cfg.road_network == "custom" else []
+    chan, chan_provenance = build_channel(cfg, buildings=_geo_buildings, dt=cfg.dt)
+    _chan_caps = chan.capabilities()
+    _chan_additive = LOSS_ADDITIVE_LEGACY in _chan_caps
+    _chan_batch = not hasattr(chan, "evaluate_link")
+    _chan_prune = getattr(chan, "prune", None)
+    _chan_env_ro = types.MappingProxyType({"buildings": _geo_buildings, "weather": cfg.weather})
+    # `geo_chan` is the BUILT-IN geometric instance when that is what is active, else None. Two
+    # sites still reach into this model's internals -- the colluder's fabricated-RSSI synthesis and
+    # the per-link state prune -- so they stay gated on the concrete type rather than on a
+    # capability. Generalising them belongs with the detector seam (roadmap phase 3), not here.
+    geo_chan = getattr(chan, "model", chan)
+    geo_chan = geo_chan if isinstance(geo_chan, GeometricChannel) else None
+    # A received-power figure is a DECLARED CAPABILITY, not a model name: only a model that declares
+    # `rssi` can carry an `rssi_dbm` evidence column. Gated exactly like station_type above -- the
+    # key is ABSENT from every ma_reports row under disc/logdistance -> byte-identical default.
+    _emit_rssi = CAP_RSSI in _chan_caps
+    if cfg.verbose and geo_chan is not None:
+        print(f"[geometric radio] env={cfg.radio_env} tx={cfg.radio_tx_power_dbm} dBm "
+              f"sens={cfg.radio_rx_sensitivity_dbm} dBm cap={geo_chan.reach_m:.0f} m "
+              f"sense={geo_chan.sense_m:.0f} m buildings="
+              f"{0 if geo_chan.buildings is None else geo_chan.buildings.n_polygons}"
+              f"{'' if geo_chan.buildings is not None else f' (canyon {cfg.radio_nlosb_density_per_km}/km)'}",
+              flush=True)
     # The DENM (event-message) layer is active when benign DENMs are requested (denm_rate>0) OR the
     # opt-in FakeHazard attack is selected via any selector (it emits phantom DENMs even at denm_rate=0,
     # so it turns the layer on -- exactly as VruImpersonation enables the station_type machinery). When
@@ -2757,14 +3378,13 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             del last_claimed[k]
         for d in [d for d in subj_events if pseudonym_info[d]["veh_vid"] not in active]:
             subj_events.pop(d, None)
-        if geo_chan is not None:
-            # per-link channel state (AR(1) shadowing + per-packet streams) is O(links seen); drop
-            # links whose endpoints have both despawned. A despawned vehicle never transmits again,
-            # so the dropped state can never be consulted -> determinism-safe.
-            for k in [k for k in geo_chan._shadow if k[0] not in active and k[1] not in active]:
-                geo_chan._shadow.pop(k, None)
-            for k in [k for k in geo_chan._packet if k[0] not in active and k[1] not in active]:
-                geo_chan._packet.pop(k, None)
+        # per-link channel state (AR(1) shadowing + per-packet streams) is O(links seen); drop links
+        # whose endpoints have BOTH despawned. A despawned vehicle never transmits again, so the
+        # dropped state can never be consulted -> determinism-safe. `prune` is an optional part of
+        # the interface (a stateless model does nothing here), so this is now one call instead of
+        # the engine reaching into a specific model's private dicts.
+        if _chan_prune is not None:
+            _chan_prune(active)
 
     live_path = os.path.join(cfg.out_dir, "live_state.json")
     live_every = max(1, int(round(cfg.live_interval_s / cfg.dt))) if cfg.live_interval_s > 0 else 0
@@ -3063,23 +3683,6 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             if lat_rate:                   # a lane change in progress -> lateral velocity swings heading
                 v.cur_h = (v.cur_h + math.degrees(math.atan2(lat_rate, max(0.5, v.cur_v)))) % 360.0
 
-    # ---- opt-in geometric channel (3GPP TR 37.885). Built ONCE; None on every other radio_model, so
-    # the disc/logdistance paths never touch it and never draw from its streams. Building footprints
-    # come from the custom-network document's optional "buildings" layer (written by
-    # `osm.py --buildings`, projected with the ROAD graph's own projection tuple so the two layers are
-    # registered); a synthetic map has none and falls back to radio_nlosb_density_per_km. ------------
-    geo_chan = None
-    if cfg.radio_model == "geometric":
-        _geo_buildings = _parse_buildings(cfg.custom_network) if cfg.road_network == "custom" else []
-        geo_chan = GeometricChannel(cfg, buildings=_geo_buildings, dt=cfg.dt)
-        if cfg.verbose:
-            print(f"[geometric radio] env={cfg.radio_env} tx={cfg.radio_tx_power_dbm} dBm "
-                  f"sens={cfg.radio_rx_sensitivity_dbm} dBm cap={geo_chan.cap_m:.0f} m "
-                  f"sense={geo_chan.sense_m:.0f} m buildings="
-                  f"{0 if geo_chan.buildings is None else geo_chan.buildings.n_polygons}"
-                  f"{'' if geo_chan.buildings is not None else f' (canyon {cfg.radio_nlosb_density_per_km}/km)'}",
-                  flush=True)
-
     # ---- Simulation loop: activate -> car-follow -> pre-pass -> detect -> collude -> revoke ----
     spawn_order = sorted(vehicles, key=lambda v: (v.spawn_time, v.vid))
     spawn_ptr = 0
@@ -3277,118 +3880,166 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # size = range means the 3x3 neighbourhood provably contains every in-range pair; candidates
         # are re-sorted into broadcast order so packet-loss RNG (hence output) is byte-identical.
         rng_cell = max(cfg.radio_range_m, 1.0)
-        # opt-in soft radio (log-distance path loss + per-link log-normal shadowing): governs whether
-        # a link physically closes, replacing the hard d<=rr disc. radio_model=="disc" takes NONE of
-        # this branch and draws NO extra rng -> byte-identical to today. See PipelineConfig.radio_model.
-        radio_logdist = (cfg.radio_model == "logdistance")
-        if geo_chan is not None:
-            # per-step blocker index for the NLOSv test: every non-VRU active vehicle is a potential
-            # obstruction (a pedestrian is not), at its TRUE position, with the TR 37.885 height for
-            # its class. RSUs are receivers, not blockers.
-            geo_chan.begin_step(step, [
-                (v.vid, *v.true_state(t)[:2],
-                 TR37885_BLOCKER_HEIGHT_M.get(v.veh_type, TR37885_BLOCKER_HEIGHT_M["car"]))
-                for v in active_list if not v.is_vru and not enforced(v, t)])
+        # ---- the step's CHANNEL FRAME (api.channel.StepFrame) -------------------------------------
+        # Station snapshots carry TRUE geometry, which is what makes the channel explicitly INSIDE
+        # the oracle boundary: physics must not be steerable by a position-falsifying attacker. They
+        # are reused from `rx_pos` wherever it already resolved the position, so no extra
+        # `true_state()` call is made for any receiver; only VRUs (transmitters, never receivers)
+        # need one. `blocker_h_m` is 0.0 for a VRU (a pedestrian is not an obstruction) and for an
+        # RSU (an RSU is a receiver, not a blocker), so the blocker set the geometric model rebuilds
+        # from `frame.stations` is entry-for-entry -- and order-for-order -- the list this replaced.
+        stations: dict = {}
+        for _v in active_list:
+            if enforced(_v, t):
+                continue
+            _p = rx_pos.get(_v.vid) or _v.true_state(t)[:2]
+            stations[_v.vid] = StationSnapshot(
+                _v.vid, _p[0], _p[1],
+                RSU_ANTENNA_HEIGHT_M if _v.is_rsu else V2X_ANTENNA_HEIGHT_M,
+                0.0 if _v.is_vru else TR37885_BLOCKER_HEIGHT_M.get(
+                    _v.veh_type, TR37885_BLOCKER_HEIGHT_M["car"]),
+                _v.is_rsu, _v.is_vru, None, _v.rx_range or 0.0)
+        for _r in rsus:
+            _p = rx_pos.get(_r.vid)
+            if _p is None:
+                continue
+            stations[_r.vid] = StationSnapshot(_r.vid, _p[0], _p[1], RSU_ANTENNA_HEIGHT_M, 0.0,
+                                               True, False, None, _r.rx_range or 0.0)
+        transmissions = [Transmission(bi, b["veh"].vid, b.get("msg_type", "cam"), b["msg_count"],
+                                      NATIVE_WIRE_SIZE_BYTES, b["digest"])
+                         for bi, b in enumerate(broadcasts)]
+        # index-parallel with `broadcasts`: the SENDER's station snapshot per PDU. Resolved once per
+        # step rather than once per candidate link (a Sybil ghost shares its attacker's snapshot,
+        # which is exactly right -- the ghost radiates from the attacker's true position).
+        tx_snaps = [stations[b["veh"].vid] for b in broadcasts]
+        frame = StepFrame(step, t, cfg.dt, stations, transmissions,
+                          [rx.vid for rx in receivers if not enforced(rx, t)], wx_loss,
+                          _chan_env_ro)
+        chan.begin_step(frame)              # advance per-step state EXACTLY ONCE
         bcell: dict = {}
         for bi, b in enumerate(broadcasts):
             bcell.setdefault((int(b["x"] // rng_cell), int(b["y"] // rng_cell)), []).append(bi)
+        if _chan_batch:
+            # ---- D1: ONE EXCHANGE PER STEP, for the whole fleet. --------------------------------
+            # This is the shape, and the ONLY shape, in which an out-of-process ns-3 / OMNeT++
+            # backend can exist. A mid-size run is ~6 000 link decisions per step over ~3 600 steps
+            # (~2.2e7 decisions); at a conservative 2 ms local-socket round trip that is ~12 hours
+            # per link and ~7 seconds per step -- about 1e4x. Per-receiver batching would still be
+            # ~200 round trips per step (~24 minutes), which is why the candidate windows for EVERY
+            # receiver are gathered here, before the receiver loop, and handed over in a single
+            # `deliver` call. Outcomes are re-sorted by (rx_vid, tx_index) so the backend's internal
+            # ordering is structurally incapable of reaching the digest.
+            # Reached only when a BatchChannelModel is declared; the built-ins never take this path.
+            _batch_out: dict = {}
+            _batch_dist: dict = {}
+            _all_cands = []
+            for _rx in receivers:
+                if enforced(_rx, t):
+                    continue
+                _rxx, _rxy = rx_pos[_rx.vid]
+                _cap = chan.window_m(stations[_rx.vid])
+                _rad = max(1, int(math.ceil(_cap / rng_cell)))
+                _cx0, _cy0 = int(_rxx // rng_cell), int(_rxy // rng_cell)
+                _c = []
+                for _dcx in range(-_rad, _rad + 1):
+                    for _dcy in range(-_rad, _rad + 1):
+                        _c.extend(bcell.get((_cx0 + _dcx, _cy0 + _dcy), ()))
+                _c.sort()                       # canonical order: tx_index asc within rx_vid asc
+                for _bi in _c:
+                    _b = broadcasts[_bi]
+                    if _b["veh"].vid == _rx.vid:
+                        continue
+                    _d = math.hypot(_b["x"] - _rxx, _b["y"] - _rxy)
+                    if _d <= _cap:
+                        _all_cands.append((_bi, _rx.vid, _d))
+                        _batch_dist[(_bi, _rx.vid)] = _d
+            for _o in _api_channel.sort_outcomes(chan.deliver(frame, _all_cands)):
+                _batch_out.setdefault(_o.rx_vid, []).append(_o)
         for rx in receivers:
             if enforced(rx, t):
                 continue
             rxx, rxy = rx_pos[rx.vid]
+            rx_snap = stations[rx.vid]
             # per-receiver range: an RSU may reach further than vehicles, so it searches a wider cell
             # window (radius = ceil(range/cell)). Vehicles keep rx_range=0 -> range=radio_range_m ->
             # radius 1 -> the original 3x3 -> byte-identical.
             rr = rx.rx_range or cfg.radio_range_m
-            if radio_logdist:
-                # a favourable shadow can pull a link past rr: widen the candidate window to the cap
-                # distance (mean signal RADIO_CAP_SIGMA shadow-std below sensitivity), bounded so the
-                # search stays O(local). A - margin (range-extending) widens it further.
-                cap = rr * 10.0 ** ((cfg.radio_cap_sigma * cfg.shadowing_sigma_db
-                                     - min(0.0, cfg.rx_sensitivity_margin_db))
-                                    / (10.0 * cfg.pathloss_exponent))
-                cap = max(rr, min(cap, rr * cfg.radio_cap_max_mult))
-                rad = max(1, int(math.ceil(cap / rng_cell)))
-            elif geo_chan is not None:
-                # the geometric cap is a LINK-BUDGET distance (TR 37.885 LOS at the configured EIRP,
-                # with shadow + fading headroom), computed once per run and already bounded by
-                # radio_cap_max_mult * radio_range_m -- see GeometricChannel.cap_m.
-                cap = geo_chan.cap_m
-                rad = max(1, int(math.ceil(cap / rng_cell)))
-            else:
-                rad = max(1, int(math.ceil(rr / rng_cell)))
+            # TWO numbers, deliberately not one (PLUGIN-ARCH 2.1 deviation 2):
+            #   cap      = the candidate-SEARCH window. disc: rr. logdistance: rr widened by the
+            #              shadow headroom (a favourable shadow can pull a link past rr), bounded so
+            #              the cell search stays O(local). geometric: the LINK-BUDGET distance.
+            #   rx_reach = the DECLARED DELIVERY reach, which is what acceptanceRangeThreshold bounds
+            #              on. disc/logdistance: rr. geometric: the same link-budget distance -- for
+            #              that model the reach IS the cap, and keeping rr would flag every honest
+            #              long LOS link it legitimately delivers as an impossible claim.
+            cap = chan.window_m(rx_snap)
+            rx_reach = chan.reach_m_for(rx_snap)
+            rad = max(1, int(math.ceil(cap / rng_cell)))
             cx0, cy0 = int(rxx // rng_cell), int(rxy // rng_cell)
             cand = []
-            for dcx in range(-rad, rad + 1):
-                for dcy in range(-rad, rad + 1):
-                    cand.extend(bcell.get((cx0 + dcx, cy0 + dcy), ()))
-            cand.sort()
+            if not _chan_batch:      # the batch path gathered its candidates in the pre-pass above
+                for dcx in range(-rad, rad + 1):
+                    for dcy in range(-rad, rad + 1):
+                        cand.extend(bcell.get((cx0 + dcx, cy0 + dcy), ()))
+                cand.sort()
             in_range = []
-            geo_meta: list = []      # geometric only: (rssi_dbm, link_state, per-link Random) per link
-            rx_ant_h = RSU_ANTENNA_HEIGHT_M if rx.is_rsu else V2X_ANTENNA_HEIGHT_M
-            for bi in cand:
-                b = broadcasts[bi]
-                if b["veh"].vid == rx.vid:
-                    continue
-                d = math.hypot(b["x"] - rxx, b["y"] - rxy)
-                if geo_chan is not None:
-                    # --- 3GPP TR 37.885 geometric model: LOS/NLOSv/NLOSb -> path loss -> AR(1)
-                    # shadowing -> per-packet Nakagami fade -> hard decode floor. Every draw comes
-                    # from a per-link keyed stream inside GeometricChannel, never from `rng`.
+            link_meta: list = []     # index-parallel with in_range: the model's LinkOutcome per link
+            if _chan_batch:
+                # the step's single exchange already happened above; read this receiver's share.
+                # `_batch_out[rx.vid]` is in (rx_vid, tx_index) order, which IS `cand` order, so
+                # `in_range` is built exactly as the per-link path builds it.
+                for out in _batch_out.get(rx.vid, ()):
+                    in_range.append((broadcasts[out.tx_index], _batch_dist[(out.tx_index, rx.vid)]))
+                    link_meta.append(out)
+            else:
+                evaluate_link = chan.evaluate_link
+                for bi in cand:
+                    b = broadcasts[bi]
+                    if b["veh"].vid == rx.vid:
+                        continue
+                    d = math.hypot(b["x"] - rxx, b["y"] - rxy)
                     if d > cap:
-                        continue                                # cheap cap before the dB math
-                    heard, rssi, lstate, prng = geo_chan.evaluate(
-                        b["veh"].vid, rx.vid, b["x"], b["y"], rxx, rxy, d,
-                        V2X_ANTENNA_HEIGHT_M, rx_ant_h)
-                    if heard:
+                        continue                    # cheap cap before any dB math or model call
+                    # ONE call, through the resolved model. `disc` re-tests d <= rr and returns the
+                    # shared DELIVERED constant; `logdistance` draws its shadow from its own keyed
+                    # stream; `geometric` runs classification -> path loss -> AR(1) shadowing ->
+                    # per-packet Nakagami fade -> decode floor. None == not delivered.
+                    out = evaluate_link(tx_snaps[bi], rx_snap, d, transmissions[bi])
+                    if out is not None:
                         in_range.append((b, d))
-                        geo_meta.append((rssi, lstate, prng))
-                    continue
-                if not radio_logdist:
-                    if d <= rr:                                 # hard range disc (default; unchanged)
-                        in_range.append((b, d))
-                    continue
-                # --- log-distance path loss + log-normal shadowing (soft probabilistic range) ---
-                if d > cap:
-                    continue                                    # cheap distance cap before the dB math
-                # mean received power relative to sensitivity: +10*n*log10(rr/d) dB, so exactly 0 dB at
-                # d==rr (calibration -> median range == rr), positive closer, negative past rr. A + margin
-                # raises the sensitivity bar (shrinks range); - lowers it (extends). d floored at 1 m.
-                mean_db = (10.0 * cfg.pathloss_exponent * math.log10(rr / max(d, 1.0))
-                           - cfg.rx_sensitivity_margin_db)
-                # per-LINK log-normal shadowing from a dedicated string-keyed stream (seed+tx+rx+step);
-                # NOT the global rng, so the disc path's rng sequence stays byte-identical.
-                shadow_db = random.Random(
-                    f"{cfg.seed}:shadow:{b['digest']}:{rx.vid}:{step}").gauss(0.0, cfg.shadowing_sigma_db)
-                if mean_db + shadow_db >= 0.0:                  # received power >= sensitivity(+margin)
-                    in_range.append((b, d))
+                        link_meta.append(out)
             load = sum(b["msg_count"] for b, _ in in_range)
             cong = min(0.8, max(0.0, (load - cfg.chan_capacity) / max(1, cfg.chan_capacity)) * 0.5)
-            geo_cbr = geo_chan.cbr(load) if geo_chan is not None else 0.0
+            geo_cbr = chan.channel_busy_ratio(rx.vid, load)
             reporter_digest = rx.active_pseudonym(t, cfg.rotate_period_s)["digest"]
             for li, (b, dist) in enumerate(in_range):
                 rssi_dbm = None
-                if geo_chan is not None:
+                if not _chan_additive:
                     # INDEPENDENT-SURVIVAL COMPOSITION: p_deliver = prod(1 - p_i). The additive form
-                    # kept on the disc/logdistance path below can exceed 1.0 (roadmap G5); a product
-                    # of survival probabilities cannot, and it is the correct composition for
+                    # kept for the grandfathered built-ins below can exceed 1.0 (roadmap G5); a
+                    # product of survival probabilities cannot, and it is the correct composition for
                     # independent impairments. The PHY error is already resolved above (the frame
                     # either cleared the faded decode floor or it never entered in_range), so what
                     # composes here is the MAC/environment loss: hidden-terminal collisions from the
                     # modelled CBR, weather absorption, and the configured baseline. cfg.nlos_loss is
                     # deliberately included so an explicit setting still bites, but it defaults to 0
                     # and setting it under this model DOUBLE-COUNTS the obstruction the geometry
-                    # already resolved.
-                    rssi_dbm, _lstate, _prng = geo_meta[li]
+                    # already resolved. The composition is ENGINE-side because the engine owns the
+                    # congestion and weather terms; the model declares which composition applies.
+                    rssi_dbm = link_meta[li].rssi_dbm
                     p_surv = ((1.0 - min(1.0, max(0.0, cfg.packet_loss_base)))
                               * (1.0 - min(1.0, max(0.0, cfg.nlos_loss * (dist / rr))))
-                              * (1.0 - geo_chan.collision_loss(dist, geo_cbr))
+                              * (1.0 - chan.collision_loss(dist, geo_cbr))
                               * (1.0 - min(1.0, max(0.0, wx_loss))))
-                    # the delivery coin comes from the LINK's own keyed stream, so the geometric
-                    # model consumes nothing from the global `rng`
-                    if p_surv < 1.0 and _prng.random() >= p_surv:
+                    # the delivery coin comes from the LINK's own keyed stream inside the model, so
+                    # a model on this composition consumes nothing from the global `rng`
+                    if p_surv < 1.0 and chan.delivery_coin(b["veh"].vid, rx.vid) >= p_surv:
                         continue                                # packet dropped on the channel
                 else:
+                    # GRANDFATHERED (`legacy_global_rng` + `loss_composition:additive_legacy`, both
+                    # refused from third parties): the coin comes from the engine's global `rng`,
+                    # whose draw count and order are load-bearing for 0bd93655... Closing this is
+                    # roadmap phase 6 and needs a deliberate, announced re-pin.
                     loss = cfg.packet_loss_base + cfg.nlos_loss * (dist / rr) + cong + wx_loss
                     if loss > 0 and rng.random() < loss:
                         continue                                # packet dropped on the channel
@@ -3466,7 +4117,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 # reach is NOT rr at all -- it is the link-budget cap the reception loop actually
                 # searched -- so the bound follows it there. Keeping rr would flag every honest
                 # long LOS link (which that model legitimately delivers) as an impossible claim.
-                art_reach = cap if geo_chan is not None else rr
+                # This is now the model's DECLARED reach (`reach_m_for`), which is what makes it a
+                # declared input rather than a leak -- and what stops a model that understates its
+                # reach from silently making this detector wrong for every honest long link (C8).
+                art_reach = rx_reach
                 det["acceptanceRangeThreshold"] = max(0.0, math.hypot(cx - rxx, cy - rxy)
                                                       - art_reach) / cfg.art_max_m
                 det["beaconFrequency"] = b["msg_count"] / cfg.freq_max
@@ -3712,9 +4366,11 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             os.path.join(cfg.out_dir, "ground_truth", "gt_denm_emissions.jsonl"),
             sorted(gt_denm, key=lambda r: r["denm_id"]))
     data_digest = _data_digest(cfg.out_dir, data_files)
+    chan.close()                       # ALWAYS called, including on the SIGINT finalisation path
     _write_manifest(cfg, data_files, data_digest,
                     counts=dict(vehicles=len(vehicles), reports=n_reports,
-                                investigations=len(ma_investigations), revoked=len(revoked_vehicles)))
+                                investigations=len(ma_investigations), revoked=len(revoked_vehicles)),
+                    plugins=plugin_block([chan_provenance()], drift=_drift_allowed))
 
     return RunResult(out_dir=cfg.out_dir, n_vehicles=len(vehicles), n_reports=n_reports,
                      n_investigations=len(ma_investigations), n_revoked=len(revoked_vehicles),
@@ -3785,7 +4441,32 @@ def _data_digest(out_dir: str, data_files: dict[str, str]) -> str:
     return h.hexdigest()
 
 
-def _write_manifest(cfg, data_files, data_digest, counts) -> None:
+#: What this engine may HONESTLY assert, per standard, today. Corrected 2026-08-30 from
+#: `{"report": "ETSI TS 103 759 (shape)", "cert": "IEEE 1609.2", "linkage": "CAMP SCP2"}`.
+#:
+#: The claim `cert: IEEE 1609.2` was NOT SUPPORTABLE and is withdrawn: there is no 1609.2
+#: certificate structure anywhere in this repo (a certificate is a hex digest plus a validity
+#: window), and NO SIGNING happens on any path -- `grep -c 'ca.sign(\|ca.verify('` over `src/` is
+#: zero, `sig_ok` is a boolean set by the attack switch at run.py:3164, and the Java engine passes a
+#: literal `true`. What IS real is `HashedId8` (`crypto_abstract.hashed_id8`, the low-order 8 bytes
+#: of SHA-256 per IEEE 1609.2 6.4.3), so the claim is downgraded to an IDENTIFIER-ONLY claim that
+#: names it. `linkage: CAMP SCP2` is KEPT verbatim -- it is earned: a real seed hash-chain,
+#: Davies-Meyer pre-linkage, `lv = plv1 XOR plv2`, forward-only matching, asserted in-run.
+#:
+#: `_data_digest` (run.py:_data_digest) excludes `manifest.json` BY CONSTRUCTION, so correcting this
+#: block moves ZERO digests -- which is why it was not worth deferring behind any code work.
+#: See docs/realism/PLUGIN-ARCHITECTURE.md 6.5 and docs/realism/STANDARDS-AUDIT.md.
+STANDARDS_PROFILE = {
+    "linkage": "CAMP SCP2 -- implemented and enforced (scms_core/linkage.py; asserted in-run)",
+    "cert": "HashedId8 identifiers per IEEE 1609.2 6.4.3; NOT a 1609.2 certificate profile",
+    "security_envelope": "none -- sig_ok is a simulated boolean; no signature is computed or verified",
+    "message": "native_v1 -- engine-private representation; no ASN.1 encoding",
+    "report": ("ETSI TS 103 759 V2.2.1: partial field-name correspondence only; not encoded, "
+               "not signed, and carrying no v2xPduEvidence"),
+}
+
+
+def _write_manifest(cfg, data_files, data_digest, counts, plugins=None) -> None:
     manifest = {
         "dataset_version": __version__,
         "build_utc": datetime.now(timezone.utc).isoformat(),   # NOT part of data_digest
@@ -3800,20 +4481,172 @@ def _write_manifest(cfg, data_files, data_digest, counts) -> None:
         # MOSAIC/Java engine writes SUMO/ETSI headings (degrees clockwise from North), so a consumer
         # merging the two MUST read this field rather than assume. Manifest-only -> digest-safe.
         "conventions": {"heading": "deg_ccw_from_east", "speed": "m_s", "position": "m_local_xy"},
-        "standards_profile": {"report": "ETSI TS 103 759 (shape)", "cert": "IEEE 1609.2",
-                              "linkage": "CAMP SCP2"},
+        "standards_profile": dict(STANDARDS_PROFILE),
+        # Interpreter/host provenance. NOT cosmetic and NOT digest-bearing: Python's documented
+        # reproducibility guarantee covers ONLY Random.random() -- gauss(), uniform(), choice() and
+        # shuffle() carry NO cross-version guarantee, and the pinned goldens depend on `gauss` (the
+        # shadowing draw) and `uniform` (net_delay). The digests are therefore pinned to a CPython
+        # version as much as to a seed, and until now the manifest did not say so. Recording
+        # sys.flags.hash_randomization alongside makes the PYTHONHASHSEED=0 discipline (run.ps1,
+        # gui.ps1, conftest.py) an auditable property of the artifact rather than a convention.
+        "runtime": _api_registry.runtime_block(),
         "data_digest_sha256": data_digest,
         "outputs": [{"path": rel, "sha256": _file_sha256(p)} for rel, p in sorted(data_files.items())],
         "counts": counts,
+        # The plugin LOCK (dvc.lock to cfg.plugins' dvc.yaml): what was ACTUALLY loaded, content
+        # addressed. Excluded from data_digest by construction; carries its own provenance_digest.
+        "plugins": plugins if plugins is not None else empty_plugin_block(),
     }
     with open(os.path.join(cfg.out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as fh:
         json.dump(manifest, fh, indent=2, sort_keys=True)
         fh.write("\n")
 
 
+# --------------------------------------------------------------------------- #
+# Plugin subcommands (PLUGIN-ARCHITECTURE.md sections 4.3 and 5)
+#
+# Dispatched from the FIRST positional token, before the 138-flag parser is built. Argparse
+# subparsers were rejected: they would move every existing flag under an implicit default
+# subcommand, which is exactly the CLI/GUI contract `tests/test_gui_cli_contract.py` polices. A
+# two-line prefix check adds the two commands the design names and cannot perturb anything else.
+# --------------------------------------------------------------------------- #
+SUBCOMMANDS = ("verify-plugins", "conformance")
+
+
+def _cli_verify_plugins(argv) -> int:
+    """`scms-poc verify-plugins <manifest.json> [--allow-drift] [--json]` -- a CI gate, NO simulation.
+
+    D4's first detection layer, on its own. It re-resolves every non-built-in entry of the manifest's
+    plugin LOCK and recomputes `module_sha256` / `dist_sha256` / `interface_version`, so a dataset can
+    be revalidated on another machine, months later, WITHOUT paying for the run -- and, crucially,
+    before paying for it. The discrimination against the second layer (the pinned goldens) is the
+    whole value: identity drift with no digest drift is a harmless refactor; NO identity drift with
+    digest drift means the plugin is nondeterministic or the interpreter changed.
+
+    Exit codes: 0 clean, 2 drift (or an unresolvable plugin), 1 for a bad/unreadable manifest.
+    """
+    import argparse
+    import sys as _sys
+    p = argparse.ArgumentParser(prog="scms-poc verify-plugins",
+                                description="Verify a manifest's plugin lock against what is "
+                                            "installed now. No simulation is run.")
+    p.add_argument("manifest", help="path to a run's manifest.json")
+    p.add_argument("--allow-drift", action="store_true",
+                   help="report drift and exit 0 (still prints every drift on stderr)")
+    p.add_argument("--json", action="store_true", help="emit a machine-readable result on stdout")
+    a = p.parse_args(argv)
+    try:
+        # utf-8-sig, not utf-8: PowerShell's `Set-Content`/`Out-File` write a UTF-8 BOM by default
+        # on this host, and `json.load` refuses one. Reading -sig is byte-identical for BOM-free
+        # files, so this only ever adds tolerance.
+        with open(a.manifest, encoding="utf-8-sig") as fh:
+            man = json.load(fh)
+    except (OSError, ValueError) as e:
+        print(f"verify-plugins: cannot read {a.manifest}: {e}", file=_sys.stderr)
+        return 1
+    lock = man.get("plugins") if isinstance(man.get("plugins"), dict) else None
+    if lock is None:
+        print(f"verify-plugins: {a.manifest} carries no plugins block (written by an engine "
+              f"predating the lock)", file=_sys.stderr)
+        return 1
+    loaded = lock.get("loaded") or []
+    third_party = [e for e in loaded if e.get("resolved_via") != "builtin"]
+    recomputed = _api_registry.provenance_digest(loaded)
+    result = {"manifest": os.path.abspath(a.manifest), "api_version": lock.get("api_version"),
+              "loaded": len(loaded), "third_party": len(third_party),
+              "provenance_digest": lock.get("provenance_digest"),
+              "provenance_digest_recomputed": recomputed,
+              "provenance_digest_ok": recomputed == lock.get("provenance_digest"),
+              "runtime": man.get("runtime", {}), "drifts": []}
+    try:
+        result["drifts"] = list(_api_registry.verify_lock(lock, allow_drift=a.allow_drift))
+    except PluginDriftError as e:
+        result["drifts"] = [str(e)]
+        _emit_verify(result, a.json)
+        print(f"PLUGIN DRIFT: {e}", file=_sys.stderr)
+        return 2
+    _emit_verify(result, a.json)
+    if not result["provenance_digest_ok"]:
+        print("verify-plugins: provenance_digest does not match the recorded `loaded` list -- the "
+              "lock itself was edited after the run", file=_sys.stderr)
+        return 2
+    if result["drifts"] and not a.allow_drift:                 # pragma: no cover - verify_lock raises
+        return 2
+    return 0
+
+
+def _emit_verify(result, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    print(f"verify-plugins {result['manifest']}")
+    print(f"  api_version          {result['api_version']}")
+    print(f"  loaded               {result['loaded']} ({result['third_party']} third-party)")
+    print(f"  provenance_digest    {result['provenance_digest']} "
+          f"{'OK' if result['provenance_digest_ok'] else 'MISMATCH'}")
+    rt = result.get("runtime") or {}
+    if rt:
+        print(f"  runtime              {rt.get('python_version')} {rt.get('platform')} "
+              f"hash_randomization={rt.get('hash_randomization')}")
+    for d in result["drifts"]:
+        print(f"  DRIFT                {d}")
+    if not result["drifts"]:
+        print("  no drift")
+
+
+def _cli_conformance(argv) -> int:
+    """`scms-poc conformance --slot channel_model --ref <ref>` -- grade a plugin against v1.
+
+    The third delivery route for the suite (the other two being "subclass it in your own test suite"
+    and "let the engine refuse an unattested plugin"). Writes the same `conformance_report.json`
+    that belongs in `manifest["plugins"]["loaded"][*]["conformance"]`, so *"this dataset was produced
+    by a conformant plugin"* becomes a machine-checkable property of the artifact.
+
+    Exit codes: 0 conformant (waived failures included -- a waiver is a declared, recorded
+    limitation), 1 a check FAILED or ERRORED, 2 the arguments themselves were unusable.
+    """
+    import argparse
+    import sys as _sys
+    from ..conformance.runner import CONTRACTS, run_ref
+    p = argparse.ArgumentParser(prog="scms-poc conformance",
+                                description="Run the v1 conformance suite against one plugin.")
+    p.add_argument("--slot", default="channel_model", choices=sorted(CONTRACTS))
+    p.add_argument("--ref", required=True,
+                   help="built-in registry key, entry-point name, or 'package.module:Class'")
+    p.add_argument("--params", default="", help="plugin params as a JSON object")
+    p.add_argument("--seed", type=int, default=None, help="override the suite seed")
+    p.add_argument("--radio-range", type=float, default=None,
+                   help="construction-environment radio_range_m handed to the model")
+    p.add_argument("--report", default=None, help="write conformance_report.json here")
+    p.add_argument("--json", action="store_true", help="print the report as JSON on stdout")
+    a = p.parse_args(argv)
+    try:
+        params = json.loads(a.params) if a.params.strip() else {}
+    except ValueError as e:
+        print(f"conformance: --params is not valid JSON: {e}", file=_sys.stderr)
+        return 2
+    if not isinstance(params, dict):
+        print("conformance: --params must be a JSON object", file=_sys.stderr)
+        return 2
+    try:
+        rep = run_ref(a.slot, a.ref, params, seed=a.seed, radio_range_m=a.radio_range)
+    except (ValueError, TypeError) as e:
+        print(f"conformance: {type(e).__name__}: {e}", file=_sys.stderr)
+        return 2
+    print(json.dumps(rep.to_dict(), indent=2, sort_keys=True) if a.json else rep.to_text())
+    if a.report:
+        rep.write(a.report)
+        print(f"conformance report written to {os.path.abspath(a.report)}")
+    return 0 if rep.ok else 1
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     import argparse
     import sys as _sys
+    _raw = list(argv) if argv is not None else list(_sys.argv[1:])
+    if _raw and _raw[0] in SUBCOMMANDS:
+        return {"verify-plugins": _cli_verify_plugins,
+                "conformance": _cli_conformance}[_raw[0]](_raw[1:])
     # phase 1: read --preset early so it can seed the parser defaults (any other flag still overrides)
     _pre = argparse.ArgumentParser(add_help=False)
     _pre.add_argument("--preset", choices=list(CLI_PRESETS))
@@ -3857,9 +4690,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--packet-loss", type=float, default=0.0, help="baseline per-message loss")
     p.add_argument("--nlos", type=float, default=0.0, help="distance-growing obstruction loss (0..1)")
     p.add_argument("--chan-capacity", type=int, default=40, help="in-range CAMs/step before congestion")
-    p.add_argument("--radio-model", choices=["disc", "logdistance", "geometric"], default="disc",
+    # choices come from the BUILT-IN REGISTRY (one source of truth with validate_config /
+    # _ENUM_OPTIONS / the GUI dropdown). A THIRD-PARTY channel model is not selected here: it is
+    # declared in the config's `plugins` block, because only a config field replays.
+    p.add_argument("--radio-model", choices=list(_api_registry.builtin_names("channel_model")),
+                   default="disc",
                    help="reachability: disc (hard range) | logdistance (soft path-loss + shadowing) "
                         "| geometric (3GPP TR 37.885 LOS/NLOSv/NLOSb + AR(1) shadowing + Nakagami)")
+    p.add_argument("--plugins", default="",
+                   help='ACTIVATE component plugins, as a JSON object {slot: {"ref":..., '
+                        '"params":{...}}}. `ref` resolves through the built-in registry, an '
+                        'installed entry point, then a dotted path "package.module:Class". '
+                        'Empty (the default) = built-ins only, byte-identical. Example: '
+                        '--plugins \'{"channel_model": {"ref": "myorg.radio:Rayleigh"}}\'')
     p.add_argument("--radio-env", choices=["urban", "highway"], default="urban",
                    help="geometric only: TR 37.885 LOS formula family (NLOS always uses urban)")
     p.add_argument("--radio-tx-power-dbm", type=float, default=23.0,
@@ -3976,6 +4819,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--config", default=None,
                    help="load config from a JSON file (raw config dict or a run's manifest.json) and "
                         "replay it exactly; --out and --featurize still apply. Ignores other flags.")
+    p.add_argument("--allow-plugin-drift", action="store_true",
+                   help="proceed when a replayed manifest's plugin content hashes no longer match "
+                        "what is installed. Each drift is still reported on stderr; the new run's "
+                        "manifest records what was ACTUALLY loaded, so the change stays visible")
     p.add_argument("--dump-config", default=None,
                    help="write the effective config to this JSON path, then run as usual")
     p.add_argument("--dump-config-schema", default=None,
@@ -3995,10 +4842,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
     if args.check_config:                             # validate a config/manifest JSON and exit
         try:
-            with open(args.check_config, encoding="utf-8") as fh:
-                cfg = config_from_dict(json.load(fh))
+            with open(args.check_config, encoding="utf-8-sig") as fh:   # -sig: tolerate a BOM
+                cfg = config_from_dict(json.load(fh),
+                                       allow_plugin_drift=args.allow_plugin_drift)
             validate_config(cfg)
-        except (OSError, ValueError, TypeError) as e:
+        except (OSError, ValueError, TypeError, PluginDriftError) as e:
             print(f"config INVALID: {type(e).__name__}: {e}", file=_sys.stderr)
             return 1
         print(f"config OK: {len(cfg.__dict__)} fields, seed={cfg.seed}, out_dir={cfg.out_dir}")
@@ -4010,12 +4858,23 @@ def main(argv: Optional[list[str]] = None) -> int:
               f"{os.path.abspath(args.dump_config_schema)}")
         return 0
     if args.config:                                  # replay a saved config exactly
-        with open(args.config, encoding="utf-8") as fh:
-            cfg = config_from_dict(json.load(fh))
+        with open(args.config, encoding="utf-8-sig") as fh:             # -sig: tolerate a BOM
+            try:
+                cfg = config_from_dict(json.load(fh),
+                                       allow_plugin_drift=args.allow_plugin_drift)
+            except PluginDriftError as e:
+                # D4: the manifest's plugin LOCK does not match what is installed now. Fail here,
+                # BEFORE step 0, with a non-zero exit -- the alternative (what this code used to do
+                # with any unknown key) is a silently different run that exits 0.
+                print(f"PLUGIN DRIFT: {e}", file=_sys.stderr)
+                return 2
         if args.out:
             cfg.out_dir = args.out
         cfg.verbose = True
-        res = run_pipeline(cfg)
+        try:
+            res = run_pipeline(cfg)
+        except ConfigError as e:
+            return _plugin_refusal(e)
         _emit_result(res, args.featurize)
         if args.dump_config:
             _dump_config(cfg, args.dump_config)
@@ -4034,7 +4893,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                          crl_aware_pct=args.crl_aware_pct, crl_dormant_s=args.crl_dormant_s,
                          radio_range_m=args.radio_range, packet_loss_base=args.packet_loss,
                          nlos_loss=args.nlos, chan_capacity=args.chan_capacity,
-                         radio_model=args.radio_model, pathloss_exponent=args.pathloss_exponent,
+                         radio_model=args.radio_model, plugins=args.plugins,
+                         pathloss_exponent=args.pathloss_exponent,
                          shadowing_sigma_db=args.shadowing_sigma_db,
                          rx_sensitivity_margin_db=args.rx_sensitivity_margin_db,
                          traffic_flow=args.flow, duration_s=args.duration, arrival_rate=args.arrival_rate,
@@ -4085,11 +4945,28 @@ def main(argv: Optional[list[str]] = None) -> int:
                          radio_nlosb_density_per_km=args.radio_nlosb_density_per_km,
                          verbose=True,
                          out_dir=(args.out or "datasets/poc_run"))
-    res = run_pipeline(cfg)
+    try:
+        res = run_pipeline(cfg)
+    except ConfigError as e:
+        return _plugin_refusal(e)
     _emit_result(res, args.featurize)
     if args.dump_config:
         _dump_config(cfg, args.dump_config)
     return 0
+
+
+def _plugin_refusal(e) -> int:
+    """A plugin the engine refused to load: a clean, explained, non-zero exit -- never a traceback.
+
+    Narrowed to `ConfigError` on purpose. It is the plugin API's own error class (and a `ValueError`
+    subclass, so `validate_config`'s existing contract still holds), so catching it here turns the
+    designed refusals -- an unknown ref, a signature mismatch, a reserved capability, a failed
+    `conformance = "required"` attestation -- into an operator-legible message, while any OTHER
+    exception still surfaces with its traceback rather than being tidied away behind a summary.
+    """
+    import sys as _sys
+    print(f"PLUGIN REFUSED: {e}", file=_sys.stderr)
+    return 2
 
 
 def _inline_or_file(s: str) -> str:
