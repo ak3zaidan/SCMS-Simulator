@@ -16,8 +16,11 @@ import json
 
 from scms_sim_ref.mock_pipeline import PipelineConfig, run_pipeline
 
-# Golden digest of the determinism-contract default config (must never move when the feature is OFF).
-DEFAULT_GOLDEN = "04ae9736f519dffb426bb1acebfec95edf32e7127ebc71346279f754a69cee38"
+# Golden digest of the determinism-contract default config (must never move when the feature is OFF;
+# re-pinned once by ADR 0002, which added true_speed/true_heading to the ground-truth record).
+# ADR 0002 re-pin (true_speed/true_heading added to gt_emissions_sample):
+# superseded 04ae9736f519... (default-config run; behaviour unchanged).
+DEFAULT_GOLDEN = "0bd93655a2d5bebb4172191fab0940a5ff90c6be685cfa033f5edcfd7c1fb740"
 
 
 def _default_run(tmp, name):

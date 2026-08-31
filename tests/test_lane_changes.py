@@ -16,8 +16,12 @@ from scms_sim_ref.mock_pipeline import PipelineConfig, run_pipeline
 from scms_sim_ref.datagen import validate as V
 
 # Frozen goldens (recorded on the base commit BEFORE this feature). Default OFF => byte-identical.
-DEFAULT_DIGEST = "04ae9736f519dffb426bb1acebfec95edf32e7127ebc71346279f754a69cee38"
-MULTILANE_DIGEST = "38845a32f35ee5c9cf148ad532b2c5e900322140c197cce0f03f62a7acd5a858"
+# ADR 0002 re-pin (true_speed/true_heading added to gt_emissions_sample):
+# superseded 04ae9736f519... (default-config run; behaviour unchanged).
+DEFAULT_DIGEST = "0bd93655a2d5bebb4172191fab0940a5ff90c6be685cfa033f5edcfd7c1fb740"
+# ADR 0002 re-pin (true_speed/true_heading added to gt_emissions_sample):
+# superseded 38845a32f35e... (multilane, lane_changes off run; behaviour unchanged).
+MULTILANE_DIGEST = "0a9e82ec549f876843ba39cce241ab28fdb39ea94900151d511e64e8c93f2277"
 
 
 def _jsonl(p):

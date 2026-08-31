@@ -2,23 +2,23 @@
   "reference_set": "v2x_awareness",
   "title": "V2X reception: awareness ratio, PDR-vs-distance shape, effective range, latency",
   "scope": "Communication panel. Awareness/PDR curves are reconstructed from MA reports joined to ground-truth emission positions, so they are proportional-to-PDR curves normalised at the near band, not absolute PDR.",
-  "curated_from": "docs/realism/investigation/research-realism-benchmarks.json (benchmarks[10,11,12,14], findings section B) and docs/realism/ROADMAP.md sections 4 (Phase 2 gate) and 5.",
+  "curated_from": "docs/realism/investigation/research-realism-benchmarks.json (benchmarks[10,11,12,14], findings section B), docs/realism/investigation/research-net-sota.json (findings section 4, measurement campaigns usable as calibration references), and docs/realism/ROADMAP.md sections 4 (Phase 2 gate) and 5.",
   "entries": {
     "awareness_ratio_200m_urban_min": {
       "min": 0.90,
       "unit": "fraction",
       "confidence": "anchored",
       "cite": "ROADMAP Phase-2 gate (Boban & d'Orey measurement campaign)",
-      "source": "Project-adopted gate from docs/realism/ROADMAP.md section 5 comm panel and the Phase-2 benchmark gate: '>= 90% neighbor-awareness at 200 m urban ... under low load (reference: Boban & d'Orey 2015 measurement campaign)'. Neighbour-awareness ratio is defined as detected neighbours / neighbours physically present within a nominal range inside a freshness window -- EURECOM, 'Rethinking Cooperative Awareness for Future V2X Safety-critical Applications', https://www.eurecom.fr/publication/5365/download/comsys-publi-5365.pdf.",
-      "note": "The 0.90 threshold is a PROJECT-ADOPTED gate; the underlying campaign is cited for the metric definition and the qualitative level, not for a transcribed 0.90 figure."
+      "source": "Project-adopted gate from docs/realism/ROADMAP.md section 5 comm panel and the Phase-2 benchmark gate: '>= 90% neighbor-awareness at 200 m urban ... under low load (reference: Boban & d'Orey 2015 measurement campaign)'. The underlying campaign is Boban & d'Orey, 'Exploring the Practical Limits of Cooperative Awareness in Vehicular Communications', https://arxiv.org/abs/1503.06590 (measurements at 4 EU sites plus large-scale GEMV2 simulation), which reports 90% awareness achievable up to ~200 m urban. Neighbour-awareness ratio is defined as detected neighbours / neighbours physically present within a nominal range inside a freshness window -- EURECOM, 'Rethinking Cooperative Awareness for Future V2X Safety-critical Applications', https://www.eurecom.fr/publication/5365/download/comsys-publi-5365.pdf.",
+      "note": "The 0.90 threshold is a PROJECT-ADOPTED gate; the campaign supports the '90% at ~200 m urban' pairing (docs/realism/investigation/research-net-sota.json findings section 4 and PHASE2-DESIGN.md 'Reference curves to pin as refdata'). See pathloss_37885.nlos_link_budget_consequence_m: at 200 m an urban NLOS link needs ~39 dBm to close, so this gate is in practice a statement about the LOS/NLOSv share of the scenario's links."
     },
     "awareness_ratio_500m_highway_min": {
       "min": 0.90,
       "unit": "fraction",
       "confidence": "anchored",
       "cite": "ROADMAP Phase-2 gate (Boban & d'Orey measurement campaign)",
-      "source": "Same source and caveat as awareness_ratio_200m_urban_min: docs/realism/ROADMAP.md Phase-2 gate, '>= 90% neighbor-awareness ... at 500 m highway under low load'.",
-      "note": "Not evaluated by the Phase-0 anchors (100/200/300 m); pinned so Phase 2 uses the same audited number."
+      "source": "Same source and caveat as awareness_ratio_200m_urban_min: docs/realism/ROADMAP.md Phase-2 gate, '>= 90% neighbor-awareness ... at 500 m highway under low load', matching Boban & d'Orey's reported '>500 m highway' (https://arxiv.org/abs/1503.06590, summarised in docs/realism/investigation/research-net-sota.json findings section 4).",
+      "note": "Not evaluated by the Phase-0 anchors (100/200/300 m); pinned so Phase 2 uses the same audited number. LINK-BUDGET CHECK: TR 37.885 highway LOS at 500 m is 101.7964 dB (pathloss_37885.pathloss_at_reference_distances_db), so with the vendored -81 dBm sensitivity this gate needs >= 20.8 dBm EIRP -- the vendored VeReMi-NextGen 0.02 W (13.01 dBm) transmit power reaches only ~204 m and CANNOT satisfy it. Phase 2 must raise transmit power (typical DSRC OBU 20-23 dBm) before this gate is meaningful."
     },
     "awareness_anchor_distances_m": {
       "points": [100.0, 200.0, 300.0],
@@ -28,21 +28,60 @@
       "source": "docs/realism/investigation/research-realism-benchmarks.json benchmarks[14] (awareness metrics: neighbor awareness ratio, EURECOM 'Rethinking Cooperative Awareness'): 'Track NAR at 100/200/300 m vs density'; adopted verbatim in docs/realism/ROADMAP.md Phase 0 task list.",
       "note": "The three distances at which the normalised awareness ratio is reported."
     },
+    "awareness_limiting_factor": {
+      "value": "shadowing",
+      "unit": "categorical",
+      "confidence": "anchored",
+      "cite": "Boban & d'Orey 2015 ('power beats rate')",
+      "source": "Boban & d'Orey, 'Exploring the Practical Limits of Cooperative Awareness in Vehicular Communications' (https://arxiv.org/abs/1503.06590): cooperative-awareness delivery is dominated by SHADOWING rather than by channel load at the beaconing rates studied -- increasing transmit power improves awareness more than increasing beacon rate does. Recorded in docs/realism/investigation/research-net-sota.json findings section 4 as 'delivery dominated by shadowing (power beats rate)'.",
+      "note": "MODEL CONSEQUENCE, pinned as a falsifiable expectation for Phase 2: under the geometric radio model, sweeping transmit power must move the awareness curve MORE than sweeping the beacon rate does at low-to-moderate density. If the implemented model shows the opposite ordering, the congestion/CBR term is overweighted relative to the propagation term."
+    },
     "pdr_gray_zone_width_min_m": {
       "min": 100.0,
       "unit": "m",
       "confidence": "anchored",
       "cite": "ROADMAP section 5 (Bai/Stancil/Krishnan MobiCom 2010 shape)",
-      "source": "Project-adopted gate from docs/realism/ROADMAP.md section 5: 'PDR gray-zone width (90% -> 20%) >= 100 m', referencing the DSRC empirical characterisation of Bai, Stancil & Krishnan, 'Toward understanding characteristics of dedicated short range communications (DSRC) from a perspective of vehicular network engineers', ACM MobiCom 2010, doi:10.1145/1859995.1860033, which establishes the reliable-zone / stochastic-gray-zone / cutoff shape.",
-      "note": "A step-function (unit-disc) range model FAILS this by construction -- that is the intended Phase-0 baseline finding, not a harness defect."
+      "source": "Project-adopted gate from docs/realism/ROADMAP.md section 5: 'PDR gray-zone width (90% -> 20%) >= 100 m', referencing the DSRC empirical characterisation of Bai, Stancil & Krishnan, 'Toward understanding characteristics of dedicated short range communications (DSRC) from a perspective of vehicular network engineers', ACM MobiCom 2010, doi:10.1145/1859995.1860033, which establishes the three-zone shape: a near-deterministic reliable zone, a wide stochastic gray zone in which PDR falls gradually, and a far zone of near-zero delivery.",
+      "derivation": "RATIONALE for the >= 100 m figure, made quantitative: with a hard receive threshold and log-normal shadowing of standard deviation sigma, PDR(d) = Phi(margin(d)/sigma), so moving from PDR 0.90 to 0.20 costs a fixed 2.1232*sigma dB of margin (Phi^-1(0.9) - Phi^-1(0.2) = 1.281552 + 0.841621). Dividing by the path-loss slope b gives a pure distance RATIO d20/d90 = 10^(2.1232*sigma/b): 2.4066 for urban LOS (sigma 3.0, b 16.7), 2.0820 for highway LOS (sigma 3.0, b 20), 1.9191 for urban NLOS (sigma 4.0, b 30). See gray_zone_ratio_from_shadowing for the pinned values.",
+      "note": "A step-function (unit-disc) range model FAILS this by construction -- that is the intended Phase-0 baseline finding, not a harness defect. Because the width is a fixed MULTIPLE of d90, the gate is only reachable once d90 is large enough: >= 71 m urban LOS, >= 92 m highway LOS, >= 109 m urban NLOS. Small-scale fading widens the zone further, so these are floors."
+    },
+    "gray_zone_ratio_from_shadowing": {
+      "points": [
+        ["urban_los", 3.0, 16.7, 2.4066, 71.09],
+        ["highway_los", 3.0, 20.0, 2.0820, 92.42],
+        ["urban_nlos", 4.0, 30.0, 1.9191, 108.81]
+      ],
+      "unit": "[state, shadowing sigma dB, path-loss slope b, d20/d90 ratio, minimum d90 in m for a 100 m gray zone]",
+      "confidence": "coarse",
+      "cite": "derived: log-normal shadowing through the TR 37.885 slopes",
+      "source": "Derived on 2026-08-30 from the anchored TR 37.885 slopes (pathloss_37885.urban_los / highway_los / urban_nlos) and shadowing sigmas (pathloss_37885.shadowing_sigma_db) under a hard receive-threshold model: d20/d90 = 10^((Phi^-1(0.9) - Phi^-1(0.2)) * sigma / b), and the last column is 100 / (ratio - 1), the smallest 90%-crossing distance at which the gate pdr_gray_zone_width_min_m can be met by shadowing alone.",
+      "derivation": "Phi^-1(0.9) - Phi^-1(0.2) = 2.123173 (computed with statistics.NormalDist, double precision); shadowing-only, no small-scale fading, no NLOS/LOS state mixing, no MAC losses -- every one of those widens the zone further, so these ratios are LOWER BOUNDS.",
+      "note": "DIAGNOSTIC, not a gate. If the Phase-2 comm panel reports a gray-zone ratio materially BELOW these values, the shadowing process is being applied with too small a sigma or is being re-drawn per packet (which averages the zone away); materially above, the link population is mixing propagation states or the fading term dominates."
+    },
+    "effective_range_pdr_min": {
+      "min": 0.50,
+      "unit": "fraction",
+      "confidence": "anchored",
+      "cite": "Safety Pilot Model Deployment (Ann Arbor) 'effective range' definition",
+      "source": "The Safety Pilot Model Deployment DSRC field study defines EFFECTIVE RANGE as the distance at which packet delivery ratio falls to 50%: 'Empirical Study of DSRC Performance Based on Safety Pilot Model Deployment Data', IEEE Transactions on Intelligent Transportation Systems 2017, https://arxiv.org/abs/1606.08365 (world's largest connected-vehicle deployment; also quantifies PDR degradation from foliage, weather, buildings, travel direction and road elevation). Recorded in docs/realism/investigation/research-net-sota.json findings section 4 and required by docs/realism/PHASE2-DESIGN.md 'Reference curves to pin as refdata'.",
+      "note": "This is a DEFINITION, not a pass/fail band: it fixes the level at which comm.effective_range_m reads the crossing (0.50), so the harness's effective range is comparable with published DSRC numbers. The harness curve is proportional-to-PDR (normalised at the near band), so the crossing is an effective range only insofar as the near band is genuinely near-100% delivery."
+    },
+    "urban_v2i_max_range_m": {
+      "value": {"max_range_m": 700.0, "frame_success_ratio_floor": 0.25},
+      "unit": "mixed",
+      "confidence": "anchored",
+      "cite": "urban V2I 802.11p field measurement (max range at FSR > 0.25)",
+      "source": "Urban V2I 802.11p measurements report a maximum range of ~700 m, defined as the largest distance at which the frame success ratio stays continuously above 0.25 (https://www.researchgate.net/publication/254058759), recorded in docs/realism/investigation/research-net-sota.json findings section 4 and listed in docs/realism/PHASE2-DESIGN.md as a curve to pin.",
+      "note": "READ THE THRESHOLD BEFORE COMPARING: 700 m here is a 25%-frame-success range, NOT a high-PDR range and NOT the 50%-PDR effective range of effective_range_pdr_min. It is roughly the far edge of the gray zone. RSU antennas are also mast-mounted, so a V2I link is far more often LOS than a V2V link at the same distance."
     },
     "los_high_pdr_range_m": {
       "range": [500.0, 700.0],
       "unit": "m",
-      "confidence": "anchored",
+      "confidence": "coarse",
       "cite": "Bai/Stancil/Krishnan MobiCom 2010; Sensors 2021 urban V2I benchmark",
       "source": "IEEE 802.11p / DSRC line-of-sight open-road measurements sustain high PDR out to ~500-700 m at ~20 dBm (GM campaigns, Bai/Stancil/Krishnan MobiCom 2010; urban V2I benchmark, Sensors 2021, PMC8347901). Summarised in research-realism-benchmarks.json benchmarks[10] (V2X PDR-vs-distance reference points).",
-      "note": "PINNED FOR LATER PHASES; Phase 0 reports an effective range (normalised awareness crossing 0.5) for tracking, without a pass/fail band, because the reconstructed curve is proportional-to-PDR rather than absolute."
+      "derivation": "An interval assembled from two campaigns with different success criteria, hence coarse rather than anchored.",
+      "note": "CAVEAT ADDED 2026-08-30 -- the 700 m upper edge collides with urban_v2i_max_range_m, where 700 m is measured at a frame success ratio of only 0.25. Treat 500 m as the defensible high-PDR LOS anchor and 700 m as the outer edge reachable at low success ratio; do not quote '700 m at high PDR'. Consistency check with the pinned constants: TR 37.885 highway LOS at 500 m needs 20.8 dBm EIRP against a -81 dBm receiver, which matches the '~20 dBm' quoted for those campaigns."
     },
     "nlos_urban_effective_range_m": {
       "value": 100.0,
@@ -50,7 +89,15 @@
       "confidence": "coarse",
       "cite": "Bai/Stancil/Krishnan MobiCom 2010; Sensors 2021",
       "source": "Urban NLoS reception collapses to an effective range 'on the order of only ~100 m at obstructed intersections' (research-realism-benchmarks.json benchmarks[10], V2X PDR-vs-distance reference points).",
-      "note": "Order-of-magnitude anchor only; no precision beyond one significant figure is claimed."
+      "note": "Order-of-magnitude anchor only; no precision beyond one significant figure is claimed. INDEPENDENT CONFIRMATION: TR 37.885 urban NLOS at the ETSI ceiling of 33 dBm EIRP against a -81 dBm receiver closes at 121.9 m (pathloss_37885.nlos_link_budget_consequence_m) -- the standard's formula and this measured anchor agree to well within the one significant figure claimed."
+    },
+    "pdr_vs_rssi_curve": {
+      "available": false,
+      "unit": "n/a",
+      "confidence": "unavailable",
+      "cite": "FLOURISH Bristol ITS-G5 dataset (open data, NOT vendored here)",
+      "source": "docs/realism/PHASE2-DESIGN.md requires 'PDR-vs-RSSI empirical curve, FLOURISH Bristol ITS-G5 (DOI 10.5523/bris.eupowp7h3jl525yxhm3521f57)'. The dataset -- 4 RSUs on a 5 km central-Bristol track, 2 OBUs, 8 sessions of ~2 h, CAMs every 10 ms at 25 dBm and 29 dBm, described in Data in Brief 2019 (https://pmc.ncbi.nlm.nih.gov/articles/PMC6727192/, arXiv:1903.10289) and explicitly 'suitable for calibrating physical layers of vehicular simulators' -- is open but is NOT vendored in this repository, and no numeric points from it appear in docs/realism/investigation/research-net-sota.json or research-realism-benchmarks.json.",
+      "note": "PLACEHOLDER, deliberately empty: no PDR-vs-RSSI pairs are invented here. This is the calibration target for nakagami_fading.sinr_to_per_mapping (also unavailable). To close both at once, download the dataset under its DOI, bin MAC-layer delivery by RSSI, and pin the resulting points with the retrieval date and the transmit-power branch (25 or 29 dBm) recorded."
     },
     "cv2x_mode4_pdr95_range_m": {
       "points": [[0.1, 380.0], [0.2, 300.0], [0.3, 280.0]],
@@ -66,7 +113,7 @@
       "confidence": "anchored",
       "cite": "DLR Cohda MK5 field measurements (ITS World Congress 2021)",
       "source": "de Ponte Mueller et al., 'ITS-G5 and C-V2X link level performance measurements', ITS World Congress 2021, https://elib.dlr.de/142341/ : ITS-G5/802.11p minimum end-to-end latency ~5 ms at 200 B payload rising to 8-9 ms at 800/1000 B. Summarised in research-realism-benchmarks.json benchmarks[12] (latency CDF anchors).",
-      "note": "PINNED FOR LATER PHASES. Phase 0 datasets carry detection_time == generation_time (no latency model), so no latency metric is scored."
+      "note": "PINNED FOR LATER PHASES. Phase 0 datasets carry detection_time == generation_time (no latency model), so no latency metric is scored. Sanity: the 802.11p PPDU airtime alone is 0.312 ms at 200 B and 1.112 ms at 800 B (phy_80211p.frame_airtime_us), so the measured 5-9 ms is dominated by stack/queueing, not by the air interface."
     },
     "latency_p50_ms_cv2x": {
       "range": [25.0, 45.0],
@@ -81,9 +128,9 @@
       "unit": "m",
       "confidence": "anchored",
       "cite": "ETSI TR 103 257-1 / Gudmundson correlation model (ROADMAP section 3.2)",
-      "source": "Gudmundson-style AR(1) shadowing with a 10-13 m decorrelation distance, adopted in docs/realism/ROADMAP.md section 3.2 item 3 and gated in the Phase-2 benchmark list as 'empirical link-level autocorrelation e-folding distance 10 +/- 3 m (ETSI TR 103 257-1)'.",
+      "source": "Gudmundson-style AR(1) shadowing with a 10-13 m decorrelation distance, adopted in docs/realism/ROADMAP.md section 3.2 item 3 and gated in the Phase-2 benchmark list as 'empirical link-level autocorrelation e-folding distance 10 +/- 3 m (ETSI TR 103 257-1)'. ETSI TR 103 257-1 V1.1.1 (2019), 'Analysis of V2X radio channel models', https://www.etsi.org/deliver/etsi_tr/103200_103299/10325701/01.01.01_60/tr_10325701v010101p.pdf , specifies an urban model with correlated log-normal shadowing of sigma = 3 dB and a 10 m decorrelation distance.",
       "derivation": "Range [7, 13] m is the ROADMAP's '10 +/- 3 m' gate written out as an interval.",
-      "note": "PINNED FOR PHASE 2 (channel model); no shadowing autocorrelation is observable in the Phase-0 dataset schema."
+      "note": "PINNED FOR PHASE 2 (channel model); no shadowing autocorrelation is observable in the Phase-0 dataset schema. THIS IS THE GATE; the per-state MODEL INPUTS are pathloss_37885.shadowing_decorrelation_distance_m (10 m LOS, 13 m NLOSv/NLOS, both inside this interval). Measured intersection decorrelation is far shorter (2.2-3.7 m, pathloss_37885.intersection_measured_decorrelation_distance_m), so an intersection-dominated scenario may legitimately fall below this gate."
     }
   }
 }

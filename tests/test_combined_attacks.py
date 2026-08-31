@@ -22,7 +22,9 @@ from scms_sim_ref.datagen import featurize
 
 # The golden default-selection digest (multiple attackers, round-robin over the DEFAULT catalog). Any
 # change to the attack catalog / assignment order would move it; the combined family must NOT.
-GOLDEN_DIGEST = "04ae9736f519dffb426bb1acebfec95edf32e7127ebc71346279f754a69cee38"
+# ADR 0002 re-pin (true_speed/true_heading added to gt_emissions_sample):
+# superseded 04ae9736f519... (default-config run; behaviour unchanged).
+GOLDEN_DIGEST = "0bd93655a2d5bebb4172191fab0940a5ff90c6be685cfa033f5edcfd7c1fb740"
 
 # A config large enough that a single opt-in type is assigned to many attackers over many steps.
 _COMMON = dict(seed=13, traffic_flow=True, road_network="grid", duration_s=120.0, arrival_rate=1.5,

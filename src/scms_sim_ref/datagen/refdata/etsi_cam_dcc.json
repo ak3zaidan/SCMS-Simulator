@@ -1,8 +1,8 @@
 {
   "reference_set": "etsi_cam_dcc",
   "title": "ETSI CAM generation rules and DCC channel-busy-ratio bands",
-  "scope": "Message-rate realism (inter-packet gap) and channel-load realism (CBR / DCC).",
-  "curated_from": "docs/realism/investigation/research-realism-benchmarks.json (benchmarks[13], findings B.2), docs/realism/investigation/determinism-io.json (CAM triggering as implemented in ScmsBeaconApp) and docs/realism/ROADMAP.md section 3.2 item 6.",
+  "scope": "Message-rate realism (inter-packet gap) and channel-load realism (CBR / DCC), for both the reactive state machine and the adaptive LIMERIC-derived variant.",
+  "curated_from": "docs/realism/investigation/research-realism-benchmarks.json (benchmarks[13], findings B.2), docs/realism/investigation/research-net-sota.json (findings section 3, ETSI DCC paragraph), docs/realism/investigation/determinism-io.json (CAM triggering as implemented in ScmsBeaconApp), docs/realism/PHASE2-DESIGN.md step 7 and docs/realism/ROADMAP.md section 3.2 item 6.",
   "entries": {
     "cam_interval_s": {
       "range": [0.1, 1.0],
@@ -10,7 +10,7 @@
       "confidence": "anchored",
       "cite": "ETSI EN 302 637-2 (T_GenCamMin / T_GenCamMax)",
       "source": "ETSI EN 302 637-2 V1.4.1, Intelligent Transport Systems (ITS); Vehicular Communications; Basic Set of Applications; Part 2: Specification of Cooperative Awareness Basic Service. T_GenCamMin = 100 ms, T_GenCamMax = 1000 ms, i.e. a CAM rate between 1 Hz and 10 Hz.",
-      "note": "The MOSAIC layer implements this triggering (ScmsBeaconApp T_GenCamMin 0.1 s / T_GenCamMax 1.0 s); the pure-Python engine emits exactly one CAM per vehicle per step (1 Hz at the default dt = 1.0 s), which sits at the upper edge of the band."
+      "note": "The MOSAIC layer implements this triggering (ScmsBeaconApp T_GenCamMin 0.1 s / T_GenCamMax 1.0 s); the pure-Python engine emits exactly one CAM per vehicle per step (1 Hz at the default dt = 1.0 s), which sits at the upper edge of the band. The DCC rates in dcc_reactive_states span exactly this 10 Hz - 1 Hz interval, so DCC never asks for a rate outside the CAM service's own limits."
     },
     "cam_trigger_thresholds": {
       "value": {"position_m": 4.0, "heading_deg": 4.0, "speed_mps": 0.5},
@@ -20,13 +20,22 @@
       "source": "ETSI EN 302 637-2 V1.4.1 CAM generation triggering conditions: position change > 4 m, heading change > 4 degrees, or speed change > 0.5 m/s since the previous CAM.",
       "note": "PINNED FOR PHASE 2 (ETSI CAM triggering in the Python engine for dt <= 0.5 runs)."
     },
+    "cbr_measurement_definition": {
+      "value": {"probe_window_ms": 100.0, "power_threshold_dbm": -85.0, "statistic": "fraction of probes whose measured power exceeds the threshold"},
+      "unit": "mixed",
+      "confidence": "anchored",
+      "cite": "ETSI TS 102 687 V1.2.1 (CBR definition used by the DCC state machine)",
+      "source": "ETSI TS 102 687 V1.2.1 (2018), 'Decentralized Congestion Control Mechanisms for Intelligent Transport Systems operating in the 5 GHz range', https://www.etsi.org/deliver/etsi_ts/102600_102699/102687/01.02.01_60/ts_102687v010201p.pdf : the channel busy ratio is the fraction of probes, taken over a 100 ms window, whose measured power is above the -85 dBm threshold. Transcribed in docs/realism/investigation/research-net-sota.json findings section 3 ('CBR = fraction of 100-ms-window probes with power above threshold (-85 dBm)') and bound in docs/realism/PHASE2-DESIGN.md step 7.",
+      "derivation": "None -- transcribed. Included as an entry rather than a note because the WINDOW and the THRESHOLD are what make two CBR numbers comparable.",
+      "note": "DISAGREEMENT WITH THE SIBLING ENTRY, stated explicitly: cbr_satisfactory_range's source text describes CBR 'measured as the busy fraction over 1 s probes'. The DCC access-layer definition in TS 102 687 is the 100 ms window pinned here; a 1 s window is a smoothed reading of the same quantity and will report a LOWER variance and a slightly different mean under bursty load. Phase 2 must model the 100 ms window, and any CBR the harness reports must state its window. Note also that -85 dBm sits 4 dB BELOW the vendored receiver sensitivity of -81 dBm (third_party/veremi-nextgen/Generator/docker/scenarios/InTAS_urban_2_4_test/omnetpp/omnetpp.ini:80): CBR counts energy that is NOT decodable, so a model that computes CBR only from successfully-received frames systematically underestimates it."
+    },
     "cbr_satisfactory_range": {
       "range": [0.55, 0.75],
       "unit": "fraction",
       "confidence": "anchored",
       "cite": "ETSI TS 102 687 / TS 103 175 (DCC)",
       "source": "ETSI TS 102 687 (Decentralized Congestion Control mechanisms for ITS operating in the 5 GHz range) and ETSI TS 103 175 (Cross-layer DCC management entity, https://www.etsi.org/deliver/etsi_ts/103100_103199/103175/01.01.01_60/ts_103175v010101p.pdf): the satisfactory DCC operating range for channel busy ratio is 0.55-0.75, with control loops holding ~0.6. CBR is measured as the busy fraction over 1 s probes.",
-      "note": "PINNED FOR PHASE 2. No CBR observable exists in the Phase-0 dataset schema, so no CBR metric is scored."
+      "note": "PINNED FOR PHASE 2. No CBR observable exists in the Phase-0 dataset schema, so no CBR metric is scored. See cbr_measurement_definition for the 100 ms / -85 dBm access-layer definition and the window discrepancy. Both control targets in this file -- reactive 0.60 and adaptive 0.68 -- fall inside this range, which is why they can coexist."
     },
     "cbr_control_target": {
       "value": 0.60,
@@ -34,15 +43,47 @@
       "confidence": "anchored",
       "cite": "ETSI TS 102 687 / TS 103 175 (DCC)",
       "source": "Same ETSI DCC sources as cbr_satisfactory_range (TS 102 687 / TS 103 175): the control algorithms hold channel busy ratio around 0.6, the centre of the 0.55-0.75 satisfactory range.",
-      "note": "PINNED FOR PHASE 2."
+      "note": "PINNED FOR PHASE 2. This is the REACTIVE state machine's operating point -- 0.60 is exactly where its last step to the restrictive 1 Hz state occurs (dcc_reactive_states). The ADAPTIVE variant targets 0.68 instead (dcc_adaptive_limeric.cbr_target); the two numbers are different control objectives, not a transcription error, and both sit inside cbr_satisfactory_range. Do not average them."
+    },
+    "dcc_reactive_states": {
+      "points": [
+        ["relaxed", 0.00, 0.30, 10.0, 100.0],
+        ["active_1", 0.30, 0.40, 5.0, 200.0],
+        ["active_2", 0.40, 0.50, 2.5, 400.0],
+        ["active_3", 0.50, 0.60, 2.0, 500.0],
+        ["restrictive", 0.60, 1.00, 1.0, 1000.0]
+      ],
+      "unit": "[state, CBR lower bound, CBR upper bound, CAM rate Hz, T_off ms]",
+      "confidence": "anchored",
+      "cite": "ETSI TS 102 687 V1.2.1 reactive DCC state machine",
+      "source": "Reactive DCC state table from ETSI TS 102 687 V1.2.1 (https://www.etsi.org/deliver/etsi_ts/102600_102699/102687/01.02.01_60/ts_102687v010201p.pdf) as commonly implemented (ms-van3t / VaN3Twin): Relaxed CBR < 0.30 -> 10 Hz (T_off 100 ms); Active1 0.30-0.40 -> 5 Hz (200 ms); Active2 0.40-0.50 -> 2.5 Hz (400 ms); Active3 0.50-0.60 -> 2 Hz (500 ms); Restrictive CBR > 0.60 -> 1 Hz (1000 ms). Transcribed identically in docs/realism/investigation/research-net-sota.json findings section 3 and in docs/realism/PHASE2-DESIGN.md step 7.",
+      "derivation": "Bounds are half-open [lo, hi): a CBR of exactly 0.30 selects active_1, 0.60 selects restrictive. The literature states the bands as '< 0.30', '0.30-0.40', ... '> 0.60'; this half-open reading is the only one that leaves no gap and no overlap at the breakpoints.",
+      "note": "AUTHORITATIVE ENCODING of the reactive table -- dcc_reactive_rate_table is the older, thinner mirror kept for its existing ref_id. T_off is the inter-packet interval implied by the rate (1/rate), so a Phase-2 implementation may key on either. Security relevance (PHASE2-DESIGN step 7): a DCC-induced drop from 10 Hz to 1 Hz cuts misbehaviour evidence density tenfold, which changes detector recall without any attacker behaviour changing."
     },
     "dcc_reactive_rate_table": {
       "points": [[0.30, 10.0], [0.40, 5.0], [0.50, 2.5], [0.60, 2.0], [0.65, 1.0]],
       "unit": "[CBR fraction, CAM rate Hz]",
       "confidence": "coarse",
-      "cite": "ETSI reactive DCC state table as adopted in ROADMAP section 3.2",
+      "cite": "ETSI reactive DCC state table as adopted in ROADMAP section 3.2 -- THINNER MIRROR of dcc_reactive_states",
       "source": "Reactive-DCC step table (CAM rate 10 / 5 / 2.5 / 2 / 1 Hz as CBR crosses 0.30 / 0.40 / 0.50 / 0.60) transcribed in docs/realism/ROADMAP.md section 3.2 item 6 from ETSI TS 102 687 reactive DCC.",
-      "note": "PINNED FOR PHASE 2. The final (0.65, 1.0) point is the ROADMAP's terminal 1 Hz state; the CBR breakpoint for it is a project reading of the table, hence confidence='coarse'."
+      "derivation": "Encoded as (CBR upper bound, rate) pairs. The terminal (0.65, 1.0) point is NOT an ETSI breakpoint: the standard's restrictive state is 'CBR > 0.60', which this encoding cannot express, so 0.65 was chosen as a finite stand-in for 'above 0.60'.",
+      "note": "SUPERSEDED BY dcc_reactive_states, which carries the true half-open bands, the state names and T_off. Kept so anything already resolving this ref_id keeps working. If the two ever disagree, dcc_reactive_states wins."
+    },
+    "dcc_adaptive_limeric": {
+      "value": {
+        "alpha": 0.016,
+        "beta": 0.0012,
+        "cbr_target": 0.68,
+        "delta_max": 0.03,
+        "update_interval_ms": 200.0,
+        "update_rule": "delta(n) = (1 - alpha) * delta(n-1) + beta * (cbr_target - cbr(n))"
+      },
+      "unit": "mixed",
+      "confidence": "anchored",
+      "cite": "ETSI TS 102 687 adaptive DCC (LIMERIC-derived)",
+      "source": "Adaptive DCC approach of ETSI TS 102 687 (LIMERIC-derived): delta(n) = (1 - alpha) * delta(n-1) + beta * (CBR_target - CBR(n)) with alpha = 0.016, beta = 0.0012, CBR_target = 0.68, delta capped at delta_max = 0.03 of channel time, updated every 200 ms. Transcribed in docs/realism/investigation/research-net-sota.json findings section 3 from https://arxiv.org/pdf/2403.01297 and https://arxiv.org/pdf/2402.12089 , and bound as the optional variant in docs/realism/PHASE2-DESIGN.md step 7 and ROADMAP section 3.2 item 6.",
+      "derivation": "None -- transcribed. delta is a FRACTION OF CHANNEL TIME the station may occupy, not a rate: the permitted message rate follows from delta divided by the frame airtime (phy_80211p.frame_airtime_us), which is why delta_max = 0.03 with a 448 us frame corresponds to ~67 Hz, i.e. the cap binds only above the CAM service's own 10 Hz ceiling.",
+      "note": "DISAGREEMENT WITH cbr_control_target, stated explicitly: the adaptive variant targets CBR 0.68, the reactive machine steps to restrictive at 0.60. Both lie inside the ETSI satisfactory range 0.55-0.75, so this is a difference of control objective, not of standard. Known dynamics (Bansal et al. critique, via research-net-sota.json): good channel utilisation but slow convergence and transient unfairness -- expect a Phase-2 CBR trace to overshoot before settling, and do not gate on a single instantaneous CBR sample."
     }
   }
 }

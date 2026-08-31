@@ -2,7 +2,13 @@
 
 An independent reviewer re-derived every statistical claim and re-measured every reported number
 against the raw traces. Most reproduced exactly. **Four did not**, and two of those are critical.
-This file is the work list; nothing here is fixed yet.
+This file is the work list.
+
+**Status 2026-08-30: C1 and C2 are FIXED** (`tools/sumo_realism.py`, `tests/test_sumo_realism.py`,
+`docs/realism/SEED-STABILITY-CALIBRATION.md`, `tools/calibration/`), along with the two
+`sumo_realism.py` documented-rate errors in "Minor". M1/M2/M3 live in
+`src/scms_sim_ref/datagen/realism_bench.py` and are **not** touched here. Per-item resolutions are
+quoted inline below.
 
 Method for the null-distribution work: 10 SUMO runs of the same scenario (seeds 23423, 987654, 1–8),
 E1 output parsed through the shipped `parse_e1_additional`/`to_station_flows`, then the shipped
@@ -25,6 +31,13 @@ E1 output parsed through the shipped `parse_e1_additional`/`to_station_flows`, t
 
 ## C1 (critical) — the seed-stability flow gate false-alarms 47 % of the time
 
+> **FIXED 2026-08-30** — `tools/sumo_realism.py`, `tests/test_sumo_realism.py` (51 tests),
+> `docs/realism/SEED-STABILITY-CALIBRATION.md`. `SEED_STABILITY_TOTAL_REL_TOL` is now `None` (a stale
+> import fails loudly rather than silently reading 0.03). The tolerance is derived from the measured
+> seed-to-seed spread of the network total over 20 runs: **0.0918**. Re-measured on 20 seeds /
+> 190 pairs, the total-flow gate goes from **86/190 = 45.3 %** false alarms to **1/190**; the whole
+> report goes from 45.3 % to **6/190 = 3.2 %** in-sample and **26/380 = 6.8 %** leave-one-seed-out.
+
 `tools/sumo_realism.py:110` sets `SEED_STABILITY_TOTAL_REL_TOL = 0.03`, justified at `:550-554` with
 *"demand is a fixed route file, so the network-wide loop total is not free to drift with the seed —
 only crossing times shift."*
@@ -44,6 +57,16 @@ the identical unchanged scenario at seeds 1 vs 5 and it fails. In CI this is a 4
 unchanged tree, and the natural response would be to loosen the gate rather than fix the model.
 
 ## C2 (critical) — the binomial null is the wrong model, so the GEH gates have almost no power
+
+> **FIXED 2026-08-30** — same change as C1. Measured index of dispersion over 20 seeds:
+> **φ = 0.2182** (4269 station tests), against the 1.0 the binomial null asserts. The bound is the
+> same formula at the measured φ: `sqrt(2·φ)·z_(1−a/2)` → **1.5370** (was 2.7718); the family-wise
+> bound → **2.7735** (was 4.3163). Power, measured over 190 pairs by injecting a halved station:
+> the worst-station gate goes from **0/190** to **151/190**. The exemplar in this section is now
+> caught — `GEH(20, 10) = 2.5820` exceeds the calibrated bound, and baseline station `4140`
+> (9 vs 17, GEH 2.2188) is reported as **outside the band** instead of "pass". Every report also
+> carries a `detectability` block naming the smallest change each station can see, and the stations
+> at which a 2× change is still invisible over 300 s.
 
 `tools/sumo_realism.py:98-106`, `:123-125`, `:522-528`, `:537-541`.
 
@@ -156,10 +179,16 @@ heading reference.
 - Stale metric counts introduced by the corrections: `docs/FEATURES.md:136` and `DATASHEET.md:77` say
   21 metrics (14 traffic + 7 comm); the panel is **22 (15 + 7)**. `PROGRESS.md:42` is correct.
 - `tools/sumo_realism.py:526` — "~1.5 % at N=22" is wrong; P(Bin(22, 0.05) ≥ 4) = **0.0222**.
+  **FIXED 2026-08-30**: the corrected figure is stated in the fallback gate's own note and pinned by
+  `tests/test_sumo_realism.py::test_binomial_gate_trip_probability_is_00222_not_15_percent`.
 - `tools/sumo_realism.py:523-524` — "each station fails with probability 0.05" is false even inside
   the binomial model, from discreteness at these station counts: 0.000 for n ≤ 3, 0.125 at n=4,
   0.0625 at n=5, 0.0703 at n=8, 0.0215 at n=10. Baseline stations `3021` (n=2) and `5060` (n=3) can
-  never fail.
+  never fail. **FIXED 2026-08-30**: the note now quotes the saw-tooth explicitly and says that
+  n ≤ 3 stations cannot fail the fallback bound at all; the parametrised test
+  `test_binomial_per_station_failure_probability_is_not_a_flat_005` pins every value. Under the
+  calibrated bound 1.5370 those stations regain power (P = 0.50 at n=2, 0.25 at n=3), which
+  `test_calibrated_bound_gives_the_small_stations_power_back` asserts.
 - Stale generated scenarios without `<lateral-resolution>`: `gen_grid_4x4_s1/sumo/map.sumocfg`,
   `scms_smoke/sumo/highway.sumocfg`.
 - `PROGRESS.md:281-284` labels `datasets/smoke` and `mosaic_smoke_realismmode` as pre-sublane but

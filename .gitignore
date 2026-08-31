@@ -28,6 +28,17 @@ scms-sim/scenarios/gen_*/
 scms-sim/scenarios/_mapcache/
 tmp/
 gui/last_run.log
+# Realism-gate working cache: raw per-seed SUMO detector output for the seed-stability
+# calibration (tools/sumo_realism.py --calibrate) and any measured counts fetched on demand.
+# The Ingolstadt/SAVeNoW open loop counts carry NO formally stated licence ("License Not
+# Specified" in the TUM catalogue), so anything fetched from them MUST stay here and MUST NOT be
+# committed. See docs/realism/GEH-VALIDATION.md and docs/realism/SEED-STABILITY-CALIBRATION.md.
+/.realism_cache/
+
+# Fetched third-party reference data — LICENCE NOT FORMALLY STATED, never commit.
+# tools/fetch_ingolstadt_counts.py caches SAVeNoW/Stadt Ingolstadt loop counts here
+# (TUM catalogue says "License Not Specified"). See docs/realism/GEH-VALIDATION.md.
+/.cache/
 
 # Secrets — never commit API keys
 .env

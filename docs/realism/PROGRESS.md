@@ -9,7 +9,9 @@ quantitative benchmark; determinism/manifest contract and config→GUI pipeline 
 - Reference run: `--flow --road grid --grid 6 --duration 300 --arrival-rate 2 --attacker-pct 0.15
   --traffic-lights --seed 42` → 593 vehicles, 7823 reports, data_digest
   `f0ec3cc0baa55a2fdbc3b445455dda26baba0303725bd2cf8e17375081f32c48`, precision 0.599 / recall 0.91,
-  latency_med 4.0 s.
+  latency_med 4.0 s. **Superseded 2026-08-30 by ADR 0002** (ground-truth kinematics): the same run
+  now digests `b25f2137cf14dd504d56bb88cd67cce273b6a6ac348f7c59ee6d3b4372257815` with every count and
+  metric unchanged. See "ADR 0002 — ground-truth kinematics + digest re-pin" below.
 - Realism scorecard: none yet (Phase 0 builds it). Known Day-0 realism defects are ranked G1–G16 in
   ROADMAP.md §2.
 
@@ -22,6 +24,7 @@ quantitative benchmark; determinism/manifest contract and config→GUI pipeline 
 | 2026-08-29 | Phase 1 — MOSAIC/SUMO flagship realism | started | — |
 | 2026-08-30 | Phase 0 + Phase 1 — integrated | done | see "Phase 0/1 integration" below |
 | 2026-08-30 | Phase 0/1 review — GEH labelling, accel estimator, sublane | done | 3 defects corrected, baselines re-measured; 2 roadmap gates still not met, 1 blocked |
+| 2026-08-30 | ADR 0002 — ground-truth kinematics + digest re-pin (Python engine) | done | 22 pinned digest sites moved in 13 test files; 656 passed; reproducibility re-verified |
 
 ## Phase 0/1 integration (2026-08-30)
 
@@ -62,7 +65,9 @@ recorded in the Java manifest, so the harness resolves its reference bands witho
 Determinism canary re-run on this tree: `--flow --road grid --grid 6 --duration 300 --arrival-rate 2
 --attacker-pct 0.15 --traffic-lights --seed 42` → 593 vehicles / 7823 reports / 152 revoked,
 data_digest `f0ec3cc0baa55a2fdbc3b445455dda26baba0303725bd2cf8e17375081f32c48` — **byte-identical**
-to the reference. `git diff --stat -- src/scms_sim_ref/mock_pipeline/` is empty.
+to the reference. `git diff --stat -- src/scms_sim_ref/mock_pipeline/` is empty. *(Historical: this
+was measured before ADR 0002. The same command now yields `b25f2137cf14dd50…` with identical counts
+— see the ADR 0002 section at the end of this file.)*
 
 ### Phase-1 gates
 
@@ -77,8 +82,12 @@ to the reference. `git diff --stat -- src/scms_sim_ref/mock_pipeline/` is empty.
   ±3 m/s² half of the gate **is** met on every full-trace run (0.959–0.996).
 - **GEH on InTAS loops**: real-world validation is **BLOCKED, not failed** — see "GEH — this is a
   seed-stability check, not a validation" below. What exists today is a simulation-vs-simulation
-  reproducibility check that passes 4/4 of its own gates. The roadmap gate "GEH < 5 on ≥ 85 % of
-  InTAS induction-loop stations" (ROADMAP.md:101) **cannot be claimed** and must not be quoted.
+  reproducibility check that passes 4/4 of its own gates, whose thresholds are now **empirically
+  calibrated from 20 seeds** rather than asserted (REVIEW-FINDINGS C1 + C2; see
+  [`SEED-STABILITY-CALIBRATION.md`](SEED-STABILITY-CALIBRATION.md)). Without a calibration on disk
+  the same check reports `uncalibrated` and no gate of it may be quoted as passing. The roadmap gate
+  "GEH < 5 on ≥ 85 % of InTAS induction-loop stations" (ROADMAP.md:101) **cannot be claimed** and
+  must not be quoted.
 - **Lane-change continuity** (new, Phase-1 follow-up): SUMO's sublane model is now on by default and
   cuts lane-change teleports 4.5× on a matched pair, but the metric's target of 0.0 events/vehicle-km
   is **not met** on any SUMO run. See "Lateral discontinuity + sublane" below.
@@ -107,15 +116,37 @@ two counts and both are fixed:
    `√(3600/300) = 3.4641`. Seed stability is now graded on window-native counts, with each station's
    `geh_veh_h` retained alongside for continuity.
 
-Current result (`comparison_kind: seed_stability`, window-native counts, 25 shared stations, 3
-both-zero stations `4070 / 4160 / 4210` excluded → 22 compared): **4/4 seed-stability gates pass** —
-station pass fraction 1.0 ≥ 0.85 at `GEH_w < 2.7718`; worst station 2.2188 ≤ the N-dependent
-Bonferroni bound 4.3163; total flow 243 vs 242 vehicles, relative error 0.00413 ≤ 0.03; count
-tolerance 0.8636 ≥ 0.80. Thresholds are derived in-tool from the exact conditional null
-(`m | m+c=n ~ Binomial(n, ½)`, under which window-native `GEH = √2·|Z|`), **not** taken from FHWA.
+**Thresholds are no longer invented (2026-08-30, REVIEW-FINDINGS C1 + C2).** The result quoted here
+until 2026-08-30 — "4/4 gates pass" at `GEH_w < 2.7718`, Bonferroni bound 4.3163, total-flow
+tolerance 0.03 — was produced by two *asserted* null distributions, and both were measured to be
+wrong: the 0.03 tolerance false-alarmed on **86 of 190** seed pairs of the unchanged scenario
+(45.3 %), and the `Binomial(n, ½)` per-station bound was ~24× too conservative (measured exceedance
+9/4269 = 0.0021 against a documented 0.05), leaving the GEH gates with almost no power. Both
+thresholds are now **derived from 20 SUMO runs of the scenario**; see
+[`SEED-STABILITY-CALIBRATION.md`](SEED-STABILITY-CALIBRATION.md) and
+`tools/calibration/seed_stability_intas_urban_low.json`.
+
+Current result on the same pair (seed 23423 vs 987654, window-native counts, 25 shared stations, 3
+both-zero stations `4070 / 4160 / 4210` excluded → 22 compared): **4/4 calibrated seed-stability
+gates pass** — station pass fraction 0.9091 ≥ 0.9091 at the calibrated `GEH_w < 1.5370`; worst
+station 2.2188 ≤ the calibrated family-wise bound 2.7735; total flow 243 vs 242 vehicles, relative
+error 0.00413 ≤ the calibrated 0.0918; count tolerance 0.8636 ≥ 0.8636. Measured report-level
+false-alarm rate on unchanged runs: **6/190 = 3.2 %** in-sample, **26/380 = 6.8 %**
+leave-one-seed-out — against 45.3 % before.
+
+Two stations are now individually flagged as **outside** the per-station band while the aggregate
+gates still pass: `4140` (9 vs 17 vehicles, GEH 2.2188) and `8002` (13 vs 7, 1.8974). Under the old
+2.7718 bound both were reported as passes — `4140` is the exact exhibit REVIEW-FINDINGS C2 named.
 Three stations carry `geh_veh_h ≥ 5` (4140 = 7.69, 8002 = 6.57, 1011 = 5.24) while their
-window-native GEH is 2.22 / 1.90 / 1.51 — those are pure seed noise on 8-vs-17, 13-vs-7 and 9-vs-5
-vehicle counts, and the old FHWA-labelled gate would have branded them validation failures.
+window-native GEH is 2.22 / 1.90 / 1.51; the old FHWA-labelled gate would have branded those
+validation failures, which is a scale error, but they are *not* uninteresting either — the first two
+are exactly the ones the calibrated per-station band now flags.
+
+What the gate can see is now reported instead of assumed: at the calibrated bound a station must
+change by **×1.63** (median over the 22 compared stations; best ×1.29, worst ×3.24) to leave the
+band, and the five 1–3-vehicle stations at which even a 2× change stays invisible over a 300 s
+window are named in the report. Under the old bound the median was ×2.09 at a 10-vehicle station,
+i.e. **a doubling of flow was undetectable**.
 
 Layout correction: `InTAS_E1.add.xml` has 196 `e1Detector`s but only **25** `name=` station groups,
 not the 27 previously reported. The other two (`income`, `outgoing`) carry no `name`, write to
@@ -138,7 +169,9 @@ comparison is the weakest available form.
 
 `traffic.accel_within_hard_bound_frac` used to fail on every engine with `accel_min −275` /
 `accel_max +272 m/s²` (28 g) while `p01`/`p99` were a perfectly realistic −4.18 / +2.65. Root cause:
-`gt_emissions_sample` carries `true_x` / `true_y` but **no true speed**, so the harness derived speed
+`gt_emissions_sample` carried `true_x` / `true_y` but **no true speed** (ADR 0002 added
+`true_speed`/`true_heading` on 2026-08-30 — datasets generated after that no longer have this root
+cause; the numbers in this section were measured before it), so the harness derived speed
 as `hypot(dx,dy)/dt` and acceleration by differencing that again. A SUMO lane change moves a vehicle
 ~3.2 m sideways — exactly one lane width — **inside one sample**, which the estimator read as a
 33 m/s longitudinal speed and hence a ~276 m/s² acceleration.
@@ -231,10 +264,11 @@ not met on any SUMO run.**
    (MOSAIC) against the ≥ 100 m gate. That is the Phase-2 target, and it is the correct reading —
    levels are crossed on the non-increasing majorant of the measured curve, so a step-function radio
    cannot pass on Poisson noise in one distance bin.
-7. **`gt_emissions_sample` still carries no true speed or heading field**, so every kinematic quantity
-   is still reconstructed by double-differencing `true_x`/`true_y`. Adding one would fix defect (B) at
-   the source, but it would change `data_digest` and is forbidden by the record-schema invariant. This
-   is the standing reason the acceleration gate cannot be cleanly closed from the harness side.
+7. ~~**`gt_emissions_sample` still carries no true speed or heading field**, so every kinematic
+   quantity is still reconstructed by double-differencing `true_x`/`true_y`.~~ **FIXED 2026-08-30 by
+   ADR 0002** — the record now carries `true_speed`/`true_heading` and the digest was deliberately
+   re-pinned (see "ADR 0002 — ground-truth kinematics + digest re-pin" at the end of this file). The
+   numbers in the tables above were all measured on differenced positions and predate the fix.
 
 ### Harness corrections (2026-08-30, review follow-up)
 
@@ -297,5 +331,86 @@ hold across all of it.
 | Phase 1 — GEH < 5 on ≥ 85 % of InTAS loop stations (ROADMAP.md:101) | **BLOCKED** | no real-world measured counts exist in the tree; only a simulation-vs-simulation seed-stability check is possible today. Needs `--ref-counts` data — see "GEH" above |
 | Phase 1 — headway KS vs highD-derived urban reference improves ≥ 20 % relative to Day-0 (ROADMAP.md:102) | **NOT MET** | KS 0.191 / 0.166 / 0.187 (InTAS) against a 0.15 gate; no 20 % relative improvement demonstrated |
 | Lane-change continuity (`lateral_discontinuity_events` = 0.0 ev/veh-km) | **NOT MET**, materially improved | 0.5851 → 0.1302 on the matched pair; Python engine reads 0.0 |
-| Determinism / manifest contract (hard invariant) | **HELD** | digest `f0ec3cc0…f32c48` reproduced exactly; `mock_pipeline/` zero diff; 222 targeted tests pass |
+| Determinism / manifest contract (hard invariant) | **HELD** | digest `f0ec3cc0…f32c48` reproduced exactly; `mock_pipeline/` zero diff; 222 targeted tests pass. *(Re-pinned to `b25f2137cf14…` by ADR 0002 on 2026-08-30 — deliberate, documented, counts unchanged.)* |
 | Phase 2 — PDR gray zone ≥ 100 m | **NOT MET** (Phase-2 target, not yet started) | 18–81 m across runs |
+
+## ADR 0002 — ground-truth kinematics + digest re-pin (2026-08-30, Python engine)
+
+Caveat 7 above ("`gt_emissions_sample` still carries no true speed or heading field") is **closed**.
+`ground_truth/gt_emissions_sample.jsonl` now carries `true_speed` (m/s) and `true_heading` (deg),
+written verbatim from the simulator's own state at emission time — `run.py:2664-2677`, fed by the
+`tx.true_state(t)` tuple already computed at `run.py:2553` and carried on the broadcast at
+`run.py:2618-2621`. `manifest.schema_versions.ground_truth` is now **2** (`ma_visible` stays 1), and
+a `conventions` block records `heading: deg_ccw_from_east`, `speed: m_s`, `position: m_local_xy`.
+Both field names were already in `FORBIDDEN_FEATURE_KEYS`, so the leakage firewall needed no change.
+
+What the field buys, measured on an all-honest full-trace run (seed 7, grid 5×5, 60 s,
+`emit_sample_prob=1.0`; 1925 samples / 72 vehicles / 1853 consecutive 1.0 s pairs):
+`|chord_speed − true_speed|` has median **0.0000 m/s**, p95 **0.0010 m/s**, max **12.7350 m/s** —
+a spike at zero with a fat tail exactly at turns and lane offsets, which is why differencing looked
+acceptable in aggregate while blowing up the acceleration gate. Bearing error against `true_heading`
+read CCW-from-East: median **0.0000°** (n=1835); read CW-from-North: median **90.0000°**.
+New `tests/test_gt_kinematics.py` (10 tests) pins completeness, truth, convention and the ORACLE
+firewall. `tools/verify_data.py` over three fresh schema-v2 datasets: 0 failures (L1/L2/L3 leakage,
+I1/I2 digest integrity and V4 emissions-truth all 3/3).
+
+Consumer-side confirmation: `realism_bench` on the new reference dataset accepts both fields on
+**270/270 tracks** and independently detects the convention —
+`convention_residuals_deg = {deg_ccw_from_east: 0.0, deg_cw_from_north: 90.0,
+rad_ccw_from_east: 53.24, rad_cw_from_north: 90.0}`, matching `manifest.conventions.heading`. Every
+kinematic metric on that run now reads `kinematics_source: "ground truth true_speed"` /
+`"ground truth true_heading (deg_ccw_from_east)"` rather than a differenced reconstruction
+(scorecard at emit_p 0.03: 9 pass / 0 fail / 13 na).
+
+**The engine's behaviour did not change; only the record it writes did.** Proof: for all eight
+datasets (seven re-pinned configs + the reference run) the post-change dataset was rewritten with the
+two keys stripped from each emission row and re-hashed under `run._data_digest`'s exact rule — each
+one reproduced its pre-bump digest byte-for-byte, so no other file, no row order and no RNG draw
+moved. The reference run's counts are also
+unchanged: 593 vehicles / 7823 reports / 152 revoked / precision 0.599 / recall 0.91 / latency_med
+4.0 s, exactly as before.
+
+### Superseded → new digests
+
+| Config | pre-bump | post-bump |
+|---|---|---|
+| default (seed 7, grid 5×5, 60 s, 1.5/s, atk 0.25) — 11 test files | `04ae9736f519…cee38` | `0bd93655a2d5bebb4172191fab0940a5ff90c6be685cfa033f5edcfd7c1fb740` |
+| multi-attack (seed 13, 8 types) — `test_attack_magnitude` | `8894cb268af3…3f63c` | `48013901c241b400e2bfaf02d393ab6e0026df8a23d20e139dec6693f2726e5d` |
+| collusion+RSU+logdistance (seed 11) — `test_config_knobs` | `53abb36711ae…806f3` | `939b4faa726853675f81453e2891bc155e2fa18ea58cac4edbdcba865df8ae2c` |
+| VRU+DENM (seed 13) — `test_config_knobs` | `4628e01edeb3…44d1` | `b3a01d40354c838ffc04c10dcdebf60cf8652b0b67ef694007128011c6d11d46` |
+| grid + traffic lights — `test_gap_acceptance`, `test_network_fidelity` | `b0bae9e4fc04…a0b8` | `fe1a58002f468b3124aa24fc26681fb9e69bb63df71e543650289e2034f699e6` |
+| multilane 6×6×3, lane_changes off — `test_lane_changes` | `38845a32f35e…a858` | `0a9e82ec549f876843ba39cce241ab28fdb39ea94900151d511e64e8c93f2277` |
+| ring (8 blocks) — `test_network_fidelity` ×2 | `ff1cddd82227…a989b` | `32133dd19efd90b280b7e6ea13e4dda6b23f33f605344c1fe3d740d95ea5da50` |
+| **reference run** `--flow --road grid --grid 6 --duration 300 --arrival-rate 2 --attacker-pct 0.15 --traffic-lights --seed 42` | `f0ec3cc0baa55a2f…f32c48` | `b25f2137cf14dd504d56bb88cd67cce273b6a6ac348f7c59ee6d3b4372257815` |
+| MOSAIC `gen_smoke` reference dataset (Java engine, same change set) | `b1789aeb90a2…c135a` | `c7efff8075ddba47724fb7d48306e94b7f127f2f781724e509866fb896e0d862` |
+
+22 pinned digest sites across 13 test files were re-pinned in the same change so the suite is never
+left red; each constant carries an inline `# ADR 0002 re-pin` note with its superseded value.
+`test_network_fidelity.py:55` pins `460b4cd04b0b…` in an *inequality* and was left alone; the
+ring-with-lights digest is now `205a0856f04c36e852fb6154b17624f4340909e3e30b7d768de7e366bbc8c8e2`.
+
+### Reproducibility contract re-verified
+
+- Reference config run twice into different directories → `b25f2137cf14dd50…` both times.
+- Same config, seed 43 → `0c54e935b11979ce5002efd2d229847ad6936bfab2fb578105817b77ca34515d`
+  (599 vehicles / 6585 reports / 139 revoked): a different seed still gives a different digest.
+- All seven re-pinned configs run twice each: every pair matched.
+- Full suite green: **656 passed in 725 s** (646 before `test_gt_kinematics.py` was added).
+
+### Heading convention (open, cross-engine)
+
+The Python engine writes `true_heading` in its native math convention — degrees **counter-clockwise
+from East**, `[0, 360)` (`run.py:667`; the detector bearing at `run.py:2823` matches). The
+MOSAIC/Java engine writes degrees **clockwise from North** (SUMO / ETSI EN 302 637-2). Both are
+self-consistent, but `true_heading`/`claimed_heading` mean different things in the two datasets.
+Rotating the Python convention would move every claimed heading, the `HeadingOffset` attack and the
+heading detector — behaviour, not schema — so it was deliberately **not** done here. The convention
+is instead declared in `manifest.conventions.heading`, and `realism_bench` detects it per track.
+Unifying on `deg_cw_from_north` remains a follow-up with its own digest move.
+
+### Stale artefacts for their owners
+
+`datasets/realism_baseline/python_flow_grid6/` (manifest still records `f0ec3cc0…`, emissions lack
+the new fields) needs regeneration by the baselines owner; that regeneration will also flip the
+harness's `kinematics_source` from differenced positions to ground truth, which is the point of the
+ADR. The scorecards in `docs/realism/baselines/` follow from it.

@@ -13,15 +13,23 @@ per-vehicle finite-difference speeds and accelerations, time-headway distributio
 (an edge proxy -- the dataset schema carries no edge id), an Edie-generalised fundamental diagram
 over space-time cells, and two hard sim-health counters (teleports, vehicle overlaps).
 
-The emission schema carries a true POSITION but no true speed, so speed and acceleration are finite
-differences -- and a finite difference of position measures whatever moved the position, including
-things that are not driving. SUMO changes lane by re-assigning the vehicle from one lane centreline
-to the next in a single step (``--lanechange.duration`` defaults to 0), which puts a whole lane width
-of sideways displacement inside one sample; differenced twice at a 0.1 s CAM interval that is a
-276 m/s^2 "acceleration". ``track_kinematics`` therefore splits every step into a LONGITUDINAL and a
-LATERAL component against a median-smoothed direction of travel, scores acceleration on the
-longitudinal component only, and publishes the lateral jumps as their own metric
-(``traffic.lateral_discontinuity_events``) instead of letting them masquerade as dynamics.
+KINEMATIC SOURCE (ADR 0002). Where the emission record carries the simulator's own ``true_speed`` /
+``true_heading``, those are used directly and the scorecard says so in ``kinematics_source`` (and in
+each affected metric's ``details.kinematics_source``). Where it does not -- every dataset generated
+before the ADR -- speed and acceleration are finite differences of the true POSITION, and a finite
+difference of position measures whatever moved the position, including things that are not driving.
+SUMO changes lane by re-assigning the vehicle from one lane centreline to the next in a single step
+(``--lanechange.duration`` defaults to 0), which puts a whole lane width of sideways displacement
+inside one sample; differenced twice at a 0.1 s CAM interval that is a 276 m/s^2 "acceleration".
+``track_kinematics`` therefore splits every step into a LONGITUDINAL and a LATERAL component against
+a median-smoothed direction of travel, scores acceleration on the longitudinal component only, and
+publishes the lateral jumps as their own metric (``traffic.lateral_discontinuity_events``) instead of
+letting them masquerade as dynamics.
+
+Every finite difference -- acceleration AND the lateral discontinuity count, and the vehicle-km each
+is normalised by -- is taken over sample pairs no wider than ``MAX_FD_DT_S``. Nothing about a wider
+gap is a measurement of the vehicle's motion, so a sub-sampled dataset degrades to ``na`` rather than
+reporting where a vehicle got to while nobody was looking.
 
 COMM panel (from ``ma/ma_reports.jsonl`` + ``ground_truth/gt_report_labels.jsonl`` + emissions):
 a PDR-vs-distance curve reconstructed from HONEST (false-positive) report links, the neighbour
@@ -86,6 +94,12 @@ MAX_TIME_BUCKETS = 240     # cap on co-presence snapshots examined (deterministi
 MAX_VEH_PER_BUCKET = 400   # cap on vehicles per snapshot (deterministic: lowest vehicle ids first)
 MOSAIC_ART_MAX_M = 1000.0  # ScmsBeaconApp ART_MAX_M default (env SCMS_ART_MAX_M), MOSAIC layer
 FULL_TRACE_MIN_PROB = 0.999   # emit_sample_prob at/above this counts as a full trace
+# --- ADR 0002: true speed / heading in the ground-truth record (consumed WHEN PRESENT) -----------
+GT_SPEED_FIELD = "true_speed"      # ORACLE scalar speed at emission time, m/s
+GT_HEADING_FIELD = "true_heading"  # ORACLE heading at emission time; the convention is DETECTED
+GT_MIN_STEPS = 30          # usable moving steps needed before a ground-truth field is trusted
+GT_HEADING_MAX_RESIDUAL_DEG = 20.0    # ... and the detected convention must fit the chords this well
+GT_SPEED_MAX_RESIDUAL_MPS = 3.0       # ... and the speed must agree with the chord speed this well
 
 # Metric severity. "hard" failures gate CI (corpus_report --realism); "soft" ones are tracked.
 HARD = "hard"
@@ -319,8 +333,14 @@ def build_tracks(emissions: list[dict]) -> dict[str, dict]:
     Uses ``true_x``/``true_y`` -- the simulator's own state -- so falsified CAMs never distort a
     mobility metric (an attacker's car still drives like a car). Returns ``{vid: {t, x, y}}`` with
     numpy arrays.
+
+    ADR 0002 adds ``true_speed`` / ``true_heading`` to the emission record. Where a vehicle carries
+    EVERY one of its samples' values they are collected alongside as ``v`` / ``h_raw`` (raw, not yet
+    unit- or convention-resolved -- that is ``ground_truth_kinematics``'s job). A track missing the
+    field on any sample keeps neither, so a partially-populated field can never be silently
+    interpolated. Older datasets simply carry no such key and take the differencing path.
     """
-    per: dict[str, dict[float, tuple[float, float]]] = {}
+    per: dict[str, dict[float, tuple]] = {}
     for e in emissions:
         vid = e.get("true_vehicle_id")
         if vid is None:
@@ -329,18 +349,161 @@ def build_tracks(emissions: list[dict]) -> dict[str, dict]:
             t = float(e["t"]); x = float(e["true_x"]); y = float(e["true_y"])
         except (KeyError, TypeError, ValueError):
             continue
-        per.setdefault(str(vid), {})[round(t, 6)] = (x, y)
+        v = h = None
+        try:
+            if e.get(GT_SPEED_FIELD) is not None:
+                v = float(e[GT_SPEED_FIELD])
+        except (TypeError, ValueError):
+            v = None
+        try:
+            if e.get(GT_HEADING_FIELD) is not None:
+                h = float(e[GT_HEADING_FIELD])
+        except (TypeError, ValueError):
+            h = None
+        per.setdefault(str(vid), {})[round(t, 6)] = (x, y, v, h)
     tracks: dict[str, dict] = {}
     for vid in sorted(per):
         ts = sorted(per[vid])
         if len(ts) < 2:
             continue
-        tracks[vid] = {
+        rows = [per[vid][t] for t in ts]
+        tr = {
             "t": np.array(ts, dtype=float),
-            "x": np.array([per[vid][t][0] for t in ts], dtype=float),
-            "y": np.array([per[vid][t][1] for t in ts], dtype=float),
+            "x": np.array([r[0] for r in rows], dtype=float),
+            "y": np.array([r[1] for r in rows], dtype=float),
         }
+        if all(r[2] is not None and math.isfinite(r[2]) for r in rows):
+            tr["v"] = np.array([r[2] for r in rows], dtype=float)
+        if all(r[3] is not None and math.isfinite(r[3]) for r in rows):
+            tr["h_raw"] = np.array([r[3] for r in rows], dtype=float)
+        tracks[vid] = tr
     return tracks
+
+
+# --- ADR 0002: resolving the ground-truth kinematic fields ---------------------------------------
+# The harness does not own the emission schema (another change adds the fields), so it must not
+# assume a unit or an angle convention. Each candidate below maps the RAW stored number onto the
+# harness's internal convention -- radians, counter-clockwise, zero due east -- and the one that
+# actually fits the observed chord bearings is selected and REPORTED. A field that fits none of
+# them is rejected and the position-differencing path is used instead, which is the only safe
+# default: a 90-degree convention error would silently rotate the whole lateral decomposition.
+HEADING_CONVENTIONS = {
+    "deg_ccw_from_east": lambda h: np.radians(h),                    # mock_pipeline (run.py:667)
+    "deg_cw_from_north": lambda h: np.radians(90.0 - h),             # SUMO / ETSI CAM heading
+    "rad_ccw_from_east": lambda h: np.asarray(h, dtype=float),
+    "rad_cw_from_north": lambda h: (math.pi / 2.0) - np.asarray(h, dtype=float),
+}
+
+
+def ground_truth_kinematics(tracks: dict[str, dict], max_dt: float = MAX_FD_DT_S) -> dict:
+    """Decide whether ``true_speed`` / ``true_heading`` can be trusted, and how to read the heading.
+
+    Both fields are VALIDATED against the geometry the harness can already measure, over the steps
+    where that geometry is meaningful (inside the finite-difference ceiling, at least 1 m of travel):
+
+      * heading -- every candidate convention is scored by the median absolute angle between the
+        step's mean stored heading and its chord bearing; the best is taken if it fits within
+        ``GT_HEADING_MAX_RESIDUAL_DEG``;
+      * speed -- accepted if the median |mean stored speed - chord speed| is within
+        ``GT_SPEED_MAX_RESIDUAL_MPS`` (a km/h field, or a field in the wrong frame, fails this).
+
+    A field is also required on EVERY track, not most of them: a half-migrated dataset would
+    otherwise put first differences of a measured speed and second differences of position in the
+    same panel, and one number would be an average of two estimators.
+
+    Returns a machine-readable descriptor; ``used`` is what the panel branches on and every metric
+    computed from the field copies ``source`` into its own ``details``.
+    """
+    n_tracks = len(tracks)
+    n_with_v = sum(1 for tr in tracks.values() if "v" in tr)
+    n_with_h = sum(1 for tr in tracks.values() if "h_raw" in tr)
+    bear, chord_v, hh = [], [], []
+    for vid in sorted(tracks):
+        tr = tracks[vid]
+        t, x, y = tr["t"], tr["x"], tr["y"]
+        dt = np.diff(t)
+        d = np.hypot(np.diff(x), np.diff(y))
+        m = (dt > 0.0) & (dt <= float(max_dt)) & (d >= 1.0)
+        if not m.any():
+            continue
+        b = np.arctan2(np.diff(y), np.diff(x))[m]
+        if "v" in tr:
+            chord_v.append(np.stack([(tr["v"][:-1] + tr["v"][1:])[m] * 0.5, (d / dt)[m]]))
+        if "h_raw" in tr:
+            hh.append(np.stack([tr["h_raw"][:-1][m], tr["h_raw"][1:][m], b]))
+        bear.append(b)
+    out = {
+        "speed": {"field": GT_SPEED_FIELD, "present_tracks": n_with_v, "total_tracks": n_tracks,
+                  "used": False, "source": "position finite difference"},
+        "heading": {"field": GT_HEADING_FIELD, "present_tracks": n_with_h, "total_tracks": n_tracks,
+                    "used": False, "convention": None, "source": "median-smoothed chord bearing"},
+    }
+    partial = ("only {n} of " + str(n_tracks) + " tracks carry {f} on every sample; a partial field "
+               "would mix two estimators inside one panel")
+    if not bear:
+        out["speed"]["reason"] = out["heading"]["reason"] = "no usable moving steps to validate against"
+        return out
+
+    if not n_with_v:
+        out["speed"]["reason"] = f"no track carries {GT_SPEED_FIELD} on every sample"
+    elif n_with_v < n_tracks:
+        out["speed"]["reason"] = partial.format(n=n_with_v, f=GT_SPEED_FIELD)
+    elif chord_v:
+        cv = np.concatenate(chord_v, axis=1)
+        n = int(cv.shape[1])
+        res = float(np.median(np.abs(cv[0] - cv[1]))) if n else float("inf")
+        out["speed"].update({"validated_steps": n, "residual_vs_chord_speed_mps": _r(res, 4)})
+        if n < GT_MIN_STEPS:
+            out["speed"]["reason"] = f"only {n} validated steps (need {GT_MIN_STEPS})"
+        elif not (res <= GT_SPEED_MAX_RESIDUAL_MPS):
+            out["speed"]["reason"] = (f"median |true_speed - chord speed| = {res:.3f} m/s exceeds "
+                                      f"{GT_SPEED_MAX_RESIDUAL_MPS:g} m/s (wrong unit or frame)")
+        else:
+            out["speed"].update({"used": True, "source": f"ground truth {GT_SPEED_FIELD}"})
+    else:
+        out["speed"]["reason"] = "no track carrying it has a usable moving step to validate against"
+
+    if not n_with_h:
+        out["heading"]["reason"] = f"no track carries {GT_HEADING_FIELD} on every sample"
+    elif n_with_h < n_tracks:
+        out["heading"]["reason"] = partial.format(n=n_with_h, f=GT_HEADING_FIELD)
+    elif hh:
+        ha = np.concatenate(hh, axis=1)
+        n = int(ha.shape[1])
+        scores = {}
+        for name, conv in HEADING_CONVENTIONS.items():
+            a, b = conv(ha[0]), conv(ha[1])
+            mid = np.arctan2(np.sin(a) + np.sin(b), np.cos(a) + np.cos(b))
+            scores[name] = float(np.degrees(np.median(np.abs(_ang_diff(mid, ha[2]))))) if n else 999.0
+        best = min(sorted(scores), key=lambda k: scores[k])
+        out["heading"].update({"validated_steps": n,
+                               "convention_residuals_deg": {k: _r(v, 3) for k, v in
+                                                            sorted(scores.items())}})
+        if n < GT_MIN_STEPS:
+            out["heading"]["reason"] = f"only {n} validated steps (need {GT_MIN_STEPS})"
+        elif not (scores[best] <= GT_HEADING_MAX_RESIDUAL_DEG):
+            out["heading"]["reason"] = (
+                f"no heading convention fits the chord bearings (best {best} at "
+                f"{scores[best]:.2f} deg > {GT_HEADING_MAX_RESIDUAL_DEG:g} deg)")
+        else:
+            out["heading"].update({"used": True, "convention": best,
+                                   "residual_deg": _r(scores[best], 3),
+                                   "source": f"ground truth {GT_HEADING_FIELD} ({best})"})
+    else:
+        out["heading"]["reason"] = "no track carrying it has a usable moving step to validate against"
+    return out
+
+
+def _track_gt(tr: dict, gt: dict | None) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """(true_speed, true_heading-in-radians-ccw-from-east) for one track, or (None, None) per field."""
+    if not gt:
+        return None, None
+    v = tr.get("v") if (gt.get("speed", {}).get("used") and "v" in tr) else None
+    h = None
+    hc = gt.get("heading", {})
+    if hc.get("used") and "h_raw" in tr:
+        h = HEADING_CONVENTIONS[hc["convention"]](tr["h_raw"])
+    return v, h
 
 
 def _ang_diff(a, b):
@@ -407,8 +570,26 @@ def smoothed_heading(ang: np.ndarray, usable: np.ndarray,
 
 def track_kinematics(t: np.ndarray, x: np.ndarray, y: np.ndarray, *,
                      max_dt: float = MAX_FD_DT_S,
-                     speed_bound_mps: float | None = None) -> dict:
+                     speed_bound_mps: float | None = None,
+                     true_speed: np.ndarray | None = None,
+                     true_heading: np.ndarray | None = None) -> dict:
     """Decompose ONE vehicle's samples into longitudinal / lateral motion and differentiate.
+
+    ADR 0002 (ground-truth kinematics). When `true_speed` / `true_heading` are supplied -- already
+    validated and unit-resolved by ``ground_truth_kinematics`` -- they REPLACE the corresponding
+    reconstruction, and the estimator gets strictly simpler:
+
+      * `true_heading` gives the direction of travel directly (the circular mean of the step's two
+        endpoint headings), so the median smoothing, the "witness" search and the raw-heading
+        stability test are all unnecessary: a lane change is a step whose heading did NOT turn, read
+        off the heading itself instead of inferred from neighbouring chords;
+      * `true_speed` turns acceleration into a FIRST difference of a measured quantity over one
+        sampling interval, rather than a second difference of position. Nothing has to be screened
+        out except a teleport (which the teleport gate already counts), because the artefacts the
+        screen exists for -- lane-change teleports, backward remaps, the partial insertion/arrival
+        steps at each end of a track -- are all artefacts of DIFFERENCING POSITION and cannot reach
+        a speed the simulator reported itself. ``accel_pair_dt`` then carries the STEP gap `dt`
+        rather than the midpoint separation, because the difference spans one step, not two.
 
     Per consecutive-sample step the displacement is split against the smoothed direction of travel
     into a LONGITUDINAL component (along the vehicle's own heading) and a LATERAL one (across it).
@@ -428,9 +609,20 @@ def track_kinematics(t: np.ndarray, x: np.ndarray, y: np.ndarray, *,
 
       * ``lateral_screen`` -- at least ``LATERAL_SCREEN_M`` sideways at more than
         ``LATERAL_SPEED_MAX_MPS``, with the headings either side agreeing (so a corner is not
-        mistaken for a jump). ``lateral`` is its lane-width-scale subset (>= ``LATERAL_JUMP_M``),
-        which is what ``traffic.lateral_discontinuity_events`` reports: a half-metre partial lane
-        offset corrupts a 0.1 s difference just as badly, but it is not a lane change;
+        mistaken for a jump). ``lateral`` is its lane-width-scale subset (>= ``LATERAL_JUMP_M``)
+        RESTRICTED TO ``lateral_scan``, which is what ``traffic.lateral_discontinuity_events``
+        reports: a half-metre partial lane offset corrupts a 0.1 s difference just as badly, but it
+        is not a lane change. ``lateral_scan`` marks the steps on which the count is even DEFINED --
+        the step's own gap inside ``max_dt``, plus (when the heading is inferred) the
+        ``HEADING_WINDOW_PAIRS`` steps either side that the inference reads. It is the same trust
+        ceiling the acceleration series applies and it is not optional: across a 10 s sampling gap
+        the "lateral" component is simply where the vehicle got to while unobserved. Measured on a
+        0.02-sampled InTAS run, 473 of 535 flagged events sat on gaps wider than the ceiling (median
+        gap 10.2 s, maximum "lateral offset" 891.7 m), and masking the step alone still left offsets
+        of 31.4 m inside a <= 2 s gap because the median heading window reached across the 10 s gaps
+        on either side. ``lateral_screen`` itself is left unmasked because its only consumers (the
+        acceleration screen and the longitudinal projection) are already gated on the PAIR mask,
+        which requires both of a pair's steps to be inside the ceiling;
       * ``reversal`` -- the vehicle's next sample is more than ``REVERSAL_M`` BEHIND it, SUMO's
         longitudinal twin of the same lane/edge position remapping;
       * ``teleport`` -- a mean speed above `speed_bound_mps`, already counted by
@@ -451,10 +643,19 @@ def track_kinematics(t: np.ndarray, x: np.ndarray, y: np.ndarray, *,
         return {"n": 0, "dt": empty, "dist": empty, "heading": empty, "heading_smooth": empty,
                 "d_long": empty, "d_lat": empty, "speed_long": empty, "lateral_speed": empty,
                 "lateral": z, "lateral_screen": z, "reversal": z, "teleport": z, "boundary": z,
+                "lateral_scan": z,
                 "accel": empty, "accel_pair_dt": empty, "accel_all": empty,
-                "accel_all_pair_dt": empty,
+                "accel_all_pair_dt": empty, "sample_speed": np.asarray(true_speed, dtype=float)
+                if true_speed is not None else empty,
                 "n_excl": {"boundary": 0, "lateral": 0, "reversal": 0, "teleport": 0}}
-    hs = smoothed_heading(ang, dist >= HEADING_MIN_DISP_M)
+    step_usable = (dt > 0.0) & (dt <= float(max_dt))
+    tv = np.asarray(true_speed, dtype=float) if true_speed is not None else None
+    th = np.asarray(true_heading, dtype=float) if true_heading is not None else None
+    if th is not None:
+        # the vehicle's own heading, averaged over the step: no smoothing, no witness search
+        hs = np.arctan2(np.sin(th[:-1]) + np.sin(th[1:]), np.cos(th[:-1]) + np.cos(th[1:]))
+    else:
+        hs = smoothed_heading(ang, dist >= HEADING_MIN_DISP_M)
     ux, uy = np.cos(hs), np.sin(hs)
     proj = dx * ux + dy * uy
     d_lat = dy * ux - dx * uy
@@ -471,41 +672,75 @@ def track_kinematics(t: np.ndarray, x: np.ndarray, y: np.ndarray, *,
     # cannot turn fast enough and would call a corner "stable". The first and last step of a track
     # have no evidence on one side, so they are not scanned at all.
     tol = math.radians(HEADING_STABLE_TOL_DEG)
-    ang_eff = np.where(dist >= HEADING_MIN_DISP_M, ang, hs)
-    # The witnesses are the nearest steps either side that are not themselves suspect: a lane change
-    # immediately followed by a second one would otherwise vouch for its own neighbour's rogue
-    # heading and both would go uncounted (veh_115 in the InTAS run does exactly this, 3.2 m one way
-    # then 6.4 m back inside 0.4 s). Witnesses are looked for at most HEADING_WINDOW_PAIRS steps out.
-    suspect = (lat_speed > LATERAL_SPEED_MAX_MPS) & (np.abs(d_lat) >= LATERAL_SCREEN_M)
-    ix = np.arange(n)
-    prev_ok = np.concatenate(([-1], np.maximum.accumulate(np.where(~suspect, ix, -1))[:-1]))
-    nxt = np.minimum.accumulate(np.where(~suspect, ix, n)[::-1])[::-1]
-    next_ok = np.concatenate((nxt[1:], [n]))
-    has_witness = ((prev_ok >= 0) & (next_ok < n)
-                   & ((ix - prev_ok) <= HEADING_WINDOW_PAIRS)
-                   & ((next_ok - ix) <= HEADING_WINDOW_PAIRS))
-    stable = np.zeros(n, dtype=bool)
-    if has_witness.any():
-        w = np.flatnonzero(has_witness)
-        stable[w] = np.abs(_ang_diff(ang_eff[next_ok[w]], ang_eff[prev_ok[w]])) <= tol
+    if th is not None:
+        # the vehicle reports where it is pointing, so "did it turn?" needs no inference at all
+        stable = np.abs(_ang_diff(th[1:], th[:-1])) <= tol
+    else:
+        ang_eff = np.where(dist >= HEADING_MIN_DISP_M, ang, hs)
+        # The witnesses are the nearest steps either side that are not themselves suspect: a lane
+        # change immediately followed by a second one would otherwise vouch for its own neighbour's
+        # rogue heading and both would go uncounted (veh_115 in the InTAS run does exactly this,
+        # 3.2 m one way then 6.4 m back inside 0.4 s). Witnesses are looked for at most
+        # HEADING_WINDOW_PAIRS steps out.
+        suspect = (lat_speed > LATERAL_SPEED_MAX_MPS) & (np.abs(d_lat) >= LATERAL_SCREEN_M)
+        ix = np.arange(n)
+        prev_ok = np.concatenate(([-1], np.maximum.accumulate(np.where(~suspect, ix, -1))[:-1]))
+        nxt = np.minimum.accumulate(np.where(~suspect, ix, n)[::-1])[::-1]
+        next_ok = np.concatenate((nxt[1:], [n]))
+        has_witness = ((prev_ok >= 0) & (next_ok < n)
+                       & ((ix - prev_ok) <= HEADING_WINDOW_PAIRS)
+                       & ((next_ok - ix) <= HEADING_WINDOW_PAIRS))
+        stable = np.zeros(n, dtype=bool)
+        if has_witness.any():
+            w = np.flatnonzero(has_witness)
+            stable[w] = np.abs(_ang_diff(ang_eff[next_ok[w]], ang_eff[prev_ok[w]])) <= tol
 
     jumped = (lat_speed > LATERAL_SPEED_MAX_MPS) & stable
     lateral_screen = jumped & (np.abs(d_lat) >= LATERAL_SCREEN_M)
-    lateral = jumped & (np.abs(d_lat) >= LATERAL_JUMP_M)     # the lane-width-scale REPORTED subset
-    d_long = np.where(lateral_screen, proj, np.where(proj >= 0.0, dist, -dist))
-    reversal = d_long < -REVERSAL_M
+    # Which steps the lateral count may be SCANNED on. The step itself must be inside the ceiling --
+    # and, when the direction of travel is INFERRED, so must the +-window_pairs steps the inference
+    # reads, because a "lateral offset" is only as meaningful as the heading it is measured across.
+    # (Measured on a 0.02-sampled InTAS run: masking the step alone still left offsets up to 31.4 m
+    # inside a <=2 s gap, because the median window reached across 10 s gaps either side of it.)
+    # With a ground-truth heading there is no window and no inference, so the step's own gap is the
+    # whole requirement.
+    lateral_scan = step_usable.copy()
+    if th is None:
+        for s in range(1, max(1, int(HEADING_WINDOW_PAIRS)) + 1):
+            lateral_scan[s:] &= step_usable[:-s]      # ... and at a track end, whatever exists
+            lateral_scan[:-s] &= step_usable[s:]
+    # the lane-width-scale REPORTED subset -- over the scannable steps ONLY (see above)
+    lateral = jumped & (np.abs(d_lat) >= LATERAL_JUMP_M) & lateral_scan
+    d_long = (proj if th is not None else
+              np.where(lateral_screen, proj, np.where(proj >= 0.0, dist, -dist)))
+    # same ceiling, same reason: 10 s later a vehicle can legitimately be 100 m "behind" itself
+    reversal = (d_long < -REVERSAL_M) & step_usable
     teleport = ((mean_speed > float(speed_bound_mps))
                 if (speed_bound_mps is not None and float(speed_bound_mps) > 0.0) else z.copy())
     boundary = z.copy()
     boundary[0] = True
     boundary[-1] = True
     with np.errstate(divide="ignore", invalid="ignore"):
-        speed_long = np.where(pos_dt, d_long / np.where(pos_dt, dt, 1.0), np.nan)
+        speed_long = (0.5 * (tv[:-1] + tv[1:]) if tv is not None else
+                      np.where(pos_dt, d_long / np.where(pos_dt, dt, 1.0), np.nan))
 
     out = {"n": n, "dt": dt, "dist": dist, "heading": ang, "heading_smooth": hs,
            "d_long": d_long, "d_lat": d_lat, "speed_long": speed_long, "lateral_speed": lat_speed,
            "lateral": lateral, "lateral_screen": lateral_screen, "reversal": reversal,
-           "teleport": teleport, "boundary": boundary}
+           "teleport": teleport, "boundary": boundary, "lateral_scan": lateral_scan,
+           "sample_speed": (tv if tv is not None else np.zeros(0, dtype=float))}
+    if tv is not None:
+        # ADR 0002: a FIRST difference of a measured speed over ONE step. Only the teleport screen
+        # survives (its step is already a HARD failure of its own metric); the boundary / lateral /
+        # reversal screens exist to protect a position double-difference and have nothing to do here.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            acc = np.where(pos_dt, (tv[1:] - tv[:-1]) / np.where(pos_dt, dt, 1.0), np.nan)
+        clean = step_usable & ~teleport
+        out.update({"accel": acc[clean], "accel_pair_dt": dt[clean],
+                    "accel_all": acc[step_usable], "accel_all_pair_dt": dt[step_usable],
+                    "n_excl": {"boundary": 0, "lateral": 0, "reversal": 0,
+                               "teleport": int((step_usable & teleport).sum())}})
+        return out
     if n < 2:
         empty = np.zeros(0, dtype=float)
         out.update({"accel": empty, "accel_pair_dt": empty, "accel_all": empty,
@@ -534,30 +769,41 @@ def track_kinematics(t: np.ndarray, x: np.ndarray, y: np.ndarray, *,
 
 
 _KIN_PAIR_COLS = ("dt", "dist", "heading", "heading_smooth", "d_long", "d_lat", "speed_long",
-                  "lateral_speed", "lateral", "lateral_screen", "reversal", "teleport", "boundary")
-_KIN_BOOL_COLS = ("lateral", "lateral_screen", "reversal", "teleport", "boundary")
+                  "lateral_speed", "lateral", "lateral_screen", "reversal", "teleport", "boundary",
+                  "lateral_scan")
+_KIN_BOOL_COLS = ("lateral", "lateral_screen", "reversal", "teleport", "boundary", "lateral_scan")
 
 
 def kinematics(tracks: dict[str, dict], max_dt: float = MAX_FD_DT_S,
-               speed_bound_mps: float | None = None) -> dict:
+               speed_bound_mps: float | None = None, gt: dict | None = None) -> dict:
     """``track_kinematics`` over every vehicle, concatenated in sorted-vehicle order.
 
     Adds the per-vehicle bookkeeping ``segment_table`` and the traffic panel need: which pairs are
     inside the finite-difference gap ceiling (``usable``), the owning vehicle index, and the totals
     the lateral-discontinuity rate is normalised by (path length -> vehicle-km).
+
+    ``gt`` is the descriptor from ``ground_truth_kinematics``; when it accepts a field, every track
+    that carries it is differentiated the ADR-0002 way and the rest fall back per track, so a
+    dataset in which only some vehicles carry the field still scores (the descriptor records how
+    many did). ``path_m`` is the vehicle-km denominator and covers ONLY steps inside the ceiling --
+    the rate and its numerator must be measured over the same subset of the trace.
     """
     vids = sorted(tracks)
     cols: dict[str, list] = {c: [] for c in _KIN_PAIR_COLS}
     extra: dict[str, list] = {"vid_i": [], "t_end": [], "t_mid": [], "x_mid": [], "y_mid": [],
                               "x_end": [], "y_end": []}
-    acc, acc_dt, acc_all, acc_all_dt = [], [], [], []
+    acc, acc_dt, acc_all, acc_all_dt, samp_v = [], [], [], [], []
     n_excl = {"boundary": 0, "lateral": 0, "reversal": 0, "teleport": 0}
     for i, vid in enumerate(vids):
         tr = tracks[vid]
         t, x, y = tr["t"], tr["x"], tr["y"]
-        k = track_kinematics(t, x, y, max_dt=max_dt, speed_bound_mps=speed_bound_mps)
+        tv, th = _track_gt(tr, gt)
+        k = track_kinematics(t, x, y, max_dt=max_dt, speed_bound_mps=speed_bound_mps,
+                             true_speed=tv, true_heading=th)
         if not k["n"]:
             continue
+        if k["sample_speed"].size:
+            samp_v.append(k["sample_speed"])
         for c in _KIN_PAIR_COLS:
             cols[c].append(k[c])
         extra["vid_i"].append(np.full(k["n"], i, dtype=np.int64))
@@ -575,7 +821,7 @@ def kinematics(tracks: dict[str, dict], max_dt: float = MAX_FD_DT_S,
         out.update({k: e for k in extra})
         out.update({"n": 0, "vehicles": vids, "usable": np.zeros(0, dtype=bool),
                     "accel": e, "accel_pair_dt": e, "accel_all": e, "accel_all_pair_dt": e,
-                    "n_excl": n_excl, "path_m": 0.0})
+                    "n_excl": n_excl, "path_m": 0.0, "path_m_all": 0.0, "sample_speed": e})
         return out
     cat = np.concatenate
     out = {c: cat(cols[c]) for c in _KIN_PAIR_COLS}
@@ -583,9 +829,12 @@ def kinematics(tracks: dict[str, dict], max_dt: float = MAX_FD_DT_S,
     out["n"] = int(out["dt"].size)
     out["vehicles"] = vids
     out["usable"] = (out["dt"] > 0.0) & (out["dt"] <= max_dt)
+    out["sample_speed"] = cat(samp_v) if samp_v else np.zeros(0, dtype=float)
     # vehicle-km is distance driven ALONG the road, so a lane-change teleport's sideways component
-    # must not pad the denominator of the rate it is being counted against.
-    out["path_m"] = float(np.abs(out["d_long"]).sum())
+    # must not pad the denominator of the rate it is being counted against -- and only the steps the
+    # numerator can be counted on (``lateral_scan``) belong in the denominator at all.
+    out["path_m"] = float(np.abs(out["d_long"][out["lateral_scan"]]).sum())
+    out["path_m_all"] = float(np.abs(out["d_long"]).sum())
     out["accel"] = cat(acc) if acc else np.zeros(0)
     out["accel_pair_dt"] = cat(acc_dt) if acc_dt else np.zeros(0)
     out["accel_all"] = cat(acc_all) if acc_all else np.zeros(0)
@@ -595,7 +844,7 @@ def kinematics(tracks: dict[str, dict], max_dt: float = MAX_FD_DT_S,
 
 
 def segment_table(tracks: dict[str, dict], max_dt: float = MAX_FD_DT_S,
-                  kin: dict | None = None) -> dict:
+                  kin: dict | None = None, gt: dict | None = None) -> dict:
     """Finite-difference segments between consecutive samples of the same vehicle.
 
     Returns column arrays over every usable segment (0 < dt <= max_dt): the segment mid-point in
@@ -607,7 +856,7 @@ def segment_table(tracks: dict[str, dict], max_dt: float = MAX_FD_DT_S,
     distance actually travelled, and the leader search wants the geometric step direction);
     ``speed_long``/``heading_smooth``/``d_lat`` carry the decomposition from ``track_kinematics``.
     """
-    k = kin if kin is not None else kinematics(tracks, max_dt)
+    k = kin if kin is not None else kinematics(tracks, max_dt, gt=gt)
     vids = k.get("vehicles", sorted(tracks))
     if not k.get("n"):
         return {"n": 0, "n_dropped_gap": 0, "vehicles": vids}
@@ -628,7 +877,8 @@ def segment_table(tracks: dict[str, dict], max_dt: float = MAX_FD_DT_S,
     }
 
 
-def accelerations(tracks: dict[str, dict], max_dt: float = MAX_FD_DT_S) -> np.ndarray:
+def accelerations(tracks: dict[str, dict], max_dt: float = MAX_FD_DT_S,
+                  gt: dict | None = None) -> np.ndarray:
     """LONGITUDINAL accelerations over consecutive steps of one vehicle.
 
     Second finite difference of the longitudinal speed (see ``track_kinematics``), screened of the
@@ -636,8 +886,11 @@ def accelerations(tracks: dict[str, dict], max_dt: float = MAX_FD_DT_S) -> np.nd
     backward position remaps, teleports and the two partial steps at each end of a track. Every
     screened class is counted and published by its own scorecard metric, and the unscreened series
     is available as ``kinematics(tracks)["accel_all"]``.
+
+    With a ``gt`` descriptor that accepts ``true_speed`` this is instead a first difference of the
+    simulator's own speed and nothing is screened but teleports (ADR 0002).
     """
-    return kinematics(tracks, max_dt)["accel"]
+    return kinematics(tracks, max_dt, gt=gt)["accel"]
 
 
 def teleport_events(tracks: dict[str, dict], speed_bound_mps: float) -> tuple[int, int]:
@@ -985,17 +1238,22 @@ def _wave_speed_kmh(fd: dict) -> tuple[float | None, int]:
 
 def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
                   fd_cell_m: float = FD_CELL_M, fd_window_s: float = FD_WINDOW_S,
-                  regime: str | None = None) -> list[dict]:
+                  regime: str | None = None, gt: dict | None = None) -> list[dict]:
     P = "traffic"
     out: list[dict] = []
     # No early return on empty input: every metric below degrades to "na" with its own reason, so the
     # panel always has the SAME shape and a consumer can index it by metric id unconditionally.
     tracks = build_tracks(emissions)
+    # ADR 0002: use the simulator's own speed/heading where the record carries them, and record per
+    # metric which path produced it, so a scorecard can never be compared across the two silently.
+    gt = ground_truth_kinematics(tracks) if gt is None else gt
+    src_v = gt["speed"]["source"]
+    src_h = gt["heading"]["source"]
     # the teleport bound is needed BEFORE the decomposition: a step that the teleport gate already
     # counts must not be counted a second time as an acceleration failure.
     sp_ref = _ref(refdata, "kinematics.speed_hard_bound_mps")
     tele_lim = float((sp_ref or {}).get("range", [0.0, 60.0])[1])
-    kin = kinematics(tracks, MAX_FD_DT_S, speed_bound_mps=tele_lim)
+    kin = kinematics(tracks, MAX_FD_DT_S, speed_bound_mps=tele_lim, gt=gt)
     segs = segment_table(tracks, MAX_FD_DT_S, kin=kin)
     n_seg = int(segs.get("n", 0))
     out.append(_metric(
@@ -1006,7 +1264,8 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
         extra={"vehicles_with_track": len(tracks),
                "segments_dropped_sampling_gap": int(segs.get("n_dropped_gap", 0)),
                "max_finite_difference_dt_s": MAX_FD_DT_S,
-               "emit_sample_prob": probe["emit_sample_prob"]}))
+               "emit_sample_prob": probe["emit_sample_prob"],
+               "kinematics_source": gt}))
 
     thin = None if probe["full_trace"] else (
         f"emissions are a {probe['emit_sample_prob']:.3g} sample (emit_sample_prob < "
@@ -1019,7 +1278,15 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
     # ---- speeds -------------------------------------------------------------------------------
     # LONGITUDINAL speed: on a lane-change step the raw chord divides a whole lane width by one
     # sample interval, which at dt=0.1 s reads back as ~33 m/s of forward motion that never happened.
-    spd = segs["speed_long"] if n_seg else np.zeros(0)
+    # ... unless the record carries the simulator's own speed, in which case no reconstruction of any
+    # kind is involved and the sample is every emitted sample rather than every usable step (ADR 0002).
+    gt_speed = bool(gt["speed"]["used"]) and kin.get("sample_speed", np.zeros(0)).size > 0
+    spd = kin["sample_speed"] if gt_speed else (segs["speed_long"] if n_seg else np.zeros(0))
+    n_spd = int(spd.size) if gt_speed else n_seg
+    spd_few = (None if n_spd >= MIN_SAMPLES else few or
+               f"only {n_spd} true-speed samples (need {MIN_SAMPLES})")
+    spd_src = ("ground truth true_speed, one value per emitted sample" if gt_speed else
+               "longitudinal component of the true_x/true_y finite difference")
     reg = regime or probe.get("regime")
     reg_reason = None if reg else ("traffic regime unknown for this dataset (no road_network in the "
                                    "manifest); pass --regime urban|highway to score speed bands")
@@ -1027,29 +1294,43 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
         ref = _ref(refdata, f"traffic_regimes.{reg}.speed_{label}_mps") if reg else None
         out.append(_metric(
             f"traffic.speed_{label}_mps", P, f"Benign true speed {label} ({reg or 'regime unknown'})",
-            _pct(spd, q), "m/s", n_seg, ref, SOFT,
-            reason=few or reg_reason,
-            extra={"regime": reg,
-                   "source_field": "longitudinal component of the true_x/true_y finite difference"}))
+            _pct(spd, q), "m/s", n_spd, ref, SOFT,
+            reason=spd_few or reg_reason,
+            extra={"regime": reg, "kinematics_source": src_v, "source_field": spd_src}))
     out.append(_metric(
-        "traffic.speed_max_mps", P, "Maximum finite-difference speed",
-        float(spd.max()) if spd.size else None, "m/s", n_seg,
-        _ref(refdata, "kinematics.speed_hard_bound_mps"), SOFT, reason=few,
+        "traffic.speed_max_mps", P,
+        "Maximum true speed" if gt_speed else "Maximum finite-difference speed",
+        float(spd.max()) if spd.size else None, "m/s", n_spd,
+        _ref(refdata, "kinematics.speed_hard_bound_mps"), SOFT, reason=spd_few,
         extra={"speed_max_raw_chord_mps": _r(float(segs["speed"].max()) if n_seg else None),
-               "note": "value is longitudinal; the raw chord speed is shown for comparison"}))
+               "kinematics_source": src_v, "source_field": spd_src,
+               "note": ("value is the simulator's own speed; the raw chord speed is shown for "
+                        "comparison" if gt_speed else
+                        "value is longitudinal; the raw chord speed is shown for comparison")}))
 
     # ---- lateral position continuity -------------------------------------------------------------
     # This is the metric that EXPOSES the artefact the acceleration screen removes, so it comes
     # first: without a lane-change teleport counter, screening those steps out of the acceleration
     # series would delete the evidence instead of relocating it.
-    n_pair = int(kin.get("n", 0))
+    # A lane change is a claim about ONE sampling interval, so -- exactly like the acceleration
+    # series -- both the count and the vehicle-km it is divided by are taken over the steps inside
+    # the finite-difference ceiling and nowhere else. Without that mask this metric is invalid at
+    # any emit_sample_prob < 1: see the docstring of track_kinematics for the measured overstatement.
+    n_pair_all = int(kin.get("n", 0))
+    use = kin["lateral_scan"] if n_pair_all else np.zeros(0, dtype=bool)
+    n_pair = int(use.sum())
     v_km = float(kin.get("path_m", 0.0)) / 1000.0
-    lat_ev = kin["lateral"] if n_pair else np.zeros(0, dtype=bool)
-    n_lat = int(lat_ev.sum())
-    d_lat_abs = np.abs(kin["d_lat"]) if n_pair else np.zeros(0)
+    n_lat = int(kin["lateral"].sum()) if n_pair_all else 0     # already restricted to scannable steps
+    d_lat_abs = np.abs(kin["d_lat"][use]) if n_pair_all else np.zeros(0)
+    n_rev = int((kin["reversal"] & use).sum()) if n_pair_all else 0
     lat_few = (None if (n_pair >= MIN_SAMPLES and v_km > 0.0) else
                ("ground_truth/gt_emissions_sample.jsonl is missing or empty" if not emissions
-                else f"only {n_pair} consecutive-sample pairs (need {MIN_SAMPLES})"))
+                else f"only {n_pair} of {n_pair_all} consecutive-sample steps can be scanned for a "
+                     f"lane-change teleport (need {MIN_SAMPLES}): the step and the heading window "
+                     f"it is measured against must all sit inside the {MAX_FD_DT_S:g} s "
+                     f"finite-difference ceiling. At emit_sample_prob="
+                     f"{probe['emit_sample_prob']:.3g} a wider gap measures where the vehicle GOT "
+                     "TO unobserved, not a lane change"))
     out.append(_metric(
         "traffic.lateral_discontinuity_events", P,
         "Lane-change teleports (a lane-width sideways step inside one sample), per vehicle-km",
@@ -1059,8 +1340,32 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
             "events": n_lat,
             "events_per_1000_sample_pairs": _r(1000.0 * n_lat / n_pair if n_pair else None),
             "vehicle_km": _r(v_km, 3), "sample_pairs": n_pair,
-            "vehicle_km_note": "longitudinal path length, so a jump's sideways component does not "
-                               "pad the denominator of the rate it is counted against",
+            "kinematics_source": src_h,
+            "sample_pairs_total": n_pair_all,
+            "sample_pairs_dropped_sampling_gap": n_pair_all - n_pair,
+            "sample_pairs_inside_gap_ceiling": (int(kin["usable"].sum()) if n_pair_all else 0),
+            "max_finite_difference_dt_s": MAX_FD_DT_S,
+            "gap_ceiling_note": "events, vehicle-km and every diagnostic below are measured over "
+                                f"the {n_pair} scannable steps only. A step is scannable when its "
+                                f"own gap -- and, where the heading is inferred, the "
+                                f"+-{HEADING_WINDOW_PAIRS}-step window it is measured against -- "
+                                f"sit inside {MAX_FD_DT_S:g} s. A wider gap carries no lane-change "
+                                "information at all: its lateral component is where the vehicle "
+                                "drove while unobserved. Counting those steps put 473 of 535 "
+                                "'events' on gaps with a 10.2 s median and a 891.7 m maximum "
+                                "lateral offset on a 0.02-sampled InTAS run",
+            "vehicle_km_note": "longitudinal path length over the same scannable steps, so a "
+                               "jump's sideways component does not pad the denominator of the rate "
+                               "it is counted against, and neither does distance covered across a "
+                               "gap on which no event could have been counted",
+            "vehicle_km_all_pairs": _r(float(kin.get("path_m_all", 0.0)) / 1000.0, 3),
+            "sampling_validity_note": "the gate is MEASURED (how many steps are scannable), not "
+                                      "declared from the manifest's emit_sample_prob: a manifest "
+                                      "may be absent or wrong, a thinned-but-still-dense trace is "
+                                      "legitimately scoreable, and a nominally full trace with a "
+                                      "few holes in it is not scoreable across those holes. The "
+                                      "rate stays comparable across sampling rates because "
+                                      "numerator and denominator cover the same steps",
             "lateral_jump_threshold_m": LATERAL_JUMP_M,
             "lateral_speed_threshold_mps": LATERAL_SPEED_MAX_MPS,
             "half_lane_steps": int((d_lat_abs >= LANE_WIDTH_M / 2.0).sum()),
@@ -1071,21 +1376,33 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
                                      "through 90 degrees inside one sample. Only `events` is the "
                                      "metric",
             "lateral_offset_p99_m": _r(_pct(d_lat_abs, 99)),
-            "max_lateral_step_m": _r(float(d_lat_abs.max()) if n_pair else None),
-            "sub_lane_screened_steps": (int(kin["lateral_screen"].sum()) - n_lat) if n_pair else 0,
+            "max_lateral_step_m": _r(float(d_lat_abs.max()) if d_lat_abs.size else None),
+            "sub_lane_screened_steps": (int((kin["lateral_screen"] & use).sum()) - n_lat
+                                        if n_pair_all else 0),
             "sub_lane_screen_threshold_m": LATERAL_SCREEN_M,
-            "longitudinal_reversal_events": int(kin["reversal"].sum()) if n_pair else 0,
+            "longitudinal_reversal_events": n_rev,
             "longitudinal_reversal_per_vehicle_km": _r(
-                (float(kin["reversal"].sum()) / v_km) if (n_pair and v_km > 0) else None),
-            "method": "per consecutive-sample step, the displacement component ACROSS the smoothed "
-                      f"direction of travel (circular median over +-{HEADING_WINDOW_PAIRS} steps). "
-                      f"A step counts when it moves >= {LATERAL_JUMP_M:g} m sideways at more than "
-                      f"{LATERAL_SPEED_MAX_MPS:g} m/s AND the RAW headings of the steps either side "
-                      f"agree within {HEADING_STABLE_TOL_DEG:g} deg -- a lane change does not turn "
-                      "the vehicle, a corner does, so cornering is not counted. A track's first and "
-                      "last step are not scanned (no evidence on one side). Normalised per "
-                      "vehicle-km of path, which is invariant to the CAM trigger rate; the "
-                      "per-1000-step rate is given alongside and is not",
+                (n_rev / v_km) if (n_pair and v_km > 0) else None),
+            "method": ("per consecutive-sample step, the displacement component ACROSS the "
+                       + (f"vehicle's own {GT_HEADING_FIELD} (ground truth, no reconstruction). "
+                          if gt["heading"]["used"] else
+                          f"smoothed direction of travel (circular median over "
+                          f"+-{HEADING_WINDOW_PAIRS} steps). ")
+                       + f"A step counts when it is scannable (gap <= {MAX_FD_DT_S:g} s"
+                       + ("" if gt["heading"]["used"] else
+                          f", and so are the +-{HEADING_WINDOW_PAIRS} steps the heading is inferred "
+                          "from") + ") AND it moves >= "
+                       f"{LATERAL_JUMP_M:g} m sideways at more than {LATERAL_SPEED_MAX_MPS:g} m/s "
+                       "AND the "
+                       + ("vehicle's own heading did not turn"
+                          if gt["heading"]["used"] else "RAW headings of the steps either side agree")
+                       + f" within {HEADING_STABLE_TOL_DEG:g} deg -- a lane change does not turn "
+                       "the vehicle, a corner does, so cornering is not counted. "
+                       + ("" if gt["heading"]["used"] else
+                          "A track's first and last step are not scanned (no evidence on one "
+                          "side). ")
+                       + "Normalised per vehicle-km of path, which is invariant to the CAM trigger "
+                       "rate; the per-1000-step rate is given alongside and is not"),
             "sub_lane_note": f"steps with a non-physical lateral speed but under {LATERAL_JUMP_M:g} m "
                              f"of offset (>= {LATERAL_SCREEN_M:g} m) are NOT counted in the headline "
                              "rate -- they are partial lane offsets, not lane changes -- but they "
@@ -1095,9 +1412,9 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
                                           f"lands more than {REVERSAL_M:g} m BEHIND this one"}))
 
     # ---- accelerations ------------------------------------------------------------------------
-    acc = kin["accel"] if n_pair else np.zeros(0)
-    acc_all = kin["accel_all"] if n_pair else np.zeros(0)
-    acc_dt = kin["accel_pair_dt"] if n_pair else np.zeros(0)
+    acc = kin["accel"] if n_pair_all else np.zeros(0)
+    acc_all = kin["accel_all"] if n_pair_all else np.zeros(0)
+    acc_dt = kin["accel_pair_dt"] if n_pair_all else np.zeros(0)
     n_acc = int(acc.size)
     acc_few = (None if n_acc >= MIN_SAMPLES else
                f"only {n_acc} acceleration samples (need {MIN_SAMPLES})")
@@ -1136,23 +1453,38 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
                "accel_p01": _r(_pct(acc, 1)), "accel_p99": _r(_pct(acc, 99)),
                "accel_min": _r(float(acc.min()) if n_acc else None),
                "accel_max": _r(float(acc.max()) if n_acc else None),
-               "method": "second difference of the LONGITUDINAL speed (displacement projected on "
-                         f"the direction of travel, smoothed over +-{HEADING_WINDOW_PAIRS} steps), "
-                         "over the exact midpoint separation (dt_i + dt_i+1)/2",
+               "kinematics_source": src_v,
+               "method": (f"FIRST difference of the ground-truth {GT_SPEED_FIELD} over one sampling "
+                          f"interval (dt <= {MAX_FD_DT_S:g} s); no position differencing is involved"
+                          if gt["speed"]["used"] else
+                          "second difference of the LONGITUDINAL speed (displacement projected on "
+                          f"the direction of travel, smoothed over +-{HEADING_WINDOW_PAIRS} steps), "
+                          "over the exact midpoint separation (dt_i + dt_i+1)/2"),
                "screened_out": dict(kin.get("n_excl", {})),
-               "screened_note": "position DISCONTINUITIES are not accelerations: lane-change "
-                                "teleports go to traffic.lateral_discontinuity_events, teleports to "
-                                "traffic.teleport_events, and a track's first/last step is a "
-                                "partial insertion/arrival step, not a second of driving. "
-                                f"screened_out.lateral uses the lower {LATERAL_SCREEN_M:g} m "
-                                "sub-lane threshold, so it exceeds the reported event count",
+               "screened_note": ("only teleports are screened: with a measured speed there is no "
+                                 "position double-difference for a lane change, a backward remap or "
+                                 "a track's partial first/last step to corrupt, and a teleport step "
+                                 "is already a HARD failure of traffic.teleport_events"
+                                 if gt["speed"]["used"] else
+                                 "position DISCONTINUITIES are not accelerations: lane-change "
+                                 "teleports go to traffic.lateral_discontinuity_events, teleports to "
+                                 "traffic.teleport_events, and a track's first/last step is a "
+                                 "partial insertion/arrival step, not a second of driving. "
+                                 f"screened_out.lateral uses the lower {LATERAL_SCREEN_M:g} m "
+                                 "sub-lane threshold, so it exceeds the reported event count"),
                "samples_before_screening": int(acc_all.size),
                "unscreened_frac_within_band": _r(
                    float(np.mean((acc_all >= lo) & (acc_all <= hi))) if acc_all.size else None, 6),
                "unscreened_accel_min": _r(float(acc_all.min()) if acc_all.size else None),
                "unscreened_accel_max": _r(float(acc_all.max()) if acc_all.size else None),
-               "unscreened_note": "the SAME longitudinal estimator with the discontinuity screen "
-                                  "switched off (not the pre-fix raw-chord estimator)",
+               "unscreened_note": ("the same estimator with the teleport screen switched off"
+                                   if gt["speed"]["used"] else
+                                   "the SAME longitudinal estimator with the discontinuity screen "
+                                   "switched off (not the pre-fix raw-chord estimator)"),
+               "pair_dt_meaning": ("the sampling interval the speed difference spans"
+                                   if gt["speed"]["used"] else
+                                   "the midpoint separation (dt_i + dt_i+1)/2 of the second "
+                                   "difference"),
                "by_pair_dt_s": by_dt or None,
                "sampling_note": "each acceleration sample carries equal weight; the by_pair_dt_s "
                                 "breakdown is what makes an interval-dependent artefact visible"}))
@@ -1160,7 +1492,8 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
         "traffic.accel_within_comfort_frac", P,
         "Accelerations inside the comfort band (+/-3 m/s^2)", frac_comf, "fraction", n_acc,
         _ref(refdata, "kinematics.accel_comfort_min_fraction"), SOFT, reason=acc_few,
-        extra={"band_mps2": list((comf_ref or {}).get("range", [])) or None}))
+        extra={"band_mps2": list((comf_ref or {}).get("range", [])) or None,
+               "kinematics_source": src_v}))
 
     # ---- sim health: teleports + overlaps + liveness ---------------------------------------------
     n_tele, n_tele_pairs = teleport_events(tracks, tele_lim)
@@ -1581,9 +1914,10 @@ def scorecard(dataset_dir: str, refdata: dict | str | None = None, *, regime: st
     reports = _jsonl(os.path.join(ma, "ma_reports.jsonl"))
     rlabels = _jsonl(os.path.join(gt, "gt_report_labels.jsonl"))
     tracks = build_tracks(emissions)
+    gt = ground_truth_kinematics(tracks)
 
     traffic = traffic_panel(emissions, probe, rd, fd_cell_m=fd_cell_m, fd_window_s=fd_window_s,
-                            regime=reg)
+                            regime=reg, gt=gt)
     comm = comm_panel(emissions, reports, rlabels, tracks, probe, rd, t_bucket_s=t_bucket_s,
                       dist_bin_m=dist_bin_m, max_dist_m=max_dist_m, regime=reg)
     metrics = traffic + comm
@@ -1595,6 +1929,9 @@ def scorecard(dataset_dir: str, refdata: dict | str | None = None, *, regime: st
     return {
         "dataset_dir": dataset_dir,
         "probe": probe,
+        # ADR 0002: which estimator produced the kinematic metrics on THIS dataset. Every affected
+        # metric repeats it in its own ``details.kinematics_source`` so a single row is self-auditing.
+        "kinematics_source": gt,
         "refdata": {"dir": rd.get("dir"), "sets": sorted(rd.get("sets", {})),
                     "n_entries": len(rd.get("entries", {}))},
         "settings": {"regime": reg or "auto", "t_bucket_s": t_bucket_s, "dist_bin_m": dist_bin_m,

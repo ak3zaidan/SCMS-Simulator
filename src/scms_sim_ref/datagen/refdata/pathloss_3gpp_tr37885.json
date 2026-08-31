@@ -1,73 +1,192 @@
 {
   "reference_set": "pathloss_37885",
-  "title": "3GPP TR 37.885 V2X path-loss constants and shadowing parameters",
-  "scope": "Reference constants for the Phase-2 geometric radio model. No Phase-0 dataset carries an RSSI/path-loss observable, so nothing here is scored yet -- these entries exist so the Phase-2 implementation and its unit tests grade against ONE audited copy of the constants.",
-  "curated_from": "docs/realism/ROADMAP.md section 3.2 item 1 (transcribed from 3GPP TR 37.885) and the Phase-2 benchmark gate 'implemented 37.885 formulas match published constants to 0.01 dB at d=100/500 m'.",
+  "title": "3GPP TR 37.885 V2X path-loss constants, NLOSv blockage distribution and shadowing parameters",
+  "scope": "Reference constants for the Phase-2 geometric radio model (radio_model=\"geometric\"). No Phase-0 dataset carries an RSSI/path-loss observable, so nothing here is scored yet -- these entries exist so the Phase-2 implementation and its unit tests grade against ONE audited copy of the constants.",
+  "curated_from": "docs/realism/PHASE2-DESIGN.md 'The model stack' table (the binding Phase-2 contract), docs/realism/ROADMAP.md section 3.2 items 1-4, and docs/realism/investigation/research-net-sota.json section 2(a) (constants there were verified against the ns-3 ThreeGppV2vPropagationLossModel source and the ATIS mirror of TR 37.885 V15.3.0).",
   "formula": "PL_dB = a + b*log10(d_m) + c*log10(fc_GHz)",
+  "verification": {
+    "date": "2026-08-30",
+    "checked_against": [
+      "docs/realism/PHASE2-DESIGN.md lines 31-44 (Urban LOS 38.77/16.7/18.2; Urban NLOS 36.85/30/18.9; Highway LOS 32.4/20/20; sigma 3.0 LOS+NLOSv / 4.0 NLOS; decorrelation 10 m LOS / 13 m NLOS; NLOSv mu 9.0/5.0 + max(0,15*log10(d)-41), sigma 4.5/4.0; blocker heights 1.6 m car / 3.0 m truck; measured single-vehicle blockage 5.5-17 dB)",
+      "docs/realism/investigation/research-net-sota.json, findings section 2(a) and the benchmark items '3GPP TR 37.885 pathloss reproduction' and 'NLOSv vehicle-blockage extra loss'"
+    ],
+    "result": "AGREE. The three (a,b,c) triples and the LOS/NLOS shadowing sigmas already pinned in this file reproduce both sources exactly, digit for digit. No constant was changed by this pass.",
+    "gaps_closed_by_this_pass": [
+      "shadowing_sigma_db carried only los/nlos; TR 37.885 assigns NLOSv the LOS value 3.0 dB -- added explicitly instead of leaving it to the reader",
+      "nlosv_extra_loss_db recorded only the mu range 5..9 with no branch rule and no sigma; the full two-branch distribution, the both-above-blocker zero case, the per-branch sigma and the blocker heights are now pinned",
+      "the per-state shadowing decorrelation distances (10 m LOS/NLOSv-LOS, 13 m NLOS) were absent from this file; only the ETSI-derived interval in v2x_awareness.shadowing_decorrelation_distance_m existed",
+      "no evaluated conformance values existed for the '0.01 dB at d=100/500 m' Phase-2 gate, so the gate could only be tested by re-deriving the formula it was meant to check"
+    ]
+  },
   "entries": {
     "urban_los": {
       "value": {"a": 38.77, "b": 16.7, "c": 18.2},
       "unit": "dB",
       "confidence": "anchored",
       "cite": "3GPP TR 37.885 (urban LOS V2V path loss)",
-      "source": "3GPP TR 37.885, 'Study on evaluation methodology of new Vehicle-to-Everything (V2X) use cases for LTE and NR', V2V channel models. Constants as transcribed in docs/realism/ROADMAP.md section 3.2 item 1: Urban LOS = 38.77 + 16.7*log10(d) + 18.2*log10(fc).",
-      "note": "d in metres, fc in GHz."
+      "source": "3GPP TR 37.885 V15.3.0, 'Study on evaluation methodology of new Vehicle-to-Everything (V2X) use cases for LTE and NR', V2V channel models (Table 6.2.1-1): Urban LOS PL = 38.77 + 16.7*log10(d_3D) + 18.2*log10(fc_GHz). Transcribed independently in docs/realism/ROADMAP.md section 3.2 item 1, in docs/realism/PHASE2-DESIGN.md, and in docs/realism/investigation/research-net-sota.json section 2(a) (which cross-checked it against the ns-3 ThreeGppV2vUrbanPropagationLossModel source); all three agree.",
+      "note": "d in metres (TR 37.885 uses 3-D distance; the Phase-2 model is 2-D + antenna heights), fc in GHz."
     },
     "urban_nlos": {
       "value": {"a": 36.85, "b": 30.0, "c": 18.9},
       "unit": "dB",
       "confidence": "anchored",
       "cite": "3GPP TR 37.885 (urban NLOS V2V path loss)",
-      "source": "Same 3GPP TR 37.885 V2V channel-model transcription as urban_los (via docs/realism/ROADMAP.md section 3.2 item 1): Urban NLOS = 36.85 + 30*log10(d) + 18.9*log10(fc).",
-      "note": "d in metres, fc in GHz."
+      "source": "3GPP TR 37.885 V15.3.0 Table 6.2.1-1, Urban NLOS (building-blocked, 'NLOSb' in GEMV2 vocabulary): PL = 36.85 + 30*log10(d_3D) + 18.9*log10(fc_GHz). Same three-way agreement as urban_los (ROADMAP section 3.2 item 1, PHASE2-DESIGN.md, research-net-sota.json section 2(a) verified against the ns-3 implementation).",
+      "note": "d in metres, fc in GHz. Distance exponent 3.0 -- this state decays far faster than LOS and is what makes the urban gray zone narrow (see nlos_link_budget_consequence_m)."
     },
     "highway_los": {
       "value": {"a": 32.4, "b": 20.0, "c": 20.0},
       "unit": "dB",
       "confidence": "anchored",
       "cite": "3GPP TR 37.885 (highway LOS V2V path loss)",
-      "source": "Same 3GPP TR 37.885 V2V channel-model transcription as urban_los (via docs/realism/ROADMAP.md section 3.2 item 1): Highway LOS = 32.4 + 20*log10(d) + 20*log10(fc).",
-      "note": "d in metres, fc in GHz. This is the free-space form."
+      "source": "3GPP TR 37.885 V15.3.0 Table 6.2.1-1, Highway LOS: PL = 32.4 + 20*log10(d_3D) + 20*log10(fc_GHz). Highway NLOS/NLOSv reuse the urban formulas (research-net-sota.json section 2(a): 'NLOS/NLOSv reuse urban formulas'). Same three-way agreement as urban_los.",
+      "note": "d in metres, fc in GHz. This is the free-space form to within 0.0478 dB -- see highway_los_free_space_offset_db before substituting an exact FSPL implementation."
+    },
+    "highway_los_free_space_offset_db": {
+      "value": 0.0478,
+      "unit": "dB",
+      "confidence": "anchored",
+      "cite": "derived from the Friis free-space constant vs TR 37.885 highway LOS",
+      "source": "Exact free-space path loss with d in metres and fc in GHz is PL = 32.447783 + 20*log10(d) + 20*log10(fc), where 32.447783 = 20*log10(4*pi*1e9/299792458). TR 37.885's highway LOS intercept is 32.4, i.e. the standard's rounded intercept sits 0.047783 dB BELOW exact free space. Computed here at full double precision on 2026-08-30.",
+      "derivation": "32.447783 - 32.4 = 0.047783 dB, rounded to 0.0478.",
+      "note": "IMPLEMENTER TRAP: the Phase-2 gate is 'match published constants to 0.01 dB'. An implementation that reuses a generic Friis/FSPL helper for highway LOS is wrong by 0.048 dB at EVERY distance and fails that gate by ~5x. Use the literal 32.4 intercept."
+    },
+    "pathloss_at_reference_distances_db": {
+      "points": [
+        ["urban_los", 100.0, 86.1995],
+        ["urban_los", 500.0, 97.8723],
+        ["urban_nlos", 100.0, 111.4191],
+        ["urban_nlos", 500.0, 132.3882],
+        ["highway_los", 100.0, 87.8170],
+        ["highway_los", 500.0, 101.7964]
+      ],
+      "unit": "[state, distance m, path loss dB at fc = 5.9 GHz]",
+      "confidence": "anchored",
+      "cite": "TR 37.885 constants evaluated at the ROADMAP Phase-2 gate distances",
+      "source": "The three anchored (a,b,c) triples in this file evaluated at d = 100 m and d = 500 m with fc = 5.9 GHz, in double precision, on 2026-08-30. These are the expected values for the ROADMAP Phase-2 benchmark gate 'implemented 37.885 formulas match published constants to 0.01 dB at d=100/500 m'; frequency terms are 18.2*log10(5.9) = 14.029507, 18.9*log10(5.9) = 14.569103, 20*log10(5.9) = 15.417040 dB.",
+      "derivation": "PL = a + b*log10(d) + c*log10(5.9), values rounded to 4 decimal places (2.5x tighter than the 0.01 dB gate tolerance, so rounding cannot mask a failure).",
+      "note": "PINNED FOR PHASE 2 unit tests. Asserting the implementation against these pinned numbers -- rather than against a second copy of the formula -- is what makes the conformance test non-tautological."
     },
     "nlosv_extra_loss_db": {
-      "value": {"mu_min": 5.0, "mu_max": 9.0, "distance_term": "max(0, 15*log10(d) - 41)", "floor": 0.0},
+      "value": {
+        "mu_min": 5.0,
+        "mu_max": 9.0,
+        "distance_term": "max(0, 15*log10(d) - 41)",
+        "floor": 0.0,
+        "distribution": "extra_loss = max(0, N(mu, sigma)) added to the LOS path loss",
+        "both_antennas_below_blocker": {"mu_base_db": 9.0, "sigma_db": 4.5},
+        "one_antenna_below_blocker": {"mu_base_db": 5.0, "sigma_db": 4.0},
+        "both_antennas_above_blocker": {"extra_loss_db": 0.0}
+      },
       "unit": "dB",
       "confidence": "anchored",
-      "cite": "3GPP TR 37.885 (NLOSv vehicle-blockage loss)",
-      "source": "NLOSv (vehicle-blocked) additional loss modelled as max(0, N(mu, sigma)) with mu = 5..9 + max(0, 15*log10(d) - 41), per docs/realism/ROADMAP.md section 3.2 item 1.",
-      "note": "The mu base (5/9 dB) selects on blocker height class in TR 37.885; the ROADMAP records the range, so no single value is asserted here."
+      "cite": "3GPP TR 37.885 (NLOSv vehicle-blockage additional loss)",
+      "source": "3GPP TR 37.885 V15.3.0 NLOSv state: PL = PL_LOS + max(0, N(mu, sigma)) where mu = 9.0 + max(0, 15*log10(d_3D) - 41) with sigma = 4.5 dB when BOTH antennas are below the blocker's height; mu = 5.0 + max(0, 15*log10(d_3D) - 41) with sigma = 4.0 dB when exactly ONE antenna is below; and no additional loss when both are above. Identical wording in docs/realism/PHASE2-DESIGN.md lines 39-41 and docs/realism/investigation/research-net-sota.json section 2(a); the ROADMAP's shorter 'mu = 5..9 + ...' phrasing is the same rule with the branch condition elided.",
+      "note": "The mu base selects on blocker height class, NOT on distance; the distance term is shared by both branches. Truncation at 0 makes this a censored Gaussian, so the MEAN extra loss is strictly greater than mu whenever mu is within ~2 sigma of 0 -- draw the Gaussian and clamp, do not shortcut to the mean."
+    },
+    "nlosv_blocker_height_m": {
+      "value": {"car": 1.6, "truck": 3.0},
+      "unit": "m",
+      "confidence": "anchored",
+      "cite": "3GPP TR 37.885 (blocker vehicle heights)",
+      "source": "3GPP TR 37.885 V15.3.0 vehicle-blockage modelling: blocker heights 1.6 m for cars and 3.0 m for trucks, drawn per the scenario's truck proportion. Recorded identically in docs/realism/PHASE2-DESIGN.md line 40 and docs/realism/investigation/research-net-sota.json section 2(a).",
+      "note": "These heights select the NLOSv branch: with the usual 1.5 m antenna height, a car blocker (1.6 m) puts both antennas below the blocker (mu base 9.0 dB) and a truck blocker (3.0 m) does likewise; the one-below branch (mu base 5.0 dB) arises when one endpoint is a truck-mounted or RSU antenna above the blocker."
+    },
+    "nlosv_distance_term_activation_m": {
+      "value": 541.17,
+      "unit": "m",
+      "confidence": "anchored",
+      "cite": "derived from the TR 37.885 NLOSv mu expression",
+      "source": "The NLOSv distance term max(0, 15*log10(d) - 41) is identically zero until 15*log10(d) = 41, i.e. d = 10^(41/15) = 541.1695 m. Computed at double precision on 2026-08-30 from the anchored expression in nlosv_extra_loss_db.",
+      "derivation": "10^(41/15) = 541.1695 m; below it mu is exactly 9.0 dB (both below) or 5.0 dB (one below), with no distance dependence at all.",
+      "note": "IMPLEMENTER NOTE: across the whole urban regime the NLOSv mean extra loss is a CONSTANT. A unit test that only probes d < 541 m cannot distinguish a correct distance term from a missing one -- probe d = 1000 m (mu = 13.0 dB both-below) as well."
+    },
+    "nlosv_measured_single_vehicle_loss_db": {
+      "range": [5.5, 17.0],
+      "unit": "dB",
+      "confidence": "anchored",
+      "cite": "multi-band V2V blockage measurement campaign (typical ~10 dB, Boban JSAC)",
+      "source": "Measured attenuation caused by a single blocking vehicle is 5.5-17 dB depending on blocker size (multi-band V2V vehicle-blockage characterisation, https://www.researchgate.net/publication/330330604), with Boban's earlier IEEE JSAC work reporting ~10 dB as typical for one obstructing vehicle. Summarised in docs/realism/investigation/research-net-sota.json section 2(f) and restated in docs/realism/PHASE2-DESIGN.md line 41 as the empirical basis for the 37.885 NLOSv mu of 5-9 dB.",
+      "note": "This is the EMPIRICAL SANITY BAND for the modelled NLOSv draw, not a second model. Check: mu 9.0 dB with sigma 4.5 dB truncated at 0 puts the bulk of draws inside 5.5-17 dB, so a Phase-2 histogram of realised NLOSv losses whose p10-p90 lands far outside this band indicates a coding error, not a modelling choice."
     },
     "shadowing_sigma_db": {
-      "value": {"los": 3.0, "nlos": 4.0},
+      "value": {"los": 3.0, "nlosv": 3.0, "nlos": 4.0},
       "unit": "dB",
       "confidence": "anchored",
-      "cite": "3GPP TR 37.885 shadowing std. dev. (via ROADMAP section 3.2 item 3)",
-      "source": "Log-normal shadowing standard deviation sigma = 3 dB (LOS) / 4 dB (NLOS), adopted in docs/realism/ROADMAP.md section 3.2 item 3 together with a Gudmundson AR(1) correlation process.",
-      "note": "The decorrelation distance for the AR(1) process is in v2x_awareness.shadowing_decorrelation_distance_m."
+      "cite": "3GPP TR 37.885 shadow-fading standard deviation",
+      "source": "3GPP TR 37.885 V15.3.0 shadow fading: sigma = 3 dB for LOS and for NLOSv, 4 dB for NLOS. Stated as '3.0 dB (LOS and NLOSv), 4.0 dB (NLOS)' in docs/realism/investigation/research-net-sota.json section 2(a), as 'sigma 3.0 LOS+NLOSv / 4.0 NLOS' in docs/realism/PHASE2-DESIGN.md, and adopted in docs/realism/ROADMAP.md section 3.2 item 3 together with a Gudmundson AR(1) correlation process.",
+      "note": "NLOSv keeps the LOS sigma because its extra blockage loss is already modelled as its own random variable (nlosv_extra_loss_db); applying the NLOS 4 dB sigma to an NLOSv link double-counts the blockage spread. Decorrelation distances are in shadowing_decorrelation_distance_m."
+    },
+    "shadowing_decorrelation_distance_m": {
+      "value": {"los": 10.0, "nlosv": 13.0, "nlos": 13.0},
+      "unit": "m",
+      "confidence": "anchored",
+      "cite": "3GPP TR 37.885 shadowing spatial autocorrelation distance",
+      "source": "3GPP TR 37.885 V15.3.0 gives the shadow-fading spatial autocorrelation distance as 10 m for LOS and 13 m for NLOSv and NLOS. Transcribed in docs/realism/investigation/research-net-sota.json section 2(a) ('spatial autocorrelation distance 10 m (LOS) / 13 m (NLOSv, NLOS)') and in docs/realism/PHASE2-DESIGN.md ('decorrelation 10 m LOS / 13 m NLOS').",
+      "note": "DISAGREEMENT WITH THE SIBLING ENTRY, resolved: v2x_awareness.shadowing_decorrelation_distance_m pins the interval [7, 13] m, which is the ROADMAP's '10 +/- 3 m (ETSI TR 103 257-1)' self-test tolerance -- a GATE on the measured e-folding distance, not a per-state model input. This entry holds the per-state MODEL INPUTS. They are consistent: both TR 37.885 values fall inside [7, 13]. Use this entry to drive the AR(1) process and that entry to grade the resulting autocorrelation."
+    },
+    "intersection_measured_shadowing_sigma_db": {
+      "range": [4.39, 5.57],
+      "unit": "dB",
+      "confidence": "anchored",
+      "cite": "urban multilink intersection measurements (Sensors 18(12):4433)",
+      "source": "Urban intersection multilink V2V measurements report NLOS shadow-fading standard deviation from 4.39 dB (car-obstructed, car-to-car) up to 5.57 dB (truck-obstructed): Sensors 18(12):4433, https://pmc.ncbi.nlm.nih.gov/articles/PMC6308981/ , summarised in docs/realism/investigation/research-net-sota.json section 2(e).",
+      "note": "DISAGREES WITH TR 37.885: the standard's NLOS sigma is 4.0 dB, i.e. 0.4-1.6 dB OPTIMISTIC versus these intersection measurements. Recorded rather than merged -- Phase 2 implements the standard (4.0 dB) so that the pathloss conformance gate stays meaningful; this entry is the honest error bar on that choice, and the natural knob if an intersection-specific refinement (VirtualSource11p) is added later."
+    },
+    "intersection_measured_decorrelation_distance_m": {
+      "range": [2.2, 3.7],
+      "unit": "m",
+      "confidence": "anchored",
+      "cite": "urban multilink intersection measurements (Sensors 18(12):4433)",
+      "source": "The same urban intersection multilink campaign (Sensors 18(12):4433, https://pmc.ncbi.nlm.nih.gov/articles/PMC6308981/ , via docs/realism/investigation/research-net-sota.json section 2(e)) measures shadowing decorrelation distances of 2.2-3.7 m at intersections.",
+      "note": "DISAGREES WITH TR 37.885 AND WITH ETSI TR 103 257-1 by a factor of ~3-6 (2.2-3.7 m measured at intersections vs 10-13 m in the models). The models describe open-street links; intersection geometry decorrelates far faster because the dominant propagation path switches as a vehicle crosses the corner. Phase 2 uses the 10/13 m model values; a scenario dominated by intersection crossings should expect its measured e-folding distance to sit BELOW the 10 +/- 3 m gate, and that is a scenario property, not a bug."
+    },
+    "link_state_update_interval_s": {
+      "value": 0.1,
+      "unit": "s",
+      "confidence": "anchored",
+      "cite": "3GPP TR 37.885 evaluation methodology (link-state update cadence)",
+      "source": "TR 37.885's evaluation methodology re-evaluates the LOS/NLOSv/NLOS link state at each 100 ms location update ('Link state re-evaluated at each 100 ms location update', docs/realism/investigation/research-net-sota.json section 2(a)); this matches the ETSI CAM 10 Hz upper rate and the MOSAIC 100 ms sync cadence adopted in ROADMAP Phase 1.",
+      "note": "The Python engine's default dt is 1.0 s, i.e. 10x coarser than the standard's update cadence. Reclassifying links once per second is therefore a documented fidelity limitation of the default configuration, not a modelling error; runs at dt <= 0.1 s reproduce the standard's cadence exactly."
+    },
+    "nlos_link_budget_consequence_m": {
+      "points": [
+        ["urban_nlos", 13.0103, 26.3],
+        ["urban_nlos", 23.0, 56.6],
+        ["urban_nlos", 33.0, 121.9]
+      ],
+      "unit": "[state, EIRP dBm, median range m at -81 dBm sensitivity]",
+      "confidence": "coarse",
+      "cite": "derived: TR 37.885 urban NLOS vs the vendored 802.11p receiver sensitivity",
+      "source": "Median (zero-shadowing) range at which TR 37.885 urban NLOS path loss equals the link budget EIRP - (-81 dBm), where -81 dBm is the receiver sensitivity configured in the vendored VeReMi-NextGen INET stack (third_party/veremi-nextgen/Generator/docker/scenarios/InTAS_urban_2_4_test/omnetpp/omnetpp.ini:80) and 13.0103 dBm is that stack's 0.02 W transmit power (line 81). Computed at double precision on 2026-08-30; 33 dBm is the ETSI ITS-G5 maximum permitted EIRP.",
+      "derivation": "d = 10^((EIRP + 81 - 36.85 - 18.9*log10(5.9)) / 30), rounded to 0.1 m.",
+      "note": "CROSS-CHECK THAT PASSES: at the 33 dBm ETSI ceiling this gives 121.9 m, which independently reproduces the measured 'urban NLoS effective range ~100 m at obstructed intersections' anchor pinned in v2x_awareness.nlos_urban_effective_range_m. Consequence for Phase 2: no realistic power reaches 200 m on an NLOS link, so the '>= 90% awareness at 200 m urban' gate is really a statement about the LOS/NLOSv share of the scenario's link population -- the gate grades the geometry, not the pathloss formula."
     },
     "nakagami_m_by_distance": {
       "points": [[50.0, 3.0], [150.0, 1.5], [null, 1.0]],
       "unit": "[distance upper bound m, Nakagami m]",
-      "confidence": "anchored",
-      "cite": "ROADMAP section 3.2 item 4 (per-packet fading)",
-      "source": "Per-packet Nakagami-m fading with m = 3 / 1.5 / 1.0 over 0-50 / 50-150 / >150 m, adopted in docs/realism/ROADMAP.md section 3.2 item 4 (the standard VANET Nakagami parameterisation used by Veins/NS-3 802.11p studies).",
-      "note": "A null upper bound means 'beyond the previous bound'."
+      "confidence": "coarse",
+      "cite": "ROADMAP section 3.2 item 4 (per-packet fading) -- MIRROR of nakagami_fading.m_by_distance_adopted",
+      "source": "Per-packet Nakagami-m fading with m = 3 / 1.5 / 1.0 over 0-50 / 50-150 / >150 m, adopted in docs/realism/ROADMAP.md section 3.2 item 4 and docs/realism/PHASE2-DESIGN.md step 4. MIRROR ENTRY: the authoritative record, including the competing ns-3 default parameterisation and the reason this banding was adopted over it, is nakagami_fading.m_by_distance_adopted in refdata/nakagami_fading.json. Values here are byte-identical to that entry.",
+      "derivation": "Kept at its original ref_id so nothing that already resolves 'pathloss_37885.nakagami_m_by_distance' breaks; the band edges are a project adoption, not a TR 37.885 constant -- TR 37.885 specifies no small-scale fading distribution for this model, which is why the confidence is coarse rather than anchored.",
+      "note": "A null upper bound means 'beyond the previous bound'. Do not edit this entry alone -- edit nakagami_fading.json and mirror it here."
     },
     "pathloss_conformance_tolerance_db": {
       "max": 0.01,
       "unit": "dB",
       "confidence": "anchored",
       "cite": "ROADMAP Phase-2 benchmark gate",
-      "source": "docs/realism/ROADMAP.md Phase-2 benchmark gate: 'Pathloss unit test: implemented 37.885 formulas match published constants to 0.01 dB at d=100/500 m'.",
-      "note": "PINNED FOR PHASE 2 unit tests."
+      "source": "docs/realism/ROADMAP.md Phase-2 benchmark gate: 'Pathloss unit test: implemented 37.885 formulas match published constants to 0.01 dB at d=100/500 m'. The expected values at those two distances are pinned in pathloss_at_reference_distances_db.",
+      "note": "PINNED FOR PHASE 2 unit tests. Note that the free-space shortcut for highway LOS misses by 0.0478 dB (highway_los_free_space_offset_db), i.e. ~5x this tolerance."
     },
     "reference_frequency_ghz": {
       "value": 5.9,
       "unit": "GHz",
       "confidence": "anchored",
       "cite": "ITS-G5 / DSRC 5.9 GHz band",
-      "source": "The ITS-G5 / DSRC control channel sits in the 5.9 GHz band; TR 37.885's fc term is evaluated in GHz.",
-      "note": "Used as the default fc when evaluating the formulas above."
+      "source": "The ITS-G5 / DSRC control channel sits in the 5.9 GHz band; TR 37.885's fc term is evaluated in GHz. The vendored VeReMi-NextGen INET stack configures carrierFrequency = 5.9 GHz and a 10 MHz channel (third_party/veremi-nextgen/Generator/docker/scenarios/InTAS_urban_2_4_test/omnetpp/omnetpp.ini:76,78), so both engines share this centre frequency.",
+      "note": "Used as the default fc when evaluating the formulas above and when computing pathloss_at_reference_distances_db."
     }
   }
 }

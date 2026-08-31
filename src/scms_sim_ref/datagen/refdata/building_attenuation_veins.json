@@ -1,0 +1,75 @@
+{
+  "reference_set": "veins_obstacle_shadowing",
+  "title": "Sommer/Veins simple obstacle shadowing -- the NLOSb alternative to the 3GPP urban-NLOS state",
+  "scope": "Building-blockage attenuation for the Phase-2 geometric radio model when per-wall counts are cheaper than a full polygon-intersection test (docs/realism/PHASE2-DESIGN.md, 'Optional refinement'). This is an ALTERNATIVE to pathloss_37885.urban_nlos, not an addition to it -- applying both to the same link double-counts the building.",
+  "curated_from": "docs/realism/investigation/research-net-sota.json (findings section 1, Veins paragraph, and the benchmark item 'Building shadowing (Veins/Sommer WONS 2011, measurement-validated)'), docs/realism/PHASE2-DESIGN.md lines 43-44 and 73-96, docs/realism/ROADMAP.md section 3.2 item 2.",
+  "formula": "extra_loss_dB = beta * n_exterior_walls_crossed + gamma * metres_of_interior_propagation",
+  "entries": {
+    "wall_attenuation_db": {
+      "value": 9.0,
+      "unit": "dB per exterior wall crossed",
+      "confidence": "anchored",
+      "cite": "Sommer et al., WONS 2011 (Veins 'Simple Obstacle Shadowing')",
+      "source": "Sommer, Eckhoff, German, Dressler, 'A Computationally Inexpensive Empirical Model of IEEE 802.11p Radio Shadowing in Urban Environments', WONS 2011, https://ieeexplore.ieee.org/document/5720204/ -- the model shipped as Veins' Simple Obstacle Shadowing: attenuation = beta * (number of exterior walls crossed) + gamma * (metres traversed inside buildings), with the typical Veins configuration beta ~ 9 dB per wall, calibrated against real 802.11p measurements and reported as 'very high accuracy ... marginal overhead'. Transcribed in docs/realism/investigation/research-net-sota.json findings section 1 and restated in docs/realism/PHASE2-DESIGN.md line 43.",
+      "note": "'Typical config' in the Veins documentation, i.e. the value the simulator ships with and the one the paper's validation used; it is not a per-material constant. See wall_attenuation_by_material (unavailable) before applying it to a specific building stock."
+    },
+    "interior_attenuation_db_per_m": {
+      "value": 0.4,
+      "unit": "dB per metre of interior propagation",
+      "confidence": "anchored",
+      "cite": "Sommer et al., WONS 2011 (Veins 'Simple Obstacle Shadowing')",
+      "source": "Same WONS 2011 model and Veins configuration as wall_attenuation_db (https://ieeexplore.ieee.org/document/5720204/): the second term is gamma ~ 0.4 dB per metre of the path that lies inside building footprints. Recorded in docs/realism/investigation/research-net-sota.json and docs/realism/PHASE2-DESIGN.md line 43 as '~9 dB per exterior wall + 0.4 dB/m interior'.",
+      "note": "The two terms are not interchangeable: the wall term punishes COUNT of buildings crossed, the interior term punishes DEPTH through them. A link grazing a building corner picks up 2 walls (18 dB) and almost no interior metres; a link through the middle of a 40 m block picks up 2 walls plus 16 dB of interior loss."
+    },
+    "model_role": {
+      "value": "alternative_to_urban_nlos",
+      "unit": "categorical",
+      "confidence": "coarse",
+      "cite": "project decision recorded so the two NLOSb models are never composed",
+      "source": "docs/realism/PHASE2-DESIGN.md offers this model as an 'Optional refinement ... where per-wall counts are cheaper than full polygon tests', with the 3GPP TR 37.885 urban-NLOS formula (pathloss_37885.urban_nlos) as the default NLOSb treatment. Both describe the SAME physical effect -- a building between transmitter and receiver -- so exactly one may be applied per link.",
+      "derivation": "A decision, not a measurement. Written as an entry so it loads next to the constants it governs.",
+      "note": "IMPLEMENTER TRAP: adding Sommer attenuation on top of the urban-NLOS formula makes an already-dead link ~20-30 dB deader and silently destroys the urban awareness curve. Choose per link state: LOS/NLOSv -> urban_los (+ NLOSv extra loss); NLOSb -> EITHER urban_nlos OR urban_los + Sommer."
+    },
+    "sommer_wall_equivalent_of_3gpp_nlos": {
+      "points": [
+        [50.0, 21.2159, 2.357],
+        [100.0, 25.2196, 2.802],
+        [200.0, 29.2233, 3.247],
+        [500.0, 34.5159, 3.835]
+      ],
+      "unit": "[distance m, TR 37.885 NLOS-minus-LOS excess dB at 5.9 GHz, equivalent number of 9 dB Sommer walls]",
+      "confidence": "coarse",
+      "cite": "derived: TR 37.885 urban NLOS vs urban LOS, expressed in Sommer walls",
+      "source": "Computed on 2026-08-30 at double precision from the anchored constants in pathloss_37885 (urban_nlos minus urban_los at fc = 5.9 GHz) and divided by the anchored 9 dB wall_attenuation_db. It answers the calibration question the two models raise: how many exterior walls does the 3GPP NLOS state implicitly assume?",
+      "derivation": "excess(d) = (36.85 + 30*log10(d) + 18.9*log10(5.9)) - (38.77 + 16.7*log10(d) + 18.2*log10(5.9)) = -1.92 + 13.3*log10(d) + 0.539596; walls = excess / 9.0. Interior propagation is excluded, so these are upper bounds on the wall COUNT.",
+      "note": "CONSISTENCY RESULT: the 3GPP urban-NLOS state is equivalent to 2.4-3.8 Sommer walls over 50-500 m -- i.e. roughly 'one building crossed' (2 walls) to 'two buildings crossed' (4 walls), which is exactly the geometry an urban NLOSb link has. The two models therefore agree to within about one wall, and the crossover is at ~2.8 walls near 100 m. A Sommer implementation that routinely reports 6+ walls per blocked link is counting interior partitions or double-counting shared walls, not modelling the same physics as the 3GPP state."
+    },
+    "footprint_source_coverage": {
+      "value": {
+        "cache_file": "datasets/_osmcache/osm_816d9f25303fea7e.xml",
+        "cache_bytes": 16948489,
+        "city": "Ingolstadt (InTAS)",
+        "building_ways_with_complete_geometry": 1482,
+        "incomplete": 0,
+        "closed_rings": 1482,
+        "nodes_available": 22248,
+        "with_height_or_levels": 208,
+        "height_coverage_fraction": 0.1404
+      },
+      "unit": "counts",
+      "confidence": "anchored",
+      "cite": "measured on the existing Overpass cache (independently re-counted 2026-08-30)",
+      "source": "docs/realism/PHASE2-DESIGN.md, 'Building footprints are already on disk (verified 2026-08-30)', reports that the cached Overpass extract datasets/_osmcache/osm_816d9f25303fea7e.xml (Ingolstadt) already contains 1482 building ways with complete geometry, 1482 closed rings, 22,248 resolvable nodes and 208 footprints carrying height or building:levels. RE-COUNTED INDEPENDENTLY on 2026-08-30 by streaming the file with xml.etree.ElementTree: 16,948,489 bytes, 22,248 nodes, 1482 building ways, 1482 closed, 1482 with every node resolvable, 208 with height or building:levels, kinds 'yes' 1141 / 'house' 139 / 'apartments' 63 / 'residential' 27 / 'school' 21 -- every figure reproduces the design note exactly. The importer at src/scms_sim_ref/mock_pipeline/osm.py currently keeps only highway ways and discards these.",
+      "derivation": "height_coverage_fraction = 208 / 1482 = 0.1404, computed here from the two re-measured counts.",
+      "note": "APPLICABILITY LIMIT for this model: only 14% of footprints carry a height, so a default building height must be assumed. That is harmless for pathloss_37885.urban_nlos (a function of distance only, decided by a 2-D segment-vs-polygon test) but it is the dominant uncertainty for the Sommer interior term, which needs the path length inside the footprint. PROJECTION WARNING: buildings must be projected with the exact (lat0, lon0, kx, ky) tuple that osm.py derives from the ROAD ways (osm.py:110-112); an independently-derived origin misaligns footprints against the road graph and corrupts every LOS/NLOS classification while still producing plausible-looking output. ERRATUM IN THE DESIGN NOTE: PHASE2-DESIGN.md line 102 states the scale as 'kx = 111320*cos(mean_lat), ky = 111320'; the code at osm.py:112 uses ky = 110540.0. Copying 111320 from the design note instead of reading the code introduces a 0.7% north-south scale error -- about 35 m over a 5 km extract, i.e. half a city block of building-vs-road misalignment."
+    },
+    "wall_attenuation_by_material": {
+      "available": false,
+      "unit": "n/a",
+      "confidence": "unavailable",
+      "cite": "no per-material or per-city wall-attenuation calibration is held in this repository",
+      "source": "The 9 dB / 0.4 dB per metre pair is the single calibrated configuration reported for the WONS 2011 measurement site; neither docs/realism/investigation/research-net-sota.json nor any vendored source carries per-material (brick / concrete / glass-curtain-wall) or per-city recalibrations, and OpenStreetMap building=* tags in the cached Ingolstadt extract are dominated by the untyped value 'yes' (1141 of 1482, see footprint_source_coverage), so material could not be inferred even if the constants existed.",
+      "note": "PLACEHOLDER, deliberately empty: no per-material constants are invented. Consequence to state in any Phase-2 datasheet -- building attenuation is modelled with ONE global wall constant, so scenarios whose building stock differs from the WONS 2011 site carry an unquantified bias in the NLOSb branch."
+    }
+  }
+}

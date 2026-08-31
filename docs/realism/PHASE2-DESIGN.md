@@ -9,7 +9,7 @@ These narrow the roadmap's §3.2 sketch into an implementable contract.
 | Fact | Consequence |
 |---|---|
 | Installed: numpy 2.5.2, pandas 3.0.5, pyarrow 25.0.1, libsumo/traci/sumolib **1.25.0** (exact match to the SUMO binary) | Phase 3 mobility has a working substrate; no DLL-mismatch fix needed |
-| **No** shapely, **no** scipy | Geometry must be pure numpy: segment-vs-polygon tests over a uniform spatial grid, mirroring the existing spatial hash at `run.py:2689`. Do **not** add a geometry dependency |
+| **No** shapely, **no** scipy | Geometry must be pure numpy: segment-vs-polygon tests over a uniform spatial grid, mirroring the existing spatial hash at `run.py:2702`. Do **not** add a geometry dependency |
 | `requirements.txt` is only cryptography/pydantic/pytest | numpy is already a de-facto runtime dep of `datagen`; keep `mock_pipeline` importable without new deps — guard optional imports |
 | WSL feature **Disabled**, no distros; enabling needs a reboot | **No in-loop or offline ns-3 / ms-van3t / VaN3Twin federation.** MOSAIC's native-Windows SNS is *less* realistic than what we already have, so it is not adopted either |
 
@@ -20,7 +20,7 @@ parameter ranges.
 
 ## The model stack (opt-in `radio_model="geometric"`)
 
-Applied at the single reception choke point (`run.py:2673-2752`). Every stage is opt-in and drawn
+Applied at the single reception choke point (`run.py:2686-2765`). Every stage is opt-in and drawn
 from dedicated string-keyed RNG streams so the default-config golden digest is untouched.
 
 **1. Link classification** — per (tx, rx) pair per step: LOS / NLOSv (blocked by a vehicle) /
@@ -119,27 +119,30 @@ projected building centroids fall inside the road network's bounding box.
 ## Verified code anchors (read 2026-08-30, `run.py`)
 
 Each defect below was confirmed by reading the reception loop directly — do not re-derive.
+**Line numbers were re-verified on 2026-08-30 after ADR 0002** (`true_speed`/`true_heading` in the
+ground-truth emission record) shifted everything below `run.py:2611` down by 13 lines; the code at
+each anchor is unchanged.
 
-- **`run.py:2742-2743`** — shadowing draw is
+- **`run.py:2755-2756`** — shadowing draw is
   `random.Random(f"{cfg.seed}:shadow:{b['digest']}:{rx.vid}:{step}")`. Two bugs in one line: keyed
   on the **cert digest** (so pseudonym rotation resamples the channel) and on **`step`** (so it is
   i.i.d. per step, with no spatial correlation). Replace with an AR(1) process carried per link and
   keyed on the true vehicle id.
-- **`run.py:2750`** — `loss = packet_loss_base + nlos_loss*(dist/rr) + cong + wx_loss`. Additive;
+- **`run.py:2763`** — `loss = packet_loss_base + nlos_loss*(dist/rr) + cong + wx_loss`. Additive;
   can exceed 1.0. Replace with the independent-survival product.
-- **`run.py:2747`** — congestion is `min(0.8, max(0, (load−chan_capacity)/chan_capacity) * 0.5)`,
+- **`run.py:2760`** — congestion is `min(0.8, max(0, (load−chan_capacity)/chan_capacity) * 0.5)`,
   a linear ramp on raw message count. Replace with modeled CBR.
-- **`run.py:2751`** — the packet-loss draw uses the **global** `rng`, not a keyed stream. This sits
+- **`run.py:2764`** — the packet-loss draw uses the **global** `rng`, not a keyed stream. This sits
   *outside* the per-model branch, so under `radio_model="geometric"` any change in the size of
   `in_range` shifts global RNG consumption. That is safe for the golden digest only because
   geometric is opt-in and the default `disc` path is untouched — but it means the geometric branch
   should move its own draws onto keyed streams rather than lean on `rng`.
-- **`run.py:2693`, `2705-2745`** — `radio_logdist` is the existing precedent for adding a radio
+- **`run.py:2706`, `2718-2758`** — `radio_logdist` is the existing precedent for adding a radio
   model: a boolean selected from `cfg.radio_model`, with the default `"disc"` path taking none of
   the branch and drawing no extra RNG. Model the `"geometric"` branch on exactly this shape.
-- **`run.py:2685-2696`** — the broadcast spatial hash (cell = radio range). Reuse this structure for
+- **`run.py:2698-2709`** — the broadcast spatial hash (cell = radio range). Reuse this structure for
   the building/vehicle occlusion index rather than introducing a geometry library.
-- **`run.py:2682`** — receivers are vehicles + RSUs, with RSUs appended last specifically to keep
+- **`run.py:2695`** — receivers are vehicles + RSUs, with RSUs appended last specifically to keep
   vehicle-side RNG draws unchanged. Preserve that ordering discipline.
 
 ## Java-side parity

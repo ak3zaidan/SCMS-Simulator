@@ -165,6 +165,15 @@ class MaCrlEvent:
 
 # --------------------------------------------------------------------------- #
 # Ground-truth records (ORACLE) -- separate files, labels only
+#
+# ground_truth schema_version 2 (ADR 0002): the per-message emission sample
+# (ground_truth/gt_emissions_sample.jsonl, built as a plain dict in
+# mock_pipeline/run.py so the streamed flow path can write it row-by-row) carries
+# `true_speed` (m/s) and `true_heading` (deg) alongside `true_x`/`true_y`. Both
+# names are in FORBIDDEN_FEATURE_KEYS above -- and would also be caught by the
+# `true_` prefix rule -- so they can never reach a feature table. The heading
+# convention is engine-specific and is declared in manifest.conventions.heading
+# (this engine: degrees counter-clockwise from East).
 # --------------------------------------------------------------------------- #
 @dataclass
 class GtVehicle:

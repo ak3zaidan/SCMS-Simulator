@@ -36,9 +36,15 @@ from scms_sim_ref.mock_pipeline import PipelineConfig, run_pipeline, config_sche
 from scms_sim_ref.mock_pipeline.run import validate_config, main
 
 # --- golden digests (measured on main a3ab5d4, BEFORE the exposure) ------------------------------- #
-GOLDEN_DEFAULT = "04ae9736f519dffb426bb1acebfec95edf32e7127ebc71346279f754a69cee38"
-GOLDEN_COLLUSION_RSU_LOGDIST = "53abb36711ae0e55ef10f754bb5086d87109af96237eda60916c1688091806f3"
-GOLDEN_VRU_DENM = "4628e01edeb30212f9da85a1cd3a5742d60eac5be2e469b1023acea1973144d1"
+# ADR 0002 re-pin (true_speed/true_heading added to gt_emissions_sample):
+# superseded 04ae9736f519... (default-config run; behaviour unchanged).
+GOLDEN_DEFAULT = "0bd93655a2d5bebb4172191fab0940a5ff90c6be685cfa033f5edcfd7c1fb740"
+# ADR 0002 re-pin (true_speed/true_heading added to gt_emissions_sample):
+# superseded 53abb36711ae... (collusion+RSU+logdistance run; behaviour unchanged).
+GOLDEN_COLLUSION_RSU_LOGDIST = "939b4faa726853675f81453e2891bc155e2fa18ea58cac4edbdcba865df8ae2c"
+# ADR 0002 re-pin (true_speed/true_heading added to gt_emissions_sample):
+# superseded 4628e01edeb3... (VRU+DENM run; behaviour unchanged).
+GOLDEN_VRU_DENM = "b3a01d40354c838ffc04c10dcdebf60cf8652b0b67ef694007128011c6d11d46"
 
 # every field exposed by this task -> (default value, expected config_schema group)
 NEW_FIELDS = {

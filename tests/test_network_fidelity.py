@@ -30,18 +30,18 @@ def test_golden_digests_unchanged(tmp_path):
     default = run_pipeline(PipelineConfig(
         seed=7, traffic_flow=True, road_network="grid", duration_s=60, arrival_rate=1.5,
         grid_w=5, grid_h=5, attacker_pct=0.25, out_dir=str(tmp_path / "g"))).data_digest
-    assert default == "04ae9736f519dffb426bb1acebfec95edf32e7127ebc71346279f754a69cee38"
+    assert default == "0bd93655a2d5bebb4172191fab0940a5ff90c6be685cfa033f5edcfd7c1fb740"
 
     grid_lights = run_pipeline(PipelineConfig(
         seed=7, traffic_flow=True, road_network="grid", duration_s=60, arrival_rate=1.5,
         grid_w=5, grid_h=5, attacker_pct=0.25, traffic_lights=True,
         out_dir=str(tmp_path / "gl"))).data_digest
-    assert grid_lights == "b0bae9e4fc04a5f5d43e4b8ab2714d23246bfcb502a27a4ed7646c3deb01a0b8"
+    assert grid_lights == "fe1a58002f468b3124aa24fc26681fb9e69bb63df71e543650289e2034f699e6"
 
     ring = run_pipeline(PipelineConfig(
         seed=7, traffic_flow=True, road_network="ring", duration_s=60, arrival_rate=1.5,
         grid_w=8, grid_block_m=120.0, attacker_pct=0.25, out_dir=str(tmp_path / "r"))).data_digest
-    assert ring == "ff1cddd82227d7aaa3b6d5f931ef0ee9313257cb1af7eb14752eda5aed4a989b"
+    assert ring == "32133dd19efd90b280b7e6ea13e4dda6b23f33f605344c1fe3d740d95ea5da50"
 
 
 def test_ring_lights_digest_intentionally_changed_and_stable(tmp_path):
@@ -149,13 +149,13 @@ def test_arterial_feature_off_is_byte_identical(tmp_path):
         arterial_every=0, arterial_speed_mps=20.0, local_speed_mps=5.0,
         out_dir=str(tmp_path / "q"))).data_digest
     assert plain == speeds_but_off == \
-        "04ae9736f519dffb426bb1acebfec95edf32e7127ebc71346279f754a69cee38"
+        "0bd93655a2d5bebb4172191fab0940a5ff90c6be685cfa033f5edcfd7c1fb740"
     # ring cap off (arterial_speed_mps=0) is byte-identical to the plain ring
     ring_off = run_pipeline(PipelineConfig(
         seed=7, traffic_flow=True, road_network="ring", duration_s=60, arrival_rate=1.5,
         grid_w=8, grid_block_m=120.0, attacker_pct=0.25, arterial_speed_mps=0.0,
         out_dir=str(tmp_path / "ro"))).data_digest
-    assert ring_off == "ff1cddd82227d7aaa3b6d5f931ef0ee9313257cb1af7eb14752eda5aed4a989b"
+    assert ring_off == "32133dd19efd90b280b7e6ea13e4dda6b23f33f605344c1fe3d740d95ea5da50"
 
 
 def test_grid_arterial_caps_are_attached_and_respected():

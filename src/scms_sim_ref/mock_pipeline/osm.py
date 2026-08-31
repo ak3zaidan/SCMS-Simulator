@@ -1,4 +1,4 @@
-"""Real-city street graphs for the pure-Python generator.
+"""Real-city street graphs (and building footprints) for the pure-Python generator.
 
 Converts an OpenStreetMap extract (raw OSM XML) into the {nodes, edges} custom-network format:
 drivable ways become edges (with per-edge speed limits from maxspeed or the highway class),
@@ -6,8 +6,16 @@ shared way-nodes become intersections, curve geometry is simplified (RDP) under 
 tolerance, and only the largest connected component is kept. The result is plain data -- the
 simulation itself stays deterministic and offline; the network fetch happens once and is cached.
 
+The SAME cached Overpass extract also carries every `building=*` way (Overpass `/api/map` returns
+all raw OSM data in the bbox; the importer historically discarded everything that was not a
+`highway`). `extract_buildings` recovers those footprints as closed rings in the SAME local metric
+frame as the road graph -- see the projection note on `osm_to_network` -- so the Phase-2 geometric
+radio model can run a LOS/NLOSb blockage test against real city geometry with no new download, no
+new cache and no geometry dependency.
+
 CLI:
     python -m scms_sim_ref.mock_pipeline.osm --city paris --out paris.json
+    python -m scms_sim_ref.mock_pipeline.osm --city ingolstadt --buildings --out ingolstadt.json
     python -m scms_sim_ref.mock_pipeline.run --flow --road custom --custom-network paris.json ...
 """
 from __future__ import annotations
@@ -86,7 +94,15 @@ def osm_to_network(xml_text: str, max_nodes: int = 380, tol_m: float = 10.0) -> 
     """OSM XML -> (nodes, edges, info) in custom-network form. Deterministic for a given input.
 
     Escalates simplification (higher tolerance, then dropping minor road classes) until the graph
-    fits max_nodes; raises ValueError if even the arterial skeleton is too large for the budget."""
+    fits max_nodes; raises ValueError if even the arterial skeleton is too large for the budget.
+
+    `info["projection"]` carries the EXACT local equirectangular frame the road nodes were projected
+    with, `{"lat0","lon0","kx","ky"}` -- and `info["road_bbox"]` the projected extent of the kept
+    component. Any other layer derived from the same extract (buildings, POIs, ...) MUST reuse that
+    tuple verbatim: the origin is `min(lat), min(lon)` OVER THE ROAD WAYS ONLY, so an independently
+    derived origin misaligns the layers against the road graph by whole city blocks while still
+    producing plausible-looking output. (Note ky = 110540.0 here, not the 111320 that a generic
+    equirectangular snippet uses -- copying the wrong constant is a 0.7% north-south scale error.)"""
     root = ET.fromstring(xml_text)
     latlon: dict[str, tuple[float, float]] = {}
     for nd in root.iter("node"):
@@ -182,12 +198,161 @@ def osm_to_network(xml_text: str, max_nodes: int = 380, tol_m: float = 10.0) -> 
         out_edges = [[remap[a], remap[b], round(sp, 1)]
                      for (a, b), sp in sorted(edges.items()) if a in remap and b in remap]
         if len(out_nodes) <= max_nodes:
+            xs = [p[0] for p in out_nodes]
+            ys = [p[1] for p in out_nodes]
             info = {"kept_nodes": len(out_nodes), "kept_edges": len(out_edges),
                     "dropped_classes": sorted(dropped), "rdp_tol_m": tol,
-                    "ways_parsed": len(ways)}
+                    "ways_parsed": len(ways),
+                    # the projection the building layer MUST reuse verbatim (see the docstring)
+                    "projection": {"lat0": lat0, "lon0": lon0, "kx": kx, "ky": ky},
+                    "road_bbox": [min(xs), min(ys), max(xs), max(ys)]}
             return out_nodes, out_edges, info
     raise ValueError(f"extract still exceeds {max_nodes} nodes after dropping "
                      f"{_DROP_ORDER}; use a smaller bbox")
+
+
+def _ring_area(ring: list) -> float:
+    """Unsigned shoelace area (m^2) of a closed ring given as an open vertex list."""
+    a = 0.0
+    n = len(ring)
+    for i in range(n):
+        x0, y0 = ring[i]
+        x1, y1 = ring[(i + 1) % n]
+        a += x0 * y1 - x1 * y0
+    return abs(a) * 0.5
+
+
+def extract_buildings(xml_text: str, projection: dict, road_bbox: list | None = None, *,
+                      margin_m: float = 250.0, min_area_m2: float = 12.0,
+                      simplify_tol_m: float = 1.0, max_polygons: int = 6000) -> tuple[list, dict]:
+    """`building=*` ways from the SAME cached Overpass XML -> closed rings in projected metres.
+
+    `projection` MUST be the `info["projection"]` dict returned by `osm_to_network` for this exact
+    XML. Re-deriving an origin from the building nodes would shift the whole footprint layer against
+    the road graph (the road origin is min(lat)/min(lon) over ROAD ways only) and silently corrupt
+    every LOS/NLOS classification downstream, so the tuple is threaded through rather than
+    recomputed -- and the caller-visible alignment assertion below is what makes a mistake loud.
+
+    Only ways with a complete, closed geometry are kept (an Overpass extract clips ways at the bbox
+    edge; a way with an unresolvable node ref is dropped rather than guessed). Rings smaller than
+    `min_area_m2` are dropped, the rest are RDP-simplified to `simplify_tol_m`, and -- when
+    `road_bbox` is given -- only footprints within `margin_m` of the road extent are returned, since
+    nothing further away can ever block a link between two vehicles.
+
+    Returns `(polygons, info)`; each polygon is an OPEN vertex list `[[x, y], ...]` (the closing
+    edge back to `polygons[i][0]` is implied). Deterministic for a given input.
+
+    Raises ValueError if the projected footprints do not overlap the road network -- the signature
+    of a wrong projection origin/scale, which is otherwise invisible in the output.
+    """
+    lat0 = float(projection["lat0"])
+    lon0 = float(projection["lon0"])
+    kx = float(projection["kx"])
+    ky = float(projection["ky"])
+    root = ET.fromstring(xml_text)
+    latlon: dict[str, tuple[float, float]] = {}
+    for nd in root.iter("node"):
+        latlon[nd.get("id")] = (float(nd.get("lat")), float(nd.get("lon")))
+
+    raw = 0
+    incomplete = 0
+    unclosed = 0
+    rings: list[list] = []
+    for way in root.iter("way"):
+        tags = {t.get("k"): t.get("v") for t in way.findall("tag")}
+        if not (tags.get("building") or tags.get("building:part")):
+            continue
+        raw += 1
+        refs = [nd.get("ref") for nd in way.findall("nd")]
+        if any(r not in latlon for r in refs):
+            incomplete += 1
+            continue
+        if len(refs) < 4 or refs[0] != refs[-1]:
+            unclosed += 1
+            continue
+        pts = []
+        for r in refs[:-1]:                      # drop the repeated closing vertex
+            la, lo = latlon[r]
+            pts.append([(lo - lon0) * kx, (la - lat0) * ky])
+        if len(pts) < 3:
+            unclosed += 1
+            continue
+        rings.append(pts)
+
+    kept: list[list] = []
+    dropped_small = 0
+    for pts in rings:
+        if _ring_area(pts) < min_area_m2:
+            dropped_small += 1
+            continue
+        if simplify_tol_m > 0 and len(pts) > 4:
+            simp = _rdp(pts + [pts[0]], simplify_tol_m)   # simplify as a closed polyline
+            if len(simp) >= 4:
+                pts = [list(p) for p in simp[:-1]]
+        kept.append(pts)
+
+    info = {"building_ways": raw, "incomplete": incomplete, "unclosed": unclosed,
+            "kept_before_bbox": len(kept), "dropped_below_min_area": dropped_small,
+            "projection": {"lat0": lat0, "lon0": lon0, "kx": kx, "ky": ky}}
+    if not kept:
+        info.update(polygons=0, centroid_inside_road_bbox_frac=None)
+        return [], info
+
+    bxs = [p[0] for ring in kept for p in ring]
+    bys = [p[1] for ring in kept for p in ring]
+    info["building_bbox"] = [min(bxs), min(bys), max(bxs), max(bys)]
+
+    if road_bbox is not None:
+        rx0, ry0, rx1, ry1 = (float(v) for v in road_bbox)
+        cents = []
+        for ring in kept:
+            cents.append((sum(p[0] for p in ring) / len(ring),
+                          sum(p[1] for p in ring) / len(ring)))
+        cxs = sorted(c[0] for c in cents)
+        cys = sorted(c[1] for c in cents)
+        med = (cxs[len(cxs) // 2], cys[len(cys) // 2])
+        # ALIGNMENT ASSERTION. Buildings and roads come out of the SAME extract, so the footprint
+        # cloud must sit on the road network. A wrong origin translates the whole cloud by hundreds
+        # of metres to kilometres while every individual polygon still looks perfectly fine -- this
+        # is the only place that mistake is observable. The tolerance is scale-relative (half the
+        # road diagonal, floor `margin_m`) so it holds for a sparse rural extract with one footprint
+        # as well as for a dense core, and it is a GATE, not a filter.
+        diag = math.hypot(rx1 - rx0, ry1 - ry0)
+        tol = max(margin_m, 0.5 * diag)
+        info["median_building_centroid"] = [round(med[0], 2), round(med[1], 2)]
+        info["alignment_tolerance_m"] = round(tol, 1)
+        if not (rx0 - tol <= med[0] <= rx1 + tol and ry0 - tol <= med[1] <= ry1 + tol):
+            raise ValueError(
+                f"projected building footprints do not sit on the road network: median centroid "
+                f"{info['median_building_centroid']} is outside the road bbox "
+                f"{[rx0, ry0, rx1, ry1]} widened by {tol:.0f} m. This is the projection trap -- "
+                f"buildings must be projected with the SAME (lat0, lon0, kx, ky) that "
+                f"osm_to_network derived from the ROAD ways (note ky = 110540.0, not 111320), "
+                f"never with a re-derived origin.")
+        # diagnostics (reported, not gated): a dense core blankets the road extent, a rural one
+        # does not, and neither says anything about whether the projection is right
+        ox = max(0.0, min(rx1, info["building_bbox"][2]) - max(rx0, info["building_bbox"][0]))
+        oy = max(0.0, min(ry1, info["building_bbox"][3]) - max(ry0, info["building_bbox"][1]))
+        road_area = max(1e-9, (rx1 - rx0) * (ry1 - ry0))
+        info["road_bbox_covered_by_buildings"] = round((ox * oy) / road_area, 4)
+        lo_x, lo_y, hi_x, hi_y = rx0 - margin_m, ry0 - margin_m, rx1 + margin_m, ry1 + margin_m
+        near, inside = [], 0
+        for ring, (cx, cy) in zip(kept, cents):
+            if rx0 <= cx <= rx1 and ry0 <= cy <= ry1:
+                inside += 1
+            if lo_x <= cx <= hi_x and lo_y <= cy <= hi_y:
+                near.append(ring)
+        info["centroid_inside_road_bbox_frac"] = round(inside / len(kept), 4)
+        kept = near
+
+    kept.sort(key=lambda r: (round(min(p[0] for p in r), 3), round(min(p[1] for p in r), 3)))
+    if len(kept) > max_polygons:
+        info["truncated_from"] = len(kept)
+        kept = kept[:max_polygons]
+    out = [[[round(x, 2), round(y, 2)] for x, y in ring] for ring in kept]
+    info["polygons"] = len(out)
+    info["vertices"] = sum(len(r) for r in out)
+    return out, info
 
 
 def fetch_osm(bbox: tuple, cache_dir: str) -> str:
@@ -209,8 +374,14 @@ def fetch_osm(bbox: tuple, cache_dir: str) -> str:
     return data.decode("utf-8", "replace")
 
 
-def import_city(city_or_bbox, cache_dir: str, max_nodes: int = 380) -> tuple[list, list, dict]:
-    """City name (see CITY_BBOXES) or explicit bbox -> (nodes, edges, info)."""
+def import_city(city_or_bbox, cache_dir: str, max_nodes: int = 380,
+                buildings: bool = False) -> tuple[list, list, dict]:
+    """City name (see CITY_BBOXES) or explicit bbox -> (nodes, edges, info).
+
+    With `buildings=True` the SAME cached extract is re-read for `building=*` footprints, projected
+    with the road graph's own projection tuple, and returned as `info["buildings"]` (a list of open
+    rings in metres) plus `info["buildings_info"]`. No extra download: `fetch_osm` is cached and
+    Overpass `/api/map` already returned the footprints."""
     if isinstance(city_or_bbox, str):
         if city_or_bbox not in CITY_BBOXES:
             raise ValueError(f"unknown city {city_or_bbox!r}; have {sorted(CITY_BBOXES)} "
@@ -225,6 +396,10 @@ def import_city(city_or_bbox, cache_dir: str, max_nodes: int = 380) -> tuple[lis
     xml_text = fetch_osm(bbox, cache_dir)
     nodes, edges, info = osm_to_network(xml_text, max_nodes=max_nodes)
     info["bbox"] = list(bbox)
+    if buildings:
+        polys, binfo = extract_buildings(xml_text, info["projection"], info["road_bbox"])
+        info["buildings"] = polys
+        info["buildings_info"] = binfo
     return nodes, edges, info
 
 
@@ -236,12 +411,19 @@ def main(argv=None) -> int:
     p.add_argument("--out", required=True)
     p.add_argument("--cache", default="datasets/_osmcache")
     p.add_argument("--max-nodes", type=int, default=380)
+    p.add_argument("--buildings", action="store_true",
+                   help="also extract building=* footprints from the same cached extract and "
+                        "persist them beside the graph (consumed by radio_model=geometric)")
     a = p.parse_args(argv)
     target = a.city if a.city else [float(v) for v in a.bbox.split(",")]
-    nodes, edges, info = import_city(target, a.cache, max_nodes=a.max_nodes)
+    nodes, edges, info = import_city(target, a.cache, max_nodes=a.max_nodes, buildings=a.buildings)
+    doc = {"nodes": nodes, "edges": edges}
+    if a.buildings:
+        doc["buildings"] = info["buildings"]
     with open(a.out, "w", encoding="utf-8") as fh:
-        json.dump({"nodes": nodes, "edges": edges}, fh)
-    print(f"wrote {a.out}: {info}")
+        json.dump(doc, fh)
+    shown = {k: v for k, v in info.items() if k != "buildings"}
+    print(f"wrote {a.out}: {shown}")
     return 0
 
 

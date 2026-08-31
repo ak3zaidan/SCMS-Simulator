@@ -512,6 +512,120 @@ def test_a_backward_position_remap_is_counted_and_screened():
     assert int(k2["reversal"].sum()) == 1 and k2["n_excl"]["reversal"] == 2
 
 
+# ==================================================================================================
+# the lateral metric under SUB-SAMPLED emissions
+#
+# `traffic.lateral_discontinuity_events` is a claim about ONE sampling interval. Across a gap wider
+# than the harness's own finite-difference ceiling there is no such claim to make: whatever sideways
+# component the chord has is where the vehicle drove while nobody was looking. Before this was
+# masked, the metric read 0.6799 ev/veh-km on datasets/mosaic_intas_urban_low_gate (emit_p 0.02) --
+# 535 "events", 473 of them (88.4%) on pairs wider than 2 s, median gap 10.2 s, maximum "lateral
+# offset" 891.7 m -- against 0.5872 on a full trace of the SAME scenario.
+# ==================================================================================================
+def _sparse_jog_track(n=40, gap=10.0, v=12.0, jog_at=20, jog_m=40.0):
+    """A vehicle sampled every `gap` s that drives east and jogs one block north and back again.
+
+    The sub-sampled artefact in miniature. Nothing moves sideways inside a sampling interval -- the
+    vehicle merely drives round a block between two samples 10 s apart -- yet every clause of the
+    lane-change test is satisfied: the chord has a 40 m component across the neighbouring chords'
+    direction, its lateral 'speed' is 4 m/s, and the RAW headings either side of the jog agree
+    exactly (both due east), so the cornering guard sees a perfectly stable heading.
+    """
+    t = [i * gap for i in range(n)]
+    x = [v * ti for ti in t]
+    y = [jog_m if i == jog_at else 0.0 for i in range(n)]
+    return t, x, y
+
+
+def test_a_gap_wider_than_the_ceiling_cannot_produce_a_lane_change_event():
+    """Same trajectory, only the finite-difference ceiling differs -- 2 events become 0."""
+    t, x, y = _sparse_jog_track()
+    wide = rb.track_kinematics(np.array(t), np.array(x), np.array(y), max_dt=1e9)
+    assert int(wide["lateral"].sum()) == 2                  # into the jog and back out of it
+    assert float(np.abs(wide["d_lat"]).max()) == pytest.approx(40.0, abs=1e-6)
+    assert float(wide["lateral_speed"].max()) == pytest.approx(4.0, abs=1e-6)
+
+    k = rb.track_kinematics(np.array(t), np.array(x), np.array(y))   # the real MAX_FD_DT_S
+    assert int(k["lateral"].sum()) == 0
+    assert int(k["lateral_scan"].sum()) == 0                # nothing is even scannable at a 10 s gap
+    assert int(k["reversal"].sum()) == 0
+
+
+def test_lateral_metric_is_na_on_a_sub_sampled_trace(tmp_path):
+    """The defect: at emit_sample_prob 0.02 the metric used to publish a rate from 10 s gaps."""
+    emis = []
+    for j in range(8):
+        t, x, y = _sparse_jog_track(jog_at=15 + j)
+        emis.extend(_track_rows(f"veh_{j:03d}", t, [xi + 5000.0 * j for xi in x], y))
+    card = rb.scorecard(_make_dataset(str(tmp_path / "sparse"), emissions=emis,
+                                      config={"emit_sample_prob": 0.02, "road_network": "grid"}))
+    m = _metric(card, "traffic.lateral_discontinuity_events")
+    assert m["status"] == "na" and m["value"] is None
+    assert "finite-difference ceiling" in m["reason"] and str(rb.MIN_SAMPLES) in m["reason"]
+    assert m["details"]["events"] == 0 and m["details"]["sample_pairs"] == 0
+    assert m["details"]["sample_pairs_total"] == 8 * 39
+    assert m["details"]["max_lateral_step_m"] is None      # the 40 m diagnostics are gone too
+    assert m["details"]["full_lane_steps"] == 0
+    # an "na" is not a failure: the metric must drop out of the soft-failure list, not fail loudly
+    assert "traffic.lateral_discontinuity_events" not in card["summary"]["soft_failures"]
+
+    # ... and the SAME jog sampled densely enough to resolve it is scored again
+    dense = []
+    for j in range(8):
+        t, x, y = _sparse_jog_track(n=120, gap=0.5, v=12.0, jog_at=60, jog_m=4.0)
+        dense.extend(_track_rows(f"veh_{j:03d}", t, [xi + 5000.0 * j for xi in x], y))
+    card2 = rb.scorecard(_make_dataset(str(tmp_path / "dense"), emissions=dense,
+                                       config={"dt": 0.5, "road_network": "grid"}))
+    m2 = _metric(card2, "traffic.lateral_discontinuity_events")
+    assert m2["status"] == "fail" and m2["details"]["events"] == 16
+
+
+def test_lateral_rate_is_normalised_over_the_scannable_subset_only(tmp_path):
+    """One real lane change per vehicle, plus a 30 s hole that must not enter EITHER side of the rate.
+
+    Each track is 59 steps at 0.1 s with a lane change at step 29; sample 50 onward is displaced
+    30 s / 360 m east / 100 m north, so step 49 is a 30.1 s gap whose 100 m sideways component would
+    otherwise be counted as a second lane change AND whose 361 m of travel would otherwise pad the
+    vehicle-km the rate is divided by (making the rate look ~7x better than it is).
+    """
+    emis = []
+    for j in range(6):
+        t, x, y = _lane_change_track(n=60, dt=0.1, v=12.0, jump_at=30)
+        t = [ti + (30.0 if i >= 50 else 0.0) for i, ti in enumerate(t)]
+        x = [xi + 500.0 * j + (360.0 if i >= 50 else 0.0) for i, xi in enumerate(x)]
+        y = [yi + (100.0 if i >= 50 else 0.0) for i, yi in enumerate(y)]
+        emis.extend(_track_rows(f"veh_{j:03d}", t, x, y))
+    # the gap step really would have been counted without the mask
+    t0, x0, y0 = ([r["t"] for r in emis[:60]], [r["true_x"] for r in emis[:60]],
+                  [r["true_y"] for r in emis[:60]])
+    wide = rb.track_kinematics(np.array(t0), np.array(x0), np.array(y0), max_dt=1e9)
+    assert int(wide["lateral"].sum()) == 2                 # the lane change AND the 30 s hole
+
+    card = rb.scorecard(_make_dataset(str(tmp_path / "hole"), emissions=emis,
+                                      config={"dt": 0.1, "road_network": "grid"}))
+    d = _metric(card, "traffic.lateral_discontinuity_events")["details"]
+    assert d["events"] == 6                                 # only the six real lane changes
+    assert d["sample_pairs_total"] == 6 * 59
+    assert d["sample_pairs_inside_gap_ceiling"] == 6 * 58    # one 30.1 s step per vehicle
+    # ... and the +-3-step window the smoothed heading is read from must be inside the ceiling too
+    assert d["sample_pairs"] == 6 * (59 - (2 * rb.HEADING_WINDOW_PAIRS + 1))
+    assert d["sample_pairs_dropped_sampling_gap"] == 6 * 7
+    assert d["vehicle_km"] == pytest.approx(6 * 52 * 1.2 / 1000.0, abs=1e-3)      # published to 3 dp
+    assert d["vehicle_km_all_pairs"] == pytest.approx(6 * (58 * 1.2 + 361.2) / 1000.0, abs=1e-3)
+    assert _metric(card, "traffic.lateral_discontinuity_events")["value"] == pytest.approx(
+        6.0 / (6 * 52 * 1.2 / 1000.0), abs=1e-4)
+    assert d["max_lateral_step_m"] == pytest.approx(rb.LANE_WIDTH_M, abs=1e-6)   # not 100.0
+
+
+def test_the_full_trace_lateral_rate_is_unchanged_by_the_gap_mask():
+    """A full trace has no dropped gaps, so the mask must be a no-op on every scored baseline."""
+    t, x, y = _lane_change_track()
+    k = rb.track_kinematics(np.array(t), np.array(x), np.array(y))
+    assert bool(k["lateral_scan"].all()) and int(k["lateral"].sum()) == 1
+    kin = rb.kinematics(rb.build_tracks(_track_rows("veh_000", t, x, y)))
+    assert kin["path_m"] == pytest.approx(kin["path_m_all"])
+
+
 def test_lateral_metric_reference_entry_is_soft_and_cites_the_sumo_default():
     ref = REFDATA["entries"]["kinematics.lateral_discontinuity_per_vehicle_km_max"]
     assert ref["max"] == 0.0 and ref["unit"] == "events/vehicle-km"
@@ -520,6 +634,219 @@ def test_lateral_metric_reference_entry_is_soft_and_cites_the_sumo_default():
     lat_ref = REFDATA["entries"]["kinematics.lateral_speed_max_mps"]
     assert lat_ref["max"] == rb.LATERAL_SPEED_MAX_MPS       # the code and the reference agree
     assert rb.LATERAL_JUMP_M == rb.LANE_WIDTH_M / 2.0
+
+
+# ==================================================================================================
+# ADR 0002 -- true_speed / true_heading in the ground-truth record
+#
+# The harness does not own the emission schema, so it must (a) use the fields when they are there,
+# (b) keep every pre-ADR dataset working unchanged, and (c) never trust a field it cannot corroborate
+# against the geometry it can already measure. A silently mis-read heading convention would rotate
+# the whole lateral decomposition by 90 degrees and still produce plausible-looking output.
+# ==================================================================================================
+def _gt_rows(vid, t, x, y, speed, heading_rad, convention="deg_ccw_from_east"):
+    """`_track_rows` plus true_speed / true_heading, the heading written in `convention`."""
+    if convention == "deg_ccw_from_east":
+        h = [math.degrees(a) % 360.0 for a in heading_rad]
+    elif convention == "deg_cw_from_north":
+        h = [(90.0 - math.degrees(a)) % 360.0 for a in heading_rad]
+    elif convention == "rad_ccw_from_east":
+        h = list(heading_rad)
+    elif convention == "rad_cw_from_north":
+        h = [(math.pi / 2.0) - a for a in heading_rad]
+    else:                                                        # pragma: no cover - test guard
+        raise AssertionError(convention)
+    rows = _track_rows(vid, t, x, y)
+    for r, s, hh in zip(rows, speed, h):
+        r["true_speed"] = round(float(s), 6)
+        r["true_heading"] = round(float(hh), 6)
+    return rows
+
+
+def _diagonal_track(n=60, dt=0.5, v=14.0, ang_deg=30.0):
+    """A straight track at 30 degrees: a bearing no two heading conventions agree on."""
+    a = math.radians(ang_deg)
+    t = [round(i * dt, 6) for i in range(n)]
+    return t, [v * ti * math.cos(a) for ti in t], [v * ti * math.sin(a) for ti in t], a
+
+
+@pytest.mark.parametrize("conv", sorted(rb.HEADING_CONVENTIONS))
+def test_ground_truth_heading_convention_is_detected_and_reported(conv):
+    """A 30-degree bearing separates all four candidates; the fit is validated, not assumed."""
+    t, x, y, a = _diagonal_track()
+    rows = _gt_rows("veh_000", t, x, y, [14.0] * len(t), [a] * len(t), conv)
+    gt = rb.ground_truth_kinematics(rb.build_tracks(rows))
+    assert gt["heading"]["used"] is True and gt["heading"]["convention"] == conv
+    assert gt["heading"]["residual_deg"] == pytest.approx(0.0, abs=1e-6)
+    assert gt["heading"]["source"].endswith(f"({conv})")
+    # every other candidate is measurably worse -- the pick is not a coin toss
+    others = [v for k, v in gt["heading"]["convention_residuals_deg"].items() if k != conv]
+    assert min(others) > rb.GT_HEADING_MAX_RESIDUAL_DEG
+    assert gt["speed"]["used"] is True and gt["speed"]["residual_vs_chord_speed_mps"] < 1e-6
+
+
+def test_a_heading_field_that_fits_no_convention_is_rejected():
+    """Garbage in the field must fall back to the chord bearing, not rotate the decomposition."""
+    t, x, y, _a = _diagonal_track()
+    rows = _track_rows("veh_000", t, x, y)
+    for i, r in enumerate(rows):
+        r["true_heading"] = float((i * 37) % 360)          # unrelated to where the vehicle points
+        r["true_speed"] = 14.0
+    gt = rb.ground_truth_kinematics(rb.build_tracks(rows))
+    assert gt["heading"]["used"] is False
+    assert "no heading convention fits" in gt["heading"]["reason"]
+    assert gt["speed"]["used"] is True                     # the speed field is judged on its own
+
+
+def test_a_ground_truth_speed_in_the_wrong_unit_is_rejected():
+    t, x, y, a = _diagonal_track()
+    rows = _gt_rows("veh_000", t, x, y, [14.0 * 3.6] * len(t), [a] * len(t))   # km/h, not m/s
+    gt = rb.ground_truth_kinematics(rb.build_tracks(rows))
+    assert gt["speed"]["used"] is False
+    assert "wrong unit or frame" in gt["speed"]["reason"]
+    assert gt["speed"]["residual_vs_chord_speed_mps"] == pytest.approx(14.0 * 2.6, abs=1e-3)
+    assert gt["heading"]["used"] is True                   # ... and the heading still is
+
+
+def test_a_partially_populated_ground_truth_field_is_not_interpolated():
+    t, x, y, a = _diagonal_track()
+    rows = _gt_rows("veh_000", t, x, y, [14.0] * len(t), [a] * len(t))
+    rows[7].pop("true_speed")                              # one sample short of a complete track
+    tracks = rb.build_tracks(rows)
+    assert "v" not in tracks["veh_000"] and "h_raw" in tracks["veh_000"]
+    gt = rb.ground_truth_kinematics(tracks)
+    assert gt["speed"]["used"] is False and gt["speed"]["present_tracks"] == 0
+    assert gt["heading"]["used"] is True and gt["heading"]["present_tracks"] == 1
+
+
+def test_a_half_migrated_dataset_does_not_mix_two_estimators():
+    """One vehicle out of four still lacks the field: the panel must not average two estimators."""
+    t, x, y, a = _diagonal_track()
+    rows = []
+    for j in range(4):
+        yy = [yi + 400.0 * j for yi in y]
+        if j == 3:
+            rows.extend(_track_rows(f"veh_{j:03d}", t, x, yy))          # the un-migrated vehicle
+        else:
+            rows.extend(_gt_rows(f"veh_{j:03d}", t, x, yy, [14.0] * len(t), [a] * len(t)))
+    gt = rb.ground_truth_kinematics(rb.build_tracks(rows))
+    assert gt["speed"]["used"] is False and gt["heading"]["used"] is False
+    assert gt["speed"]["present_tracks"] == 3 and gt["speed"]["total_tracks"] == 4
+    assert "mix two estimators" in gt["speed"]["reason"]
+    assert "mix two estimators" in gt["heading"]["reason"]
+
+
+def test_ground_truth_speed_removes_the_arrival_clamp_artefact_entirely():
+    """The ADR's own worked example. Same trace as test_arrival_clamp_...: the final 1 s step covers
+    1.2 m because the vehicle's last sample is its destination, which a position double-difference
+    reads as -15.6 m/s^2 and only a boundary screen can suppress. The simulator knew all along that
+    the speed never changed, so with true_speed there is no artefact to screen."""
+    n = 40                                                 # long enough to validate the field on
+    t = [float(i) for i in range(n)]
+    x = [16.8 * i for i in range(n - 1)] + [16.8 * (n - 2) + 1.2]
+    y = [0.0] * n
+    rows = _gt_rows("veh_000", t, x, y, [16.8] * n, [0.0] * n)
+    tracks = rb.build_tracks(rows)
+    gt = rb.ground_truth_kinematics(tracks)
+    assert gt["speed"]["used"] is True and gt["speed"]["validated_steps"] == n - 1
+
+    fallback = rb.kinematics(tracks)                       # what a pre-ADR dataset gets
+    assert float(fallback["accel_all"].min()) == pytest.approx(-15.6, abs=1e-6)
+    assert fallback["n_excl"]["boundary"] == 2
+
+    k = rb.kinematics(tracks, gt=gt)
+    assert float(np.abs(k["accel_all"]).max()) == 0.0      # not screened -- never generated
+    assert k["accel"].size == n - 1 and k["n_excl"] == {"boundary": 0, "lateral": 0, "reversal": 0,
+                                                        "teleport": 0}
+    assert np.allclose(k["accel_pair_dt"], 1.0)            # one STEP, not a midpoint separation
+
+
+def test_ground_truth_speed_still_reports_a_genuine_hard_brake():
+    """The gate must not become vacuous: a real -12 m/s^2 in the speed field is still a failure."""
+    dt = 0.1
+    speeds = [25.0] * 25 + [25.0 - 1.2 * (i + 1) for i in range(10)] + [13.0] * 25
+    t, x = [0.0], [0.0]
+    for v in speeds:
+        t.append(round(t[-1] + dt, 6))
+        x.append(x[-1] + v * dt)
+    y = [0.0] * len(t)
+    rows = _gt_rows("veh_000", t, x, y, [speeds[0]] + speeds, [0.0] * len(t))
+    k = rb.kinematics(rb.build_tracks(rows), gt=rb.ground_truth_kinematics(rb.build_tracks(rows)))
+    assert float(k["accel"].min()) == pytest.approx(-12.0, abs=1e-6)
+    assert int((k["accel"] < -8.0).sum()) == 10
+
+
+def test_ground_truth_heading_finds_the_lane_change_with_no_smoothing_window():
+    """With a measured heading the lane-change test reads the vehicle's own turn, and the +-3-step
+    scan window disappears -- so a step next to a dropped gap is still scannable."""
+    t, x, y = _lane_change_track()
+    rows = _gt_rows("veh_000", t, x, y, [12.0] * len(t), [0.0] * len(t))
+    tracks = rb.build_tracks(rows)
+    gt = rb.ground_truth_kinematics(tracks)
+    k = rb.kinematics(tracks, gt=gt)
+    assert int(k["lateral"].sum()) == 1 and k["lateral"][29]
+    assert bool(k["lateral_scan"].all())
+    assert float(np.abs(k["d_lat"]).max()) == pytest.approx(rb.LANE_WIDTH_M, abs=1e-6)
+    # a corner is separated by the heading itself turning, not by neighbouring chords
+    ang = [0.0] * 30 + [math.pi / 2.0] * 30
+    xx = [12.0 * 0.1 * i for i in range(30)] + [12.0 * 0.1 * 29] * 30
+    yy = [0.0] * 30 + [12.0 * 0.1 * (i + 1) for i in range(30)]
+    corner = _gt_rows("veh_001", t, xx, yy, [12.0] * 60, ang)
+    tr2 = rb.build_tracks(corner)
+    k2 = rb.kinematics(tr2, gt=rb.ground_truth_kinematics(tr2))
+    assert int(k2["lateral"].sum()) == 0
+
+
+def test_scorecard_records_which_kinematic_path_produced_each_metric(tmp_path):
+    t, x, y, a = _diagonal_track(n=120, dt=0.5)
+    emis = []
+    for j in range(6):
+        emis.extend(_gt_rows(f"veh_{j:03d}", t, [xi + 900.0 * j for xi in x], y,
+                             [14.0] * len(t), [a] * len(t), "deg_cw_from_north"))
+    card = rb.scorecard(_make_dataset(str(tmp_path / "gt"), emissions=emis,
+                                      config={"dt": 0.5, "road_network": "grid"}))
+    ks = card["kinematics_source"]
+    assert ks["speed"]["used"] is True and ks["heading"]["convention"] == "deg_cw_from_north"
+    for mid in ("traffic.speed_p50_mps", "traffic.speed_max_mps",
+                "traffic.accel_within_hard_bound_frac", "traffic.accel_within_comfort_frac"):
+        assert _metric(card, mid)["details"]["kinematics_source"] == "ground truth true_speed", mid
+    lat = _metric(card, "traffic.lateral_discontinuity_events")
+    assert lat["details"]["kinematics_source"].startswith("ground truth true_heading")
+    assert "true_heading (ground truth" in lat["details"]["method"]
+    acc = _metric(card, "traffic.accel_within_hard_bound_frac")
+    assert "FIRST difference of the ground-truth true_speed" in acc["details"]["method"]
+    assert acc["value"] == 1.0 and acc["status"] == "pass"
+    # the speed metric now samples EVERY emission, not every usable step
+    assert _metric(card, "traffic.speed_p50_mps")["n"] == 6 * len(t)
+    assert _metric(card, "traffic.speed_max_mps")["value"] == pytest.approx(14.0, abs=1e-6)
+    assert card["kinematics_source"]["heading"]["residual_deg"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_a_pre_adr_dataset_reports_the_fallback_path_and_is_unchanged(tmp_path):
+    """Older datasets carry neither field: the harness must say so and behave exactly as before."""
+    card = rb.scorecard(_make_dataset(str(tmp_path / "old"),
+                                      emissions=_straight_line_emissions()))
+    ks = card["kinematics_source"]
+    assert ks["speed"]["used"] is False and ks["heading"]["used"] is False
+    assert ks["speed"]["source"] == "position finite difference"
+    assert "no track carries true_speed" in ks["speed"]["reason"]
+    assert "no track carries true_heading" in ks["heading"]["reason"]
+    assert _metric(card, "traffic.speed_p50_mps")["details"]["source_field"].startswith(
+        "longitudinal component")
+    assert _metric(card, "traffic.speed_p50_mps")["value"] == pytest.approx(12.0, abs=1e-6)
+
+
+def test_ground_truth_kinematics_never_leaks_a_per_entity_value(tmp_path):
+    """The fields are ORACLE: the scorecard may name them, never carry one vehicle's value."""
+    t, x, y, a = _diagonal_track(n=120, dt=0.5)
+    emis = []
+    for j in range(6):
+        emis.extend(_gt_rows(f"veh_{j:03d}", t, [xi + 900.0 * j for xi in x], y,
+                             [14.0] * len(t), [a] * len(t)))
+    card = rb.scorecard(_make_dataset(str(tmp_path / "gtleak"), emissions=emis))
+    assert find_forbidden_keys(card) == []                 # a VALUE named "true_speed" is not a key
+    blob = json.dumps(card, default=str)
+    assert "veh_000" not in blob and "veh_005" not in blob
 
 
 # ==================================================================================================

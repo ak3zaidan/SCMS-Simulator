@@ -78,8 +78,10 @@ def test_realism_entries_present_and_typed():
         c = pf[arg]
         assert c["name"] == name, f"{arg} should be control {name!r} (got {c['name']!r})"
         assert c["type"] == ctype, f"{arg} should be a {ctype} control (got {c['type']!r})"
-    # radio_model must offer both propagation models.
-    assert set(pf["--radio-model"]["options"]) == {"disc", "logdistance"}
+    # radio_model must offer every propagation model the engine implements: the hard disc, the
+    # log-distance soft range, and the Phase-2 geometric (3GPP TR 37.885) model.
+    assert set(pf["--radio-model"]["options"]) == {"disc", "logdistance", "geometric"}
+    assert set(pf["--radio-model"]["options"]) == set(runmod._ENUM_OPTIONS["radio_model"])
 
 
 def test_realism_defaults_match_pipelineconfig():

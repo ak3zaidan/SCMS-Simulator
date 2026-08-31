@@ -18,7 +18,9 @@ def _count_reports(out):
 
 
 # The reference default-path digest, measured on the starting commit BEFORE this feature existed.
-_GOLDEN = "04ae9736f519dffb426bb1acebfec95edf32e7127ebc71346279f754a69cee38"
+# ADR 0002 re-pin (true_speed/true_heading added to gt_emissions_sample):
+# superseded 04ae9736f519... (default-config run; behaviour unchanged).
+_GOLDEN = "0bd93655a2d5bebb4172191fab0940a5ff90c6be685cfa033f5edcfd7c1fb740"
 
 
 def test_default_path_is_byte_identical(tmp_path):

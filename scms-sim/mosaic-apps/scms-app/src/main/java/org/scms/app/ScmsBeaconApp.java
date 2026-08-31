@@ -17,6 +17,14 @@
  *                           error on the transmitted CAM (keyed per vehicle, driven by sim time)
  *   SCMS_PSEUDONYM_POLICY=distance  NextGen's 800-1500 m + 120-360 s pseudonym change, re-based on
  *                           simulation time (upstream used the wall clock, see ScmsBackend)
+ *
+ * Phase-2 channel realism, also opt-in and implemented once in org.scms.radio.RxChannel (shared
+ * with ScmsRsuApp, so infrastructure and vehicle links come from the SAME radio):
+ *   SCMS_RADIO_MODEL=geometric  3GPP TR 37.885 link budget with a LOS / NLOSb decision taken against
+ *                           the real InTAS building footprints, and Gudmundson AR(1) shadowing
+ *                           carried per link (see RxChannel / BuildingIndex / PathLoss)
+ *   SCMS_DCC=1              ETSI TS 102 687 reactive DCC gating CAM emission on the modelled channel
+ *                           busy ratio (see org.scms.radio.Dcc)
  */
 package org.scms.app;
 
@@ -41,6 +49,7 @@ import org.eclipse.mosaic.lib.util.scheduling.Event;
 
 import org.scms.attacks.AttackLib;
 import org.scms.backend.ScmsBackend;
+import org.scms.radio.RxChannel;
 import org.scms.realism.DriverProfile;
 import org.scms.realism.SensorErrorModel;
 
@@ -52,21 +61,6 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
     private static final double CAM_INTERVAL_S = envD("SCMS_CAM_INTERVAL", 1.0);   // ETSI T_GenCamMax
     private static final double CAM_MIN_S = envD("SCMS_CAM_MIN", 0.1);             // ETSI T_GenCamMin
     private static final int FLOOD_BURST = envI("SCMS_FLOOD_BURST", 10);           // DoS msgs per tick
-    private static final int CHAN_CAPACITY = envI("SCMS_CHAN_CAPACITY", 25);   // CAMs/100ms before congestion loss (0 = off)
-    private static final double CHAN_WINDOW_S = 0.1;
-    private static final double WEATHER_DROP = weatherDrop();                   // 802.11p attenuation by weather
-    private static final double NLOS_INTENSITY = envD("SCMS_NLOS", 0.0);        // building-obstruction loss (0 = off)
-
-    private static double weatherDrop() {
-        String w = System.getenv("SCMS_WEATHER");
-        if (w == null) { return 0.0; }
-        switch (w.toLowerCase()) {
-            case "rain": return 0.05;
-            case "fog":  return 0.03;
-            case "snow": return 0.10;
-            default:     return 0.0;
-        }
-    }
 
     private static int envI(String n, int d) {
         String e = System.getenv(n);
@@ -93,9 +87,8 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
     private static boolean scenarioNoted = false;   // resolve the scenario dir once per JVM
 
     private final CamDetector detector = new CamDetector();
-    private double chanWinStart = Double.NEGATIVE_INFINITY;
-    private int chanCount = 0, chanLoad = 0;      // local channel load (CBR proxy)
-    private java.util.Random chanRng;             // deterministic contention-loss RNG
+    private RxChannel channel;                    // weather / obstruction / contention (shared model)
+    private long dccSuppressed = 0;               // CAMs this vehicle did not send because of DCC
 
     @Override
     public void onStartup() {
@@ -104,7 +97,7 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         backend.register(id);
         cred = backend.getCredential(id);
         myDigest = cred.certDigest;
-        chanRng = new java.util.Random(0x9E3779B97F4A7C15L ^ (long) id.hashCode());
+        channel = new RxChannel(id);
         noteScenario(backend);
         if ("nextgen".equals(ScmsBackend.SENSOR_MODEL)) {
             // Weather scales the GNSS/compass error magnitudes exactly as it scales the built-in
@@ -154,17 +147,29 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         }
     }
 
-    /** Hand the back-end the scenario directory once, so the manifest can pick up input hashes. */
+    /**
+     * Hand the back-end the scenario directory once, so the manifest can pick up input hashes — and
+     * take the same opportunity to load the scenario's building footprints, which live under that
+     * directory ({@code <scenario>/sumo/buildings.poly.xml}) and are parsed once per JVM.
+     */
     private void noteScenario(ScmsBackend backend) {
         if (scenarioNoted) {
             return;
         }
         scenarioNoted = true;
+        java.io.File dir = null;
         try {
-            backend.noteScenarioDir(org.eclipse.mosaic.fed.application.ambassador.SimulationKernel
-                    .SimulationKernel.getConfigurationPath());
+            dir = org.eclipse.mosaic.fed.application.ambassador.SimulationKernel
+                    .SimulationKernel.getConfigurationPath();
+            backend.noteScenarioDir(dir);
         } catch (Throwable ignored) {
             // best-effort: without it the manifest just omits the inputs section
+        }
+        try {
+            RxChannel.buildings(dir);   // no-op unless SCMS_RADIO_MODEL=geometric
+        } catch (Throwable ex) {
+            // A footprint file that will not parse must degrade to LOS-everywhere, never kill a run.
+            getLog().warn("building footprints not loaded: {}", ex.toString());
         }
         backend.noteAppParams(appParams());
     }
@@ -182,11 +187,10 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         p.put("SCMS_SPEED_TOL", CamDetector.SPEED_TOL_M);
         p.put("SCMS_HEADING_DIFF", CamDetector.HEADING_DIFF);
         p.put("SCMS_SYBIL_MIN", CamDetector.SYBIL_MIN);
-        p.put("SCMS_CHAN_CAPACITY", CHAN_CAPACITY);
-        p.put("SCMS_NLOS", NLOS_INTENSITY);
         p.put("SCMS_MIN_CONSEC", CamDetector.MIN_CONSEC);
         p.put("SCMS_MAX_ACCEL", CamDetector.MAX_PLAUSIBLE_ACCEL);
         p.put("SCMS_KF_THRESH", CamDetector.KF_THRESH);
+        p.putAll(RxChannel.params());   // radio model, weather loss, congestion, DCC, footprints
         return p;
     }
 
@@ -208,23 +212,36 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
                 || "DoSRandom".equals(AttackLib.baseOf(cred.attackType)));
         // ETSI EN 302 637-2 CAM generation rules: trigger on dynamics (Δpos>4 m / Δhdg>4° /
         // Δspeed>0.5 m/s), floored at T_GenCamMin and heart-beating at T_GenCamMax. DoS floods.
+        //
+        // ETSI TS 102 687 reactive DCC (SCMS_DCC=1, off by default) raises that floor from
+        // T_GenCamMin towards T_GenCamMax as the modelled channel busy ratio climbs — 10 / 5 / 2.5 /
+        // 2 / 1 Hz at CBR 0.30 / 0.40 / 0.50 / 0.60, the table pinned in
+        // refdata/etsi_cam_dcc.json:dcc_reactive_rate_table. The terminal 1 Hz state IS T_GenCamMax,
+        // so DCC never stretches a CAM beyond the CAM standard's own heartbeat.
+        //
+        // A DoS flood deliberately IGNORES the floor. That asymmetry is the point: congestion
+        // control throttles the honest witnesses whose evidence the MA depends on while the attacker
+        // keeps its rate, which is precisely the pressure a real misbehaviour authority is under.
+        double dccMin = channel.dccMinIntervalS(tS);         // 0.0 when SCMS_DCC is off
+        double minGap = Math.max(CAM_MIN_S, dccMin);
         double dtLast = tS - lastSendS;
-        boolean due;
-        if (flood) {
-            due = true;
-        } else if (dtLast < CAM_MIN_S) {
-            due = false;
-        } else if (dtLast >= CAM_INTERVAL_S || !haveSentBefore) {
-            due = true;
-        } else {
-            double dPos = Math.hypot(selfX - lastSentX, selfY - lastSentY);
-            double dHdg = angleDiff(updated.getHeading(), lastSentHeading);
-            double dSpd = Math.abs(updated.getSpeed() - lastSentSpeed);
-            due = dPos > 4.0 || dHdg > 4.0 || dSpd > 0.5;
-        }
+        // The ETSI trigger on its own: would EN 302 637-2 have emitted a CAM now, ignoring DCC?
+        boolean etsiTriggered = !haveSentBefore || dtLast >= CAM_INTERVAL_S
+                || Math.hypot(selfX - lastSentX, selfY - lastSentY) > 4.0
+                || angleDiff(updated.getHeading(), lastSentHeading) > 4.0
+                || Math.abs(updated.getSpeed() - lastSentSpeed) > 0.5;
+        boolean due = flood || (dtLast >= minGap && etsiTriggered);
         if (!due) {
+            // Separate a DCC suppression (the ETSI trigger DID fire, congestion control held the
+            // frame) from an ordinary "nothing changed" tick, so the manifest can report how much
+            // cooperative awareness the channel state actually cost.
+            if (etsiTriggered && dtLast >= CAM_MIN_S && dtLast < minGap) {
+                dccSuppressed++;
+                channel.dccNoteSuppressed();
+            }
             return;
         }
+        channel.dccNoteAllowed();
         lastSendS = tS;
         lastSentX = selfX; lastSentY = selfY;
         lastSentHeading = updated.getHeading(); lastSentSpeed = updated.getSpeed();
@@ -289,40 +306,18 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         }
         double t = getOperatingSystem().getSimulationTime() / 1e9;
         ScmsBackend backend = ScmsBackend.instance();
-        // Weather (rain/fog/snow) attenuates the 802.11p link — a fraction of frames are lost.
-        if (WEATHER_DROP > 0 && chanRng.nextDouble() < WEATHER_DROP) {
-            return;
-        }
-        // NLOS: buildings obstruct more-distant links in urban areas — loss grows with distance.
-        // The obstruction is a property of the PHYSICAL link, so the geometry must come from the
-        // TRUE sender position (back-end ORACLE), never from cam.claimedX/Y: a position-falsifying
-        // attacker claiming a far-away location would otherwise drive its OWN reception probability
-        // — inventing packet loss that the radio never applied, and (for a ghost claiming to be
-        // nearby) making Sybil frames MORE reliable than honest ones. Ground truth is consumed here
+        // The channel — weather attenuation, LOS/NLOSb obstruction, CSMA/CA contention — is decided
+        // by ONE shared model (org.scms.radio.RxChannel), the same instance type the RSU receiver
+        // uses, so infrastructure links are not quietly governed by a second implementation.
+        //
+        // Every geometric input it takes comes from the back-end ORACLE (the sender's true position
+        // and an opaque per-link key), never from cam.claimedX/Y. A position-falsifying attacker
+        // claiming a far-away location must not be able to drive its OWN reception probability:
+        // that would invent packet loss the radio never applied and, for a ghost claiming to be
+        // nearby, would make Sybil frames MORE reliable than honest ones. Ground truth is consumed
         // for channel physics only; nothing derived from it reaches a report or an MA-visible field.
-        if (NLOS_INTENSITY > 0 && haveSelf) {
-            double[] txTrue = backend.truePositionOf(dg);
-            if (txTrue != null) {
-                double dist = Math.hypot(txTrue[0] - selfX, txTrue[1] - selfY);
-                double pn = NLOS_INTENSITY * Math.min(1.0, Math.max(0.0, (dist - 150.0) / 300.0));
-                if (pn > 0 && chanRng.nextDouble() < pn) {
-                    return;
-                }
-            }
-        }
-        // Channel congestion (CSMA/CA contention / CBR collapse): under high local channel load a
-        // fraction of frames are lost before they can be decoded. This is the main radio realism a
-        // full 802.11p PHY/MAC (OMNeT++/ns-3) would add over SNS — it makes DoS floods actually
-        // degrade nearby reception and gives dense traffic a realistic packet-delivery ratio.
-        if (t - chanWinStart >= CHAN_WINDOW_S) {
-            chanWinStart = t; chanLoad = chanCount; chanCount = 0;
-        }
-        chanCount++;
-        if (CHAN_CAPACITY > 0 && chanLoad > CHAN_CAPACITY) {
-            double pDrop = Math.min(0.95, (double) (chanLoad - CHAN_CAPACITY) / CHAN_CAPACITY);
-            if (chanRng.nextDouble() < pDrop) {
-                return; // frame lost to channel contention
-            }
+        if (!channel.deliver(dg, t, selfX, selfY, haveSelf)) {
+            return;
         }
         if (backend.isRevoked(dg, t)) {
             return; // ENFORCEMENT: drop revoked certificates
@@ -362,6 +357,12 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
 
     @Override
     public void onShutdown() {
+        if (channel != null) {
+            channel.publishStats();   // fold this receiver's channel/DCC counters into the manifest
+        }
+        if (dccSuppressed > 0) {
+            getLog().debug("DCC suppressed {} CAMs for {}", dccSuppressed, getOperatingSystem().getId());
+        }
     }
 
     @Override

@@ -22,7 +22,9 @@ from scms_sim_ref.mock_pipeline import PipelineConfig, run_pipeline
 
 # The published default golden digest (see the determinism contract). vru_pct defaults to 0.0, so the
 # default run MUST stay byte-identical to this value after the VRU feature is added.
-GOLDEN = "04ae9736f519dffb426bb1acebfec95edf32e7127ebc71346279f754a69cee38"
+# ADR 0002 re-pin (true_speed/true_heading added to gt_emissions_sample):
+# superseded 04ae9736f519... (default-config run; behaviour unchanged).
+GOLDEN = "0bd93655a2d5bebb4172191fab0940a5ff90c6be685cfa033f5edcfd7c1fb740"
 
 
 def _jsonl(p):

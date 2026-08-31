@@ -72,15 +72,17 @@ the shipped benchmark evaluates generalization *as protocols over these splits/l
 leave-one-attack-family-out (novel-attack), forward-in-time, and — for multi-condition
 campaign corpora that carry a `domain_id` — leave-one-domain-out.
 
-## Measured realism, and known unrealisms
+## Measured realism
 Every dataset's own `DATASHEET.md` carries a **measured realism scorecard**
-(`datagen.realism_bench`): 14 traffic + 7 comm metrics scored against reference summaries pinned
-with citations in `datagen/refdata/`. Metrics are split by severity — **HARD** metrics are physical
-plausibility (acceleration inside [−8, +4] m/s², zero teleports, zero overlapping vehicles) plus one
-**liveness** gate (at least half the fleet actually moves — every other hard gate is an
-impossibility check that a frozen dataset passes trivially), and are the CI gate; everything else
-warns. A metric the dataset cannot support reports `na` **with a machine-readable reason**, never a
-guess — including when its own sample size is below the floor.
+(`datagen.realism_bench`): 22 metrics (15 traffic + 7 comm) scored against reference summaries pinned
+with citations in `datagen/refdata/` (10 sets / 98 entries at the time of writing; the loader reads
+whatever is on disk). Metrics are split by severity — **HARD**
+metrics are physical plausibility (acceleration inside [−8, +4] m/s², zero teleports, zero
+overlapping vehicles) plus one **liveness** gate (at least half the fleet actually moves — every
+other hard gate is an impossibility check that a frozen dataset passes trivially), and are the CI
+gate; everything else warns. A metric the dataset cannot support reports `na` **with a
+machine-readable reason**, never a guess — including when its own sample size is below the floor, and
+including when the emission trace is too sparse to finite-difference honestly.
 
 Score any dataset yourself:
 
@@ -89,29 +91,76 @@ python -m scms_sim_ref.datagen.realism_bench <dataset_dir> --markdown --fail-on-
 ```
 
 Measured hard failures are printed in each datasheet's "Realism benchmark" section rather than
-hidden. As of the Phase-0/1 baseline (`docs/realism/PROGRESS.md`) the standing ones are:
+hidden.
 
-- **Acceleration plausibility** — ~0.2–0.5 % of finite-difference accelerations fall outside
-  [−8, +4] m/s² on both engines.
-- **Vehicle overlap** — the pure-Python engine has **no collision detection**; distinct vehicles can
-  occupy the same point. The MOSAIC/SUMO path scores 0 (SUMO enforces separation).
-- **Fundamental diagram** — capacity misses the 1800–2400 veh/h/lane anchor from both sides. It is a
-  space-time *cell* approximation (the emission schema carries no edge id): cells are directional
-  and the per-lane divisor is measured from the lateral spread inside each cell, but parallel lanes
-  of the same carriageway inside one cell are still only estimated. Treat it as a tracked trend, not
-  an absolute.
-- **Comm panel** — the PDR curve is *proportional* to PDR (reconstructed from honest report links
-  normalised at the nearest band), not an absolute PDR: there is no per-reception observable (RSSI,
-  delivered-vs-attempted) in the schema yet. Effective range is tracked without a pass/fail band.
-- **PDR gray zone** — both engines still ship a hard-cutoff (unit-disc / range-threshold) radio, so
-  the 90 %→20 % band is a few tens of metres against the ≥ 100 m gate. That failure is the intended
-  Phase-0 baseline: level crossings are read off the non-increasing majorant of the measured curve
-  precisely so a step-function radio cannot pass on Poisson noise in one distance bin.
-- **Single radio stack, no real RF** — one analytic/SNS channel model, no measured interference, no
-  hardware-in-the-loop. Sim-to-real transfer must be argued, not assumed.
-- Reference bands for speed are **coarse envelopes** (posted-limit / corpus-provenance derived), not
-  measured percentile tables; licence-gated corpora are pinned as explicit `available: false`
-  placeholders rather than invented numbers.
+**Reading the numbers.** Kinematic metrics are only comparable across datasets that used the same
+estimator, so the scorecard names it: `kinematics_source` (and each metric's
+`details.kinematics_source`) says whether speed/heading came from the ground-truth record
+(`true_speed` / `true_heading`, ADR 0002) or were reconstructed by differencing `true_x`/`true_y`.
+Finite differences are taken only across sample pairs no wider than 2 s **and normalised over exactly
+that subset**; anything sparser is `na`. Numbers quoted below are from **full emission traces**
+(`emit_sample_prob = 1.0`) — a sub-sampled run does not score these metrics at all.
+
+## Known unrealisms
+
+Measured, current as of the Phase-0/1 baseline (`docs/realism/PROGRESS.md`), not aspirational:
+
+1. **No collision detection in the Python engine.** `mock_pipeline` never resolves vehicle-vehicle
+   conflicts, so distinct vehicles can occupy the same point: **290 overlapping pairs** (< 1 m apart
+   at an identical timestamp) on the reference 300 s `--flow --road grid --grid 6` run at
+   `emit_sample_prob = 1.0` — a HARD failure of `traffic.overlap_events`. The MOSAIC/SUMO path scores
+   **0** (SUMO enforces separation). Any model trained on Python-engine mobility must not treat
+   spatial exclusivity as a learnable invariant.
+2. **Both radios are hard cutoffs; the geometric channel is Phase 2, not shipped.** Reception is a
+   unit-disc / range-threshold model, so the 90 %→20 % PDR gray zone measures **18–81 m** across runs
+   against a ≥ 100 m reference gate — Python 81 m, MOSAIC smoke 32 m, InTAS full traces 43–48 m. This
+   failure is
+   *by construction* and is the intended baseline: level crossings are read off the non-increasing
+   majorant of the measured curve precisely so a step-function radio cannot pass on Poisson noise in
+   one distance bin. 3GPP TR 37.885 path loss, correlated shadowing, NLOSv/NLOSb blockage, Nakagami
+   fading, a closed-form 802.11p PDR/CBR model, ETSI DCC and an `rssi_dbm` observable are the Phase-2
+   design (`docs/realism/PHASE2-DESIGN.md`) and are **not in any dataset yet**.
+3. **Real-world traffic (GEH) validation is BLOCKED — not met, and not failed.** No measured
+   induction-loop counts exist anywhere in the tree: all 15 vendored `InTAS_Detectors_Output.xml`
+   files are config-echo stubs with zero `<interval>` rows, and the InTAS route files are *demand*
+   (model input), so grading counts against them is circular. `tools/sumo_realism.py --ref-det-out`
+   therefore produces a **seed-stability** check — one SUMO run against another SUMO run of the same
+   scenario, gate ids `seed_stability.*`, thresholds derived in-tool from the exact conditional null
+   rather than borrowed from FHWA. It measures the simulator's reproducibility against itself and
+   says **nothing** about resemblance to real traffic. Do not quote "GEH < 5 on ≥ 85 % of InTAS loop
+   stations". Supplying measured counts via `--ref-counts` is what unblocks it (schema:
+   `src/scms_sim_ref/datagen/refdata/geh_reference_counts.README.md`).
+4. **Lane changes are still discontinuous on the SUMO path.** With the sublane model on
+   (`--lateral-resolution 0.8`, default) the best run measures **0.1302** lane-change teleports per
+   vehicle-km against a 0.0 target; with it off, 0.5851 on the same seed and scenario. A 3.2 m
+   instantaneous lateral jump is exactly the signature a position-plausibility detector keys on, so
+   this is directly load-bearing for the misbehaviour labels. The pure-Python engine has no lanes and
+   reads 0.0.
+5. **Acceleration plausibility is not 100 %.** After every artefact class is screened, 0.058 %
+   (Python, `accel_within_hard_bound_frac` 0.999417) to 0.126–0.177 % (InTAS runs, 0.998744–0.998233)
+   of samples still fall outside [−8, +4] m/s². The Python residual is 19 of 32 585 samples, **all at
+   exactly 1.0 s sampling** — so it cannot be small-interval differencing noise; it is the engine's
+   own dynamics, and `mock_pipeline/` is frozen by the digest invariant. The InTAS residual is
+   single-sample *longitudinal* position remaps at junction/edge transitions (median |d_lat| across
+   the pair is 0.001 m, so it is not lateral and the sublane model cannot fix it), corroborated
+   independently by reading SUMO's own `--fcd-output` speed with no position differencing at all
+   (0.9999 within band, `accel_min` −9.0 m/s² over 781 091 samples / 334 vehicles). Note the size of
+   this miss was overstated ~4× before the estimator was corrected — a 3.2 m one-sample lane-change
+   snap used to read as a 33 m/s longitudinal speed and a −275 m/s² acceleration.
+6. **Fundamental diagram** — capacity misses the 1800–2400 veh/h/lane anchor from both sides (517 on
+   the Python grid, 2759 on the MOSAIC highway). It is a space-time *cell* approximation (the emission
+   schema carries no edge id): cells are directional and the per-lane divisor is measured from the
+   lateral spread inside each cell, but parallel lanes of the same carriageway inside one cell are
+   still only estimated. Treat it as a tracked trend, not an absolute.
+7. **The comm panel is proportional to PDR, not absolute PDR** — reconstructed from honest report
+   links normalised at the nearest populated band, because no per-reception observable (RSSI,
+   delivered-vs-attempted) exists in the schema yet. Effective range is tracked with no pass/fail
+   band.
+8. **Single radio stack, no real RF** — one analytic/SNS channel model, no measured interference, no
+   hardware-in-the-loop. Sim-to-real transfer must be argued, not assumed.
+9. **Reference bands for speed are coarse envelopes** (posted-limit / corpus-provenance derived), not
+   measured percentile tables; licence-gated corpora are pinned as explicit `available: false`
+   placeholders rather than invented numbers.
 
 ## Reproducibility
 - Every build ships `manifest.json`: seed, full config, generator + schema versions,

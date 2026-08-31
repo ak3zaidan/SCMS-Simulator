@@ -21,9 +21,14 @@ from scms_sim_ref.datagen.leakage_linter import find_forbidden_keys
 from scms_sim_ref.mock_pipeline import PipelineConfig, run_pipeline
 from scms_sim_ref.mock_pipeline.run import _parse_magnitude_scale, validate_config
 
-# Goldens recorded on the base commit (09d690c) BEFORE the feature was wired; they MUST NOT move.
-DEFAULT_GOLDEN = "04ae9736f519dffb426bb1acebfec95edf32e7127ebc71346279f754a69cee38"
-MULTI_ATTACK_GOLDEN = "8894cb268af3ab4f0833a371f34808539fb0521a565727aea8037e427693f63c"
+# Goldens first recorded on the base commit (09d690c) BEFORE the feature was wired; NOTHING in this
+# file may move them. They were re-pinned once, deliberately, by ADR 0002 (see the notes below).
+# ADR 0002 re-pin (true_speed/true_heading added to gt_emissions_sample):
+# superseded 04ae9736f519... (default-config run; behaviour unchanged).
+DEFAULT_GOLDEN = "0bd93655a2d5bebb4172191fab0940a5ff90c6be685cfa033f5edcfd7c1fb740"
+# ADR 0002 re-pin (true_speed/true_heading added to gt_emissions_sample):
+# superseded 8894cb268af3... (multi-attack run; behaviour unchanged).
+MULTI_ATTACK_GOLDEN = "48013901c241b400e2bfaf02d393ab6e0026df8a23d20e139dec6693f2726e5d"
 # A multi-attack default run spanning several position/speed/heading types (all magnitudes default).
 MULTI_TYPES = ("ConstPosOffset", "RandomPos", "ConstSpeedOffset", "RandomSpeed",
                "StopAndGo", "HeadingOffset", "SlowDrift", "AlongRoadOffset")

@@ -113,7 +113,7 @@ public final class ScmsBackend {
     static final String OUT_DIR = resolveOutDir();
 
     /** Version of the MOSAIC application layer, recorded in the manifest (jar name is unchanged). */
-    public static final String APP_VERSION = "0.1.0+realism.p1";
+    public static final String APP_VERSION = "0.1.0+realism.p2";
 
     // ---------------------------------------------------------------- Phase-1 realism (VeReMi-NextGen ports)
     // Every knob below is OPT-IN and defaults to the pre-port behaviour, so an existing seed still
@@ -285,6 +285,11 @@ public final class ScmsBackend {
     private final Map<String, double[]> subjAgg = new HashMap<>();   // subject -> {firstT, lastT}
     private final Map<String, java.util.Set<Long>> subjSeconds = new HashMap<>();   // subject -> distinct report seconds
     private final Map<String, java.util.Set<String>> trustedReporters = new HashMap<>();  // subject veh -> trusted reporter vehs
+    // Channel / DCC run totals, aggregated from every receiver at shutdown (manifest diagnostics).
+    private long chSensed, chDelivered, chDropWeather, chDropObstruction, chDropCongestion, chNlosb;
+    private long dccAllowedCams, dccSuppressedCams, dccCbrSamples;
+    private double dccCbrSum, dccCbrMax;
+    private Map<String, Object> channelIndexStats;
 
     private ScmsBackend() {
         Runtime.getRuntime().addShutdownHook(new Thread(this::writeOutputs));
@@ -500,6 +505,56 @@ public final class ScmsBackend {
         return new double[] {d.lastX, d.lastY};
     }
 
+    /**
+     * OPAQUE, stable key for the RADIO LINK behind a pseudonym — the identifier the channel model
+     * keys its per-link shadowing process on.
+     *
+     * <p>It is deliberately NOT the vehicle id. The channel needs an identity that survives
+     * pseudonym rotation (otherwise every rotation resamples the channel — the correctness bug the
+     * per-step, digest-keyed shadowing draw had) and that maps a Sybil ghost onto its puppeteer
+     * (they are one radio). Handing the application layer the true vehicle id would satisfy both and
+     * put a real identity one careless line away from a misbehaviour report, so what comes back is
+     * SHA-256("linkkey" | scenario seed | unit id) truncated to 64 bits: enough to key an RNG stream
+     * and a hash map, and useless as an identity.
+     *
+     * @return the link key, or 0 before the vehicle's first beacon (no oracle entry yet)
+     */
+    public synchronized long channelLinkKey(String certDigest) {
+        Dev d = devByDigest.get(certDigest);
+        if (d == null) {
+            return 0L;
+        }
+        return streamSeed("linkkey", d.unitId);
+    }
+
+    /**
+     * Aggregate one receiver's channel counters into the run totals (manifest {@code counts.channel}).
+     * Diagnostics only: no dataset row depends on them.
+     */
+    public synchronized void noteChannel(long sensed, long delivered, long dropWeather,
+                                         long dropObstruction, long dropCongestion, long nlosbLinks,
+                                         long dccAllowed, long dccSuppressed,
+                                         long cbrSamples, double cbrSum, double cbrMax) {
+        chSensed += sensed;
+        chDelivered += delivered;
+        chDropWeather += dropWeather;
+        chDropObstruction += dropObstruction;
+        chDropCongestion += dropCongestion;
+        chNlosb += nlosbLinks;
+        dccAllowedCams += dccAllowed;
+        dccSuppressedCams += dccSuppressed;
+        dccCbrSamples += cbrSamples;
+        dccCbrSum += cbrSum;
+        dccCbrMax = Math.max(dccCbrMax, cbrMax);
+    }
+
+    /** Final LOS/NLOSb index counters + projection-alignment verdict (manifest diagnostics). */
+    public synchronized void noteChannelIndex(Map<String, Object> stats) {
+        if (stats != null && !stats.isEmpty()) {
+            channelIndexStats = stats;
+        }
+    }
+
     /** Records the driver profile a vehicle applied (ground truth + manifest fleet composition). */
     public synchronized void noteDriverProfile(String unitId, String profile) {
         Dev d = devByUnit.get(unitId);
@@ -648,9 +703,23 @@ public final class ScmsBackend {
         }
         // per-message ground-truth sample (true vs claimed) for message-level benchmarks
         if (emitRng.nextDouble() < EMIT_SAMPLE) {
+            // ADR 0002: the TRUE kinematics are written out, not reconstructed downstream. The
+            // harness used to differentiate true_x/true_y twice to recover acceleration, and a
+            // single-sample lane change (~3.2 m of lateral displacement at constant speed) then
+            // showed up as hundreds of m/s^2. The simulator knows the exact values at emission time.
+            //
+            // Units and convention, matching everything else on the MOSAIC path:
+            //   true_speed   m/s
+            //   true_heading degrees in [0, 360), 0 = NORTH, increasing CLOCKWISE
+            // which is SUMO's / MOSAIC's VehicleData.getHeading() convention, the same one the
+            // claimed heading uses, the same one AttackLib's along-road offsets assume
+            // (x + d*sin(h), y + d*cos(h), AttackLib.java:370-372) and the same one
+            // CamDetector.headingInconsistency compares against (atan2(dx, dy), CamDetector.java:143).
+            // ORACLE ONLY: both keys are in schemas.records.FORBIDDEN_FEATURE_KEYS.
             Map<String, Object> em = gtRow("emit_id", String.format(java.util.Locale.ROOT, "emt_%08d", gtEmit.size()), "t", round3(t),
                     "true_vehicle_id", unitId,
                     "true_x", round3(x), "true_y", round3(y),
+                    "true_speed", round3(speed), "true_heading", round3(norm360(heading)),
                     "claimed_x", round3(c.x), "claimed_y", round3(c.y), "claimed_speed", round3(c.speed),
                     "pos_conf", round3(conf),
                     "is_attacker", d.attacker, "is_faulty", d.faulty, "falsified", falsified);
@@ -860,6 +929,11 @@ public final class ScmsBackend {
             manifest.put("dataset_version", "0.3.0");
             manifest.put("generator", "scms_sim_ref (MOSAIC layer, full-entity back-end v4)");
             manifest.put("app_version", APP_VERSION);
+            // ADR 0002: gt_emissions_sample gained true_speed / true_heading, so the ground-truth
+            // record shape changed and every pinned digest for this engine moves with it. The
+            // increment is the versioned, deliberate half of the determinism contract — the
+            // property is unchanged, the value it is asserted against is not.
+            manifest.put("schema_versions", Map.of("ma_visible", 1, "ground_truth", 2));
             manifest.put("seed", MASTER_SEED);
             manifest.put("scms_entities", Scms.ENTITY_NAMES);
             Map<String, Object> inputs = inputManifest();
@@ -921,6 +995,32 @@ public final class ScmsBackend {
                     profiles.merge(p, 1, Integer::sum);
                 }
                 counts.put("driver_profiles", profiles);
+            }
+            // Channel diagnostics: how many frames the receivers actually sensed and where the
+            // losses went. Only emitted when something beyond the default SNS path was active, so a
+            // pre-Phase-2 run's manifest is unchanged.
+            if (chSensed > 0 && (chDropWeather + chDropObstruction + chDropCongestion + chNlosb) > 0) {
+                Map<String, Object> ch = new LinkedHashMap<>();
+                ch.put("frames_sensed", chSensed);
+                ch.put("frames_delivered", chDelivered);
+                ch.put("delivery_ratio", round3((double) chDelivered / chSensed));
+                ch.put("dropped_weather", chDropWeather);
+                ch.put("dropped_obstruction", chDropObstruction);
+                ch.put("dropped_congestion", chDropCongestion);
+                ch.put("nlosb_links", chNlosb);
+                if (channelIndexStats != null) {
+                    ch.put("buildings", channelIndexStats);
+                }
+                counts.put("channel", ch);
+            }
+            if (dccAllowedCams + dccSuppressedCams > 0 || dccCbrSamples > 0) {
+                Map<String, Object> dc = new LinkedHashMap<>();
+                dc.put("cams_allowed", dccAllowedCams);
+                dc.put("cams_suppressed", dccSuppressedCams);
+                dc.put("cbr_samples", dccCbrSamples);
+                dc.put("cbr_mean", dccCbrSamples > 0 ? round3(dccCbrSum / dccCbrSamples) : 0.0);
+                dc.put("cbr_max", round3(dccCbrMax));
+                counts.put("dcc", dc);
             }
             manifest.put("counts", counts);
             manifest.put("data_digest_sha256", hex(all.digest(), 32));
@@ -1162,14 +1262,31 @@ public final class ScmsBackend {
         }
     }
 
+    /**
+     * Write one JSONL table and return its SHA-256, STREAMING row by row.
+     *
+     * <p>The previous form built the whole file as a single {@code StringBuilder} and then took a
+     * second full copy as a byte array — roughly 6x the file size resident at once, all of it in the
+     * JVM shutdown hook where there is no chance to recover. A run with heavy DoS flooding
+     * (SCMS_FLOOD_BURST high, many attackers) produces enough report rows to exhaust the default
+     * heap there, and the dataset is lost after the simulation has already completed. Digesting the
+     * same bytes on the way to disk keeps memory flat and produces byte-identical output.
+     */
     private String writeJsonl(Path path, List<Map<String, Object>> rows) throws IOException {
-        StringBuilder sb = new StringBuilder();
-        for (Map<String, Object> r : rows) {
-            sb.append(gson.toJson(r)).append('\n');
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            try (java.io.OutputStream out = new java.io.BufferedOutputStream(
+                    Files.newOutputStream(path), 1 << 16)) {
+                for (Map<String, Object> r : rows) {
+                    byte[] line = (gson.toJson(r) + "\n").getBytes(StandardCharsets.UTF_8);
+                    md.update(line);
+                    out.write(line);
+                }
+            }
+            return hex(md.digest(), 32);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
         }
-        byte[] bytes = sb.toString().getBytes(StandardCharsets.UTF_8);
-        Files.write(path, bytes);
-        return sha256Hex(bytes);
     }
 
     // ------------------------------------------------------------------ helpers
@@ -1198,6 +1315,12 @@ public final class ScmsBackend {
 
     private static double round3(double v) {
         return Math.round(v * 1000.0) / 1000.0;
+    }
+
+    /** Heading into [0, 360) (0 = North, clockwise — SUMO/MOSAIC convention). */
+    private static double norm360(double a) {
+        double v = a % 360.0;
+        return v < 0 ? v + 360.0 : v;
     }
 
     private static byte[] sha(String s) {

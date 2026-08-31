@@ -20,7 +20,7 @@ Python side: undirected 2-D straight-segment graphs, global `n_lanes` as a perpe
 ~0% of a realism harness exists. All benchmarking is detection-quality (ROC/PR/recall@FPR). Only calibration: GNSS CEP vs a literature constant. No fundamental diagram, no headway/accel distributions, no GEH, no PDR-vs-distance, no CBR validation. Reusable assets: `calibration.py` pattern (numpy KS, JSON out, datasheet-embedded), digest-neutral hooks (`PER_STEP_HOOK`, `LANE_CHANGE_HOOK`, `GAP_YIELD_HOOK`), `emit_sample_prob=1.0` full traces, InTAS induction loops (`InTAS_E1.add.xml`) already copied into every generated scenario.
 
 ### 1.5 Hard invariants (must-not-break)
-1. **Golden digest contract**: default config byte-identical (digest `04ae9736f519…` pinned in ≥4 test files). All new realism = opt-in + dedicated string-keyed RNG streams (`random.Random(f"{seed}:label:id")`), zero draws when off.
+1. **Golden digest contract**: default config byte-identical (digest `0bd93655a2d5…` pinned in 11 test files; **was `04ae9736f519…` until ADR 0002 re-pinned it on 2026-08-30** when `true_speed`/`true_heading` entered the ground-truth record). All new realism = opt-in + dedicated string-keyed RNG streams (`random.Random(f"{seed}:label:id")`), zero draws when off.
 2. **Manifest replay**: `config_from_dict` round-trip; every knob through PipelineConfig → validate_config → _FIELD_META → argparse → (optional) CONFIG_SPEC pf_* — the 9-step checklist in the gui-config-surface report.
 3. **Schema firewall**: new MA-visible fields must pass `FORBIDDEN_FEATURE_KEYS` / leakage linter.
 4. Windows host; MOSAIC ns-3/OMNeT++ federates are Linux-only (Dockerfiles) — **not** available natively.
@@ -120,7 +120,7 @@ New opt-in `radio_model="geometric"` in the reception loop (single choke point, 
 - Pathloss unit test: implemented 37.885 formulas match published constants to 0.01 dB at d=100/500 m.
 - Shadowing correlation: empirical link-level autocorrelation e-folding distance 10±3 m (self-test against Gudmundson target).
 - CBR/DCC: at ≥ 80 veh in radio range with DCC off, modeled CBR ≥ 0.55 (ETSI congestion regime); with DCC on, steady-state CBR ≤ 0.68 and CAM rate steps down per the ETSI table.
-- Determinism: default-config golden digest `04ae9736f519…` byte-identical (full pytest suite green).
+- Determinism: default-config golden digest `0bd93655a2d5…` byte-identical (full pytest suite green). *(Post-ADR-0002 value; `04ae9736f519…` was the pre-2026-08-30 pin.)*
 **Risk**: building fetch adds an online dependency — mitigated by the existing sha256 disk-cache pattern (osm.py:193-209) and synthetic fallback. RSSI field leakage review — it is receiver-measurable, hence MA-visible-legitimate, but must be asserted in `test_dataset_integrity` and derived from *true* geometry only on the channel side.
 
 ### Phase 3 — SUMO-backed Python mobility + network fidelity + surfacing (Day 3; 3 agents)

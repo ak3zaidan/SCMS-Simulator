@@ -198,8 +198,8 @@ python -m pytest -q
 #    correctness, count reconciliation, splits, provenance, per-file digests).
 python tools/verify_data.py                     # add --recursive for nested corpora
 
-# 3. Realism. HARD metrics are physical plausibility (acceleration bounds, teleports,
-#    vehicle overlap); soft ones only warn.
+# 3. Realism. 22 metrics (15 traffic + 7 comm). HARD metrics are physical plausibility
+#    (acceleration bounds, teleports, vehicle overlap) plus liveness; soft ones only warn.
 python -m scms_sim_ref.datagen.realism_bench datasets/smoke --markdown --fail-on-hard
 python -m scms_sim_ref.datagen.corpus_report --corpus datasets/massive --realism
 ```
@@ -208,7 +208,32 @@ Both realism commands are **opt-in**: without `--fail-on-hard` / `--realism` not
 the existing exit codes or output changes. Scoring the distribution metrics needs a full
 emission trace — `emit_sample_prob=1.0` (Python) or `SCMS_EMIT_SAMPLE=1.0` (MOSAIC);
 otherwise the harness reports those metrics as `na` with the reason, rather than guessing.
+That includes every finite difference: acceleration and the lane-change (lateral) counter
+are measured only across sample pairs no wider than 2 s, and normalised over exactly that
+subset, so a sub-sampled run reports `na` instead of a number computed from where a vehicle
+got to while nobody was watching.
 
-A SUMO-side traffic-calibration gate (GEH plus the four FHWA criteria over induction loops)
-lives in `tools/sumo_realism.py`; it needs reference counts, which are not yet on disk —
-see `docs/realism/PROGRESS.md`.
+### What `tools/sumo_realism.py` does and does not prove
+
+It has two mutually exclusive reference modes, and only one of them is traffic *validation*:
+
+| Flag | `comparison_kind` | Reference | What it proves |
+|---|---|---|---|
+| `--ref-det-out <other_run.xml>` | `seed_stability` / `regression_same_seed` | **another SUMO run** of the same scenario | reproducibility of the simulator against itself — **nothing about real traffic** |
+| `--ref-counts <counts.json>` | `fhwa_validation` | **real-world measured** loop counts | the FHWA calibration/validation criteria (GEH < 5 on ≥ 85 % of links, …) |
+
+**Only the first mode is exercisable in this repository today.** No measured count data for the
+Ingolstadt (InTAS) loops is vendored: all 15 `InTAS_Detectors_Output.xml` copies under
+`third_party/veremi-nextgen` are config-echo stubs with zero `<interval>` rows, and the InTAS route
+files are *demand* (model input), so grading counts against them would be circular. The loop
+**geometry** is genuine — 196 `e1Detector`s in `InTAS_E1.add.xml`, 25 named station groups — but
+geometry is not counts. The roadmap gate "GEH < 5 on ≥ 85 % of InTAS loop stations" is therefore
+**BLOCKED, not met and not failed**, and must not be quoted. `seed_stability` thresholds are derived
+in-tool from the exact conditional null (`m | m+c = n ~ Binomial(n, ½)`), deliberately *not* borrowed
+from FHWA — GEH is not scale-free (`GEH(k·m, k·c) = √k·GEH(m, c)`) and the FHWA number is written for
+hourly volumes. To unblock validation, supply measured counts keyed by station id through
+`--ref-counts`; the schema is documented in
+`src/scms_sim_ref/datagen/refdata/geh_reference_counts.README.md`. See `docs/realism/PROGRESS.md`.
+
+The same file also carries an acceleration-plausibility gate over a SUMO `--fcd-output` trace, which
+reads SUMO's *own* reported speed and so needs no reference counts at all.

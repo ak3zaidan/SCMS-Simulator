@@ -127,21 +127,39 @@ Flag: `--events JSON_OR_FILE`.
 ## Realism benchmark
 
 Measures whether the generated traffic and radio actually look real, against reference summaries
-pinned **with citations** in `datagen/refdata/` (7 sets, 55 entries; every entry carries a `source`,
-a short `cite` and a `confidence` ∈ {anchored, coarse, unavailable}). Read-only, deterministic,
+pinned **with citations** in `datagen/refdata/` (10 sets / 98 entries at the time of writing — the
+loader picks up whatever `refdata/*.json` is on disk; every entry carries a `source`, a short `cite`
+and a `confidence` ∈ {anchored, coarse, unavailable}, and the suite asserts all three exist). Every
+number in a scorecard is either measured or `na`; nothing is assumed. Read-only, deterministic,
 numpy-only — it never writes into a dataset and takes no RNG draws.
 
 | Feature | What it does | Flag / command |
 |---|---|---|
-| Realism scorecard | 21 metrics (14 traffic + 7 comm) with pass/fail/na, each carrying its reference range, citation and — when `na` — a machine-readable reason | `python -m scms_sim_ref.datagen.realism_bench <dataset> [--markdown] [--json out]` |
+| Realism scorecard | 22 metrics (15 traffic + 7 comm) with pass/fail/na, each carrying its reference range, citation and — when `na` — a machine-readable reason. `card["kinematics_source"]` (and every affected metric's `details.kinematics_source`) records *which estimator produced the number* | `python -m scms_sim_ref.datagen.realism_bench <dataset> [--markdown] [--json out]` |
 | HARD physical gate | Acceleration inside [−8, +4] m/s², zero teleports, zero overlapping vehicles, **plus a liveness gate** (≥ 50 % of the fleet actually moves — the other three are impossibility checks a frozen dataset passes) — the CI gate; everything else warns | `--fail-on-hard` (exit 1 on any HARD failure) |
-| Traffic panel | Speed percentiles, acceleration plausibility + comfort band, teleports (scanned across *every* consecutive sample pair, not just short gaps), vehicle overlap, moving-vehicle fraction, time-headway median / sub-floor fraction / KS vs a fitted Cowan-M3 shape (leader found in the follower's own lane, so adjacent-lane traffic cannot fake a near-zero headway and no headway is censored by a grouping cell), Edie fundamental diagram over *directional* cells with a measured per-lane divisor (capacity + backward wave speed) | (automatic) |
+| Traffic panel | Speed percentiles, acceleration plausibility + comfort band, lane-change (lateral) discontinuity rate, teleports (scanned across *every* consecutive sample pair, not just short gaps), vehicle overlap, moving-vehicle fraction, time-headway median / sub-floor fraction / KS vs a fitted Cowan-M3 shape (leader found in the follower's own lane, so adjacent-lane traffic cannot fake a near-zero headway and no headway is censored by a grouping cell), Edie fundamental diagram over *directional* cells with a measured per-lane divisor (capacity + backward wave speed) | (automatic) |
+| Lane-change continuity | `traffic.lateral_discontinuity_events` — sideways steps of at least half a lane width, at over 2 m/s, taken while the direction of travel does **not** turn (so cornering is not counted), per vehicle-km. SOFT, reference max **0.0** ev/veh-km (SUMO 1.25.0 defaults `--lanechange.duration 0`, i.e. an instantaneous centreline snap). This is the artefact the acceleration screen removes, published rather than deleted | (automatic) |
+| Sampling-gap discipline | Every finite difference is taken across sample pairs no wider than `MAX_FD_DT_S` (2 s) **and normalised over exactly that subset**; the lateral counter additionally requires the ±3-step window its heading is inferred from to be inside the ceiling. A sub-sampled trace therefore reports `na` with a reason instead of measuring where a vehicle got to unobserved | (automatic) |
+| Ground-truth kinematics | Consumes `true_speed` / `true_heading` from the ground-truth emission record **when present** (ADR 0002), which turns acceleration into a first difference of a measured quantity; falls back to position differencing for older datasets. The heading convention is *detected* against the observed chord bearings and both fields are rejected if they do not corroborate — a wrong unit or a 90° convention error can never silently rotate the decomposition | (automatic) |
 | Comm panel | Neighbour-awareness ratio at 100 / 200 / 300 m, PDR gray-zone width (90 %→20 %), effective range, CAM inter-packet gap | (automatic) |
 | Engine-agnostic | Auto-detects the pure-Python and MOSAIC/SUMO producers and their differing `acceptanceRangeThreshold` conventions; needs a full trace (`emit_sample_prob=1.0` / `SCMS_EMIT_SAMPLE=1.0`) to score the distribution metrics | `--regime {auto,urban,highway}` to override |
 | Corpus realism gate | Folds the scorecard into the corpus report as a separate section + warning list; HARD failures make the CLI exit non-zero | `python -m scms_sim_ref.datagen.corpus_report --corpus <dir> --realism` |
 | Per-domain realism | Records the scorecard summary alongside precision/recall in the campaign / massive per-domain catalog | `campaign` (automatic), `massive --realism` |
 | Foundry realism gate | Rejects evolved scenarios that "evade" only by being kinematically absurd | `python -m scms_sim_ref.datagen.foundry --realism-gate` |
-| SUMO-side GEH | GEH statistic + the four FHWA calibration gates over SUMO E1 induction loops, plus an acceleration-plausibility gate over an fcd/emission trace | `python tools/sumo_realism.py --det-out <out.xml> --det-add <E1.add.xml> --ref-counts <ref.json>` |
+| SUMO run-to-run stability | GEH over SUMO E1 induction loops between **two runs of the same scenario** — `comparison_kind: seed_stability`, thresholds derived in-tool from the exact conditional null, on window-native counts. Reproducibility only; **not** traffic validation and never graded against the FHWA criteria | `python tools/sumo_realism.py --det-out <after.xml> --ref-det-out <before.xml> --det-add <E1.add.xml>` |
+| SUMO FHWA validation | The same tool's `--ref-counts` mode (`comparison_kind: fhwa_validation`) is the only one that applies the FHWA criteria. **Blocked in this repo: no measured counts exist on disk** — see the note below | `python tools/sumo_realism.py --det-out <out.xml> --det-add <E1.add.xml> --ref-counts <measured.json>` |
+| SUMO acceleration gate | Acceleration plausibility from SUMO's *own* reported speed in an fcd/emission trace (no position double-differencing, no reference counts needed) | `python tools/sumo_realism.py --fcd <fcd.xml>` |
+
+> **FHWA validation is BLOCKED, not met and not failed.** No real-world measured loop counts are
+> vendored anywhere in the tree: all 15 `InTAS_Detectors_Output.xml` copies under
+> `third_party/veremi-nextgen` are config-echo stubs with zero `<interval>` rows, and the InTAS route
+> files are *demand* (model input), so grading counts against them is circular. The loop **geometry**
+> is genuine (196 `e1Detector`s, 25 named station groups) — geometry is not counts. What
+> `--ref-det-out` produces is a **seed-stability** check of the simulator against itself; its gate ids
+> are `seed_stability.*` and its report carries a leading `warning` key saying so. The roadmap gate
+> "GEH < 5 on ≥ 85 % of InTAS loop stations" must not be quoted. Supplying counts through
+> `--ref-counts` unblocks it — schema at
+> `src/scms_sim_ref/datagen/refdata/geh_reference_counts.README.md`.
 
 ## MOSAIC/SUMO realism (Java + scenario layer)
 
@@ -152,6 +170,7 @@ through `SCMS_*` environment variables and recorded in `<dataset>/scenario_prove
 |---|---|---|
 | 100 ms MOSAIC↔SUMO sync | Default on every map, so the ETSI EN 302 637-2 CAM rules fire at 1–10 Hz instead of a 1 Hz spike. ~10× the MOSAIC steps. MOSAIC launches SUMO with `--step-length <sync>`, which beats the sumocfg — so this knob is also the SUMO integration step, every generated sumocfg is rewritten to match, and `resolved.sumo_step_ms` records what SUMO really ran | `SCMS_SYNC_MS` (`1000` restores the old behaviour) |
 | EIDM car-following | Human-like extended IDM instead of Krauss, on generated, curated and InTAS maps alike | `SCMS_CF_MODEL` |
+| Sublane lane changes | SUMO's sublane model on by default (`--lateral-resolution 0.8`, which auto-selects SL2015) so a lane change is a continuous ~3 s lateral traverse instead of a single-step snap across a whole 3.2 m lane — the exact jump a V2X position-plausibility detector keys on. 0.8 m splits SUMO's default lane into 4 sublanes and stays under the narrowest motorised vehicle (motorcycle, 0.9 m). Measured on a matched InTAS pair (300 s, seed 42, `emit_p` 1.0, 334 vehicles, identical but for this knob): `traffic.lateral_discontinuity_events` **0.5851 → 0.1302** ev/veh-km (4.49× fewer), full-lane-width lateral steps 134 → 5 (26.8× fewer), max single-step lateral offset 6.42 → 4.50 m. It does **not** fix the acceleration gate and marginally worsens it (0.998671 → 0.998233), because that residual is longitudinal. The 0.0 ev/veh-km target is still not met on any SUMO run | `SCMS_LATERAL_RES` (`off` restores instant snapping), `SCMS_LATERAL_SPEED` |
 | Driver heterogeneity | Per-driver `speedFactor` distribution + jittered `tau`/`accel`/`decel`/`minGap`/`length` prototypes (MOSAIC otherwise hard-writes `speedDev="0.0"`) | `SCMS_SPEED_DEV`, `SCMS_VTYPE_SAMPLES`, `SCMS_VTYPE_JITTER` |
 | Driver profiles | VeReMi-NextGen 10/80/10 aggressive/normal/passive, applied per vehicle at runtime; keyed on (seed, vehicle id) so the fleet mix is reproducible | `SCMS_DRIVER_PROFILES`, `SCMS_DRIVER_AGGRESSIVE_PCT`, `SCMS_DRIVER_PASSIVE_PCT` |
 | NextGen sensor-error model | Temporally-correlated GNSS error, relative speed error, speed-decaying heading error. The CAM carries only an ETSI-style 95 % confidence radius — never the realised error vector — and that radius is **quantised onto a coarse fleet-shared ladder** so a constant per-vehicle confidence cannot act as a cross-pseudonym linkage key | `SCMS_SENSOR_MODEL=nextgen`, `SCMS_SENSOR_*` |

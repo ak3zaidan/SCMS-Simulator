@@ -15,9 +15,12 @@
  * a static receiver with a known-good position is not fooled by the mobility a mobile witness has
  * to guess at, and it cannot itself be an attacker or a colluder.
  *
- * Channel realism mirrors the vehicle receiver (weather attenuation, distance-growing NLOS loss
- * computed from the sender's TRUE position via the back-end oracle, CSMA/CA congestion loss), so
- * RSU links are not unrealistically perfect relative to vehicle links.
+ * Channel realism is not merely a mirror of the vehicle receiver: since Phase 2 both run the SAME
+ * org.scms.radio.RxChannel instance type (weather attenuation, LOS/NLOSb obstruction computed from
+ * the sender's TRUE position via the back-end oracle, CSMA/CA congestion loss), so RSU links are
+ * neither unrealistically perfect relative to vehicle links nor governed by a second, drifting copy
+ * of the radio. An RSU also senses the channel for the DCC channel-busy-ratio estimate even though
+ * it never transmits a CAM of its own.
  *
  * Placement, count and the WGS-84 positions come from the scenario generator
  * (mapgen.rsu_units / SCMS_RSUS / SCMS_RSU_PLACEMENT); this class only has to be present in the
@@ -39,40 +42,31 @@ import org.eclipse.mosaic.lib.geo.GeoPoint;
 import org.eclipse.mosaic.lib.util.scheduling.Event;
 
 import org.scms.backend.ScmsBackend;
+import org.scms.radio.RxChannel;
 
 public class ScmsRsuApp extends AbstractApplication<RoadSideUnitOperatingSystem>
         implements CommunicationApplication {
-
-    private static final int CHAN_CAPACITY = CamDetector.envI("SCMS_CHAN_CAPACITY", 25);
-    private static final double CHAN_WINDOW_S = 0.1;
-    private static final double NLOS_INTENSITY = CamDetector.envD("SCMS_NLOS", 0.0);
-    private static final double WEATHER_DROP = weatherDrop();
-
-    private static double weatherDrop() {
-        String w = System.getenv("SCMS_WEATHER");
-        if (w == null) { return 0.0; }
-        switch (w.toLowerCase()) {
-            case "rain": return 0.05;
-            case "fog":  return 0.03;
-            case "snow": return 0.10;
-            default:     return 0.0;
-        }
-    }
 
     private final CamDetector detector = new CamDetector();
     private String myDigest;
     private double selfX, selfY;
     private boolean haveSelf = false;
-    private double chanWinStart = Double.NEGATIVE_INFINITY;
-    private int chanCount = 0, chanLoad = 0;
-    private java.util.Random chanRng;
+    private RxChannel channel;
 
     @Override
     public void onStartup() {
         String id = getOperatingSystem().getId();
         ScmsBackend backend = ScmsBackend.instance();
         myDigest = backend.rsuCredential(id).certDigest;
-        chanRng = new java.util.Random(0x9E3779B97F4A7C15L ^ (long) id.hashCode());
+        channel = new RxChannel(id);
+        try {
+            // Idempotent (one parse per JVM). An RSU can start before any vehicle does, so it must
+            // be able to bring the footprints up itself rather than depend on ScmsBeaconApp.
+            RxChannel.buildings(org.eclipse.mosaic.fed.application.ambassador.SimulationKernel
+                    .SimulationKernel.getConfigurationPath());
+        } catch (Throwable ex) {
+            getLog().warn("building footprints not loaded: {}", ex.toString());
+        }
         // A road-side unit is surveyed: its position is known exactly and never changes, so it is
         // resolved once at start-up rather than tracked from mobility updates.
         GeoPoint pos = getOperatingSystem().getPosition();
@@ -106,30 +100,11 @@ public class ScmsRsuApp extends AbstractApplication<RoadSideUnitOperatingSystem>
         }
         double t = getOperatingSystem().getSimulationTime() / 1e9;
         ScmsBackend backend = ScmsBackend.instance();
-        if (WEATHER_DROP > 0 && chanRng.nextDouble() < WEATHER_DROP) {
+        // Weather / LOS-NLOSb obstruction / contention, from the shared model. All geometry comes
+        // from the TRUE sender position (channel physics only — see ScmsBeaconApp for why a claimed
+        // position must never steer reception probability).
+        if (!channel.deliver(dg, t, selfX, selfY, haveSelf)) {
             return;
-        }
-        // NLOS geometry from the TRUE sender position (channel physics only — see ScmsBeaconApp for
-        // why a claimed position must never steer reception probability).
-        if (NLOS_INTENSITY > 0 && haveSelf) {
-            double[] txTrue = backend.truePositionOf(dg);
-            if (txTrue != null) {
-                double dist = Math.hypot(txTrue[0] - selfX, txTrue[1] - selfY);
-                double pn = NLOS_INTENSITY * Math.min(1.0, Math.max(0.0, (dist - 150.0) / 300.0));
-                if (pn > 0 && chanRng.nextDouble() < pn) {
-                    return;
-                }
-            }
-        }
-        if (t - chanWinStart >= CHAN_WINDOW_S) {
-            chanWinStart = t; chanLoad = chanCount; chanCount = 0;
-        }
-        chanCount++;
-        if (CHAN_CAPACITY > 0 && chanLoad > CHAN_CAPACITY) {
-            double pDrop = Math.min(0.95, (double) (chanLoad - CHAN_CAPACITY) / CHAN_CAPACITY);
-            if (chanRng.nextDouble() < pDrop) {
-                return;
-            }
         }
         if (backend.isRevoked(dg, t)) {
             return;
@@ -157,6 +132,9 @@ public class ScmsRsuApp extends AbstractApplication<RoadSideUnitOperatingSystem>
 
     @Override
     public void onShutdown() {
+        if (channel != null) {
+            channel.publishStats();
+        }
     }
 
     @Override

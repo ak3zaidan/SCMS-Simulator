@@ -35,7 +35,9 @@ from scms_sim_ref.mock_pipeline.run import (ATTACK_CATALOG, COMBINED_ATTACKS,
 
 # The published default golden digest (see the determinism contract). VruImpersonation is opt-in, so
 # the default run MUST stay byte-identical to this value.
-GOLDEN = "04ae9736f519dffb426bb1acebfec95edf32e7127ebc71346279f754a69cee38"
+# ADR 0002 re-pin (true_speed/true_heading added to gt_emissions_sample):
+# superseded 04ae9736f519... (default-config run; behaviour unchanged).
+GOLDEN = "0bd93655a2d5bebb4172191fab0940a5ff90c6be685cfa033f5edcfd7c1fb740"
 
 ATTACK = "VruImpersonation"
 DETECTOR = "vruImpersonation"

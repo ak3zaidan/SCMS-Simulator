@@ -9,6 +9,19 @@ kinematic value, an attack label, or the exact fields F2MD leaked
 It is deliberately conservative: it inspects keys recursively through nested
 dicts and lists, and treats anything matching `is_forbidden_feature_key` as a
 violation regardless of nesting depth.
+
+REVIEWED EXCEPTION -- `rssi_dbm` (added by radio_model="geometric", Phase 2).
+It is DERIVED from the transmitter's true position but it is NOT ground truth:
+a real receiver's PHY measures the received power of every frame it decodes, so
+the MA legitimately holds it. It is therefore deliberately absent from
+FORBIDDEN_FEATURE_KEYS and this linter passes it. The property that makes it
+safe AND useful is that it must be computed on the channel side from TRUE
+geometry, never from the position the sender CLAIMS -- a Sybil ghost then
+carries its attacker's real-location RSSI, which is exactly what an
+RSSI-vs-claimed-distance detector keys on. A claimed-position implementation
+would leave the column looking perfectly plausible, so no key-name rule can
+catch it; that direction is asserted separately in
+tests/test_geometric_channel.py::test_rssi_tracks_true_geometry_not_the_claimed_position.
 """
 
 from __future__ import annotations

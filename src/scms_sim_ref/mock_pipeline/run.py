@@ -261,6 +261,461 @@ RADIO_CAP_SIGMA = 4.0        # candidate cap headroom in shadow standard deviati
 RADIO_CAP_MAX_MULT = 6.0     # hard ceiling on cap / range (bounds the cell-search neighbourhood)
 
 
+# =========================================================================== #
+# Geometric V2X channel model  (opt-in: radio_model="geometric")
+#
+# A pure-Python, dependency-free GEMV2-lite: every (tx, rx) pair is classified
+# LOS / NLOSv (a vehicle in the way) / NLOSb (a building in the way) and then
+# put through the 3GPP TR 37.885 path loss for that state, a Gudmundson AR(1)
+# shadowing process carried per link, and a per-packet Nakagami-m fade, before
+# an independent-survival composition decides delivery.
+#
+# Every constant below is transcribed from ONE audited copy in
+# datagen/refdata/{pathloss_3gpp_tr37885,nakagami_fading,phy_80211p_profile}.json
+# -- see tests/test_geometric_channel.py, which grades the implementation
+# against the refdata file rather than against a second copy of the formula.
+# =========================================================================== #
+
+# TR 37.885 Table 6.2.1-1: PL_dB = a + b*log10(d_m) + c*log10(fc_GHz).
+# NOTE highway LOS uses the standard's literal 32.4 intercept, which sits 0.0478 dB below exact
+# free space -- reusing a generic Friis helper here misses the 0.01 dB conformance gate by ~5x.
+TR37885_PATHLOSS = {
+    "urban_los":   (38.77, 16.7, 18.2),
+    "urban_nlos":  (36.85, 30.0, 18.9),     # "NLOSb" in GEMV2 vocabulary: building-blocked
+    "highway_los": (32.4,  20.0, 20.0),
+}
+TR37885_FC_GHZ = 5.9                        # ITS-G5 / DSRC control channel
+# Shadow-fading std: NLOSv keeps the LOS sigma because its blockage spread is a separate random
+# variable (TR37885_NLOSV below); applying the NLOS 4 dB here would double-count the blockage.
+TR37885_SHADOW_SIGMA_DB = {"LOS": 3.0, "NLOSv": 3.0, "NLOSb": 4.0}
+TR37885_SHADOW_DECORR_M = {"LOS": 10.0, "NLOSv": 13.0, "NLOSb": 13.0}
+# NLOSv additional loss: PL_LOS + max(0, N(mu, sigma)), mu = base + max(0, 15*log10(d) - 41).
+# The base selects on BLOCKER HEIGHT vs antenna height, not on distance; the distance term is
+# identically zero below 10^(41/15) = 541.17 m, i.e. constant across the whole urban regime.
+TR37885_NLOSV = {"both_below": (9.0, 4.5), "one_below": (5.0, 4.0), "both_above": (0.0, 0.0)}
+TR37885_BLOCKER_HEIGHT_M = {"car": 1.6, "motorcycle": 1.6, "truck": 3.0, "bus": 3.0}
+V2X_ANTENNA_HEIGHT_M = 1.5           # roof-mounted OBU antenna
+RSU_ANTENNA_HEIGHT_M = 5.0           # pole-mounted RSU: above a car blocker, below nothing useful
+# Small-scale fading (nakagami_fading.m_by_distance_adopted): m = 3 / 1.5 / 1.0 over 0-50 / 50-150 /
+# >150 m. Power is Gamma(shape=m, scale=1/m) -- unit MEAN, so fading redistributes power without
+# adding any (gammavariate(m, 1/m); using scale=1 would inflate mean power by a factor of m).
+NAKAGAMI_M_BANDS = ((50.0, 3.0), (150.0, 1.5), (float("inf"), 1.0))
+# Vendored VeReMi-NextGen INET 802.11p profile (phy_80211p_profile.json): 6 Mb/s QPSK-1/2, 10 MHz.
+PHY_NOISE_DBM = -110.0               # radioMedium.backgroundNoise.power
+PHY_SNIR_THRESHOLD_DB = 4.0          # receiver.snirThreshold -- a hard step, see _per_from_rx_dbm
+PHY_CS_THRESHOLD_DBM = -85.0         # ETSI DCC channel-busy probe level (etsi_cam_dcc)
+# PPDU airtime for a ~500 B signed CAM at 6 Mb/s in 10 MHz (712 us) plus AIFS(AC_BE) + mean backoff
+# (207.5 us). Counting the MAC overhead is the difference between meeting and missing the CBR gate.
+PHY_FRAME_AIRTIME_S = (712.0 + 207.5) * 1e-6
+
+# Implementation tunables of the geometry (not standards constants).
+GEO_BUILDING_CELL_M = 3.0            # occupancy-raster resolution for the NLOSb blockage test
+GEO_BUILDING_MAX_CELLS = 6_000_000   # auto-coarsen the raster rather than blow up memory
+GEO_VEHICLE_CELL_M = 25.0            # uniform grid over vehicle blockers for the NLOSv test
+GEO_BLOCKER_HALF_WIDTH_M = 1.0       # a vehicle body blocks the LOS line within this lateral offset
+GEO_ENDPOINT_CLEAR_M = 6.0           # ignore raster hits this close to either antenna: the road
+                                     # graph is RDP-simplified (10 m) and the raster has a ~1-cell
+                                     # halo, so an antenna can nominally land on a building cell
+GEO_FADING_HEADROOM_DB = 10.0        # candidate-window headroom for a favourable Nakagami fade
+
+
+def tr37885_pathloss_db(state: str, d_m: float, fc_ghz: float = TR37885_FC_GHZ) -> float:
+    """3GPP TR 37.885 mean path loss in dB. `state` is a key of TR37885_PATHLOSS.
+
+    Distance is floored at 1 m (the formulas diverge at 0 and are not defined in the reactive near
+    field anyway). This is the ONLY place the constants are evaluated."""
+    try:
+        a, b, c = TR37885_PATHLOSS[state]
+    except KeyError:
+        raise ValueError(f"unknown TR 37.885 state {state!r} "
+                         f"(have {sorted(TR37885_PATHLOSS)})") from None
+    return a + b * math.log10(max(float(d_m), 1.0)) + c * math.log10(fc_ghz)
+
+
+def tr37885_nlosv_mu_db(base_db: float, d_m: float) -> float:
+    """NLOSv mean extra loss: base + max(0, 15*log10(d) - 41) (zero distance term below 541.17 m)."""
+    return base_db + max(0.0, 15.0 * math.log10(max(float(d_m), 1.0)) - 41.0)
+
+
+def nakagami_m_for_distance(d_m: float) -> float:
+    """Nakagami shape factor for a link of this length (3 / 1.5 / 1.0 over 0-50 / 50-150 / >150 m)."""
+    for upper, m in NAKAGAMI_M_BANDS:
+        if d_m <= upper:
+            return m
+    return NAKAGAMI_M_BANDS[-1][1]
+
+
+def hidden_terminal_fraction(d_m: float, sense_r_m: float) -> float:
+    """Fraction of a receiver's sensing disc that the TRANSMITTER cannot carrier-sense.
+
+    Exact two-disc geometry: with equal sensing radius R and separation d, the shared (mutually
+    sensed) area is 2R^2*acos(d/2R) - (d/2)*sqrt(4R^2 - d^2); everything else in the receiver's disc
+    holds terminals that are hidden from the transmitter. 0 at d = 0, 1 at d >= 2R."""
+    R = max(float(sense_r_m), 1e-9)
+    d = max(0.0, float(d_m))
+    if d >= 2.0 * R:
+        return 1.0
+    shared = 2.0 * R * R * math.acos(d / (2.0 * R)) - (d / 2.0) * math.sqrt(max(0.0, 4.0 * R * R - d * d))
+    return max(0.0, min(1.0, 1.0 - shared / (math.pi * R * R)))
+
+
+class _BuildingRaster:
+    """Uniform occupancy grid over building footprints + a supercover ray march for LOS testing.
+
+    Pure Python/bytearray -- shapely is deliberately NOT a dependency (see PHASE2-DESIGN.md). Each
+    polygon contributes its INTERIOR (even-odd scanline fill at cell centres) and its WALLS (the
+    edges stamped by the same DDA used for queries), so a footprint thinner than one cell still
+    blocks. `blocked()` walks only the cells the segment actually crosses and exits on the first
+    hit, so an urban query costs a handful of lookups rather than a polygon sweep."""
+
+    def __init__(self, polygons, cell_m: float = GEO_BUILDING_CELL_M,
+                 max_cells: int = GEO_BUILDING_MAX_CELLS):
+        pts = [p for ring in polygons for p in ring]
+        if not pts:
+            raise ValueError("_BuildingRaster needs at least one polygon")
+        self.x0 = min(p[0] for p in pts) - cell_m
+        self.y0 = min(p[1] for p in pts) - cell_m
+        x1 = max(p[0] for p in pts) + cell_m
+        y1 = max(p[1] for p in pts) + cell_m
+        # auto-coarsen instead of allocating an unbounded grid for a very large extract
+        while True:
+            nx = max(1, int((x1 - self.x0) / cell_m) + 1)
+            ny = max(1, int((y1 - self.y0) / cell_m) + 1)
+            if nx * ny <= max_cells:
+                break
+            cell_m *= 2.0
+        self.cell = float(cell_m)
+        self.nx, self.ny = nx, ny
+        self.grid = bytearray(nx * ny)
+        self.n_polygons = len(polygons)
+        for ring in polygons:
+            self._fill(ring)
+            for i in range(len(ring)):
+                ax, ay = ring[i]
+                bx, by = ring[(i + 1) % len(ring)]
+                self._stamp(ax, ay, bx, by)
+        self.occupied_cells = sum(1 for v in self.grid if v)
+
+    def _fill(self, ring) -> None:
+        """Even-odd scanline fill of the ring interior at cell-centre resolution."""
+        ys = [p[1] for p in ring]
+        iy_lo = max(0, int((min(ys) - self.y0) / self.cell))
+        iy_hi = min(self.ny - 1, int((max(ys) - self.y0) / self.cell))
+        n = len(ring)
+        for iy in range(iy_lo, iy_hi + 1):
+            yc = self.y0 + (iy + 0.5) * self.cell
+            xs = []
+            for i in range(n):
+                ax, ay = ring[i]
+                bx, by = ring[(i + 1) % n]
+                if (ay > yc) != (by > yc):
+                    xs.append(ax + (yc - ay) * (bx - ax) / (by - ay))
+            xs.sort()
+            row = iy * self.nx
+            for k in range(0, len(xs) - 1, 2):
+                ix_lo = max(0, int(math.ceil((xs[k] - self.x0) / self.cell - 0.5)))
+                ix_hi = min(self.nx - 1, int((xs[k + 1] - self.x0) / self.cell - 0.5))
+                for ix in range(ix_lo, ix_hi + 1):
+                    self.grid[row + ix] = 1
+
+    def _stamp(self, x0, y0, x1, y1) -> None:
+        for ix, iy, _t in self._cells(x0, y0, x1, y1):
+            if 0 <= ix < self.nx and 0 <= iy < self.ny:
+                self.grid[iy * self.nx + ix] = 1
+
+    def _cells(self, x0, y0, x1, y1):
+        """Amanatides-Woo supercover traversal: yields (ix, iy, t) for every cell the segment
+        crosses, t being the normalised position along the segment where the cell is entered."""
+        cell = self.cell
+        ix = int(math.floor((x0 - self.x0) / cell))
+        iy = int(math.floor((y0 - self.y0) / cell))
+        ix1 = int(math.floor((x1 - self.x0) / cell))
+        iy1 = int(math.floor((y1 - self.y0) / cell))
+        dx, dy = x1 - x0, y1 - y0
+        stepx = 1 if dx > 0 else -1
+        stepy = 1 if dy > 0 else -1
+        inf = float("inf")
+        tdx = abs(cell / dx) if dx else inf
+        tdy = abs(cell / dy) if dy else inf
+        if dx:
+            nxb = self.x0 + (ix + (1 if dx > 0 else 0)) * cell
+            tmx = (nxb - x0) / dx
+        else:
+            tmx = inf
+        if dy:
+            nyb = self.y0 + (iy + (1 if dy > 0 else 0)) * cell
+            tmy = (nyb - y0) / dy
+        else:
+            tmy = inf
+        t = 0.0
+        guard = 4 * (abs(ix1 - ix) + abs(iy1 - iy)) + 8
+        for _ in range(guard):
+            yield ix, iy, t
+            if ix == ix1 and iy == iy1:
+                return
+            if tmx < tmy:
+                ix += stepx
+                t = tmx
+                tmx += tdx
+            else:
+                iy += stepy
+                t = tmy
+                tmy += tdy
+            if t > 1.0:
+                return
+
+    def blocked(self, x0, y0, x1, y1, endpoint_clear_m: float = GEO_ENDPOINT_CLEAR_M) -> bool:
+        """True if the segment crosses an occupied cell, ignoring the first/last `endpoint_clear_m`."""
+        length = math.hypot(x1 - x0, y1 - y0)
+        if length <= 2.0 * endpoint_clear_m:
+            return False
+        skip = endpoint_clear_m / length
+        nx, ny, grid = self.nx, self.ny, self.grid
+        for ix, iy, t in self._cells(x0, y0, x1, y1):
+            if t < skip or t > 1.0 - skip:
+                continue
+            if 0 <= ix < nx and 0 <= iy < ny and grid[iy * nx + ix]:
+                return True
+        return False
+
+
+class _VehicleBlockerIndex:
+    """Uniform grid over the step's vehicle positions (same structure as the broadcast spatial hash
+    at the reception choke point) answering "is a vehicle body sitting on this LOS line?"."""
+
+    __slots__ = ("cell", "buckets")
+
+    def __init__(self, cell_m: float = GEO_VEHICLE_CELL_M):
+        self.cell = float(cell_m)
+        self.buckets: dict = {}
+
+    def rebuild(self, entries) -> None:
+        """`entries` = iterable of (vid, x, y, blocker_height_m)."""
+        self.buckets = {}
+        c = self.cell
+        for vid, x, y, h in entries:
+            self.buckets.setdefault((int(x // c), int(y // c)), []).append((vid, x, y, h))
+
+    def tallest_blocker(self, x0, y0, x1, y1, skip_a: int, skip_b: int,
+                        half_width_m: float = GEO_BLOCKER_HALF_WIDTH_M) -> float:
+        """Height of the tallest vehicle whose body intersects the segment (0.0 = clear).
+
+        Only the cells the segment actually passes through are visited -- sampled every `cell` metres
+        along the line with its 3x3 neighbourhood, which provably covers every cell within one cell
+        (>> half_width_m) of the segment. Enumerating the segment's bounding box instead is
+        O(length^2/cell^2) and is what made a 700 m link cost 841 bucket probes instead of ~80."""
+        dx, dy = x1 - x0, y1 - y0
+        ll = dx * dx + dy * dy
+        if ll <= 1e-9:
+            return 0.0
+        c = self.cell
+        length = math.sqrt(ll)
+        steps = int(length / c) + 1
+        best = 0.0
+        get = self.buckets.get
+        seen = set()
+        for k in range(steps + 1):
+            s0 = min(1.0, (k * c) / length)
+            bx = int((x0 + s0 * dx) // c)
+            by = int((y0 + s0 * dy) // c)
+            for cx in (bx - 1, bx, bx + 1):
+                for cy in (by - 1, by, by + 1):
+                    key = (cx, cy)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    for vid, vx, vy, h in get(key, ()):
+                        if vid == skip_a or vid == skip_b or h <= best:
+                            continue
+                        s = ((vx - x0) * dx + (vy - y0) * dy) / ll
+                        if not (0.0 < s < 1.0):      # strictly BETWEEN the two antennas
+                            continue
+                        px, py = x0 + s * dx, y0 + s * dy
+                        if (vx - px) ** 2 + (vy - py) ** 2 <= half_width_m * half_width_m:
+                            best = h
+        return best
+
+
+class GeometricChannel:
+    """The `radio_model="geometric"` link model: classification -> path loss -> AR(1) shadowing ->
+    per-packet Nakagami fade -> independent-survival composition.
+
+    RNG DISCIPLINE. Every draw comes from a dedicated string-keyed stream carried per link, never
+    from the pipeline's global `rng`, so switching the model on cannot perturb any other stream --
+    and the default `disc` path never constructs this object at all.
+
+      * shadowing  : one Random per UNORDERED pair `f"{seed}:shadow2:{lo}:{hi}"`, advanced exactly
+                     once per step (the channel is reciprocal), keyed on the TRUE vehicle ids so a
+                     pseudonym rotation no longer resamples the channel (the old per-step draw at
+                     the cert digest was both non-reciprocal and memoryless -- roadmap G5).
+      * per-packet : one Random per ORDERED pair `f"{seed}:geo:{tx}:{rx}"` supplying the NLOSv
+                     blockage draw, the Nakagami fade and the delivery coin.
+      * canyon     : the synthetic-map NLOSb fallback shares the shadowing stream, so it is
+                     re-decided on the same spatial cadence as the shadowing it accompanies.
+    """
+
+    def __init__(self, cfg, buildings=None, dt: float = 1.0):
+        self.seed = cfg.seed
+        self.dt = max(float(dt), 1e-9)
+        self.env = cfg.radio_env
+        self.los_state = "urban_los" if self.env == "urban" else "highway_los"
+        self.nlos_state = "urban_nlos"      # TR 37.885 reuses the urban NLOS formula on highways
+        self.tx_dbm = float(cfg.radio_tx_power_dbm)
+        self.sens_dbm = float(cfg.radio_rx_sensitivity_dbm)
+        # Decode floor: the vendored PHY bounds range by SENSITIVITY, but keep the SNIR arm explicit
+        # so a noisier configuration bites. See _per_from_rx_dbm for why this is a hard step.
+        self.decode_floor_dbm = max(self.sens_dbm, PHY_NOISE_DBM + PHY_SNIR_THRESHOLD_DB)
+        self.canyon_per_m = max(0.0, float(cfg.radio_nlosb_density_per_km)) / 1000.0
+        self.buildings = _BuildingRaster(buildings) if buildings else None
+        self._shadow: dict = {}             # unordered pair -> per-link AR(1) + classification state
+        self._packet: dict = {}             # ordered pair -> per-packet Random
+        self.blockers = _VehicleBlockerIndex()
+        self.step = -1
+        self.stats = Counter()
+        # candidate-window cap: the distance at which the MEDIAN LOS signal is cap_sigma shadow
+        # sigmas plus a fading headroom below the decode floor. Bounded by radio_cap_max_mult *
+        # radio_range_m exactly as the logdistance branch is, so the cell search stays O(local) --
+        # at realistic power the TR 37.885 urban-LOS slope (b = 16.7) puts the unbounded cap in the
+        # tens of kilometres, so the multiplier, not the physics, is the performance dial here.
+        a, b, c = TR37885_PATHLOSS[self.los_state]
+        budget = (self.tx_dbm - self.decode_floor_dbm
+                  + cfg.radio_cap_sigma * TR37885_SHADOW_SIGMA_DB["LOS"] + GEO_FADING_HEADROOM_DB)
+        self.cap_m = 10.0 ** ((budget - a - c * math.log10(TR37885_FC_GHZ)) / b)
+        self.cap_m = max(1.0, min(self.cap_m, cfg.radio_range_m * cfg.radio_cap_max_mult))
+        # carrier-sense radius for the hidden-terminal term, on the same LOS budget at -85 dBm
+        sense_budget = self.tx_dbm - PHY_CS_THRESHOLD_DBM
+        self.sense_m = min(self.cap_m,
+                           10.0 ** ((sense_budget - a - c * math.log10(TR37885_FC_GHZ)) / b))
+
+    # -- per-step ---------------------------------------------------------------------------- #
+    def begin_step(self, step: int, blocker_entries) -> None:
+        self.step = step
+        self.blockers.rebuild(blocker_entries)
+
+    def cbr(self, load_msgs_per_step: float) -> float:
+        """Modelled channel busy ratio: offered frames per second x PPDU+MAC airtime, capped at 1.
+
+        Zeroth-order (it counts the load the receiver decodes, so it ignores energy between the
+        -85 dBm probe level and the -81 dBm decode floor and double-counts overlapping frames at
+        high load) -- the Sepulcre et al. analytical estimator PHASE2-DESIGN step 6 binds is not
+        implemented here; this replaces the linear ramp on raw message count, not that model."""
+        return min(1.0, max(0.0, load_msgs_per_step) / self.dt * PHY_FRAME_AIRTIME_S)
+
+    def collision_loss(self, dist_m: float, cbr: float) -> float:
+        """Hidden-terminal collision probability: the pure-ALOHA vulnerable-period result
+        1 - exp(-2G) applied to the share of the offered load the transmitter cannot carrier-sense
+        (CSMA defers the rest). Coarse by construction; it is 0 at co-location and grows with the
+        separation, which is the qualitative behaviour the flat ramp it replaces did not have."""
+        g = cbr * hidden_terminal_fraction(dist_m, self.sense_m)
+        return 1.0 - math.exp(-2.0 * g) if g > 0.0 else 0.0
+
+    # -- per-link ---------------------------------------------------------------------------- #
+    def _link_state(self, tx_vid, rx_vid, txx, txy, rxx, rxy, d, tx_h, rx_h):
+        """Classify + advance the AR(1) shadowing for this link, once per step.
+
+        Returns (state, shadow_db, nlosv_mu_base, nlosv_sigma) with state in LOS / NLOSv / NLOSb."""
+        key = (tx_vid, rx_vid) if tx_vid < rx_vid else (rx_vid, tx_vid)
+        st = self._shadow.get(key)
+        if st is None:
+            st = {"rng": random.Random(f"{self.seed}:shadow2:{key[0]}:{key[1]}"),
+                  "s": None, "step": -1, "pa": None, "pb": None,
+                  "state": "LOS", "mu": 0.0, "sig": 0.0}
+            self._shadow[key] = st
+        if st["step"] == self.step:
+            return st["state"], st["s"], st["mu"], st["sig"]
+        rng = st["rng"]
+        # Gudmundson decorrelation is driven by how far the link has moved through the environment:
+        # the SUM of the two endpoint displacements, so a convoy at constant separation still sees
+        # its shadowing decorrelate as the street scrolls past (a |delta d| measure would not).
+        pa, pb = (txx, txy), (rxx, rxy)
+        if key[0] != tx_vid:
+            pa, pb = pb, pa
+        if st["pa"] is None:
+            moved = float("inf")
+        else:
+            moved = (math.dist(pa, st["pa"]) + math.dist(pb, st["pb"]))
+        st["pa"], st["pb"] = pa, pb
+
+        # --- classification -------------------------------------------------------------------
+        blocker_h = self.blockers.tallest_blocker(txx, txy, rxx, rxy, tx_vid, rx_vid)
+        if self.buildings is not None:
+            nlosb = self.buildings.blocked(txx, txy, rxx, rxy)
+        elif self.canyon_per_m > 0.0:
+            # Synthetic map with no footprints: an urban-canyon blocker density (expected blockages
+            # per km) as a Poisson process along the path, P(LOS) = exp(-lambda*d). Re-decided only
+            # once the link has moved a decorrelation distance, so the verdict is spatially coherent
+            # instead of flickering every step.
+            prev = st.get("canyon")
+            if prev is None or moved >= TR37885_SHADOW_DECORR_M["NLOSb"]:
+                prev = rng.random() >= math.exp(-self.canyon_per_m * d)
+                st["canyon"] = prev
+            nlosb = prev
+        else:
+            nlosb = False
+        if nlosb:
+            state, mu_base, sig_v = "NLOSb", 0.0, 0.0
+        elif blocker_h > 0.0:
+            below = (tx_h < blocker_h) + (rx_h < blocker_h)
+            mu_base, sig_v = TR37885_NLOSV[("both_above", "one_below", "both_below")[below]]
+            state = "NLOSv" if below else "LOS"     # both antennas above the blocker -> no loss
+        else:
+            state, mu_base, sig_v = "LOS", 0.0, 0.0
+        self.stats[state] += 1
+
+        # --- AR(1) / Gudmundson shadowing -------------------------------------------------------
+        sigma = TR37885_SHADOW_SIGMA_DB[state]
+        decorr = TR37885_SHADOW_DECORR_M[state]
+        if st["s"] is None or moved == float("inf"):
+            s = rng.gauss(0.0, sigma)
+        else:
+            rho = math.exp(-moved / decorr)
+            s = rho * st["s"] + math.sqrt(max(0.0, 1.0 - rho * rho)) * rng.gauss(0.0, sigma)
+        st.update(s=s, step=self.step, state=state, mu=mu_base, sig=sig_v)
+        return state, s, mu_base, sig_v
+
+    def _per_from_rx_dbm(self, rx_dbm: float) -> float:
+        """SINR -> PER for the 6 Mb/s QPSK-1/2 10 MHz 802.11p profile.
+
+        No coded SINR->PER waterfall for this profile is held anywhere in this repository
+        (refdata nakagami_fading.sinr_to_per_mapping is recorded as UNAVAILABLE), and inventing one
+        would be fabrication. This is therefore the vendored stack's own hard step -- decode iff the
+        received power clears both the -81 dBm sensitivity and the 4 dB SNIR bar. A step has no
+        partial-reception region on its own; the per-packet Nakagami fade applied BEFORE it is what
+        turns the population PDR into a smooth waterfall (and what the >= 100 m gray-zone gate
+        measures)."""
+        return 0.0 if rx_dbm >= self.decode_floor_dbm else 1.0
+
+    def evaluate(self, tx_vid, rx_vid, txx, txy, rxx, rxy, d, tx_h, rx_h):
+        """One packet on one link. Returns (heard, rssi_dbm, state, packet_rng).
+
+        `rssi_dbm` is the FADED received power -- what the receiver's PHY actually measures for this
+        frame. It is computed from TRUE geometry (txx/txy are the transmitter's true position, never
+        its claimed one), which is exactly what makes an RSSI-vs-claimed-distance detector possible:
+        a Sybil ghost inherits its attacker's true-position RSSI. It is receiver-measurable and so
+        legitimately MA-visible."""
+        d = max(float(d), 1.0)
+        state, shadow_db, mu_base, sig_v = self._link_state(
+            tx_vid, rx_vid, txx, txy, rxx, rxy, d, tx_h, rx_h)
+        pkey = (tx_vid, rx_vid)
+        prng = self._packet.get(pkey)
+        if prng is None:
+            prng = random.Random(f"{self.seed}:geo:{tx_vid}:{rx_vid}")
+            self._packet[pkey] = prng
+        if state == "NLOSb":
+            pl = tr37885_pathloss_db(self.nlos_state, d)
+        else:
+            pl = tr37885_pathloss_db(self.los_state, d)
+            if state == "NLOSv":
+                # censored Gaussian: draw and clamp at 0, never shortcut to the mean
+                pl += max(0.0, prng.gauss(tr37885_nlosv_mu_db(mu_base, d), sig_v))
+        mean_rx = self.tx_dbm - pl + shadow_db
+        m = nakagami_m_for_distance(d)
+        fade_db = 10.0 * math.log10(max(prng.gammavariate(m, 1.0 / m), 1e-12))
+        rx_dbm = mean_rx + fade_db
+        heard = self._per_from_rx_dbm(rx_dbm) <= 0.0
+        return heard, rx_dbm, state, prng
+
+
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
@@ -346,7 +801,12 @@ class PipelineConfig:
     # log-normal shadowing draw (dB); a link is HEARD iff received power >= sensitivity(+margin). The
     # existing packet_loss_base/nlos_loss/congestion/weather losses then compose ON TOP as per-packet
     # drops on the links that do close. The three tunables below are consulted ONLY when logdistance.
-    radio_model: str = "disc"            # "disc" (hard range) | "logdistance" (soft path-loss+shadowing)
+    # "geometric" is the third model: 3GPP TR 37.885 path loss under a per-link LOS / NLOSv (vehicle
+    # in the way) / NLOSb (building in the way) classification, Gudmundson AR(1) shadowing carried
+    # per link, per-packet Nakagami-m fading and an independent-survival loss product. It consults
+    # the radio_env / radio_tx_power_dbm / radio_rx_sensitivity_dbm / radio_nlosb_density_per_km
+    # knobs below and NONE of the logdistance ones; "disc" (default) takes neither branch.
+    radio_model: str = "disc"            # "disc" (hard range) | "logdistance" | "geometric"
     pathloss_exponent: float = 2.7       # log-distance exponent n (urban ~2.7-3.5; free space 2.0)
     shadowing_sigma_db: float = 4.0      # log-normal shadowing std (dB); 0 -> near-hard cutoff at range
     rx_sensitivity_margin_db: float = 0.0  # + shrinks / - extends the effective range vs radio_range_m
@@ -354,6 +814,17 @@ class PipelineConfig:
     # when radio_model=="logdistance"; the "disc" default takes neither, so it is byte-identical regardless.
     radio_cap_sigma: float = RADIO_CAP_SIGMA        # candidate cap headroom in shadow standard deviations
     radio_cap_max_mult: float = RADIO_CAP_MAX_MULT  # hard ceiling on cap / range (bounds the cell search)
+    # --- geometric (3GPP TR 37.885) channel model; consulted ONLY when radio_model=="geometric" ---
+    radio_env: str = "urban"             # TR 37.885 LOS family: "urban" | "highway" (NLOS reuses urban)
+    radio_tx_power_dbm: float = 23.0     # EIRP. A deployed ITS-G5/DSRC OBU runs 20-23 dBm (ETSI caps
+                                         # EIRP at 33); the vendored VeReMi-NextGen INET config's
+                                         # 13.0103 dBm reaches only ~204 m median on highway LOS, so
+                                         # the >=500 m awareness gate is unreachable below ~20.8 dBm.
+    radio_rx_sensitivity_dbm: float = -81.0   # decode floor (vendored NextGen 6 Mb/s 802.11p profile)
+    radio_nlosb_density_per_km: float = 4.0   # SYNTHETIC-MAP FALLBACK ONLY: expected building
+                                         # blockages per km of link path, P(LOS) = exp(-lambda*d),
+                                         # used when the map carries no footprints. Ignored entirely
+                                         # once real building polygons are present.
     art_max_m: float = 150.0             # tolerance for claiming a position beyond the radio range
     offroad_tol_m: float = 15.0          # map check: claimed distance from the nearest road tolerated
     max_accel_mps2: float = 12.0         # implausible-acceleration threshold
@@ -759,6 +1230,43 @@ def _parse_custom_network(s) -> tuple[list, list]:
     return doc["nodes"], doc["edges"]
 
 
+def _parse_buildings(s) -> list:
+    """Optional `"buildings"` layer of a custom-network document -> [[[x, y], ...], ...] in metres.
+
+    Written by `osm.py --buildings`, which projects `building=*` footprints with the ROAD graph's own
+    projection tuple so the two layers are registered. Consumed only by radio_model="geometric" for
+    the NLOSb blockage test; absent/empty -> the synthetic urban-canyon fallback. Any other
+    road_network (grid/ring/spider/linear) carries no footprints by construction."""
+    if isinstance(s, dict):
+        doc = s
+    else:
+        if not s or not str(s).strip():
+            return []
+        try:
+            doc = json.loads(s)
+        except json.JSONDecodeError:
+            return []
+    polys = doc.get("buildings") if isinstance(doc, dict) else None
+    if not polys:
+        return []
+    out = []
+    for k, ring in enumerate(polys):
+        if not isinstance(ring, (list, tuple)) or len(ring) < 3:
+            raise ValueError(f"custom_network buildings[{k}] needs >= 3 vertices (got {ring!r})")
+        pts = []
+        for p in ring:
+            try:
+                x, y = float(p[0]), float(p[1])
+            except (TypeError, ValueError, IndexError):
+                raise ValueError(f"buildings[{k}] vertex must be [x, y] in metres "
+                                 f"(got {p!r})") from None
+            if not (math.isfinite(x) and math.isfinite(y)):
+                raise ValueError(f"buildings[{k}] has a non-finite coordinate")
+            pts.append((x, y))
+        out.append(pts)
+    return out
+
+
 # Scenario-event timeline: each event type, its required keys, and what it changes mid-run.
 EVENT_TYPES = {
     "demand": "arrival-rate multiplier while active: {t, until, mult}",
@@ -910,8 +1418,22 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"jmax must be >= 1 (got {cfg.jmax})")
     if cfg.radio_range_m <= 0:
         raise ValueError(f"radio_range_m must be > 0 (got {cfg.radio_range_m})")
-    if cfg.radio_model not in ("disc", "logdistance"):
-        raise ValueError(f"radio_model must be disc|logdistance (got {cfg.radio_model!r})")
+    if cfg.radio_model not in ("disc", "logdistance", "geometric"):
+        raise ValueError(f"radio_model must be disc|logdistance|geometric (got {cfg.radio_model!r})")
+    if cfg.radio_env not in ("urban", "highway"):
+        raise ValueError(f"radio_env must be urban|highway (got {cfg.radio_env!r})")
+    if not -20.0 <= cfg.radio_tx_power_dbm <= 40.0:
+        raise ValueError(f"radio_tx_power_dbm must be in [-20, 40] dBm "
+                         f"(got {cfg.radio_tx_power_dbm}); ETSI caps ITS-G5 EIRP at 33 dBm")
+    if not -120.0 <= cfg.radio_rx_sensitivity_dbm <= 0.0:
+        raise ValueError(f"radio_rx_sensitivity_dbm must be in [-120, 0] dBm "
+                         f"(got {cfg.radio_rx_sensitivity_dbm})")
+    if cfg.radio_tx_power_dbm <= cfg.radio_rx_sensitivity_dbm:
+        raise ValueError(f"radio_tx_power_dbm ({cfg.radio_tx_power_dbm}) must exceed "
+                         f"radio_rx_sensitivity_dbm ({cfg.radio_rx_sensitivity_dbm}): no link budget")
+    if cfg.radio_nlosb_density_per_km < 0:
+        raise ValueError(f"radio_nlosb_density_per_km must be >= 0 "
+                         f"(got {cfg.radio_nlosb_density_per_km})")
     if cfg.pathloss_exponent <= 0:
         raise ValueError(f"pathloss_exponent must be > 0 (got {cfg.pathloss_exponent})")
     if cfg.shadowing_sigma_db < 0:
@@ -1125,7 +1647,8 @@ def _field_group(name: str) -> str:
 # Enumerated fields -> their valid options (sourced from the live constants so they never drift).
 _ENUM_OPTIONS = {
     "weather": list(WEATHER_MULT),
-    "radio_model": ["disc", "logdistance"],
+    "radio_model": ["disc", "logdistance", "geometric"],
+    "radio_env": ["urban", "highway"],
     "road_network": ["linear", "grid", "ring", "spider", "custom"],
     "demand_profile": ["uniform", "rush", "night"],
     "od_model": ["uniform", "gravity"],
@@ -1305,7 +1828,20 @@ _FIELD_META = {
                            "tighter co-location to flag", lo=0.5, hi=20, st=0.5, u="m"),
     # Radio
     "radio_range_m": dict(h="Vehicle reception range", lo=10, hi=2000, u="m"),
-    "radio_model": dict(h="Reachability model: disc (hard range) | logdistance (soft path-loss + shadowing)"),
+    "radio_model": dict(h="Reachability model: disc (hard range) | logdistance (soft path-loss + "
+                          "shadowing) | geometric (3GPP TR 37.885 LOS/NLOSv/NLOSb + AR(1) shadowing "
+                          "+ per-packet Nakagami fading)"),
+    "radio_env": dict(h="geometric only: TR 37.885 LOS formula family (urban 38.77+16.7log10 d vs "
+                        "highway 32.4+20log10 d); NLOS always uses the urban formula"),
+    "radio_tx_power_dbm": dict(h="geometric only: transmit EIRP. Deployed ITS-G5 OBUs run 20-23 dBm; "
+                                 "ETSI caps EIRP at 33; below ~20.8 dBm no channel model can reach "
+                                 "500 m on highway LOS", lo=-20, hi=40, st=0.5, u="dBm"),
+    "radio_rx_sensitivity_dbm": dict(h="geometric only: receiver decode floor (vendored VeReMi-NextGen "
+                                       "6 Mb/s 802.11p profile: -81 dBm)", lo=-120, hi=0, st=1, u="dBm"),
+    "radio_nlosb_density_per_km": dict(h="geometric only, SYNTHETIC MAPS ONLY: urban-canyon building "
+                                         "blocker density, P(LOS) = exp(-lambda*d). Ignored when the "
+                                         "map carries real building footprints", lo=0, hi=50, st=0.5,
+                                       u="/km"),
     "pathloss_exponent": dict(h="Log-distance path-loss exponent n (urban ~2.7-3.5; logdistance only)",
                               lo=1.5, hi=6.0, st=0.1),
     "shadowing_sigma_db": dict(h="Log-normal shadowing std in dB (0 = near-hard cutoff; logdistance only)",
@@ -1442,6 +1978,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                               or (attack_weights is not None
                                   and any(a in attack_weights for a in IDENTITY_SPOOF_ATTACKS)))
     _emit_station_type = cfg.vru_pct > 0 or _impersonation_enabled
+    # radio_model="geometric" is the only model that produces a received-power figure, so it is the
+    # only one that can carry an `rssi_dbm` evidence column. Gated exactly like station_type above:
+    # the key is ABSENT from every ma_reports row under disc/logdistance -> byte-identical default.
+    _emit_rssi = (cfg.radio_model == "geometric")
     # The DENM (event-message) layer is active when benign DENMs are requested (denm_rate>0) OR the
     # opt-in FakeHazard attack is selected via any selector (it emits phantom DENMs even at denm_rate=0,
     # so it turns the layer on -- exactly as VruImpersonation enables the station_type machinery). When
@@ -2073,7 +2613,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 and received_by.get(reporter_digest, 0) < cfg.reputation_max)
 
     def file_report(t, reporter_digest, subject_digest, subject_veh, reasons, det, conf,
-                    cx, cy, px, py, malicious, sig_valid=True, station_type="vehicle"):
+                    cx, cy, px, py, malicious, sig_valid=True, station_type="vehicle",
+                    rssi_dbm=None):
         counters["report"] += 1
         rid = f"rpt_{counters['report']:05d}"
         delay = rng.uniform(0.0, cfg.net_delay_max)
@@ -2095,6 +2636,17 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         row["sig_valid"] = bool(sig_valid)
         if _emit_station_type:                           # MA-VISIBLE self-declared station type on the
             row["station_type"] = station_type          # subject's beacon; key absent by default (byte-identical)
+        if _emit_rssi:
+            # MA-VISIBLE received-signal strength of the subject's frame, in dBm. Legitimately
+            # measurable by the receiver PHY, so it is NOT ground truth and NOT in
+            # FORBIDDEN_FEATURE_KEYS -- but it is computed from the subject's TRUE position on the
+            # channel side (GeometricChannel.evaluate), never from the position the subject CLAIMS.
+            # That is the whole point: a Sybil ghost, or any position-falsifying attacker, carries
+            # the RSSI of its attacker's real location, so RSSI-vs-claimed-distance is a detector.
+            # None can only happen on a path with no received frame; the colluder path below
+            # synthesises one from its own true link geometry rather than leaving a NULL that would
+            # be a perfect oracle for "this accusation was fabricated".
+            row["rssi_dbm"] = None if rssi_dbm is None else round(float(rssi_dbm), 2)
         for k in (*DET_KEYS, *SOFT_KEYS):
             row[f"detnorm_{k}"] = round(det.get(k, 0.0), 3)
         ma_reports.append(row)
@@ -2205,6 +2757,14 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             del last_claimed[k]
         for d in [d for d in subj_events if pseudonym_info[d]["veh_vid"] not in active]:
             subj_events.pop(d, None)
+        if geo_chan is not None:
+            # per-link channel state (AR(1) shadowing + per-packet streams) is O(links seen); drop
+            # links whose endpoints have both despawned. A despawned vehicle never transmits again,
+            # so the dropped state can never be consulted -> determinism-safe.
+            for k in [k for k in geo_chan._shadow if k[0] not in active and k[1] not in active]:
+                geo_chan._shadow.pop(k, None)
+            for k in [k for k in geo_chan._packet if k[0] not in active and k[1] not in active]:
+                geo_chan._packet.pop(k, None)
 
     live_path = os.path.join(cfg.out_dir, "live_state.json")
     live_every = max(1, int(round(cfg.live_interval_s / cfg.dt))) if cfg.live_interval_s > 0 else 0
@@ -2503,6 +3063,23 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             if lat_rate:                   # a lane change in progress -> lateral velocity swings heading
                 v.cur_h = (v.cur_h + math.degrees(math.atan2(lat_rate, max(0.5, v.cur_v)))) % 360.0
 
+    # ---- opt-in geometric channel (3GPP TR 37.885). Built ONCE; None on every other radio_model, so
+    # the disc/logdistance paths never touch it and never draw from its streams. Building footprints
+    # come from the custom-network document's optional "buildings" layer (written by
+    # `osm.py --buildings`, projected with the ROAD graph's own projection tuple so the two layers are
+    # registered); a synthetic map has none and falls back to radio_nlosb_density_per_km. ------------
+    geo_chan = None
+    if cfg.radio_model == "geometric":
+        _geo_buildings = _parse_buildings(cfg.custom_network) if cfg.road_network == "custom" else []
+        geo_chan = GeometricChannel(cfg, buildings=_geo_buildings, dt=cfg.dt)
+        if cfg.verbose:
+            print(f"[geometric radio] env={cfg.radio_env} tx={cfg.radio_tx_power_dbm} dBm "
+                  f"sens={cfg.radio_rx_sensitivity_dbm} dBm cap={geo_chan.cap_m:.0f} m "
+                  f"sense={geo_chan.sense_m:.0f} m buildings="
+                  f"{0 if geo_chan.buildings is None else geo_chan.buildings.n_polygons}"
+                  f"{'' if geo_chan.buildings is not None else f' (canyon {cfg.radio_nlosb_density_per_km}/km)'}",
+                  flush=True)
+
     # ---- Simulation loop: activate -> car-follow -> pre-pass -> detect -> collude -> revoke ----
     spawn_order = sorted(vehicles, key=lambda v: (v.spawn_time, v.vid))
     spawn_ptr = 0
@@ -2611,9 +3188,14 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 tx.onset = t
             if declared_station == "vru":                # remember the MA-observed declaration per cert
                 vru_declared_digests.add(digest)
+            # tspd/thdg are the TRUE kinematics already computed above (tx.true_state(t)); they ride
+            # along on the broadcast purely so the ground-truth emission sampler can record them
+            # without recomputing (ADR 0002). They are ORACLE values: nothing on the reception /
+            # detection path reads them, and they never enter an MA-visible row.
             b_cam = dict(veh=tx, digest=digest, cx=cx, cy=cy, cs=cs, ch=ch, conf=conf,
                          ghost=False, x=x, y=y, falsified=falsified, msg_count=msg_count,
-                         cg=cg, sig_ok=sig_ok, cvf=cvf, cvt=cvt, station_type=declared_station)
+                         cg=cg, sig_ok=sig_ok, cvf=cvf, cvt=cvt, station_type=declared_station,
+                         tspd=tspeed, thdg=theading)
             broadcasts.append(b_cam)
             # ---- DENM (event-message) emission (opt-in; only when the DENM layer is enabled) ----
             # A FakeHazard attacker emits a PHANTOM hazard (emergency brake) while cruising -- its own
@@ -2656,9 +3238,17 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 continue
             if rng.random() < cfg.emit_sample_prob:
                 tx = b["veh"]
+                # ADR 0002: true_speed (m/s) and true_heading (deg) are the simulator's OWN kinematic
+                # state at emission time, written verbatim -- NOT reconstructed by differencing
+                # true_x/true_y, which conflates a lane change with an acceleration. ORACLE-only
+                # (both names are in records.FORBIDDEN_FEATURE_KEYS). heading convention is the
+                # engine's native one, degrees CCW from +x (East), [0, 360) -- see true_state() and
+                # manifest.conventions.heading. No RNG draw and no reordering: the values were
+                # already computed for this broadcast.
                 gt_emissions.append(dict(
                     emit_id=f"emt_{stream_counts['emit'] + len(gt_emissions):08d}", t=round(t, 3),
                     true_vehicle_id=f"veh_{tx.vid:03d}", true_x=round(b["x"], 3), true_y=round(b["y"], 3),
+                    true_speed=round(b["tspd"], 3), true_heading=round(b["thdg"], 3),
                     claimed_x=round(b["cx"], 3), claimed_y=round(b["cy"], 3), claimed_speed=round(b["cs"], 3),
                     pos_conf=round(b["conf"], 3), is_attacker=tx.is_attacker, is_faulty=tx.is_faulty,
                     falsified=bool(b["falsified"]), _visibility=R.ORACLE))
@@ -2691,6 +3281,14 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # a link physically closes, replacing the hard d<=rr disc. radio_model=="disc" takes NONE of
         # this branch and draws NO extra rng -> byte-identical to today. See PipelineConfig.radio_model.
         radio_logdist = (cfg.radio_model == "logdistance")
+        if geo_chan is not None:
+            # per-step blocker index for the NLOSv test: every non-VRU active vehicle is a potential
+            # obstruction (a pedestrian is not), at its TRUE position, with the TR 37.885 height for
+            # its class. RSUs are receivers, not blockers.
+            geo_chan.begin_step(step, [
+                (v.vid, *v.true_state(t)[:2],
+                 TR37885_BLOCKER_HEIGHT_M.get(v.veh_type, TR37885_BLOCKER_HEIGHT_M["car"]))
+                for v in active_list if not v.is_vru and not enforced(v, t)])
         bcell: dict = {}
         for bi, b in enumerate(broadcasts):
             bcell.setdefault((int(b["x"] // rng_cell), int(b["y"] // rng_cell)), []).append(bi)
@@ -2711,6 +3309,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                                     / (10.0 * cfg.pathloss_exponent))
                 cap = max(rr, min(cap, rr * cfg.radio_cap_max_mult))
                 rad = max(1, int(math.ceil(cap / rng_cell)))
+            elif geo_chan is not None:
+                # the geometric cap is a LINK-BUDGET distance (TR 37.885 LOS at the configured EIRP,
+                # with shadow + fading headroom), computed once per run and already bounded by
+                # radio_cap_max_mult * radio_range_m -- see GeometricChannel.cap_m.
+                cap = geo_chan.cap_m
+                rad = max(1, int(math.ceil(cap / rng_cell)))
             else:
                 rad = max(1, int(math.ceil(rr / rng_cell)))
             cx0, cy0 = int(rxx // rng_cell), int(rxy // rng_cell)
@@ -2720,11 +3324,26 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     cand.extend(bcell.get((cx0 + dcx, cy0 + dcy), ()))
             cand.sort()
             in_range = []
+            geo_meta: list = []      # geometric only: (rssi_dbm, link_state, per-link Random) per link
+            rx_ant_h = RSU_ANTENNA_HEIGHT_M if rx.is_rsu else V2X_ANTENNA_HEIGHT_M
             for bi in cand:
                 b = broadcasts[bi]
                 if b["veh"].vid == rx.vid:
                     continue
                 d = math.hypot(b["x"] - rxx, b["y"] - rxy)
+                if geo_chan is not None:
+                    # --- 3GPP TR 37.885 geometric model: LOS/NLOSv/NLOSb -> path loss -> AR(1)
+                    # shadowing -> per-packet Nakagami fade -> hard decode floor. Every draw comes
+                    # from a per-link keyed stream inside GeometricChannel, never from `rng`.
+                    if d > cap:
+                        continue                                # cheap cap before the dB math
+                    heard, rssi, lstate, prng = geo_chan.evaluate(
+                        b["veh"].vid, rx.vid, b["x"], b["y"], rxx, rxy, d,
+                        V2X_ANTENNA_HEIGHT_M, rx_ant_h)
+                    if heard:
+                        in_range.append((b, d))
+                        geo_meta.append((rssi, lstate, prng))
+                    continue
                 if not radio_logdist:
                     if d <= rr:                                 # hard range disc (default; unchanged)
                         in_range.append((b, d))
@@ -2745,11 +3364,34 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     in_range.append((b, d))
             load = sum(b["msg_count"] for b, _ in in_range)
             cong = min(0.8, max(0.0, (load - cfg.chan_capacity) / max(1, cfg.chan_capacity)) * 0.5)
+            geo_cbr = geo_chan.cbr(load) if geo_chan is not None else 0.0
             reporter_digest = rx.active_pseudonym(t, cfg.rotate_period_s)["digest"]
-            for b, dist in in_range:
-                loss = cfg.packet_loss_base + cfg.nlos_loss * (dist / rr) + cong + wx_loss
-                if loss > 0 and rng.random() < loss:
-                    continue                                    # packet dropped on the channel
+            for li, (b, dist) in enumerate(in_range):
+                rssi_dbm = None
+                if geo_chan is not None:
+                    # INDEPENDENT-SURVIVAL COMPOSITION: p_deliver = prod(1 - p_i). The additive form
+                    # kept on the disc/logdistance path below can exceed 1.0 (roadmap G5); a product
+                    # of survival probabilities cannot, and it is the correct composition for
+                    # independent impairments. The PHY error is already resolved above (the frame
+                    # either cleared the faded decode floor or it never entered in_range), so what
+                    # composes here is the MAC/environment loss: hidden-terminal collisions from the
+                    # modelled CBR, weather absorption, and the configured baseline. cfg.nlos_loss is
+                    # deliberately included so an explicit setting still bites, but it defaults to 0
+                    # and setting it under this model DOUBLE-COUNTS the obstruction the geometry
+                    # already resolved.
+                    rssi_dbm, _lstate, _prng = geo_meta[li]
+                    p_surv = ((1.0 - min(1.0, max(0.0, cfg.packet_loss_base)))
+                              * (1.0 - min(1.0, max(0.0, cfg.nlos_loss * (dist / rr))))
+                              * (1.0 - geo_chan.collision_loss(dist, geo_cbr))
+                              * (1.0 - min(1.0, max(0.0, wx_loss))))
+                    # the delivery coin comes from the LINK's own keyed stream, so the geometric
+                    # model consumes nothing from the global `rng`
+                    if p_surv < 1.0 and _prng.random() >= p_surv:
+                        continue                                # packet dropped on the channel
+                else:
+                    loss = cfg.packet_loss_base + cfg.nlos_loss * (dist / rr) + cong + wx_loss
+                    if loss > 0 and rng.random() < loss:
+                        continue                                # packet dropped on the channel
                 if b.get("msg_type") == "denm":
                     # DENM (event message): the receiver checks whether the announced brake/stationary
                     # hazard CORROBORATES the sender's own observed kinematics. The DENM carries the
@@ -2778,7 +3420,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                             file_report(t, reporter_digest, b["digest"], b["veh"],
                                         ["denmPlausibility"], det, b["conf"],
                                         b["cx"], b["cy"], b["cx"], b["cy"], malicious=False,
-                                        sig_valid=True, station_type=b["station_type"])
+                                        sig_valid=True, station_type=b["station_type"],
+                                        rssi_dbm=rssi_dbm)
                     continue
                 tx, digest, cx, cy, cs, ch, conf = (b["veh"], b["digest"], b["cx"], b["cy"],
                                                     b["cs"], b["ch"], b["conf"])
@@ -2819,9 +3462,13 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 # sender far BEYOND THIS RECEIVER'S range is implausible (excess distance / tolerance).
                 # Use rr (the actual per-receiver range used for reception above), not the global
                 # radio_range_m: an RSU with a longer rsu_range_m legitimately hears distant honest
-                # vehicles and must not flag them as out-of-range.
+                # vehicles and must not flag them as out-of-range. Under radio_model="geometric" the
+                # reach is NOT rr at all -- it is the link-budget cap the reception loop actually
+                # searched -- so the bound follows it there. Keeping rr would flag every honest
+                # long LOS link (which that model legitimately delivers) as an impossible claim.
+                art_reach = cap if geo_chan is not None else rr
                 det["acceptanceRangeThreshold"] = max(0.0, math.hypot(cx - rxx, cy - rxy)
-                                                      - rr) / cfg.art_max_m
+                                                      - art_reach) / cfg.art_max_m
                 det["beaconFrequency"] = b["msg_count"] / cfg.freq_max
                 det["staleOrReplay"] = max(det.get("staleOrReplay", 0.0), (t - b["cg"]) / cfg.stale_max_s)
                 det["mapOffRoad"] = _offroad(cx, cy) / cfg.offroad_tol_m
@@ -2890,7 +3537,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 reasons = sorted(fired, key=lambda k: -det[k])
                 file_report(t, reporter_digest, digest, tx, reasons, det, conf,
                             cx, cy, ref[0], ref[1], malicious=False, sig_valid=b["sig_ok"],
-                            station_type=b["station_type"])
+                            station_type=b["station_type"], rssi_dbm=rssi_dbm)
 
         # COLLUSION pass: colluders file fabricated reports against benign victims. In flow mode
         # victims are chosen dynamically (nearby active benign vehicles); in fixed mode from the list.
@@ -2935,8 +3582,38 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 det["beaconFrequency"] = cfab.randint(1, 3) / cfg.freq_max
                 det["staleOrReplay"] = cfab.uniform(0.0, 0.15)
                 fab_conf = cfab.uniform(2.0, 9.0)
+                # rssi_dbm on a FABRICATED accusation. This path never received a frame, so a NULL
+                # (or a missing key) here would be a perfect oracle: "no RSSI => the report is a
+                # collusion". The colluder is a real radio standing a real distance from its victim
+                # -- it genuinely hears the victim's CAMs, it just lies about their content -- so the
+                # honest synthesis is the value the channel model would produce for that TRUE link.
+                # Same model, same true geometry, only the *draw* comes from the colluder's own
+                # fabrication stream (keeping the reception loop's per-link streams untouched).
+                fab_rssi = None
+                if geo_chan is not None:
+                    vxx, vyy = rx_pos.get(victim.vid, victim.true_state(t)[:2])
+                    txx2, txy2 = rx_pos.get(tx.vid, tx.true_state(t)[:2])
+                    fab_d = max(1.0, math.hypot(vxx - txx2, vyy - txy2))
+                    fab_state = ("urban_nlos" if cfab.random() < (1.0 - math.exp(
+                        -geo_chan.canyon_per_m * fab_d)) else geo_chan.los_state)
+                    fab_mean = geo_chan.tx_dbm - tr37885_pathloss_db(fab_state, fab_d)
+                    fab_sig = TR37885_SHADOW_SIGMA_DB["NLOSb" if fab_state == "urban_nlos" else "LOS"]
+                    fab_m = nakagami_m_for_distance(fab_d)
+                    # A report is only ever filed on a frame that was DECODED, so the honest column
+                    # is the channel law CONDITIONED on clearing the decode floor. Reproduce that by
+                    # rejection sampling, not by clamping: clamping would pile a point mass at
+                    # exactly the floor and hand an ML model "rssi == -81.00 => fabricated".
+                    for _try in range(16):
+                        fab_rssi = (fab_mean + cfab.gauss(0.0, fab_sig)
+                                    + 10.0 * math.log10(max(cfab.gammavariate(fab_m, 1.0 / fab_m),
+                                                            1e-12)))
+                        if fab_rssi >= geo_chan.decode_floor_dbm:
+                            break
+                    else:   # pathological geometry (very long link): stay in the decodable window
+                        fab_rssi = geo_chan.decode_floor_dbm + abs(cfab.gauss(0.0, fab_sig))
                 file_report(t, reporter_digest, subject_digest, victim,
-                            ["positionSpeedInconsistency"], det, fab_conf, 0.0, 0.0, 0.0, 0.0, malicious=True)
+                            ["positionSpeedInconsistency"], det, fab_conf, 0.0, 0.0, 0.0, 0.0,
+                            malicious=True, rssi_dbm=fab_rssi)
 
         # Online MA decision: revoke subjects with SUSTAINED, TRUSTED evidence in a RECENT window.
         # (Lifetime-accumulated evidence would let bursty benign faults spread over a long trip add
@@ -3115,7 +3792,14 @@ def _write_manifest(cfg, data_files, data_digest, counts) -> None:
         "generator": "scms_sim_ref.mock_pipeline (pre-MOSAIC reference, realistic v2)",
         "seed": cfg.seed,
         "config": {k: (list(v) if isinstance(v, tuple) else v) for k, v in cfg.__dict__.items()},
-        "schema_versions": {"ma_visible": 1, "ground_truth": 1},
+        # ground_truth 2 == ADR 0002: gt_emissions_sample carries true_speed / true_heading.
+        # ma_visible is unchanged (no MA-visible field moved), so it stays at 1.
+        "schema_versions": {"ma_visible": 1, "ground_truth": 2},
+        # Units/frames a consumer cannot infer from the numbers. The Python engine's heading is the
+        # math convention (atan2(vy, vx)): degrees counter-clockwise from +x/East, [0, 360). The
+        # MOSAIC/Java engine writes SUMO/ETSI headings (degrees clockwise from North), so a consumer
+        # merging the two MUST read this field rather than assume. Manifest-only -> digest-safe.
+        "conventions": {"heading": "deg_ccw_from_east", "speed": "m_s", "position": "m_local_xy"},
         "standards_profile": {"report": "ETSI TS 103 759 (shape)", "cert": "IEEE 1609.2",
                               "linkage": "CAMP SCP2"},
         "data_digest_sha256": data_digest,
@@ -3173,8 +3857,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--packet-loss", type=float, default=0.0, help="baseline per-message loss")
     p.add_argument("--nlos", type=float, default=0.0, help="distance-growing obstruction loss (0..1)")
     p.add_argument("--chan-capacity", type=int, default=40, help="in-range CAMs/step before congestion")
-    p.add_argument("--radio-model", choices=["disc", "logdistance"], default="disc",
-                   help="reachability: disc (hard range) | logdistance (soft path-loss + shadowing)")
+    p.add_argument("--radio-model", choices=["disc", "logdistance", "geometric"], default="disc",
+                   help="reachability: disc (hard range) | logdistance (soft path-loss + shadowing) "
+                        "| geometric (3GPP TR 37.885 LOS/NLOSv/NLOSb + AR(1) shadowing + Nakagami)")
+    p.add_argument("--radio-env", choices=["urban", "highway"], default="urban",
+                   help="geometric only: TR 37.885 LOS formula family (NLOS always uses urban)")
+    p.add_argument("--radio-tx-power-dbm", type=float, default=23.0,
+                   help="geometric only: transmit EIRP in dBm (deployed OBUs 20-23; ETSI cap 33)")
+    p.add_argument("--radio-rx-sensitivity-dbm", type=float, default=-81.0,
+                   help="geometric only: receiver decode floor in dBm (vendored 802.11p: -81)")
+    p.add_argument("--radio-nlosb-density-per-km", type=float, default=4.0,
+                   help="geometric only, synthetic maps: urban-canyon blocker density per km "
+                        "(ignored when the map carries real building footprints)")
     p.add_argument("--pathloss-exponent", type=float, default=2.7,
                    help="log-distance path-loss exponent n (logdistance only)")
     p.add_argument("--shadowing-sigma-db", type=float, default=4.0,
@@ -3385,6 +4079,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                          gps_quality_lambda=args.gps_quality_lambda,
                          radio_cap_sigma=args.radio_cap_sigma,
                          radio_cap_max_mult=args.radio_cap_max_mult,
+                         radio_env=args.radio_env,
+                         radio_tx_power_dbm=args.radio_tx_power_dbm,
+                         radio_rx_sensitivity_dbm=args.radio_rx_sensitivity_dbm,
+                         radio_nlosb_density_per_km=args.radio_nlosb_density_per_km,
                          verbose=True,
                          out_dir=(args.out or "datasets/poc_run"))
     res = run_pipeline(cfg)

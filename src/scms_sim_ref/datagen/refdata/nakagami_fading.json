@@ -1,0 +1,68 @@
+{
+  "reference_set": "nakagami_fading",
+  "title": "Small-scale fading: Nakagami-m shape factor vs link distance at 5.9 GHz",
+  "scope": "Per-packet small-scale fading for the Phase-2 geometric radio model (step 4 of docs/realism/PHASE2-DESIGN.md). Two competing parameterisations are pinned side by side -- the one this project adopts and the ns-3 default it is NOT -- because they differ by up to a factor of 4 in m and a step-function simulator can silently inherit either.",
+  "curated_from": "docs/realism/ROADMAP.md section 3.2 item 4, docs/realism/PHASE2-DESIGN.md step 4, and docs/realism/investigation/research-net-sota.json (findings section 1 for the ns-3 NakagamiPropagationLossModel defaults, section 2(e) for the Cheng/Henty/Stancil 5.9 GHz measurements, recommendation 3 for the adopted banding).",
+  "model": "Received power is scaled by a Nakagami-m fading gain: power ~ Gamma(shape = m, scale = Omega/m), Omega = mean power from path loss + shadowing. m = 1 is Rayleigh; m -> infinity is non-fading.",
+  "entries": {
+    "m_by_distance_adopted": {
+      "points": [[50.0, 3.0], [150.0, 1.5], [null, 1.0]],
+      "unit": "[distance upper bound m, Nakagami m]",
+      "confidence": "coarse",
+      "cite": "ADOPTED banding (ROADMAP 3.2 item 4 / PHASE2-DESIGN step 4), shaped by Cheng et al. 5.9 GHz fits",
+      "source": "m = 3 over 0-50 m, m = 1.5 over 50-150 m, m = 1.0 beyond 150 m. Adopted in docs/realism/ROADMAP.md section 3.2 item 4 and docs/realism/PHASE2-DESIGN.md step 4, and recommended in docs/realism/investigation/research-net-sota.json recommendation 3 ('~3 below 50 m, ~1.5 mid, 1.0 beyond ~150 m per Cheng et al./ns-3 practice'). The physical shape it encodes -- m high (~3) near the transmitter, decaying toward Rayleigh at range -- is the measured behaviour reported by Cheng, Henty, Stancil et al. for 5.9 GHz DSRC in suburban Pittsburgh (per-distance-bin Nakagami fits; https://www.researchgate.net/publication/3236681), summarised in research-net-sota.json section 2(e).",
+      "derivation": "The SHAPE (monotone decay 3 -> 1.5 -> 1) is measurement-backed; the exact band edges 50 m and 150 m are a project rounding of Cheng et al.'s per-bin fits and are not transcribed from any published table. Hence coarse, not anchored.",
+      "note": "PINNED FOR PHASE 2. This is the authoritative copy; pathloss_37885.nakagami_m_by_distance is a byte-identical mirror kept for its existing ref_id. A null upper bound means 'beyond the previous bound'."
+    },
+    "m_by_distance_ns3_default": {
+      "points": [[80.0, 1.5], [200.0, 0.75], [null, 0.75]],
+      "unit": "[distance upper bound m, Nakagami m]",
+      "confidence": "anchored",
+      "cite": "ns-3 NakagamiPropagationLossModel default attributes (m0/m1/m2, Distance1/Distance2)",
+      "source": "The ns-3 NakagamiPropagationLossModel splits distance into three bands at Distance1 = 80 m and Distance2 = 200 m with default shape factors m0 = 1.5, m1 = 0.75, m2 = 0.75 (https://www.nsnam.org/docs/models/html/propagation.html), transcribed in docs/realism/investigation/research-net-sota.json findings section 1 ('three distance bands m0/m1/m2 at Distance1=80 m, Distance2=200 m; classic defaults m=1.5/0.75/0.75').",
+      "note": "NOT ADOPTED -- recorded because it is what a reader who cross-checks against an ns-3/Veins study will see. These are the simulator's generic model defaults, not a 5.9 GHz vehicular fit: they are more pessimistic than the adopted banding everywhere (m = 0.75 is WORSE than Rayleigh, a deep-fade regime measured only occasionally at long range), and their band edges are 80/200 m rather than 50/150 m."
+    },
+    "parameterisation_adopted": {
+      "value": "m_by_distance_adopted",
+      "unit": "ref_id",
+      "confidence": "coarse",
+      "cite": "project decision, recorded so the two parameterisations are never silently swapped",
+      "source": "Phase 2 adopts m_by_distance_adopted (3 / 1.5 / 1.0 at 50 / 150 m) and NOT m_by_distance_ns3_default (1.5 / 0.75 / 0.75 at 80 / 200 m). Reasons, in order: (1) the adopted bands come from 5.9 GHz DSRC measurements at the band this project models, whereas the ns-3 values are that simulator's generic defaults; (2) m < 1 is a sub-Rayleigh deep-fade regime reported only occasionally at long range by Cheng et al., so applying 0.75 to EVERY link beyond 80 m converts an occasional worst case into the baseline; (3) the ROADMAP and PHASE2-DESIGN both bind the 3/1.5/1.0 banding, and refdata must not quietly contradict the binding design; (4) the two disagree most exactly where the comm panel measures -- at 100 m the adopted m is 1.5 vs ns-3's 0.75, a factor of 2 in fading severity.",
+      "derivation": "A decision, not a measurement. Written as an entry rather than prose so it is loaded alongside the numbers it arbitrates.",
+      "note": "If a future cross-validation against a Veins/ns-3 study needs bit-comparable fading, switch to m_by_distance_ns3_default EXPLICITLY via config and record it in the manifest -- do not edit m_by_distance_adopted."
+    },
+    "dual_slope_breakpoint_m": {
+      "value": 100.0,
+      "unit": "m",
+      "confidence": "coarse",
+      "cite": "Cheng, Henty, Stancil et al., 5.9 GHz DSRC suburban measurements",
+      "source": "The 5.9 GHz DSRC measurement campaign of Cheng, Henty, Stancil et al. (suburban Pittsburgh; https://www.researchgate.net/publication/3236681) fits a DUAL-SLOPE log-distance path loss with a breakpoint at approximately 100 m -- the same campaign whose per-bin Nakagami fits motivate m_by_distance_adopted. Recorded in docs/realism/investigation/research-net-sota.json section 2(e).",
+      "derivation": "The literature reports '~100 m'; no more precise breakpoint distance is transcribed anywhere in the sources this project holds, so the value carries one significant figure.",
+      "note": "CONTEXT, NOT AN ADOPTED MODEL INPUT. Phase 2 uses the single-slope TR 37.885 formulas, so no breakpoint is implemented. The breakpoint is pinned because it explains the SHAPE of the adopted fading bands -- the fading transition (50-150 m) straddles the measured path-loss breakpoint (~100 m); both mark the distance at which the ground-reflected ray stops adding constructively. A future dual-slope path-loss variant would put its breakpoint here."
+    },
+    "m_far_range_observed_max": {
+      "max": 1.0,
+      "unit": "Nakagami m",
+      "confidence": "anchored",
+      "cite": "Cheng/Henty/Stancil per-bin Nakagami fits (occasionally sub-Rayleigh)",
+      "source": "In the Cheng/Henty/Stancil 5.9 GHz fits the shape factor decays toward 1 with distance and is 'occasionally sub-Rayleigh (m < 1) at long range' (docs/realism/investigation/research-net-sota.json section 2(e)). ns-3's third-band default of 0.75 is one such sub-Rayleigh choice.",
+      "note": "The adopted banding floors m at 1.0 (Rayleigh) rather than following the occasional sub-Rayleigh fits, so the modelled far-field tail is slightly OPTIMISTIC versus the worst measured bins. Stated so the optimism is auditable; it is the conservative direction for a security simulator (fewer channel-induced message losses to mistake for an attack)."
+    },
+    "unit_mean_power_convention": {
+      "value": {"distribution": "gamma", "shape": "m", "scale": "Omega/m", "mean_gain": 1.0},
+      "unit": "linear power gain",
+      "confidence": "anchored",
+      "cite": "definition of the Nakagami-m distribution (power is Gamma-distributed)",
+      "source": "For a Nakagami-m envelope the received POWER is Gamma-distributed with shape m and mean Omega, i.e. power = Gamma(m, Omega/m). Implementations must normalise the fading gain to unit mean (Omega = the mean power produced by path loss + shadowing) so that fading redistributes power without adding or removing any; this is the convention used by the ns-3 NakagamiPropagationLossModel (https://www.nsnam.org/docs/models/html/propagation.html), which multiplies the incoming power by a unit-mean Gamma variate.",
+      "note": "IMPLEMENTER TRAP: numpy's numpy.random.Generator.gamma(shape=m, scale=1.0) has mean m, not 1. Using it unscaled inflates mean received power by a factor of m -- +4.8 dB in the near band (m = 3) and 0 dB beyond 150 m (m = 1), i.e. a distance-dependent bias that looks exactly like a path-loss-exponent error. Divide by m (or pass scale = 1/m)."
+    },
+    "sinr_to_per_mapping": {
+      "available": false,
+      "unit": "n/a",
+      "confidence": "unavailable",
+      "cite": "no SINR->PER table for 802.11p 6 Mb/s QPSK-1/2 10 MHz is transcribed in this repository",
+      "source": "PHASE2-DESIGN.md step 4 requires the faded SINR to feed 'an SINR->PER mapping for the 6 Mb/s QPSK-1/2 10 MHz 802.11p profile', but no such curve exists in docs/realism/investigation/research-net-sota.json, in the ROADMAP, or in the vendored VeReMi-NextGen configuration -- the vendored INET stack instead uses a single hard SNIR threshold of 4 dB (third_party/veremi-nextgen/Generator/docker/scenarios/InTAS_urban_2_4_test/omnetpp/omnetpp.ini:79). Deriving a coded-BER curve here would be invention, so the curve is recorded as UNAVAILABLE rather than guessed.",
+      "note": "PLACEHOLDER, deliberately empty. Two honest options for Phase 2: (a) use the vendored 4 dB SNIR threshold as a hard step (phy_80211p.snir_threshold_db) and document the resulting missing waterfall region, or (b) obtain the open FLOURISH Bristol PDR-vs-RSSI measurements (v2x_awareness.pdr_vs_rssi_curve, also unavailable here) and fit the mapping to them. Do not fabricate a waterfall curve to fill this slot."
+    }
+  }
+}

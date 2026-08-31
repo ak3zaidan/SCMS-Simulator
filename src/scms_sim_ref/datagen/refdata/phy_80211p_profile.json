@@ -1,0 +1,132 @@
+{
+  "reference_set": "phy_80211p",
+  "title": "IEEE 802.11p / ITS-G5 PHY-MAC profile: the calibration constants both engines share",
+  "scope": "The radio profile the Phase-2 channel model is parameterised against: transmit power, sensitivity, SNIR threshold, bitrate and channel width, plus the frame airtime and link-budget quantities the CBR and PDR models need. The first group is transcribed from the vendored VeReMi-NextGen INET configuration (the calibration constants ROADMAP section 3.2 says to treat as authoritative for the Java side); the derived group is arithmetic on top of it, each with its derivation written out.",
+  "curated_from": "third_party/veremi-nextgen/Generator/docker/scenarios/InTAS_urban_2_4_test/omnetpp/omnetpp.ini (17 byte-identical copies of this PHY block ship in the submodule), docs/realism/ROADMAP.md section 3.2 (Java-side note: 'treat the vendored NextGen omnetpp.ini physics (20 mW, -81 dBm, SNIR 4 dB) as calibration constants') and section 3.2 item 6 (frame airtime for the CBR model), docs/realism/PHASE2-DESIGN.md steps 4 and 6.",
+  "entries": {
+    "tx_power_dbm": {
+      "value": 13.0103,
+      "unit": "dBm",
+      "confidence": "anchored",
+      "cite": "vendored VeReMi-NextGen INET radio configuration (0.02 W)",
+      "source": "third_party/veremi-nextgen/Generator/docker/scenarios/InTAS_urban_2_4_test/omnetpp/omnetpp.ini:81 sets '**.wlan*.radio.transmitter.power = 0.02W'; 10*log10(0.02 W / 1 mW) = 13.0103 dBm. The same value appears in all 17 vendored omnetpp.ini copies. ROADMAP section 3.2 designates these vendored physics ('20 mW, -81 dBm, SNIR 4 dB') as the calibration constants for the Java side.",
+      "note": "LOW versus deployed DSRC/ITS-G5 radios, which typically run 20-23 dBm and are permitted up to 33 dBm EIRP. This single number is why several published range anchors are unreachable under the vendored configuration -- see link_budget_median_range_m."
+    },
+    "rx_sensitivity_dbm": {
+      "value": -81.0,
+      "unit": "dBm",
+      "confidence": "anchored",
+      "cite": "vendored VeReMi-NextGen INET radio configuration",
+      "source": "third_party/veremi-nextgen/Generator/docker/scenarios/InTAS_urban_2_4_test/omnetpp/omnetpp.ini:80 sets '**.wlan*.radio.receiver.sensitivity = -81dBm' for the 6 Mb/s 10 MHz 802.11p profile configured in the same block (lines 65-81). Identical in all 17 vendored copies.",
+      "note": "This is the DECODE floor. The ETSI DCC channel-busy threshold is -85 dBm (etsi_cam_dcc.cbr_measurement_definition), 4 dB lower: energy between -85 and -81 dBm raises CBR without ever delivering a frame."
+    },
+    "snir_threshold_db": {
+      "value": 4.0,
+      "unit": "dB",
+      "confidence": "anchored",
+      "cite": "vendored VeReMi-NextGen INET radio configuration",
+      "source": "third_party/veremi-nextgen/Generator/docker/scenarios/InTAS_urban_2_4_test/omnetpp/omnetpp.ini:79 sets '**.wlan*.radio.receiver.snirThreshold = 4dB' -- a hard step: a frame whose SNIR exceeds 4 dB is received, otherwise it is lost. Identical in all 17 vendored copies.",
+      "note": "STAND-IN FOR A MISSING CURVE: this hard step is what the vendored stack uses instead of a coded SINR->PER waterfall (nakagami_fading.sinr_to_per_mapping, recorded as unavailable). A step at 4 dB has no partial-reception region at all, so a Phase-2 model that adopts it inherits an artificially sharp PDR transition -- exactly the defect the >= 100 m gray-zone gate (v2x_awareness.pdr_gray_zone_width_min_m) exists to catch. Small-scale fading applied BEFORE the threshold is what restores the gray zone."
+    },
+    "thermal_noise_dbm": {
+      "value": -110.0,
+      "unit": "dBm",
+      "confidence": "anchored",
+      "cite": "vendored VeReMi-NextGen INET radio-medium configuration",
+      "source": "third_party/veremi-nextgen/Generator/docker/scenarios/InTAS_urban_2_4_test/omnetpp/omnetpp.ini:86 sets 'Simulation.radioMedium.backgroundNoise.power = -110dBm' and line 93 sets the Veins-side '*.**.nic.phy80211p.thermalNoise = -110dBm'.",
+      "note": "Consistency check: with -110 dBm noise and the 4 dB SNIR threshold, a frame is decodable at -106 dBm on SNIR grounds alone -- 25 dB below the -81 dBm sensitivity floor, so in this configuration SENSITIVITY, not noise, is what bounds range. Interference (other transmitters), not thermal noise, is what makes the SNIR test bite."
+    },
+    "channel_profile": {
+      "value": {
+        "op_mode": "p",
+        "bitrate_mbps": 6.0,
+        "modulation": "QPSK 1/2",
+        "carrier_frequency_ghz": 5.9,
+        "bandwidth_mhz": 10.0,
+        "channel_number": 4,
+        "cw_min": 15,
+        "cw_max": 1023
+      },
+      "unit": "mixed",
+      "confidence": "anchored",
+      "cite": "vendored VeReMi-NextGen INET 802.11p MAC/PHY block",
+      "source": "third_party/veremi-nextgen/Generator/docker/scenarios/InTAS_urban_2_4_test/omnetpp/omnetpp.ini lines 64-78: opMode = 'p' (line 65), rateSelection bitrate 6 Mbps (line 68), cwMin 15 / cwMax 1023 (lines 70-71), carrierFrequency 5.9 GHz (line 76), bandwidth 10 MHz (line 78), channel number 4. 6 Mb/s in a 10 MHz 802.11p channel is the QPSK rate-1/2 mode and is the profile PHASE2-DESIGN.md step 4 names for the SINR->PER mapping.",
+      "note": "cwMin = 15 is INET's generic default, not the 802.11p EDCA per-access-category value (AC_VI uses cwMin = 7, AC_BE cwMin = 15). It matters only for the backoff term in mac_overhead_us; the PPDU airtime in frame_airtime_us is unaffected."
+    },
+    "frame_airtime_us": {
+      "points": [
+        [100.0, 822.0, 18.0, 184.0],
+        [200.0, 1622.0, 34.0, 312.0],
+        [300.0, 2422.0, 51.0, 448.0],
+        [500.0, 4022.0, 84.0, 712.0],
+        [800.0, 6422.0, 134.0, 1112.0]
+      ],
+      "unit": "[MPDU bytes, PSDU bits incl. SERVICE+tail, OFDM data symbols, PPDU airtime us]",
+      "confidence": "coarse",
+      "cite": "derived: IEEE 802.11 OFDM PPDU timing at 10 MHz, 6 Mb/s",
+      "source": "Computed on 2026-08-30 from the 10 MHz 802.11p OFDM timing (preamble 32 us, SIGNAL symbol 8 us, data symbol 8 us, N_DBPS = 6 Mb/s * 8 us = 48 bits per symbol) applied to the vendored 6 Mb/s profile in channel_profile: bits = 16 (SERVICE) + 8*MPDU + 6 (tail); symbols = ceil(bits / 48); PPDU = 32 + 8 + 8*symbols microseconds.",
+      "derivation": "Exact arithmetic; 'coarse' because the MPDU SIZES are assumptions, not measurements -- a signed CAM with an attached certificate lands in the 300-500 B band, which is the row to use for channel-load work. Excludes AIFS, backoff and any inter-frame space (see mac_overhead_us).",
+      "note": "DISAGREES WITH THE ROADMAP'S ROUND FIGURE: ROADMAP section 3.2 item 6 writes '300 B @ 6 Mb/s ~ 0.4 ms'. The true PPDU is 448 us -- 12% higher -- because the 40 us preamble+SIGNAL and the symbol-boundary rounding (50.46 symbols -> 51) are not in the 0.4 ms shortcut. Use 448 us; a 12% error in airtime is a 12% error in modelled CBR."
+    },
+    "mac_overhead_us": {
+      "value": {"slot_us": 13.0, "sifs_us": 32.0, "difs_us": 58.0, "aifs_ac_be_us": 110.0, "mean_backoff_us": 97.5, "total_added_us": 207.5},
+      "unit": "us",
+      "confidence": "coarse",
+      "cite": "derived: 802.11p 10 MHz EDCA timing with the vendored cwMin",
+      "source": "IEEE 802.11 OFDM 10 MHz timing: slot = 13 us, SIFS = 32 us, hence DIFS = SIFS + 2*slot = 58 us and AIFS(AC) = SIFS + AIFSN*slot, which for AC_BE (AIFSN = 6) gives 110 us. Mean initial backoff = (cwMin/2)*slot = (15/2)*13 = 97.5 us with the vendored cwMin = 15 (channel_profile, omnetpp.ini:70). Computed on 2026-08-30.",
+      "derivation": "total_added_us = aifs_ac_be_us + mean_backoff_us = 110 + 97.5 = 207.5 us of channel time per broadcast attempt, on top of the PPDU. Coarse: it assumes AC_BE, the vendored cwMin, no collisions and no retransmission (802.11p broadcast has no ACK and no retry), and it uses the MEAN backoff rather than the distribution.",
+      "note": "Whether this term is counted is the difference between meeting and missing the ROADMAP CBR gate -- see cbr_from_load."
+    },
+    "cbr_from_load": {
+      "points": [
+        [300.0, 10.0, 80.0, 0.3584, 0.5244],
+        [500.0, 10.0, 80.0, 0.5696, 0.7356],
+        [300.0, 1.0, 80.0, 0.0358, 0.0524],
+        [300.0, 10.0, 133.93, 0.6000, null],
+        [500.0, 10.0, 84.27, 0.6000, null]
+      ],
+      "unit": "[MPDU bytes, CAM rate Hz, vehicles in sensing range, CBR counting PPDU only, CBR counting PPDU + MAC overhead]",
+      "confidence": "coarse",
+      "cite": "derived: airtime x offered load, the zeroth-order CBR estimator",
+      "source": "Computed on 2026-08-30 as CBR = n_vehicles * rate_Hz * airtime_s, using frame_airtime_us for the PPDU column and frame_airtime_us + mac_overhead_us.total_added_us for the second column. The last two rows invert the relation to give the vehicle count at which CBR reaches the reactive-DCC restrictive threshold of 0.60 (etsi_cam_dcc.cbr_control_target).",
+      "derivation": "Zeroth-order only: it assumes every transmission in sensing range is heard, that airtime adds linearly, and that no two transmissions overlap. It therefore OVERESTIMATES CBR at high load (overlapping transmissions are counted twice) and ignores the below-threshold energy that ETSI's -85 dBm probe does count. The Sepulcre et al. TVT 2022 analytical model (docs/realism/investigation/research-net-sota.json findings section 3) is the accurate replacement that PHASE2-DESIGN step 6 binds; this entry is the sanity check that model must reproduce at low load.",
+      "note": "RECONCILES A ROADMAP GATE WITH ITS OWN CONSTANTS. The Phase-2 gate reads 'at >= 80 veh in radio range with DCC off, modeled CBR >= 0.55'. With 300 B frames counted as bare PPDUs that yields only 0.358 -- the gate FAILS on arithmetic, not on physics. It is met at 80 vehicles only if MAC overhead is counted (0.524, still marginal) or if the frame is a realistically-sized signed CAM of ~500 B (0.570 PPDU-only, 0.736 with overhead). Phase 2 must therefore state its assumed CAM size and whether AIFS+backoff are inside its CBR definition, or the gate is untestable."
+    },
+    "rssi_observable_window_dbm": {
+      "range": [-81.0, -34.8],
+      "unit": "dBm",
+      "confidence": "coarse",
+      "cite": "derived: the decodable window of the vendored PHY under TR 37.885 path loss",
+      "source": "Phase 2 adds an MA-visible rssi_dbm observable to evidence rows (docs/realism/PHASE2-DESIGN.md step 8). Its plausible window under the vendored radio profile is bounded below by rx_sensitivity_dbm (-81 dBm: a frame quieter than this is never delivered, so no row exists) and above by the strongest realistic link -- transmit power 13.0103 dBm minus the smallest path loss the model can produce, TR 37.885 highway LOS at d = 1 m, which is 32.4 + 20*log10(5.9) = 47.8170 dB. Computed on 2026-08-30.",
+      "derivation": "upper = 13.0103 - 47.8170 = -34.81 dBm at 1 m (urban LOS at 1 m gives -39.79 dBm; at a realistic 5 m urban LOS spacing, -51.5 dBm). MEAN values: a single shadowing draw can add ~3*sigma = 9-12 dB above the mean, and a different transmit power shifts the whole window one-for-one, so an assertion band should be widened accordingly rather than using these two numbers as hard limits.",
+      "note": "FOR THE LEAKAGE/INTEGRITY TEST, not for scoring. rssi_dbm is receiver-measurable and therefore legitimately MA-visible, but it must be computed from TRUE geometry on the channel side: a Sybil ghost inherits its attacker's true-position RSSI, which is precisely what makes an RSSI-vs-claimed-distance detector work. Any implementation that computes RSSI from the CLAIMED position destroys that signal while leaving the column looking plausible -- a plausible-range assertion cannot catch it, so the true-geometry requirement must be asserted separately."
+    },
+    "nominal_unit_disc_range_m": {
+      "value": 709.4,
+      "unit": "m",
+      "confidence": "anchored",
+      "cite": "MOSAIC SNS singlehopRadius as configured by this project (SCMS_RADIO_RANGE default)",
+      "source": "The MOSAIC engine's Simple Network Simulator uses a unit-disc single-hop radius, written per scenario by scms-sim/scenarios/mapgen.py:416,423 with the default SCMS_RADIO_RANGE = 709.4 m and mirrored into the manifest by ScmsBackend.java:949; verified on disk in the generated C:/Users/Administrator/tools/mosaic/scenarios/scms_regress_head/sns/sns_config.json and in every InTAS dataset manifest (datasets/intas_sublane_300s/manifest.json:25). MOSAIC's own bundled Barnim example ships the same 709.4 value.",
+      "note": "DISAGREES WITH THE RESEARCH REPORT: docs/realism/investigation/research-net-sota.json states the SNS 'singlehopRadius default 509.4 m'. Every sns_config.json on this host -- MOSAIC's bundled Barnim scenario and every scenario this project generates -- contains 709.4, and that is the value recorded in the dataset manifests the harness reads. Treat 709.4 as the operative number and 509.4 as unverified. This is the RANGE PHASE 2 REPLACES: it is a hard cutoff with no gray zone, and comm.pdr_gray_zone_width_m reports it as such by design. Note also that the SNS delay model configured alongside it (SimpleRandomDelay, 0.4-2.4 ms, mapgen.py:421-422) is an order of magnitude below the 5-9 ms measured for real ITS-G5 stacks (v2x_awareness.latency_p50_ms_80211p) -- it models air time only, not the stack."
+    },
+    "link_budget_median_range_m": {
+      "points": [
+        ["urban_los", 13.0103, 293.57],
+        ["urban_los", 20.0, 769.59],
+        ["urban_los", 23.0, 1163.85],
+        ["urban_nlos", 13.0103, 26.28],
+        ["urban_nlos", 20.0, 44.95],
+        ["urban_nlos", 23.0, 56.58],
+        ["highway_los", 13.0103, 204.02],
+        ["highway_los", 20.0, 456.19],
+        ["highway_los", 23.0, 644.39]
+      ],
+      "unit": "[TR 37.885 state, EIRP dBm, median range m]",
+      "confidence": "coarse",
+      "cite": "derived: TR 37.885 path loss against the vendored -81 dBm sensitivity",
+      "source": "Computed on 2026-08-30 at double precision: the distance at which the anchored TR 37.885 path loss (pathloss_37885) equals EIRP - rx_sensitivity_dbm, with fc = 5.9 GHz. 13.0103 dBm is the vendored transmit power (tx_power_dbm); 20 and 23 dBm bracket deployed DSRC/ITS-G5 OBU power.",
+      "derivation": "d = 10^((EIRP + 81 - a - c*log10(5.9)) / b). MEDIAN range: shadowing is zero-mean in dB, so half of links at this distance are worse. No antenna gain, no fading, no interference.",
+      "note": "THREE CONSEQUENCES FOR THE PHASE-2 GATES. (1) '>= 90% awareness at 500 m highway' needs >= 20.8 dBm; the vendored 13.0 dBm reaches 204 m median, so the gate cannot pass on the vendored power no matter how good the channel model is. (2) The 500-700 m LOS anchor (v2x_awareness.los_high_pdr_range_m) is consistent with the '~20 dBm' its campaigns used -- 456 m highway / 770 m urban at 20 dBm. (3) Urban NLOS is 26-57 m across the whole practical power range: NLOS links are effectively dead at any power, so urban awareness is decided by the LOS/NLOSv share of the link population."
+    }
+  }
+}
