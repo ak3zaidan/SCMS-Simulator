@@ -3774,6 +3774,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     net = None
     _sumo_tf = None            # the netimport transform, SHARED with the replay provider below
     _sumo_info: dict = {}
+    _sumo_surface: dict = {}   # roads.CustomNetwork.set_road_surface provenance (sumo path only)
     _sumo_net_sha = ""
     if cfg.road_network == "grid":
         from .roads import GridNetwork
@@ -3809,12 +3810,25 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         net = CustomNetwork(*_parse_custom_network(
             network_document(_sumo_nodes, _sumo_edges, _sumo_info),
             directed=cfg.custom_network_directed))
+        # THE DRIVABLE SURFACE, and it is the other half of the coherence guarantee. The graph above
+        # answers "where can a trip go"; `dist_to_road` -- which feeds mapOffRoad and the geometric
+        # channel's building blockage -- asks "is this vehicle on tarmac", and the graph is a bad
+        # proxy for that on a real city: one centreline per physical road (a two-way street has two
+        # carriageways, and 35 InTAS node-pairs carry more than one distinct road), and nothing at
+        # all inside a junction, where SUMO drives an internal lane for tens of metres. Measured on
+        # InTAS: p95 17.434 m -> 3.197 m, max 95.227 m -> 4.803 m, 12.70% -> 0.00% beyond 8 m.
+        # Geometry only: no node, no edge, no route and no RNG draw changes because of this.
+        if _sumo_info.get("road_surface"):
+            _sumo_surface = net.set_road_surface(**_sumo_info["road_surface"])
         if cfg.verbose:
             print(f"[sumo net] {os.path.basename(cfg.sumo_net)} -> {len(net.nodes)} junctions "
                   f"({_sumo_info.get('intersections_deg_ge3', '?')} deg>=3), "
                   f"{_sumo_info.get('n_directed_edges', '?')} directed edges, oneway "
                   f"{_sumo_info.get('oneway_share', 0.0)}, {_sumo_info.get('n_signal_nodes', 0)} "
-                  f"signalised junctions", flush=True)
+                  f"signalised junctions, {_sumo_info.get('kept_edges', 0)} graph edges "
+                  f"({_sumo_info.get('parallel_road_keys', 0)} node-pairs carry >1 physical road) "
+                  f"| surface {_sumo_surface.get('surface_segments', 0)} segments + "
+                  f"{_sumo_surface.get('junction_discs', 0)} junction discs", flush=True)
     # ---- OPT-IN directed carriageways -------------------------------------------------------- #
     # `enable_directed_lanes()` gives each direction of travel its own carriageway, offset sideways
     # off the graph centreline, so two vehicles driving opposite ways down one street no longer
@@ -3862,9 +3876,19 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                                   "frame_city": cfg.sumo_frame_city,
                                   "n_nodes": len(net.nodes),
                                   "directed": bool(cfg.custom_network_directed),
-                                  "n_signal_nodes": len(_sumo_info.get("signal_nodes", ()))},
+                                  "n_signal_nodes": len(_sumo_info.get("signal_nodes", ())),
+                                  # what the graph is, and what it had to leave out, on the record
+                                  "net_junctions": _sumo_info.get("net_junctions"),
+                                  "strong_component_nodes": _sumo_info.get("strong_component_nodes"),
+                                  "nodes_dropped_not_strongly_connected":
+                                      _sumo_info.get("strong_trimmed_nodes"),
+                                  "parallel_road_keys": _sumo_info.get("parallel_road_keys"),
+                                  "road_surface": _sumo_surface},
                       "coherence": {"dist_to_road_m": _offroad_stats,
-                                    "p95_gate_m": cfg.sumo_offroad_p95_max_m}}
+                                    "p95_gate_m": cfg.sumo_offroad_p95_max_m,
+                                    # `dist_to_road` is measured against the SURFACE, not the graph
+                                    "measured_against": ("road_surface" if _sumo_surface
+                                                         else "routing_graph")}}
         if cfg.verbose:
             print(f"[sumo replay] {len(_trace.vehicles)} frozen trajectories, {_trace.n_rows} "
                   f"vehicle-steps, sumo_seed={_trace.meta.get('sumo_seed')} "

@@ -1,7 +1,14 @@
 # SUMO-backed mobility for the Python engine (freeze + replay)
 
 **Status: shipped, default OFF.** `mock_pipeline/sumo_trace.py` (new) +
-`mock_pipeline/run.py` (the seam) + `tests/test_sumo_mobility.py` (36 tests).
+`mock_pipeline/run.py` (the seam) + `tests/test_sumo_mobility.py` (39 tests), plus the road-geometry
+fix the first real city forced (`roads.CustomNetwork.set_road_surface`, below).
+
+> **The payoff is measured in `PYTHON-ENGINE-VALIDATION.md`**: the Python engine driven over a full
+> clock hour of the InTAS AM peak and graded against real Ingolstadt loop counts, with the adapter
+> itself measured at **0.000 m** position error over 709,454 samples. Two default-inert options were
+> added to `freeze()` to make a real city's peak hour freezable at all — `warmup_steps` and
+> `substeps`; see that document's section 6 for why each was forced.
 
 ## Why
 
@@ -97,6 +104,52 @@ engine's edge is the junction-to-junction line. That is what road-following look
 (`sumo_offroad_p95_max_m`, default 8 m) is also tested **negatively**: a deliberately misregistered
 frame (+250 m, −130 m) is refused.
 
+### The gate fired on a real city, and it was right — `SUMO-COHERENCE-DIAGNOSIS.md`
+
+A procedural grid is straight, single-carriageway and has junctions the size of a car. A real
+netconvert city is none of those, and on the frozen InTAS AM peak the gate refused the run at p95
+**17.434 m**, max **95.227 m**. It was correct to: the engine's road geometry was wrong, in two
+ways that a grid cannot expose.
+
+1. **The engine builds from the document's UNDIRECTED `edges` array, and those are `[a, b, speed]`
+   triples — no shape.** Every curved road was its straight chord; the curve geometry the importer
+   preserves lives in `directed_edges`, which `custom_network_directed=false` (the default) never
+   reads. `netimport.net_to_network(undirected_shapes=True)` now emits that array in object form
+   carrying the canonical polyline. *(The suspected cause, RDP simplification, was measured and
+   cleared: `_rdp` exists only in `osm.py` and `netimport.py` has never called it.)*
+2. **`dist_to_road` answered a MAP question with the ROUTING GRAPH.** One centreline per physical
+   road — but a two-way street has two carriageways, and 35 InTAS node pairs carry more than one
+   distinct road, so `_canonicalise_shapes` has to impose one geometry on the others (2,165 of
+   7,941 records, displacing vertices p50 5.81 m / max 183.69 m). And a graph edge stops at the
+   junction *centre*, while a vehicle crossing a signalised junction drives an internal lane for
+   tens of metres that no edge covers.
+
+`roads.CustomNetwork.set_road_surface()` splits the two: the graph stays the router's, and
+`dist_to_road` measures against the map's **drivable surface** — every edge's own polyline (7,941
+polylines / 23,705 segments) plus every junction's own polygon reduced to a disc (3,332 discs;
+radius p50 8.97 m, p99 27.32 m, max 70.47 m). Importing SUMO's internal lanes instead was not
+available: 15,706 of them against `MAX_EDGES` 12,000.
+
+| InTAS, 4,071 sampled replayed positions | p50 | p95 | max | > 8 m |
+|---|---|---|---|---|
+| raw SUMO net, no internal lanes | 1.300 | 4.652 | 18.167 | 1.28% |
+| raw SUMO net, with internal lanes (reference) | 1.299 | 3.201 | 6.400 | 0.00% |
+| engine, before | 2.203 | 17.434 | 95.227 | 12.70% |
+| **engine, now** | **0.363** | **3.197** | **4.803** | **0.00%** |
+
+The surface is geometry, not topology: no node, no edge, no route and no RNG draw changes. It costs
+`dist_to_road` 15.9 → 29.6 µs per cold call (0.66 → 0.73 µs on a memo hit, which is the per-receiver
+case) and a one-off 64 ms to install; the whole 300 s / 1,188-vehicle InTAS run takes 31.7 s. The
+negative arm is re-tested *with the surface installed* — a +250 m / −130 m frame error is still
+refused, because a more generous map buys coherence for honest vehicles and nothing at all for a
+wrong origin.
+
+**Strong connectivity is now unconditional on this path** (3,328 → 3,289 junctions, 4,393 → 4,344
+edges). Those 39 junctions can be entered and never left; keeping them made the engine's map depend
+on `custom_network_directed` — invisible with it off, silently trimmed by `_parse_custom_network`
+with it on. The roads they carried remain in the *surface*, because a vehicle on a road the router
+declined to use is still on a road.
+
 ## Certificate lifetime from the SUMO route
 
 The internal model has to *guess* a trip's duration (`3 × free-flow + half a signal cycle per
@@ -124,9 +177,39 @@ Measured on a congested trace (6×6 grid, `randomTrips -p 0.18`, 1,541 vehicles,
 | `sumo_net` | `""` | Network | `--sumo-net` |
 | `sumo_frame_city` | `""` | Network | `--sumo-frame-city` |
 
+`freeze()` itself gained two options, both default-inert and both keyed out of `meta` unless
+engaged, so no existing artifact's sha256 moves:
+
+| flag | default | what it is for |
+|---|---|---|
+| `--warmup STEPS` | `0` | steps run from `--begin` WITHOUT recording. `--begin 25200` makes SUMO discard every vehicle departing earlier, so a peak-hour window opened cold starts on an EMPTY city — **36 vehicles ten seconds in**, against ~3,400 with an hour of warm-up ahead of it. |
+| `--substeps N` | `1` | step SUMO at `dt/N` and record every Nth state. A scenario is calibrated at a step length; re-integrating InTAS at 1 s is a different model, and SUMO 1.25.0 aborts outright (`Request lateral offset of vehicle … for invalid lane`) after producing 34 collisions the calibrated configuration does not have. |
+| `--time-to-teleport S` | `-1` (never) | `-1` is a change to the SCENARIO, not just to the artifact: InTAS's AM peak teleports **365 times in 25,271 vehicles** under its own 300 s policy, and suppressing all of them leaves those vehicles stuck, depressing the very flows a validation measures. Pass the scenario's own value to keep its calibrated mobility. |
+| `--split-on-gap` | off | a teleported (or parked) vehicle leaves `getIDList()` and returns elsewhere; the format's contiguity guard refuses that trace. This records the return as a separate trajectory `<id>#<n>` — which is also the better model, since a second vehicle appearing is what a teleport physically resembles, whereas a 500 m one-step jump is what every plausibility detector here is built to flag. |
+
+### A SUMO crash that is seed-dependent, and cost three long runs to attribute
+
+Freezing InTAS 21600–28800 died three times with no Python traceback: SIGSEGV at sim time
+**23544.1** with `--time-to-teleport -1`, at **23904.7** with `300`, and at 23904.7 again from the
+plain `sumo.exe` (`0xC0000005`) with neither `libsumo` nor `--ignore-route-errors` in play. It is
+none of those: **it is the SUMO seed.** The same window at seed 42 completes. If a long freeze dies
+without a traceback, re-seed before changing anything else.
+
 plus `road_network="sumo"`. `manifest["mobility"]` (emitted only when the mode is on) carries the
 provider, the SUMO version/seed, the network by content hash, and the measured coherence — the
-dvc.lock to `config`'s dvc.yaml.
+dvc.lock to `config`'s dvc.yaml. **No new config field was added for the geometry fix**: a correct
+import is not a mode. What the manifest gained is evidence, under `mobility.network`:
+
+```json
+"net_junctions": 3332, "n_nodes": 3289, "strong_component_nodes": 3289,
+"nodes_dropped_not_strongly_connected": 39, "parallel_road_keys": 35,
+"road_surface": {"graph_segments": 12101, "surface_polylines": 7941,
+                 "surface_segments": 23705, "surface_vertices": 31646,
+                 "junction_discs": 3332, "junction_radius_max_m": 70.47, "cell_m": 100.0}
+```
+
+and `mobility.coherence.measured_against` (`"road_surface"` / `"routing_graph"`), so a reader can
+tell which geometry the reported percentiles were taken against.
 
 ## Usage
 
@@ -138,6 +221,25 @@ python -m scms_sim_ref.mock_pipeline.run --flow --duration 300 --seed 42 \
     --road sumo --sumo-net map.net.xml \
     --mobility-source sumo_replay --sumo-trace map.trace --sumo-trace-sha256 <hex> \
     --attacker-pct 0.15 --out datasets/sumo_run
+```
+
+The real-city run, verbatim (InTAS AM peak, 25200–25500 s, `InTAS_buildings.sumocfg`):
+
+```
+python -m scms_sim_ref.mock_pipeline.run --flow --duration 300 --seed 42 \
+    --road sumo --sumo-net C:/Temp/smob/ingolstadt.net.xml \
+    --mobility-source sumo_replay --sumo-trace C:/Temp/smob/intas.trace \
+    --sumo-trace-sha256 95a946f4187ca4262d0a76c95aa6f6696c273ffe1779fffaff1bb41650f598c2 \
+    --attacker-pct 0.15 --out datasets/sumo_run
+
+[sumo net] ingolstadt.net.xml -> 3289 junctions (2045 deg>=3), 7891 directed edges, oneway 0.1097,
+           109 signalised junctions, 4344 graph edges (35 node-pairs carry >1 physical road)
+           | surface 23705 segments + 3332 junction discs
+[sumo replay] 1188 frozen trajectories, 158767 vehicle-steps, sumo_seed=257318856 (SUMO 1.25.0),
+              teleports=0 | dist_to_road p50=0.363 p95=3.197 max=4.803 m | trace 95a946f4187ca426
+vehicles=1188 reports=14504 investigations=155 revoked=155
+data_digest=c4a7cddeb4ef58dd254ad051186911ebfd2c0e143b84115ac8f8d967eb082491
+detection: precision=0.955 recall=0.822 attackers=180 revoked=155 latency_med=6.0s
 ```
 
 ## Toolchain traps honoured
@@ -181,3 +283,12 @@ and freezes through the CLI in a fresh interpreter.
   RNG stream to be split first.
 * `buildings` are not extracted from a `.net.xml` (netconvert discards them); a geometric-channel
   run on a SUMO net still needs `osm.py --buildings` in the same frame via `sumo_frame_city`.
+* **The GRAPH still holds one geometry per node pair.** `_canonicalise_shapes` still substitutes a
+  shape on 2,165 of 7,941 InTAS records, and `netimport`'s CLI still writes the plain triple form.
+  That no longer affects `dist_to_road` — the surface layer carries the real per-carriageway
+  polylines — but it does still decide where an INTERNAL (non-replay) vehicle drives on a SUMO net.
+  Fixing it properly means letting `CustomNetwork` hold parallel edges, which is a topology change,
+  not a geometry one.
+* **The surface is not in the on-disk document.** `osm.network_document` does not carry
+  `road_surface`, so it exists only on the in-process import path (`sumo_trace.engine_network` →
+  `run_pipeline`). A `--out net.json` document reloaded later gets the graph and not the map.

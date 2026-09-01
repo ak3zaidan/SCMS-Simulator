@@ -35,6 +35,12 @@ those as `traffic.overlap_events` -- a HARD gate the SUMO path scores 0 on. Thre
 `largest_strong_component()` trims a one-way document to what is actually drivable, which a
 bbox-clipped OSM/netconvert import needs, and `edges_from_directed()` converts the importers'
 directed-edge records into this module's schema.
+
+`CustomNetwork.set_road_surface()` (also opt-in) separates two questions the routing graph was
+answering with one object: WHERE CAN A TRIP GO (the graph) and WHERE IS THERE TARMAC (the map).
+`dist_to_road` only ever asked the second, and on an imported city the graph is a bad proxy for it
+-- one centreline per physical road, nothing at all inside a junction. See that method for the
+measured cost of conflating them.
 """
 from __future__ import annotations
 
@@ -1095,8 +1101,141 @@ class CustomNetwork(_LaneFrameMixin):
         self._max_ring = int(max(self.bbox[2] - self.bbox[0], self.bbox[3] - self.bbox[1])
                              // self._cell) + 2
         self._d2r_cache: dict = {}
+        # ---- OPT-IN drivable-SURFACE layer (see `set_road_surface`) ----------------------------
+        # EMPTY unless a caller opts in, and every `dist_to_road` fast path tests emptiness first,
+        # so an ordinary map computes exactly what it always did.
+        self._junc: tuple = ()                 # (cx, cy, r) junction discs; distance 0 inside
+        self._jindex: dict = {}                # cell -> junction indices (shares self._cell)
+        self._surface: dict = {}               # provenance counts, reported in the manifest
         self._phase: dict | None = None        # lazily-built deterministic node 2-colouring
         self._coord_idx: dict | None = None    # lazily-built coord -> node index (for node_phase)
+
+    # ------------------------------------------------------------------ #
+    # OPT-IN: the drivable SURFACE `dist_to_road` measures against
+    # ------------------------------------------------------------------ #
+    def set_road_surface(self, polylines=(), junctions=()) -> dict:
+        """Give `dist_to_road` the map's REAL drivable surface instead of the routing graph.
+
+        WHY THIS EXISTS, and it is not a convenience. `dist_to_road` answers a MAP question -- "is
+        this vehicle on a road" -- and it feeds the `mapOffRoad` detector and the geometric channel's
+        building blockage. The routing graph is a poor answer to that question on an imported city:
+
+          * a graph edge is one centreline per physical road, but a real two-way street has two
+            carriageways with their OWN polylines, and two distinct roads may join the same pair of
+            junctions (35 such node-pairs in the InTAS import) -- the graph can hold only one of them;
+          * a graph edge stops at the junction CENTRE, but a vehicle crossing a large signalised
+            junction drives an internal connection tens of metres long that no graph edge covers.
+
+        Measured on InTAS (1,188 SUMO vehicles, 4,071 sampled positions), distance from the replayed
+        position to the engine's roads:
+
+            routing graph, straight chords          p50 2.203  p95 17.434  max 95.227  12.70% > 8 m
+            + curve geometry on the graph edges     p50 1.671  p95  7.219  max 57.481   3.22% > 8 m
+            + this surface layer                    p50 0.363  p95  3.197  max  4.803   0.00% > 8 m
+
+        and `dist_to_road` goes 15.9 -> 29.6 us cold, 0.66 -> 0.73 us warm. Warm is the case that
+        matters: the memo is keyed on the claimed position, so one vehicle-step costs one computation
+        however many receivers heard it.
+
+        `polylines` are extra road centrelines ([[x, y], ...] each, >= 2 points) that participate in
+        `dist_to_road` and in NOTHING else -- not routing, not `edge_len`, not `random_trip`. They are
+        map geometry, not topology, and keeping them out of the graph is what makes this affordable:
+        the InTAS surface is 23,705 segments against a `MAX_EDGES` of 12,000.
+
+        `junctions` are `(x, y, radius)` discs standing for the paved junction AREA; a position inside
+        one is on the road (distance 0). This is the alternative to importing SUMO's internal junction
+        lanes, which is not arithmetically available: InTAS has 15,706 of them against `MAX_EDGES`
+        12,000 and `MAX_NODES` 4,000, and they are a routing artefact anyway -- the junction polygon
+        is the map's own statement of where the tarmac is.
+
+        Idempotent-ish and explicit: calling it twice re-adds. Draws no RNG; deterministic in input
+        order. Returns the provenance dict it also stores on `self._surface`."""
+        base_segs = len(self._segs)
+        added_pts = 0
+        polylines = list(polylines)
+        for poly in polylines:
+            pts = [(float(p[0]), float(p[1])) for p in poly]
+            if len(pts) < 2:
+                raise ValueError(f"road-surface polyline needs >= 2 points (got {len(pts)})")
+            for p, q in zip(pts, pts[1:]):
+                if not all(math.isfinite(v) for v in (*p, *q)):
+                    raise ValueError("road-surface polyline has a non-finite coordinate")
+                if p != q:
+                    self._segs.append((p[0], p[1], q[0], q[1]))
+                    self._seg_edge.append(-1)          # -1 = surface geometry, no parent graph edge
+            added_pts += len(pts)
+        discs = []
+        for j in junctions:
+            jx, jy, jr = float(j[0]), float(j[1]), float(j[2])
+            if not (math.isfinite(jx) and math.isfinite(jy) and math.isfinite(jr) and jr >= 0.0):
+                raise ValueError(f"junction disc {j!r} must be (x, y, radius >= 0) and finite")
+            discs.append((jx, jy, jr))
+        self._junc = tuple(discs)
+        # ---- rebuild the cell index over the enlarged segment set --------------------------- #
+        _lens = sorted(math.hypot(s[2] - s[0], s[3] - s[1]) for s in self._segs)
+        self._cell = min(600.0, max(100.0, 2.0 * _lens[len(_lens) // 2]))
+        cell = self._cell
+        _ix: dict[tuple[int, int], set] = {}
+        for k, (ax, ay, bx, by) in enumerate(self._segs):
+            steps = max(1, int(math.hypot(bx - ax, by - ay) // cell) + 1)
+            for c in range(steps):
+                t0, t1 = c / steps, (c + 1) / steps
+                px0, py0 = ax + (bx - ax) * t0, ay + (by - ay) * t0
+                px1, py1 = ax + (bx - ax) * t1, ay + (by - ay) * t1
+                for ci in range(int(min(px0, px1) // cell), int(max(px0, px1) // cell) + 1):
+                    for cj in range(int(min(py0, py1) // cell), int(max(py0, py1) // cell) + 1):
+                        _ix.setdefault((ci, cj), set()).add(k)
+        self._index = {c: tuple(sorted(v)) for c, v in _ix.items()}
+        # A disc is registered in every cell its BOUNDING BOX touches, so every point of the disc --
+        # its boundary included -- lies in a registered cell. That is the same invariant the segment
+        # chunking above maintains, and it is what makes the ring walk's early break exact.
+        _jx: dict[tuple[int, int], list] = {}
+        for k, (jx, jy, jr) in enumerate(self._junc):
+            for ci in range(int((jx - jr) // cell), int((jx + jr) // cell) + 1):
+                for cj in range(int((jy - jr) // cell), int((jy + jr) // cell) + 1):
+                    _jx.setdefault((ci, cj), []).append(k)
+        self._jindex = {c: tuple(v) for c, v in _jx.items()}
+        cis = [c[0] for c in self._index] + [c[0] for c in self._jindex]
+        cjs = [c[1] for c in self._index] + [c[1] for c in self._jindex]
+        self._cbox = (min(cis), min(cjs), max(cis), max(cjs))
+        self._max_ring = (self._cbox[2] - self._cbox[0]) + (self._cbox[3] - self._cbox[1]) + 2
+        self._d2r_cache = {}                   # the answer changed; the memo must not survive it
+        self._surface = {"graph_segments": base_segs,
+                         "surface_polylines": len(polylines),
+                         "surface_segments": len(self._segs) - base_segs,
+                         "surface_vertices": added_pts,
+                         "junction_discs": len(self._junc),
+                         "junction_radius_max_m": round(max((d[2] for d in self._junc), default=0.0), 2),
+                         "cell_m": round(self._cell, 1)}
+        return dict(self._surface)
+
+    def _junction_dist(self, x: float, y: float) -> float:
+        """Distance to the nearest junction DISC (0 inside one). Same ring walk as `dist_to_road`,
+        over `_jindex`; only reached when a surface has been installed."""
+        best = math.inf
+        cell = self._cell
+        ci, cj = int(x // cell), int(y // cell)
+        i0, j0, i1, j1 = self._cbox
+        r_lo = max(0, i0 - ci, ci - i1, j0 - cj, cj - j1)
+        r_hi = max(abs(i0 - ci), abs(i1 - ci), abs(j0 - cj), abs(j1 - cj))
+        jindex, junc = self._jindex, self._junc
+        for r in range(r_lo, r_hi + 1):
+            if r == 0:
+                cells = ((ci, cj),)
+            else:
+                cells = [(i, cj - r) for i in range(ci - r, ci + r + 1)]
+                cells += [(i, cj + r) for i in range(ci - r, ci + r + 1)]
+                cells += [(ci - r, j) for j in range(cj - r + 1, cj + r)]
+                cells += [(ci + r, j) for j in range(cj - r + 1, cj + r)]
+            for c in cells:
+                for k in jindex.get(c, ()):
+                    jx, jy, jr = junc[k]
+                    d = math.hypot(x - jx, y - jy) - jr
+                    if d < best:
+                        best = d if d > 0.0 else 0.0
+            if best <= r * cell:
+                break
+        return best
 
     def _coord(self, i: int) -> tuple[float, float]:
         return self.coords[i]
@@ -1273,6 +1412,18 @@ class CustomNetwork(_LaneFrameMixin):
         if hit is not None:
             return hit
         best = math.inf
+        # OPT-IN surface layer. `_junc` is EMPTY on every map that has not called
+        # `set_road_surface`, so this is one tuple truth-test per call and the loops below are
+        # untouched -- the default path computes byte-identically what it always did. When a surface
+        # IS installed, seeding `best` with the junction distance only makes the ring walk break
+        # EARLIER, and it breaks on a real distance to real road geometry, so the result stays exact.
+        if self._junc:
+            best = self._junction_dist(x, y)
+            if best <= 0.0:                    # inside the paved junction area: on the road
+                if len(self._d2r_cache) > 200_000:
+                    self._d2r_cache.clear()
+                self._d2r_cache[key] = 0.0
+                return 0.0
         cell = self._cell
         ci, cj = int(x // cell), int(y // cell)
         i0, j0, i1, j1 = self._cbox
@@ -1500,6 +1651,8 @@ class CustomNetwork(_LaneFrameMixin):
             out["drive_side"] = "left" if self._side > 0 else "right"
         if self.route_metric != "length":
             out["route_metric"] = self.route_metric
+        if self._surface:
+            out["road_surface"] = dict(self._surface)
         return out
 
 

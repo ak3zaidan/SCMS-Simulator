@@ -233,13 +233,78 @@ class SumoTrace:
 # --------------------------------------------------------------------------- #
 # Phase A -- FREEZE
 # --------------------------------------------------------------------------- #
+def _ttt_arg(v: float) -> str:
+    """`--time-to-teleport` as SUMO's own CLI writes it: an integer when it is one."""
+    f = float(v)
+    return str(int(f)) if f == int(f) else repr(f)
+
+
 def freeze(*, net: str, out: str, routes: str = "", sumocfg: str = "", seed: int | None = None,
            steps: int, dt: float = 1.0, begin: float = 0.0, sumo_bin: str = "",
-           extra_args=(), strict_version: bool = True, run_seed: int | None = None) -> SumoTrace:
+           extra_args=(), strict_version: bool = True, run_seed: int | None = None,
+           warmup_steps: int = 0, substeps: int = 1,
+           time_to_teleport: float = -1.0, split_on_gap: bool = False) -> SumoTrace:
     """Run SUMO ONCE and write the canonical trajectory artifact to `out`.
 
     `seed` is SUMO's seed. Pass `run_seed` instead to derive it from the engine's run seed
     (`derive_sumo_seed`); the derivation and the resulting value are both recorded in the file.
+
+    `warmup_steps` (default 0) runs that many steps from `begin` WITHOUT recording, so the recorded
+    window starts on an already-loaded network instead of an empty one. A demand file whose vehicles
+    depart before `begin` is discarded by SUMO, so `--begin 25200` alone starts an empty city and the
+    first minutes of the trace are a fill transient, not the peak. Step 0 of the artifact is then
+    SUMO time `begin + (warmup_steps + 1) * dt`, which is what `step0_sim_time` records either way.
+    A vehicle already on the network when recording starts is written with `first_step = 0`; its
+    `depart_s` is the time it was FIRST SEEN, i.e. the start of the recorded window, not its true
+    SUMO departure (which is outside the artifact). Default 0 keeps `meta` byte-identical: the
+    `warmup_steps` key is emitted only when it is non-zero.
+
+    `substeps` (default 1) DECOUPLES SUMO's integration step from the artifact's sample interval:
+    SUMO is stepped at `dt / substeps` and every `substeps`-th state is recorded, so the artifact's
+    dt -- and the engine's -- is still `dt`. This is not an optimisation. A scenario is calibrated
+    at a particular step length (InTAS: 0.1 s, EIDM, `lateral-resolution 0.8`) and re-integrating it
+    at 1 s is a DIFFERENT model, not a coarser view of the same one: on InTAS it produces collisions
+    the calibrated configuration does not have, and SUMO 1.25.0 aborts outright with "Request
+    lateral offset of vehicle ... for invalid lane" when the sublane model is asked to place a
+    vehicle after a 1 s jump onto an internal lane. Sub-stepping keeps the mobility exactly the one
+    the scenario was calibrated for and samples it at the rate the engine (and a CAM stream) works
+    at. Teleport and collision counters are polled on EVERY SUMO step, not only on recorded ones, so
+    an event between two samples is still reported. Default 1 keeps `meta` byte-identical: the
+    `substeps` key is emitted only when it is greater than 1.
+
+    `time_to_teleport` (default `-1`, i.e. never) is SUMO's `--time-to-teleport`. A teleport is a
+    discontinuity the replay would faithfully reproduce as a physically impossible jump, so the
+    default disables it -- but `-1` is a change to the SCENARIO, not just to the artifact, and on a
+    congested real network it is a large one: InTAS's AM peak under its own `300` s policy teleports
+    **365 times (49 jam, 289 yield, 23 wrongLane) in 25,271 vehicles**, and suppressing all of them
+    leaves those vehicles stuck instead, which depresses exactly the flows a validation run
+    measures. Passing the scenario's own value keeps the mobility the one the scenario was
+    calibrated for, and makes the artifact comparable with an ordinary run of it.
+
+    THIS IS ALSO WHERE SUMO ITSELF WILL FAIL, and the failure is SEED-dependent, not flag-dependent.
+    On InTAS from 21600 s, SUMO 1.25.0 dies with a Windows ACCESS_VIOLATION (0xC0000005 / SIGSEGV)
+    at sim time **23544.1** under `-1` and at **23904.7** under `300`, at the same seed. The same
+    23904.7 crash reproduces in the plain `sumo` binary with neither `libsumo` nor
+    `--ignore-route-errors` involved, and the same window at a different SUMO seed runs to 28800
+    cleanly. So the teleport policy moves WHEN it happens, not WHETHER: if a long freeze aborts with
+    no Python traceback, re-seed before changing anything else.
+
+    `meta["time_to_teleport"]` records the value whenever it is not the default, and
+    `meta["teleports"]` is measured either way -- so a trace with teleports in it says so.
+
+    `split_on_gap` (default False) is what makes such a run WRITABLE. A vehicle SUMO teleports --
+    or parks, with `parking.maneuver` on -- leaves `vehicle.getIDList()` and comes back later
+    somewhere else (measured on InTAS: `carIn5871:1` absent at step 25, present again at 26). The
+    format assumes one contiguous presence per id, so the default refuses such a trace outright,
+    which is right: writing it as a contiguous run would silently mislabel every later step. With
+    `split_on_gap` the return is recorded as a SEPARATE trajectory `<id>#<n>` instead. That is not a
+    workaround, it is the better model: a 500 m jump in one step is a discontinuity every position-
+    plausibility detector in this repository would correctly flag, whereas a second trajectory is
+    simply another vehicle appearing -- which is what a teleported vehicle physically resembles. Its
+    `route_length_m` is its OWN driven distance (`getDistance` is cumulative over the whole SUMO
+    trip, so the segment start is subtracted); the first segment keeps the raw value, so nothing
+    about a gap-free freeze moves. `meta["gap_splits"]` counts them, and is emitted only when the
+    option is on.
 
     The invocation is single-threaded (`--threads 1`), teleport-free (`--time-to-teleport -1`, so a
     jammed vehicle waits instead of being ported across the map -- a teleport is a discontinuity the
@@ -260,6 +325,12 @@ def freeze(*, net: str, out: str, routes: str = "", sumocfg: str = "", seed: int
         raise ValueError(f"steps must be > 0 (got {steps})")
     if dt <= 0:
         raise ValueError(f"dt must be > 0 (got {dt})")
+    warmup_steps = int(warmup_steps)
+    if warmup_steps < 0:
+        raise ValueError(f"warmup_steps must be >= 0 (got {warmup_steps})")
+    substeps = int(substeps)
+    if substeps < 1:
+        raise ValueError(f"substeps must be >= 1 (got {substeps})")
     if run_seed is not None:
         seed = derive_sumo_seed(run_seed)
     if seed is None:
@@ -276,46 +347,71 @@ def freeze(*, net: str, out: str, routes: str = "", sumocfg: str = "", seed: int
             f"strict_version=False and accept that the artifact is not comparable.")
 
     binary = sumo_bin or sumo_binary("sumo")
-    end = begin + steps * dt
+    end = begin + (warmup_steps + steps) * dt
     argv = [binary]
     if sumocfg:
         argv += ["-c", sumocfg]
     else:
         argv += ["-n", net, "-r", routes]
     argv += ["--seed", str(int(seed)),
-             "--step-length", repr(float(dt)),
+             "--step-length", repr(float(dt) / substeps),
              "--begin", repr(float(begin)),
              "--end", repr(float(end)),
              "--threads", "1",
              "--no-step-log", "true",
              "--no-warnings", "true",
-             "--time-to-teleport", "-1",
+             # formatted as an integer when it is one, so the DEFAULT renders "-1" exactly as it did
+             # before this became a parameter -- `meta["invocation"]` is inside the hashed artifact.
+             "--time-to-teleport", _ttt_arg(time_to_teleport),
              "--ignore-route-errors", "true",
              *[str(a) for a in extra_args]]
 
     # --- drive SUMO ------------------------------------------------------ #
-    #: raw[sumo_id] = [first_step, [x], [y], [speed], [angle], depart_s, last_dist, last_step]
+    #: raw[key] = [first_step, [x], [y], [speed], [angle], depart_s, last_dist, last_step, dist0]
+    #: `key` is the SUMO id, or `<id>#<n>` for the n-th segment when `split_on_gap` is on.
     raw: dict = {}
+    live: dict = {}                 # sumo id -> the key it is currently being recorded under
+    seg_no: dict = {}               # sumo id -> how many times it has left and come back
+    split_keys: set = set()         # the keys that are post-gap segments (NOT `"#" in key`: a SUMO
+    splits = 0                      # id may legitimately contain a '#')
     teleports = 0
     collisions = 0
     libsumo.start(argv)
     try:
-        for step in range(steps):
+        for _ in range(warmup_steps * substeps):
+            # WARM-UP: stepped, never recorded. Teleports/collisions in here are not counted either
+            # -- they did not happen inside the artifact, and claiming them would misattribute a
+            # transient of the fill phase to the window the engine actually replays.
             libsumo.simulationStep()
-            teleports += libsumo.simulation.getStartingTeleportNumber()
-            collisions += libsumo.simulation.getCollidingVehiclesNumber()
+        for step in range(steps):
+            for _ in range(substeps):
+                libsumo.simulationStep()
+                # polled on EVERY SUMO step: these are per-step counters, so sampling them only on
+                # recorded steps would silently drop every event that happened in between.
+                teleports += libsumo.simulation.getStartingTeleportNumber()
+                collisions += libsumo.simulation.getCollidingVehiclesNumber()
             now = libsumo.simulation.getTime()
             for vid in libsumo.vehicle.getIDList():
-                rec = raw.get(vid)
-                if rec is None:
-                    rec = raw[vid] = [step, [], [], [], [], now, 0.0, step - 1]
-                elif rec[7] != step - 1:
+                rec = raw.get(live.get(vid))
+                if rec is not None and rec[7] != step - 1:
                     # The replay indexes a vehicle's state by `step - first_step`, and `load()`
-                    # refuses a gap on read -- so a gap must be caught HERE rather than written out
+                    # refuses a gap on read -- so a gap must be handled HERE rather than written out
                     # as a contiguous run that silently mislabels every later step.
-                    raise RuntimeError(f"SUMO vehicle {vid!r} disappeared and came back "
-                                       f"(steps {rec[7]} -> {step}); the trace format assumes one "
-                                       f"contiguous presence per vehicle id")
+                    if not split_on_gap:
+                        raise RuntimeError(
+                            f"SUMO vehicle {vid!r} disappeared and came back "
+                            f"(steps {rec[7]} -> {step}); the trace format assumes one contiguous "
+                            f"presence per vehicle id. Pass split_on_gap=True "
+                            f"(--split-on-gap) to record the return as a separate trajectory")
+                    splits += 1
+                    seg_no[vid] = seg_no.get(vid, 0) + 1
+                    live[vid] = f"{vid}#{seg_no[vid]}"
+                    split_keys.add(live[vid])
+                    rec = None
+                if rec is None:
+                    key = live.setdefault(vid, vid)
+                    rec = raw[key] = [step, [], [], [], [], now, 0.0, step - 1,
+                                      libsumo.vehicle.getDistance(vid)]
                 x, y = libsumo.vehicle.getPosition(vid)
                 rec[1].append(x)
                 rec[2].append(y)
@@ -335,17 +431,23 @@ def freeze(*, net: str, out: str, routes: str = "", sumocfg: str = "", seed: int
             "routes file has <trip>/<vehicle> elements.")
 
     # --- canonical id mapping: (first_step, sumo_id), assigned once and WRITTEN DOWN ---------- #
+    rec_begin = begin + warmup_steps * dt          # SUMO time the RECORDED window starts from
     order = sorted(raw, key=lambda k: (raw[k][0], k))
     vehicles: list[TraceVehicle] = []
     xs, ys, vs, angs = [], [], [], []
     for idx, vid in enumerate(order):
-        first, X, Y, V, A, depart, dist, _last_seen = raw[vid]
+        first, X, Y, V, A, depart, dist, _last_seen, dist0 = raw[vid]
+        if vid in split_keys:
+            # a post-gap segment: `getDistance` is cumulative over the whole SUMO trip, so the
+            # segment's own driven length is the difference. The first segment keeps the raw value,
+            # which is what every artifact frozen before splitting existed already recorded.
+            dist -= dist0
         if any(c.isspace() for c in vid):
             raise ValueError(f"SUMO vehicle id {vid!r} contains whitespace, which the line-oriented "
                              f"trace format cannot represent unambiguously")
         last = first + len(X) - 1
         vehicles.append(TraceVehicle(idx, vid, first, last, depart,
-                                     begin + (last + 1) * dt, last < steps - 1, dist))
+                                     rec_begin + (last + 1) * dt, last < steps - 1, dist))
         xs.append(X)
         ys.append(Y)
         vs.append(V)
@@ -364,10 +466,10 @@ def freeze(*, net: str, out: str, routes: str = "", sumocfg: str = "", seed: int
         "end": float(end),
         "steps": int(steps),
         "final_sim_time": float(final_time),
-        # step k of this trace is SUMO time `begin + (k+1)*dt` -- the state AFTER the (k+1)-th
-        # simulationStep(). The engine maps its own step k onto trace step k; the absolute offset
-        # is recorded so a consumer can align against SUMO output files if it ever needs to.
-        "step0_sim_time": float(begin + dt),
+        # step k of this trace is SUMO time `begin + (warmup_steps+k+1)*dt` -- the state AFTER that
+        # many simulationStep()s. The engine maps its own step k onto trace step k; the absolute
+        # offset is recorded so a consumer can align against SUMO output files if it ever needs to.
+        "step0_sim_time": float(rec_begin + dt),
         "net_basename": os.path.basename(net),
         "net_sha256": file_sha256(net),
         "routes_basename": (os.path.basename(routes) if routes else ""),
@@ -383,6 +485,19 @@ def freeze(*, net: str, out: str, routes: str = "", sumocfg: str = "", seed: int
         "coord_frame": "raw SUMO network coordinates (metres); angle = deg CLOCKWISE from North",
         "round_decimals": _ROUND,
     }
+    if warmup_steps:
+        # Emitted ONLY when non-zero, so a warm-up-free freeze keeps `meta` -- and therefore the
+        # artifact's sha256 -- byte-identical to one taken before this option existed.
+        meta["warmup_steps"] = int(warmup_steps)
+        meta["recorded_begin"] = float(rec_begin)
+    if substeps > 1:                                   # same rule: emitted only when it is not 1
+        meta["substeps"] = int(substeps)
+        meta["sumo_step_length"] = float(dt) / substeps
+    if float(time_to_teleport) != -1.0:                # ... and only when it is not "never"
+        meta["time_to_teleport"] = float(time_to_teleport)
+    if split_on_gap:                                   # ... and only when splitting is on
+        meta["split_on_gap"] = True
+        meta["gap_splits"] = int(splits)
     trace = SumoTrace(meta, vehicles, {"x": xs, "y": ys, "v": vs, "a": angs})
     _write(out, trace)
     trace.sha256 = file_sha256(out)
@@ -667,7 +782,7 @@ class SumoReplayMobility:
 # --------------------------------------------------------------------------- #
 def engine_network(net_path: str, *, frame_city: str = "", cache_dir: str = "datasets/_osmcache",
                    directed: bool = False, strong: bool | None = None, max_nodes: int = 0,
-                   shapes: bool = True):
+                   shapes: bool = True, surface: bool = True):
     """Import a SUMO `.net.xml` as the ENGINE's network and return the transform used to do it.
 
     Returns `(nodes, edges, info, tf)`. `tf` is the very function `netimport` applied to the
@@ -679,7 +794,37 @@ def engine_network(net_path: str, *, frame_city: str = "", cache_dir: str = "dat
     extract. Anything else landing in that frame with an independently derived origin misaligns
     silently by whole city blocks while every individual street still looks plausible, which is
     precisely what would make the geometric channel's building blockage nonsense. A procedural net
-    (netgenerate) has no geo-projection and keeps its own metric coordinates."""
+    (netgenerate) has no geo-projection and keeps its own metric coordinates.
+
+    THREE THINGS THIS FIXES ON EVERY SUMO NET, each measured on InTAS (1,188 vehicles, 4,071 sampled
+    replayed positions; distance from the position to the engine's roads):
+
+    1. `undirected_shapes=True` -- the engine builds from the document's UNDIRECTED array, and as
+       `[a, b, speed]` triples that array describes every curved road as its straight chord. That
+       alone was p50 2.203 m / p95 17.434 m / max 95.227 m, 12.7% of positions more than 8 m off
+       road, and it is what made the coherence gate fire on an honest trace.
+    2. `surface=True` -- `dist_to_road` measures against the map's real tarmac (every carriageway's
+       own polyline, plus the junction polygons a vehicle crosses on an internal lane) rather than
+       against the routing graph. Final: p50 0.351 m / p95 3.195 m / max 4.804 m, 0.00% over 8 m,
+       which is the raw-SUMO-network reference (p95 3.201 m / max 6.400 m) reached from inside the
+       engine.
+    3. `strong=True` unconditionally -- see below.
+
+    STRONG CONNECTIVITY IS NOT OPTIONAL HERE, and this is a deliberate change of behaviour. InTAS
+    imports 3,328 junctions of which 3,289 are in the largest strongly connected component: 39 can be
+    driven into and never out of (a bbox-clipped one-way pair, or a ramp whose only exit leaves the
+    extract). Keeping them meant the engine's map DEPENDED on `custom_network_directed`: off, the
+    router ignored one-ways and the traps were invisible; on, `run._parse_custom_network` silently
+    trimmed them. Two configurations, two different cities, one manifest schema describing both.
+    They are dropped in both cases now -- 39 nodes and 49 undirected edges, 1.2% of the graph -- so
+    the network the manifest describes is the network the run used. The dropped roads stay in the
+    `road_surface` layer, because a vehicle SUMO drove down a road the engine's router declined to
+    use is still on a road, and flagging it `mapOffRoad` would be exactly the false positive this
+    whole change removes.
+
+    `directed` is therefore no longer what selects the trim -- it is kept because callers pass it and
+    because it still records which LAYER of the document the caller intends to build from. Pass
+    `strong=False` explicitly to opt out, which only a diagnostic should do."""
     from . import netimport                            # noqa: PLC0415  (needs sumolib)
 
     frame = None
@@ -691,9 +836,10 @@ def engine_network(net_path: str, *, frame_city: str = "", cache_dir: str = "dat
         frame = road_projection(fetch_osm(CITY_BBOXES[frame_city], cache_dir))
     net = netimport.read_net(net_path)
     if strong is None:
-        strong = directed
+        strong = True
     nodes, edges, info = netimport.net_to_network(net, projection=frame, strong=strong,
-                                                  max_nodes=max_nodes, shapes=shapes)
+                                                  max_nodes=max_nodes, shapes=shapes,
+                                                  undirected_shapes=shapes, surface=surface)
     tf, _param = netimport._transformer(net, frame)
     info = dict(info)
     info["projection"] = frame
@@ -722,6 +868,19 @@ def main(argv=None) -> int:
     p.add_argument("--steps", type=int, required=True, help="number of simulation steps to freeze")
     p.add_argument("--dt", type=float, default=1.0, help="step length (s); MUST match the run's dt")
     p.add_argument("--begin", type=float, default=0.0, help="SUMO start time (s)")
+    p.add_argument("--warmup", type=int, default=0, metavar="STEPS",
+                   help="steps to run from --begin WITHOUT recording, so the artifact starts on a "
+                        "loaded network instead of an empty one (default 0)")
+    p.add_argument("--time-to-teleport", type=float, default=-1.0, metavar="S",
+                   help="SUMO --time-to-teleport (default -1 = never). Pass the SCENARIO's own "
+                        "value to keep its calibrated mobility: InTAS's AM peak teleports 365 "
+                        "times under its 300 s policy, and -1 leaves those vehicles stuck instead")
+    p.add_argument("--split-on-gap", action="store_true",
+                   help="record a vehicle that leaves the network and returns (teleport, parking) "
+                        "as a SEPARATE trajectory '<id>#<n>' instead of refusing the trace")
+    p.add_argument("--substeps", type=int, default=1, metavar="N",
+                   help="step SUMO at --dt/N and record every Nth state: keeps the scenario's own "
+                        "calibrated integration step while the artifact stays at --dt (default 1)")
     p.add_argument("--allow-version-drift", action="store_true",
                    help=f"do not require SUMO {SUMO_VERSION_PINNED} (the trajectories are then not "
                         f"comparable with ones frozen on the pinned build)")
@@ -733,6 +892,8 @@ def main(argv=None) -> int:
         return 0
     trace = freeze(net=a.net, routes=a.routes or "", sumocfg=a.sumocfg or "", out=a.out,
                    seed=a.seed, run_seed=a.run_seed, steps=a.steps, dt=a.dt, begin=a.begin,
+                   warmup_steps=a.warmup, substeps=a.substeps,
+                   time_to_teleport=a.time_to_teleport, split_on_gap=a.split_on_gap,
                    strict_version=not a.allow_version_drift)
     print(json.dumps({**trace.summary(), "out": a.out,
                       "invocation": trace.meta["invocation"]}, indent=1, sort_keys=True))

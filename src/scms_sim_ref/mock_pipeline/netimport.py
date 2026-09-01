@@ -425,6 +425,48 @@ def _largest_strong_component(n_nodes: int, directed: list) -> set:
     return best
 
 
+def road_surface(net, tf, *, vclass: str | None = "passenger", round_m: int = 2) -> dict:
+    """The map's DRIVABLE SURFACE, as `roads.CustomNetwork.set_road_surface` wants it.
+
+    This is deliberately NOT the routing graph and it is not derived from it. The graph holds one
+    centreline per physical road between two junction CENTRES; the surface holds what SUMO's own
+    network says is tarmac:
+
+      * every non-internal edge's own polyline, in its own place -- both carriageways of a two-way
+        street, and every one of several distinct roads that happen to share a junction pair. None
+        of that survives the graph, which keeps a single shape per undirected node pair (and must:
+        `roads.CustomNetwork` rejects two different shapes for one edge);
+      * every junction's polygon, reduced to a disc (centre + the furthest shape vertex). A vehicle
+        crossing a signalised junction is on an INTERNAL lane for tens of metres and no edge covers
+        it -- but the junction polygon does, and it is the map's own statement of where the tarmac
+        is rather than a reconstruction from connections.
+
+    Importing the internal lanes themselves was the alternative and it is not available: InTAS has
+    15,706 of them against `CustomNetwork.MAX_EDGES` of 12,000, before any of them get nodes.
+
+    Emitted BEFORE any class-dropping or connectivity trimming: `dist_to_road` asks whether a vehicle
+    is on a road, which does not stop being true because the router declined to use that road.
+    Deterministic (edges and junctions in id order); draws no RNG."""
+    polylines = []
+    for e in sorted(net.getEdges(), key=lambda e: e.getID()):
+        if e.getFunction() == "internal" or (vclass is not None and not e.allows(vclass)):
+            continue
+        pts = [[round(v, round_m) for v in tf(px, py)] for px, py in e.getShape()]
+        ded = [p for k, p in enumerate(pts) if k == 0 or p != pts[k - 1]]
+        if len(ded) >= 2:
+            polylines.append(ded)
+    junctions = []
+    for n in sorted(net.getNodes(), key=lambda n: n.getID()):
+        if n.getType() == "internal":
+            continue
+        c = tf(*n.getCoord()[:2])
+        # The radius is measured in the TARGET frame, from the transformed polygon -- taking it in
+        # SUMO metres and carrying it across would silently rescale it under a re-projection.
+        r = max((math.dist(c, tf(px, py)) for px, py in n.getShape()), default=0.0)
+        junctions.append([round(c[0], round_m), round(c[1], round_m), round(r, round_m)])
+    return {"polylines": polylines, "junctions": junctions}
+
+
 def _canonicalise_shapes(directed: list, coords: list) -> int:
     """ONE geometry per physical road, and re-measure the lengths against it.
 
@@ -435,6 +477,17 @@ def _canonicalise_shapes(directed: list, coords: list) -> int:
     one `edge_shape` per undirected key and REJECTS a second, different one). So the importer has
     to choose, and it chooses deterministically: the low->high direction's polyline is the road's
     geometry, and the high->low record carries its exact reverse.
+
+    WHAT THIS COSTS, measured on InTAS rather than asserted: 2,165 of 7,941 records get a substituted
+    shape, displacing their original vertices by p50 5.81 m / p95 9.61 m / max 183.69 m. The tail is
+    not the carriageway offset -- it is 35 undirected node-pairs joined by MORE THAN ONE distinct
+    physical road (a straight street and a loop road between the same two junctions), where one
+    geometry is imposed on the other. Distance-to-road over the frozen InTAS trace: p95 4.776 m /
+    max 17.173 m per carriageway, p95 6.399 m / max 57.481 m after this function.
+
+    That loss is unavoidable in the GRAPH (one edge, one shape) and it is why `road_surface` exists:
+    `dist_to_road` measures against the per-carriageway geometry, which this never touches, so the
+    substitution now only affects where an INTERNAL (non-replay) vehicle drives.
 
     Returns the number of records whose shape was replaced."""
     canon: dict[tuple[int, int], list] = {}
@@ -469,7 +522,9 @@ def read_net(net_path: str):
 def net_to_network(net, *, projection: dict | None = None, expect_bbox_xy: list | None = None,
                    max_nodes: int = 0, shapes: bool = True, turns: bool = False,
                    strong: bool = False, vclass: str | None = "passenger",
-                   min_edge_m: float = 1.0, round_m: int = 1) -> tuple[list, list, dict]:
+                   min_edge_m: float = 1.0, round_m: int = 1,
+                   undirected_shapes: bool = False, surface: bool = False,
+                   ) -> tuple[list, list, dict]:
     """A sumolib net -> (nodes, edges, info) in custom-network form.
 
     nodes are REAL junctions only (netconvert already folded curve vertices into edge shapes);
@@ -485,7 +540,19 @@ def net_to_network(net, *, projection: dict | None = None, expect_bbox_xy: list 
 
     `strong=True` keeps only the largest STRONGLY connected component -- required by a consumer that
     honours one-ways (a bbox-clipped extract leaves junctions you can drive into and never out of);
-    the count is reported as `weak_only_nodes` either way."""
+    the count is reported as `weak_only_nodes` either way.
+
+    `undirected_shapes=True` emits the undirected `edges` array in `parse_edge_spec`'s OBJECT form
+    carrying the canonical curve geometry, instead of `[a, b, speed]` triples. THIS IS NOT COSMETIC.
+    The triples describe every road as the straight chord between its junctions, and a consumer that
+    builds from the undirected array -- which is what `road_network="sumo"` does by default -- then
+    reasons about a city whose curved roads have been replaced by their chords. Measured on InTAS:
+    distance from a replayed SUMO position to the engine's roads was p50 2.203 m / p95 17.434 m /
+    max 95.227 m with the triples and p50 1.671 m / p95 7.219 m / max 57.481 m with the shapes. Left
+    False the array is byte-identical to what every existing consumer reads.
+
+    `surface=True` additionally emits `info["road_surface"]` -- see `road_surface()`. It is map
+    geometry for `dist_to_road`, NOT topology: no node, no edge and no route changes because of it."""
     tf, param = _transformer(net, projection)
     nodes_all = [n for n in net.getNodes() if n.getType() != "internal"]
     edges_all = [e for e in net.getEdges()
@@ -599,13 +666,30 @@ def net_to_network(net, *, projection: dict | None = None, expect_bbox_xy: list 
         strong_set = _largest_strong_component(
             len(coords), [d for d in directed if d["a"] in remap and d["b"] in remap])
         weak_only = len(remap) - len(strong_set & set(remap))
+        strong_trimmed = 0
         if strong and len(strong_set) >= 2:
             keep_ids = sorted(i for i in remap if i in strong_set)
+            strong_trimmed = len(remap) - len(keep_ids)
             remap = {old: new for new, old in enumerate(keep_ids)}
             out_nodes = [coords[old] for old in keep_ids]
             weak_only = 0                        # ... they are gone now
-        out_edges = [[remap[a], remap[b], round(sp, 1)]
-                     for (a, b), sp in sorted(undirected.items()) if a in remap and b in remap]
+        inv_remap = {new: old for old, new in remap.items()}
+        out_edges: list = [[remap[a], remap[b], round(sp, 1)]
+                           for (a, b), sp in sorted(undirected.items()) if a in remap and b in remap]
+        if undirected_shapes:
+            # ONE canonical polyline per physical road (`_canonicalise_shapes` already made the two
+            # directions agree), attached to the undirected array so the graph follows the road's
+            # curve instead of chording it. Object form; `roads.parse_edge_spec` reads both.
+            canon_shape = {(rec["a"], rec["b"]): rec["shape"]
+                           for rec in directed if rec.get("shape") and rec["a"] < rec["b"]}
+            shaped = []
+            for a, b, sp in out_edges:
+                e: dict = {"a": a, "b": b, "speed": sp}
+                sh = canon_shape.get((inv_remap[a], inv_remap[b]))
+                if sh:
+                    e["shape"] = sh
+                shaped.append(e)
+            out_edges = shaped
         kept_dir = []
         old_to_new_dir: dict[int, int] = {}
         for k, rec in enumerate(directed):
@@ -628,11 +712,35 @@ def net_to_network(net, *, projection: dict | None = None, expect_bbox_xy: list 
                     short_edges_dropped=too_short, speeds_clamped=clamped,
                     strong_component_nodes=len(strong_set), weak_only_nodes=weak_only,
                     strongly_connected=bool(strong),
+                    # nodes REMOVED because they could be entered and never left. Reported so the
+                    # trim is a stated fact of the import rather than a silent difference between
+                    # two consumers of the same document.
+                    strong_trimmed_nodes=strong_trimmed,
                     projection=projection,
                     road_bbox=[min(p[0] for p in out_nodes), min(p[1] for p in out_nodes),
                                max(p[0] for p in out_nodes), max(p[1] for p in out_nodes)])
+        # How much geometry the ONE-SHAPE-PER-EDGE graph model cannot hold, reported rather than
+        # left to be rediscovered. A physical road contributes ONE directed record if it is one-way
+        # and TWO if it is not, so a node pair carrying MORE than two is joined by more than one
+        # distinct road -- and `_canonicalise_shapes` then imposes one of their geometries on the
+        # others. 35 such pairs in InTAS; the `road_surface` layer is what keeps their real
+        # polylines available to `dist_to_road`.
+        _by_pair: dict[tuple[int, int], int] = {}
+        for rec in kept_dir:
+            k = (min(rec["a"], rec["b"]), max(rec["a"], rec["b"]))
+            _by_pair[k] = _by_pair.get(k, 0) + 1
+        info["parallel_road_keys"] = sum(1 for v in _by_pair.values() if v > 2)
+        info["undirected_shapes"] = bool(undirected_shapes)
         info["alignment"] = _assert_alignment(out_nodes, expect_bbox_xy)
         info.update(topology_stats(out_nodes, out_edges, kept_dir, sig))
+        if surface:
+            info["road_surface"] = road_surface(net, tf, vclass=vclass)
+            info["road_surface_stats"] = {
+                "polylines": len(info["road_surface"]["polylines"]),
+                "segments": sum(len(p) - 1 for p in info["road_surface"]["polylines"]),
+                "junction_discs": len(info["road_surface"]["junctions"]),
+                "junction_radius_max_m": round(max((j[2] for j in info["road_surface"]["junctions"]),
+                                                   default=0.0), 2)}
         return out_nodes, out_edges, info
     raise ValueError("no connected component could be built from this .net.xml")
 
@@ -640,9 +748,13 @@ def net_to_network(net, *, projection: dict | None = None, expect_bbox_xy: list 
 def topology_stats(nodes: list, edges: list, directed: list, signal_nodes=()) -> dict:
     """The fidelity numbers this import is judged on: one-way share, degree distribution,
     intersection count, per-edge lane distribution and lane-km. Same shape for either import path
-    so the raw-OSM graph can be scored against the netconvert net as ground truth."""
+    so the raw-OSM graph can be scored against the netconvert net as ground truth.
+
+    `edges` may be either form `roads.parse_edge_spec` accepts -- the `[a, b, speed]` triples or the
+    object records `undirected_shapes=True` emits -- because this function is called on both."""
     deg: dict[int, set] = {}
-    for a, b, *_r in edges:
+    for e in edges:
+        a, b = (e["a"], e["b"]) if isinstance(e, dict) else (e[0], e[1])
         deg.setdefault(a, set()).add(b)
         deg.setdefault(b, set()).add(a)
     hist: dict[int, int] = {}

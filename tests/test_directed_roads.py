@@ -799,3 +799,84 @@ def test_geometry_keeps_the_positional_edge_form_every_consumer_indexes():
     assert len(geo["edge_attrs"]) == len(geo["edges"])
     a0 = geo["edge_attrs"][geo["edges"].index([0, 1, 20.0])]
     assert a0["lanes_forward"] == 3 and a0["lanes_backward"] == 1 and a0["shape"] == [[200.0, 40.0]]
+
+
+# --------------------------------------------------------------------------- #
+# the drivable SURFACE layer -- `dist_to_road` asks a MAP question, not a routing one
+# --------------------------------------------------------------------------- #
+def test_road_surface_is_absent_until_asked_for_and_changes_nothing():
+    """The whole layer is opt-in. An untouched network exposes an empty surface and computes the
+    identical distances, which is what keeps every pinned golden byte-identical."""
+    net = CustomNetwork(H_NODES, H_EDGES)
+    assert net._junc == () and net._jindex == {} and net._surface == {}
+    assert "road_surface" not in net.stats()
+    before = [net.dist_to_road(x, y) for x in range(0, 900, 97) for y in range(0, 700, 89)]
+    other = CustomNetwork(H_NODES, H_EDGES)
+    assert [other.dist_to_road(x, y) for x in range(0, 900, 97)
+            for y in range(0, 700, 89)] == before
+
+
+def test_a_junction_disc_makes_the_junction_INTERIOR_road():
+    """The reason this exists: a vehicle crossing a signalised junction is on an internal lane that
+    no graph edge covers, so it measures as far off-road as the junction is big. The junction
+    polygon is the map's own statement that the whole area is tarmac."""
+    net = CustomNetwork(H_NODES, H_EDGES)
+    # (400, 150) is inside the H's crossbar area but 150 m from the nearest centreline
+    off = net.dist_to_road(400.0, 150.0)
+    assert off > 100.0
+    net.set_road_surface(junctions=[(400.0, 150.0, 20.0)])
+    assert net.dist_to_road(400.0, 150.0) == 0.0          # inside the disc
+    assert net.dist_to_road(400.0, 165.0) == 0.0          # still inside
+    assert net.dist_to_road(400.0, 200.0) == pytest.approx(30.0, abs=1e-6)   # 50 m out, r = 20
+    # ... and a position genuinely off the map is still far off it: the gate keeps its teeth
+    assert net.dist_to_road(400.0, 900.0) > 250.0
+
+
+def test_surface_polylines_are_geometry_and_NOT_topology():
+    """A surface polyline must not become a road you can drive: no node, no edge, no route, no
+    length. It exists so `dist_to_road` stops calling an honest vehicle off-road."""
+    net = CustomNetwork(H_NODES, H_EDGES)
+    edges_before, len_before, adj_before = list(net.edges), dict(net.edge_len), dict(net.uadj)
+    assert net.dist_to_road(200.0, 500.0) > 150.0
+    info = net.set_road_surface(polylines=[[[0.0, 500.0], [400.0, 500.0], [800.0, 500.0]]],
+                                junctions=[])
+    assert net.dist_to_road(200.0, 500.0) == pytest.approx(0.0, abs=1e-9)
+    assert list(net.edges) == edges_before and dict(net.edge_len) == len_before
+    assert dict(net.uadj) == adj_before
+    assert info["surface_segments"] == 2 and info["surface_polylines"] == 1
+    assert net.stats()["road_surface"]["surface_segments"] == 2
+
+
+def test_the_surface_ring_walk_agrees_with_a_brute_force_scan():
+    """The cell index prunes; it must not approximate. Junction discs are registered by BOUNDING
+    BOX so every point of a disc lies in a registered cell -- the same invariant the segment
+    chunking maintains, and what makes the early break exact."""
+    net = CustomNetwork(H_NODES, H_EDGES)
+    polys = [[[0.0, 500.0], [400.0, 520.0], [800.0, 500.0]], [[100.0, -200.0], [700.0, -180.0]]]
+    juncs = [(0.0, 0.0, 12.0), (400.0, 300.0, 35.0), (800.0, 600.0, 5.0)]
+    net.set_road_surface(polylines=polys, junctions=juncs)
+    segs = list(net._segs)
+    for x in range(-300, 1200, 71):
+        for y in range(-400, 900, 67):
+            brute = min([_pt_seg_dist(x, y, *s) for s in segs]
+                        + [max(0.0, math.hypot(x - jx, y - jy) - jr) for jx, jy, jr in juncs])
+            assert net.dist_to_road(float(x), float(y)) == pytest.approx(brute, abs=1e-9), (x, y)
+
+
+def test_the_surface_invalidates_the_distance_memo():
+    """`dist_to_road` memoises, and the surface changes the answer. A stale memo would report the
+    pre-surface distance for every position already queried during network construction."""
+    net = CustomNetwork(H_NODES, H_EDGES)
+    assert net.dist_to_road(400.0, 150.0) > 100.0         # populate the memo
+    net.set_road_surface(junctions=[(400.0, 150.0, 20.0)])
+    assert net.dist_to_road(400.0, 150.0) == 0.0
+
+
+def test_a_malformed_surface_is_refused():
+    net = CustomNetwork(H_NODES, H_EDGES)
+    with pytest.raises(ValueError, match=">= 2 points"):
+        net.set_road_surface(polylines=[[[0.0, 0.0]]])
+    with pytest.raises(ValueError, match="radius"):
+        net.set_road_surface(junctions=[(0.0, 0.0, -1.0)])
+    with pytest.raises(ValueError, match="non-finite"):
+        net.set_road_surface(polylines=[[[0.0, 0.0], [float("inf"), 1.0]]])

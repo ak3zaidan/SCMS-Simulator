@@ -469,3 +469,92 @@ def test_real_city_import_lands_on_the_raw_osm_graph():
     assert info["alignment"]["nodes_inside_expected_bbox_frac"] > 0.8
     for k in range(4):                                 # same extent, to a few metres
         assert abs(info["road_bbox"][k] - raw_info["road_bbox"][k]) < 5.0
+
+
+# --------------------------------------------------------------------------- #
+# the geometry the engine actually reasons about
+# --------------------------------------------------------------------------- #
+def test_the_undirected_array_carries_no_curve_unless_asked(net_path):
+    """THE DEFECT THIS CLOSES. `road_network="sumo"` builds `CustomNetwork` from the document's
+    UNDIRECTED array, and as `[a, b, speed]` triples that array says every road is the straight
+    chord between its junctions -- the curve lives only in `directed_edges`, which that path never
+    reads. On InTAS this measured a replayed SUMO vehicle p95 17.434 m / max 95.227 m off the
+    engine's roads and made the coherence gate refuse an honest trace."""
+    _n, plain, _i = netimport.import_net(net_path, projection=None)
+    assert plain == [[0, 1, 22.2], [1, 2, 13.9]]                   # unchanged for every consumer
+    assert all(isinstance(e, list) for e in plain)
+    nodes, shaped, info = netimport.import_net(net_path, projection=None, undirected_shapes=True)
+    assert info["undirected_shapes"] is True
+    ab = next(e for e in shaped if (e["a"], e["b"]) == (0, 1))
+    assert ab["speed"] == 22.2 and ab["shape"] == [[100.0, 21.6]]  # the curve, on the graph edge
+    assert next(e for e in shaped if (e["a"], e["b"]) == (1, 2)).get("shape") is None
+    # ... and it still loads, with the curve reaching the engine's own geometry this time
+    net = CustomNetwork(nodes, shaped)
+    assert net.edge_shape[(0, 1)] == ((100.0, 21.6),)
+    assert net.dist_to_road(100.0, 21.6) == pytest.approx(0.0, abs=1e-9)
+    assert CustomNetwork(nodes, plain).dist_to_road(100.0, 21.6) == pytest.approx(21.6, abs=0.1)
+
+
+def test_road_surface_is_the_map_not_the_graph(net_path):
+    """`road_surface` is what `dist_to_road` should measure against: every edge's OWN polyline
+    (the graph keeps one per node pair) plus the junction polygons (the graph has nothing inside a
+    junction at all). It is opt-in and it is geometry, not topology."""
+    _n, _e, plain = netimport.import_net(net_path, projection=None)
+    assert "road_surface" not in plain
+    _n2, _e2, info = netimport.import_net(net_path, projection=None, surface=True)
+    surf = info["road_surface"]
+    assert len(surf["polylines"]) == 3                   # AB, BC and CB each keep their own
+    assert [round(v, 1) for v in surf["polylines"][0][1]] == [100.0, 21.6]
+    assert len(surf["junctions"]) == 3                   # A, B, C -- centre + polygon radius
+    assert all(len(j) == 3 and j[2] >= 0.0 for j in surf["junctions"])
+    assert info["road_surface_stats"]["polylines"] == 3
+    assert info["road_surface_stats"]["junction_discs"] == 3
+
+
+def test_a_junction_radius_is_measured_in_the_TARGET_frame(net_path):
+    """Carrying the radius across as a SUMO-metre scalar would silently rescale it under a
+    re-projection -- the same class of error `_assert_frame` exists to catch, one layer down."""
+    xml = open(net_path, encoding="utf-8").read().replace(
+        '<junction id="C" type="priority" x="200.00" y="150.00" incLanes="BC_0" intLanes=""\n'
+        '              shape="200.00,150.00"/>',
+        '<junction id="C" type="priority" x="200.00" y="150.00" incLanes="BC_0" intLanes=""\n'
+        '              shape="190.00,150.00 200.00,160.00 210.00,150.00 200.00,140.00"/>')
+    p = os.path.join(os.path.dirname(net_path), "wide.net.xml")
+    open(p, "w", encoding="utf-8").write(xml)
+    _n, _e, own = netimport.import_net(p, projection=None, surface=True)
+    r_own = {tuple(j[:2]): j[2] for j in own["road_surface"]["junctions"]}[(200.0, 150.0)]
+    assert r_own == pytest.approx(10.0, abs=0.01)
+    _n2, _e2, geo = netimport.import_net(p, projection=_fixture_frame(), surface=True)
+    # the frame is a metric re-projection of the same net, so the radius must survive it to ~cm
+    far = max(geo["road_surface"]["junctions"], key=lambda j: j[1])
+    assert far[2] == pytest.approx(10.0, abs=0.05)
+
+
+def test_strong_trimming_is_reported_as_a_number_not_a_flag(net_path):
+    """A one-way A->B with no way back makes A a node a trip can leave but nothing can re-enter,
+    and B/C a pocket A cannot be reached from. Whichever gets dropped, HOW MANY is the fact a
+    consumer needs -- `strongly_connected: false` alone leaves it to be rediscovered."""
+    _n, _e, loose = netimport.import_net(net_path, projection=None)
+    assert loose["strongly_connected"] is False and loose["strong_trimmed_nodes"] == 0
+    assert loose["strong_component_nodes"] == 2 and loose["kept_nodes"] == 3
+    nodes, _e2, tight = netimport.import_net(net_path, projection=None, strong=True)
+    assert tight["strongly_connected"] is True
+    assert tight["strong_trimmed_nodes"] == 1 and len(nodes) == 2
+
+
+def test_parallel_physical_roads_are_counted_because_the_graph_cannot_hold_them(net_path):
+    """One shape per undirected node pair is a hard constraint of `roads.CustomNetwork`. Two
+    DISTINCT roads joining the same two junctions therefore lose one of their geometries, and the
+    count says how often -- 35 node pairs on InTAS, displacing vertices by up to 183.69 m."""
+    _n, _e, info = netimport.import_net(net_path, projection=None)
+    assert info["parallel_road_keys"] == 0
+    xml = open(net_path, encoding="utf-8").read().replace(
+        '    <junction id="A"',
+        '    <edge id="BC2" from="B" to="C" priority="3" type="highway.residential">\n'
+        '        <lane id="BC2_0" index="0" speed="13.89" length="260.00" width="3.20"\n'
+        '              shape="200.00,0.00 300.00,75.00 200.00,150.00"/>\n'
+        '    </edge>\n    <junction id="A"')
+    p = os.path.join(os.path.dirname(net_path), "parallel.net.xml")
+    open(p, "w", encoding="utf-8").write(xml)
+    _n2, _e2, par = netimport.import_net(p, projection=None)
+    assert par["parallel_road_keys"] == 1                 # BC, CB and BC2 all join junctions 1-2

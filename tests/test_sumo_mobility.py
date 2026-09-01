@@ -68,13 +68,14 @@ def _have_sumo() -> bool:
 needs_sumo = pytest.mark.skipif(not _have_sumo(), reason="SUMO_HOME + sumolib required")
 
 
-def _freeze_out_of_process(net, routes, out, run_seed, steps=None, dt=None):
+def _freeze_out_of_process(net, routes, out, run_seed, steps=None, dt=None, extra=()):
     """Freeze through the shipped CLI in a FRESH interpreter (see the module docstring)."""
     import subprocess
     import sys
     cmd = [sys.executable, "-m", "scms_sim_ref.mock_pipeline.sumo_trace",
            "--net", net, "--routes", routes, "--out", out,
-           "--run-seed", str(run_seed), "--steps", str(steps or STEPS), "--dt", str(dt or DT)]
+           "--run-seed", str(run_seed), "--steps", str(steps or STEPS), "--dt", str(dt or DT),
+           *[str(a) for a in extra]]
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO,
                        env={**os.environ, "PYTHONPATH": os.path.join(REPO, "src")})
     assert r.returncode == 0, f"freeze failed:\n{r.stdout}\n{r.stderr}"
@@ -253,6 +254,112 @@ def test_freeze_is_deterministic_and_seed_controlled(scenario, tmp_path):
     assert scenario["b"].sha256 != scenario["a"].sha256, "a different seed must move the hash"
     assert scenario["b"].meta["sumo_seed"] != scenario["a"].meta["sumo_seed"]
     assert scenario["a"].meta["sumo_seed"] == st.derive_sumo_seed(42)
+
+
+@needs_sumo
+@pytest.mark.parametrize("extra", [(), ("--warmup", "0"), ("--substeps", "1"),
+                                   ("--time-to-teleport", "-1")])
+def test_warmup_and_substeps_are_byte_identical_at_their_defaults(scenario, tmp_path, extra):
+    """The artifact hash may not move because an option that is OFF now exists.
+
+    `meta` is inside the hashed file, so an unconditional new key would re-hash every trace ever
+    frozen and turn `--sumo-trace-sha256` pins into false alarms. Both keys are therefore emitted
+    only when the option is actually engaged."""
+    t = _freeze_out_of_process(scenario["net"], scenario["routes"],
+                               str(tmp_path / f"d{len(extra)}{extra[-1] if extra else ''}.trace"),
+                               42, extra=extra)
+    assert t.sha256 == scenario["a"].sha256, f"{extra or 'no flags'} moved the artifact hash"
+    for k in ("warmup_steps", "substeps", "time_to_teleport", "split_on_gap", "gap_splits"):
+        assert k not in t.meta, f"{k} must not appear in meta at its default"
+    inv = t.meta["invocation"]
+    assert inv[inv.index("--time-to-teleport") + 1] == "-1", (
+        "the default must still render as the integer '-1' SUMO's CLI was given before it became "
+        "a parameter -- the invocation is inside the hashed artifact")
+
+
+@needs_sumo
+def test_warmup_starts_the_recording_on_a_loaded_network(scenario, tmp_path):
+    """A warm-up is not a longer trace: it is the SAME window, entered already full.
+
+    `--begin T` makes SUMO discard every vehicle departing before T, so a window opened cold starts
+    on an empty city and its first minutes are a fill transient rather than the traffic being
+    studied. The measured consequence on InTAS's AM peak is 36 vehicles ten seconds after
+    `--begin 25200` against ~3,400 with an hour of warm-up ahead of it."""
+    cold = _freeze_out_of_process(scenario["net"], scenario["routes"],
+                                  str(tmp_path / "cold.trace"), 42, steps=10)
+    warm = _freeze_out_of_process(scenario["net"], scenario["routes"],
+                                  str(tmp_path / "warm.trace"), 42, steps=10,
+                                  extra=("--warmup", str(STEPS // 2)))
+    assert warm.meta["warmup_steps"] == STEPS // 2
+    assert warm.meta["step0_sim_time"] == pytest.approx(warm.meta["begin"]
+                                                        + (STEPS // 2 + 1) * DT)
+    assert warm.meta["end"] == pytest.approx(warm.meta["begin"] + (STEPS // 2 + 10) * DT)
+    assert len(warm.vehicles) > len(cold.vehicles), (
+        "a warmed-up window must open on more vehicles than a cold one "
+        f"({len(warm.vehicles)} vs {len(cold.vehicles)})")
+    # every vehicle already on the network is written from step 0, contiguously
+    assert sum(1 for v in warm.vehicles if v.first_step == 0) > 0
+    assert warm.meta["steps"] == 10, "steps counts RECORDED steps, not warm-up ones"
+
+
+@needs_sumo
+def test_substeps_keeps_the_integration_step_and_the_sample_rate_apart(scenario, tmp_path):
+    """SUMO integrates at dt/N; the artifact -- and so the engine -- still steps at dt."""
+    sub = _freeze_out_of_process(scenario["net"], scenario["routes"],
+                                 str(tmp_path / "sub.trace"), 42, extra=("--substeps", "5"))
+    assert sub.meta["substeps"] == 5
+    assert sub.meta["dt"] == pytest.approx(DT), "the ARTIFACT's dt is untouched"
+    assert sub.meta["sumo_step_length"] == pytest.approx(DT / 5)
+    inv = sub.meta["invocation"]
+    assert inv[inv.index("--step-length") + 1] == repr(DT / 5), "SUMO must get the sub-step"
+    assert inv[inv.index("--end") + 1] == repr(float(sub.meta["end"]))
+    assert sub.meta["steps"] == scenario["a"].meta["steps"]
+    # a different integration step is a different simulation, so the trajectory must differ --
+    # otherwise the flag would be doing nothing at all
+    assert sub.sha256 != scenario["a"].sha256
+    reloaded = st.load(str(tmp_path / "sub.trace"))
+    assert len(reloaded.vehicles) == len(sub.vehicles)
+
+
+@needs_sumo
+def test_a_vehicle_that_leaves_and_returns_is_refused_by_default_and_split_on_request(
+        scenario, tmp_path):
+    """SUMO's teleport (and its parking manoeuvre) take a vehicle OUT of the network and put it back
+    somewhere else. The trace format indexes state by `step - first_step`, so a gap written as a
+    contiguous run mislabels every later step -- it must be refused, or recorded as a second
+    trajectory, never papered over.
+
+    A very short `--time-to-teleport` is used to MAKE the event happen on a procedural grid; on a
+    real congested scenario it happens on its own -- InTAS's AM peak teleports 365 times in 25,271
+    vehicles under its own 300 s policy, so a freeze of it is unwritable without this.
+    """
+    import subprocess
+    import sys
+    base = [sys.executable, "-m", "scms_sim_ref.mock_pipeline.sumo_trace",
+            "--net", scenario["net"], "--routes", scenario["routes"],
+            "--run-seed", "42", "--steps", str(STEPS), "--dt", str(DT),
+            "--time-to-teleport", "1"]
+    env = {**os.environ, "PYTHONPATH": os.path.join(REPO, "src")}
+    r = subprocess.run(base + ["--out", str(tmp_path / "refused.trace")],
+                       capture_output=True, text=True, cwd=REPO, env=env)
+    assert r.returncode != 0 and "disappeared and came back" in r.stderr, (
+        "a gap must be refused by default")
+    assert "--split-on-gap" in r.stderr, "the refusal must name the option that handles it"
+
+    ok = _freeze_out_of_process(scenario["net"], scenario["routes"],
+                                str(tmp_path / "split.trace"), 42,
+                                extra=("--time-to-teleport", "1", "--split-on-gap"))
+    assert ok.meta["split_on_gap"] is True
+    assert ok.meta["gap_splits"] >= 1, "the control must actually produce a gap to split"
+    assert ok.meta["time_to_teleport"] == 1.0
+    assert ok.meta["teleports"] >= 1
+    seg = [v for v in ok.vehicles if "#" in v.sumo_id]
+    assert len(seg) == ok.meta["gap_splits"]
+    # every trajectory, split or not, is still contiguous -- which is what `load()` verifies
+    st.load(str(tmp_path / "split.trace"))
+    for v in seg:
+        assert v.last_step >= v.first_step
+        assert v.route_length_m >= 0.0, "a segment's own driven length, not the trip's cumulative"
 
 
 @needs_sumo
@@ -587,3 +694,67 @@ def test_config_round_trips_through_the_manifest(scenario, tmp_path):
     assert back.sumo_net == scenario["net"]
     res = run_pipeline(config_from_dict({**man["config"], "out_dir": str(tmp_path / "rt2")}))
     assert res.data_digest == man["data_digest_sha256"], "a manifest must replay to itself"
+
+
+# --------------------------------------------------------------------------- #
+# 5b. the coherence gate measures against the MAP, not against the routing graph
+# --------------------------------------------------------------------------- #
+@needs_sumo
+def test_the_engine_measures_against_the_drivable_surface(scenario, tmp_path):
+    """WHY THE GATE USED TO FIRE ON AN HONEST TRACE. `dist_to_road` was answering a map question
+    with the routing graph -- one centreline per physical road, nothing at all inside a junction --
+    so a vehicle crossing a signalised junction, or driving the other carriageway of a two-way
+    street, measured as off-road. Measured on InTAS (1,188 vehicles, 4,071 sampled positions):
+    graph chords p50 2.203 / p95 17.434 / max 95.227 m; with this surface p50 0.351 / p95 3.195 /
+    max 4.804 m, against a raw-SUMO-network reference of p95 3.201 / max 6.400 m."""
+    run_pipeline(_cfg(scenario, tmp_path / "surf"))
+    mob = json.load(open(tmp_path / "surf" / "manifest.json"))["mobility"]
+    surf = mob["network"]["road_surface"]
+    assert surf["surface_segments"] > 0 and surf["junction_discs"] > 0
+    assert mob["coherence"]["measured_against"] == "road_surface"
+    # The surface is GEOMETRY, not topology: it carries one polyline per DIRECTED carriageway plus
+    # the junction polygons, so it is strictly richer than the graph's one segment per undirected
+    # edge -- while the graph itself (n_nodes) is untouched by installing it.
+    assert surf["surface_segments"] > surf["graph_segments"] > 0
+    assert mob["network"]["n_nodes"] == mob["network"]["strong_component_nodes"]
+    assert surf["junction_discs"] >= mob["network"]["n_nodes"]
+
+
+@needs_sumo
+def test_a_misregistered_frame_is_refused_WITH_the_surface_installed(scenario):
+    """The negative arm has to survive the fix. A more generous road surface must buy coherence for
+    honest vehicles without buying it for a wrong projection origin -- the failure mode where every
+    street still looks plausible and the whole city is 250 m from where the engine thinks it is."""
+    from scms_sim_ref.mock_pipeline.roads import CustomNetwork
+    from scms_sim_ref.mock_pipeline.osm import network_document
+    from scms_sim_ref.mock_pipeline.run import _parse_custom_network
+
+    nodes, edges, info, tf = st.engine_network(scenario["net"])
+    net = CustomNetwork(*_parse_custom_network(network_document(nodes, edges, info)))
+    stats = net.set_road_surface(**info["road_surface"])
+    assert stats["junction_discs"] > 0
+    good = st.SumoReplayMobility(scenario["a"], dt=DT, transform=tf)
+    bad = st.SumoReplayMobility(scenario["a"], dt=DT,
+                                transform=lambda x, y: (x + 250.0, y - 130.0))
+    g = good.offroad_stats(net.dist_to_road)
+    b = bad.offroad_stats(net.dist_to_road)
+    assert g["p95"] <= PipelineConfig().sumo_offroad_p95_max_m, g
+    assert b["p95"] > PipelineConfig().sumo_offroad_p95_max_m, b
+    # and the surface must not have flattened the distribution into "everything is on a road"
+    assert b["p50"] > 10.0, b
+
+
+@needs_sumo
+def test_the_engine_graph_is_the_strongly_connected_core_in_every_configuration(scenario):
+    """`strongly_connected: false` is not a diagnostic to carry around: those junctions can be
+    entered and never left, so a trip routed onto one strands. Before, whether they were dropped
+    depended on `custom_network_directed` -- off, the router ignored one-ways and never saw them;
+    on, `_parse_custom_network` trimmed them silently. Two configurations, two different maps, one
+    manifest schema describing both. InTAS: 39 of 3,328 junctions, 1.2% of the graph."""
+    _n, _e, info, _tf = st.engine_network(scenario["net"])
+    assert info["strongly_connected"] is True
+    assert info["kept_nodes"] == info["strong_component_nodes"]
+    assert info["strong_trimmed_nodes"] >= 0
+    # the roads those junctions carried are still MAP: a vehicle SUMO drove down a road the router
+    # declined to use is on a road, and calling it mapOffRoad is the false positive being removed
+    assert len(info["road_surface"]["junctions"]) >= info["kept_nodes"]
