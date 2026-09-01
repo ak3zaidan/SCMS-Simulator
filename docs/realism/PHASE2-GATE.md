@@ -65,6 +65,51 @@ is 2.41 (urban LOS), 2.08 (highway LOS), 1.92 (urban NLOS) — already computed 
 The gate should be that ratio plus an awareness floor, so a model cannot pass by simply getting
 quieter. **Recommend replacing the absolute-width gate.**
 
+## Correction (2026-08-31): real buildings are *worse*, so the fallback was not the cause
+
+The section above concluded that the uniform canyon-density fallback was "the dominant cause" of the
+awareness collapse, and predicted that a real OSM map — where the fallback is never used — was the
+configuration the model was designed for. **That prediction was wrong and the measurement refutes it.**
+
+Ingolstadt imported from OSM with 1519 real building polygons (`--buildings --attrs --signals`;
+341 nodes, 402 edges, 177 one-way, 52 signalled junctions; buildings sharing the road graph's exact
+projection, `centroid_inside_road_bbox_frac = 1.0`):
+
+| Metric | disc | geometric, synthetic grid + canyon 4/km | geometric, canyon 0 | **geometric, real OSM buildings** |
+|---|---|---|---|---|
+| awareness @100 m | 0.976 | 0.539 | 0.913 | **0.413** |
+| awareness @200 m | 0.902 | 0.279 | 0.771 | **0.115** |
+| awareness @300 m | 0.996 | 0.214 | 0.619 | **0.048** |
+| effective range | 494.8 m | 121.1 m | 398.1 m | **90.4 m** |
+| gray zone | 80.6 (fail) | 271.3 (pass) | 509.4 (pass) | **113.5 (pass)** |
+
+So the over-attenuation is **intrinsic to the parameterisation, not an artefact of the fallback**.
+In a dense European old town almost every link that is not along the same street is NLOS, and the
+3GPP urban-NLOS term (`36.85 + 30·log10 d`) is steep.
+
+### But the gate itself is now suspect
+
+The measured effective range of 90 m is *consistent with the physics we configured*: at
+`tx_power 23 dBm` and `sensitivity −81 dBm`, the refdata computation gives an urban-NLOS median
+range of ~57 m, rising to **121.9 m at the 33 dBm ETSI ceiling** — and that 100–120 m band
+independently reproduces the measured "~100 m urban NLOS" anchor. Our 90 m sits inside it.
+
+Meanwhile the gate demands ≥ 0.90 awareness at 200 m, anchored on Boban & d'Orey. That campaign's
+figure is very unlikely to be an **all-pairs** average over every vehicle pair in a dense city
+including through-building links — which is exactly what our metric computes. Comparing an all-pairs
+average against a measurement whose selection conditions we have not reproduced is the same class of
+error as the GEH gate that graded a simulation against itself: the number is real, the comparison is
+not like-for-like.
+
+**Therefore: do not tune the model to reach 0.90.** That would be fitting to a mis-specified target.
+The next step is to establish what Boban & d'Orey actually measured — LOS-only pairs, same-road
+pairs, or all pairs — and either restate the metric to match those conditions or replace the anchor
+with one whose conditions we can reproduce. Only then is the awareness number meaningful.
+
+The one conclusion that survives unchanged: **the disc model's step-function edge is genuinely
+fixed** — the gray zone passes in every geometric configuration, and `disc`'s 494.8 m "effective
+range" was only ever `radio_range_m` read back.
+
 ## Actions
 
 1. Replace the uniform canyon-density fallback with street-geometry-aware classification on synthetic
