@@ -445,6 +445,12 @@ def _fmt_compare(res: dict) -> str:
             f"  reference : {res['reference']['source']}",
             f"              {_shape(res['reference'])}", "",
             f"  {'metric':<34} {'cand':>12} {'ref':>12} {'value':>10} {'limit':>7}  status"]
+    if res.get("self_graded"):
+        # Printed BEFORE the numbers, not appended after them: the exact zeros below are the thing a
+        # reader is most likely to quote, so the caveat has to arrive first.
+        rows[1:1] = ["  " + "!" * 88] + [f"  ! {ln}" for ln in _wrap(SELF_GRADED_NOTE, 84)] \
+                    + [f"  ! reference net: {res['self_graded']['reference_net']}",
+                       "  " + "!" * 88]
     rows.append("  " + "-" * 88)
     for m in res["metrics"]:
         c = m["candidate"] if not isinstance(m["candidate"], dict) else "hist"
@@ -453,9 +459,26 @@ def _fmt_compare(res: dict) -> str:
                     f"{m['limit']:>7}  {m['status'].upper()}"
                     f"{'' if m['severity'] == 'hard' else '  (informational)'}")
     s = res["summary"]
-    rows.append(f"  -> {s['pass']} pass / {s['fail']} fail / {s['na']} n-a; "
-                f"hard failures: {s['hard_failures'] or 'none'}")
+    if res.get("self_graded"):
+        rows.append(f"  -> {s['pass']} pass / {s['fail']} fail / {s['na']} n-a -- SELF-GRADED, "
+                    f"NOT fidelity evidence (parser round-trip against its own input file)")
+    else:
+        rows.append(f"  -> {s['pass']} pass / {s['fail']} fail / {s['na']} n-a; "
+                    f"hard failures: {s['hard_failures'] or 'none'}")
     return "\n".join(rows)
+
+
+def _wrap(text: str, width: int) -> list:
+    out, line = [], ""
+    for word in text.split():
+        if line and len(line) + 1 + len(word) > width:
+            out.append(line)
+            line = word
+        else:
+            line = f"{line} {word}".strip()
+    if line:
+        out.append(line)
+    return out
 
 
 # ============================================================================================ #
@@ -763,6 +786,36 @@ def attribute_overlaps(dataset_dir: str, *, overlap_m: float = OVERLAP_DIST_M,
 # ============================================================================================ #
 # CLI
 # ============================================================================================ #
+SELF_GRADED_NOTE = (
+    "SELF-GRADED: this candidate was parsed from the SAME .net.xml file it is being scored "
+    "against. Every metric is therefore a PARSER ROUND-TRIP measurement and 'all pass' is "
+    "structurally guaranteed -- it says the importer reads netconvert's output faithfully, and "
+    "says NOTHING about how faithfully the engine network models the real road layout. The "
+    "raw-OSM row is the one that measures that. Metrics are reported as informational.")
+
+
+def _mark_self_graded(res: dict, gt_net: str) -> dict:
+    """Flag (and defang) a row whose candidate and reference are the same file.
+
+    `--city X --path netconvert` resolves BOTH sides through `NI.net_cache_path(bbox, cache)` with
+    the same default `NETCONVERT_OSM_ARGS`, so both land on the identical cached `.net.xml`. The row
+    printed 6/6 with `oneway_share_pp 0.0`, `degree_ks 0.0`, `intersection_rel_err 0.0` and
+    `lane_ks 0.0` -- exact zeros, because it was comparing a file with itself -- and nothing in the
+    output said so. A reader taking that as network-fidelity evidence was reading a self-graded
+    result, which is the same failure as a simulation graded against itself.
+    """
+    src = res.get("candidate", {}).get("parsed_from_net")
+    if not src or not gt_net or os.path.abspath(src) != os.path.abspath(gt_net):
+        return res
+    res["self_graded"] = {"reference_net": os.path.abspath(gt_net), "note": SELF_GRADED_NOTE}
+    for m in res.get("metrics", []):
+        m["severity"] = "informational"
+        m["self_graded"] = True
+    res["summary"]["self_graded"] = True
+    res["summary"]["hard_failures"] = []
+    return res
+
+
 def _resolve_gt_net(city: str, cache_dir: str) -> str:
     """The netconvert ground-truth net for a preset city (built once, then disk-cached)."""
     from scms_sim_ref.mock_pipeline import netimport as NI
@@ -785,14 +838,17 @@ def _candidate_for(city: str, path: str, cache_dir: str, max_nodes: int) -> dict
         doc = OSM.network_document(nodes, edges, info)
         return document_summary(doc, f"osm.py --{'attrs --signals' if attrs else 'legacy'}"
                                      f" max_nodes={max_nodes} ({city})")
-    if path == "netconvert":
-        nodes, edges, info = NI.import_city(city, cache_dir, max_nodes=0, shapes=True, strong=False)
+    if path in ("netconvert", "netconvert-strong"):
+        strong = path == "netconvert-strong"
+        nodes, edges, info = NI.import_city(city, cache_dir, max_nodes=0, shapes=True, strong=strong)
         doc = OSM.network_document(nodes, edges, info)
-        return document_summary(doc, f"netimport.py ({city})")
-    if path == "netconvert-strong":
-        nodes, edges, info = NI.import_city(city, cache_dir, max_nodes=0, shapes=True, strong=True)
-        doc = OSM.network_document(nodes, edges, info)
-        return document_summary(doc, f"netimport.py --strong ({city})")
+        label = f"netimport.py{' --strong' if strong else ''} ({city})"
+        summary = document_summary(doc, label)
+        # The .net.xml this candidate was PARSED FROM. `main` compares it with the reference net;
+        # when they are the same file the row is a parser round-trip, not a fidelity measurement,
+        # and it must say so rather than print a structurally guaranteed "6 pass / 0 fail".
+        summary["parsed_from_net"] = os.path.abspath(info["net_path"])
+        return summary
     raise ValueError(f"unknown import path {path!r}")
 
 
@@ -869,6 +925,8 @@ def main(argv=None) -> int:
                          "candidate": cd, "reference": {k: v for k, v in gt.items()
                                                         if not k.startswith("_")}}
                    for cd in cands]
+        results = [_mark_self_graded(r, gt_net) if "import_error" not in r["candidate"] else r
+                   for r in results]
         for r in results:
             if "import_error" in r["candidate"]:
                 print(f"\n  candidate : {r['candidate']['source']}\n"

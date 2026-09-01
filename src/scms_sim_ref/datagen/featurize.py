@@ -31,35 +31,99 @@ from typing import Any
 
 import pandas as pd
 
+from ..api.detect import THIRD_PARTY_PREFIX as _THIRD_PARTY_PREFIX
+from ..mock_pipeline import detectors as _detectors   # registers the built-in `check` slot entries
 from .benchmark import EXCLUDED_FEATURE_COLUMNS
 from .leakage_linter import lint_feature_frame
 
-REASON_VOCAB = [
-    "constantPositionFrozen",
-    "positionSpeedInconsistency",
-    "positionSpeedConsistency",   # mock-pipeline alias
-    "acceptanceRangeThreshold",
-    "positionJump",
-    "sybilCoLocation",
-    "headingInconsistency",
-    "implausibleAcceleration",
-    "staleOrReplay",
-    "beaconFrequency",
-    "signatureVerification",
-    "certValidity",
-    "mapOffRoad",
-    "vruImpersonation",
-    "denmPlausibility",
-]
+# --------------------------------------------------------------------------- #
+# The detector vocabulary, DERIVED FROM THE SHIPPED SUITE (PLUGIN-ARCHITECTURE.md phase 3)
+# --------------------------------------------------------------------------- #
+# These three lists used to be literals here, and adding one detector meant editing all three plus
+# eight sites in `run.py` -- which is precisely what made adding a detector a FORK. They are now
+# derived from the same declaration the engine builds its suite from, so a detector is declared
+# exactly once, next to its own arithmetic.
+#
+# Three consequences worth stating. The dead `positionSpeedConsistency` alias is gone BY
+# CONSTRUCTION (no check declares it, so it cannot appear). A THIRD-PARTY detector's column
+# (`detnorm_x_<plugin_id>_<code>`, section 4.4) is not in this list at all -- so the effective
+# vocabulary for a dataset is the shipped list PLUS the namespaced columns the reports carry, in
+# sorted order, which is what lets a third-party check reach the ML tables with zero edits to this
+# file. And the derivation reads `detectors.BUILTIN_CHECKS` (a fixed tuple) rather than
+# `registry.builtin_names("check")` (a live view of a process-global dict), so an imported
+# distribution that calls `register_builtin()` cannot add a column to tables it had no part in.
 
-# Detectors whose per-report normalized score is carried as a multi-detector FUSION fingerprint
-# (detnorm_* on each report; detmax_* aggregated per vehicle) — what an ML-based global MA consumes.
-DETECTORS = [
-    "acceptanceRangeThreshold", "positionJump", "positionSpeedInconsistency",
-    "headingInconsistency", "implausibleAcceleration", "staleOrReplay",
-    "beaconFrequency", "sybilCoLocation", "constantPositionFrozen", "kalmanConsistency",
-    "signatureVerification", "certValidity", "mapOffRoad", "vruImpersonation", "denmPlausibility",
-]
+#: The SHIPPED built-in suite, read from `detectors.BUILTIN_CHECKS` -- a fixed tuple written in that
+#: module -- and not from `registry.builtin_names("check")`, which is a live view of a process-global
+#: dict any imported distribution can write into with `register_builtin()`. Same fix, same reason, as
+#: `run.default_check_refs`: the vocabulary of the ML tables must be a function of the engine version
+#: and the dataset, never of what happened to be importable in the process that built them.
+_BUILTIN_CODES = [cls.reason_code for cls in _detectors.BUILTIN_CHECKS]
+
+#: Reason codes the built-in suite publishes, in shipped order. SOFT checks are excluded:
+#: a soft check is scored into the fusion fingerprint but can never BE a reason (that is what `soft`
+#: means), so a `reason_<soft>` one-hot would be a permanently-zero column.
+REASON_VOCAB = [cls.reason_code for cls in _detectors.BUILTIN_CHECKS
+                if not getattr(cls, "soft", False)]
+
+#: Detectors whose per-report normalized score is carried as a multi-detector FUSION fingerprint
+#: (detnorm_* on each report; detmax_* aggregated per vehicle) -- what an ML-based global MA
+#: consumes. Every check contributes exactly one detnorm column.
+DETECTORS = list(_BUILTIN_CODES)
+
+
+def _observed_detectors(reports) -> list:
+    """Built-in detectors, then any additional `detnorm_*` columns the dataset actually carries.
+
+    The extras are sorted, so column order is a deterministic function of the dataset. They are, by
+    construction, third-party columns (`x_<plugin_id>_<code>`) or columns from an engine version
+    with checks this one does not have -- either way the honest thing is to carry them through
+    rather than silently drop a detector's evidence.
+    """
+    known = set(DETECTORS)
+    extra = set()
+    for r in reports:
+        for k in r:
+            if k.startswith("detnorm_"):
+                name = k[len("detnorm_"):]
+                if name not in known:
+                    extra.add(name)
+    return DETECTORS + sorted(extra)
+
+
+def _observed_reasons(reports) -> list:
+    """Built-in reason codes, then the third-party codes the run's SUITE could emit.
+
+    **Derived from the detnorm COLUMNS, not from the codes that happened to fire, and that is the
+    whole point of this function.** The earlier version took the union of `reason_codes` actually
+    seen in the file, which made the ML table's schema a function of the *outcome* of the run: a
+    third-party check that fired at least once contributed a `reason_x_<id>_<code>` one-hot, and the
+    same detector on the same scenario at a stricter threshold contributed no such column at all.
+    Two runs of one sweep then produced tables with different column sets, which silently breaks
+    every consumer that assumes a fixed schema -- concatenating a sweep, scoring a val split with a
+    model fitted on train, or diffing two operating points.
+
+    A check that is in the run's suite carries its `detnorm_` column on EVERY report row (the engine
+    copies a zero-template that has every column in it), whether or not it ever fired. So the columns
+    are the stable statement of "which detectors were running", and the reason vocabulary is derived
+    from them. A third-party check's reason code IS its namespaced column name (`x_<id>_<code>`,
+    `api/detect.namespaced_key`), so the mapping is exact and needs no lookup.
+
+    A soft third-party check -- scored, never a reason -- therefore gets a permanently-zero one-hot.
+    That is deliberate: a constant column is harmless and honest, whereas making its presence depend
+    on whether the run happened to produce a firing is the defect being fixed. (Built-in soft checks
+    are still excluded, because :data:`REASON_VOCAB` is a declared list and their `soft` flag is
+    knowable here.)
+
+    The final `sorted(extra)` term keeps a code that appears in `reason_codes` with no matching
+    column -- a dataset from another engine version -- rather than dropping a detector's evidence.
+    """
+    known = set(REASON_VOCAB)
+    third_party = sorted({c for c in _observed_detectors(reports)
+                          if c not in known and c.startswith(_THIRD_PARTY_PREFIX)})
+    known.update(third_party)
+    extra = sorted({c for r in reports for c in (r.get("reason_codes") or []) if c not in known})
+    return REASON_VOCAB + third_party + extra
 
 
 # Attack base -> family (mirrors org.scms.attacks.AttackLib). Used only for LABELS, so a model
@@ -129,6 +193,11 @@ def build(dataset_dir: str, split_seed: int = 1234) -> dict[str, Any]:
     gt = os.path.join(dataset_dir, "ground_truth")
     reports = _load_jsonl(os.path.join(ma, "ma_reports.jsonl"))
     cert_status = _load_jsonl(os.path.join(ma, "ma_cert_status.jsonl"))
+    # The effective vocabularies for THIS dataset: the registry's built-ins plus whatever a
+    # third-party check contributed to these reports. Shadowing the module constants deliberately --
+    # every use below is per-dataset, and a module-level list could not know about a plugin.
+    DETECTORS = _observed_detectors(reports)
+    REASON_VOCAB = _observed_reasons(reports)
     # MA-VISIBLE observed-DENM log (present ONLY when the DENM event-message layer was enabled). It
     # carries NO real/fake flag (that oracle label lives in ground_truth/gt_denm_emissions.jsonl); we
     # turn it into leakage-safe per-subject COUNTS: how many DENMs a cert sent and how many were
@@ -571,24 +640,10 @@ _ID_COLS = {"report_id", "subject_cert_digest", "reporter_cert_digest", "entity_
 
 # Human-readable data dictionary: what each detector/engineered feature means. Emitted into
 # schema.json so an ML consumer understands the columns without reading the generator source.
-_DETECTOR_DOCS = {
-    "positionSpeedInconsistency": "claimed displacement inconsistent with claimed speed over the interval",
-    "positionJump": "implausibly large position change between consecutive claims",
-    "headingInconsistency": "claimed heading vs the bearing implied by consecutive positions",
-    "staleOrReplay": "claim generation-time older than the staleness threshold (stale/replayed)",
-    "constantPositionFrozen": "position frozen across consecutive CAMs while still claiming to move",
-    "implausibleAcceleration": "implied acceleration exceeds a physical limit",
-    "sybilCoLocation": "many distinct certificates at the same point+heading (ghost cluster)",
-    "acceptanceRangeThreshold": "claimed position lies beyond the receiver's radio range",
-    "beaconFrequency": "CAM rate above the plausible beacon rate (flooding / DoS)",
-    "signatureVerification": "message signature failed to verify",
-    "certValidity": "certificate presented outside its validity window",
-    "mapOffRoad": "claimed position far from any road (HD-map plausibility check)",
-    "kalmanConsistency": "constant-velocity tracker residual (soft fusion feature, never a hard reason)",
-    "vruImpersonation": "beacon self-declares VRU yet moves at vehicle speed (VRU-impersonation spoof)",
-    "denmPlausibility": "received event message (DENM) announces a brake/stationary hazard while its "
-                        "sender's own claimed speed shows it is still moving fast (phantom hazard)",
-}
+#
+# DERIVED, not transcribed: each description is the first paragraph of the check's own docstring, so
+# a detector documents itself once, beside its arithmetic, and can never drift from a copy kept here.
+_DETECTOR_DOCS = _detectors.check_docs()
 _FEATURE_DOCS = {
     "pos_confidence": "reported 95% GNSS position-uncertainty radius (m)",
     "detector_score_norm": "primary detector's normalized score (~1 at its firing threshold)",
@@ -610,13 +665,26 @@ _FEATURE_DOCS = {
 }
 
 
+def _third_party_desc(code: str) -> str | None:
+    """`x_<plugin_id>_<reason_code>` -- a third-party check's namespaced column (section 4.4).
+
+    This process may never have imported the plugin that produced it, so there is no docstring to
+    quote; naming the plugin and its reason code is what CAN be said honestly, and saying that is
+    better than emitting a column with no description at all.
+    """
+    if not code.startswith("x_"):
+        return None
+    pid, _, reason = code[2:].partition("_")
+    return (f"third-party check {reason!r} from plugin {pid!r} "
+            f"(>= 1.0 == violating)") if reason else None
+
+
 def _col_desc(name: str) -> str | None:
-    if name.startswith("detnorm_"):
-        d = _DETECTOR_DOCS.get(name[len("detnorm_"):])
-        return d if d is None else f"per-report detnorm: {d}"
-    if name.startswith("detmax_"):
-        d = _DETECTOR_DOCS.get(name[len("detmax_"):])
-        return d if d is None else f"per-vehicle max detnorm: {d}"
+    for prefix, label in (("detnorm_", "per-report detnorm"), ("detmax_", "per-vehicle max detnorm")):
+        if name.startswith(prefix):
+            code = name[len(prefix):]
+            d = _DETECTOR_DOCS.get(code) or _third_party_desc(code)
+            return d if d is None else f"{label}: {d}"
     return _FEATURE_DOCS.get(name)
 
 

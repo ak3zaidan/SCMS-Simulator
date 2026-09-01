@@ -734,16 +734,27 @@ def _audit_plugins(ds, man):
         # PL3: identity is RECORDED or explicitly declared incomplete -- never quietly absent.
         # "Never fabricate" cuts both ways: a null hash with no `provenance_incomplete` flag is a
         # lock that looks complete and is not.
-        unidentified = []
+        #
+        # `package_sha256` counts as identity and is the only one of the three that covers a SIBLING
+        # module: `module_sha256` hashes one file, and `dist_sha256` is copied from the wheel RECORD,
+        # which is a record of what the installer wrote rather than of what the tree contains now.
+        unidentified, single_file = [], []
         for entry in loaded:
             if not isinstance(entry, dict):
                 unidentified.append("non-object entry"); continue
-            has_id = bool(entry.get("dist_sha256") or entry.get("module_sha256"))
+            has_id = bool(entry.get("dist_sha256") or entry.get("module_sha256")
+                          or entry.get("package_sha256"))
             if not has_id and not entry.get("provenance_incomplete"):
                 unidentified.append(f"{entry.get('slot')}:{entry.get('ref')} has no hash and no "
                                     f"provenance_incomplete flag")
+            elif (entry.get("resolved_via") != "builtin" and entry.get("module_sha256")
+                  and not entry.get("package_sha256")):
+                single_file.append(f"{entry.get('ref')}")
         rec(ds, "PL3_plugin_identity", not unidentified, "; ".join(unidentified[:4])
-            or f"{len(loaded)} entr(y|ies) identified")
+            or (f"{len(loaded)} entr(y|ies) identified"
+                + (f"; {len(single_file)} third-party entr(y|ies) carry only a single-file hash "
+                   f"(pre-package_sha256 manifest, or a bare-module plugin): "
+                   + ", ".join(single_file[:3]) if single_file else "")))
 
         # PL4: reserved capabilities on a non-built-in entry.
         bad_caps = []

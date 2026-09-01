@@ -1,6 +1,6 @@
-"""`ChannelModelContract` -- checks C1-C12 for `ChannelModel/1.x`.
+"""`ChannelModelContract` -- checks C1-C13 for `ChannelModel/1.x`.
 
-Subclass it in YOUR test suite and pytest collects thirteen real tests (the twelve numbered checks
+Subclass it in YOUR test suite and pytest collects fourteen real tests (the thirteen numbered checks
 plus C6's second arm)::
 
     from scms_sim_ref.conformance import ChannelModelContract
@@ -50,8 +50,8 @@ from .harness import DrawCounter, audit_guard, build_frames, trace
 
 SUITE_VERSION = "v1"
 
-#: The check ids, in the order they are run and reported. Twelve numbered checks; C6 has two arms
-#: (the structural one and the anti-laundering one), so there are thirteen rows.
+#: The check ids, in the order they are run and reported. Thirteen numbered checks; C6 has two arms
+#: (the structural one and the anti-laundering one), so there are fourteen rows.
 CHANNEL_CHECKS = (
     "C1_repeatable",
     "C2_call_order_independent",
@@ -66,13 +66,28 @@ CHANNEL_CHECKS = (
     "C10_fail_fast",
     "C11_float_hygiene",
     "C12_pipeline_two_run_digest",
+    "C13_config_not_mutated",
 )
 
-#: C7's published bounds. Wider than physically usual on purpose -- a 33 dBm ETSI-cap transmitter at
-#: a few metres is legitimately close to 0 dBm -- but closed, so a model returning a linear-scale
-#: watt figure in a field documented as dBm is caught immediately.
-RSSI_MIN_DBM = -140.0
-RSSI_MAX_DBM = 0.0
+#: C7's published bounds, IMPORTED rather than restated. `api.channel.check_outcome` is C7's runtime
+#: form and the engine now runs it on every delivered link of a third-party model; two independent
+#: literals for one published bound is how a runtime gate ends up laxer than the check it claims to
+#: be (they read [-200, 50] and [-140, 0] respectively until 2026-08-31).
+RSSI_MIN_DBM = _channel.RSSI_MIN_DBM
+RSSI_MAX_DBM = _channel.RSSI_MAX_DBM
+
+#: C9's tolerances. `PDR_SLACK` / `RSSI_SLACK_DB` bound BOTH the adjacent-rung comparison and the
+#: first-rung-versus-last one, so the ladder's total tolerance is one slack rather than six.
+PDR_SLACK = 0.10
+RSSI_SLACK_DB = 1.5
+
+#: C9's non-degeneracy floor. The ladder spans a 19x distance ratio (0.05 -> 0.95 of the declared
+#: reach); the shallowest path-loss exponent any FieldSpec in this tree admits (n = 1.6) already
+#: gives 10 * 1.6 * log10(19) = 20.5 dB there, so 3 dB is not a physics claim, it is the line below
+#: which a model is not modelling distance at all.
+MIN_ATTENUATION_DB = 3.0
+#: The same statement for a model that reports no rssi: PDR must fall by at least this much.
+MIN_PDR_DROP = 0.05
 
 
 class CheckSkipped(Exception):
@@ -138,7 +153,14 @@ class ChannelModelContract:
         env = {k: getattr(cfg, k) for k in _CHANNEL_ENV_KEYS if hasattr(cfg, k)}
         env["dt"] = 1.0
         env["buildings"] = []
-        env["config"] = cfg
+        # Read-only, exactly as the engine hands it over -- a contract that gave the model a WRITABLE
+        # config would be grading a different construction environment from the one it will get.
+        env["config"] = _engine().ReadOnlyConfig(cfg)
+        # C13 watches THIS object. The snapshot is taken here, before the model exists, so a write
+        # performed during __init__ -- the cheapest place to do it and the one the engine could not
+        # see until `_write_manifest` ran an hour later -- is inside the watched window.
+        self._env_cfg = cfg
+        self._env_cfg_before = _config_snapshot(cfg)
         return env
 
     def _config(self):
@@ -164,6 +186,18 @@ class ChannelModelContract:
     def capabilities(self) -> frozenset:
         return frozenset(self.make().capabilities())
 
+    # -- driving a model, always with its namespace attached ---------------------------------- #
+    # Every drive site goes through these two so the suite can never grade a model with a FROZEN
+    # RngNamespace step. `make()` sets `self._ns` immediately before returning, and Python evaluates
+    # a call's arguments before the call, so `self._trace(self.make(), ...)` reads the namespace of
+    # the model it is about to drive.
+    def _trace(self, model, frames, **kw):
+        kw.setdefault("rng_ns", getattr(self, "_ns", None))
+        return trace(model, frames, **kw)
+
+    def _adapt(self, model):
+        return H.adapt(model, getattr(self, "_ns", None))
+
     # -- frames ------------------------------------------------------------------------------- #
     def frames(self, **kw):
         kw.setdefault("n_steps", 6)
@@ -184,8 +218,8 @@ class ChannelModelContract:
         gate) can only speak after a full run, and cannot say WHY the digests differ.
         """
         fr = self.frames()
-        a = trace(self.make(), fr)
-        b = trace(self.make(), fr)
+        a = self._trace(self.make(), fr)
+        b = self._trace(self.make(), fr)
         assert a, "the model delivered nothing at all -- the scenario cannot grade it"
         assert a == b, _first_diff(a, b)
 
@@ -198,8 +232,8 @@ class ChannelModelContract:
         order, so any future re-ordering of the receive loop silently re-derives every digest.
         """
         fr = self.frames()
-        a = trace(self.make(), fr, order="sorted")
-        b = trace(self.make(), fr, order="reversed")
+        a = self._trace(self.make(), fr, order="sorted")
+        b = self._trace(self.make(), fr, order="reversed")
         ka = {(r[0], r[1], r[2]): r[3:] for r in a}
         kb = {(r[0], r[1], r[2]): r[3:] for r in b}
         assert ka == kb, ("per-link results depend on call ORDER -> draws are not identity-keyed. "
@@ -208,12 +242,62 @@ class ChannelModelContract:
     def check_C3_global_rng_untouched(self):
         """D3, asserted: the plugin never reaches the engine's shared stream.
 
-        Two traps. The module-level `random` state is snapshotted and compared -- that catches a bare
-        `random.random()` or a `random.seed()` anywhere in the model. And a live `random.Random` is
-        planted in `frame.env["rng"]`, because `env` is the one mapping a plugin is handed that could
-        plausibly be made to carry one; a model that finds it and draws from it moves its state.
+        FOUR traps, and the last two exist because the first two catch only the shapes that are
+        provably HARMLESS.
+
+        Measured 2026-08-31 on five models that subclass the reference plugin with `plugin_id`
+        forced to `rayleigh`, so physics and RNG namespace are bit-identical and any digest movement
+        is attributable to the ENGINE's stream and nothing else. Control: `be3b5dea…`, 3012
+        `ma_reports`, 25 investigations, 25 CRL events, 67 sampled emissions.
+
+        =========================== ============= ========================================
+        vector                      old C3        engine `data_digest`
+        =========================== ============= ========================================
+        module `random.random()`    **FAIL**      unchanged
+        `random.seed(time_ns())`    **FAIL**      unchanged
+        `sys._getframe` -> `rng`    pass (13/13)  **moved** `433dd921…`, reports 3012 -> 3000,
+                                                  emissions 67 -> 64
+        `Random.random` passthrough pass (13/13)  unchanged (it consumes the same draws)
+        `Random.random` biased x0.5 pass (13/13)  **moved** `9cdbed88…`, reports 3012 -> 46356,
+                                                  investigations and CRL events 25 -> 100,
+                                                  emissions 67 -> 359
+        =========================== ============= ========================================
+
+        Read that table twice. **The check was detecting exactly the two vectors that cannot reach
+        the engine** -- its `rng` is a private `random.Random` instance, so a module-level draw
+        provably cannot touch it -- while the two that can scored 13/13 and also passed
+        `conformance="required"` attestation. The passthrough row is the honest caveat: rebinding
+        alone moves nothing, because a wrapper that just forwards consumes the same draws. It is the
+        CAPABILITY that matters, and the last row is what that capability is worth once exercised:
+        fifteen times the reports and every attacker revoked, from one line at construction.
+
+        1. **module state** -- a bare `random.random()` / `random.seed()` anywhere in the model.
+        2. **`frame.env["rng"]`** -- `env` is the one mapping a plugin is handed that could
+           plausibly be made to carry a stream.
+        3. **the `random.Random` CLASS SURFACE** -- every generator method's identity is compared
+           before and after. A model that rebinds `random.Random.random` (or `gauss`, or `seed`)
+           reaches every stream in the process at once, including the engine's private instance,
+           without ever touching a state this check could otherwise snapshot. Restored in `finally`,
+           the same way the module state is: a check that detects a tamper and leaves it installed
+           has poisoned the interpreter for everything that runs after it.
+        4. **a frame-local decoy** -- the trace is driven from a frame whose local is named `rng`
+           and holds a live `random.Random`, exactly as `run_pipeline`'s is. A plugin that walks
+           `sys._getframe(k).f_locals` looking for the engine's stream finds this one.
+
+        Stated honestly, because the design insists on it: capability-by-omission is a real
+        STRUCTURAL defence against the ACCIDENTAL case and is not enforceable against a determined
+        one -- a plugin can reach any object in the process through `gc.get_objects()`. What these
+        four traps do is make the realistic deliberate vectors visible instead of invisible, and the
+        engine-side statement that actually holds remains the artifact-level one: the pinned goldens
+        and the two-run digest gate.
         """
         saved = random.getstate()
+        # The baseline is the one the RUNNER took before ANY check ran, when no plugin code had yet
+        # executed. Taking it here instead would compare a model against a class it had already
+        # patched during C1 -- and an evasive patch is written idempotently precisely so that the
+        # second construction is a no-op. `run_contract` stashes it; a bare pytest invocation of this
+        # one method falls back to a fresh snapshot.
+        surface = getattr(self, "_pristine_random", None) or H.random_class_surface()
         try:
             random.seed(999)
             before = random.getstate()
@@ -221,7 +305,7 @@ class ChannelModelContract:
             probe_state = probe.getstate()
             fr = build_frames(n_steps=4, n_stations=10,
                               env={"buildings": [], "weather": "clear", "rng": probe})
-            trace(self.make(), fr)
+            decoy, decoy_state = self._trace_behind_a_decoy_rng(fr)
             assert random.getstate() == before, (
                 "the model drew from the module-level `random` stream. A plugin's only source of "
                 "randomness is its RngNamespace: the engine's global stream's draw COUNT AND ORDER "
@@ -229,8 +313,35 @@ class ChannelModelContract:
             assert probe.getstate() == probe_state, (
                 "the model found a Random in frame.env and drew from it -- capability by omission "
                 "means not touching a stream you were not handed")
+            tampered = H.tampered_random_names(surface)
+            assert not tampered, (
+                f"the model REBOUND {tampered} on the `random` module or the `random.Random` class. "
+                f"That reaches every stream in the process at once -- including the engine's private "
+                f"instance, whose draw count and order are load-bearing -- while leaving every state "
+                f"snapshot a check could take perfectly intact. It is the vector capability by "
+                f"omission cannot close by omitting anything.")
+            assert decoy.getstate() == decoy_state, (
+                "the model walked the call stack to a caller's local named `rng` and drew from it. "
+                "`run_pipeline` holds the engine's shared stream in a local of exactly that name "
+                "(`rng = random.Random(cfg.seed)`), so this is not a hypothetical shape: it moves "
+                "report_prob, collusion, net_delay and emit sampling, and no state this plugin was "
+                "handed changes.")
         finally:
+            H.restore_random_class_surface(surface)       # undo any tamper the model installed
             random.setstate(saved)
+
+    def _trace_behind_a_decoy_rng(self, fr):
+        """Drive the trace from a frame carrying a local named `rng` that IS a `random.Random`.
+
+        Deliberately shaped like `run_pipeline`'s own frame (`rng = random.Random(cfg.seed)` beside
+        a `cfg`), so a plugin walking `sys._getframe(k).f_locals` for the engine's shared stream --
+        by name or by type -- finds this object and moves its state where the check can see it.
+        """
+        rng = random.Random(4242)                          # noqa: F841 - the decoy IS the point
+        cfg = self._config()                               # noqa: F841 - so is its neighbour
+        state = rng.getstate()
+        self._trace(self.make(), fr)
+        return rng, state
 
     def check_C4_state_advances_once_per_step(self):
         """Only for `capabilities() & {"stateful"}`: with a FROZEN scene and an identical candidate
@@ -250,7 +361,7 @@ class ChannelModelContract:
         ns_counts = []
         for frame in fr:
             with DrawCounter() as dc:
-                ad = H.adapt(model)
+                ad = self._adapt(model)
                 ad.begin_step(frame)
                 cands = H.candidates_for(ad, frame)
                 list(ad.deliver(frame, cands))
@@ -287,7 +398,7 @@ class ChannelModelContract:
             _registry.resolve(self.SLOT, self.REF)          # warm the import OUTSIDE the guard
         fr = self.frames(n_steps=3)
         with audit_guard() as g:
-            trace(self.make(), fr)
+            self._trace(self.make(), fr)
         assert not g.hits, f"denied I/O during evaluation: {g.hits}"
 
     def check_C6_no_oracle_leak(self):
@@ -314,7 +425,7 @@ class ChannelModelContract:
         fr = self.frames(n_steps=4)
         before = [{v: (st.vid, st.x, st.y, st.ant_h_m, st.blocker_h_m, st.is_rsu, st.is_vru,
                        st.tx_power_dbm, st.rx_range_m) for v, st in f.stations.items()} for f in fr]
-        rows = trace(model, fr)
+        rows = self._trace(model, fr)
         after = [{v: (st.vid, st.x, st.y, st.ant_h_m, st.blocker_h_m, st.is_rsu, st.is_vru,
                       st.tx_power_dbm, st.rx_range_m) for v, st in f.stations.items()} for f in fr]
         assert before == after, "the model mutated the StepFrame it was handed"
@@ -346,8 +457,8 @@ class ChannelModelContract:
         for fa, fb in zip(plain, spiked):                    # the declared fields must be identical
             assert [_declared(s) for s in fa.stations.values()] == \
                    [_declared(s) for s in fb.stations.values()], "harness bug: frames differ"
-        a = trace(self.make(), plain)
-        b = trace(self.make(), spiked)
+        a = self._trace(self.make(), plain)
+        b = self._trace(self.make(), spiked)
         assert a == b, (
             "the model's output changed when GROUND TRUTH it was never promised appeared beside the "
             "declared fields. It is reading the oracle: every physics number it produces is "
@@ -366,7 +477,7 @@ class ChannelModelContract:
             f"reads it for the candidate window AND acceptanceRangeThreshold reads it as art_reach, "
             f"so a model that omits or understates it makes that detector wrong for every honest "
             f"long link.")
-        rows = trace(model, self.frames())
+        rows = self._trace(model, self.frames())
         for step, ti, rv, rssi, state, delay, extras in rows:
             where = f"step {step} link (tx {ti} -> rx {rv})"
             if rssi is not None:
@@ -390,7 +501,7 @@ class ChannelModelContract:
         pre-filter, because the question is what the MODEL does, not what the loop does for it.
         """
         model = self.make()
-        ad = H.adapt(model)
+        ad = self._adapt(model)
         fr = build_frames(n_steps=4, n_stations=14, spacing_m=90.0, move_m=5.0)
         for frame in fr:
             for rx_vid in frame.receivers:
@@ -416,35 +527,80 @@ class ChannelModelContract:
     # physics
     # ===================================================================================== #
     def check_C9_monotone_in_distance(self):
-        """PDR(d) and mean rssi(d) NON-INCREASING over a fixed distance ladder, all else equal.
+        """PDR(d) and mean rssi(d) NON-INCREASING **and actually distance-dependent** over a fixed
+        ladder, all else equal.
 
         Waivable WITH A WRITTEN JUSTIFICATION: a model with a deliberate near-field, a two-ray
-        ground-reflection null or a beam pattern legitimately fails it, and the waiver mechanism
-        exists so that stays a declared property of the implementation rather than a silent hole.
+        ground-reflection null or a beam pattern legitimately fails the monotone arms, and an
+        idealised unit-disc model (`disc`) legitimately fails the attenuation arm. The waiver
+        mechanism exists so that stays a declared property of the implementation, recorded in
+        `conformance_report.json` next to the artifact, rather than a silent hole.
 
         Sampling budget and tolerances are fixed, not tuned: 12 transmitters x 8 steps per rung, a
         0.10 absolute PDR tolerance and a 1.5 dB rssi tolerance. The ladder ROTATES the transmitters
         around the receiver, holding the distance exactly constant while moving both endpoints far
         enough to decorrelate an AR(1) shadowing process -- otherwise the rungs would be one
         correlated trajectory rather than independent samples.
+
+        THREE arms, and the second and third exist because the first cannot fail the two shapes that
+        matter most:
+
+        * **adjacent** -- `pdr[i] <= pdr[i-1] + PDR_SLACK` and the same for mean rssi. Catches a
+          steeply anti-monotone model.
+        * **cumulative** -- the FIRST rung against the LAST, bounded by ONE slack. The adjacent arm
+          alone tolerates `PDR_SLACK` at every one of the six steps, i.e. a monotone RISE of 0.60
+          PDR and 9 dB across the whole ladder, which it is structurally incapable of seeing.
+        * **attenuation** -- across a 19x distance ratio (0.05 to 0.95 of the declared reach) the
+          model must show SOME distance dependence. A model returning a flat delivery probability
+          and a constant rssi at every distance is not a channel, and the first two arms pass it by
+          construction: `<=` is satisfied by equality. Graded on rssi when the model produces any
+          (`MIN_ATTENUATION_DB`, far below the ~21 dB a 1.6-exponent path loss gives over that
+          ratio, so no honest model is near the line), otherwise on PDR.
         """
         model = self.make()
         reach = float(model.reach_m)
         rungs = [round(f * reach, 1) for f in (0.05, 0.12, 0.25, 0.40, 0.60, 0.80, 0.95)]
         pdrs, rssis = [], []
         for d in rungs:
-            pdr, mean, offered = H.pdr_and_rssi(self.make(), d)
+            m = self.make()
+            pdr, mean, offered = H.pdr_and_rssi(m, d, rng_ns=getattr(self, "_ns", None))
             assert offered > 0, f"ladder rung {d} m offered no candidate links"
             pdrs.append(pdr)
             rssis.append(mean)
+        ladder = list(zip(rungs, [round(p, 3) for p in pdrs],
+                          [None if r is None else round(r, 2) for r in rssis]))
+        # -- arm 1: adjacent rungs ---------------------------------------------------------- #
         for i in range(1, len(rungs)):
-            assert pdrs[i] <= pdrs[i - 1] + 0.10, (
+            assert pdrs[i] <= pdrs[i - 1] + PDR_SLACK, (
                 f"PDR rises with distance: {rungs[i - 1]} m -> {pdrs[i - 1]:.3f}, "
-                f"{rungs[i]} m -> {pdrs[i]:.3f} (ladder {list(zip(rungs, [round(p, 3) for p in pdrs]))})")
+                f"{rungs[i]} m -> {pdrs[i]:.3f} (ladder {ladder})")
             if rssis[i] is not None and rssis[i - 1] is not None:
-                assert rssis[i] <= rssis[i - 1] + 1.5, (
+                assert rssis[i] <= rssis[i - 1] + RSSI_SLACK_DB, (
                     f"mean rssi rises with distance: {rungs[i - 1]} m -> {rssis[i - 1]:.2f} dBm, "
-                    f"{rungs[i]} m -> {rssis[i]:.2f} dBm")
+                    f"{rungs[i]} m -> {rssis[i]:.2f} dBm (ladder {ladder})")
+        # -- arm 2: cumulative, first rung against last ------------------------------------- #
+        assert pdrs[-1] <= pdrs[0] + PDR_SLACK, (
+            f"PDR is higher at the FAR end of the ladder than the near end: {rungs[0]} m -> "
+            f"{pdrs[0]:.3f}, {rungs[-1]} m -> {pdrs[-1]:.3f}. Each adjacent step stayed inside the "
+            f"{PDR_SLACK} tolerance, but they accumulate (ladder {ladder})")
+        if rssis[0] is not None and rssis[-1] is not None:
+            assert rssis[-1] <= rssis[0] + RSSI_SLACK_DB, (
+                f"mean rssi is higher at the FAR end of the ladder than the near end: {rungs[0]} m "
+                f"-> {rssis[0]:.2f} dBm, {rungs[-1]} m -> {rssis[-1]:.2f} dBm (ladder {ladder})")
+        # -- arm 3: the model must depend on distance at all -------------------------------- #
+        measured = [r for r in rssis if r is not None]
+        if len(measured) >= 2 and rssis[0] is not None and rssis[-1] is not None:
+            drop, unit, floor = rssis[0] - rssis[-1], "dB", MIN_ATTENUATION_DB
+        else:
+            drop, unit, floor = pdrs[0] - pdrs[-1], "PDR", MIN_PDR_DROP
+        assert drop >= floor, (
+            f"the model is CONSTANT in distance: over a {rungs[-1] / max(rungs[0], 1e-9):.0f}x "
+            f"distance ratio ({rungs[0]} m -> {rungs[-1]} m) it fell by only {drop:.3f} {unit}, "
+            f"below the {floor} {unit} floor. Arms 1 and 2 are '<=' comparisons and are satisfied "
+            f"by exact equality, so a flat delivery probability with a constant rssi passes both "
+            f"while being physically impossible. Declare a waiver if this model is a deliberate "
+            f"idealisation (`disc` does). Ladder: {ladder}")
+        return f"ladder {ladder}"
 
     def check_C10_fail_fast(self):
         """Invalid params raise at CONSTRUCTION, never at step k > 0.
@@ -491,8 +647,8 @@ class ChannelModelContract:
         last-ulp difference flips a whole report.
         """
         fr = self.frames()
-        a = trace(self.make(), fr)
-        b = trace(self.make(), fr)
+        a = self._trace(self.make(), fr)
+        b = self._trace(self.make(), fr)
         ra = [_round_row(r, self.PRECISION) for r in a]
         rb = [_round_row(r, self.PRECISION) for r in b]
         assert ra == rb, _first_diff(ra, rb)
@@ -527,6 +683,78 @@ class ChannelModelContract:
         assert digests[0] == digests[1], (
             f"two identical runs produced different datasets: {digests[0]} != {digests[1]}")
         return f"data_digest={digests[0]}"
+
+    def check_C13_config_not_mutated(self):
+        """The MANIFEST REPLAY contract, asserted against plugin code: the model does not write to
+        the run's configuration.
+
+        `env["config"]` is the run's `PipelineConfig`, and `_write_manifest` serialises
+        `cfg.__dict__` at the END of the run. So a plugin that writes one attribute through it --
+        `env["config"].report_prob = 1.0`, at construction or at step 30 -- makes the artifact
+        describe a config that did not produce it: the steps before the write ran under the user's
+        value and the steps after under the plugin's, and the manifest records only the second.
+        Measured before the fix, on the 60-step acceptance config with the reference plugin: the run
+        completed at exit 0, its `data_digest` was byte-identical to the honest control (so the
+        pinned-golden layer sees nothing at all), `provenance_digest` was unchanged, `verify-plugins`
+        reported OK, and the manifest replayed to a DIFFERENT dataset.
+
+        THREE arms, and the third is the one that actually holds:
+
+        1. **construction** -- a write during `__init__`, the cheapest place to do it.
+        2. **the run** -- a write at step k > 0, which no construction-time gate can see.
+        3. **the snapshot**, which is arm 1 and 2's backstop. Arms 1 and 2 recognise the
+           `ReadOnlyConfig` refusal, i.e. they see a plugin that went through the reference the
+           engine handed it. Python cannot make that reference unforgeable -- `env` is a plain dict,
+           and the real object is reachable through this view's own slot, through `gc.get_objects()`
+           or through a frame walk -- so the enforceable statement is not "you cannot write" but
+           "if the config moved, this is not a conformant model". The dict comparison is that
+           statement, and it does not care how the write was performed.
+
+        Stated the same way C5 states PEP 578 and C3 states capability-by-omission: this is the
+        detection layer. The engine's `_assert_config_unmoved` is the one that refuses to write an
+        artifact, and the two are deliberately independent.
+        """
+        _engine()
+        try:
+            model = self.make()
+        except ConfigError as e:
+            if "READ-ONLY" in str(e):
+                raise AssertionError(
+                    f"the model wrote to the run's configuration through env['config'] AT "
+                    f"CONSTRUCTION. The manifest records `cfg.__dict__` at the end of the run, so "
+                    f"the artifact would describe a config that did not produce it. Declare the "
+                    f"knob through your own config_fields() and read it from `params`. "
+                    f"[{' '.join(str(e).split())[:200]}]") from None
+            raise
+        cfg = getattr(self, "_env_cfg", None)
+        if cfg is None:                                     # a contract whose env() is fully custom
+            _skip("this contract's env() does not build a PipelineConfig, so there is nothing "
+                  "for C13 to watch")
+        before = self._env_cfg_before
+        _assert_unmoved(before, cfg, "during CONSTRUCTION")
+        # 12 contiguous steps -- past the horizon of every other scenario in this suite (the longest
+        # is C9's 8-step ladder) -- and then a four-frame tail at step 10_000. The tail is the
+        # important half: the realistic shape of this bug is `if frame.step >= 30`, guarded so the
+        # write lands once the run has settled, and NO contiguous window shorter than 31 steps can
+        # see that. Jumping the step label catches every threshold below 10_000 for the price of
+        # four frames. It is still a bounded probe, and that is stated rather than papered over:
+        # the unbounded statement is the engine's `_assert_config_unmoved`, which compares the real
+        # config at the real end of the real run and refuses to write a manifest if it moved.
+        frames = self.frames(n_steps=12) + build_frames(n_steps=4, n_stations=12, spacing_m=55.0,
+                                                        move_m=7.0, step0=10_000)
+        try:
+            self._trace(model, frames)
+        except ConfigError as e:
+            if "READ-ONLY" in str(e):
+                raise AssertionError(
+                    f"the model wrote to the run's configuration through env['config'] DURING THE "
+                    f"RUN. The steps before the write ran under one config and the steps after "
+                    f"under another, so no config describes the dataset -- and the manifest records "
+                    f"the one that produced only its tail. "
+                    f"[{' '.join(str(e).split())[:200]}]") from None
+            raise
+        _assert_unmoved(before, cfg, "during the run")
+        return "config unmoved across construction, 12 steps and a tail at step 10000"
 
     # ===================================================================================== #
     # pytest surface -- one thin method per check, all sharing _run()
@@ -580,6 +808,9 @@ class ChannelModelContract:
     def test_C12_pipeline_two_run_digest(self):
         self._run("C12_pipeline_two_run_digest")
 
+    def test_C13_config_not_mutated(self):
+        self._run("C13_config_not_mutated")
+
 
 # --------------------------------------------------------------------------- #
 # helpers
@@ -612,6 +843,36 @@ def _engine():
 
 def _declared(st):
     return tuple(getattr(st, f) for f in _DECLARED_FIELDS)
+
+
+def _config_snapshot(cfg) -> dict:
+    """`cfg.__dict__` in the shape `manifest["config"]` carries it.
+
+    Delegates to the engine's own `_config_dict` when it is importable, so C13 and the engine's
+    `_assert_config_unmoved` can never disagree about what "the config" is -- the same reason C7
+    imports its dBm bounds from `api.channel` instead of restating them. The fallback is that
+    function's body, for a contract used without the engine on the path.
+    """
+    fn = getattr(_engine(), "_config_dict", None)
+    if fn is not None:
+        return dict(fn(cfg))
+    return {k: (list(v) if isinstance(v, tuple) else v) for k, v in cfg.__dict__.items()}
+
+
+def _assert_unmoved(before: dict, cfg, when: str) -> None:
+    """C13's snapshot arm: the config dict is field-for-field what it was."""
+    now = _config_snapshot(cfg)
+    moved = sorted(k for k in set(before) | set(now) if before.get(k) != now.get(k))
+    if not moved:
+        return
+    detail = "; ".join(f"{k}: {before.get(k)!r} -> {now.get(k)!r}" for k in moved[:5])
+    raise AssertionError(
+        f"the run configuration MOVED {when}: {detail}"
+        + (f" (and {len(moved) - 5} more)" if len(moved) > 5 else "")
+        + ". Only the model can have done this -- nothing else touched the object. It did not go "
+          "through env['config'] (that view refuses writes), so it reached the real config another "
+          "way: this view's own slot, a frame walk, or gc. The dataset is unreplayable either way, "
+          "because the manifest records cfg.__dict__ as it stands at the END of the run.")
 
 
 def _config_fields(cls) -> dict:

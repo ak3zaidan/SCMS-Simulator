@@ -15,6 +15,71 @@ quantitative benchmark; determinism/manifest contract and config→GUI pipeline 
 - Realism scorecard: none yet (Phase 0 builds it). Known Day-0 realism defects are ranked G1–G16 in
   ROADMAP.md §2.
 
+## Adversarial review of the directed-road workstream (2026-08-31)
+
+The channel-plugin and directed-road workstreams both landed without their verifier agents. The
+plugin findings and their fixes are in
+[PLUGIN-CONFORMANCE-EVIDENCE.md §7](PLUGIN-CONFORMANCE-EVIDENCE.md). The road findings, all
+reproduced before they were fixed:
+
+**Gates after the whole review.** Full suite **912 passed in 990.85 s**, exit 0. The reference run
+`--flow --road grid --grid 6 --duration 300 --arrival-rate 2 --attacker-pct 0.15 --traffic-lights
+--seed 42` still digests `b25f2137cf14dd504d56bb88cd67cce273b6a6ac348f7c59ee6d3b4372257815` with
+593 vehicles / 7823 reports / 152 investigations / 152 revoked and precision 0.599 / recall 0.91 /
+latency_med 4.0 s — every count and metric unchanged. Nothing in this review moves a pinned digest:
+the three new road knobs default off, and no built-in channel model touches `RngNamespace`.
+
+- **The directed carriageway geometry was unreachable from any config or CLI invocation.**
+  `roads.enable_directed_lanes()` and `roads.edges_from_directed()` existed, were tested, and were
+  correct — and `grep` over `run.py` found **zero** occurrences of `enable_directed_lanes`,
+  `directed_edges`, `carriageway`, `largest_strong_component` or `drive_side`, while
+  `PipelineConfig.__dataclass_fields__` had no field matching `direct*`/`carriage*`/`oneway`/
+  `drive_side`/`lanes_per`. **Every** producer of the headline "head-on overlaps → 0" result — the
+  commit message, `tests/test_directed_roads.py`, `datasets/_netfidelity/_ab_directed.py` — installed
+  a `class _Directed(GridNetwork)` subclass over `roads.GridNetwork`, each stating in its own
+  docstring that "run.py is owned by a parallel workflow". The measurement was real; the shipped
+  product could not produce it. **Fixed:** `directed_lanes`, `drive_side` and
+  `custom_network_directed` are config fields with CLI flags, `config_schema()` entries and
+  `validate_config` rules, all default-inert. The end-to-end test now sets `directed_lanes=True` on
+  a `PipelineConfig` instead of monkeypatching `roads`, so it fails if the wiring is ever removed
+  rather than quietly measuring its own subclass.
+- **The `custom_network` loader read only the UNDIRECTED `edges` array.** `osm.network_document`
+  writes `{nodes, edges, directed_edges, signal_nodes}`; `run._parse_custom_network` returned
+  `doc["nodes"], doc["edges"]` and dropped the rest, so every one-way flag, per-direction lane count
+  and shape polyline `netimport.py` and `osm.py` extract was discarded on the only path a user can
+  take. Measured on the real Ingolstadt extract (`osm_to_network(attrs=True)`): the document carries
+  **627** directed records with lane counts 1..3 and `oneway_share 0.2823` (the netconvert importer's
+  own reading of the same city is 433 records at 0.2794), and the network the engine built from that
+  document reported `directed=False`, **0** one-way edges, **0** lane-specified edges — the
+  pre-change model. **Fixed:** `custom_network_directed=true` builds from
+  `directed_edges` via `roads.edges_from_directed`, then trims to `largest_strong_component` (a
+  bbox clip leaves junctions you can enter and never leave, which `CustomNetwork` refuses). Same
+  document, re-measured: **326 nodes / 610 edges, `directed=True`, 160 one-way, 385 lane-specified.**
+  The default stays undirected so every pre-schema document loads exactly as before.
+- **`tools/network_fidelity.py compare`'s `netconvert` row graded the importer against the exact
+  `.net.xml` it had just parsed** — `_resolve_gt_net` and `_candidate_for(..., "netconvert")` both
+  resolve to `net_816d9f25303fea7e_636359.net.xml` (`os.path.abspath` equality `True`) — producing a
+  guaranteed `6 pass / 0 fail` with `oneway_share_pp`, `degree_ks`, `intersection_rel_err` and
+  `lane_ks` all exactly `0.0`, and nothing in the output saying so. **Fixed:** the tool detects the
+  identity, prints a banner **above** the numbers, marks every metric informational, and ends the row
+  `SELF-GRADED, NOT fidelity evidence (parser round-trip against its own input file)`. The row that
+  does measure something — raw OSM — still **fails** the hard `degree_ks` gate (0.1973 vs 0.10) and
+  misses signalised-node count by 3.5× (50 vs 11); that is a real open defect, not a regression.
+- **The projection alignment gate was calibrated wider than the city it guards.** `tol = max(250,
+  0.5 × expected diagonal)` around the whole bbox = **952.9 m** for Ingolstadt, and the test was
+  "median node inside the bbox WIDENED BY that". On the real 217-junction cloud (median 134.4 m west
+  and 52.4 m south of the bbox centre, half-extent 734 × 608 m) that accepts an east-west translation
+  of **(734 + 134.4) + 953 = 1821 m** and a diagonal one of **1613 × √2 = 2281 m** — against a
+  1468 × 1216 m extent. A city could be projected entirely off itself and pass. It also could not
+  catch the trap its own error message names (`ky = 110540, not 111320`), which displaces nodes by
+  only 10.6–18.7 m, because `expect_bbox_xy` is derived from the same projection tuple under test.
+  **Fixed:** two independent arms, calibrated on the seven cached cities rather than guessed — the
+  median node against the bbox **centre** per axis at `max(250 m, 0.25 × extent)` (worst real offset
+  fraction 0.104, so ~2.4× headroom; undetected translation now 233–499 m), and the containment
+  fraction the function already computed and threw away, floored at 0.60 (correct imports measure
+  0.838–0.899). The scale constant is now checked directly by `_assert_frame`, called from
+  `_transformer` before any point is projected, so the named trap fires regardless of geometry.
+
 ## Phase log
 
 | Date | Phase | Status | Gate result |

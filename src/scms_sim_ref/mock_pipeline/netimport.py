@@ -184,6 +184,73 @@ def inverse_utm(x: float, y: float, zone: int, northern: bool = True) -> tuple[f
     return math.degrees(lon) + ((zone - 1) * 6 - 180 + 3), math.degrees(lat)
 
 
+#: `osm._frame`'s meridional constant. Restated here so the check below is an INDEPENDENT statement
+#: about the frame it is handed rather than a comparison of a value with itself.
+FRAME_KY = 110540.0
+#: `osm._frame`'s equatorial constant: kx = FRAME_KX * cos(mean_lat), so 0 < kx <= FRAME_KX always.
+FRAME_KX = 111320.0
+#: Latitude span the kx band allows between `lat0` (the extract's MINIMUM) and its MEAN. One degree
+#: is ~111 km -- two orders more than any supported extract (the cached cities span 0.013-0.018 deg).
+LAT_SPAN_DEG = 1.0
+
+
+def _assert_frame(projection: dict) -> dict:
+    """GATE: the frame tuple itself, before anything is projected with it.
+
+    `_assert_alignment` compares WHERE points land against a bbox derived from THIS SAME tuple, so
+    it is structurally incapable of catching a wrong scale constant -- both sides move together. The
+    error message there names exactly that trap ("note ky = 110540, not 111320") while being unable
+    to fire on it: measured on the cached extracts, substituting ky = 111320 displaces nodes by only
+    10.6-18.7 m, three orders below any translation tolerance, and every city still passes. That
+    displacement is not harmless -- the geometric channel's building-blockage test would then be
+    computed against footprints offset from the road graph, producing plausible-looking but wrong
+    NLOS decisions with the gate green.
+
+    This check is the one that can fire on it, because it tests the CONSTANTS rather than the
+    geometry. It deliberately does NOT compare against `osm.road_projection(xml)`: the CLI's
+    `--frame-city` deliberately projects one city's net into another city's frame, and a hard
+    equality would forbid that legitimate use while adding nothing (the value being compared would
+    be the value that produced it).
+    """
+    missing = [k for k in ("lat0", "lon0", "kx", "ky") if k not in (projection or {})]
+    if missing:
+        raise ValueError(f"projection frame is missing {missing}; it must be the tuple "
+                         f"`osm.road_projection` returns: lat0/lon0 = min lat/lon over the ROAD "
+                         f"ways, kx = {FRAME_KX} * cos(mean_lat), ky = {FRAME_KY}")
+    lat0, lon0 = float(projection["lat0"]), float(projection["lon0"])
+    kx, ky = float(projection["kx"]), float(projection["ky"])
+    if not (-90.0 <= lat0 <= 90.0 and -180.0 <= lon0 <= 180.0):
+        raise ValueError(f"projection origin (lat0={lat0}, lon0={lon0}) is not a WGS84 coordinate")
+    if ky != FRAME_KY:
+        raise ValueError(
+            f"projection frame has ky = {ky}, not {FRAME_KY}. THIS IS THE TRAP: {FRAME_KX} is the "
+            f"equatorial degree of LONGITUDE and {FRAME_KY} the mean degree of LATITUDE, and every "
+            f"layer sharing this map (the road graph, the imported net, the building footprints) "
+            f"must use the identical constant or they silently de-register by ~10-20 m over a "
+            f"1.5 km extent -- far too little for the extent gate to see, far too much for the "
+            f"geometric channel's building-blockage test, which would then compute NLOS against "
+            f"footprints offset from the roads.")
+    if not (0.0 < kx <= FRAME_KX + 1e-6):
+        raise ValueError(f"projection frame has kx = {kx}, outside (0, {FRAME_KX}]: kx is "
+                         f"{FRAME_KX} * cos(mean_lat) and cos is at most 1")
+    # kx = FRAME_KX * cos(MEAN latitude) and `lat0` is the extract's MINIMUM, so the band is around
+    # cos(|lat0|) widened by one degree of latitude span in BOTH directions. Symmetric in |lat|
+    # deliberately: in the southern hemisphere the minimum latitude is the most negative, so the mean
+    # is CLOSER to the equator and kx is LARGER than cos(lat0) gives -- a one-sided band derived from
+    # the northern case would reject every southern-hemisphere import. One degree is ~111 km, two
+    # orders more than any supported extract, because this is a units/typo check (kx and ky swapped,
+    # or the equatorial constant used unscaled), not a re-derivation. A small latitude inconsistency
+    # is the EXTENT gate's business, not this one's.
+    lo = FRAME_KX * math.cos(math.radians(min(90.0, abs(lat0) + LAT_SPAN_DEG))) - 1e-6
+    hi = FRAME_KX * math.cos(math.radians(max(0.0, abs(lat0) - LAT_SPAN_DEG))) + 1e-6
+    if not (lo <= kx <= hi):
+        raise ValueError(
+            f"projection frame has kx = {kx:.1f}, inconsistent with lat0 = {lat0}: "
+            f"{FRAME_KX} * cos(mean_lat) over an extract whose minimum latitude is {lat0} must lie "
+            f"in [{lo:.1f}, {hi:.1f}] (kx and ky swapped? the equatorial constant used unscaled?)")
+    return projection
+
+
 def _transformer(net, projection: dict | None):
     """(x, y) in SUMO net coordinates -> (x, y) in the target frame.
 
@@ -197,6 +264,7 @@ def _transformer(net, projection: dict | None):
         raise ValueError("this .net.xml has no geo-projection (projParameter='!'), so it cannot be "
                          "registered with an osm.py projection frame -- import it with "
                          "projection=None (its own metric coordinates) instead")
+    _assert_frame(projection)
     param = net._location["projParameter"]
     zone = _utm_zone(param)
     off_x, off_y = net.getLocationOffset()
@@ -224,13 +292,45 @@ def _transformer(net, projection: dict | None):
     return tf, param
 
 
-def _assert_alignment(pts: list, expect_bbox_xy: list | None, *, margin_m: float = 250.0) -> dict:
+#: `_assert_alignment` tolerances, CALIBRATED on the cached extracts rather than guessed.
+#:
+#: The old rule was `median node inside the expected bbox WIDENED BY max(250, 0.5*diagonal)`, which
+#: for Ingolstadt meant the median could sit anywhere in a box roughly 3.5x the modelled area wide:
+#: measured by bisection on the real 217-junction cloud, it accepted an east-west translation of
+#: 1821 m and a diagonal one of 2281 m -- both LARGER THAN THE CITY. A city could be projected
+#: entirely off itself and pass.
+#:
+#: The rule now compares the median node with the bbox CENTRE, per axis, tolerating a fraction of
+#: that axis's own extent. Measured |median - centre| / extent over the seven cached cities
+#: (amsterdam, berlin, ingolstadt, manhattan, munich, paris, vienna): worst 0.104 (manhattan). 0.25
+#: therefore carries ~2.4x headroom over the worst real city, while the largest translation it can
+#: miss drops to 233-499 m across those seven -- 233 m for Ingolstadt itself, against the 1821 m the
+#: old rule allowed there.
+ALIGN_CENTRE_FRAC = 0.25
+ALIGN_MARGIN_M = 250.0
+#: Second, INDEPENDENT arm, over a statistic the function already computed and then ignored. It is
+#: not a restatement of the median test: it moves under a wrong SCALE or a rotation, which shift the
+#: cloud's spread without necessarily shifting its centre. netconvert keeps whole edges, so junctions
+#: legitimately sit outside the requested bbox; measured containment for a CORRECT import is
+#: 0.838-0.899 over the same seven cities, so 0.60 has ~0.24 absolute headroom.
+ALIGN_MIN_INSIDE_FRAC = 0.60
+
+
+def _assert_alignment(pts: list, expect_bbox_xy: list | None, *,
+                      margin_m: float = ALIGN_MARGIN_M,
+                      centre_frac: float = ALIGN_CENTRE_FRAC,
+                      min_inside_frac: float = ALIGN_MIN_INSIDE_FRAC) -> dict:
     """GATE: the imported network must land where the extract says it is.
 
-    A wrong origin/scale translates the whole graph while every street still looks fine -- exactly
-    the failure `extract_buildings` guards against for footprints, and the same tolerance rule
-    (half the expected diagonal, floor `margin_m`) is used here so the two layers cannot drift
-    apart silently."""
+    A wrong origin translates the whole graph while every street still looks fine -- exactly the
+    failure `extract_buildings` guards against for footprints.
+
+    Two arms; see the constants above for how each tolerance was measured. NOTE what this gate can
+    and cannot do: it is a TRANSLATION and gross-shape check. It cannot see a wrong scale CONSTANT,
+    because `expect_bbox_xy` is derived from the very projection tuple under test, so both sides move
+    together -- that is `_assert_frame`'s job, and it is called from `_transformer` before any point
+    is projected.
+    """
     xs = sorted(p[0] for p in pts)
     ys = sorted(p[1] for p in pts)
     med = [xs[len(xs) // 2], ys[len(ys) // 2]]
@@ -239,18 +339,30 @@ def _assert_alignment(pts: list, expect_bbox_xy: list | None, *, margin_m: float
     if expect_bbox_xy is None:
         return info
     x0, y0, x1, y1 = (float(v) for v in expect_bbox_xy)
-    tol = max(margin_m, 0.5 * math.hypot(x1 - x0, y1 - y0))
+    cx, cy = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
+    tol_x = max(margin_m, centre_frac * abs(x1 - x0))
+    tol_y = max(margin_m, centre_frac * abs(y1 - y0))
     info["expected_bbox"] = [round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2)]
-    info["alignment_tolerance_m"] = round(tol, 1)
+    info["alignment_tolerance_m"] = [round(tol_x, 1), round(tol_y, 1)]
+    info["median_offset_m"] = [round(med[0] - cx, 2), round(med[1] - cy, 2)]
     inside = sum(1 for p in pts if x0 <= p[0] <= x1 and y0 <= p[1] <= y1)
-    info["nodes_inside_expected_bbox_frac"] = round(inside / max(1, len(pts)), 4)
-    if not (x0 - tol <= med[0] <= x1 + tol and y0 - tol <= med[1] <= y1 + tol):
+    frac = inside / max(1, len(pts))
+    info["nodes_inside_expected_bbox_frac"] = round(frac, 4)
+    if abs(med[0] - cx) > tol_x or abs(med[1] - cy) > tol_y:
         raise ValueError(
-            f"imported network does not land on the expected extent: median node "
-            f"{info['median_node']} is outside {info['expected_bbox']} widened by {tol:.0f} m. "
-            f"This is the projection trap -- a SUMO net must be re-projected into the SAME local "
-            f"frame osm.py derived from the ROAD ways (lat0/lon0 = min lat/lon, kx = "
-            f"111320*cos(mean_lat), ky = 110540), never with a re-derived origin.")
+            f"imported network does not land on the expected extent: its median node "
+            f"{info['median_node']} is offset {info['median_offset_m']} m from the centre of "
+            f"{info['expected_bbox']}, beyond the tolerance {info['alignment_tolerance_m']} m "
+            f"(= {centre_frac:g} of each axis's extent, floor {margin_m:g} m). A SUMO net must be "
+            f"re-projected into the SAME local frame osm.py derived from the ROAD ways "
+            f"(lat0/lon0 = min lat/lon over those ways), never with a re-derived origin.")
+    if frac < min_inside_frac:
+        raise ValueError(
+            f"only {frac:.1%} of the imported junctions land inside the requested extent "
+            f"{info['expected_bbox']} (floor {min_inside_frac:.0%}). netconvert keeps whole edges, "
+            f"so a few junctions legitimately sit outside -- a correct import measures 84-90% -- "
+            f"but this is the signature of a wrong SCALE or a rotated frame, which spreads the "
+            f"cloud without necessarily moving its centre.")
     return info
 
 

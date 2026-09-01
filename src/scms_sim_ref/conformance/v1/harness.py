@@ -87,7 +87,7 @@ class OracleStation(StationSnapshot):
 
 def build_frames(*, n_steps: int = 6, n_stations: int = 12, spacing_m: float = 55.0,
                  move_m: float = 0.0, weather_loss: float = 0.0, oracle: bool = False,
-                 env: dict = None, dt: float = 1.0):
+                 env: dict = None, dt: float = 1.0, step0: int = 0):
     """A street of `n_stations` stations, one PDU each per step.
 
     `move_m == 0.0` freezes the geometry, which is what C4 needs: with an identical candidate set
@@ -95,11 +95,18 @@ def build_frames(*, n_steps: int = 6, n_stations: int = 12, spacing_m: float = 5
     every step, and any other count is a step-guard bug.
 
     `oracle=True` swaps in :class:`OracleStation`s whose DECLARED fields are unchanged (C6b).
+
+    `step0` starts the numbering somewhere other than 0. C13 uses it to drive a short tail at a HIGH
+    step index: a plugin whose side effect is guarded by `if frame.step >= 30` is invisible to any
+    contiguous window shorter than 31 steps, and the realistic shape of a config write really is
+    "after the run has settled". A cheap jump in the step number costs four frames and catches every
+    threshold below it, which a longer contiguous trace would only do by being longer.
     """
     envmap = dict(env or {"buildings": [], "weather": "clear"})
     frames = []
-    for step in range(n_steps):
-        shift = move_m * step
+    for k in range(n_steps):
+        step = step0 + k
+        shift = move_m * k                  # geometry advances with the FRAME, not the step label
         stations = {}
         for i in range(n_stations):
             x = i * spacing_m + shift
@@ -143,12 +150,22 @@ def build_ladder(distance_m: float, *, n_tx: int = 12, n_steps: int = 8, dt: flo
 # --------------------------------------------------------------------------- #
 # Driving a model
 # --------------------------------------------------------------------------- #
-def adapt(model):
+def adapt(model, rng_ns=None):
     """Wrap a raw model in whichever adapter its shape calls for -- exactly as `build_channel` does,
-    so the suite drives a plugin through the same object the engine drives it through."""
+    so the suite drives a plugin through the same object the engine drives it through.
+
+    `rng_ns` is the model's `RngNamespace`. Passing it is not optional book-keeping: the adapter's
+    `begin_step` is what advances `RngNamespace._step`, so a harness that omits it grades the model
+    with a FROZEN step -- every `stream()` key ending `:s-1` -- which is a DIFFERENT MODEL from the
+    one the engine runs. Measured on the reference plugin's own C9 ladder, frozen versus advanced:
+    PDR `1.000 1.000 1.000 1.000 0.969 0.885 0.792` versus `1.000 1.000 0.979 0.948 0.844 0.698
+    0.615`. A frozen stateless draw is a fixed per-link offset, so the curve flattens and 0.18 of
+    range loss disappears at the far rung; C1/C2/C11 likewise compare traces whose step dimension
+    carries no information.
+    """
     if hasattr(model, "evaluate"):
-        return PerLinkAdapter(model)
-    return BatchAdapter(model)
+        return PerLinkAdapter(model, rng_ns)
+    return BatchAdapter(model, rng_ns)
 
 
 def candidates_for(adapter, frame, *, beyond: float = 0.0):
@@ -175,7 +192,8 @@ def candidates_for(adapter, frame, *, beyond: float = 0.0):
     return out
 
 
-def trace(model, frames, *, order: str = "sorted", beyond: float = 0.0, step_hook=None):
+def trace(model, frames, *, order: str = "sorted", beyond: float = 0.0, step_hook=None,
+          rng_ns=None):
     """Drive `model` over `frames` and return a canonical, comparable list of rows.
 
     One row per DELIVERED link: `(step, tx_index, rx_vid, rssi_dbm, link_state, delay_s,
@@ -183,7 +201,7 @@ def trace(model, frames, *, order: str = "sorted", beyond: float = 0.0, step_hoo
     Outcomes are re-sorted by `(rx_vid, tx_index)` before they are recorded, so a backend's internal
     ordering is structurally incapable of reaching the comparison.
     """
-    ad = adapt(model)
+    ad = adapt(model, rng_ns)
     rows = []
     for frame in frames:
         ad.begin_step(frame)
@@ -213,6 +231,57 @@ _RANDOM_METHODS = (
     "sample", "uniform", "triangular", "normalvariate", "gauss", "lognormvariate", "expovariate",
     "vonmisesvariate", "gammavariate", "betavariate", "paretovariate", "weibullvariate", "binomialvariate",
 )
+
+
+#: sentinel: the attribute is inherited from the C base `_random.Random`, not owned by `random.Random`
+_INHERITED = object()
+
+
+def random_class_surface() -> dict:
+    """Identity of every generator method on `random.Random`, plus the module-level bindings.
+
+    The instrument C3's third trap needs. Rebinding `random.Random.random` reaches EVERY stream in
+    the process at once -- including the engine's private `random.Random(cfg.seed)`, whose draw
+    count and order are load-bearing -- while leaving every generator STATE a check could snapshot
+    perfectly intact. Comparing identities is the only way to see it.
+    """
+    surface = {name: random.Random.__dict__.get(name, _INHERITED) for name in _RANDOM_METHODS}
+    surface["random.random"] = random.random
+    surface["random.seed"] = random.seed
+    surface["random.getstate"] = random.getstate
+    surface["random.setstate"] = random.setstate
+    return surface
+
+
+def tampered_random_names(surface: dict) -> list:
+    """Sorted names in `surface` whose binding is no longer the one it recorded."""
+    out = [n for n in _RANDOM_METHODS if random.Random.__dict__.get(n, _INHERITED) is not surface[n]]
+    out += [n for n in ("random.random", "random.seed", "random.getstate", "random.setstate")
+            if getattr(random, n.split(".", 1)[1]) is not surface[n]]
+    return sorted(out)
+
+
+def restore_random_class_surface(surface: dict) -> list:
+    """Put back anything that moved. Returns the names that had been tampered with.
+
+    A check that DETECTS a tamper and leaves it installed has poisoned the interpreter for
+    everything that runs after it, which is a worse outcome than not checking.
+    """
+    moved = tampered_random_names(surface)
+    for name in _RANDOM_METHODS:
+        original = surface[name]
+        if random.Random.__dict__.get(name, _INHERITED) is original:
+            continue
+        if original is _INHERITED:
+            try:
+                delattr(random.Random, name)              # was inherited from _random.Random
+            except AttributeError:                        # pragma: no cover
+                pass
+        else:
+            setattr(random.Random, name, original)
+    for name in ("random.random", "random.seed", "random.getstate", "random.setstate"):
+        setattr(random, name.split(".", 1)[1], surface[name])
+    return moved
 
 
 class DrawCounter:
@@ -348,7 +417,7 @@ def finite(x) -> bool:
     return x is None or (isinstance(x, (int, float)) and math.isfinite(float(x)))
 
 
-def pdr_and_rssi(model, distance_m, *, n_tx=12, n_steps=8):
+def pdr_and_rssi(model, distance_m, *, n_tx=12, n_steps=8, rng_ns=None):
     """(PDR, mean rssi or None, n_offered) at one rung of the C9 distance ladder."""
     frames = build_ladder(distance_m, n_tx=n_tx, n_steps=n_steps)
     offered = [0]
@@ -356,7 +425,7 @@ def pdr_and_rssi(model, distance_m, *, n_tx=12, n_steps=8):
     def _count(frame, cands, outs, dist):
         offered[0] += len(cands)
 
-    rows = trace(model, frames, step_hook=_count)
+    rows = trace(model, frames, step_hook=_count, rng_ns=rng_ns)
     got = len(rows)
     rssis = [r[3] for r in rows if r[3] is not None]
     mean = (sum(rssis) / len(rssis)) if rssis else None

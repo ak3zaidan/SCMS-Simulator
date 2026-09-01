@@ -2,14 +2,37 @@
 
 **Status:** **phases 0, 1 and 2 implemented**; phases 3-6 remain design.
 
+**Adversarial review (2026-08-31).** Phase 2 landed without its verifier. Six behavioural defects and
+three mis-transcribed digests were found and fixed; every one is reproduced, fixed and re-measured in
+**`PLUGIN-CONFORMANCE-EVIDENCE.md` §7**. Three of them share a shape worth naming here, because it is
+the failure mode this document is most exposed to: **`RngNamespace.begin_step`, `check_outcome` and
+`package_sha256` were each defined, documented, individually tested — and called by nothing.** The
+step term in the plugin RNG key was dead (`_step` stayed `-1` for whole runs, so a "stateless
+per-packet" stream was a per-run constant); the only outcome-validation on the default third-party
+path did not run; and the lock hashed one source FILE, so an edit to a sibling module replayed
+silently wrong with `verify-plugins` reporting clean. A function with no caller reads exactly like a
+working defence. Also corrected: C3 detected only the two RNG attacks that provably cannot reach the
+engine's stream while missing both that do; C9 could not fail a model with a constant delivery
+probability; `env["config"]` was the live mutable `PipelineConfig`; and three lock digests quoted in
+the evidence document were from a different install state than the artifacts they labelled.
+After the review: full suite **922 passed in 992.65 s**, exit 0; the reference run still digests
+`b25f2137cf14dd50…` with every count and metric unchanged; all 8 pinned goldens hold. The review's
+own findings were then re-verified independently, which added conformance check
+**C13_config_not_mutated** (the plugin-side half of the `env["config"]` defect — the engine gate
+alone cannot tell an author their model is wrong before they produce an artifact) and the three
+regression tests that assert the RNG step term is live, the absence of which is the whole reason
+defect 1 survived.
+
 **Phase 2 (2026-08-31).** `src/scms_sim_ref/conformance/` ships the v1 suite (C1-C12, thirteen rows
-— C6 has two arms), delivered both as a pytest-importable `ChannelModelContract` and as
+— C6 has two arms; the adversarial review below added C13 for a fourteenth), delivered both as a
+pytest-importable `ChannelModelContract` and as
 `scms-poc conformance`; `scms-poc verify-plugins` is a no-simulation CI gate; `tools/verify_data.py`
 gains six lock checks (`PL1`-`PL6`); and `--allow-plugin-drift` now **writes the drift into the new
 manifest** (`plugins.drift_allowed`), the half of section 4.3 phase 1 deferred. Headline gate, all
 five items measured and transcribed in **`PLUGIN-CONFORMANCE-EVIDENCE.md`**: an out-of-repo
 distribution (`scms-demo-channel 0.1.0`, installed as its own wheel, importing only
-`scms_sim_ref.api`) passes 13/13 checks and reproduces `9abe9eea…` across two processes with 10 of 11
+`scms_sim_ref.api`) passes 13/13 checks (14/14 since C13) and reproduces `9abe9eea…` (now `be3b5dea…`; see below)
+across two processes with 10 of 11
 files byte-identical; one mutated byte of its source makes the manifest unreplayable **before step 0**
 (exit 2, no output directory created); a `time.time()`-seeded model fails C1 **and** separately
 yields `e3c94d7e…` vs `4275ef8a…` under an identical `provenance_digest`; and an oracle-reading model
@@ -919,9 +942,12 @@ Every one of these is already load-bearing in the engine and must be restated in
 
 > **AS IMPLEMENTED (2026-08-31).** `src/scms_sim_ref/conformance/` — `v1/channel.py` (the contract),
 > `v1/harness.py` (scenarios, `DrawCounter`, `audit_guard`), `runner.py` (the pytest-free driver and
-> `ConformanceReport`). Thirteen rows for the twelve numbered checks, because C6 has two arms.
+> `ConformanceReport`). Fourteen rows for the thirteen numbered checks, because C6 has two arms —
+> phase 2 shipped C1-C12, and the adversarial review added **C13_config_not_mutated** (the model
+> does not write to the run's `PipelineConfig`; three arms — a write at construction, a write during
+> a 12-step run, and a before/after snapshot that does not care how the write was performed).
 > `tests/test_conformance.py` grades the SUITE, with one deliberate violator per check, each of
-> which must fail its own check and (for C6b) *only* its own check.
+> which must fail its own check and (for C6b and both C13 violators) *only* its own check.
 >
 > **Two deviations, both forced and both stated in the module docstring.**
 > **(1)** C6b is `C6b_oracle_invariance`, not `rssi_tracks_true_geometry_not_claimed`. The memo's
@@ -1323,7 +1349,8 @@ still works). Add `manifest["plugins"]`.
 
 ### Phase 2 — Conformance suite + provenance lock — **IMPLEMENTED 2026-08-31**
 
-**Work.** `scms_sim_ref.conformance.v1` (C1–C12). `strict_plugins` in `config_from_dict`.
+**Work.** `scms_sim_ref.conformance.v1` (C1–C12; C13 added by the adversarial review).
+`strict_plugins` in `config_from_dict`.
 `scms-poc verify-plugins`. `scms-poc conformance`. Extend `tools/verify_data.py`.
 
 **Gate — the headline acceptance test.** Every item below was measured; the transcript, the exit
@@ -1331,9 +1358,11 @@ codes and the digests are in **`PLUGIN-CONFORMANCE-EVIDENCE.md`**, reproducible 
 (`C:\Temp\scms_plugin_demo\ACCEPTANCE.ps1`).
 - ✅ **A reference channel plugin living OUTSIDE the repo** (`scms-demo-channel 0.1.0`, its own
   pyproject and wheel in `C:\Temp\scms_plugin_demo`, importing only `scms_sim_ref.api` — asserted by
-  a source scan in its own suite) passes all 12 checks (13 rows, exit 0) and **reproduces
-  byte-identical output across two runs**: `9abe9eeac07f947e…`, 10 of 11 files byte-identical,
-  `manifest.json` differing only by `build_utc`.
+  a source scan in its own suite) passes all 12 checks (13 rows, exit 0; 13 checks / 14 rows since
+  C13) and **reproduces byte-identical output across two runs**: `9abe9eeac07f947e…`, 10 of 11 files
+  byte-identical, `manifest.json` differing only by `build_utc`. (That digest was measured with the
+  frozen-RNG-step defect present; on the fixed engine the same config and plugin give
+  `be3b5deaa209d078…`, still two-run identical. See `PLUGIN-CONFORMANCE-EVIDENCE.md` §7 defect 1.)
 - ✅ Mutating one byte of that plugin's source — inside a docstring, so behaviour is unchanged —
   makes `verify-plugins` exit **2** and the replay exit **2** with `PluginDriftError`, **before
   step 0**: no output directory is created. `--allow-plugin-drift` then reproduces the *identical*

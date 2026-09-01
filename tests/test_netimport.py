@@ -234,16 +234,81 @@ def test_net_is_reprojected_into_the_osm_frame(net_path):
 
 def test_alignment_gate_rejects_a_shifted_frame(net_path):
     """The projection trap: a wrong origin translates the whole network while every street still
-    looks perfectly plausible. The gate is the only place that is observable."""
+    looks perfectly plausible. The gate is the only place that is observable.
+
+    A pure LONGITUDE shift is the clean translation case -- kx depends on latitude only, so the
+    frame stays internally consistent and the extent arm is what has to fire.
+    """
     frame = _fixture_frame()
     expect = [0.0, 0.0, 250.0, 200.0]
     netimport.import_net(net_path, projection=frame, expect_bbox_xy=expect)   # passes
-    bad = dict(frame, lat0=frame["lat0"] + 0.05)                              # ~5.5 km north
-    with pytest.raises(ValueError, match="projection trap"):
-        netimport.import_net(net_path, projection=bad, expect_bbox_xy=expect)
-    with pytest.raises(ValueError, match="projection trap"):
+    with pytest.raises(ValueError, match="does not land on the expected extent"):
         netimport.import_net(net_path, projection=dict(frame, lon0=frame["lon0"] - 0.05),
-                             expect_bbox_xy=expect)
+                             expect_bbox_xy=expect)                          # ~3.7 km east
+    with pytest.raises(ValueError, match="does not land on the expected extent"):
+        netimport.import_net(net_path, projection=dict(frame, lat0=frame["lat0"] + 0.05),
+                             expect_bbox_xy=expect)                          # ~5.5 km south
+
+
+def test_the_frame_gate_catches_the_scale_constant_its_message_names():
+    """Finding: `_assert_alignment`'s message warned about "ky = 110540, not 111320" while being
+    structurally unable to fire on it -- `expect_bbox_xy` is derived from the SAME tuple under test,
+    so both sides move together. Measured on the cached extracts, the substitution displaces nodes by
+    only 10.6-18.7 m and every city passed. That is far too little for a translation gate to see and
+    far too much for the geometric channel's building-blockage test, which would then compute NLOS
+    against footprints offset from the road graph.
+
+    `_assert_frame` tests the CONSTANTS instead, so it fires regardless of geometry.
+    """
+    frame = _fixture_frame()
+    netimport._assert_frame(frame)                                   # the real frame passes
+    with pytest.raises(ValueError, match="THIS IS THE TRAP"):
+        netimport._assert_frame(dict(frame, ky=111320.0))
+    with pytest.raises(ValueError, match=r"outside \(0,"):
+        netimport._assert_frame(dict(frame, kx=200000.0))
+    with pytest.raises(ValueError, match="missing"):
+        netimport._assert_frame({"lat0": 48.0, "lon0": 11.0, "kx": 74000.0})
+    with pytest.raises(ValueError, match="not a WGS84 coordinate"):
+        netimport._assert_frame(dict(frame, lat0=480.0))
+    # kx and ky swapped -- the classic units typo, and the reason the band exists at all
+    with pytest.raises(ValueError, match="inconsistent with lat0"):
+        netimport._assert_frame(dict(frame, kx=netimport.FRAME_KY, ky=netimport.FRAME_KY))
+    # the band is symmetric in |lat|: in the southern hemisphere lat0 is the MOST NEGATIVE latitude,
+    # so the extract's mean is CLOSER to the equator and kx is LARGER than cos(lat0) gives. A
+    # one-sided band derived from the northern case would reject every southern import.
+    for lat0 in (-33.87, -22.91, 33.87):
+        mean = lat0 + 0.006                        # a ~700 m tall extract, as the cached ones are
+        netimport._assert_frame({"lat0": lat0, "lon0": 151.2, "ky": netimport.FRAME_KY,
+                                 "kx": netimport.FRAME_KX * math.cos(math.radians(mean))})
+
+
+def test_the_extent_gate_is_tighter_than_the_city_it_guards():
+    """Finding: `tol = max(250, 0.5*diagonal)` around the whole bbox accepted an east-west
+    translation of 1821 m and a diagonal one of 2281 m on the real 217-junction Ingolstadt cloud --
+    both LARGER than the 1468 x 1216 m modelled area, so a city could be projected entirely off
+    itself and still pass.
+
+    The rule now bounds |median - bbox centre| per axis. Asserted on a synthetic cloud so it needs no
+    network access, and calibrated (see `ALIGN_CENTRE_FRAC`) against the seven cached cities, whose
+    worst real offset fraction is 0.104.
+    """
+    w, h = 1468.0, 1216.0
+    expect = [0.0, 0.0, w, h]
+    grid = [[x, y] for x in range(0, int(w), 40) for y in range(0, int(h), 40)]
+    netimport._assert_alignment(grid, expect)                        # centred -> passes
+    tol_x = max(netimport.ALIGN_MARGIN_M, netimport.ALIGN_CENTRE_FRAC * w)
+    assert tol_x < w, "the tolerance must be smaller than the city it guards"
+    # the OLD rule's tolerance, for the record: it exceeded the extent in both axes
+    assert max(250.0, 0.5 * math.hypot(w, h)) > 0.5 * w
+    ok = [[x + tol_x * 0.9, y] for x, y in grid]
+    netimport._assert_alignment(ok, expect)
+    bad = [[x + tol_x * 1.2, y] for x, y in grid]
+    with pytest.raises(ValueError, match="does not land on the expected extent"):
+        netimport._assert_alignment(bad, expect)
+    # the second arm: a cloud whose CENTRE is right but whose scale is wrong
+    spread = [[(x - w / 2) * 3.0 + w / 2, (y - h / 2) * 3.0 + h / 2] for x, y in grid]
+    with pytest.raises(ValueError, match="land inside the requested extent"):
+        netimport._assert_alignment(spread, expect)
 
 
 def test_alignment_reports_coverage_without_a_bbox(net_path):

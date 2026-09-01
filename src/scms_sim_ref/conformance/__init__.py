@@ -5,7 +5,7 @@ shipped as importable base classes under a version package (`v1` speaks `Channel
 than as a floating pile of tests. Three delivery routes, one implementation behind all of them:
 
 1. **Subclass it in your own test suite** -- `class TestRayleigh(ChannelModelContract)`, set `REF`
-   (or override `make()`), and pytest collects C1-C12 as twelve real tests.
+   (or override `make()`), and pytest collects C1-C13 as fourteen real tests (C6 has two arms).
 2. **Run it from the CLI** -- `scms-poc conformance --slot channel_model --ref myorg.radio:Rayleigh`,
    which needs no pytest and writes a `conformance_report.json`.
 3. **Embed the report** -- that summary is what belongs in

@@ -8,6 +8,7 @@ realism harness as `traffic.overlap_events`, a HARD gate failure the SUMO path s
 Everything here is OPT-IN. The last section is the guard that says so: with nothing enabled, every
 network produces the exact objects it produced before and consumes the exact same RNG.
 """
+import json
 import math
 import random
 
@@ -643,16 +644,20 @@ def _opposing_overlaps(dataset_dir):
 
 
 def test_directed_lane_frames_eliminate_head_on_overlaps(tmp_path):
-    """The G7 gate, end to end. Two identical routed grid runs; the second gives every direction its
-    own carriageway. Head-on overlaps -- distinct vehicles occupying the same point while driving
-    opposite ways -- go to zero.
+    """The G7 gate, end to end, THROUGH THE SHIPPED CONFIG SURFACE.
 
-    run.py is owned elsewhere, so the wiring is applied here the way the `needed_wiring` diff
-    describes it: swap `roads.GridNetwork` for a subclass that calls enable_directed_lanes(). run.py
-    imports GridNetwork inside run_pipeline, so the swap is picked up with no edit to run.py.
+    Two identical routed grid runs; the second sets `directed_lanes=True` and nothing else. Head-on
+    overlaps -- distinct vehicles occupying the same point while driving opposite ways -- go to zero.
+
+    This used to install a `class _Directed(GridNetwork)` subclass over `roads.GridNetwork`, because
+    run.py was owned by a parallel workflow when the measurement was made. That made the number real
+    and the PRODUCT incapable of producing it: `grep` over run.py found zero occurrences of
+    `enable_directed_lanes`, and `PipelineConfig` had no field matching direct*/carriage*/oneway/
+    drive_side/lanes_per. A user who read the commit message and set every knob the product exposed
+    could not reproduce it. The monkeypatch is gone; if `directed_lanes` ever stops being wired into
+    `run_pipeline`, this test fails instead of quietly measuring its own subclass.
     """
     from scms_sim_ref.mock_pipeline import PipelineConfig, run_pipeline
-    from scms_sim_ref.mock_pipeline import roads as _roads
 
     cfg = dict(traffic_flow=True, road_network="grid", grid_w=6, grid_h=6, n_lanes=2,
                arrival_rate=3.0, duration_s=300.0, demand_profile="rush", traffic_lights=True,
@@ -664,22 +669,104 @@ def test_directed_lane_frames_eliminate_head_on_overlaps(tmp_path):
     run_pipeline(PipelineConfig(out_dir=base_dir, **cfg))
     base_opp, base_same = _opposing_overlaps(base_dir)
 
-    orig = _roads.GridNetwork
-    try:
-        class _Directed(orig):
-            def __init__(self, *a, **k):
-                super().__init__(*a, **k)
-                self.enable_directed_lanes(lane_width_m=3.5, lanes_per_dir=2)
-        _roads.GridNetwork = _Directed
-        dir_dir = str(tmp_path / "dir")
-        run_pipeline(PipelineConfig(out_dir=dir_dir, **cfg))
-    finally:
-        _roads.GridNetwork = orig
+    dir_dir = str(tmp_path / "dir")
+    run_pipeline(PipelineConfig(out_dir=dir_dir, directed_lanes=True, **cfg))
     dir_opp, dir_same = _opposing_overlaps(dir_dir)
 
     assert base_opp > 0, "the baseline must actually exhibit the defect for this to mean anything"
     assert dir_opp == 0, f"head-on overlaps survived: {dir_opp} (baseline {base_opp})"
     assert dir_opp + dir_same < base_opp + base_same
+
+
+def test_directed_lanes_is_reachable_from_the_config_and_inert_by_default(tmp_path, capsys):
+    """The activation surface itself, asserted end to end: dataclass field, `config_schema()` entry,
+    CLI flag, and a real `main()` invocation that reaches `run_pipeline`.
+
+    The defect was not that the geometry was wrong; it was that the geometry was UNREACHABLE from
+    every surface the product exposes. So what is pinned here is reachability and default-inertness,
+    not physics.
+    """
+    import dataclasses
+
+    from scms_sim_ref.mock_pipeline import PipelineConfig, config_schema
+    from scms_sim_ref.mock_pipeline.run import main
+
+    names = {f.name for f in dataclasses.fields(PipelineConfig)}
+    assert {"directed_lanes", "drive_side", "custom_network_directed"} <= names
+    d = PipelineConfig()
+    assert d.directed_lanes is False and d.custom_network_directed is False
+    assert d.drive_side == "right"
+    sch = config_schema()
+    assert sch["drive_side"]["options"] == ["right", "left"]
+    assert sch["directed_lanes"]["type"] == "bool"
+
+    # the CLI flag exists, is accepted, and lands in the run's own manifest
+    rc = main(["--flow", "--road", "grid", "--grid", "4", "--duration", "20", "--arrival-rate", "1",
+               "--lanes", "2", "--directed-lanes", "--drive-side", "left", "--seed", "3",
+               "--out", str(tmp_path / "cli")])
+    capsys.readouterr()
+    assert rc == 0
+    man = json.loads((tmp_path / "cli" / "manifest.json").read_text(encoding="utf-8"))
+    assert man["config"]["directed_lanes"] is True and man["config"]["drive_side"] == "left"
+
+
+def test_the_custom_network_loader_consumes_the_directed_layer_when_asked(tmp_path):
+    """Finding: `_parse_custom_network` read only the UNDIRECTED `edges` array, so every one-way
+    flag, per-direction lane count and shape polyline `netimport.py` / `osm.py` produce was silently
+    discarded on the only path a user can take.
+
+    Backward compatibility is the reason the default stays undirected, so both halves are pinned:
+    off -> the pre-schema graph, byte-for-byte; on -> the directed one.
+    """
+    import json
+
+    from scms_sim_ref.mock_pipeline.run import _parse_custom_network
+
+    doc = {
+        "nodes": [[0, 0], [400, 0], [400, 400], [0, 400]],
+        "edges": [[0, 1], [1, 2], [2, 3], [3, 0]],                 # undirected, as before
+        "directed_edges": [                                        # a one-way gyratory
+            {"a": 0, "b": 1, "speed_mps": 14.0, "lanes": 2},
+            {"a": 1, "b": 2, "speed_mps": 14.0, "lanes": 2},
+            {"a": 2, "b": 3, "speed_mps": 14.0, "lanes": 1},
+            {"a": 3, "b": 0, "speed_mps": 14.0, "lanes": 1},
+        ],
+    }
+    blob = json.dumps(doc)
+    plain = CustomNetwork(*_parse_custom_network(blob))
+    assert plain.directed is False
+    assert plain.stats().get("oneway_edges", 0) == 0
+    assert plain.stats().get("lane_specified_edges", 0) == 0
+
+    rich = CustomNetwork(*_parse_custom_network(blob, directed=True))
+    assert rich.directed is True
+    assert rich.stats()["oneway_edges"] == 4
+    assert rich.stats()["lane_specified_edges"] == 4
+
+    # an opt-in that finds nothing to opt into must SAY so, not fall back to the old graph
+    with pytest.raises(ValueError, match="no \"directed_edges\" layer"):
+        _parse_custom_network(json.dumps({"nodes": doc["nodes"], "edges": doc["edges"]}),
+                              directed=True)
+
+
+def test_a_clipped_one_way_import_is_trimmed_to_its_drivable_core():
+    """A bbox clip leaves nodes you can enter and never leave; `CustomNetwork` refuses a directed map
+    that is not strongly connected. The loader runs `largest_strong_component` so the documented
+    `netimport.py --city ... --out map.json` workflow ends in a runnable map rather than an error."""
+    import json
+
+    from scms_sim_ref.mock_pipeline.run import _parse_custom_network
+
+    doc = {
+        "nodes": [[0, 0], [400, 0], [400, 400], [0, 400], [900, 400]],
+        "edges": [[0, 1], [1, 2], [2, 3], [3, 0], [2, 4]],
+        "directed_edges": [{"a": 0, "b": 1}, {"a": 1, "b": 2}, {"a": 2, "b": 3}, {"a": 3, "b": 0},
+                           {"a": 2, "b": 4}],          # node 4: enter, never leave (clipped exit)
+    }
+    nodes, edges = _parse_custom_network(json.dumps(doc), directed=True)
+    assert len(nodes) == 4                              # the dead-end sink is trimmed
+    net = CustomNetwork(nodes, edges)                   # ... and the result actually builds
+    assert net.directed is True
 
 
 def _rich_square():

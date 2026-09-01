@@ -37,6 +37,7 @@ import os
 import sys
 
 from . import channel as _channel
+from . import detect as _detect
 from .errors import (CapabilityError, ConfigError, InterfaceVersionError, PluginDriftError,
                      SignatureError)
 from .rng import check_plugin_id
@@ -51,17 +52,36 @@ _BUILTINS: dict = {"channel_model": {}, "check": {}, "fusion": {}, "message_code
 
 SLOTS: tuple = tuple(sorted(_BUILTINS))
 
-#: slot -> (interface name, interface version, {method: (required positional parameter names,)})
+#: slot -> (interface name, interface version, max minor, {shape: {method: (required positional
+#: parameter names,)}}). A slot with more than one accepted SHAPE (the channel's per-link vs
+#: per-step forms) lists them all; the resolver reports which one an object satisfied.
 INTERFACE: dict = {
     "channel_model": (
-        _channel.INTERFACE_NAME, _channel.INTERFACE_VERSION,
-        {"capabilities": (),
-         "begin_step": ("frame",),
-         "evaluate": ("tx", "rx", "d_m", "txn")},
-        {"capabilities": (),
-         "begin_step": ("frame",),
-         "deliver": ("frame", "candidates")},
+        _channel.INTERFACE_NAME, _channel.INTERFACE_VERSION, _channel.MAX_MINOR,
+        {"link": {"capabilities": (),
+                  "begin_step": ("frame",),
+                  "evaluate": ("tx", "rx", "d_m", "txn")},
+         "batch": {"capabilities": (),
+                   "begin_step": ("frame",),
+                   "deliver": ("frame", "candidates")}},
     ),
+    "check": (
+        _detect.INTERFACE_NAME, _detect.INTERFACE_VERSION, _detect.MAX_MINOR,
+        {"check": _detect.CHECK_SPEC},
+    ),
+    "fusion": (
+        _detect.INTERFACE_NAME, _detect.INTERFACE_VERSION, _detect.MAX_MINOR,
+        {"fusion": _detect.FUSION_SPEC},
+    ),
+}
+
+#: slot -> (known capabilities, capabilities refused from anything that is not a built-in). Both
+#: sets are the SLOT's, not the channel's: a detector declaring `rssi` means "reads obs.rssi_dbm",
+#: which is a different statement from a channel declaring it.
+CAPABILITIES: dict = {
+    "channel_model": (_channel.KNOWN_CAPABILITIES, _channel.RESERVED_CAPABILITIES),
+    "check": (_detect.KNOWN_CAPABILITIES, _detect.RESERVED_CAPABILITIES),
+    "fusion": (_detect.KNOWN_CAPABILITIES, _detect.RESERVED_CAPABILITIES),
 }
 
 
@@ -100,16 +120,23 @@ class ProvenanceRecord:
     """One entry of `manifest["plugins"]["loaded"]` -- the lock, not the intent."""
 
     __slots__ = ("slot", "order", "ref", "resolved_via", "distribution", "version",
-                 "dist_sha256", "module_sha256", "interface_version", "capabilities",
-                 "declared_streams", "params", "params_sha256", "provenance_incomplete",
-                 "conformance")
+                 "dist_sha256", "module_sha256", "package_sha256", "interface_version",
+                 "capabilities", "declared_streams", "params", "params_sha256",
+                 "provenance_incomplete", "conformance")
 
     def __init__(self, slot, order, ref, resolved_via, distribution, version, dist_sha256,
                  module_sha256, interface_version, capabilities, declared_streams, params,
-                 params_sha256, provenance_incomplete, conformance=None):
+                 params_sha256, provenance_incomplete, conformance=None, package_sha256=None):
         self.slot, self.order, self.ref = slot, order, ref
         self.resolved_via, self.distribution, self.version = resolved_via, distribution, version
         self.dist_sha256, self.module_sha256 = dist_sha256, module_sha256
+        #: sha256 over the plugin's whole top-level PACKAGE directory. `module_sha256` covers only
+        #: the file the class is DEFINED in, so a behaviour-changing edit to any SIBLING module the
+        #: class imports its physics from is invisible to it -- and `dist_sha256` comes from the
+        #: wheel RECORD, which goes stale the moment a file is edited in place. This field is the
+        #: one that closes that gap. `None` for a built-in and for a plugin that is a bare module
+        #: rather than a package (there `module_sha256` already covers everything).
+        self.package_sha256 = package_sha256
         self.interface_version, self.capabilities = interface_version, capabilities
         self.declared_streams, self.params = declared_streams, params
         self.params_sha256 = params_sha256
@@ -127,6 +154,10 @@ class ProvenanceRecord:
              "module_sha256": self.module_sha256, "interface_version": self.interface_version,
              "capabilities": sorted(self.capabilities), "declared_streams": list(self.declared_streams),
              "params": self.params, "params_sha256": self.params_sha256}
+        # Emitted ONLY when it exists, so a built-in's lock entry -- and every manifest written
+        # before this field -- is byte-identical to what it was.
+        if self.package_sha256 is not None:
+            d["package_sha256"] = self.package_sha256
         if self.provenance_incomplete:
             d["provenance_incomplete"] = True
         if self.conformance:
@@ -159,11 +190,36 @@ def _sha256_file(path: str) -> str:
 _MODULE_HASH_CACHE: dict = {}
 
 
+def _file_sha256_cached(path: str):
+    """`_sha256_file` behind the stat-tuple cache, or None if the path is not a readable file."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not os.path.isfile(path):
+        return None
+    key = (path, st.st_mtime_ns, st.st_size)
+    hit = _MODULE_HASH_CACHE.get(key)
+    if hit is not None:
+        return hit
+    try:
+        digest = _sha256_file(path)
+    except OSError:
+        return None
+    _MODULE_HASH_CACHE[key] = digest
+    return digest
+
+
 def module_sha256(obj):
-    """sha256 of the defining source file, or of the package directory walked in SORTED order.
+    """sha256 of the file the object is DEFINED in -- that file and nothing else.
 
     Always-available fallback for `dist_sha256`. Fails (returns None) for C extensions and
-    `exec`-created classes. NEVER hashes `__pycache__`: a `.pyc` embeds mtimes and paths.
+    `exec`-created classes.
+
+    **It is deliberately narrow, and on its own it is not enough.** A class defined in `leaky.py`
+    that inherits every line of its physics from a sibling `rayleigh.py` has a `module_sha256` that
+    does not move when `rayleigh.py` is rewritten. That is what :func:`package_sha256` is for, and
+    why :func:`make_provenance` records both.
     """
     try:
         src = inspect.getsourcefile(obj) or inspect.getfile(obj)
@@ -171,28 +227,25 @@ def module_sha256(obj):
         return None
     if not src:
         return None
-    try:
-        st = os.stat(src)
-    except OSError:
-        return None
-    if not os.path.isfile(src):
-        return None
-    key = (src, st.st_mtime_ns, st.st_size)
-    hit = _MODULE_HASH_CACHE.get(key)
-    if hit is not None:
-        return hit
-    try:
-        digest = _sha256_file(src)
-    except OSError:
-        return None
-    _MODULE_HASH_CACHE[key] = digest
-    return digest
+    return _file_sha256_cached(src)
 
 
 def package_sha256(root: str):
     """sha256 over a package directory: `sorted((relpath, filehash))`, `__pycache__` excluded.
 
-    Structurally the same helper as `_data_digest` (run.py:3779), deliberately.
+    Structurally the same helper as `_data_digest` (run.py), deliberately.
+
+    This is the lock's answer to the SIBLING-MODULE hole. `module_sha256` hashes one file and
+    `dist_sha256` is copied out of the wheel's RECORD -- a manifest of what the installer WROTE,
+    which says nothing about what the file contains now. Edit a sibling module of an installed
+    distribution in place and both stay put, `verify-plugins` reports "no drift", and the replay
+    produces a different dataset at exit 0: precisely D4's stated failure mode, with the lock in
+    place. Hashing the package directory is what makes that edit visible.
+
+    Per-file hashes go through the stat-tuple cache, so the in-process multi-run drivers pay the
+    walk (a `stat` per file) and not the read. The residual blind spot is the cache's, and it is
+    the one `module_sha256` has always had: an edit that preserves BOTH mtime_ns and size in the
+    same process is not seen. A fresh process always re-reads.
     """
     if not os.path.isdir(root):
         return None
@@ -204,12 +257,31 @@ def package_sha256(root: str):
                 continue
             full = os.path.join(dirpath, name)
             rel = os.path.relpath(full, root).replace(os.sep, "/")
-            h.update(rel.encode("utf-8"))
-            try:
-                h.update(_sha256_file(full).encode())
-            except OSError:
+            digest = _file_sha256_cached(full)
+            if digest is None:
                 return None
+            h.update(rel.encode("utf-8"))
+            h.update(digest.encode())
     return h.hexdigest()
+
+
+def package_root(obj):
+    """Directory of the top-level PACKAGE the object's module lives in, or None.
+
+    None for a bare single-module plugin (where `module_sha256` already covers the whole thing) and
+    for a namespace package spread over several directories (where there is no single tree to hash
+    and saying so beats hashing an arbitrary one of them).
+    """
+    mod = getattr(obj, "__module__", None)
+    if not mod:
+        return None
+    top = sys.modules.get(mod.split(".")[0])
+    if top is None:
+        return None
+    paths = [p for p in (getattr(top, "__path__", None) or ())]
+    if len(paths) != 1:
+        return None
+    return paths[0] if os.path.isdir(paths[0]) else None
 
 
 #: top-level module name -> (distribution, version, dist_sha256). `packages_distributions()` walks
@@ -378,8 +450,8 @@ def _parse_version(iv: str, slot: str):
 
 
 def _check_interface_version(obj, slot: str) -> str:
-    want_name, want_iv, *_ = INTERFACE[slot]
-    _, want_major, want_minor_max = _parse_version(want_iv, slot)
+    want_name, want_iv, max_minor, _shapes = INTERFACE[slot]
+    _, want_major, _want_minor = _parse_version(want_iv, slot)
     got = getattr(obj, "interface_version", None)
     if got is None:
         raise InterfaceVersionError(
@@ -391,10 +463,10 @@ def _check_interface_version(obj, slot: str) -> str:
     if major != want_major:
         raise InterfaceVersionError(
             f"{slot}: interface major {major} != engine major {want_major} ({got!r})")
-    if minor > _channel.MAX_MINOR:
+    if minor > max_minor:
         raise InterfaceVersionError(
             f"{slot}: interface minor {minor} exceeds this engine's maximum "
-            f"{_channel.MAX_MINOR} ({got!r})")
+            f"{max_minor} ({got!r})")
     return got
 
 
@@ -410,13 +482,16 @@ def _check_signature(obj, slot: str) -> str:
     satisfied ("link" or "batch").
     """
     cls = _members(obj)
-    _, _, link_spec, batch_spec = INTERFACE[slot]
+    shapes = INTERFACE[slot][3]
     errs = []
-    for shape, spec in (("link", link_spec), ("batch", batch_spec)):
+    for shape, spec in shapes.items():
         problem = _signature_problem(cls, spec)
         if problem is None:
             return shape
         errs.append(f"as a {shape} model: {problem}")
+    if len(shapes) == 1:
+        raise SignatureError(f"{slot}: {cls.__name__} does not match the declared shape -- "
+                             + errs[0].split(": ", 1)[-1])
     raise SignatureError(f"{slot}: {cls.__name__} matches neither declared shape -- " +
                          "; ".join(errs))
 
@@ -485,32 +560,39 @@ def make_provenance(slot, order, ref, obj, how, iv, capabilities, declared_strea
     still get the full probe.
     """
     if how == "builtin":
-        dist, version, dsha = None, None, None
+        dist, version, dsha, psha = None, None, None, None
     else:
         dist, version, dsha = _distribution_for(obj)
+        # The one hash that covers a SIBLING module. Third parties only: a built-in's package is
+        # this engine, and hashing `src/scms_sim_ref/` would make every manifest unreplayable after
+        # any edit to any engine file -- the same reason built-ins are exempt from `verify_lock`.
+        root = package_root(obj)
+        psha = package_sha256(root) if root else None
     msha = module_sha256(obj)
-    incomplete = dsha is None and msha is None
+    incomplete = dsha is None and msha is None and psha is None
     return ProvenanceRecord(
         slot=slot, order=order, ref=ref, resolved_via=how, distribution=dist, version=version,
         dist_sha256=dsha, module_sha256=msha, interface_version=iv,
         capabilities=frozenset(capabilities), declared_streams=tuple(declared_streams),
         params=dict(params or {}), params_sha256=params_sha256(params),
-        provenance_incomplete=incomplete, conformance=conformance)
+        provenance_incomplete=incomplete, conformance=conformance, package_sha256=psha)
 
 
 def check_capabilities(slot, ref, obj, how, caps) -> frozenset:
     """Reserved capabilities are refused from anything that is not a built-in (section 4.1)."""
     caps = frozenset(caps)
+    known, reserved = CAPABILITIES.get(slot, (_channel.KNOWN_CAPABILITIES,
+                                              _channel.RESERVED_CAPABILITIES))
     if how != "builtin" or not is_builtin(slot, obj):
-        bad = sorted(caps & _channel.RESERVED_CAPABILITIES)
+        bad = sorted(caps & reserved)
         if bad:
             raise CapabilityError(
                 f"{slot} {ref!r} declares reserved capability {bad} -- reserved for built-ins "
-                f"(these exist only so `disc`/`logdistance` keep digest 0bd93655...)")
-    unknown = sorted(c for c in caps if c not in _channel.KNOWN_CAPABILITIES)
+                f"(these exist only so the built-ins keep their pinned digests)")
+    unknown = sorted(c for c in caps if c not in known)
     if unknown:
         raise CapabilityError(f"{slot} {ref!r} declares unknown capability {unknown}; known: "
-                              f"{sorted(_channel.KNOWN_CAPABILITIES)}")
+                              f"{sorted(known)}")
     return caps
 
 
@@ -569,7 +651,16 @@ def verify_lock(lock: dict, *, allow_drift: bool = False) -> list:
                 raise drift
             drifts.append(drift.args[0])
             continue
+        root = package_root(obj)
         for fname, actual in (("module_sha256", module_sha256(obj)),
+                              # WITHOUT this row the lock is blind to an edit of any file other than
+                              # the one the class is defined in. Measured: `leaky:LeakyChannel`
+                              # inherits its whole physics from `rayleigh.py`; adding 6 dB of
+                              # transmit power there left `module_sha256` (leaky.py) and
+                              # `dist_sha256` (the installer's RECORD) both unmoved, so
+                              # `verify-plugins` printed "no drift" and exited 0 while the replay
+                              # produced a DIFFERENT dataset. That is D4's stated failure mode.
+                              ("package_sha256", package_sha256(root) if root else None),
                               ("dist_sha256", _distribution_for(obj)[2]),
                               ("interface_version", iv)):
             expected = entry.get(fname)

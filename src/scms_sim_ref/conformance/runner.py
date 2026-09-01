@@ -15,11 +15,14 @@ import json
 import time
 import traceback
 
+from .v1 import harness as _H
 from .v1.channel import CHANNEL_CHECKS, SUITE_VERSION, ChannelModelContract, CheckSkipped
+from .v1.detect import DETECT_CHECKS, CheckContract
 
-#: slot -> (contract class, ordered check ids). Only the channel slot exists in this engine; the
-#: detector contract (D1-D7) lands with the detector seam (roadmap phase 3).
-CONTRACTS = {"channel_model": (ChannelModelContract, CHANNEL_CHECKS)}
+#: slot -> (contract class, ordered check ids). `--slot` on the CLI reads this, so registering a
+#: contract here is all it takes for `scms-poc conformance --slot check --ref ...` to work.
+CONTRACTS = {"channel_model": (ChannelModelContract, CHANNEL_CHECKS),
+             "check": (CheckContract, DETECT_CHECKS)}
 
 PASS, FAIL, SKIP, WAIVED, ERROR = "PASS", "FAIL", "SKIP", "WAIVED", "ERROR"
 
@@ -100,34 +103,45 @@ def run_contract(contract, checks=None) -> ConformanceReport:
     checks = tuple(checks or CHANNEL_CHECKS)
     _validate_waivers(contract)
     rows = []
+    # The PRISTINE `random.Random` surface, captured before any plugin code has run in this suite.
+    # C3's class-surface trap compares against this rather than against a snapshot it takes itself:
+    # a model that rebinds `random.Random.random` does it at CONSTRUCTION, which happens in C1, so a
+    # snapshot taken inside C3 would already contain the tamper -- and an evasive patch is written
+    # idempotently precisely so the second construction changes nothing. Restored in `finally`, so a
+    # suite run against a hostile plugin never leaves the interpreter patched for whatever runs next.
+    surface = _H.random_class_surface()
+    contract._pristine_random = surface
     t0 = time.perf_counter()
-    for check_id in checks:
-        fn = getattr(contract, "check_" + check_id, None)
-        if fn is None:
-            rows.append(_row(check_id, SKIP, "not implemented by this contract", 0.0))
-            continue
-        c0 = time.perf_counter()
-        try:
-            detail = fn()
-            rows.append(_row(check_id, PASS, str(detail) if detail else "",
-                             time.perf_counter() - c0))
-        except AssertionError as e:
-            why = _waiver(contract, check_id)
-            if why:
-                rows.append(_row(check_id, WAIVED, f"{why} [underlying: {_one_line(e)}]",
+    try:
+        for check_id in checks:
+            fn = getattr(contract, "check_" + check_id, None)
+            if fn is None:
+                rows.append(_row(check_id, SKIP, "not implemented by this contract", 0.0))
+                continue
+            c0 = time.perf_counter()
+            try:
+                detail = fn()
+                rows.append(_row(check_id, PASS, str(detail) if detail else "",
                                  time.perf_counter() - c0))
-            else:
-                rows.append(_row(check_id, FAIL, _one_line(e), time.perf_counter() - c0))
-        except BaseException as e:                          # noqa: BLE001 - Skipped is BaseException
-            if _is_skip(e):
-                rows.append(_row(check_id, SKIP, _one_line(e), time.perf_counter() - c0))
-            elif isinstance(e, Exception):
-                rows.append(_row(check_id, ERROR,
-                                 f"{type(e).__name__}: {_one_line(e)}\n"
-                                 + "".join(traceback.format_exc(limit=6)).strip()[-900:],
-                                 time.perf_counter() - c0))
-            else:
-                raise
+            except AssertionError as e:
+                why = _waiver(contract, check_id)
+                if why:
+                    rows.append(_row(check_id, WAIVED, f"{why} [underlying: {_one_line(e)}]",
+                                     time.perf_counter() - c0))
+                else:
+                    rows.append(_row(check_id, FAIL, _one_line(e), time.perf_counter() - c0))
+            except BaseException as e:                      # noqa: BLE001 - Skipped is BaseException
+                if _is_skip(e):
+                    rows.append(_row(check_id, SKIP, _one_line(e), time.perf_counter() - c0))
+                elif isinstance(e, Exception):
+                    rows.append(_row(check_id, ERROR,
+                                     f"{type(e).__name__}: {_one_line(e)}\n"
+                                     + "".join(traceback.format_exc(limit=6)).strip()[-900:],
+                                     time.perf_counter() - c0))
+                else:
+                    raise
+    finally:
+        _H.restore_random_class_surface(surface)
     return ConformanceReport(getattr(contract, "SLOT", "channel_model"),
                              getattr(contract, "REF", None), getattr(contract, "PARAMS", {}),
                              SUITE_VERSION, getattr(contract, "INTERFACE_VERSION", ""),

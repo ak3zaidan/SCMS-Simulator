@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from types import MappingProxyType as _MappingProxyType
 from typing import Iterable, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 INTERFACE_NAME = "ChannelModel"
@@ -96,6 +97,16 @@ RESERVED_CAPABILITIES = frozenset({CAP_LEGACY_GLOBAL_RNG, LOSS_ADDITIVE_LEGACY})
 
 #: The closed link-state vocabulary (conformance check C7).
 LINK_STATES = frozenset({"LOS", "NLOSv", "NLOSb"})
+
+#: THE published `rssi_dbm` bounds. ONE definition, imported by `conformance.v1.channel` rather than
+#: restated there: `check_outcome` is C7's runtime form, and a runtime gate whose bounds are wider
+#: than the check's is not that check -- it is a second, laxer contract with the same name. (They
+#: were [-200, 50] here and [-140, 0] in C7 until 2026-08-31.) Wider than physically usual on
+#: purpose -- a 33 dBm ETSI-cap transmitter at a few metres is legitimately close to 0 dBm -- but
+#: closed, so a model returning a linear-scale watt figure through a field documented as dBm is
+#: caught immediately.
+RSSI_MIN_DBM = -140.0
+RSSI_MAX_DBM = 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -312,11 +323,18 @@ class PerLinkAdapter:
     #: `evaluate_link` is BOUND AT CONSTRUCTION rather than defined as a forwarding method: the
     #: engine calls it once per candidate link (~10^7 times on a mid-size run), and one fewer
     #: Python frame per link is the difference between a refactor that is free and one that is not.
-    __slots__ = ("model", "evaluate_link")
+    __slots__ = ("model", "evaluate_link", "rng_ns", "validate")
 
-    def __init__(self, model):
+    def __init__(self, model, rng_ns=None, validate: bool = False):
         self.model = model
-        self.evaluate_link = model.evaluate
+        #: `validate` is what turns `check_outcome` from a function nobody calls into the engine's
+        #: outcome gate. On for third-party models, off for built-ins (the goldens grade those, and
+        #: this is a per-delivered-link call on a ~10^7-link loop).
+        self.validate = bool(validate)
+        self.evaluate_link = (_checked_evaluate(model.evaluate) if validate else model.evaluate)
+        #: The model's `RngNamespace`, so :meth:`begin_step` can advance it. See
+        #: :meth:`BatchAdapter.begin_step` for why the ADAPTER owns that responsibility.
+        self.rng_ns = rng_ns
 
     # -- BatchChannelModel surface ------------------------------------------------------------ #
     @property
@@ -335,6 +353,8 @@ class PerLinkAdapter:
         return frozenset(self.model.capabilities()) | {CAP_BATCH}
 
     def begin_step(self, frame: StepFrame) -> None:
+        if self.rng_ns is not None:
+            self.rng_ns.begin_step(frame.step)
         self.model.begin_step(frame)
 
     def channel_busy_ratio(self, rx_vid: int, offered: float) -> float:
@@ -363,7 +383,13 @@ class PerLinkAdapter:
                 continue
             res = self.model.evaluate(tx, rx, d_m, txn)
             if res is not None:
-                out.append(res.bind(tx_index, rx_vid))
+                # VALIDATE FIRST, THEN BIND. `check_outcome` returns a fresh `LinkOutcome` built from
+                # values read exactly once, so `bind` below is OUR method on OUR object -- a model
+                # cannot supply its own `bind` (or its own stateful `rssi_dbm`) and have the engine
+                # use the result. Binding first and validating the return of the model's `bind` is
+                # what left the time-of-check/time-of-use gap open.
+                out.append(check_outcome(res).bind(tx_index, rx_vid) if self.validate
+                           else res.bind(tx_index, rx_vid))
         return out
 
     # -- in-process fast path (`evaluate_link` is bound in __init__) ---------------------------- #
@@ -388,10 +414,12 @@ class BatchAdapter:
     that absence is how the engine knows to drive `deliver`.
     """
 
-    __slots__ = ("model",)
+    __slots__ = ("model", "rng_ns", "validate")
 
-    def __init__(self, model):
+    def __init__(self, model, rng_ns=None, validate: bool = False):
         self.model = model
+        self.rng_ns = rng_ns
+        self.validate = bool(validate)
 
     @property
     def interface_version(self) -> str:
@@ -409,10 +437,22 @@ class BatchAdapter:
         return frozenset(self.model.capabilities()) | {CAP_BATCH}
 
     def begin_step(self, frame: StepFrame) -> None:
+        # THE ADAPTER advances the RngNamespace, not the engine and not the model. `stream()` keys on
+        # `RngNamespace._step`, and that field is only ever moved by `RngNamespace.begin_step`. Wiring
+        # it here -- one place, on the object every driver of a model already calls `begin_step` on
+        # (the engine loop, `conformance.v1.harness.trace`, C4 and C8) -- is what makes the documented
+        # "pure function of (seed, replicate, plugin, label, ids, step)" true. It was previously
+        # called by NOBODY: `_step` stayed -1 for a whole run, every `stream()` key ended `:s-1`, and
+        # the advertised per-packet fade of a stateless model was a fixed per-link constant for the
+        # entire run. The plugin must never call it (that would let a model rewrite its own key
+        # space mid-step), which is why it is not on the model-facing surface.
+        if self.rng_ns is not None:
+            self.rng_ns.begin_step(frame.step)
         self.model.begin_step(frame)
 
     def deliver(self, frame: StepFrame, candidates: Sequence[tuple]) -> Iterable[LinkOutcome]:
-        return self.model.deliver(frame, candidates)
+        outs = self.model.deliver(frame, candidates)
+        return [check_outcome(o) for o in outs] if self.validate else outs
 
     def reach_m_for(self, rx: StationSnapshot) -> float:
         return reach_of(self.model, rx)
@@ -448,15 +488,85 @@ def sort_outcomes(outcomes: Iterable[LinkOutcome]) -> list:
     return sorted(outcomes, key=lambda o: (o.rx_vid, o.tx_index))
 
 
-def check_outcome(o: LinkOutcome) -> LinkOutcome:
-    """Conformance check C7's runtime form: ranges, closed vocabulary, no NaN/inf."""
+def check_outcome(o) -> LinkOutcome:
+    """Conformance check C7's runtime form: ranges, closed vocabulary, no NaN/inf.
+
+    Called by the engine on EVERY delivered link of a THIRD-PARTY model (see
+    :class:`PerLinkAdapter`'s `validate` flag). It used to be called by nobody, which meant the only
+    outcome validation in the tree lived in a conformance suite that is off by default: a plugin
+    returning `LinkOutcome(rssi_dbm=9999.0, link_state="TELEPATHY")` on every link completed at exit
+    0 with a valid manifest, and every row of `ma/ma_reports.jsonl` carried `"rssi_dbm": 9999.0`
+    (+9999 dBm is about 10^997 W) into the MA-visible dataset.
+
+    **IT RETURNS A COPY, AND THAT IS THE POINT.** This function used to validate by READING the
+    caller's object and then hand the SAME OBJECT back, which is a textbook time-of-check /
+    time-of-use gap: nothing obliges a plugin to return a `LinkOutcome` at all, and an object whose
+    `rssi_dbm` is a stateful ``property`` returns one value to the checker and a different one to the
+    engine a moment later. Measured before this change, on the per-link path: a model returning an
+    object whose first read of `rssi_dbm` is -70.0 and every subsequent read is 9999.0 passed the
+    range check and put **9999.0** into `ma/ma_reports.jsonl`. The same shape defeats the link-state
+    vocabulary and the delay bound.
+
+    So every field is read EXACTLY ONCE into a local, the LOCALS are what get validated, and a fresh
+    `LinkOutcome` -- the base class, built here, with primitives coerced to `int` / `float` /
+    plain `str` -- is what the engine goes on to use. A plugin cannot influence the values after the
+    check because it no longer holds the object the engine reads. `extras` is copied into a
+    `MappingProxyType` over a plain dict of coerced floats for the same reason.
+
+    Built-ins skip it: they are graded by the pinned goldens, and this is a per-delivered-link call
+    on a ~10^7-link loop.
+    """
     from .errors import ConfigError
-    if o.rssi_dbm is not None:
-        r = float(o.rssi_dbm)
-        if not math.isfinite(r) or not (-200.0 <= r <= 50.0):
-            raise ConfigError(f"LinkOutcome.rssi_dbm out of range: {o.rssi_dbm!r}")
-    if o.link_state is not None and o.link_state not in LINK_STATES:
-        raise ConfigError(f"LinkOutcome.link_state {o.link_state!r} not in {sorted(LINK_STATES)}")
-    if not math.isfinite(o.delay_s) or o.delay_s < 0.0:
-        raise ConfigError(f"LinkOutcome.delay_s must be finite and >= 0 (got {o.delay_s!r})")
-    return o
+    # ONE read per field. Everything below validates and returns these LOCALS, never `o` again.
+    tx_index = getattr(o, "tx_index", UNBOUND)
+    rx_vid = getattr(o, "rx_vid", UNBOUND)
+    rssi, state, delay, extras = o.rssi_dbm, o.link_state, o.delay_s, o.extras
+    if rssi is not None:
+        rssi = float(rssi)
+        if not math.isfinite(rssi) or not (RSSI_MIN_DBM <= rssi <= RSSI_MAX_DBM):
+            raise ConfigError(
+                f"LinkOutcome.rssi_dbm out of range: {rssi!r} (tx {tx_index} -> rx "
+                f"{rx_vid}); the declared bound is [{RSSI_MIN_DBM}, {RSSI_MAX_DBM}] dBm. A value "
+                f"outside it is normally a UNITS bug -- linear milliwatts through a field documented "
+                f"as dBm -- and it reaches the MA-visible dataset as evidence.")
+    if state is not None:
+        state = str(state)                      # a `str` SUBCLASS with a custom __eq__ is not a state
+        if state not in LINK_STATES:
+            raise ConfigError(f"LinkOutcome.link_state {state!r} not in {sorted(LINK_STATES)} "
+                              f"(tx {tx_index} -> rx {rx_vid}); the vocabulary is CLOSED")
+    delay = float(delay)
+    if not math.isfinite(delay) or delay < 0.0:
+        raise ConfigError(f"LinkOutcome.delay_s must be finite and >= 0 (got {delay!r})")
+    if extras:
+        items = extras.items() if hasattr(extras, "items") else extras
+        copied = {}
+        for k, v in items:
+            fv = float(v)
+            if not math.isfinite(fv):
+                raise ConfigError(f"LinkOutcome.extras[{k!r}] = {v!r} is not finite")
+            copied[str(k)] = fv
+        extras = _MappingProxyType(copied)
+    else:
+        extras = ()
+    return LinkOutcome(int(tx_index), int(rx_vid), rssi, state, delay, extras)
+
+
+def _checked_evaluate(evaluate):
+    """`model.evaluate` with :func:`check_outcome` on every delivered link.
+
+    The per-link path hands the model no `tx_index`/`rx_vid` (the adapter binds them afterwards), so
+    the outcome's own identity fields are the `UNBOUND` sentinel and would make the message read
+    "tx -1 -> rx -1". The link is re-identified here from the arguments the model actually got.
+    """
+    from .errors import ConfigError
+
+    def evaluate_link(tx, rx, d_m, txn):
+        out = evaluate(tx, rx, d_m, txn)
+        if out is None:
+            return None
+        try:
+            return check_outcome(out)
+        except ConfigError as e:
+            raise ConfigError(f"{e} [link: tx vid {txn.tx_vid} -> rx vid {rx.vid}, "
+                              f"d = {float(d_m):.1f} m]") from None
+    return evaluate_link

@@ -141,6 +141,33 @@ class Declarative(HardRangeLink):
             raise ValueError("range_m 1234 is the plugin's own rejected value")
 
 
+SEEN_STEPS = []         # (frame.step, rng.step) once per begin_step -- the CRITICAL-1 instrument
+FADE_KEYS = set()       # every STATELESS stream key drawn, so the step term can be read back out
+
+
+class StepRecorder(HardRangeLink):
+    """Records what the ENGINE actually did to this model's `RngNamespace`.
+
+    `RngNamespace.begin_step` is called by the ADAPTER, never by the model, and a plugin has no
+    other way to notice whether it happened -- which is exactly why it went uncalled for a whole
+    phase. When it is not called, `_step` stays at -1 for the entire run, every `stream()` key ends
+    `:s-1`, and a draw documented as a pure function of `(seed, plugin, label, ids, STEP)` is a
+    fixed per-link constant instead: an advertised per-packet fade that never fades.
+    """
+
+    plugin_id = "steprec"
+
+    def begin_step(self, frame):
+        super().begin_step(frame)
+        SEEN_STEPS.append((frame.step, self._rng.step))
+
+    def evaluate(self, tx, rx, d_m, txn):
+        if d_m > (rx.rx_range_m or self.reach_m):
+            return None
+        FADE_KEYS.add(self._rng.key("fade", tx.vid, rx.vid, with_step=True))
+        return DELIVERED if self._rng.stream("fade", tx.vid, rx.vid).random() > 0.02 else None
+
+
 class WrongSignature(HardRangeLink):
     plugin_id = "wrongsig"
 
@@ -286,7 +313,9 @@ def test_third_party_channel_model_runs_with_zero_edits_to_the_engine(tmp_path, 
         packet_loss_base=0.05, out_dir=str(tmp_path / "tp"), **_PLUGIN_CFG))
     assert res.n_reports > 0
     man = json.loads((tmp_path / "tp" / "manifest.json").read_text(encoding="utf-8"))
-    entry, = man["plugins"]["loaded"]
+    # The lock records EVERY loaded component -- since phase 3 that is the channel model plus the
+    # run's whole detection layer (its checks, in DET_KEYS order, and its fusion).
+    entry, = [e for e in man["plugins"]["loaded"] if e["slot"] == "channel_model"]
     assert entry["ref"] == "myorg_radio:HardRangeLink"
     assert entry["resolved_via"] == "dotted_path"
     assert len(entry["module_sha256"]) == 64
@@ -414,6 +443,134 @@ def test_rng_namespace_keys_are_reserved_stable_and_step_scoped():
         api.RngNamespace(7, "myplug").key("l", with_step=False)
 
 
+# ------------------------------------- the per-step dimension of the namespace must be LIVE ------ #
+# `RngNamespace.begin_step` was, for a whole phase, called by NOBODY. `_step` stayed at -1 for an
+# entire run, every `stream()` key ended `:s-1`, and the documented "pure function of (seed,
+# replicate, plugin, label, ids, step)" quietly lost its last term. Nothing failed, because nothing
+# asserted it. These three tests are that assertion, at the three levels it can be made.
+class _StepProbe:
+    """Minimal LinkChannelModel that reports the namespace step it was driven at."""
+
+    interface_version = apichan.INTERFACE_VERSION
+    plugin_id = "stepprobe"
+    reach_m = 500.0
+
+    def __init__(self, ns):
+        self._rng = ns
+        self.seen = []
+
+    def capabilities(self):
+        return frozenset({"reach", apichan.LOSS_INDEPENDENT_SURVIVAL})
+
+    def begin_step(self, frame):
+        self.seen.append(self._rng.step)
+
+    def evaluate(self, tx, rx, d_m, txn):
+        return apichan.DELIVERED
+
+    def draw(self, tx_vid, rx_vid):
+        return self._rng.stream("fade", tx_vid, rx_vid).random()
+
+
+class _BatchStepProbe(_StepProbe):
+    plugin_id = "bstepprobe"
+
+    def deliver(self, frame, candidates):
+        return [apichan.LinkOutcome(t, r) for t, r, _d in candidates]
+
+
+def _frame(step):
+    stations = {v: apichan.StationSnapshot(v, 40.0 * v, 0.0, 1.6, 1.6) for v in range(3)}
+    txns = [apichan.Transmission(i, i, "cam", 1, 300, "d%02d" % i) for i in range(3)]
+    return apichan.StepFrame(step, float(step), 1.0, stations, txns, sorted(stations), 0.0, {})
+
+
+@pytest.mark.parametrize("probe_cls,adapter", [(_StepProbe, apichan.PerLinkAdapter),
+                                               (_BatchStepProbe, apichan.BatchAdapter)])
+def test_both_adapters_advance_the_rng_namespace_once_per_step(probe_cls, adapter):
+    """THE regression test for the dead step dimension, at the adapter.
+
+    The adapter -- not the engine and not the model -- owns advancing the namespace, because it is
+    the one object every driver of a model already calls `begin_step` on (the engine loop,
+    `conformance.v1.harness.trace`, C4 and C8). Delete `self.rng_ns.begin_step(frame.step)` from
+    either adapter and this fails: `seen` becomes `[-1, -1, -1, -1]` and the four keys collapse to
+    one.
+    """
+    ns = api.RngNamespace(11, probe_cls.plugin_id)
+    model = probe_cls(ns)
+    ad = adapter(model, ns)
+    keys, draws = [], []
+    for step in range(4):
+        ad.begin_step(_frame(step))
+        keys.append(ns.key("fade", 1, 2, with_step=True))
+        draws.append(model.draw(1, 2))          # the same link, four steps apart
+    assert model.seen == [0, 1, 2, 3], (
+        f"the adapter did not advance the RngNamespace: it saw {model.seen}. A model driven at a "
+        f"frozen step is a DIFFERENT MODEL from the one the engine runs.")
+    assert keys == ["11:plugin:%s:fade:1:2:s%d" % (probe_cls.plugin_id, k) for k in range(4)]
+    assert len(set(draws)) == 4, (
+        f"one link drew {sorted(set(draws))} across four steps: a stateless per-packet draw that "
+        f"does not move with the step IS the defect, not a symptom of it")
+    # ...and a namespace that is never advanced is exactly the -1 the defect produced
+    frozen = api.RngNamespace(11, probe_cls.plugin_id)
+    assert frozen.key("fade", 1, 2, with_step=True).endswith(":s-1")
+
+
+def test_a_frozen_step_turns_a_per_packet_draw_into_a_per_link_constant():
+    """WHY it mattered, as a number rather than an argument.
+
+    A stateless `stream()` is keyed on the step. Freeze the step and the same (tx, rx) pair draws
+    the SAME value at every step for the whole run -- so a model advertising a per-packet Rayleigh
+    fade actually applies one fixed offset per link and the channel never fades. This is the
+    mechanism behind the measured PDR ladder flattening (0.18 of range loss recovered at the far
+    rung once the step was live).
+    """
+    live, frozen = api.RngNamespace(5, "fadeprobe"), api.RngNamespace(5, "fadeprobe")
+    live_draws, frozen_draws = [], []
+    for step in range(8):
+        live.begin_step(step)                       # what the adapter does
+        live_draws.append(live.stream("fade", 3, 7).random())
+        frozen_draws.append(frozen.stream("fade", 3, 7).random())   # begin_step never called
+    assert len(set(frozen_draws)) == 1, "a frozen namespace must be constant -- that is the defect"
+    assert len(set(live_draws)) == 8, "a live namespace must give one value per step"
+    assert live_draws[0] != frozen_draws[0]         # ...and s0 is not s-1
+
+
+def test_the_engine_gives_a_plugin_a_LIVE_per_step_rng_dimension(tmp_path, plugin_pkg):
+    """The same statement END TO END, which is the level the defect actually lived at.
+
+    The adapter-level test above passes even if `build_channel` stops handing the namespace to the
+    adapter (`PerLinkAdapter(model)` instead of `PerLinkAdapter(model, rng_ns)`) -- which is exactly
+    the shape the bug had. This one drives a real `run_pipeline` and reads back, from inside the
+    plugin, both the namespace step at every `begin_step` and the full set of stream keys it
+    produced. Before the fix: `sorted({ns.step}) == [-1]` and every key ended `:s-1`.
+    """
+    mod = importlib.import_module("myorg_radio")
+    mod.SEEN_STEPS.clear()
+    mod.FADE_KEYS.clear()
+    run_pipeline(PipelineConfig(out_dir=str(tmp_path / "steps"),
+                                plugins={"channel_model": {"ref": "myorg_radio:StepRecorder"}},
+                                **_PLUGIN_CFG))
+    assert mod.SEEN_STEPS, "the plugin was never driven"
+    mismatched = [(f, n) for f, n in mod.SEEN_STEPS if f != n]
+    assert not mismatched, (
+        f"{len(mismatched)} step(s) where the RngNamespace disagreed with the frame it was driven "
+        f"with, e.g. (frame.step, ns.step) = {mismatched[:5]}. `build_channel` must pass `rng_ns` "
+        f"to the adapter it builds, or the whole per-step dimension is dead.")
+    steps = sorted({n for _f, n in mod.SEEN_STEPS})
+    assert steps[0] == 0 and len(steps) > 1 and steps == list(range(steps[-1] + 1)), steps
+    assert -1 not in steps
+    suffixes = {k.rsplit(":", 1)[-1] for k in mod.FADE_KEYS}
+    assert "s-1" not in suffixes, "the stream keys are frozen at the sentinel step"
+    assert suffixes <= {"s%d" % k for k in steps}, sorted(suffixes)[:5]
+    # Every step that offered a candidate link contributed its OWN key term. The count can be one
+    # short of the step count and no more: on this scenario step 0 has no two stations in range yet,
+    # so it draws nothing. Before the fix this number was 1 for the whole run.
+    assert len(steps) - 1 <= len(suffixes) <= len(steps), (
+        f"{len(mod.FADE_KEYS)} stream keys spread over only {len(suffixes)} distinct step terms "
+        f"across {len(steps)} steps: {sorted(suffixes)[:5]}")
+
+
 def test_plugin_id_namespace_is_enforced():
     with pytest.raises(api.ConfigError):
         api.RngNamespace(1, "Bad Id")
@@ -429,10 +586,17 @@ def test_manifest_records_runtime_and_the_plugin_lock(tmp_path):
     assert rt["python"] == sys.version
     assert rt["hash_randomization"] is bool(sys.flags.hash_randomization)
     assert rt["platform"] and rt["implementation"] == "CPython"
-    entry, = man["plugins"]["loaded"]
+    entry = man["plugins"]["loaded"][0]
     assert (entry["slot"], entry["ref"], entry["resolved_via"]) == ("channel_model", "disc", "builtin")
     assert "legacy_global_rng" in entry["capabilities"]        # the grandfathering is RECORDED
     assert "loss_composition:additive_legacy" in entry["capabilities"]
+    # The detection layer is locked the same way, in the order it is evaluated in.
+    checks = [e for e in man["plugins"]["loaded"] if e["slot"] == "check"]
+    assert [e["ref"] for e in checks] == list(RM.default_check_refs())
+    assert [e["order"] for e in checks] == list(range(len(checks)))
+    fusion, = [e for e in man["plugins"]["loaded"] if e["slot"] == "fusion"]
+    assert fusion["ref"] == "streak_v1" and "legacy_global_rng" in fusion["capabilities"]
+    assert man["plugins"]["interface_versions"]["Detector"] == "1.0"
     assert man["plugins"]["api_version"] == "1.0"
     assert res.data_digest                                     # digest is over data files only
 

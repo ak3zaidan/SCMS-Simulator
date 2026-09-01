@@ -1,4 +1,4 @@
-"""Phase 2: the conformance suite (C1-C12) and the provenance lock.
+"""Phase 2: the conformance suite (C1-C13) and the provenance lock.
 
 The point of a conformance suite is that it can FAIL, so most of what is pinned here is that each
 check catches the specific thing it was built to catch. Three properties, in the order they matter:
@@ -98,6 +98,49 @@ class UsesGlobalRng(Good):
         return -60.0 - 20.0 * random.random()
 
 
+class MonkeypatchesRandom(Good):
+    """Violates C3 by REBINDING `random.Random.random` at construction.
+
+    The vector capability-by-omission cannot close by omitting anything: it reaches every stream in
+    the process at once -- including the engine's private `random.Random(cfg.seed)` -- while every
+    state snapshot a check could take stays perfectly intact. Measured against the real engine, this
+    shape scored 13/13 on the old suite and MOVED the data digest. The wrapper is a pure passthrough
+    here, so this fixture violates C3 and nothing else.
+    """
+    plugin_id = "patcher"
+
+    def __init__(self, *, params, rng, env):
+        super().__init__(params=params, rng=rng, env=env)
+        original = random.Random.random
+        if getattr(original, "_scms_test_wrapper", False):
+            return                                   # idempotent: every check builds a fresh model
+
+        def wrapper(inner_self, *a, **kw):
+            return original(inner_self, *a, **kw)
+        wrapper._scms_test_wrapper = True
+        random.Random.random = wrapper
+
+
+class WalksTheStack(Good):
+    """Violates C3 by frame-walking to a caller's local named `rng` and drawing from it.
+
+    `run_pipeline` holds the engine's shared stream in a local of exactly that name. The draw is
+    discarded, so this model's OWN output is unchanged -- which is the point: it perturbs the
+    engine's stream (report_prob, collusion, net_delay, emit sampling) and passes every other check.
+    """
+    plugin_id = "stackwalk"
+
+    def _rx_dbm(self, tx, rx, d_m):
+        f = sys._getframe(1)
+        while f is not None:
+            candidate = f.f_locals.get("rng")
+            if isinstance(candidate, random.Random):
+                candidate.random()
+                break
+            f = f.f_back
+        return super()._rx_dbm(tx, rx, d_m)
+
+
 class OrderDependent(Good):
     """Violates C2: one shared sequential stream, so a link's value depends on when it was asked
     for. Passes C1 -- it repeats perfectly, as long as nothing reorders the loop."""
@@ -168,19 +211,28 @@ class BadUnits(Good):
 
 
 class OverReaches(Good):
-    """Violates C8: delivers past its own declared reach, which is exactly what makes
-    acceptanceRangeThreshold wrong for every honest long link."""
+    """Violates C8 AND ONLY C8: delivers past its own declared reach, which is exactly what makes
+    acceptanceRangeThreshold wrong for every honest long link.
+
+    It keeps `Good`'s distance-dependent physics and merely drops the decode floor, so the only
+    contract statement it breaks is the reach one. (It used to return a CONSTANT -70.0 dBm at every
+    distance; C9 could not see that, because C9 compared adjacent rungs with `<=` and equality
+    satisfies `<=`. C9's attenuation arm sees it now, which would make this fixture a two-check
+    violator and defeat the "and only that" half of the suite's own grading test.)"""
     plugin_id = "overreach"
 
     def window_m(self, rx):
         return 3.0 * self.reach_m
 
     def evaluate(self, tx, rx, d_m, txn):
-        return apichan.LinkOutcome(rssi_dbm=-70.0) if d_m <= 3.0 * self.reach_m else None
+        if d_m > 3.0 * self.reach_m:
+            return None
+        p = self._rx_dbm(tx, rx, d_m)
+        return apichan.LinkOutcome(rssi_dbm=p) if p >= -125.0 else None
 
 
 class Antimonotone(Good):
-    """Violates C9: PDR RISES with distance."""
+    """Violates C9's ADJACENT arm: PDR RISES steeply with distance."""
     plugin_id = "antimono"
 
     def evaluate(self, tx, rx, d_m, txn):
@@ -189,6 +241,62 @@ class Antimonotone(Good):
         frac = d_m / max(self.reach_m, 1.0)
         u = self._rng.stream("keep", tx.vid, rx.vid).random()
         return apichan.LinkOutcome(rssi_dbm=-90.0 + 30.0 * frac) if u < frac else None
+
+
+class _LadderQuantised(Good):
+    """Base for the two C9 fixtures whose whole point is an EXACT delivery ratio.
+
+    C9's ladder offers exactly `n_tx * n_steps` = 96 candidate links per rung, one per
+    `(step, tx_index)` pair. Selecting on that pair instead of tossing a coin makes the measured PDR
+    exact rather than binomial, so a fixture built to sit a stated distance either side of a stated
+    tolerance sits there deterministically instead of on a sampling distribution that straddles it.
+    """
+    _SLOTS = 96
+    _N_TX = 12
+
+    def _slot(self, txn) -> int:
+        return (max(self.step, 0) * self._N_TX + txn.tx_index) % self._SLOTS
+
+    def _deliver(self, txn, p: float) -> bool:
+        return self._slot(txn) < round(self._SLOTS * p)
+
+
+class RisesWithinAdjacentTolerance(_LadderQuantised):
+    """Violates C9's CUMULATIVE arm and nothing else.
+
+    PDR rises by exactly 0.08 per ladder rung: under the 0.10 adjacent-rung tolerance at EVERY one
+    of the six steps, and +0.48 end to end. The adjacent arm is structurally incapable of seeing it,
+    which is the whole reason the cumulative arm exists. RSSI falls honestly, so the rssi arms and
+    the attenuation arm all pass and the failure is attributable to one arm.
+    """
+    plugin_id = "creeper"
+    #: the ladder fractions C9 uses, so the model can tell which rung it is standing on
+    _FRACS = (0.05, 0.12, 0.25, 0.40, 0.60, 0.80, 0.95)
+
+    def evaluate(self, tx, rx, d_m, txn):
+        import math
+        if d_m > (rx.rx_range_m or self.reach_m):
+            return None
+        frac = d_m / max(self.reach_m, 1.0)
+        rung = max(0, sum(1 for f in self._FRACS if frac >= f - 1e-9) - 1)
+        if not self._deliver(txn, 0.30 + 0.08 * rung):
+            return None
+        return apichan.LinkOutcome(rssi_dbm=-70.0 - 20.0 * math.log10(max(d_m, 1.0)))
+
+
+class ConstantInDistance(_LadderQuantised):
+    """Violates C9's ATTENUATION arm and nothing else.
+
+    A flat 50 % delivery probability and a constant -70.0 dBm whether the link is 25 m or 475 m --
+    physically impossible, and invisible to any arm built out of `<=` comparisons, because equality
+    satisfies every one of them. This is the shape the check could not fail before.
+    """
+    plugin_id = "constdist"
+
+    def evaluate(self, tx, rx, d_m, txn):
+        if d_m > (rx.rx_range_m or self.reach_m):
+            return None
+        return apichan.LinkOutcome(rssi_dbm=-70.0) if self._deliver(txn, 0.5) else None
 
 
 class AcceptsAnything(Good):
@@ -204,6 +312,83 @@ class AcceptsAnything(Good):
         super().__init__(params={}, rng=rng, env=env)
 
 
+class MutatesTheConfig(Good):
+    """The replay-contract vector: writes to the run's config through `env["config"]`.
+
+    Physics identical to `Good`. `_write_manifest` serialised the config at the END of the run, so
+    before the fix this ran to completion at exit 0 with a manifest recording `report_prob = 1.0` --
+    not the `0.9` the user's config asked for. Measured against the reference plugin on the 60-step
+    acceptance config: the run's own `data_digest` was byte-identical to the honest control (so the
+    pinned-golden layer sees nothing), and replaying the manifest at the `1.0` it records produced a
+    DIFFERENT dataset. The manifest did not replay to the dataset it described.
+    """
+    plugin_id = "cfgwriter"
+    WRITE_AT_STEP = 3
+
+    def __init__(self, *, params, rng, env):
+        super().__init__(params=params, rng=rng, env=env)
+        self._cfg = env["config"]
+
+    def begin_step(self, frame):
+        super().begin_step(frame)
+        if frame.step == self.WRITE_AT_STEP:
+            self._cfg.report_prob = 1.0
+
+
+class MutatesTheConfigLate(MutatesTheConfig):
+    """C13's violator: the same write, at step 8.
+
+    Step 8 is past the horizon of every other scenario in the suite (the longest is C9's 8-step
+    ladder, steps 0..7) and inside C13's own 12-step window, so this model fails C13 and NOTHING
+    ELSE. That is not a convenience: a writer at step 0 makes every check that constructs a model
+    error out -- correct behaviour, but it proves nothing about WHICH check saw it, and
+    attributability is the whole diagnostic value of the suite.
+    """
+    plugin_id = "cfgwriterlate"
+    WRITE_AT_STEP = 8
+
+
+class MutatesTheConfigOnceSettled(MutatesTheConfig):
+    """C13's high-step-tail violator: `if frame.step >= 30`, which is the REALISTIC shape.
+
+    A plugin author who writes to the config does it once the run has settled, not at step 0. No
+    contiguous conformance window shorter than 31 steps can see that, so C13 drives a four-frame
+    tail at step 10 000 after its twelve contiguous ones: one cheap jump in the step label catches
+    every threshold below it. Verbatim the shape of the out-of-repo `LateConfigMutator` fixture,
+    which writes `report_prob = 1.0` at step 30 of a 60-step run and, before the fix, produced a
+    manifest at exit 0 that replayed to a different dataset.
+    """
+    plugin_id = "cfgsettled"
+    WRITE_AT_STEP = -1                      # never equal to a step: the guard below is >=, not ==
+
+    def begin_step(self, frame):
+        Good.begin_step(self, frame)
+        if frame.step >= 30:
+            self._cfg.report_prob = 1.0
+
+
+class MutatesTheConfigBehindTheView(Good):
+    """C13's arm-3 violator: reaches the REAL config around the read-only view and writes silently.
+
+    `ReadOnlyConfig` keeps the live object in a slot, so `env["config"]._ReadOnlyConfig__cfg` is the
+    dataclass itself -- and `gc.get_objects()` and a frame walk are two more routes to it. Python
+    cannot make a reference unforgeable. This model therefore raises NOTHING: no view refuses it, no
+    exception is logged, and the only thing that can see the write is the before/after dict
+    comparison. That is why C13 has a snapshot arm rather than merely catching the view's own error.
+    """
+    plugin_id = "cfgsneak"
+
+    def __init__(self, *, params, rng, env):
+        super().__init__(params=params, rng=rng, env=env)
+        view = env["config"]
+        self._real = getattr(view, "_ReadOnlyConfig__cfg", view)
+
+    def begin_step(self, frame):
+        super().begin_step(frame)
+        if frame.step == 8:
+            object.__setattr__(self._real, "report_prob", 1.0)
+
+
 _VIOLATORS = {
     "C3_global_rng_untouched": UsesGlobalRng,
     "C2_call_order_independent": OrderDependent,
@@ -214,6 +399,7 @@ _VIOLATORS = {
     "C7_ranges": BadUnits,
     "C8_reach_honesty": OverReaches,
     "C9_monotone_in_distance": Antimonotone,
+    "C13_config_not_mutated": MutatesTheConfigLate,
 }
 
 
@@ -256,6 +442,70 @@ def test_each_check_catches_its_own_violator_and_only_that(check_id, cls):
     if check_id == "C6b_oracle_invariance":
         failed = {c for c, s in statuses.items() if s == "FAIL"}
         assert failed == {"C6b_oracle_invariance"}, rep.to_text()
+
+
+@pytest.mark.parametrize("cls,marker", [
+    (MonkeypatchesRandom, "REBOUND"),
+    (WalksTheStack, "walked the call stack"),
+])
+def test_C3_catches_the_two_vectors_that_actually_move_the_engines_stream(cls, marker):
+    """The two RNG attacks that used to score 13/13.
+
+    Measured against the real engine before the traps were added: both of these MOVED the pipeline's
+    `data_digest` (ma_reports 3203 -> 3147 rows, ma_investigations and ma_crl_events 25 -> 24, i.e.
+    they perturbed report_prob, revocation and emit sampling), and both passed conformance, including
+    `conformance="required"` attestation. Meanwhile the two vectors C3 DID catch -- a module-level
+    `random.random()` and a `random.seed()` -- left the digest unchanged, because the engine's stream
+    is a private `random.Random` instance a module-level draw cannot reach. The check was detecting
+    exactly the harmless half.
+
+    Each must fail C3 alone: a blanket tightening that fails everything proves nothing about which
+    property broke.
+    """
+    surface = H.random_class_surface()
+    try:
+        rep = run_contract(_contract(cls))
+        statuses = {r["check"]: r["status"] for r in rep.rows}
+        failed = {c for c, s in statuses.items() if s in ("FAIL", "ERROR")}
+        assert failed == {"C3_global_rng_untouched"}, rep.to_text()
+        row, = [r for r in rep.rows if r["check"] == "C3_global_rng_untouched"]
+        assert marker in row["detail"], row["detail"]
+    finally:                                       # belt and braces; run_contract restores it too
+        H.restore_random_class_surface(surface)
+
+
+def test_the_runner_leaves_the_interpreter_a_hostile_plugin_patched_repaired():
+    """A suite that detects a tamper and leaves it installed has poisoned everything that runs
+    after it -- a worse outcome than not checking. `run_contract` restores in `finally`."""
+    before = random.Random.__dict__.get("random")
+    surface = H.random_class_surface()
+    try:
+        rep = run_contract(_contract(MonkeypatchesRandom))
+        assert not rep.ok                                  # it WAS caught ...
+        assert random.Random.__dict__.get("random") is before      # ... and it was put back
+        assert not getattr(random.Random.random, "_scms_test_wrapper", False)
+    finally:
+        H.restore_random_class_surface(surface)
+
+
+@pytest.mark.parametrize("cls,arm", [(RisesWithinAdjacentTolerance, "cumulative"),
+                                     (ConstantInDistance, "attenuation")])
+def test_C9_catches_what_adjacent_rung_comparison_structurally_cannot(cls, arm):
+    """The two C9 shapes that passed 12/1 before the arms were added.
+
+    A model whose PDR creeps up by less than the per-rung tolerance at every rung, and a model that
+    is simply CONSTANT in distance, both satisfy `pdr[i] <= pdr[i-1] + 0.10` at every step -- the
+    second by exact equality. Neither is a channel. Both must FAIL, and each must fail C9 alone, so
+    the new arms are attributable rather than a blanket tightening.
+    """
+    rep = run_contract(_contract(cls))
+    statuses = {r["check"]: r["status"] for r in rep.rows}
+    failed = {c for c, s in statuses.items() if s in ("FAIL", "ERROR")}
+    assert failed == {"C9_monotone_in_distance"}, rep.to_text()
+    row, = [r for r in rep.rows if r["check"] == "C9_monotone_in_distance"]
+    assert arm in ("cumulative", "attenuation")
+    marker = "FAR end of the ladder" if arm == "cumulative" else "CONSTANT in distance"
+    assert marker in row["detail"], row["detail"]
 
 
 def test_waivers_are_data_with_a_justification_not_a_mute_button():
@@ -395,6 +645,147 @@ def test_the_two_detection_layers_are_independent(tmp_path):
     assert a.data_digest
 
 
+# ------------------------------------------------------- the engine-side gates a plugin meets ---- #
+class GarbageOut(Good):
+    """The outcome-validation vector: +9999 dBm (about 10^997 W) and an invented link state, on
+    every delivered link, straight into the MA-visible `rssi_dbm` evidence column."""
+    plugin_id = "garbageout"
+
+    def capabilities(self):
+        return frozenset({"rssi", "link_state", "reach", apichan.LOSS_INDEPENDENT_SURVIVAL})
+
+    def evaluate(self, tx, rx, d_m, txn):
+        if d_m > (rx.rx_range_m or self.reach_m):
+            return None
+        return apichan.LinkOutcome(rssi_dbm=9999.0, link_state="TELEPATHY")
+
+
+def _plugin_cfg(cls, tmp_path, name, **over):
+    """A run configured to load `cls` by dotted path out of THIS test module."""
+    ref = f"{cls.__module__}:{cls.__name__}"
+    return PipelineConfig(seed=17, traffic_flow=True, road_network="grid", duration_s=20,
+                          arrival_rate=1.5, grid_w=4, grid_h=4, attacker_pct=0.25,
+                          out_dir=str(tmp_path / name),
+                          plugins={"channel_model": {"ref": ref}}, **over)
+
+
+def test_a_plugin_cannot_rewrite_the_config_the_manifest_records(tmp_path):
+    """Constraint 2 (the manifest replay contract), enforced against plugin code.
+
+    Two arms, because the two failure modes are different: the read-only view makes the write itself
+    an error, and the snapshot comparison is what holds even if a plugin reaches the real object some
+    other way. The run must NOT produce a manifest describing a config that did not produce it.
+    """
+    with pytest.raises(api.ConfigError, match="READ-ONLY"):
+        run_pipeline(_plugin_cfg(MutatesTheConfig, tmp_path, "mut", report_prob=0.9))
+    # ...and the snapshot arm, exercised directly: the gate does not depend on the view holding
+    cfg = _plugin_cfg(Good, tmp_path, "snap", report_prob=0.9)
+    before = RM._config_dict(cfg)
+    cfg.report_prob = 1.0
+    with pytest.raises(api.ConfigError, match="MUTATED"):
+        RM._assert_config_unmoved(before, cfg, "during the run")
+
+
+def test_C13_catches_the_config_write_the_engine_layer_only_sees_at_the_end():
+    """C13, the conformance-side half of the same statement, and it must be ATTRIBUTABLE.
+
+    The engine gate (`_assert_config_unmoved`) refuses to write an artifact; C13 tells a plugin
+    author before they ever produce one. The two are independent on purpose -- conformance is off by
+    default, and the engine gate cannot say WHICH property broke.
+    """
+    rep = run_contract(_contract(MutatesTheConfigLate))
+    statuses = {r["check"]: r["status"] for r in rep.rows}
+    failed = {c for c, s in statuses.items() if s in ("FAIL", "ERROR")}
+    assert failed == {"C13_config_not_mutated"}, rep.to_text()
+    row, = [r for r in rep.rows if r["check"] == "C13_config_not_mutated"]
+    assert "DURING THE RUN" in row["detail"], row["detail"]
+
+
+def test_C13_catches_the_realistic_write_at_step_30_that_no_short_window_can_see():
+    """The high-step tail, and the reason it exists.
+
+    `if frame.step >= 30` is what this bug actually looks like in the wild -- the write lands once
+    the run has settled. Twelve contiguous steps cannot see it and neither can thirty; the fix is
+    not a longer trace but a JUMP in the step label, four frames at step 10 000, which catches every
+    threshold below that for the price of four frames. Measured against the out-of-repo
+    `hostile.replay_break:LateConfigMutator` (physics identical to the reference plugin, writes
+    `report_prob = 1.0` at step 30): 13 passed, 1 failed, the failure being C13 alone.
+    """
+    rep = run_contract(_contract(MutatesTheConfigOnceSettled))
+    statuses = {r["check"]: r["status"] for r in rep.rows}
+    failed = {c for c, s in statuses.items() if s in ("FAIL", "ERROR")}
+    assert failed == {"C13_config_not_mutated"}, rep.to_text()
+    # ...and the tail is genuinely what catches it: the contiguous window alone does not
+    plain = H.build_frames(n_steps=12, n_stations=12, move_m=7.0)
+    model = _contract(MutatesTheConfigOnceSettled).make()
+    H.trace(model, plain)                                   # 12 steps -> no write, no error
+    with pytest.raises(api.ConfigError, match="READ-ONLY"):
+        H.trace(model, H.build_frames(n_steps=4, n_stations=12, move_m=7.0, step0=10_000))
+
+
+def test_build_frames_step0_labels_the_frames_without_moving_the_geometry():
+    """`step0` shifts the step LABEL only. If it also shifted the geometry, C13's tail would be a
+    different scenario rather than the same one seen from a later step number."""
+    a = H.build_frames(n_steps=4, n_stations=6, move_m=7.0)
+    b = H.build_frames(n_steps=4, n_stations=6, move_m=7.0, step0=10_000)
+    assert [f.step for f in a] == [0, 1, 2, 3]
+    assert [f.step for f in b] == [10_000, 10_001, 10_002, 10_003]
+    for fa, fb in zip(a, b):
+        assert {v: (s.x, s.y) for v, s in fa.stations.items()} == \
+               {v: (s.x, s.y) for v, s in fb.stations.items()}
+
+
+def test_C13_catches_a_write_that_goes_AROUND_the_read_only_view():
+    """Arm 3, the one that actually holds.
+
+    `ReadOnlyConfig` makes the ACCIDENTAL and one-line-deliberate write a loud error. It cannot make
+    the reference unforgeable -- the live object sits in the view's own slot, and `gc.get_objects()`
+    and a frame walk reach it too. This model writes through the slot: nothing raises, nothing is
+    logged, the physics is `Good`'s, and only the before/after dict comparison sees it.
+    """
+    rep = run_contract(_contract(MutatesTheConfigBehindTheView))
+    statuses = {r["check"]: r["status"] for r in rep.rows}
+    failed = {c for c, s in statuses.items() if s in ("FAIL", "ERROR")}
+    assert failed == {"C13_config_not_mutated"}, rep.to_text()
+    row, = [r for r in rep.rows if r["check"] == "C13_config_not_mutated"]
+    assert "MOVED during the run" in row["detail"] and "report_prob" in row["detail"], row["detail"]
+
+
+def test_C13_passes_the_honest_model_and_every_builtin():
+    """A check that no honest model can pass is not a check. All three built-ins read `env['config']`
+    at construction (`GeometricChannel.from_plugin`) and none of them writes to it."""
+    assert run_contract(_contract(Good)).rows                      # smoke: the contract is runnable
+    for ref in ("disc", "logdistance", "geometric"):
+        rep = run_ref("channel_model", ref, {}, exclude=("C12_pipeline_two_run_digest",))
+        row, = [r for r in rep.rows if r["check"] == "C13_config_not_mutated"]
+        assert row["status"] == "PASS", f"{ref}: {row}"
+
+
+def test_an_out_of_range_outcome_never_reaches_the_dataset(tmp_path):
+    """C7's runtime form, on the DEFAULT third-party path.
+
+    Conformance is off by default, so before the fix this completed at exit 0 with a valid manifest
+    and every `ma_reports` row carrying `"rssi_dbm": 9999.0`. `check_outcome` existed and was called
+    by nobody.
+    """
+    with pytest.raises(api.ConfigError, match="rssi_dbm out of range"):
+        run_pipeline(_plugin_cfg(GarbageOut, tmp_path, "garbage"))
+    # the same model still fails C7, so the two layers agree rather than one covering for the other
+    rep = run_contract(_contract(GarbageOut))
+    assert {r["check"] for r in rep.rows if r["status"] == "FAIL"} >= {"C7_ranges"}
+
+
+def test_check_outcome_and_C7_publish_the_SAME_bounds():
+    """One definition. A runtime gate whose band is wider than the check it is the runtime form of
+    is a second, laxer contract wearing the same name."""
+    from scms_sim_ref.conformance.v1 import channel as C9M
+    assert (apichan.RSSI_MIN_DBM, apichan.RSSI_MAX_DBM) == (C9M.RSSI_MIN_DBM, C9M.RSSI_MAX_DBM)
+    with pytest.raises(api.ConfigError):
+        apichan.check_outcome(apichan.LinkOutcome(rssi_dbm=apichan.RSSI_MAX_DBM + 1.0))
+    with pytest.raises(api.ConfigError):
+        apichan.check_outcome(apichan.LinkOutcome(link_state="TELEPATHY"))
+
+
 # --------------------------------------------------------------------------- CLI + lock ---------- #
 def test_verify_plugins_cli_round_trips_a_real_manifest(tmp_path, capsys):
     run_pipeline(PipelineConfig(seed=5, n_steps=12, n_vehicles=8, out_dir=str(tmp_path / "r")))
@@ -413,6 +804,99 @@ def test_verify_plugins_cli_round_trips_a_real_manifest(tmp_path, capsys):
     tampered.write_text(json.dumps(doc), encoding="utf-8")
     assert RM.main(["verify-plugins", str(tampered)]) == 2
     assert "provenance_digest does not match" in capsys.readouterr().err
+
+
+_SIBLING_PKG_PHYSICS = """\
+GAIN_DB = 0.0
+
+
+class Base:
+    def rx_dbm(self, d_m):
+        return -60.0 - 20.0 * d_m + GAIN_DB
+"""
+
+_SIBLING_PKG_MODEL = """\
+from scms_sim_ref.api.channel import INTERFACE_VERSION, LinkOutcome
+from .physics import Base
+
+
+class Model(Base):
+    interface_version = INTERFACE_VERSION
+    plugin_id = "sibtest"
+    reach_m = 500.0
+
+    def __init__(self, *, params, rng, env):
+        self._rng = rng
+
+    def capabilities(self):
+        return frozenset({"rssi", "reach"})
+
+    def begin_step(self, frame):
+        pass
+
+    def evaluate(self, tx, rx, d_m, txn):
+        return LinkOutcome(rssi_dbm=self.rx_dbm(d_m))
+"""
+
+
+def _install_sibling_pkg(root, physics=_SIBLING_PKG_PHYSICS):
+    pkg = root / "sibpkg"
+    pkg.mkdir(exist_ok=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "physics.py").write_text(physics, encoding="utf-8")
+    (pkg / "model.py").write_text(_SIBLING_PKG_MODEL, encoding="utf-8")
+    return pkg
+
+
+def test_the_lock_sees_an_edit_to_a_SIBLING_module_not_just_the_defining_file(tmp_path):
+    """D4's failure mode, closed.
+
+    `module_sha256` hashes ONLY the file the class is defined in, and `dist_sha256` is copied out of
+    the wheel RECORD -- a record of what the installer wrote, which does not move when a file is
+    edited in place. A plugin class that inherits its physics from a sibling module therefore had a
+    lock that did not move when that physics was rewritten: `verify_lock` returned clean and the
+    replay produced a different dataset at exit 0. `package_sha256` is the field that closes it.
+
+    Measured against the real out-of-repo demo before the fix: editing `rayleigh.py` to add 6 dB of
+    transmit power left `scms_demo_channel.leaky:LeakyChannel`'s `module_sha256` (leaky.py) and
+    `dist_sha256` unmoved, `verify-plugins` printed "no drift" and exited 0, and the replay produced
+    a different `data_digest`.
+    """
+    import importlib
+    import shutil
+
+    _install_sibling_pkg(tmp_path)
+    sys.path.insert(0, str(tmp_path))
+    try:
+        for name in [m for m in list(sys.modules) if m == "sibpkg" or m.startswith("sibpkg.")]:
+            del sys.modules[name]
+        importlib.invalidate_caches()
+        RM._api_registry._MODULE_HASH_CACHE.clear()
+        obj, how, iv, _shape = RM._api_registry.resolve("channel_model", "sibpkg.model:Model")
+        prov = RM._api_registry.make_provenance("channel_model", 0, "sibpkg.model:Model", obj,
+                                                how, iv, {"rssi", "reach"}, (), {})
+        entry = prov.to_dict()
+        assert entry["package_sha256"], "a package plugin must carry a package-level hash"
+        lock = {"loaded": [entry]}
+        assert RM._api_registry.verify_lock(lock) == []          # clean before the edit
+
+        # a real physics change, in a file the class is NOT defined in
+        (tmp_path / "sibpkg" / "physics.py").write_text(
+            _SIBLING_PKG_PHYSICS.replace("GAIN_DB = 0.0", "GAIN_DB = 6.0"), encoding="utf-8")
+        RM._api_registry._MODULE_HASH_CACHE.clear()
+        assert RM._api_registry.module_sha256(obj) == entry["module_sha256"], (
+            "the defining file is untouched -- which is precisely why module_sha256 cannot see this")
+        with pytest.raises(api.PluginDriftError) as e:
+            RM._api_registry.verify_lock(lock)
+        assert e.value.field == "package_sha256"
+        # --allow-plugin-drift still downgrades a hard stop to a loud one, never to silence
+        assert len(RM._api_registry.verify_lock(lock, allow_drift=True)) == 1
+    finally:
+        sys.path.remove(str(tmp_path))
+        for name in [m for m in list(sys.modules) if m == "sibpkg" or m.startswith("sibpkg.")]:
+            del sys.modules[name]
+        shutil.rmtree(tmp_path / "sibpkg", ignore_errors=True)
+        RM._api_registry._MODULE_HASH_CACHE.clear()
 
 
 def test_verify_plugins_fails_when_the_plugin_is_simply_not_installed(tmp_path, capsys):
@@ -449,7 +933,7 @@ def test_strict_plugins_false_is_the_documented_escape_hatch(capsys):
 
 def test_conformance_cli_exit_codes(capsys):
     assert RM.main(["conformance", "--ref", "geometric"]) == 0
-    assert "13 passed" in capsys.readouterr().out
+    assert "14 passed" in capsys.readouterr().out       # 13 numbered checks; C6 has two arms
     assert RM.main(["conformance", "--ref", "logdistance"]) == 0     # waived, not failed
     assert "WAIVED" in capsys.readouterr().out
     assert RM.main(["conformance", "--ref", "nope-not-a-model"]) == 1
@@ -523,7 +1007,7 @@ def test_conformance_required_attests_the_plugin_into_the_manifest(tmp_path):
     # artifact-level check ran.
     assert conf["excluded"] == ["C12_pipeline_two_run_digest"]
     assert "pipeline inside a pipeline" in conf["excluded_reason"]
-    assert conf["passed"] == 12 and conf["skipped"] == 0        # the other twelve all ran
+    assert conf["passed"] == 13 and conf["skipped"] == 0        # the other thirteen all ran
     # ...and attestation is manifest-only: it changes no data
     plain = run_pipeline(PipelineConfig(seed=5, n_steps=12, n_vehicles=9,
                                         out_dir=str(tmp_path / "plain"),

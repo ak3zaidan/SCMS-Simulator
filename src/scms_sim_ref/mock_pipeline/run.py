@@ -29,6 +29,7 @@ same seed+config -> byte-identical data.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import inspect
 import json
@@ -49,8 +50,13 @@ from ..api.channel import (CAP_CBR, CAP_LEGACY_GLOBAL_RNG, CAP_LINK_STATE, CAP_R
                            CAP_STATEFUL, DELIVERED, LOSS_ADDITIVE_LEGACY,
                            LOSS_INDEPENDENT_SURVIVAL, LinkChannelModelBase, LinkOutcome,
                            PerLinkAdapter, StationSnapshot, StepFrame, Transmission)
+from ..api import detect as _api_detect
+from ..api import integrity as _integrity
+from ..api import srcgate as _srcgate
+from ..api.detect import Observation
 from ..api.errors import ConfigError, PluginDriftError            # noqa: F401 (re-exported)
 from ..api.rng import RngNamespace
+from . import detectors as _detectors                             # registers the `check` builtins
 from ..scms_core import crypto_abstract as ca
 from ..scms_core.linkage import CrlLinkageEntry, DeviceLinkageContext, linkage_seed_at
 from ..schemas import records as R
@@ -585,6 +591,20 @@ class DiscChannel(LinkChannelModelBase):
     plugin_id = "disc"
     interface_version = _api_channel.INTERFACE_VERSION
 
+    #: WAIVERS ARE DATA (the Django doctrine): a built-in states what it legitimately cannot pass
+    #: rather than the suite being edited around it, and the justification travels into
+    #: `conformance_report.json` and from there into the manifest.
+    conformance_waivers = {
+        "C9_monotone_in_distance":
+            "C9's attenuation arm asks that delivery depend on distance at all across a 19x "
+            "distance ratio. `disc` is the deliberate unit-disc IDEALISATION -- `heard iff "
+            "d <= rr`, PDR exactly 1.0 at every distance inside the disc and 0.0 outside, no rssi "
+            "at all -- so it fails that arm BY DEFINITION, not by defect. It is the default only "
+            "because it is the cheapest and the historical baseline `0bd93655...` is pinned to it; "
+            "any study of range-dependent reception must use `logdistance` or `geometric`. The "
+            "monotone arms (adjacent and cumulative) still run and still hold.",
+    }
+
     def __init__(self, *, range_m: float):
         self.reach_m = float(range_m)
 
@@ -950,11 +970,90 @@ _CHANNEL_ENV_KEYS = ("radio_range_m", "pathloss_exponent", "shadowing_sigma_db",
                      "nlos_loss", "seed", "dt")
 
 
+class ReadOnlyConfig:
+    """Attribute-read-only view of `PipelineConfig`, handed to a plugin as `env["config"]`.
+
+    `_channel_env` used to pass the LIVE dataclass instance. `_write_manifest` serialises
+    `cfg.__dict__` at the END of the run, so a plugin that wrote through that reference -- one line,
+    `env["config"].report_prob = 1.0`, at construction or at step 30 -- silently rewrote the config
+    the artifact claims produced it, at exit 0, with an identical `provenance_digest` and a clean
+    `verify-plugins`. The manifest replay contract (constraint 2) was broken with no drift signal
+    anywhere.
+
+    Two defences, and they are deliberately different in kind:
+
+    * this view, which makes the ACCIDENTAL and the one-line-deliberate write a loud immediate
+      error rather than a silent success; and
+    * :func:`_assert_config_unmoved`, which is the one that actually holds. Python has no way to
+      make a reference unforgeable -- `env` is a plain dict, a determined plugin can reach the real
+      object through `gc`, through a frame walk, or through this view's own slot -- so the
+      enforceable statement is not "you cannot write" but "if the config moved, the run does not
+      produce an artifact". Stated the same way C5 states that PEP 578 is detection, not sandboxing.
+    """
+
+    __slots__ = ("_ReadOnlyConfig__cfg",)
+
+    def __init__(self, cfg):
+        object.__setattr__(self, "_ReadOnlyConfig__cfg", cfg)
+
+    def __getattr__(self, name):
+        if name.startswith("__"):                       # no __dict__ / __setattr__ escape hatch
+            raise AttributeError(name)
+        return getattr(object.__getattribute__(self, "_ReadOnlyConfig__cfg"), name)
+
+    def __setattr__(self, name, value):
+        raise ConfigError(
+            f"env['config'] is READ-ONLY: a plugin may not write {name!r} (or any other field) on "
+            f"the run's configuration. The manifest records `cfg.__dict__`, so a mid-run write "
+            f"makes the dataset unreplayable while the manifest still says exit 0. Declare the knob "
+            f"through your own `config_fields()` and read it from `params` instead.")
+
+    def __delattr__(self, name):
+        self.__setattr__(name, None)
+
+    def __repr__(self) -> str:                          # pragma: no cover - debugging aid
+        return f"ReadOnlyConfig(seed={self.seed})"
+
+
+def _config_dict(cfg) -> dict:
+    """`cfg.__dict__` in the shape `manifest["config"]` carries it. ONE definition, used by the
+    snapshot, the comparison and the manifest writer, so those three can never disagree about what
+    "the config" is."""
+    return {k: (list(v) if isinstance(v, tuple) else v) for k, v in cfg.__dict__.items()}
+
+
+def _assert_config_unmoved(before: dict, cfg, when: str) -> None:
+    """Refuse to continue if anything moved `cfg` since `before` was taken.
+
+    THE enforceable half of the read-only-config contract. A plugin that mutates the run's config --
+    at construction, or at step 30 -- produces a dataset that NO config describes: the steps before
+    the write ran under the old value and the steps after under the new one. Writing either into
+    `manifest["config"]` would be a lie, so the run fails instead. Nothing in the engine mutates
+    `cfg` between `validate_config` and the manifest write, so this can only fire on plugin code.
+    """
+    now = _config_dict(cfg)
+    moved = sorted(k for k in set(before) | set(now) if before.get(k, _MISSING) != now.get(k, _MISSING))
+    if not moved:
+        return
+    detail = "; ".join(f"{k}: {before.get(k, _MISSING)!r} -> {now.get(k, _MISSING)!r}"
+                       for k in moved[:5])
+    raise ConfigError(
+        f"the run configuration was MUTATED {when}: {detail}"
+        + (f" (and {len(moved) - 5} more)" if len(moved) > 5 else "")
+        + ". Only a plugin can do this. The dataset is unreplayable -- the steps before the write "
+          "ran under one config and the steps after under another -- so no manifest is written.")
+
+
+_MISSING = object()
+
+
 def _channel_env(cfg, buildings, dt):
     env = {k: getattr(cfg, k) for k in _CHANNEL_ENV_KEYS if hasattr(cfg, k)}
     env["dt"] = dt
     env["buildings"] = buildings
-    env["config"] = cfg
+    # Read-only. The built-ins reach it through `GeometricChannel.from_plugin` and only ever READ
+    # attributes off it, so the view is transparent to them.
+    env["config"] = ReadOnlyConfig(cfg)
     return env
 
 
@@ -964,10 +1063,17 @@ _CHANNEL_SECTION_KEYS = frozenset({"ref", "params", "conformance"})
 #: `plugins.<slot>.conformance`: "off" (default, and the only zero-cost setting) or "required".
 CONFORMANCE_MODES = ("off", "required")
 
-#: Checks the IN-RUN attestation cannot run. C12 runs two full pipelines; attestation happens inside
-#: one, so running C12 there would put a pipeline inside a pipeline. Excluded BEFORE the suite runs,
-#: not filtered out of its report afterwards, and named in the embedded summary.
-_ATTEST_EXCLUDES = ("C12_pipeline_two_run_digest",)
+#: Per slot, the checks the IN-RUN attestation cannot run: the ones that themselves run a full
+#: pipeline. Attestation happens INSIDE a pipeline, so running one of these there would put a
+#: pipeline inside a pipeline. Excluded BEFORE the suite runs, not filtered out of its report
+#: afterwards, and named in the embedded summary so nobody reads `passed: N` and believes the
+#: artifact-level check ran.
+_ATTEST_EXCLUDES_BY_SLOT = {"channel_model": ("C12_pipeline_two_run_digest",),
+                            "check": ("D6_off_by_default_is_byte_identical",)}
+
+#: Back-compat alias: the channel slot's list, which is what this name meant when only that slot
+#: could be attested.
+_ATTEST_EXCLUDES = _ATTEST_EXCLUDES_BY_SLOT["channel_model"]
 
 
 def _channel_conformance(cfg) -> str:
@@ -980,7 +1086,23 @@ def _channel_conformance(cfg) -> str:
 
 
 def _attest(slot: str, ref: str, params: dict) -> dict:
-    """Run the v1 conformance suite against this plugin BEFORE step 0 and refuse a failing one.
+    """Run the v1 conformance suite against this plugin BEFORE CONSTRUCTION and refuse a failing one.
+
+    **Order, and it is the whole point.** This used to run AFTER `instantiate`. A hostile `__init__`
+    therefore executed before it was ever gated: it could rebind `random.Random.random`, replace
+    `api.channel.check_outcome`, or -- decisively -- monkeypatch `conformance.runner.run_ref` or
+    `ConformanceReport.ok`, and then "pass", because the process performing the attestation was one
+    the candidate had already edited. An attestation performed by code the subject can rewrite
+    attests to nothing. Both callers now attest BEFORE the run's instance exists.
+
+    **Place.** Conformance must itself construct the candidate -- there is no way to grade a model
+    without building one -- so the suite runs in a CHILD interpreter
+    (`conformance/attest.py`), which is discarded a moment later and shares no object with this run.
+    The child brackets the suite with an integrity sentinel of its own and reports what it saw, so
+    "the candidate tampered while being attested" is a recorded property of the attestation rather
+    than something this process has to infer. Cost: one interpreter start per attested plugin, on a
+    path that is off by default.
+
 
     The design's third delivery route -- *"let the engine refuse an unattested plugin"* -- expressed
     as a config declaration rather than a flag, so it lands in `manifest["config"]` and replays like
@@ -988,11 +1110,12 @@ def _attest(slot: str, ref: str, params: dict) -> dict:
     `manifest["plugins"]["loaded"][*]["conformance"]`, which is what turns *"this dataset was
     produced by a conformant plugin"* into a machine-checkable property of the artifact.
 
-    OFF BY DEFAULT, and that is not timidity. Attestation costs a measured 0.111 s per run (1.268 s
-    vs 1.157 s, median of 3, on a 60 s grid) and, because C5 installs a PEP 578 audit hook that can
-    never be removed, it leaves a small permanent per-audit-event cost on the process. Neither
-    belongs on the engine path of a run that did not ask for it, and the honest home for a
-    twelve-check suite is a CI gate, not every `run_pipeline`.
+    OFF BY DEFAULT, and that is not timidity. Attestation now costs an interpreter start plus the
+    suite (measured ~1.0 s per attested plugin, against ~0.11 s when it ran in-process), and the PEP
+    578 audit hook C5 installs -- which can never be removed once added -- is now paid by the child
+    and thrown away with it rather than left on the engine process forever. Neither belongs on the
+    engine path of a run that did not ask for it, and the honest home for a fourteen-check suite is a
+    CI gate, not every `run_pipeline`.
 
     **C12 is excluded, and it has to be**: C12 runs two full pipelines, so running it from inside
     `build_channel` -- which is itself inside a pipeline -- nests a pipeline in a pipeline. It is
@@ -1001,19 +1124,51 @@ def _attest(slot: str, ref: str, params: dict) -> dict:
     running the two pipelines its own summary said were excluded. The exclusion is named in the
     summary, so nobody reads `passed: 12` here and believes the artifact-level check ran.
     """
-    from ..conformance.runner import run_ref
-    rep = run_ref(slot, ref, params, exclude=_ATTEST_EXCLUDES)
-    if not rep.ok:
-        failed = [r["check"] for r in rep.rows if r["status"] in ("FAIL", "ERROR")]
+    from ..conformance.attest import run_out_of_process
+    excludes = _ATTEST_EXCLUDES_BY_SLOT.get(slot, ())
+    report = run_out_of_process(slot, ref, params, exclude=excludes)
+    summary = dict(report.get("summary") or {})
+    if report.get("error"):
+        raise ConfigError(
+            f"plugins.{slot}.conformance=required and attesting {ref!r} FAILED to complete: "
+            f"{report['error']}\n{report.get('traceback', '')}")
+    if not summary.get("ok"):
+        failed = [r["check"] for r in (report.get("checks") or [])
+                  if r.get("status") in ("FAIL", "ERROR")]
         raise ConfigError(
             f"plugins.{slot}.conformance=required and {ref!r} does not conform: {failed} failed.\n"
-            + rep.to_text())
-    summary = rep.summary()
-    summary["excluded"] = list(_ATTEST_EXCLUDES)
-    summary["excluded_reason"] = ("C12 runs two pipelines; running it from inside one would put a "
-                                  "pipeline inside a pipeline. Run it from the CLI or CI instead: "
-                                  "scms-poc conformance --ref <ref>")
+            + _attest_text(report))
+    # The child's own integrity verdict. A candidate whose CONSTRUCTION rebinds an engine or RNG
+    # object is refused here even though every contract check passed -- which is the ordering defect
+    # stated as a rule: passing a suite you were able to edit is not passing a suite.
+    integ = report.get("integrity") or {}
+    if not integ.get("ok", True):
+        raise ConfigError(
+            f"plugins.{slot}.conformance=required and {ref!r} TAMPERED with the interpreter while "
+            f"being attested: {integ.get('tampered')}. Conformance is run in a child process "
+            f"precisely so this is visible instead of being applied to the process doing the "
+            f"judging; a plugin that rewrites the engine's own objects at construction is refused "
+            f"whatever its check results say.")
+    summary["attested_out_of_process"] = True
+    summary["integrity"] = integ
+    summary["excluded"] = list(excludes)
+    summary["excluded_reason"] = (
+        f"{', '.join(excludes)} runs a full pipeline; running it from inside one would put a "
+        f"pipeline inside a pipeline. Run it from the CLI or CI instead: "
+        f"scms-poc conformance --slot {slot} --ref <ref>") if excludes else ""
     return summary
+
+
+def _attest_text(report: dict) -> str:
+    """The child's rows, rendered the way `ConformanceReport.to_text` renders them in-process."""
+    rows = report.get("checks") or []
+    width = max((len(r.get("check", "")) for r in rows), default=10)
+    lines = [f"conformance {report.get('suite')} :: {report.get('slot')} :: {report.get('ref')} "
+             f"(attested out of process)"]
+    for r in rows:
+        detail = f"  {r.get('detail')}" if r.get("detail") else ""
+        lines.append(f"  {r.get('status', '?'):<6} {r.get('check', '?'):<{width}}{detail}")
+    return "\n".join(lines)
 
 
 def _channel_selection(cfg):
@@ -1057,17 +1212,37 @@ def build_channel(cfg, buildings=None, dt: float = 1.0):
     """
     ref, params = _channel_selection(cfg)
     cls, how, iv, shape = _api_registry.resolve("channel_model", ref)
-    pid = _api_registry.plugin_id_of(cls, ref if ":" not in ref else ref.rsplit(":", 1)[-1].lower())
-    rng_ns = RngNamespace(cfg.seed, pid)
-    model = _api_registry.instantiate(cls, params=params, rng=rng_ns,
-                                      env=_channel_env(cfg, buildings, dt))
-    caps = _api_registry.check_capabilities("channel_model", ref, cls, how, model.capabilities())
-    chan = _api_channel.BatchAdapter(model) if shape == "batch" else PerLinkAdapter(model)
-    # Attestation, when the config asked for it. Here rather than in `validate_config` because it is
-    # expensive and belongs with the one construction that actually happens, not with every
-    # validation pass the GUI and the copilot make.
+    # ATTESTATION FIRST, and OUT OF PROCESS. This used to run twenty lines further down, AFTER the
+    # instance existed -- so a hostile `__init__` ran before it was ever gated and could rewrite the
+    # machinery about to judge it. See `_attest`.
     conformance = (_attest("channel_model", ref, params)
                    if _channel_conformance(cfg) == "required" else None)
+    pid = _api_registry.plugin_id_of(cls, ref if ":" not in ref else ref.rsplit(":", 1)[-1].lower())
+    rng_ns = RngNamespace(cfg.seed, pid)
+    # CONSTRUCTION UNDER A SENTINEL. Attestation moved in front of construction still leaves the
+    # run's OWN instance being built in this interpreter, and `__init__` is arbitrary code. The
+    # snapshot is taken before the constructor runs and compared the moment it returns, so a
+    # construction-time rebind of `random.Random`, of `api.channel.check_outcome`, of `run._attest`
+    # or of any other watched object is fatal HERE -- before step 0, before an output directory
+    # exists. Built-ins are the engine; only third-party code is bracketed.
+    _guard = _integrity.Sentinel(armed=(how != "builtin"))
+    model = _api_registry.instantiate(cls, params=params, rng=rng_ns,
+                                      env=_channel_env(cfg, buildings, dt))
+    _guard.verify("while CONSTRUCTING the channel plugin", subject=f"plugins.channel_model {ref!r}")
+    caps = _api_registry.check_capabilities("channel_model", ref, cls, how, model.capabilities())
+    # The adapter carries the namespace so that `chan.begin_step(frame)` in the step loop advances it
+    # exactly once per step. Without that wiring `RngNamespace._step` never leaves -1 and every
+    # `stream()` key ends `:s-1`, which silently turns a stateless per-packet draw into a per-run
+    # constant -- see `BatchAdapter.begin_step`.
+    # `validate` runs `api.channel.check_outcome` on every delivered link of a THIRD-PARTY model:
+    # rssi in the declared dBm band, link_state in the closed vocabulary, finite non-negative delay.
+    # Conformance (C7) is the same statement but is OFF BY DEFAULT, so without this the default
+    # third-party path had NO outcome validation at all and an out-of-vocabulary or absurd value
+    # flowed straight into the MA-visible dataset as evidence. Built-ins are exempt: the pinned
+    # goldens grade them, and this is a call per delivered link on a ~10^7-link loop.
+    _validate = (how != "builtin")
+    chan = (_api_channel.BatchAdapter(model, rng_ns, _validate) if shape == "batch"
+            else PerLinkAdapter(model, rng_ns, _validate))
 
     def _provenance():
         # Built AT THE END of the run, not here: `declared_streams` is the set of stream labels the
@@ -1080,6 +1255,412 @@ def build_channel(cfg, buildings=None, dt: float = 1.0):
                                              conformance=conformance)
 
     return chan, _provenance
+
+
+# --------------------------------------------------------------------------- #
+# The DETECTOR seam (PLUGIN-ARCHITECTURE.md section 2.2 / phase 3)
+# --------------------------------------------------------------------------- #
+#: Keys one entry of the `plugins.check` ARRAY may carry. Closed so a typo is an error.
+_CHECK_ENTRY_KEYS = frozenset({"ref", "params", "conformance", "source_gate"})
+
+#: Keys the `plugins.fusion` section may carry.
+_FUSION_SECTION_KEYS = frozenset({"ref", "params", "source_gate"})
+
+#: Inside `plugins.check`, expands IN PLACE to this run's built-in suite in its canonical order.
+#:
+#: An EXTENSION to the design's section 3.3 shape, and a deliberate one. The array is the explicit,
+#: ordered, replayable input the design requires -- but a user whose only goal is to ADD one
+#: detector should not have to transcribe fourteen built-in names to keep them, and a transcription
+#: is exactly the kind of hand-maintained list this phase exists to delete. `["@builtins", {...}]`
+#: says "the shipped suite, then mine", stays a single config string, and replays byte-identically.
+BUILTIN_CHECKS_TOKEN = "@builtins"
+
+#: The default `fusion` reference. `streak_v1` reproduces the engine's historical rule exactly.
+DEFAULT_FUSION = "streak_v1"
+
+
+def default_check_refs(*, station_types: bool = False, denm: bool = False) -> tuple:
+    """This run's built-in check suite, in the SHIPPED order.
+
+    That order IS evaluation order IS `DET_KEYS` order, and it reaches `data_digest` through the
+    fusion's stable-sort tie-break over equal scores. The two GATED entries keep the "registering is
+    not enabling" property that stops a newly registered check from perturbing the default digest.
+
+    **Expanded from `detectors.BUILTIN_CHECKS`, a fixed in-tree tuple, and NOT from the live
+    registry -- which is a fix, not a style preference.** `_api_registry.builtin_names("check")` is a
+    view of a process-global dict that `register_builtin()` writes into, and importing a
+    distribution is enough to call it. So `@builtins` used to expand to *whatever was registered at
+    the moment the config was resolved*: an installed-but-undeclared plugin that registered itself at
+    import time got into the suite of a run that never asked for it, contributed a column, and moved
+    the digest -- the exact inverse of the D6 property this seam is built on. Reading the shipped
+    tuple instead makes the expansion a function of the ENGINE VERSION alone.
+    """
+    on = {"station_type": bool(station_types), "denm": bool(denm)}
+    out = []
+    for cls in _detectors.BUILTIN_CHECKS:
+        gate = getattr(cls, "gate", None)
+        if gate is None or on.get(gate, False):
+            out.append(cls.reason_code)
+    return tuple(out)
+
+
+def _assert_not_hijacked(slot: str, ref: str, cls) -> None:
+    """A ref that resolved through the BUILT-IN tier must be the class this engine ships.
+
+    The other half of the same hole. `register_builtin` overwrites per (slot, name), so a third
+    party could bind its own class to `positionJump` and be resolved as a built-in: `_builtin_params`
+    would hand it the engine's config fields, `is_builtin` would let it keep the reserved
+    `legacy_raw_compare` grandfathering, its column would NOT be `x_`-namespaced, and the source gate
+    would skip it. Identity against the fixed in-tree mapping is the whole check.
+    """
+    shipped = (_detectors.BUILTIN_CHECK_BY_CODE if slot == "check"
+               else _detectors.BUILTIN_FUSION_BY_NAME).get(ref)
+    if shipped is not None and cls is not shipped:
+        raise ConfigError(
+            f"plugins.{slot} {ref!r} resolved to {cls.__module__}.{getattr(cls, '__name__', cls)!r}, "
+            f"but {ref!r} is a BUILT-IN name owned by "
+            f"{shipped.__module__}.{shipped.__name__}. Something called "
+            f"register_builtin({slot!r}, {ref!r}, ...) and replaced it -- a third-party component "
+            f"cannot take a built-in's name, its engine config fields or its reserved capabilities. "
+            f"Give it its own ref and its own reason_code.")
+
+
+def _checks_selection(cfg, *, station_types: bool, denm: bool) -> tuple:
+    """((ref, params, conformance, source_gate), ...) for the check slot: `plugins` wins, else the
+    built-ins."""
+    default = tuple((r, {}, "off", _srcgate.DEFAULT_MODE)
+                    for r in default_check_refs(station_types=station_types, denm=denm))
+    sel = (cfg.plugins or {}).get("check") if isinstance(cfg.plugins, dict) else None
+    if not sel:
+        return default
+    if isinstance(sel, (str, dict)):
+        sel = [sel]
+    if not isinstance(sel, (list, tuple)):
+        raise ConfigError("plugins.check must be an ARRAY of {'ref': ..., 'params': {...}} entries "
+                          "(its ORDER is digest-bearing, so it is an explicit input)")
+    out = []
+    for entry in sel:
+        if entry == BUILTIN_CHECKS_TOKEN:
+            out.extend(default)
+            continue
+        if isinstance(entry, str):
+            entry = {"ref": entry}
+        if not isinstance(entry, dict) or "ref" not in entry:
+            raise ConfigError(f"plugins.check entry {entry!r} must be a ref string, "
+                              f"{BUILTIN_CHECKS_TOKEN!r}, or {{'ref': ..., 'params': {{...}}}}")
+        extra = sorted(set(entry) - _CHECK_ENTRY_KEYS)
+        if extra:
+            raise ConfigError(f"plugins.check entry: unknown key(s) {extra}; "
+                              f"known: {sorted(_CHECK_ENTRY_KEYS)}")
+        params = entry.get("params") or {}
+        if not isinstance(params, dict):
+            raise ConfigError("plugins.check[].params must be an object")
+        mode = str(entry.get("conformance", "off"))
+        if mode not in CONFORMANCE_MODES:
+            raise ConfigError(f"plugins.check[].conformance must be one of "
+                              f"{list(CONFORMANCE_MODES)} (got {mode!r})")
+        sgate = _srcgate.check_mode(entry.get("source_gate", _srcgate.DEFAULT_MODE),
+                                    "plugins.check[].source_gate")
+        out.append((str(entry["ref"]), params, mode, sgate))
+    seen = [r for r, _p, _c, _g in out]
+    dupes = sorted({r for r in seen if seen.count(r) > 1})
+    if dupes:
+        # The CHEAP half of the duplicate-column guard: the same ref twice, caught without resolving
+        # anything. The half that actually bites -- two DIFFERENT refs resolving to the same
+        # (plugin_id, reason_code), and therefore to the same column -- can only be caught after
+        # resolution, and is in `build_checks`.
+        raise ConfigError(f"plugins.check declares {dupes} more than once; each check contributes "
+                          f"exactly one detnorm_* column, so duplicates are refused")
+    return tuple(out)
+
+
+def _fusion_selection(cfg):
+    """(ref, params, source_gate) for the fusion slot."""
+    sel = (cfg.plugins or {}).get("fusion") if isinstance(cfg.plugins, dict) else None
+    if not sel:
+        return DEFAULT_FUSION, {}, _srcgate.DEFAULT_MODE
+    if isinstance(sel, str):
+        sel = {"ref": sel}
+    if not isinstance(sel, dict) or "ref" not in sel:
+        raise ConfigError("plugins.fusion must be a string or {'ref': ..., 'params': {...}}")
+    extra = sorted(set(sel) - _FUSION_SECTION_KEYS)
+    if extra:
+        raise ConfigError(f"plugins.fusion: unknown key(s) {extra}; "
+                          f"known: {sorted(_FUSION_SECTION_KEYS)}")
+    params = sel.get("params") or {}
+    if not isinstance(params, dict):
+        raise ConfigError("plugins.fusion.params must be an object")
+    return (str(sel["ref"]), params,
+            _srcgate.check_mode(sel.get("source_gate", _srcgate.DEFAULT_MODE),
+                                "plugins.fusion.source_gate"))
+
+
+def _detector_env(cfg) -> dict:
+    """Config scalars the detection layer may read at construction. NOT the oracle: every one is
+    user-supplied config that already appears verbatim in `manifest["config"]`."""
+    return {"dt": cfg.dt, "seed": cfg.seed, "t0": 0.0}
+
+
+def _builtin_params(cls, cfg, declared: dict, slot: str, ref: str) -> dict:
+    """A BUILT-IN's params are the engine's own config fields, resolved from `cfg`.
+
+    Its knobs were `cfg.<field>` reads in the inline block; they already have `_FIELD_META` entries,
+    argparse flags, GUI widgets and a `manifest["config"]` slot. Mirroring them (rather than
+    re-declaring defaults inside the check) means `--detector-z-threshold` keeps working and there
+    is exactly ONE definition of each. Overriding one through `plugins.<slot>.params` is refused
+    for the same reason: two spellings of one knob is how they drift apart.
+    """
+    fields = getattr(cls, "cfg_fields", {}) or {}
+    if declared:
+        raise ConfigError(
+            f"plugins.{slot} {ref!r} is a BUILT-IN: its knobs are engine config fields, so set "
+            f"{sorted(fields.values())} directly instead of through params (got {sorted(declared)})")
+    return {name: getattr(cfg, field) for name, field in fields.items()}
+
+
+def _plugin_params(cls, declared: dict, slot: str, ref: str) -> dict:
+    """A third party's params: its own `FieldSpec` defaults, overridden by what the config declared,
+    with an undeclared name refused rather than silently ignored."""
+    spec = _plugin_config_fields(cls)
+    params = {name: fs.default for name, fs in spec.items()}
+    for k, v in sorted(declared.items()):
+        fs = spec.get(k)
+        if fs is None and spec:
+            raise ConfigError(f"plugins.{slot}.params: {ref} declares no field {k!r}; "
+                              f"known: {sorted(spec)}")
+        if fs is not None:
+            fs.validate(f"plugins.{slot}.params.{k}", v)
+        params[k] = v
+    return params
+
+
+class LoadedCheck:
+    """One resolved, constructed check plus everything the engine needs to run and record it."""
+
+    __slots__ = ("ref", "instance", "column", "plugin_id", "builtin", "soft", "precision",
+                 "msg_types", "vru_suppressed", "params", "rng", "provenance")
+
+    def __init__(self, ref, instance, column, plugin_id, builtin, params, rng, provenance):
+        self.ref, self.instance, self.column = ref, instance, column
+        self.plugin_id, self.builtin = plugin_id, builtin
+        self.soft = bool(getattr(instance, "soft", False))
+        # Section 4.1: the engine rounds a plugin's returned score to its DECLARED precision before
+        # the `>= 1.0` compare, because that compare is a cliff and a last-ulp difference flips a
+        # whole report. The built-ins compare the RAW float -- that is what the goldens were pinned
+        # on -- and declare `legacy_raw_compare`, which the resolver refuses from third parties.
+        self.precision = (None if _api_detect.CAP_LEGACY_RAW_COMPARE in instance.capabilities()
+                          else int(getattr(instance, "precision", 3)))
+        self.msg_types = tuple(getattr(instance, "msg_types", ("cam",)))
+        self.vru_suppressed = bool(getattr(instance, "vru_suppressed", False))
+        self.params, self.rng, self.provenance = params, rng, provenance
+
+
+class CheckSuite:
+    """The ordered check vector plus the fusion -- the detection layer of one run.
+
+    `keys` is `DET_KEYS`: the ordered HARD columns. The order is digest-bearing through the FUSION's
+    stable-sort tie-break (the rows themselves are canonicalised with sorted keys, so insertion order
+    never reaches the bytes). `soft_keys` are scored and emitted but can never fire.
+    """
+
+    __slots__ = ("checks", "fusion", "fusion_params", "fusion_rng", "fusion_ref", "keys",
+                 "soft_keys", "columns", "zero", "cam_plan", "denm_plan", "vru_suppressed",
+                 "sig_column", "sig_suppressed", "third_party", "fusion_wrap", "_prov")
+
+    def __init__(self, checks, fusion, fusion_params, fusion_rng, fusion_ref, prov,
+                 *, fusion_builtin=True, fusion_pid=None):
+        self.checks = tuple(checks)
+        #: The plugin id a THIRD-PARTY fusion's state is namespaced under, or None for the built-in.
+        #:
+        #: The check slot has always wrapped a third party's per-(rx, sender) state in
+        #: `NamespacedState`; the fusion slot handed the raw engine dict to EVERYONE, built-in or
+        #: not. So a third-party fusion -- which is called on the same `st` object, once per message,
+        #: after the whole check vector -- could read and REWRITE `h` (the claim history every
+        #: history-bearing check compares against), `streak` (the built-in fusion's consecutive-
+        #: violation counters) and `kf` (the soft tracker's state), with none of the discipline the
+        #: check slot enforces one call earlier on the same dict. It gets the same wrapper now.
+        self.fusion_wrap = None if fusion_builtin else fusion_pid
+        self.fusion, self.fusion_params = fusion, fusion_params
+        self.fusion_rng, self.fusion_ref = fusion_rng, fusion_ref
+        self.keys = tuple(c.column for c in self.checks if not c.soft)
+        self.soft_keys = tuple(c.column for c in self.checks if c.soft)
+        self.columns = self.keys + self.soft_keys
+        #: The template every per-message score vector is copied from: every column present, in
+        #: declared order, at 0.0. A check that does not apply to this message type therefore scores
+        #: exactly 0.0, which is what the inline `det = {k: 0.0 for k in DET_KEYS}` did.
+        self.zero = {c: 0.0 for c in self.columns}
+        self.cam_plan = self._plan("cam")
+        self.denm_plan = self._plan("denm")
+        self.vru_suppressed = tuple(c.column for c in self.checks if c.vru_suppressed)
+        sig = [c.column for c in self.checks
+               if c.builtin and c.column == _detectors.SignatureVerification.reason_code]
+        self.sig_column = sig[0] if sig else None
+        #: On a signature failure the content cannot be trusted at all, so every plausibility score
+        #: is suppressed and only the crypto failure is reported. That suppression is the engine's,
+        #: not any one check's, and it covers third-party columns too.
+        self.sig_suppressed = tuple(c for c in self.columns if c != self.sig_column)
+        self.third_party = tuple(c for c in self.checks if not c.builtin)
+        self._prov = prov
+
+    def _plan(self, msg_type):
+        """The per-message call plan for one message type: (column, evaluate, params, rng, wrap,
+        precision) tuples, in declared order. Built ONCE per run; the reception loop is the hottest
+        loop in the engine and must not re-derive this per message."""
+        plan = []
+        for c in self.checks:
+            if msg_type not in c.msg_types:
+                continue
+            wrap = None if c.builtin else c.plugin_id
+            plan.append((c.column, c.instance.evaluate, c.params, c.rng, wrap, c.precision))
+        return tuple(plan)
+
+    def begin_step(self, step: int) -> None:
+        for c in self.checks:
+            c.rng.begin_step(step)
+        self.fusion_rng.begin_step(step)
+
+    def provenance(self) -> list:
+        return [p() for p in self._prov]
+
+
+def build_checks(cfg, *, station_types: bool = False, denm: bool = False) -> CheckSuite:
+    """Resolve + construct the run's detection layer. Once, before step 0; every failure fatal here.
+
+    A plugin that raises mid-loop would produce a partial dataset whose digest matches nothing, and
+    it must NOT take the SIGINT path that finalises a VALID manifest for a partial run. Instances are
+    PER-RUN objects, never module globals, so the in-process multi-run drivers cannot cross-
+    contaminate.
+    """
+    loaded, prov, columns = [], [], {}
+    for order, (ref, declared, mode, sgate) in enumerate(
+            _checks_selection(cfg, station_types=station_types, denm=denm)):
+        cls, how, iv, _shape = _api_registry.resolve("check", ref)
+        _assert_not_hijacked("check", ref, cls)
+        builtin = how == "builtin" and _api_registry.is_builtin("check", cls)
+        if not builtin:
+            # THE SOURCE GATE, at plugin RESOLUTION -- the moment a third-party class first exists in
+            # this process and before anything of it has been constructed or called. A guard rail,
+            # never a sandbox: see api/srcgate.py, whose refusal message says so in full.
+            _srcgate.gate("check", ref, cls, mode=sgate)
+        # ATTESTATION FIRST, and OUT OF PROCESS -- the check slot repeated the channel slot's
+        # ordering defect verbatim (instantiate at run.py:1493, attest at :1499), so a hostile
+        # `__init__` ran before the D1-D7 suite that was supposed to gate it. See `_attest`.
+        attested = _attest("check", ref, declared) if mode == "required" else None
+        pid = _api_registry.plugin_id_of(cls, _fallback_pid(ref))
+        params = (_builtin_params(cls, cfg, declared, "check", ref) if builtin
+                  else _plugin_params(cls, declared, "check", ref))
+        rng_ns = RngNamespace(cfg.seed, pid)
+        # CONSTRUCTION UNDER A SENTINEL: a third party's `__init__` is arbitrary code running in the
+        # engine's interpreter, and any rebind it performs is fatal before step 0. See `build_channel`.
+        _guard = _integrity.Sentinel(armed=not builtin)
+        inst = _api_registry.instantiate(cls, params=params, rng=rng_ns, env=_detector_env(cfg))
+        _guard.verify("while CONSTRUCTING a detector plugin", subject=f"plugins.check {ref!r}")
+        caps = _api_registry.check_capabilities("check", ref, cls, how, inst.capabilities())
+        code = str(inst.reason_code)
+        # SECTION 4.4: a third party's column is `x_<plugin_id>_<code>`, so it can never collide
+        # with a built-in's or with a future standardised name. The namespaced string is ALSO the
+        # reason code that lands in `reason_codes`, so the collision-freedom is end-to-end.
+        column = _claim_column(columns, ref, order, pid, code, builtin)
+        loaded.append(LoadedCheck(ref, inst, column, pid, builtin, params, rng_ns, None))
+        prov.append(_check_provenance("check", order, ref, cls, how, iv, caps, rng_ns, params,
+                                      conformance=attested))
+    fref, fdeclared, fsgate = _fusion_selection(cfg)
+    fcls, fhow, fiv, _fshape = _api_registry.resolve("fusion", fref)
+    _assert_not_hijacked("fusion", fref, fcls)
+    fbuiltin = fhow == "builtin" and _api_registry.is_builtin("fusion", fcls)
+    if not fbuiltin:
+        _srcgate.gate("fusion", fref, fcls, mode=fsgate)
+    fpid = _api_registry.plugin_id_of(fcls, _fallback_pid(fref))
+    fparams = (_builtin_params(fcls, cfg, fdeclared, "fusion", fref) if fbuiltin
+               else _plugin_params(fcls, fdeclared, "fusion", fref))
+    frng = RngNamespace(cfg.seed, fpid)
+    keys = tuple(c.column for c in loaded if not c.soft)
+    fenv = dict(_detector_env(cfg), keys=keys,
+                soft_keys=tuple(c.column for c in loaded if c.soft))
+    if fbuiltin:
+        # GRANDFATHERED, and structurally reachable by a BUILT-IN ONLY: the env that carries the
+        # engine's global stream is built differently for a third party, which never sees the key.
+        # The `report_prob` Bernoulli is drawn from that single stream, whose draw COUNT AND ORDER
+        # are load-bearing for every pinned golden; moving it to a keyed namespace is a scheduled
+        # re-pin, not something a refactor may do quietly. `check_capabilities` below independently
+        # refuses the DECLARATION from anything that is not a built-in.
+        fenv["legacy_rng"] = _LEGACY_RNG.get("rng")
+    _fguard = _integrity.Sentinel(armed=not fbuiltin)
+    fusion = _api_registry.instantiate(fcls, params=fparams, rng=frng, env=fenv)
+    _fguard.verify("while CONSTRUCTING the fusion plugin", subject=f"plugins.fusion {fref!r}")
+    fcaps = _api_registry.check_capabilities("fusion", fref, fcls, fhow, fusion.capabilities())
+    fprov = _check_provenance("fusion", 0, fref, fcls, fhow, fiv, fcaps, frng, fparams)
+    return CheckSuite(loaded, fusion, fparams, frng, fref, prov + [fprov],
+                      fusion_builtin=fbuiltin, fusion_pid=fpid)
+
+
+def _claim_column(columns: dict, ref, order, pid, code, builtin) -> str:
+    """The check's emitted column, refused if another entry already claimed it.
+
+    **DE-DUPLICATION BY THE RESOLVED COLUMN, not by the ref string.** `_checks_selection` can only
+    see that two entries spell the same ref; what actually collides is the resolved
+    `(plugin_id, reason_code)` pair, and two DIFFERENT refs reach one pair routinely -- a subclass,
+    an alias, a re-export, the same class published under two entry-point names, a dotted path
+    alongside the entry-point name for the same class.
+
+    Measured before this guard: `@builtins` plus a check plus a trivial subclass of it loaded 15
+    checks into 14 distinct column slots. The per-message call plan evaluated that column twice, the
+    second score silently overwrote the first in every report row, and the zero-template the engine
+    copies per message was one entry short. No warning anywhere, and the ML tables carried one
+    column where the manifest's lock recorded two detectors.
+    """
+    column = code if builtin else _api_detect.namespaced_key(pid, code)
+    if column in columns:
+        first_ref, first_order = columns[column]
+        raise ConfigError(
+            f"plugins.check entries {first_order} ({first_ref!r}) and {order} ({ref!r}) both "
+            f"resolve to column {column!r}"
+            + ("" if builtin else f" -- the (plugin_id, reason_code) pair ({pid!r}, {code!r})") +
+            f". Each check contributes exactly one detnorm_* column, so the second would silently "
+            f"overwrite the first in every report row. Two different refs may not share a "
+            f"(plugin_id, reason_code) pair; change one of them.")
+    columns[column] = (ref, order)
+    return column
+
+
+def _fallback_pid(ref: str) -> str:
+    """A plugin id for a ref that declares none: the class name, lowercased."""
+    tail = ref.rsplit(":", 1)[-1] if ":" in ref else ref
+    out = "".join(ch if ch.isalnum() else "_" for ch in tail).lower().strip("_")
+    return out[:32] or "plugin"
+
+
+def _check_provenance(slot, order, ref, cls, how, iv, caps, rng_ns, params, conformance=None):
+    """Deferred exactly as the channel's is: `declared_streams` is the set of labels the plugin
+    ACTUALLY consumed, and a check that draws only during the loop has consumed none at
+    construction time. Recording an always-empty list would be fabrication by omission."""
+    def _build():
+        return _api_registry.make_provenance(slot, order, ref, cls, how, iv, caps,
+                                             rng_ns.declared_streams(), params,
+                                             conformance=conformance)
+    return _build
+
+
+def _round_score(value, precision: int, column: str) -> float:
+    """A third-party check's returned score, rounded to its DECLARED precision and range-checked.
+
+    Section 4.1: the engine rounds BEFORE the `>= 1.0` compare, because that comparison is a CLIFF --
+    a last-ulp difference flips a whole report, and float reduction order is not portable. A NaN or
+    an infinity is refused outright rather than propagated: it would compare false against every
+    threshold and silently disable the check for the rest of the run.
+    """
+    v = float(value)
+    if not (v == v and -math.inf < v < math.inf):
+        raise ConfigError(f"check {column!r} returned a non-finite score {value!r}; a detnorm must "
+                          f"be a finite float (>= 1.0 == violating)")
+    return round(v, precision)
+
+
+#: The run's global `random.Random(cfg.seed)`, parked here for the duration of `build_checks` so the
+#: grandfathered built-in fusion can be handed it. A module global rather than a parameter because
+#: `build_checks` is also called by the conformance harness and by tests with no engine loop; it is
+#: written and cleared inside `run_pipeline`, and it is never handed to a third-party plugin.
+_LEGACY_RNG: dict = {"rng": None}
 
 
 #: Drift a replay was told to ACCEPT, waiting to be written into that replay's own manifest.
@@ -1115,7 +1696,7 @@ def _claim_drift_record(cfg) -> list:
     return drifts
 
 
-def plugin_block(records, drift=None) -> dict:
+def plugin_block(records, drift=None, integrity=None) -> dict:
     """`manifest["plugins"]` -- the LOCK (what was loaded), against `cfg.plugins` (what was asked).
 
     Not part of `data_digest_sha256` (which by design covers data files only) and carrying its own
@@ -1124,8 +1705,9 @@ def plugin_block(records, drift=None) -> dict:
     """
     loaded = [r.to_dict() for r in records]
     block = {"api_version": _api_registry.API_VERSION,
-             "interface_versions": {_api_channel.INTERFACE_NAME:
-                                    _api_channel.INTERFACE_VERSION.split("/", 1)[1]},
+             "interface_versions": {
+                 _api_channel.INTERFACE_NAME: _api_channel.INTERFACE_VERSION.split("/", 1)[1],
+                 _api_detect.INTERFACE_NAME: _api_detect.INTERFACE_VERSION.split("/", 1)[1]},
              "loaded": loaded,
              "provenance_digest": _api_registry.provenance_digest(records)}
     if drift:
@@ -1134,6 +1716,15 @@ def plugin_block(records, drift=None) -> dict:
         # code that did not match the manifest it was replayed from", and `loaded` above records
         # what ran, so the two locks diff cleanly.
         block["drift_allowed"] = list(drift)
+    if integrity:
+        # Present ONLY when the run armed integrity monitoring (i.e. `cfg.plugins` declared
+        # something), so a manifest written without plugins is byte-identical to what it was. It
+        # records what the monitor covered and what it saw, because "the engine was still made of the
+        # objects it started with, and its own stream had advanced exactly `engine_rng_words` words"
+        # is a claim an artifact should carry rather than a sentence in a changelog. Read it with
+        # `api/integrity.py`'s docstring: a PASS means nothing on the watch list moved, never that
+        # the plugin was honest.
+        block["integrity"] = dict(integrity)
     return block
 
 
@@ -1411,6 +2002,24 @@ class PipelineConfig:
     # replays through `config_from_dict`; entry-point iteration order is machine state, which is
     # why discovery may be automatic but activation never is.
     plugins: dict = field(default_factory=dict)
+    # --- directed carriageway geometry (roads.py `_LaneFrameMixin`) ----------------------------
+    # THE ACTIVATION SURFACE for `roads.enable_directed_lanes()` / `roads.edges_from_directed()`.
+    # Both existed, were tested, and were reachable ONLY by monkeypatching `roads.GridNetwork` from
+    # Python -- every producer of the "head-on overlaps 117/49/32 -> 0" measurement (the commit
+    # message, `tests/test_directed_roads.py`, `datasets/_netfidelity/_ab_directed.py`) installs a
+    # `class _Directed(GridNetwork)` subclass, because run.py was owned by a parallel workflow at the
+    # time. The measurement was real; the shipped product could not produce it. These three fields
+    # are what a user sets instead. All default-inert -> every pinned golden holds.
+    directed_lanes: bool = False         # each direction of travel gets its OWN carriageway, offset
+                                         # sideways off the centreline, so opposing streams no longer
+                                         # share one polyline. Lanes per direction = n_lanes.
+    drive_side: str = "right"            # "right" | "left" -- which side the carriageway sits on
+    custom_network_directed: bool = False  # road_network="custom": build from the document's
+                                         # `directed_edges` layer (one-way flags, per-direction lane
+                                         # counts, shape polylines) instead of the undirected
+                                         # `edges` array, then trim to the largest strongly
+                                         # connected component. Without it, everything netimport.py
+                                         # and osm.py extract about one-way streets is discarded.
 
     def derive(self, label: str, n: int = 32) -> bytes:
         return hashlib.sha256(f"{self.seed}|{label}".encode()).digest()[:n]
@@ -1648,10 +2257,35 @@ def _parse_rsu_coords(s: str) -> list:
     return out
 
 
-def _parse_custom_network(s) -> tuple[list, list]:
+def _parse_custom_network(s, *, directed: bool = False) -> tuple[list, list]:
     """Parse + sanity-check the custom_network JSON -> (nodes, edges). Raises ValueError with a
     design-actionable message (this is the feedback loop for AI/user map design). Accepts an
-    already-parsed dict too (tool layers sometimes hand the object through)."""
+    already-parsed dict too (tool layers sometimes hand the object through).
+
+    `directed=False` (the default, and what `road_network="custom"` did unconditionally until
+    2026-08-31) reads ONLY the undirected `edges` array, so a reader that predates the richer schema
+    sees exactly the old bidirectional graph. That default is right for backward compatibility and
+    wrong as the only option: `osm.network_document` also writes a `directed_edges` layer carrying
+    one record per LEGAL DIRECTION with its own one-way flag, per-direction lane count and shape
+    polyline, and discarding it threw away everything `netimport.py`'s 670 lines and `osm.py`'s tag
+    parsing extract. Measured on the real Ingolstadt extract (`osm_to_network(attrs=True)`): the
+    document carries **627 directed records** with lane counts 1..3 and `oneway_share` 0.28, and the
+    `CustomNetwork` the engine built from that same document reported `directed=False`, **0** one-way
+    edges and **0** lane-specified edges -- the pre-change model, on the only path a user can take.
+
+    `directed=True` (`custom_network_directed`) builds from that layer instead, then trims to the
+    largest strongly connected component -- which a bbox-clipped import needs, because clipping
+    leaves nodes you can enter and never leave, and `CustomNetwork` refuses a directed map that is
+    not strongly connected rather than stranding trips inside it. Same document, same measurement:
+    **326 nodes / 610 edges, `directed=True`, 160 one-way, 385 lane-specified.**
+
+    What is still NOT consumed, stated rather than implied: `shape` polylines pass through
+    `edges_from_directed` and ARE honoured, but `signal_nodes` is ignored -- the engine's signals
+    come from `cfg.traffic_lights` on a grid. Wiring it up is not a one-liner and must not be done
+    carelessly: `largest_strong_component` REMAPS node indices and returns only counts, not the
+    remap, so a consumer that indexed the original `signal_nodes` into the trimmed graph would
+    signalise the wrong junctions. `buildings` is unaffected -- polygons in metres, not indices.
+    """
     if isinstance(s, dict):
         doc = s
     else:
@@ -1664,7 +2298,24 @@ def _parse_custom_network(s) -> tuple[list, list]:
             raise ValueError(f"custom_network is not valid JSON: {e}") from None
     if not isinstance(doc, dict) or "nodes" not in doc or "edges" not in doc:
         raise ValueError('custom_network JSON must be an object with "nodes" and "edges"')
-    return doc["nodes"], doc["edges"]
+    if not directed:
+        return doc["nodes"], doc["edges"]
+    directed_edges = doc.get("directed_edges")
+    if not directed_edges:
+        raise ValueError(
+            'custom_network_directed=true but the document carries no "directed_edges" layer. '
+            'Produce one with `python -m scms_sim_ref.mock_pipeline.netimport --city <name> '
+            '--out map.json` (or osm.py with --attrs), or set custom_network_directed=false to use '
+            'the undirected "edges" array.')
+    from .roads import edges_from_directed, largest_strong_component
+    nodes, edges, info = largest_strong_component(doc["nodes"], edges_from_directed(directed_edges))
+    if len(nodes) < 2 or not edges:
+        raise ValueError(
+            f"the directed layer has no drivable strongly-connected core: "
+            f"{len(doc['nodes'])} nodes and {len(directed_edges)} directed edges reduced to "
+            f"{len(nodes)} nodes / {len(edges)} edges. A bbox clip that cuts every return path "
+            f"leaves a map on which no round trip exists.")
+    return nodes, edges
 
 
 def _parse_buildings(s) -> list:
@@ -2020,7 +2671,25 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
                          f"(got {cfg.road_network!r})")
     if cfg.road_network == "custom":
         from .roads import CustomNetwork
-        CustomNetwork(*_parse_custom_network(cfg.custom_network))   # full design validation
+        CustomNetwork(*_parse_custom_network(               # full design validation
+            cfg.custom_network, directed=cfg.custom_network_directed))
+    elif cfg.custom_network_directed:
+        raise ValueError(f"custom_network_directed needs road_network='custom' (got "
+                         f"{cfg.road_network!r}): it selects which layer of the custom-network "
+                         f"DOCUMENT to build from, and no other topology has one")
+    from .roads import DRIVE_SIDES
+    if cfg.drive_side not in DRIVE_SIDES:
+        raise ValueError(f"drive_side must be one of {sorted(DRIVE_SIDES)} (got {cfg.drive_side!r})")
+    if cfg.directed_lanes:
+        # `linear` builds no network object at all (vehicles drive straight lines), so there is no
+        # graph to give carriageways to. Refusing here beats a flag that silently does nothing --
+        # the whole class of defect this field exists to close.
+        if cfg.road_network == "linear":
+            raise ValueError("directed_lanes needs a routed road network (grid, ring, spider or "
+                             "custom): road_network='linear' has no graph to offset off")
+        if not cfg.traffic_flow:
+            raise ValueError("directed_lanes needs traffic_flow=true: carriageway offsets apply to "
+                             "ROUTED trips, and a fixed-fleet vehicle drives a straight line")
     if cfg.road_network in ("spider", "custom") and not cfg.traffic_flow:
         raise ValueError(f"road_network={cfg.road_network!r} needs traffic_flow=true: fixed-fleet "
                          f"vehicles drive straight lines, which would put them off the designed "
@@ -2084,12 +2753,13 @@ def _validate_plugins(cfg) -> None:
     unknown = sorted(set(cfg.plugins) - set(_api_registry.SLOTS))
     if unknown:
         raise ValueError(f"plugins: unknown slot(s) {unknown}; known: {list(_api_registry.SLOTS)}")
-    unsupported = sorted(s for s in cfg.plugins if s != "channel_model" and cfg.plugins[s])
+    unsupported = sorted(s for s in cfg.plugins if s not in _CONSUMED_SLOTS and cfg.plugins[s])
     if unsupported:
         # Say what is not there rather than accept it and silently ignore it -- an ignored plugin
         # section is exactly the "replays as a different run with exit code 0" failure D4 closes.
         raise ValueError(f"plugins: slot(s) {unsupported} are declared but not yet consumed by this "
-                         f"engine (phase 1 ships the channel seam only); remove them or upgrade")
+                         f"engine (consumed: {sorted(_CONSUMED_SLOTS)}); remove them or upgrade")
+    _validate_detector_plugins(cfg)
     ref, params = _channel_selection(cfg)
     _channel_conformance(cfg)          # reject a bad `conformance` mode HERE, not at step 0
     cls, how, _iv, _shape = _api_registry.resolve("channel_model", ref)
@@ -2109,6 +2779,48 @@ def _validate_plugins(cfg) -> None:
         getattr(cls, "validate_params")(params)
 
 
+#: Plugin slots this engine actually CONSUMES. A declared-but-unconsumed slot is refused rather than
+#: ignored -- an ignored plugin section replays as a different run with exit code 0, which is the
+#: exact failure the lock exists to prevent.
+_CONSUMED_SLOTS = frozenset({"channel_model", "check", "fusion"})
+
+
+def _validate_detector_plugins(cfg) -> None:
+    """Shape + params validation for the `check` / `fusion` slots, at CONFIG time.
+
+    Fail-fast with the plugin's own message, before step 0 and before any output directory exists.
+    The suite is not CONSTRUCTED here -- construction happens once inside `run_pipeline`, because a
+    plugin instance is a per-run object and the GUI/copilot validate configs they never run.
+    """
+    checks = [(r, p, g) for r, p, _mode, g in _checks_selection(cfg, station_types=True, denm=True)]
+    fref, fparams, fgate = _fusion_selection(cfg)
+    columns: dict = {}
+    for slot, entries in (("check", checks), ("fusion", [(fref, fparams, fgate)])):
+        for order, (ref, declared, sgate) in enumerate(entries):
+            cls, how, _iv, _shape = _api_registry.resolve(slot, ref)
+            _assert_not_hijacked(slot, ref, cls)
+            builtin = how == "builtin" and _api_registry.is_builtin(slot, cls)
+            if not builtin:
+                # The source gate runs at CONFIG time too, so `--check-config`, the GUI's validation
+                # pass and the copilot refuse a frame-walking plugin without building a run.
+                _srcgate.gate(slot, ref, cls, mode=sgate)
+            if builtin:
+                _builtin_params(cls, cfg, declared, slot, ref)
+            else:
+                _plugin_params(cls, declared, slot, ref)
+            if slot == "check":
+                # The duplicate-column guard, at CONFIG time as well as at load: `--check-config`,
+                # the GUI and the copilot must refuse a collision without building a suite. Both
+                # feature gates are open here (`_checks_selection` above), so this grades the widest
+                # vector the config could produce.
+                _claim_column(columns, ref, order,
+                              _api_registry.plugin_id_of(cls, _fallback_pid(ref)),
+                              str(getattr(cls, "reason_code", "")), builtin)
+            own = inspect.getattr_static(cls, "validate_params", None)
+            if isinstance(own, (classmethod, staticmethod)):
+                getattr(cls, "validate_params")(declared)
+
+
 # tuple-typed config fields -- JSON has no tuples, so lists are coerced back on load
 _TUPLE_FIELDS = ("attacker_ids", "attack_types")
 
@@ -2123,7 +2835,7 @@ def _field_group(name: str) -> str:
                       "gap_acceptance", "car_following", "veh_length", "od_", "boundary",
                       "traffic_flow", "duration", "max_total", "nominal_speed", "state_prune", "vru_")),
         ("Network", ("road_network", "grid", "custom_network", "traffic_lights", "light_cycle",
-                     "arterial", "local_speed")),
+                     "arterial", "local_speed", "directed_lanes", "drive_side")),
         ("Scenario events", ("events",)),
         ("Plugins", ("plugins",)),
         ("Messages", ("denm",)),
@@ -2150,6 +2862,7 @@ _ENUM_OPTIONS = {
     "radio_model": list(_api_registry.builtin_names("channel_model")),
     "radio_env": ["urban", "highway"],
     "road_network": ["linear", "grid", "ring", "spider", "custom"],
+    "drive_side": ["right", "left"],
     "demand_profile": ["uniform", "rush", "night"],
     "od_model": ["uniform", "gravity"],
     "fleet": ["mixed", *VEHICLE_TYPES],
@@ -2240,6 +2953,14 @@ _FIELD_META = {
                            "or a fully custom node/edge map (see custom_network)"),
     "custom_network": dict(h='Custom map JSON {"nodes":[[x,y]...metres],"edges":[[a,b]...]} — any '
                              'connected road graph (AI/user-designed); used when road_network=custom'),
+    "custom_network_directed": dict(h="Build the custom map from its directed_edges layer (one-way "
+                                      "flags, per-direction lanes, shape polylines) instead of the "
+                                      "undirected edges array, trimmed to the largest strongly "
+                                      "connected component. Needs road_network=custom"),
+    "directed_lanes": dict(h="Give each direction of travel its own carriageway, offset sideways "
+                             "off the road centreline (lanes per direction = n_lanes). Removes "
+                             "head-on overlaps; needs a routed network and traffic_flow"),
+    "drive_side": dict(h="Which side of the centreline a direction's carriageway sits on"),
     "events": dict(h='Scenario timeline JSON: [{"t":s,"type":"demand|weather|close_edge|attack_wave",'
                      '...}] — mid-run demand surges, weather fronts, road closures, attack waves'),
     "grid_w": dict(h="Grid columns (grid) / number of intersections (ring)", lo=2, hi=40),
@@ -2367,7 +3088,12 @@ _FIELD_META = {
     "plugins": dict(h="Component plugins to ACTIVATE, as {slot: {ref, params}}. `ref` resolves "
                       "through the built-in registry, an installed entry point, then a dotted path "
                       "'package.module:Class'. Empty (the default) = built-ins only, byte-identical. "
-                      "Example: {\"channel_model\": {\"ref\": \"geometric\"}}"),
+                      "Example: {\"channel_model\": {\"ref\": \"geometric\"}}. A check/fusion entry "
+                      "also takes conformance:'off'|'required' and source_gate:'on'|'off'; "
+                      "source_gate scans the plugin's own source for frame walking, gc reflection "
+                      "and engine-internal imports and refuses them by default (a guard rail, NOT a "
+                      "sandbox -- an in-process plugin is TRUSTED code; see "
+                      "docs/realism/DETECTOR-PLUGIN.md section 2)"),
 }
 
 
@@ -2425,14 +3151,34 @@ def _plugin_schema(cfg) -> dict:
         if slot not in _api_registry.SLOTS or not plugins[slot]:
             continue
         try:
-            ref = (_channel_selection(cfg)[0] if slot == "channel_model"
-                   else str(plugins[slot].get("ref")))
-            cls, _how, _iv, _shape = _api_registry.resolve(slot, ref)
+            refs = _declared_refs(cfg, slot)
         except Exception:            # a schema query must never be the thing that fails a run
             continue
-        for name, fs in sorted(_plugin_config_fields(cls).items()):
-            extra[f"plugins.{slot}.{name}"] = fs.to_schema(group="Plugins")
+        for ref in refs:
+            try:
+                cls, how, _iv, _shape = _api_registry.resolve(slot, ref)
+            except Exception:
+                continue
+            if how == "builtin" and _api_registry.is_builtin(slot, cls):
+                # A BUILT-IN's knobs are already top-level `PipelineConfig` fields with their own
+                # schema entries; emitting them a second time under `plugins.` would give the GUI two
+                # widgets for one number, which is the drift this seam exists to remove.
+                continue
+            for name, fs in sorted(_plugin_config_fields(cls).items()):
+                extra[f"plugins.{slot}.{name}"] = fs.to_schema(group="Plugins")
     return extra
+
+
+def _declared_refs(cfg, slot: str) -> tuple:
+    """Every ref the config declares for one slot, in declared order."""
+    if slot == "channel_model":
+        return (_channel_selection(cfg)[0],)
+    if slot == "check":
+        return tuple(r for r, _p, _c, _g in _checks_selection(cfg, station_types=True, denm=True))
+    if slot == "fusion":
+        return (_fusion_selection(cfg)[0],)
+    sel = cfg.plugins.get(slot)
+    return (str(sel.get("ref")),) if isinstance(sel, dict) and sel.get("ref") else ()
 
 
 def _plugin_config_fields(cls) -> dict:
@@ -2537,11 +3283,39 @@ GAP_YIELD_HOOK = None
 
 def run_pipeline(cfg: PipelineConfig) -> RunResult:
     validate_config(cfg)
+    # THE CONFIG SNAPSHOT. Taken after validation (which is the last thing allowed to touch `cfg`)
+    # and deep-copied, so a plugin mutating a nested container -- `cfg.plugins[...]["params"][k]` --
+    # is caught as well as a scalar write. This dict, not the live object, is what the manifest
+    # records, and `_assert_config_unmoved` compares against it before step 0 and again before the
+    # manifest is written. See `ReadOnlyConfig` for why the snapshot, not the view, is the half that
+    # actually holds.
+    _cfg0 = copy.deepcopy(_config_dict(cfg))
     _ABORT["flag"] = False                            # fresh per run (module state is not reentrant)
     # CLAIMED BY IDENTITY, not merely consumed: a drift accepted by one replay is recorded in THAT
     # run's manifest and in no other, even when the drifted config is built and never run.
     _drift_allowed = _claim_drift_record(cfg)
-    rng = random.Random(cfg.seed)
+    # WHOLE-RUN INTEGRITY MONITORING, armed exactly when the config declares plugins -- the only way
+    # third-party code enters a run. Two instruments, and they catch different things:
+    #
+    #   * `_run_sentinel` snapshots the identity of the RNG primitives, the engine's own gates
+    #     (`check_outcome`, `srcgate.gate`, `_attest`, `_data_digest`, `_write_manifest`, ...) and the
+    #     objects the plugin boundary is made of, and re-compares them just before the manifest is
+    #     written. This is what sees a `random.Random` class rebind installed at step 30 -- an attack
+    #     that passes ALL FOUR of C3's traps, because conformance exercises a bounded window and a
+    #     fixed-window contract test can only certify behaviour it observed. Lengthening the window
+    #     is not the fix; monitoring that holds for the whole run is.
+    #   * `rng` is a `WitnessedRandom` when armed: bit-identical to `random.Random` (only `random()`
+    #     and `getrandbits()` are overridden, each adding one integer increment), but it counts
+    #     Mersenne-Twister words, so at the end of the run the engine can PROVE its own stream is
+    #     exactly as far along as the draws it made would put it. That catches the second form --
+    #     a `random.Random.random` rebind, which leaves every generator STATE a snapshot could
+    #     compare perfectly intact while silently supplying different numbers.
+    #
+    # Neither is a sandbox and neither is evidence of honesty: reading the oracle through a frame
+    # walk moves nothing on either list. See `api/integrity.py` and DETECTOR-PLUGIN.md section 2.
+    _armed = _integrity.armed_for(cfg)
+    _run_sentinel = _integrity.Sentinel(armed=_armed)
+    rng = _integrity.engine_random(cfg.seed, armed=_armed)
     wmult = WEATHER_MULT.get(cfg.weather, 1.0)
     la1, la2 = LinkageAuthority(1), LinkageAuthority(2)
     pca, ra = PseudonymCA(), RegistrationAuthority()
@@ -2581,6 +3355,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     # two layers are registered); a synthetic map has none and falls back to the canyon density.
     _geo_buildings = _parse_buildings(cfg.custom_network) if cfg.road_network == "custom" else []
     chan, chan_provenance = build_channel(cfg, buildings=_geo_buildings, dt=cfg.dt)
+    # A construction-time write to `env["config"]` is fatal HERE, before step 0 -- which is where
+    # every plugin failure belongs (PLUGIN-ARCH 3.2), and is early enough that no output directory
+    # has been created.
+    _assert_config_unmoved(_cfg0, cfg, "while constructing the channel plugin")
     _chan_caps = chan.capabilities()
     _chan_additive = LOSS_ADDITIVE_LEGACY in _chan_caps
     _chan_batch = not hasattr(chan, "evaluate_link")
@@ -2633,7 +3411,17 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         net = CustomNetwork(*spider_graph(cfg.grid_w, cfg.grid_h, cfg.grid_block_m))
     elif cfg.road_network == "custom":
         from .roads import CustomNetwork
-        net = CustomNetwork(*_parse_custom_network(cfg.custom_network))
+        net = CustomNetwork(*_parse_custom_network(cfg.custom_network,
+                                                   directed=cfg.custom_network_directed))
+    # ---- OPT-IN directed carriageways -------------------------------------------------------- #
+    # `enable_directed_lanes()` gives each direction of travel its own carriageway, offset sideways
+    # off the graph centreline, so two vehicles driving opposite ways down one street no longer
+    # occupy the same polyline. Default OFF -> not called -> no offsets, no new state, every pinned
+    # golden byte-identical. This call is the ONLY thing that stood between the measured
+    # head-on-overlap result and a user being able to reproduce it from a config.
+    if cfg.directed_lanes and net is not None:
+        net.enable_directed_lanes(lane_width_m=cfg.lane_width_m, drive_side=cfg.drive_side,
+                                  lanes_per_dir=cfg.n_lanes)
     events = _parse_events(cfg.events)                     # validated timeline (possibly empty)
 
     # ---- scenario-event timeline (deterministic mid-run dynamics; empty -> byte-identical) ----
@@ -3173,50 +3961,39 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # back. It is caught by the denmPlausibility detector.
         return cx, cy, cs, ch
 
-    Z = cfg.detector_z_threshold        # residual must exceed ~this x the broadcast uncertainty to count
-    MIN_CONSEC = cfg.detector_min_consec  # consecutive violations required before a reason fires
-
-    def detectors(ref, cx, cy, cs, ch, t, conf) -> dict:
-        """Confidence-normalized residuals (detnorm ~1 at the firing threshold). A single GNSS
-        outlier gives a one-off spike but is filtered by the streak gate + not advancing the ref."""
-        det = {d: 0.0 for d in ("positionSpeedInconsistency", "positionJump", "headingInconsistency",
-                                "staleOrReplay", "constantPositionFrozen", "implausibleAcceleration")}
-        px, py, ps, ph, pt = ref
-        dtt = max(1e-6, t - pt)
-        disp = math.hypot(cx - px, cy - py)
-        tol = max(conf, 0.5 * cfg.consistency_threshold_m)     # uncertainty scale
-        avg_v = 0.5 * (cs + ps)                                # avg over the interval (accel/decel-safe)
-        jerk_slack = 0.3 * abs(cs - ps) * dtt                  # extra tolerance for stop-and-go jerk
-        det["positionSpeedInconsistency"] = max(0.0, abs(disp - avg_v * dtt) - jerk_slack) / (Z * tol)
-        det["positionJump"] = disp / (avg_v * dtt + Z * tol + cfg.consistency_threshold_m)
-        det["implausibleAcceleration"] = (abs(cs - ps) / dtt) / cfg.max_accel_mps2
-        # headingInconsistency is computed in the loop over a SHORT (one-step) baseline, not this
-        # lagged reference -- a 1.5 s baseline spans road turns and reads them as heading lies.
-        if cx == px and cy == py and cs > 0.5:
-            det["constantPositionFrozen"] = 1.5
-            det["staleOrReplay"] = 1.2
-        return det
-
-    DET_KEYS = ("positionSpeedInconsistency", "positionJump", "headingInconsistency",
-                "staleOrReplay", "constantPositionFrozen", "implausibleAcceleration",
-                "sybilCoLocation", "acceptanceRangeThreshold", "beaconFrequency",
-                "signatureVerification", "certValidity", "mapOffRoad")
-    # vruImpersonation is added ONLY when station types are in play (VRUs or the opt-in impersonation
-    # attack). Otherwise no beacon declares "vru", the detector is always 0.0, and appending its
-    # detnorm_* to every report would perturb the DEFAULT digest -- so it is gated here to stay
-    # byte-identical, mirroring how the station_type report field is gated on _emit_station_type.
-    if _emit_station_type:
-        DET_KEYS = DET_KEYS + ("vruImpersonation",)
-    # denmPlausibility is added ONLY when the DENM layer is enabled. Otherwise no DENM is ever received,
-    # the detector is always 0.0, and appending its detnorm_* to every report would perturb the DEFAULT
-    # digest -- so it is gated here to stay byte-identical, mirroring the vruImpersonation gate above.
-    if _denm_enabled:
-        DET_KEYS = DET_KEYS + ("denmPlausibility",)
-    # SOFT features: carried in the fusion fingerprint (detnorm_*) for ML, but NEVER trigger a report
-    # on their own -- a constant-velocity tracker false-positives on curves, so it must stay soft.
-    SOFT_KEYS = ("kalmanConsistency",)
-    MOTION_KEYS = ("positionSpeedInconsistency", "positionJump", "headingInconsistency",
-                   "constantPositionFrozen", "implausibleAcceleration")
+    # ---- DETECTION LAYER: resolved and constructed ONCE, before step 0 ---------------------------
+    # PLUGIN-ARCHITECTURE.md 2.2/8.3. The nine inline detectors and the streak/report_prob block that
+    # used to live here are now `Check` and `Fusion` implementations on the registry
+    # (`mock_pipeline/detectors.py`), and this is where the run's suite is assembled. Everything that
+    # was digest-bearing about the inline form is preserved BY CONSTRUCTION rather than by care:
+    #
+    #   * `DET_KEYS` is `suite.keys` -- the checks' columns in REGISTRATION order, which is the order
+    #     the inline block evaluated them in, including the two gated appends;
+    #   * `SOFT_KEYS` is `suite.soft_keys`;
+    #   * `MOTION_KEYS` (the VRU suppression list) is `suite.vru_suppressed`, DECLARED per check
+    #     (`vru_suppressed = True`) instead of restated as a fourth hand-maintained tuple.
+    #
+    # A third party's check contributes `detnorm_x_<plugin_id>_<code>` and cannot collide with any of
+    # these. Every failure -- an unresolvable ref, a bad param, a reserved capability -- is fatal
+    # HERE, before step 0, and must not take the SIGINT path that finalises a valid partial manifest.
+    _LEGACY_RNG["rng"] = rng
+    try:
+        suite = build_checks(cfg, station_types=_emit_station_type, denm=_denm_enabled)
+    finally:
+        _LEGACY_RNG["rng"] = None
+    DET_KEYS = suite.keys
+    SOFT_KEYS = suite.soft_keys
+    _DET_ZERO = suite.zero
+    _CAM_PLAN, _DENM_PLAN = suite.cam_plan, suite.denm_plan
+    _VRU_SUPPRESSED, _SIG_SUPPRESSED = suite.vru_suppressed, suite.sig_suppressed
+    _fusion, _fusion_params, _fusion_rng = suite.fusion, suite.fusion_params, suite.fusion_rng
+    _fusion_decide = _fusion.decide
+    _wrap_state = _api_detect.NamespacedState
+    #: None for the BUILT-IN fusion, which reads and writes `streak` on the raw per-link dict and
+    #: whose access to it is what every pinned golden was recorded on. A THIRD-PARTY fusion gets the
+    #: same `NamespacedState` the check slot has always handed a third-party check -- one call
+    #: earlier, on the same dict.
+    _fusion_wrap = suite.fusion_wrap
     touched_subjects: set[str] = set()
 
     def trusted(reporter_digest: str) -> bool:
@@ -3235,23 +4012,31 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
 
     def file_report(t, reporter_digest, subject_digest, subject_veh, reasons, det, conf,
                     cx, cy, px, py, malicious, sig_valid=True, station_type="vehicle",
-                    rssi_dbm=None):
+                    rssi_dbm=None, score=None, score_norm=None):
+        # `score` / `score_norm` come from the FUSION's `ReportDecision` on the two detection paths
+        # (that is what makes the summary scores the fusion layer's statement rather than the report
+        # writer's); the collusion path, which fabricates its own vector with no fusion involved,
+        # leaves them None and keeps the historical derivation.
         counters["report"] += 1
         rid = f"rpt_{counters['report']:05d}"
         delay = rng.uniform(0.0, cfg.net_delay_max)
         rep_veh = digest_to_vehicle[reporter_digest]
+        if score is None:
+            score = det.get(reasons[0], 1.0)
+        if score_norm is None:
+            score_norm = max(det.values()) if det else 1.0
         row = R.MaReport(
             report_id=rid, ingest_time=round(t + delay, 3), detection_time=t, generation_time=t,
             reporter_cert_digest=reporter_digest, subject_cert_digest=subject_digest,
             reason_codes=reasons,
-            detector_outputs=[{"check_id": reasons[0], "score": round(det.get(reasons[0], 1.0), 3),
+            detector_outputs=[{"check_id": reasons[0], "score": round(score, 3),
                                "verdict": "fail"}],
             cert_validity={"sig_valid": True, "not_expired": True, "not_revoked": True, "chain_ok": True},
             evidence_msg_refs=[f"{rid}-m"],
             st_bbox=[min(cx, px), min(cy, py), max(cx, px), max(cy, py)],
             st_tstart=t, st_tend=t, duplicate_flag=False).to_dict()
-        row["detector_score"] = round(det.get(reasons[0], 1.0), 3)
-        row["detector_score_norm"] = round(max(det.values()) if det else 1.0, 3)
+        row["detector_score"] = round(score, 3)
+        row["detector_score_norm"] = round(score_norm, 3)
         row["subject_pos_confidence"] = round(conf, 3)
         row["cert_crl_status"] = "active"
         row["sig_valid"] = bool(sig_valid)
@@ -3916,6 +4701,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                           [rx.vid for rx in receivers if not enforced(rx, t)], wx_loss,
                           _chan_env_ro)
         chan.begin_step(frame)              # advance per-step state EXACTLY ONCE
+        suite.begin_step(step)              # detector RNG namespaces: same discipline, same reason
         bcell: dict = {}
         for bi, b in enumerate(broadcasts):
             bcell.setdefault((int(b["x"] // rng_cell), int(b["y"] // rng_cell)), []).append(bi)
@@ -4045,34 +4831,47 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                         continue                                # packet dropped on the channel
                 if b.get("msg_type") == "denm":
                     # DENM (event message): the receiver checks whether the announced brake/stationary
-                    # hazard CORROBORATES the sender's own observed kinematics. The DENM carries the
-                    # sender's claimed speed (its own CAM state); a genuine emergency-brake/stationary
-                    # sender is slow (score < 1 -> plausible), while a phantom hazard from a cruising
-                    # sender scores above 1 -> denmPlausibility fires. This reads MA-VISIBLE evidence
-                    # only (the claimed event + the sender's claimed speed); it never consults the oracle
-                    # real/fake flag, and benign DENMs (low claimed speed) never trip it -> no false
-                    # revocations. An unverifiable (bad-sig) DENM carries no trustworthy content -> skip.
-                    if b["sig_ok"]:
-                        denm_speed = max(0.0, b["cs"])
-                        # Audit GAP #5: the plausibility bound is now EVENT-TYPE aware. An
-                        # emergencyElectronicBrakeLight sender that has truly braked is at/below the
-                        # post-brake bound (DENM_BENIGN_MAX_SPEED_MPS); one still MOVING NORMALLY above
-                        # it announces a brake its own kinematics contradict, EVEN below the generic
-                        # 6 m/s line -- closing the slow-in-congestion phantom-brake gap. A stationary/
-                        # other hazard keeps the generic bound. Benign DENMs (brake speed <= the benign
-                        # max with margin, stationary < 0.5) stay below their bound -> never flagged.
-                        thresh = (cfg.denm_benign_max_speed_mps + 0.5  # brake bound DERIVED just above benign
-                                  if b.get("event_type") == "emergencyElectronicBrakeLight"
-                                  else cfg.denm_implausible_speed_mps)
-                        score = denm_speed / thresh
-                        if score >= 1.0 and rng.random() <= cfg.report_prob:
-                            det = {k: 0.0 for k in DET_KEYS}
-                            det["denmPlausibility"] = score
+                    # hazard CORROBORATES the sender's own observed kinematics. Scored by the checks
+                    # that declare `msg_types` containing "denm" (the built-in `denmPlausibility`),
+                    # and decided by the fusion's event arm -- a one-shot claim has no history to
+                    # streak over. An unverifiable (bad-sig) DENM carries no trustworthy content, so
+                    # it is not scored at all.
+                    if b["sig_ok"] and _DENM_PLAN:
+                        # An event message has no per-link history of its own. The sender's CAM
+                        # state is used when this receiver already holds one (so a stateful check
+                        # sees continuity); otherwise a throwaway dict, NOT a new `last_claimed`
+                        # entry -- creating one here would change what the pruner walks.
+                        st_d = last_claimed.get((rx.vid, b["digest"]))
+                        if st_d is None:
+                            st_d = {"h": [], "streak": {}, "touch": step}
+                        obs = Observation(
+                            b["digest"], b["station_type"], b["cx"], b["cy"], b["cs"], b["ch"],
+                            b["conf"], b["cg"], b["msg_count"], "denm", b.get("event_type"),
+                            True, b["cvf"], b["cvt"],
+                            rxx, rxy, rx_reach, rssi_dbm, link_meta[li].link_state, t, cfg.dt,
+                            True, b["cx"], b["cy"], b["cs"], b["ch"], t,
+                            b["cx"], b["cy"], b["cs"], b["ch"], t,
+                            _offroad(b["cx"], b["cy"]),
+                            types.MappingProxyType(
+                                {"cell_cert_count": cells[(round(b["cx"] / cfg.sybil_cell_m),
+                                                           round(b["cy"] / cfg.sybil_cell_m),
+                                                           int(b["ch"] // 45) % 8)],
+                                 "cbr": geo_cbr}))
+                        det = _DET_ZERO.copy()
+                        for _col, _ev, _prm, _rn, _wrap, _prec in _DENM_PLAN:
+                            _v = _ev(obs, st_d if _wrap is None else _wrap_state(st_d, _wrap),
+                                     _prm, _rn)
+                            det[_col] = _v if _prec is None else _round_score(_v, _prec, _col)
+                        decision = _fusion_decide(
+                            det, st_d if _fusion_wrap is None else _wrap_state(st_d, _fusion_wrap),
+                            obs, _fusion_params, _fusion_rng)
+                        if decision is not None:
                             file_report(t, reporter_digest, b["digest"], b["veh"],
-                                        ["denmPlausibility"], det, b["conf"],
+                                        list(decision.reason_codes), det, b["conf"],
                                         b["cx"], b["cy"], b["cx"], b["cy"], malicious=False,
                                         sig_valid=True, station_type=b["station_type"],
-                                        rssi_dbm=rssi_dbm)
+                                        rssi_dbm=rssi_dbm, score=decision.top_score,
+                                        score_norm=decision.score_norm)
                     continue
                 tx, digest, cx, cy, cs, ch, conf = (b["veh"], b["digest"], b["cx"], b["cy"],
                                                     b["cs"], b["ch"], b["conf"])
@@ -4081,8 +4880,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 if st is None:
                     st = {"h": [(cx, cy, cs, ch, t)], "streak": {}, "touch": step}
                     last_claimed[key] = st
-                    det = {k: 0.0 for k in DET_KEYS}
-                    ref = st["h"][0]
+                    # First sight: there is no history, so every history-bearing check scores 0.0 and
+                    # the reference IS this claim (which is also what the VRU jump arm compares to).
+                    ref = prev = st["h"][0]
+                    first_sight = True
                 else:
                     st["touch"] = step
                     h = st["h"]
@@ -4095,56 +4896,45 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                             ref = f
                         else:
                             break
-                    det = detectors(ref, cx, cy, cs, ch, t, conf)
-                    # headingInconsistency over a ONE-STEP baseline (most recent prior fix): turns are
-                    # negligible over one step, so a moving vehicle's bearing matches its claimed heading.
+                    # The ONE-STEP baseline (most recent prior fix) the heading check uses: turns are
+                    # negligible over one step, so a moving vehicle's bearing matches its heading.
                     prev = h[-1]
-                    dprev = math.hypot(cx - prev[0], cy - prev[1])
-                    if cs > 3.0 and (t - prev[4]) <= 2.0 * cfg.dt and dprev > max(5.0, 2.5 * conf):
-                        bearing = math.degrees(math.atan2(cy - prev[1], cx - prev[0])) % 360.0
-                        det["headingInconsistency"] = _ang_diff(ch, bearing) / cfg.heading_threshold_deg
+                    first_sight = False
                     h.append((cx, cy, cs, ch, t))
                     while len(h) > 1 and t - h[0][4] > cfg.detector_lag_s + 2 * cfg.dt:
                         h.pop(0)
-                # radio-dependent detectors (need the receiver position + per-message metadata)
-                det["sybilCoLocation"] = cells[(round(cx / cfg.sybil_cell_m), round(cy / cfg.sybil_cell_m),
-                                                int(ch // 45) % 8)] / cfg.sybil_min_certs
-                # a receiver only physically hears in-range transmitters, so a claim placing the
-                # sender far BEYOND THIS RECEIVER'S range is implausible (excess distance / tolerance).
-                # Use rr (the actual per-receiver range used for reception above), not the global
-                # radio_range_m: an RSU with a longer rsu_range_m legitimately hears distant honest
-                # vehicles and must not flag them as out-of-range. Under radio_model="geometric" the
-                # reach is NOT rr at all -- it is the link-budget cap the reception loop actually
-                # searched -- so the bound follows it there. Keeping rr would flag every honest
-                # long LOS link (which that model legitimately delivers) as an impossible claim.
-                # This is now the model's DECLARED reach (`reach_m_for`), which is what makes it a
-                # declared input rather than a leak -- and what stops a model that understates its
-                # reach from silently making this detector wrong for every honest long link (C8).
-                art_reach = rx_reach
-                det["acceptanceRangeThreshold"] = max(0.0, math.hypot(cx - rxx, cy - rxy)
-                                                      - art_reach) / cfg.art_max_m
-                det["beaconFrequency"] = b["msg_count"] / cfg.freq_max
-                det["staleOrReplay"] = max(det.get("staleOrReplay", 0.0), (t - b["cg"]) / cfg.stale_max_s)
-                det["mapOffRoad"] = _offroad(cx, cy) / cfg.offroad_tol_m
-                det["certValidity"] = 1.5 if (t > b["cvt"] + 1.0 or t < b["cvf"] - 1.0) else 0.0
-                # soft constant-velocity (alpha-beta) consistency residual -> fusion feature only
-                kf = st.get("kf")
-                if kf is None:
-                    st["kf"] = (cx, cy, 0.0, 0.0, t)
-                    det["kalmanConsistency"] = 0.0
-                else:
-                    ex, ey, evx, evy, et = kf
-                    dtk = max(1e-3, t - et)
-                    predx, predy = ex + evx * dtk, ey + evy * dtk
-                    rxk, ryk = cx - predx, cy - predy
-                    det["kalmanConsistency"] = math.hypot(rxk, ryk) / (2 * cfg.consistency_threshold_m + conf)
-                    st["kf"] = (predx + 0.5 * rxk, predy + 0.5 * ryk,
-                                evx + 0.3 * rxk / dtk, evy + 0.3 * ryk / dtk, t)
+                # THE FIREWALL (PLUGIN-ARCHITECTURE.md 2.2). Everything a check may see, and nothing
+                # else: the claim as received, this receiver's own position and DECLARED reach, its
+                # PHY's measurement of the frame, the history it already holds for this certificate,
+                # its own HD map evaluated at the CLAIMED position, and aggregate MA-visible context.
+                # `b` itself -- which carries `veh` (a whole Vehicle with .is_attacker/.attack_type),
+                # the sender's TRUE x/y, `falsified` and `ghost` -- never crosses this line.
+                obs = Observation(
+                    digest, b["station_type"], cx, cy, cs, ch, conf, b["cg"], b["msg_count"],
+                    "cam", None, b["sig_ok"], b["cvf"], b["cvt"],
+                    rxx, rxy, rx_reach, rssi_dbm, link_meta[li].link_state, t, cfg.dt,
+                    first_sight, ref[0], ref[1], ref[2], ref[3], ref[4],
+                    prev[0], prev[1], prev[2], prev[3], prev[4],
+                    _offroad(cx, cy),
+                    types.MappingProxyType(
+                        {"cell_cert_count": cells[(round(cx / cfg.sybil_cell_m),
+                                                   round(cy / cfg.sybil_cell_m),
+                                                   int(ch // 45) % 8)],
+                         "cbr": geo_cbr}))
+                # THE SCORE VECTOR, in declared order. `_DET_ZERO` carries every column at 0.0, so a
+                # check that does not apply to this message type scores exactly 0.0 -- which is what
+                # the inline `det = {k: 0.0 for k in DET_KEYS}` did.
+                det = _DET_ZERO.copy()
+                for _col, _ev, _prm, _rn, _wrap, _prec in _CAM_PLAN:
+                    _v = _ev(obs, st if _wrap is None else _wrap_state(st, _wrap), _prm, _rn)
+                    det[_col] = _v if _prec is None else _round_score(_v, _prec, _col)
                 if not b["sig_ok"]:
                     # signature fails -> the content cannot be trusted, so the plausibility detectors
                     # are moot; the receiver only reports the crypto-verification failure itself.
-                    det = {k: 0.0 for k in DET_KEYS}
-                    det["signatureVerification"] = 1.5
+                    # (`signatureVerification` scored itself 1.5 above; this suppresses the rest,
+                    # third-party columns included -- an untrusted frame is untrusted for everyone.)
+                    for _col in _SIG_SUPPRESSED:
+                        det[_col] = 0.0
                 elif b["station_type"] == "vru":
                     # VRU-appropriate plausibility, gated on the SELF-DECLARED station type carried on
                     # the received beacon (an MA-VISIBLE field, NOT the oracle is_vru): pedestrians/
@@ -4154,44 +4944,26 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     # for a VRU-declared beacon. Detectors that are meaningful regardless of station type
                     # stay ON: sybilCoLocation, signatureVerification, certValidity, acceptanceRange-
                     # Threshold (impossible-distance claim), beaconFrequency (flooding/DoS), staleOrReplay.
-                    for _mk in MOTION_KEYS:
-                        det[_mk] = 0.0
-                    det["mapOffRoad"] = 0.0
-                    # The gate above trusts a SELF-DECLARED field, so a moving VEHICLE that declares
-                    # station_type="vru" would otherwise dodge every suppressed detector for free. Close
-                    # it with TWO arms, both keyed on the DECLARED type + MA-VISIBLE claimed kinematics:
-                    #   (1) SPEED arm -- a plausible-VRU beacon claims a few m/s, so a CLAIMED speed
-                    #       above the cyclist bound (VRU_MAX_PLAUSIBLE_SPEED_MPS) is a vehicle. cs is the
-                    #       noise-free broadcast value (NOT a displacement estimate), so GNSS jitter on a
-                    #       slow genuine VRU never inflates it. Catches VruImpersonation (honest driving).
-                    #   (2) POSITION arm (audit GAP #6) -- a genuine VRU moves SMOOTHLY at ~vru speed, so
-                    #       the displacement of its claimed position since the lagged reference implies at
-                    #       most a VRU-grade speed. A declared-VRU whose claimed position JUMPS/teleports
-                    #       implies a speed far above the VRU bound even while it CLAIMS a slow speed (so
-                    #       the speed arm stays quiet). Catches VruPositionSpoof -- the slow-and-position-
-                    #       falsifying impersonator the speed arm alone missed. The tolerance is the VRU
-                    #       speed bound over the interval PLUS the broadcast confidence (Z*conf, which
-                    #       scales with the VRU's own GNSS noise) PLUS a full multipath-outlier magnitude,
-                    #       so GNSS jitter/outliers on a real VRU can NEVER push a genuine VRU to fire.
-                    if "vruImpersonation" in DET_KEYS:
-                        speed_arm = max(0.0, cs) / cfg.vru_max_plausible_speed_mps
-                        dtt_v = max(cfg.dt, t - ref[4])
-                        vru_allow = (cfg.vru_max_plausible_speed_mps * dtt_v
-                                     + Z * max(conf, 0.5 * cfg.consistency_threshold_m)
-                                     + cfg.gps_outlier_mag_m)
-                        jump_arm = math.hypot(cx - ref[0], cy - ref[1]) / max(1e-6, vru_allow)
-                        det["vruImpersonation"] = max(speed_arm, jump_arm)
-                for k in DET_KEYS:
-                    st["streak"][k] = st["streak"].get(k, 0) + 1 if det.get(k, 0.0) >= 1.0 else 0
-                fired = {k: det[k] for k in DET_KEYS if st["streak"].get(k, 0) >= MIN_CONSEC}
-                if not fired:
+                    # The suppression list is DECLARED (`vru_suppressed = True` on each check), not a
+                    # fourth hand-maintained tuple that had to be edited in lockstep with DET_KEYS.
+                    # The gate trusts a SELF-DECLARED field, so a moving VEHICLE that declares
+                    # station_type="vru" would otherwise dodge every suppressed detector for free --
+                    # which is what the `vruImpersonation` check (still scored above, and NOT in the
+                    # suppression list) exists to close.
+                    for _col in _VRU_SUPPRESSED:
+                        det[_col] = 0.0
+                # THE FUSION (layer 2). Streak gate, then the report_prob Bernoulli, then the
+                # most-severe-first ordering -- all of it inside the pluggable component now.
+                decision = _fusion_decide(
+                    det, st if _fusion_wrap is None else _wrap_state(st, _fusion_wrap),
+                    obs, _fusion_params, _fusion_rng)
+                if decision is None:
                     continue
-                if rng.random() > cfg.report_prob:
-                    continue
-                reasons = sorted(fired, key=lambda k: -det[k])
+                reasons = list(decision.reason_codes)
                 file_report(t, reporter_digest, digest, tx, reasons, det, conf,
                             cx, cy, ref[0], ref[1], malicious=False, sig_valid=b["sig_ok"],
-                            station_type=b["station_type"], rssi_dbm=rssi_dbm)
+                            station_type=b["station_type"], rssi_dbm=rssi_dbm,
+                            score=decision.top_score, score_norm=decision.score_norm)
 
         # COLLUSION pass: colluders file fabricated reports against benign victims. In flow mode
         # victims are chosen dynamically (nearby active benign vehicles); in fixed mode from the list.
@@ -4295,6 +5067,21 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             if (step + 1) % cfg.state_prune_every == 0:
                 prune_state(step, active)
 
+    # ---- WHOLE-RUN INTEGRITY: the half a bounded conformance window structurally cannot do ----
+    # Checked the moment the step loop ends, BEFORE a single output file is written, so a run whose
+    # engine was rewritten mid-flight produces no dataset at all rather than a plausible one.
+    #
+    # THE MEASURED ATTACK THIS EXISTS FOR: a `random.Random` class rebind installed at
+    # `frame.step >= 30`. It passes all four of C3's traps, and that is not a hole in the traps --
+    # conformance drives a bounded window of steps and the attack simply waits it out. **A
+    # fixed-window contract suite can only certify behaviour it observed.** These two lines certify
+    # the run.
+    _integrity_words = None
+    if _armed:
+        _run_sentinel.verify("at the END of the run")
+        if hasattr(rng, "verify_stream"):
+            _integrity_words = rng.verify_stream("at the END of the run")["words"]
+
     if _prev_sigint is not None:                      # restore the caller's Ctrl-C behaviour
         try:
             _signal.signal(_signal.SIGINT, _prev_sigint)
@@ -4367,10 +5154,25 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             sorted(gt_denm, key=lambda r: r["denm_id"]))
     data_digest = _data_digest(cfg.out_dir, data_files)
     chan.close()                       # ALWAYS called, including on the SIGINT finalisation path
+    # The manifest is about to claim that THIS config produced THIS data. Check that first: a
+    # mid-run write leaves a dataset that neither the old nor the new value describes, so the honest
+    # outcome is no manifest at all rather than a plausible one nobody can replay.
+    _assert_config_unmoved(_cfg0, cfg, "during the run")
     _write_manifest(cfg, data_files, data_digest,
                     counts=dict(vehicles=len(vehicles), reports=n_reports,
                                 investigations=len(ma_investigations), revoked=len(revoked_vehicles)),
-                    plugins=plugin_block([chan_provenance()], drift=_drift_allowed))
+                    plugins=plugin_block([chan_provenance()] + suite.provenance(),
+                                         drift=_drift_allowed,
+                                         integrity=({"armed": True,
+                                                     "verified_at": ["channel construction",
+                                                                     "check construction",
+                                                                     "fusion construction",
+                                                                     "end of run"],
+                                                     "watched": _run_sentinel.watched,
+                                                     "engine_rng_words": _integrity_words,
+                                                     "ok": True}
+                                                    if _armed else None)),
+                    config_snapshot=_cfg0)
 
     return RunResult(out_dir=cfg.out_dir, n_vehicles=len(vehicles), n_reports=n_reports,
                      n_investigations=len(ma_investigations), n_revoked=len(revoked_vehicles),
@@ -4466,13 +5268,17 @@ STANDARDS_PROFILE = {
 }
 
 
-def _write_manifest(cfg, data_files, data_digest, counts, plugins=None) -> None:
+def _write_manifest(cfg, data_files, data_digest, counts, plugins=None,
+                    config_snapshot=None) -> None:
     manifest = {
         "dataset_version": __version__,
         "build_utc": datetime.now(timezone.utc).isoformat(),   # NOT part of data_digest
         "generator": "scms_sim_ref.mock_pipeline (pre-MOSAIC reference, realistic v2)",
         "seed": cfg.seed,
-        "config": {k: (list(v) if isinstance(v, tuple) else v) for k, v in cfg.__dict__.items()},
+        # The SNAPSHOT taken before step 0, not a late read of the live object. `run_pipeline`
+        # already refuses to get here if the two differ, so this is belt and braces -- but it means
+        # the field that carries the replay contract is never a function of when it was read.
+        "config": _config_dict(cfg) if config_snapshot is None else config_snapshot,
         # ground_truth 2 == ADR 0002: gt_emissions_sample carries true_speed / true_heading.
         # ma_visible is unchanged (no MA-visible field moved), so it stays at 1.
         "schema_versions": {"ma_visible": 1, "ground_truth": 2},
@@ -4730,6 +5536,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="road network model (spider: --grid = arms, --grid-h = rings)")
     p.add_argument("--custom-network", default="", metavar="JSON_OR_FILE",
                    help='custom map: inline JSON {"nodes":[[x,y]...],"edges":[[a,b]...]} or a file path')
+    p.add_argument("--custom-network-directed", action="store_true",
+                   help="build the custom map from its directed_edges layer (one-way flags, "
+                        "per-direction lane counts, shape polylines) rather than the undirected "
+                        "edges array; trimmed to the largest strongly connected component")
+    p.add_argument("--directed-lanes", action="store_true",
+                   help="give each direction of travel its own carriageway, offset off the road "
+                        "centreline (lanes per direction = --lanes); removes head-on overlaps")
+    p.add_argument("--drive-side", default="right", choices=["right", "left"],
+                   help="which side of the centreline a direction's carriageway sits on")
     p.add_argument("--events", default="", metavar="JSON_OR_FILE",
                    help="scenario timeline: inline JSON list of events or a file path")
     p.add_argument("--grid", type=int, default=6, help="grid road network dimension (grid x grid)")
@@ -4900,6 +5715,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                          traffic_flow=args.flow, duration_s=args.duration, arrival_rate=args.arrival_rate,
                          road_network=("grid" if (args.flow and args.road == "linear") else args.road),
                          custom_network=_inline_or_file(args.custom_network),
+                         custom_network_directed=args.custom_network_directed,
+                         directed_lanes=args.directed_lanes, drive_side=args.drive_side,
                          events=_inline_or_file(args.events),
                          grid_w=args.grid, grid_h=(args.grid_h or args.grid), grid_block_m=args.grid_block,
                          n_lanes=args.lanes, lane_width_m=args.lane_width, light_cycle_s=args.light_cycle,
