@@ -85,6 +85,33 @@ traffic growth, so vintage cannot be the whole explanation. Note also that InTAS
 validation reported NRMSE 0.33 — a loose fit, and one that does not constrain systematic bias, since
 a uniform under-estimate can sit inside that error.
 
+## Second window — the shortfall is systematic, not day-specific
+
+The first result used one hour of one day, which cannot distinguish a systematic demand deficit from
+an unrepresentative morning. A second window was graded: a **different day, a different peak, and the
+opposite time of day**.
+
+| | Window A | Window B |
+|---|---|---|
+| Reference | Tue 2023-11-14, 06:00–07:00Z (local 07:00–08:00, **AM** peak) | Wed 2023-11-15, 15:00–16:00Z (local 16:00–17:00, **PM** peak) |
+| SUMO window | 25200–28800 s (warm-up from 21600) | 57600–61200 s (warm-up from 54000) |
+| Measured | 45,713 veh | 48,169 veh |
+| Modelled | 21,095 veh | 20,096 veh |
+| **Relative error** | **−53.9%** | **−58.3%** |
+| Median station GEH | 25.5 | 30.9 |
+| Stations passing GEH < 5 | 0 / 23 | 0 / 23 |
+| Ratio min / median / max | 0.17 / **0.48** / 0.74 | 0.21 / **0.42** / 0.66 |
+| Stations under 0.75× | **23 / 23** | **23 / 23** |
+| Stations over 1.25× | 0 | 0 |
+
+Both windows: every one of 23 stations under-produces, none over-produces, and the model delivers
+roughly 42–48% of measured flow. The measured side is internally consistent too — the city records
+45.7k and 48.2k vehicles in the two peaks, as expected for AM and PM peaks in the same week.
+
+**This settles the day-specificity question.** A one-sided ~2× deficit reproducing across two
+different days, two different peaks and 46 station-observations is a property of the demand model,
+not of the hour that was sampled.
+
 ## Reproduce
 
 ```powershell
