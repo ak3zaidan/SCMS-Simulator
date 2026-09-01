@@ -52,6 +52,7 @@ from ..api.channel import (CAP_CBR, CAP_LEGACY_GLOBAL_RNG, CAP_LINK_STATE, CAP_R
                            PerLinkAdapter, StationSnapshot, StepFrame, Transmission)
 from ..api import detect as _api_detect
 from ..api import integrity as _integrity
+from ..api import isolate as _isolate
 from ..api import srcgate as _srcgate
 from ..api.detect import Observation
 from ..api.errors import ConfigError, PluginDriftError            # noqa: F401 (re-exported)
@@ -959,6 +960,36 @@ for _name, _cls in (("disc", DiscChannel), ("logdistance", LogDistanceChannel),
     _api_registry.register_builtin("channel_model", _name, _cls)
 del _name, _cls
 
+
+class InternalMobility:
+    """The engine's OWN mobility, named so it can be SELECTED rather than merely assumed.
+
+    `roads.random_trip` picks a shortest-path route, `run_pipeline.car_follow` integrates the
+    Intelligent Driver Model along it, and traffic lights come from `net.node_phase`'s 2-colouring.
+    This class holds no code: it is the registry entry that makes "internal" one option among
+    several instead of the hard-coded only one, exactly as `disc` is for the channel. It is the
+    DEFAULT and it is what every pinned golden was measured on."""
+
+    NAME = "internal"
+    INTERFACE_NAME = "scms.mobility"
+    INTERFACE_VERSION = "1.0"
+
+    @staticmethod
+    def capabilities() -> frozenset:
+        return frozenset({"position", "speed", "heading", "spawn", "despawn", "route_length",
+                          "car_following", "signals"})
+
+
+#: The `mobility` slot -- empty until now, which is why the IDM model was not selectable at all.
+#: Registration order is the display order that `_ENUM_OPTIONS["mobility_source"]`, the argparse
+#: `choices` and the GUI dropdown all read, so those cannot drift apart. `SumoReplayMobility` is
+#: imported lazily by name (its module pulls in `sumolib`/`libsumo` only inside functions, so this
+#: import stays cheap for the 60-odd test modules that import run.py).
+from .sumo_trace import SumoReplayMobility as _SumoReplayMobility   # noqa: E402
+for _name, _cls in (("internal", InternalMobility), ("sumo_replay", _SumoReplayMobility)):
+    _api_registry.register_builtin("mobility", _name, _cls)
+del _name, _cls
+
 #: Config scalars a channel model may read at construction. NOT the oracle: every one of these is
 #: user-supplied config that already appears verbatim in `manifest["config"]`. `config` and
 #: `buildings` are handed over for BUILT-IN construction (`GeometricChannel.from_plugin`); a third
@@ -1211,6 +1242,11 @@ def build_channel(cfg, buildings=None, dt: float = 1.0):
     `campaign.py`, `massive.py`, `gui/agent.py`) would otherwise cross-contaminate.
     """
     ref, params = _channel_selection(cfg)
+    # LOAD UNDER A SENTINEL, and the snapshot is taken BEFORE `resolve` on purpose. `resolve`
+    # IMPORTS the plugin's module, and module-level code runs on import -- an earlier hook than
+    # `__init__` and one no gate in this project looked at. Everything from that import to the
+    # constructor's return is inside the bracket.
+    _guard = _integrity.Sentinel(armed=_integrity.armed_for(cfg))
     cls, how, iv, shape = _api_registry.resolve("channel_model", ref)
     # ATTESTATION FIRST, and OUT OF PROCESS. This used to run twenty lines further down, AFTER the
     # instance existed -- so a hostile `__init__` ran before it was ever gated and could rewrite the
@@ -1219,16 +1255,17 @@ def build_channel(cfg, buildings=None, dt: float = 1.0):
                    if _channel_conformance(cfg) == "required" else None)
     pid = _api_registry.plugin_id_of(cls, ref if ":" not in ref else ref.rsplit(":", 1)[-1].lower())
     rng_ns = RngNamespace(cfg.seed, pid)
-    # CONSTRUCTION UNDER A SENTINEL. Attestation moved in front of construction still leaves the
-    # run's OWN instance being built in this interpreter, and `__init__` is arbitrary code. The
-    # snapshot is taken before the constructor runs and compared the moment it returns, so a
-    # construction-time rebind of `random.Random`, of `api.channel.check_outcome`, of `run._attest`
-    # or of any other watched object is fatal HERE -- before step 0, before an output directory
-    # exists. Built-ins are the engine; only third-party code is bracketed.
-    _guard = _integrity.Sentinel(armed=(how != "builtin"))
+    # Attestation moved in front of construction still leaves the run's OWN instance being built in
+    # this interpreter, and `__init__` is arbitrary code. The comparison happens the moment the
+    # constructor returns, so an import-time or construction-time rebind of `random.Random`, of
+    # `api.channel.check_outcome`, of `run._attest` or of any other watched object is fatal HERE --
+    # before step 0, before an output directory exists. Built-ins are the engine, so only a
+    # third-party resolution is graded.
     model = _api_registry.instantiate(cls, params=params, rng=rng_ns,
                                       env=_channel_env(cfg, buildings, dt))
-    _guard.verify("while CONSTRUCTING the channel plugin", subject=f"plugins.channel_model {ref!r}")
+    if how != "builtin":
+        _guard.verify("while LOADING the channel plugin",
+                      subject=f"plugins.channel_model {ref!r}")
     caps = _api_registry.check_capabilities("channel_model", ref, cls, how, model.capabilities())
     # The adapter carries the namespace so that `chan.begin_step(frame)` in the step loop advances it
     # exactly once per step. Without that wiring `RngNamespace._step` never leaves -1 and every
@@ -1261,7 +1298,12 @@ def build_channel(cfg, buildings=None, dt: float = 1.0):
 # The DETECTOR seam (PLUGIN-ARCHITECTURE.md section 2.2 / phase 3)
 # --------------------------------------------------------------------------- #
 #: Keys one entry of the `plugins.check` ARRAY may carry. Closed so a typo is an error.
-_CHECK_ENTRY_KEYS = frozenset({"ref", "params", "conformance", "source_gate"})
+#:
+#: `isolated: true` runs the check in its OWN INTERPRETER (`api/isolate.py`): the engine serialises
+#: the `Observation` -- and only the `Observation` -- to a child, which returns a score. It is a
+#: CONFIG key rather than a flag precisely so it lands verbatim in `manifest["config"]["plugins"]`
+#: and replays: a dataset produced by an isolated detector says so in its own manifest.
+_CHECK_ENTRY_KEYS = frozenset({"ref", "params", "conformance", "source_gate", "isolated"})
 
 #: Keys the `plugins.fusion` section may carry.
 _FUSION_SECTION_KEYS = frozenset({"ref", "params", "source_gate"})
@@ -1326,9 +1368,9 @@ def _assert_not_hijacked(slot: str, ref: str, cls) -> None:
 
 
 def _checks_selection(cfg, *, station_types: bool, denm: bool) -> tuple:
-    """((ref, params, conformance, source_gate), ...) for the check slot: `plugins` wins, else the
-    built-ins."""
-    default = tuple((r, {}, "off", _srcgate.DEFAULT_MODE)
+    """((ref, params, conformance, source_gate, isolated), ...) for the check slot: `plugins` wins,
+    else the built-ins."""
+    default = tuple((r, {}, "off", _srcgate.DEFAULT_MODE, False)
                     for r in default_check_refs(station_types=station_types, denm=denm))
     sel = (cfg.plugins or {}).get("check") if isinstance(cfg.plugins, dict) else None
     if not sel:
@@ -1359,10 +1401,31 @@ def _checks_selection(cfg, *, station_types: bool, denm: bool) -> tuple:
         if mode not in CONFORMANCE_MODES:
             raise ConfigError(f"plugins.check[].conformance must be one of "
                               f"{list(CONFORMANCE_MODES)} (got {mode!r})")
-        sgate = _srcgate.check_mode(entry.get("source_gate", _srcgate.DEFAULT_MODE),
-                                    "plugins.check[].source_gate")
-        out.append((str(entry["ref"]), params, mode, sgate))
-    seen = [r for r, _p, _c, _g in out]
+        isolated = entry.get("isolated", False)
+        if not isinstance(isolated, bool):
+            raise ConfigError(f"plugins.check[].isolated must be true or false (got {isolated!r}); "
+                              f"true runs the check in its own interpreter, where the run's ground "
+                              f"truth is not in the address space at all")
+        if isolated and str(entry["ref"]) in _detectors.BUILTIN_CHECK_BY_CODE:
+            # Refused HERE rather than in the worker, which would only report the built-in's name as
+            # unresolvable: the child imports `scms_sim_ref.api` and nothing else, so it has never
+            # heard of the engine's own registry.
+            raise ConfigError(
+                f"plugins.check {entry['ref']!r} is a BUILT-IN check and cannot be isolated: it IS "
+                f"the engine, its knobs are engine config fields, and running it out of process "
+                f"would buy nothing and cost a round trip per message. Isolation exists for "
+                f"third-party code you have not reviewed.")
+        # THE SOURCE GATE DEFAULTS OFF FOR AN ISOLATED CHECK, and that is the honest default rather
+        # than a weakening. The gate is a static name-match whose entire justification is that an
+        # in-process detector's `sys._getframe` reaches the reception loop's broadcast dict; out of
+        # process that walk finds this engine's frames nowhere, so refusing a submission for
+        # containing the name would be theatre. Set `"source_gate": "on"` explicitly and the parent
+        # still screens the module file the worker reports -- reading a file is not importing it.
+        sgate = _srcgate.check_mode(
+            entry.get("source_gate", ("off" if isolated else _srcgate.DEFAULT_MODE)),
+            "plugins.check[].source_gate")
+        out.append((str(entry["ref"]), params, mode, sgate, isolated))
+    seen = [r for r, _p, _c, _g, _i in out]
     dupes = sorted({r for r in seen if seen.count(r) > 1})
     if dupes:
         # The CHEAP half of the duplicate-column guard: the same ref twice, caught without resolving
@@ -1438,17 +1501,24 @@ class LoadedCheck:
     """One resolved, constructed check plus everything the engine needs to run and record it."""
 
     __slots__ = ("ref", "instance", "column", "plugin_id", "builtin", "soft", "precision",
-                 "msg_types", "vru_suppressed", "params", "rng", "provenance")
+                 "msg_types", "vru_suppressed", "params", "rng", "provenance", "isolated")
 
-    def __init__(self, ref, instance, column, plugin_id, builtin, params, rng, provenance):
+    def __init__(self, ref, instance, column, plugin_id, builtin, params, rng, provenance,
+                 isolated=False):
         self.ref, self.instance, self.column = ref, instance, column
         self.plugin_id, self.builtin = plugin_id, builtin
+        #: True when `instance` is an `api.isolate.IsolatedCheck` -- a proxy for a plugin running in
+        #: its own interpreter. It answers `evaluate(obs, state, params, rng)` exactly as an
+        #: in-process check does, and carries the same declared metadata, read off the worker's
+        #: handshake instead of off a class this process imported.
+        self.isolated = bool(isolated)
         self.soft = bool(getattr(instance, "soft", False))
         # Section 4.1: the engine rounds a plugin's returned score to its DECLARED precision before
         # the `>= 1.0` compare, because that compare is a cliff and a last-ulp difference flips a
         # whole report. The built-ins compare the RAW float -- that is what the goldens were pinned
         # on -- and declare `legacy_raw_compare`, which the resolver refuses from third parties.
-        self.precision = (None if _api_detect.CAP_LEGACY_RAW_COMPARE in instance.capabilities()
+        caps = (instance.capabilities if isolated else instance.capabilities())
+        self.precision = (None if _api_detect.CAP_LEGACY_RAW_COMPARE in caps
                           else int(getattr(instance, "precision", 3)))
         self.msg_types = tuple(getattr(instance, "msg_types", ("cam",)))
         self.vru_suppressed = bool(getattr(instance, "vru_suppressed", False))
@@ -1465,11 +1535,17 @@ class CheckSuite:
 
     __slots__ = ("checks", "fusion", "fusion_params", "fusion_rng", "fusion_ref", "keys",
                  "soft_keys", "columns", "zero", "cam_plan", "denm_plan", "vru_suppressed",
-                 "sig_column", "sig_suppressed", "third_party", "fusion_wrap", "_prov")
+                 "sig_column", "sig_suppressed", "third_party", "fusion_wrap", "_prov",
+                 "workers", "isolated")
 
     def __init__(self, checks, fusion, fusion_params, fusion_rng, fusion_ref, prov,
-                 *, fusion_builtin=True, fusion_pid=None):
+                 *, fusion_builtin=True, fusion_pid=None, workers=()):
         self.checks = tuple(checks)
+        #: Live `api.isolate.IsolatedCheck` workers, in load order. `close()` reaps them; the child
+        #: also exits on EOF of its stdin, so a parent that dies without reaching `close()` still
+        #: leaves nothing behind.
+        self.workers = tuple(workers)
+        self.isolated = tuple(c.column for c in self.checks if getattr(c, "isolated", False))
         #: The plugin id a THIRD-PARTY fusion's state is namespaced under, or None for the built-in.
         #:
         #: The check slot has always wrapped a third party's per-(rx, sender) state in
@@ -1510,7 +1586,11 @@ class CheckSuite:
         for c in self.checks:
             if msg_type not in c.msg_types:
                 continue
-            wrap = None if c.builtin else c.plugin_id
+            # An ISOLATED check gets `None` too, and for the opposite reason to a built-in's: the
+            # namespacing still happens, but on the far side of the serialiser. The proxy has to
+            # extract `state["plugin:<id>"]`, ship it and put it back regardless, so wrapping the
+            # dict here would only build a `NamespacedState` for the proxy to immediately unwrap.
+            wrap = None if (c.builtin or getattr(c, "isolated", False)) else c.plugin_id
             plan.append((c.column, c.instance.evaluate, c.params, c.rng, wrap, c.precision))
         return tuple(plan)
 
@@ -1522,6 +1602,19 @@ class CheckSuite:
     def provenance(self) -> list:
         return [p() for p in self._prov]
 
+    def close(self) -> None:
+        """FINISH every isolated worker and reap its process. Always called, on every path.
+
+        `finish()` is what collects the stream labels the manifest records and what asserts the
+        worker scored exactly as many messages as the engine sent it -- a worker that skipped one
+        produced a dataset nobody can reproduce, so that is a hard error and not a warning.
+        """
+        for w in self.workers:
+            try:
+                w.finish()
+            finally:
+                w.close()
+
 
 def build_checks(cfg, *, station_types: bool = False, denm: bool = False) -> CheckSuite:
     """Resolve + construct the run's detection layer. Once, before step 0; every failure fatal here.
@@ -1532,8 +1625,30 @@ def build_checks(cfg, *, station_types: bool = False, denm: bool = False) -> Che
     contaminate.
     """
     loaded, prov, columns = [], [], {}
-    for order, (ref, declared, mode, sgate) in enumerate(
+    workers: list = []
+    try:
+        return _build_checks(cfg, loaded, prov, columns, workers,
+                             station_types=station_types, denm=denm)
+    except BaseException:
+        # An isolated check that loads and a later one that does not must not leave a live child
+        # behind: the in-process multi-run drivers (`datagen/foundry.py`, `campaign.py`,
+        # `massive.py`, `gui/agent.py`) would then accumulate one per failed run.
+        for w in workers:
+            w.close()
+        raise
+
+
+def _build_checks(cfg, loaded, prov, columns, workers, *, station_types: bool,
+                  denm: bool) -> CheckSuite:
+    for order, (ref, declared, mode, sgate, isolated) in enumerate(
             _checks_selection(cfg, station_types=station_types, denm=denm)):
+        if isolated:
+            loaded.append(_load_isolated_check(cfg, order, ref, declared, mode, sgate, columns,
+                                               prov, workers))
+            continue
+        # Snapshot BEFORE `resolve`, which imports the plugin's module -- module-level code is an
+        # earlier hook than `__init__`. See `build_channel`.
+        _guard = _integrity.Sentinel(armed=_integrity.armed_for(cfg))
         cls, how, iv, _shape = _api_registry.resolve("check", ref)
         _assert_not_hijacked("check", ref, cls)
         builtin = how == "builtin" and _api_registry.is_builtin("check", cls)
@@ -1550,11 +1665,11 @@ def build_checks(cfg, *, station_types: bool = False, denm: bool = False) -> Che
         params = (_builtin_params(cls, cfg, declared, "check", ref) if builtin
                   else _plugin_params(cls, declared, "check", ref))
         rng_ns = RngNamespace(cfg.seed, pid)
-        # CONSTRUCTION UNDER A SENTINEL: a third party's `__init__` is arbitrary code running in the
-        # engine's interpreter, and any rebind it performs is fatal before step 0. See `build_channel`.
-        _guard = _integrity.Sentinel(armed=not builtin)
+        # A third party's import-time and `__init__` code is arbitrary code running in the engine's
+        # interpreter, and any rebind it performs is fatal before step 0. See `build_channel`.
         inst = _api_registry.instantiate(cls, params=params, rng=rng_ns, env=_detector_env(cfg))
-        _guard.verify("while CONSTRUCTING a detector plugin", subject=f"plugins.check {ref!r}")
+        if not builtin:
+            _guard.verify("while LOADING a detector plugin", subject=f"plugins.check {ref!r}")
         caps = _api_registry.check_capabilities("check", ref, cls, how, inst.capabilities())
         code = str(inst.reason_code)
         # SECTION 4.4: a third party's column is `x_<plugin_id>_<code>`, so it can never collide
@@ -1565,6 +1680,7 @@ def build_checks(cfg, *, station_types: bool = False, denm: bool = False) -> Che
         prov.append(_check_provenance("check", order, ref, cls, how, iv, caps, rng_ns, params,
                                       conformance=attested))
     fref, fdeclared, fsgate = _fusion_selection(cfg)
+    _fguard = _integrity.Sentinel(armed=_integrity.armed_for(cfg))
     fcls, fhow, fiv, _fshape = _api_registry.resolve("fusion", fref)
     _assert_not_hijacked("fusion", fref, fcls)
     fbuiltin = fhow == "builtin" and _api_registry.is_builtin("fusion", fcls)
@@ -1585,13 +1701,103 @@ def build_checks(cfg, *, station_types: bool = False, denm: bool = False) -> Che
         # re-pin, not something a refactor may do quietly. `check_capabilities` below independently
         # refuses the DECLARATION from anything that is not a built-in.
         fenv["legacy_rng"] = _LEGACY_RNG.get("rng")
-    _fguard = _integrity.Sentinel(armed=not fbuiltin)
     fusion = _api_registry.instantiate(fcls, params=fparams, rng=frng, env=fenv)
-    _fguard.verify("while CONSTRUCTING the fusion plugin", subject=f"plugins.fusion {fref!r}")
+    if not fbuiltin:
+        _fguard.verify("while LOADING the fusion plugin", subject=f"plugins.fusion {fref!r}")
     fcaps = _api_registry.check_capabilities("fusion", fref, fcls, fhow, fusion.capabilities())
     fprov = _check_provenance("fusion", 0, fref, fcls, fhow, fiv, fcaps, frng, fparams)
     return CheckSuite(loaded, fusion, fparams, frng, fref, prov + [fprov],
-                      fusion_builtin=fbuiltin, fusion_pid=fpid)
+                      fusion_builtin=fbuiltin, fusion_pid=fpid, workers=workers)
+
+
+def _load_isolated_check(cfg, order, ref, declared, mode, sgate, columns, prov, workers):
+    """Load one `check` OUT OF PROCESS. **The plugin's module is never imported here.**
+
+    The order is the whole point, and it is the same discipline `_attest` established for the
+    in-process slots, taken one step further:
+
+    1. **spawn + resolve in the child.** The plugin's module-level code and its `__init__` run in an
+       interpreter that holds no engine object -- no broadcast dict, no `Vehicle`, no
+       `PipelineConfig`, no global `random.Random(cfg.seed)`, and no frame of this loop.
+    2. **screen and validate in the parent, from what the child reported.** The declared params are
+       range-checked against the `FieldSpec`s the worker sent, by `_params_from_spec` (which is
+       `_plugin_params` with the spec taken off the wire instead of out of a class this process
+       imported); the column is claimed against the same table the in-process entries use; and
+       if `source_gate` was explicitly turned on, the parent reads (does not import) the module file
+       the worker named and scans it.
+    3. **construct in the child**, with the params the parent resolved -- and refuse if the worker's
+       echoed `params_sha256` is not the one the manifest is about to record.
+
+    No integrity `Sentinel` brackets this, and its absence is deliberate rather than an oversight:
+    the sentinel exists to catch a third party rebinding objects in THIS interpreter, and an isolated
+    plugin has no code running here to do it with. The whole-run sentinel still covers the run.
+    """
+    attested = (_attest("check", ref, declared) if mode == "required" else None)
+    # No timeout knob on `PipelineConfig`, deliberately: it is a FAIL-STOP ceiling, it can only ever
+    # turn a run into a failure, and adding a config field would put a number that cannot affect any
+    # result into `manifest["config"]` and into `config_schema()`.
+    worker = _isolate.IsolatedCheck(ref, declared, seed=cfg.seed, env=_detector_env(cfg),
+                                    timeout=_isolate.DEFAULT_TIMEOUT_S)
+    workers.append(worker)
+    meta = worker.spawn()
+    if sgate == "on":
+        # The gate, applied to a module the parent has read but not imported. Advisory by default
+        # in this mode (see `_checks_selection`) and enforced when the config asks for it.
+        _gate_isolated_source(ref, meta)
+    spec = _isolate.spec_from_wire(meta.get("config_fields") or {})
+    params = _params_from_spec(spec, declared, "check", ref)
+    caps = _api_registry.check_capabilities("check", ref, None, "isolated",
+                                            worker.construct(params))
+    column = _claim_column(columns, ref, order, worker.plugin_id, worker.reason_code, False)
+    prov.append(_isolated_provenance(order, worker, params, attested))
+    return LoadedCheck(ref, worker, column, worker.plugin_id, False, params, worker.rng, None,
+                       isolated=True)
+
+
+def _params_from_spec(spec: dict, declared: dict, slot: str, ref: str) -> dict:
+    """`_plugin_params`, driven by a `FieldSpec` map instead of a class.
+
+    Identical semantics deliberately: the defaults are the spec's, an undeclared name is REFUSED
+    rather than ignored, and every supplied value goes through the plugin author's own bounds. The
+    only difference is where the spec came from -- a wire frame instead of a `config_fields()` call
+    in this process -- which is what keeps the plugin out of the engine.
+    """
+    params = {name: fs.default for name, fs in spec.items()}
+    for k, v in sorted((declared or {}).items()):
+        fs = spec.get(k)
+        if fs is None and spec:
+            raise ConfigError(f"plugins.{slot}.params: {ref} declares no field {k!r}; "
+                              f"known: {sorted(spec)}")
+        if fs is not None:
+            fs.validate(f"plugins.{slot}.params.{k}", v)
+        params[k] = v
+    return params
+
+
+def _gate_isolated_source(ref: str, meta: dict) -> None:
+    """Run the source gate over the module file the WORKER reported, without importing it."""
+    path = meta.get("module_path")
+    if not path or not os.path.isfile(path):
+        raise _srcgate.SourceGateError(
+            f"plugins.check {ref!r}: source_gate='on' with isolated=true, but the worker reported "
+            f"no readable module file ({path!r}). The gate refuses what it cannot read.")
+    try:
+        from importlib.util import decode_source
+        with open(path, "rb") as fh:
+            src = decode_source(fh.read())
+    except OSError as e:
+        raise _srcgate.SourceGateError(f"plugins.check {ref!r}: cannot read {path}: {e}") from None
+    findings = _srcgate.scan_source(src, path)
+    if findings:
+        raise _srcgate.SourceGateError(_srcgate._message("check", ref, path, findings))
+
+
+def _isolated_provenance(order, worker, params, conformance):
+    """Deferred exactly as the in-process form is: `declared_streams` is what the worker reports at
+    FINISH, and FINISH has not happened yet when the suite is built."""
+    def _build():
+        return _isolate.provenance_record("check", order, worker, params, conformance=conformance)
+    return _build
 
 
 def _claim_column(columns: dict, ref, order, pid, code, builtin) -> str:
@@ -2020,6 +2226,40 @@ class PipelineConfig:
                                          # `edges` array, then trim to the largest strongly
                                          # connected component. Without it, everything netimport.py
                                          # and osm.py extract about one-way streets is discarded.
+    # --- SUMO-backed mobility (mock_pipeline/sumo_trace.py) ------------------------------------
+    # THE POINT: this engine writes the datasets, and its mobility is a hand-rolled IDM over a
+    # synthetic graph that has never been validated against a calibrated traffic model -- every
+    # real-world GEH number in this repo measured the OTHER (MOSAIC/SUMO) engine. Setting
+    # `mobility_source="sumo_replay"` makes SUMO produce the movement while the whole SCMS / attack
+    # / detector / MA stack above it stays exactly as it is. All default-inert: `mobility_source`
+    # defaults to the built-in "internal" model, nothing below is read on that path, and NOT ONE
+    # rng draw is added -- so every pinned golden holds byte for byte.
+    mobility_source: str = "internal"    # "internal" (roads.Trip + the IDM in car_follow) or
+                                         # "sumo_replay" (a frozen SUMO trajectory artifact)
+    sumo_net: str = ""                   # road_network="sumo": the .net.xml the engine reasons
+                                         # about. It MUST be the net the trace was frozen on --
+                                         # both go through one netimport transform, which is what
+                                         # keeps dist_to_road / mapOffRoad / the geometric channel's
+                                         # building blockage meaningful.
+    sumo_frame_city: str = ""            # geo-referenced net: re-project into osm.py's local frame
+                                         # for THIS city, i.e. the exact (lat0, lon0, kx, ky) tuple
+                                         # derived from that extract's ROAD ways. Empty = keep the
+                                         # net's own metric coordinates (procedural nets).
+    sumo_trace: str = ""                 # mobility_source="sumo_replay": the frozen artifact
+    sumo_trace_sha256: str = ""          # its sha256. FILLED IN by validate_config and therefore
+                                         # recorded in manifest["config"], so a re-frozen trajectory
+                                         # (different SUMO seed, different SUMO build) is a
+                                         # DETECTABLE INPUT CHANGE -- a refused run with a
+                                         # diagnostic -- instead of a silent digest break that looks
+                                         # like an engine regression. Set it explicitly to PIN it.
+    sumo_cert_slack_s: float = 30.0      # replay: extra pseudonym-certificate lifetime past the
+                                         # trace's EXACT despawn time (the internal model can only
+                                         # budget an estimate; SUMO already drove the whole trip)
+    sumo_offroad_p95_max_m: float = 8.0  # replay coherence GATE: refuse the run if the p95
+                                         # distance from a replayed position to the engine's nearest
+                                         # road exceeds this. A road-following vehicle sits within
+                                         # half a carriageway of the centreline; anything scattered
+                                         # means the two frames disagree.
 
     def derive(self, label: str, n: int = 32) -> bytes:
         return hashlib.sha256(f"{self.seed}|{label}".encode()).digest()[:n]
@@ -2666,17 +2906,18 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"gps_quality_floor must be in [0, 20] (got {cfg.gps_quality_floor})")
     if cfg.gps_quality_lambda <= 0:
         raise ValueError(f"gps_quality_lambda must be > 0 (got {cfg.gps_quality_lambda})")
-    if cfg.road_network not in ("linear", "grid", "ring", "spider", "custom"):
-        raise ValueError(f"road_network must be linear|grid|ring|spider|custom "
+    if cfg.road_network not in ("linear", "grid", "ring", "spider", "custom", "sumo"):
+        raise ValueError(f"road_network must be linear|grid|ring|spider|custom|sumo "
                          f"(got {cfg.road_network!r})")
     if cfg.road_network == "custom":
         from .roads import CustomNetwork
         CustomNetwork(*_parse_custom_network(               # full design validation
             cfg.custom_network, directed=cfg.custom_network_directed))
-    elif cfg.custom_network_directed:
-        raise ValueError(f"custom_network_directed needs road_network='custom' (got "
+    elif cfg.custom_network_directed and cfg.road_network != "sumo":
+        raise ValueError(f"custom_network_directed needs road_network='custom' or 'sumo' (got "
                          f"{cfg.road_network!r}): it selects which layer of the custom-network "
                          f"DOCUMENT to build from, and no other topology has one")
+    _validate_mobility(cfg)
     from .roads import DRIVE_SIDES
     if cfg.drive_side not in DRIVE_SIDES:
         raise ValueError(f"drive_side must be one of {sorted(DRIVE_SIDES)} (got {cfg.drive_side!r})")
@@ -2690,7 +2931,7 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         if not cfg.traffic_flow:
             raise ValueError("directed_lanes needs traffic_flow=true: carriageway offsets apply to "
                              "ROUTED trips, and a fixed-fleet vehicle drives a straight line")
-    if cfg.road_network in ("spider", "custom") and not cfg.traffic_flow:
+    if cfg.road_network in ("spider", "custom", "sumo") and not cfg.traffic_flow:
         raise ValueError(f"road_network={cfg.road_network!r} needs traffic_flow=true: fixed-fleet "
                          f"vehicles drive straight lines, which would put them off the designed "
                          f"roads (set traffic_flow=true and an arrival_rate)")
@@ -2729,6 +2970,81 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
     for name in _PROB_FIELDS:                       # clamp fractions rather than produce nonsense
         setattr(cfg, name, min(1.0, max(0.0, float(getattr(cfg, name)))))
     return cfg
+
+
+def _validate_mobility(cfg) -> None:
+    """The SUMO-backed mobility surface, validated as one coherent unit rather than knob by knob.
+
+    Everything here is inert unless `mobility_source` is moved off `"internal"` or `road_network`
+    is set to `"sumo"`, and neither costs an rng draw, so the default path is byte-identical.
+
+    THE HASH IS FILLED IN HERE, before `run_pipeline` takes its config snapshot -- which is the only
+    place it can be, because the snapshot is what `manifest["config"]` records and
+    `_assert_config_unmoved` forbids any later write. Leaving `sumo_trace_sha256` empty means "adopt
+    whatever is on disk and record it"; setting it means "PIN it", and a mismatch is refused. That
+    is what turns SUMO's nondeterminism into a detectable INPUT change: a trajectory re-frozen under
+    a different SUMO seed or a different SUMO build stops the run with a diagnostic instead of
+    silently producing a different `data_digest` that reads as an engine regression."""
+    _mob = _api_registry.builtin_names("mobility")
+    if cfg.mobility_source not in _mob:
+        raise ValueError(f"mobility_source must be {'|'.join(_mob)} (got {cfg.mobility_source!r})")
+    if cfg.road_network == "sumo":
+        if not cfg.sumo_net:
+            raise ValueError('road_network="sumo" needs sumo_net=<path to a SUMO .net.xml>: the '
+                             'engine imports that net (netimport.py) as the graph it reasons about')
+        if not os.path.exists(cfg.sumo_net):
+            raise ValueError(f"sumo_net not found: {cfg.sumo_net!r}")
+    elif cfg.sumo_net:
+        raise ValueError(f"sumo_net needs road_network='sumo' (got {cfg.road_network!r}); it names "
+                         f"the network the engine builds from, not an extra layer on another one")
+    if cfg.sumo_frame_city and cfg.road_network != "sumo":
+        raise ValueError("sumo_frame_city needs road_network='sumo': it selects the projection "
+                         "frame the .net.xml is re-projected into")
+    if cfg.sumo_cert_slack_s < 0:
+        raise ValueError(f"sumo_cert_slack_s must be >= 0 (got {cfg.sumo_cert_slack_s})")
+    if cfg.sumo_offroad_p95_max_m <= 0:
+        raise ValueError(f"sumo_offroad_p95_max_m must be > 0 (got {cfg.sumo_offroad_p95_max_m})")
+    if cfg.mobility_source != "sumo_replay":
+        if cfg.sumo_trace:
+            raise ValueError("sumo_trace needs mobility_source='sumo_replay'; a frozen trajectory "
+                             "that nothing replays is a config that lies about the run")
+        if cfg.sumo_trace_sha256:
+            raise ValueError("sumo_trace_sha256 needs mobility_source='sumo_replay'")
+        return
+    # ---- mobility_source == "sumo_replay" ---------------------------------------------------- #
+    if not cfg.traffic_flow:
+        raise ValueError("mobility_source='sumo_replay' needs traffic_flow=true: the frozen "
+                         "trajectory IS an arrival process (vehicles depart and arrive over time), "
+                         "and a fixed fleet has nowhere to put it")
+    if cfg.road_network != "sumo":
+        raise ValueError(
+            f"mobility_source='sumo_replay' needs road_network='sumo' (got "
+            f"{cfg.road_network!r}). The replayed vehicles must move on the SAME network the engine "
+            f"reasons about -- both are derived from one .net.xml through one netimport transform. "
+            f"Replaying onto any other graph makes dist_to_road, mapOffRoad and the geometric "
+            f"channel's building blockage measurements of two different cities.")
+    if cfg.directed_lanes:
+        raise ValueError("mobility_source='sumo_replay' is incompatible with directed_lanes: SUMO "
+                         "has ALREADY placed each vehicle on its own carriageway and lane, and "
+                         "offsetting the engine's centrelines again moves the roads off the "
+                         "replayed traffic (the coherence gate would then fail on your own map)")
+    if not cfg.sumo_trace:
+        raise ValueError("mobility_source='sumo_replay' needs sumo_trace=<frozen artifact>; "
+                         "produce one with `python -m scms_sim_ref.mock_pipeline.sumo_trace "
+                         "--net map.net.xml --routes map.rou.xml --steps 300 --run-seed 42 "
+                         "--out map.trace`")
+    if not os.path.exists(cfg.sumo_trace):
+        raise ValueError(f"sumo_trace not found: {cfg.sumo_trace!r}")
+    from .sumo_trace import file_sha256
+    have = file_sha256(cfg.sumo_trace)
+    if cfg.sumo_trace_sha256 and cfg.sumo_trace_sha256 != have:
+        raise ValueError(
+            f"the frozen trajectory at {cfg.sumo_trace!r} does not match the sha256 this config "
+            f"pins.\n  pinned:  {cfg.sumo_trace_sha256}\n  on disk: {have}\n"
+            f"The INPUT changed -- a different SUMO seed, a different SUMO build, or a different "
+            f"network/demand. That is a new dataset, not a reproduction of the pinned one: re-pin "
+            f"sumo_trace_sha256 deliberately, or restore the artifact this config was written for.")
+    cfg.sumo_trace_sha256 = have
 
 
 def _validate_plugins(cfg) -> None:
@@ -2792,11 +3108,22 @@ def _validate_detector_plugins(cfg) -> None:
     The suite is not CONSTRUCTED here -- construction happens once inside `run_pipeline`, because a
     plugin instance is a per-run object and the GUI/copilot validate configs they never run.
     """
-    checks = [(r, p, g) for r, p, _mode, g in _checks_selection(cfg, station_types=True, denm=True)]
+    checks = [(r, p, g, iso) for r, p, _mode, g, iso in _checks_selection(cfg, station_types=True,
+                                                                         denm=True)]
     fref, fparams, fgate = _fusion_selection(cfg)
     columns: dict = {}
-    for slot, entries in (("check", checks), ("fusion", [(fref, fparams, fgate)])):
-        for order, (ref, declared, sgate) in enumerate(entries):
+    for slot, entries in (("check", checks), ("fusion", [(fref, fparams, fgate, False)])):
+        for order, (ref, declared, sgate, isolated) in enumerate(entries):
+            if isolated:
+                # AN ISOLATED CHECK IS NOT RESOLVED HERE, and that is the whole point: resolving it
+                # means IMPORTING it, and module-level code is an earlier hook than `__init__`. Its
+                # params, its column and its source screening are validated against the `FieldSpec`s
+                # the WORKER reports, in `build_checks`, before step 0 and before any output
+                # directory exists -- the same fail-fast, one phase later. The cost is stated in
+                # docs/realism/DETECTOR-PLUGIN.md: `--dump-config-schema` and the GUI's advanced
+                # panel cannot show an isolated plugin's knobs, because showing them means running
+                # the plugin's code in the process that is asking.
+                continue
             cls, how, _iv, _shape = _api_registry.resolve(slot, ref)
             _assert_not_hijacked(slot, ref, cls)
             builtin = how == "builtin" and _api_registry.is_builtin(slot, cls)
@@ -2833,9 +3160,11 @@ def _field_group(name: str) -> str:
                      "crl_aware", "crl_dormant")),
         ("Mobility", ("fleet", "trip_", "idm_", "demand", "arrival", "n_lanes", "lane_", "turn_",
                       "gap_acceptance", "car_following", "veh_length", "od_", "boundary",
-                      "traffic_flow", "duration", "max_total", "nominal_speed", "state_prune", "vru_")),
+                      "traffic_flow", "duration", "max_total", "nominal_speed", "state_prune", "vru_",
+                      "mobility_source", "sumo_trace", "sumo_cert_slack", "sumo_offroad")),
         ("Network", ("road_network", "grid", "custom_network", "traffic_lights", "light_cycle",
-                     "arterial", "local_speed", "directed_lanes", "drive_side")),
+                     "arterial", "local_speed", "directed_lanes", "drive_side",
+                     "sumo_net", "sumo_frame_city")),
         ("Scenario events", ("events",)),
         ("Plugins", ("plugins",)),
         ("Messages", ("denm",)),
@@ -2861,7 +3190,10 @@ _ENUM_OPTIONS = {
     # the validate_config check, this list, the argparse choices and the GUI dropdown
     "radio_model": list(_api_registry.builtin_names("channel_model")),
     "radio_env": ["urban", "highway"],
-    "road_network": ["linear", "grid", "ring", "spider", "custom"],
+    # same rule as radio_model: sourced from the BUILT-IN REGISTRY so validate_config's message,
+    # this list, the argparse choices and the GUI dropdown are one source of truth
+    "mobility_source": list(_api_registry.builtin_names("mobility")),
+    "road_network": ["linear", "grid", "ring", "spider", "custom", "sumo"],
     "drive_side": ["right", "left"],
     "demand_profile": ["uniform", "rush", "night"],
     "od_model": ["uniform", "gravity"],
@@ -2950,7 +3282,35 @@ _FIELD_META = {
     "state_prune_ttl": dict(h="Evict detection state untouched this many steps", lo=1),
     # Network
     "road_network": dict(h="Road topology: straight lines, routed grid, ring, radial spider city, "
-                           "or a fully custom node/edge map (see custom_network)"),
+                           "a fully custom node/edge map (see custom_network), or a SUMO .net.xml "
+                           "imported through netimport (see sumo_net)"),
+    # SUMO-backed mobility
+    "mobility_source": dict(h="Where vehicle movement comes from: 'internal' (the engine's own "
+                              "routed IDM car-following — the default, and what every pinned "
+                              "golden was measured on) or 'sumo_replay' (a frozen SUMO trajectory "
+                              "artifact, so the movement is SUMO's while the SCMS/attack/detector/"
+                              "MA stack above it is unchanged). Needs sumo_trace + road_network=sumo"),
+    "sumo_net": dict(h="road_network=sumo: the SUMO .net.xml the engine imports as its road graph. "
+                       "With sumo_replay it MUST be the net the trace was frozen on — one import, "
+                       "one transform, so the vehicles and the roads share a frame"),
+    "sumo_frame_city": dict(h="Geo-referenced .net.xml: re-project it into osm.py's local frame for "
+                              "this city (the exact lat0/lon0/kx/ky derived from that extract's "
+                              "road ways), so the net registers with osm.py roads and building "
+                              "footprints. Empty = keep the net's own metric coordinates"),
+    "sumo_trace": dict(h="mobility_source=sumo_replay: the frozen trajectory artifact "
+                         "(python -m scms_sim_ref.mock_pipeline.sumo_trace --net ... --routes ... "
+                         "--steps N --run-seed S --out map.trace)"),
+    "sumo_trace_sha256": dict(h="sha256 of the frozen trajectory. Left empty it is FILLED IN from "
+                                "the file and recorded in manifest[config]; set explicitly it PINS "
+                                "the input, and a re-frozen trajectory is refused rather than "
+                                "silently producing a different data_digest"),
+    "sumo_cert_slack_s": dict(h="Replay: extra pseudonym-certificate lifetime past the trace's exact "
+                                "despawn time (SUMO already drove the trip, so the budget is exact "
+                                "rather than an estimate)", lo=0, hi=600, st=5, u="s"),
+    "sumo_offroad_p95_max_m": dict(h="Replay coherence gate: refuse the run if the p95 distance from "
+                                     "a replayed position to the engine's nearest road exceeds this "
+                                     "(a misregistered frame scatters it)", lo=0.5, hi=200, st=0.5,
+                                   u="m"),
     "custom_network": dict(h='Custom map JSON {"nodes":[[x,y]...metres],"edges":[[a,b]...]} — any '
                              'connected road graph (AI/user-designed); used when road_network=custom'),
     "custom_network_directed": dict(h="Build the custom map from its directed_edges layer (one-way "
@@ -3089,11 +3449,15 @@ _FIELD_META = {
                       "through the built-in registry, an installed entry point, then a dotted path "
                       "'package.module:Class'. Empty (the default) = built-ins only, byte-identical. "
                       "Example: {\"channel_model\": {\"ref\": \"geometric\"}}. A check/fusion entry "
-                      "also takes conformance:'off'|'required' and source_gate:'on'|'off'; "
-                      "source_gate scans the plugin's own source for frame walking, gc reflection "
-                      "and engine-internal imports and refuses them by default (a guard rail, NOT a "
-                      "sandbox -- an in-process plugin is TRUSTED code; see "
-                      "docs/realism/DETECTOR-PLUGIN.md section 2)"),
+                      "also takes conformance:'off'|'required', source_gate:'on'|'off' and "
+                      "isolated:true|false. source_gate scans the plugin's own source for frame "
+                      "walking, gc reflection and engine-internal imports and refuses them by "
+                      "default (a guard rail, NOT a sandbox -- an in-process plugin is TRUSTED "
+                      "code). isolated:true runs a CHECK in its own interpreter, which is the real "
+                      "boundary: the engine sends it the Observation and nothing else, so the "
+                      "run's ground truth is not in its address space at all. Same seed, same "
+                      "scores, same digest; ~40 us per delivered message. Use it for a detector "
+                      "you have not reviewed. See docs/realism/DETECTOR-PLUGIN.md section 2"),
 }
 
 
@@ -3174,7 +3538,11 @@ def _declared_refs(cfg, slot: str) -> tuple:
     if slot == "channel_model":
         return (_channel_selection(cfg)[0],)
     if slot == "check":
-        return tuple(r for r, _p, _c, _g in _checks_selection(cfg, station_types=True, denm=True))
+        # ISOLATED refs are omitted: every caller of this helper goes on to `resolve()` the ref, and
+        # resolving an isolated plugin in the engine's process is precisely what it was declared
+        # isolated to avoid.
+        return tuple(r for r, _p, _c, _g, iso in _checks_selection(cfg, station_types=True,
+                                                                   denm=True) if not iso)
     if slot == "fusion":
         return (_fusion_selection(cfg)[0],)
     sel = cfg.plugins.get(slot)
@@ -3282,7 +3650,15 @@ GAP_YIELD_HOOK = None
 
 
 def run_pipeline(cfg: PipelineConfig) -> RunResult:
+    # THE FIRST STATEMENT OF THE RUN, and it has to be. `validate_config` RESOLVES every declared
+    # plugin ref, and resolving imports the module -- so a `random.Random = Impostor` at MODULE SCOPE
+    # has already run by the time `build_channel` is reached. Module-level code is an earlier hook
+    # than `__init__`, it is one line, and the source gate's name list does not contain it. Snapshot
+    # before anything reads `cfg.plugins` at all.
+    _armed = _integrity.armed_for(cfg)
+    _run_sentinel = _integrity.Sentinel(armed=_armed)
     validate_config(cfg)
+    _run_sentinel.verify("while RESOLVING the declared plugins (module import time)")
     # THE CONFIG SNAPSHOT. Taken after validation (which is the last thing allowed to touch `cfg`)
     # and deep-copied, so a plugin mutating a nested container -- `cfg.plugins[...]["params"][k]` --
     # is caught as well as a scalar write. This dict, not the live object, is what the manifest
@@ -3313,8 +3689,6 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     #
     # Neither is a sandbox and neither is evidence of honesty: reading the oracle through a frame
     # walk moves nothing on either list. See `api/integrity.py` and DETECTOR-PLUGIN.md section 2.
-    _armed = _integrity.armed_for(cfg)
-    _run_sentinel = _integrity.Sentinel(armed=_armed)
     rng = _integrity.engine_random(cfg.seed, armed=_armed)
     wmult = WEATHER_MULT.get(cfg.weather, 1.0)
     la1, la2 = LinkageAuthority(1), LinkageAuthority(2)
@@ -3359,6 +3733,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     # every plugin failure belongs (PLUGIN-ARCH 3.2), and is early enough that no output directory
     # has been created.
     _assert_config_unmoved(_cfg0, cfg, "while constructing the channel plugin")
+    if _armed:
+        _run_sentinel.verify("after LOADING the channel plugin")
     _chan_caps = chan.capabilities()
     _chan_additive = LOSS_ADDITIVE_LEGACY in _chan_caps
     _chan_batch = not hasattr(chan, "evaluate_link")
@@ -3396,6 +3772,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     * cfg.dt / cfg.denm_rate_window_s)
     total_time = cfg.n_steps * cfg.dt
     net = None
+    _sumo_tf = None            # the netimport transform, SHARED with the replay provider below
+    _sumo_info: dict = {}
+    _sumo_net_sha = ""
     if cfg.road_network == "grid":
         from .roads import GridNetwork
         net = GridNetwork(cfg.grid_w, cfg.grid_h, cfg.grid_block_m,
@@ -3413,6 +3792,29 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         from .roads import CustomNetwork
         net = CustomNetwork(*_parse_custom_network(cfg.custom_network,
                                                    directed=cfg.custom_network_directed))
+    elif cfg.road_network == "sumo":
+        # THE COHERENCE GUARANTEE, and it is structural rather than a check bolted on afterwards.
+        # `engine_network` reads the .net.xml ONCE and hands back both the imported graph and the
+        # very transform it applied to the junction coordinates. The replay provider below is
+        # constructed with THAT transform, so the vehicles and the roads they drive on land in one
+        # frame by construction. (`osm.py`'s trap: a layer re-derived with its own origin misaligns
+        # by whole city blocks while every individual street still looks plausible.)
+        from .osm import network_document
+        from .roads import CustomNetwork
+        from .sumo_trace import engine_network, file_sha256 as _net_sha
+        _sumo_nodes, _sumo_edges, _sumo_info, _sumo_tf = engine_network(
+            cfg.sumo_net, frame_city=cfg.sumo_frame_city,
+            directed=cfg.custom_network_directed)
+        _sumo_net_sha = _net_sha(cfg.sumo_net)
+        net = CustomNetwork(*_parse_custom_network(
+            network_document(_sumo_nodes, _sumo_edges, _sumo_info),
+            directed=cfg.custom_network_directed))
+        if cfg.verbose:
+            print(f"[sumo net] {os.path.basename(cfg.sumo_net)} -> {len(net.nodes)} junctions "
+                  f"({_sumo_info.get('intersections_deg_ge3', '?')} deg>=3), "
+                  f"{_sumo_info.get('n_directed_edges', '?')} directed edges, oneway "
+                  f"{_sumo_info.get('oneway_share', 0.0)}, {_sumo_info.get('n_signal_nodes', 0)} "
+                  f"signalised junctions", flush=True)
     # ---- OPT-IN directed carriageways -------------------------------------------------------- #
     # `enable_directed_lanes()` gives each direction of travel its own carriageway, offset sideways
     # off the graph centreline, so two vehicles driving opposite ways down one street no longer
@@ -3422,6 +3824,53 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     if cfg.directed_lanes and net is not None:
         net.enable_directed_lanes(lane_width_m=cfg.lane_width_m, drive_side=cfg.drive_side,
                                   lanes_per_dir=cfg.n_lanes)
+    # ---- OPT-IN SUMO-backed mobility: load the frozen trajectory ----------------------------- #
+    # `mobility_source="internal"` (the default) leaves `_replay` None: not one line below runs, no
+    # module is imported, no rng is drawn, every pinned golden holds. When it IS on, this is the
+    # WHOLE seam -- the provider supplies the spawn schedule and writes cur_x/cur_y/cur_v/cur_h each
+    # step, and everything downstream (SCMS, attacks, radio, detectors, MA, reporting) is untouched.
+    _replay = None
+    _mob_block = None
+    if cfg.mobility_source == "sumo_replay":
+        from .sumo_trace import SumoReplayMobility, load as _load_trace
+        _trace = _load_trace(cfg.sumo_trace)
+        if _trace.sha256 != cfg.sumo_trace_sha256:        # belt and braces: validate_config filled it
+            raise ValueError(f"the frozen trajectory changed between validation and load "
+                             f"({cfg.sumo_trace_sha256} -> {_trace.sha256})")
+        _replay = SumoReplayMobility(_trace, dt=cfg.dt, transform=_sumo_tf)
+        # THE COHERENCE ASSERTION. A replayed vehicle must be ON the engine's roads: `dist_to_road`
+        # feeds the mapOffRoad detector, and the geometric channel ray-casts building footprints
+        # registered to this same frame. A road-following vehicle sits within about half a
+        # carriageway of the centreline (SUMO puts it on a LANE centre, the engine's edge is the
+        # junction-to-junction line); a misregistered frame scatters the distribution instead.
+        _offroad_stats = _replay.offroad_stats(net.dist_to_road)
+        if _offroad_stats["p95"] > cfg.sumo_offroad_p95_max_m:
+            raise ValueError(
+                f"SUMO replay is NOT coherent with the engine's network: distance-to-road over "
+                f"{_offroad_stats['n']} sampled replayed positions is p50={_offroad_stats['p50']} m, "
+                f"p95={_offroad_stats['p95']} m, max={_offroad_stats['max']} m, against a "
+                f"sumo_offroad_p95_max_m of {cfg.sumo_offroad_p95_max_m} m. The vehicles are not "
+                f"driving on the roads the engine reasons about -- almost always because sumo_net "
+                f"is not the .net.xml the trace was frozen on, or because sumo_frame_city projects "
+                f"the network into a frame the trajectory was never transformed into.")
+        _mob_block = {"source": "sumo_replay",
+                      "provider": _replay.describe(),
+                      "trace_path_basename": os.path.basename(cfg.sumo_trace),
+                      "trace_sha256": _trace.sha256,
+                      "network": {"path_basename": os.path.basename(cfg.sumo_net),
+                                  "sha256": _sumo_net_sha,
+                                  "frame_city": cfg.sumo_frame_city,
+                                  "n_nodes": len(net.nodes),
+                                  "directed": bool(cfg.custom_network_directed),
+                                  "n_signal_nodes": len(_sumo_info.get("signal_nodes", ()))},
+                      "coherence": {"dist_to_road_m": _offroad_stats,
+                                    "p95_gate_m": cfg.sumo_offroad_p95_max_m}}
+        if cfg.verbose:
+            print(f"[sumo replay] {len(_trace.vehicles)} frozen trajectories, {_trace.n_rows} "
+                  f"vehicle-steps, sumo_seed={_trace.meta.get('sumo_seed')} "
+                  f"({_trace.meta.get('sumo_version')}), teleports={_trace.meta.get('teleports')} "
+                  f"| dist_to_road p50={_offroad_stats['p50']} p95={_offroad_stats['p95']} "
+                  f"max={_offroad_stats['max']} m | trace {_trace.sha256[:16]}", flush=True)
     events = _parse_events(cfg.events)                     # validated timeline (possibly empty)
 
     # ---- scenario-event timeline (deterministic mid-run dynamics; empty -> byte-identical) ----
@@ -3469,7 +3918,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     gt_vehicle, gt_idmap = [], []
     atk_counter = {"n": 0}                  # running index for round-robin attack-type assignment
 
-    def make_vehicle(vid, spawn_time, is_att, is_flt, is_coll, trip, life_hint):
+    def make_vehicle(vid, spawn_time, is_att, is_flt, is_coll, trip, life_hint, replay_span=None):
         vr = random.Random(f"{cfg.seed}:veh:{vid}")
         la_h1, la_h2 = f"lc1:{vid}", f"lc2:{vid}"
         la_id1, la_id2 = 0x0001, 0x0002
@@ -3489,7 +3938,23 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         else:
             atype = "none"
         cf = bool(cfg.traffic_flow and cfg.car_following and trip is not None)
-        if cf:
+        if replay_span is not None:
+            # SUMO REPLAY. The vehicle is a `cf` actor in the only sense `Vehicle.true_state` cares
+            # about -- its truth is read from `cur_*`, which the replay provider writes each step --
+            # but the IDM integrator never runs for it (`cf_active` is off in this mode).
+            #
+            # CERTIFICATE LIFETIME, and this is the point of requirement 5. The internal model has
+            # to GUESS a trip's duration (3x free-flow + half a signal cycle per intersection + 30 s
+            # slack) because congestion makes the arrival time dynamic, and a guess that comes in
+            # short expires an honest vehicle's certificate mid-trip -- mass false `certValidity`
+            # positives and a precision collapse that is an artifact of the budget, not of any
+            # attack. Under replay there is nothing to guess: SUMO already drove the whole trip and
+            # the trace records exactly when this vehicle leaves. The budget is that duration, from
+            # the SUMO route, plus `sumo_cert_slack_s`.
+            cf = True
+            finish_time = replay_span.finish_time
+            life = max(cfg.dt, replay_span.finish_time - spawn_time) + cfg.sumo_cert_slack_s
+        elif cf:
             # car-following: arrival time is dynamic (congestion) -> despawn on route completion.
             finish_time = None
             # Cert validity window must cover the REALISTIC (congested) trip duration, not just 2x
@@ -3668,7 +4133,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         closure_sig: tuple = ()
         rrng = random.Random(f"{cfg.seed}:flow")
         vid, tt = 0, 0.0
-        while True:                              # thinning: candidates at max rate, kept per demand
+        # `_replay is None` is the DEFAULT and is exactly `while True` there -- a constant load, no
+        # draw, no behaviour change. Under SUMO replay the engine's own arrival process is simply not
+        # run: SUMO decided who departs when, and the frozen trace records it (block below).
+        while _replay is None:                   # thinning: candidates at max rate, kept per demand
             tt += rrng.expovariate(cand_rate) if cand_rate > 0 else total_time
             if tt >= total_time:
                 break
@@ -3696,6 +4164,33 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     if net is not None else None)
             make_vehicle(vid, tt, is_att, is_flt, is_coll, trip, life_hint=90.0)
             vid += 1
+        if _replay is not None:
+            # ---- SUMO REPLAY: the arrival process IS the frozen trace ------------------------- #
+            # No thinning, no expovariate, no `random_trip` -- departures, routes and car-following
+            # are all SUMO's, decided before this run started. What is still drawn here is the ROLE
+            # assignment (attacker / faulty / colluder), which belongs to the SECURITY experiment
+            # rather than to the traffic model, and it comes from its OWN string-keyed stream
+            # (`{seed}:sumoflow`) so it cannot touch the global `rng` sequence the pinned goldens
+            # depend on. Vehicles are created in the trace's canonical `idx` order, which the
+            # artifact records, so `vid` is a deterministic function of the trace alone.
+            _srng = random.Random(f"{cfg.seed}:sumoflow")
+            from .roads import Trip as _Trip
+            for _span in _replay.plan(total_time=total_time, max_vehicles=cfg.max_total_vehicles):
+                is_att = _srng.random() < cfg.attacker_pct
+                is_flt = (not is_att) and _srng.random() < cfg.faulty_pct
+                is_coll = is_att and _srng.random() < cfg.collude_pct
+                # The engine's `Trip` still exists for this vehicle, built from the DRIVEN polyline
+                # rather than from a router: `trip.length` is the SUMO route length and `trip.speed`
+                # its mean speed, so everything that reads `Vehicle.trip` keeps working. The
+                # per-step kinematics never come from it -- they come from the frozen arrays.
+                _trip = _Trip(_span.polyline, _span.mean_speed, _span.spawn_time)
+                make_vehicle(vid, _span.spawn_time, is_att, is_flt, is_coll, _trip,
+                             life_hint=90.0, replay_span=_span)
+                _replay.bind(vid, _span.idx)
+                vid += 1
+            if cfg.verbose:
+                print(f"[sumo replay] {vid} vehicles scheduled from the frozen trace over a "
+                      f"{total_time:.0f} s horizon", flush=True)
         if _closure_evs and net is not None and hasattr(net, "set_closures"):
             net.set_closures([])                 # routing closures only affect the spawn pre-pass
     else:
@@ -3981,6 +4476,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         suite = build_checks(cfg, station_types=_emit_station_type, denm=_denm_enabled)
     finally:
         _LEGACY_RNG["rng"] = None
+    if _armed:
+        _run_sentinel.verify("after LOADING the detection layer")
     DET_KEYS = suite.keys
     SOFT_KEYS = suite.soft_keys
     _DET_ZERO = suite.zero
@@ -4201,7 +4698,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
 
     # car-following: the Intelligent Driver Model gives realistic accel/decel, so vehicles queue and
     # experience stop-and-go behind slower leaders -> genuine congestion the detectors must tolerate.
-    cf_active = bool(cfg.traffic_flow and cfg.car_following and net is not None)
+    # Under SUMO replay the IDM integrator is OFF: SUMO already did the car-following (and the
+    # signal control, and the gap acceptance, and the lane changes), and re-integrating on top of a
+    # frozen trajectory would be two models fighting over the same state.
+    cf_active = bool(cfg.traffic_flow and cfg.car_following and net is not None) and _replay is None
     _CF_CELL = max(cfg.idm_lookahead_m, 30.0)
     _lights = bool(cfg.traffic_lights and net is not None)
     _turn = bool(cfg.turn_slowdown and net is not None)
@@ -4505,6 +5005,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         active_list = [active[vid] for vid in sorted(active)]
         if cf_active:
             car_follow(active_list, t)
+        elif _replay is not None:
+            # THE MOBILITY SEAM, in one line and in exactly the place `car_follow` occupies: the
+            # provider writes cur_x / cur_y / cur_v / cur_h / s_pos from the frozen trace, and the
+            # entire rest of the step -- broadcast pre-pass, channel, detectors, MA, reporting --
+            # is untouched code reading untouched fields.
+            _replay.advance(active_list, step, t)
 
         # PRE-PASS: every active broadcast this step (real pseudonyms + sybil ghosts)
         broadcasts: list[dict] = []
@@ -5154,6 +5660,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             sorted(gt_denm, key=lambda r: r["denm_id"]))
     data_digest = _data_digest(cfg.out_dir, data_files)
     chan.close()                       # ALWAYS called, including on the SIGINT finalisation path
+    # Isolated detector workers: FINISH (which collects their declared streams for the manifest and
+    # asserts they scored every message they were sent) and reap the processes. Before
+    # `suite.provenance()` below, which reads what FINISH returned.
+    suite.close()
     # The manifest is about to claim that THIS config produced THIS data. Check that first: a
     # mid-run write leaves a dataset that neither the old nor the new value describes, so the honest
     # outcome is no manifest at all rather than a plausible one nobody can replay.
@@ -5164,15 +5674,15 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     plugins=plugin_block([chan_provenance()] + suite.provenance(),
                                          drift=_drift_allowed,
                                          integrity=({"armed": True,
-                                                     "verified_at": ["channel construction",
-                                                                     "check construction",
-                                                                     "fusion construction",
+                                                     "verified_at": ["plugin resolution (import)",
+                                                                     "channel plugin load",
+                                                                     "detection layer load",
                                                                      "end of run"],
                                                      "watched": _run_sentinel.watched,
                                                      "engine_rng_words": _integrity_words,
                                                      "ok": True}
                                                     if _armed else None)),
-                    config_snapshot=_cfg0)
+                    config_snapshot=_cfg0, mobility=_mob_block)
 
     return RunResult(out_dir=cfg.out_dir, n_vehicles=len(vehicles), n_reports=n_reports,
                      n_investigations=len(ma_investigations), n_revoked=len(revoked_vehicles),
@@ -5269,7 +5779,7 @@ STANDARDS_PROFILE = {
 
 
 def _write_manifest(cfg, data_files, data_digest, counts, plugins=None,
-                    config_snapshot=None) -> None:
+                    config_snapshot=None, mobility=None) -> None:
     manifest = {
         "dataset_version": __version__,
         "build_utc": datetime.now(timezone.utc).isoformat(),   # NOT part of data_digest
@@ -5303,6 +5813,13 @@ def _write_manifest(cfg, data_files, data_digest, counts, plugins=None,
         # addressed. Excluded from data_digest by construction; carries its own provenance_digest.
         "plugins": plugins if plugins is not None else empty_plugin_block(),
     }
+    # The MOBILITY LOCK, and it is the same dvc.yaml/dvc.lock split the plugin block is: `config`
+    # carries the INTENT (a path and a pinned hash), this carries what was actually replayed --
+    # the SUMO build and seed that produced it, the network it was frozen on by content, and the
+    # measured coherence between the two. Emitted ONLY when the mode is on, so a default run's
+    # manifest is byte-identical (and it is outside `data_digest` by construction either way).
+    if mobility is not None:
+        manifest["mobility"] = mobility
     with open(os.path.join(cfg.out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as fh:
         json.dump(manifest, fh, indent=2, sort_keys=True)
         fh.write("\n")
@@ -5532,8 +6049,34 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--flow", action="store_true", help="traffic-flow mode: vehicles spawn/despawn over time")
     p.add_argument("--duration", type=float, default=0.0, help="flow: sim length in seconds")
     p.add_argument("--arrival-rate", type=float, default=2.0, help="flow: mean vehicles spawned per second")
-    p.add_argument("--road", default="linear", choices=["linear", "grid", "ring", "spider", "custom"],
-                   help="road network model (spider: --grid = arms, --grid-h = rings)")
+    p.add_argument("--road", default="linear",
+                   choices=["linear", "grid", "ring", "spider", "custom", "sumo"],
+                   help="road network model (spider: --grid = arms, --grid-h = rings; "
+                        "sumo: import --sumo-net through netimport)")
+    # --- SUMO-backed mobility (see mock_pipeline/sumo_trace.py) --------------------------------- #
+    p.add_argument("--mobility-source", default="internal",
+                   choices=list(_api_registry.builtin_names("mobility")),
+                   help="where vehicle movement comes from: internal (routed IDM car-following, the "
+                        "default) or sumo_replay (a frozen SUMO trajectory; needs --sumo-trace and "
+                        "--road sumo)")
+    p.add_argument("--sumo-net", default="", metavar="NET_XML",
+                   help="--road sumo: the SUMO .net.xml the engine imports as its road graph "
+                        "(with --mobility-source sumo_replay it must be the net the trace was "
+                        "frozen on)")
+    p.add_argument("--sumo-frame-city", default="", metavar="CITY",
+                   help="geo-referenced .net.xml: re-project it into osm.py's local frame for this "
+                        "city, so it registers with osm.py roads and building footprints")
+    p.add_argument("--sumo-trace", default="", metavar="TRACE",
+                   help="--mobility-source sumo_replay: the frozen trajectory artifact "
+                        "(python -m scms_sim_ref.mock_pipeline.sumo_trace ...)")
+    p.add_argument("--sumo-trace-sha256", default="", metavar="HEX",
+                   help="PIN the frozen trajectory: a re-frozen trace (different SUMO seed or "
+                        "build) is then refused instead of silently changing data_digest")
+    p.add_argument("--sumo-cert-slack", type=float, default=30.0,
+                   help="replay: extra certificate lifetime past the trace's exact despawn time (s)")
+    p.add_argument("--sumo-offroad-p95-max", type=float, default=8.0,
+                   help="replay coherence gate: max p95 distance (m) from a replayed position to "
+                        "the engine's nearest road")
     p.add_argument("--custom-network", default="", metavar="JSON_OR_FILE",
                    help='custom map: inline JSON {"nodes":[[x,y]...],"edges":[[a,b]...]} or a file path')
     p.add_argument("--custom-network-directed", action="store_true",
@@ -5717,6 +6260,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                          custom_network=_inline_or_file(args.custom_network),
                          custom_network_directed=args.custom_network_directed,
                          directed_lanes=args.directed_lanes, drive_side=args.drive_side,
+                         mobility_source=args.mobility_source, sumo_net=args.sumo_net,
+                         sumo_frame_city=args.sumo_frame_city, sumo_trace=args.sumo_trace,
+                         sumo_trace_sha256=args.sumo_trace_sha256,
+                         sumo_cert_slack_s=args.sumo_cert_slack,
+                         sumo_offroad_p95_max_m=args.sumo_offroad_p95_max,
                          events=_inline_or_file(args.events),
                          grid_w=args.grid, grid_h=(args.grid_h or args.grid), grid_block_m=args.grid_block,
                          n_lanes=args.lanes, lane_width_m=args.lane_width, light_cycle_s=args.light_cycle,

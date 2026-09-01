@@ -58,7 +58,8 @@ And what is NOT claimed, stated as plainly as the rest:
   raises the bar and does not remove it.
 * A **passing** verification means "nothing on the watch list moved", never "this plugin is honest".
   Reading the oracle through a frame walk moves nothing at all, and stays perfectly reproducible
-  while doing it. See `docs/realism/DETECTOR-PLUGIN.md` section 2.
+  while doing it. Genuinely untrusted detector code needs an out-of-process boundary, where the
+  oracle is not in the address space. See `docs/realism/DETECTOR-PLUGIN.md` section 2.
 
 **Armed only when the config declares plugins** (``cfg.plugins`` non-empty). A run with no plugins
 runs no third-party code, so there is nothing to monitor and the default path pays nothing -- which
@@ -195,15 +196,20 @@ class Sentinel:
         if not self.armed:
             return []
         out = []
-        for name in RANDOM_METHODS:
-            was = self._rand[("random.Random", name)]
-            now = random.Random.__dict__.get(name, _INHERITED)
-            if now is not was:
-                out.append((f"random.Random.{name}",
-                            f"{_describe(was)} -> {_describe(now)}; a method rebind on the class "
-                            f"reaches EVERY stream in this interpreter at once, including the "
-                            f"engine's own private random.Random(cfg.seed), while leaving every "
-                            f"generator STATE a snapshot could compare perfectly intact"))
+        # The CLASS first. When `random.Random` itself has been rebound, every per-method comparison
+        # below is against a different class and would report twenty consequences of one cause, so
+        # the cause is reported alone.
+        class_moved = random.Random is not self._rand[("random", "Random")]
+        if not class_moved:
+            for name in RANDOM_METHODS:
+                was = self._rand[("random.Random", name)]
+                now = random.Random.__dict__.get(name, _INHERITED)
+                if now is not was:
+                    out.append((f"random.Random.{name}",
+                                f"{_describe(was)} -> {_describe(now)}; a method rebind on the class "
+                                f"reaches EVERY stream in this interpreter at once, including the "
+                                f"engine's own private random.Random(cfg.seed), while leaving every "
+                                f"generator STATE a snapshot could compare perfectly intact"))
         for key in (("random", "Random"), ("random", "SystemRandom"), ("random", "_inst")):
             was, now = self._rand[key], getattr(random, key[1], None)
             if now is not was:
@@ -243,6 +249,13 @@ class Sentinel:
         has poisoned the interpreter for whatever runs next, which is worse than not looking."""
         if not self.armed:
             return
+        # THE CLASS FIRST, and the order is load-bearing: with `random.Random` rebound to an
+        # impostor, the per-method loop below would write the engine's original methods ONTO THE
+        # IMPOSTOR and leave the rebind itself in place -- restoring nothing while looking like it had.
+        for name in ("Random", "SystemRandom", "_inst") + RANDOM_MODULE_NAMES:
+            was = self._rand.get(("random", name), _MISSING)
+            if was is not _MISSING and getattr(random, name, None) is not was:
+                setattr(random, name, was)
         for name in RANDOM_METHODS:
             was = self._rand[("random.Random", name)]
             if random.Random.__dict__.get(name, _INHERITED) is was:
@@ -254,10 +267,6 @@ class Sentinel:
                     pass
             else:
                 setattr(random.Random, name, was)
-        for name in ("Random", "SystemRandom", "_inst") + RANDOM_MODULE_NAMES:
-            was = self._rand.get(("random", name), _MISSING)
-            if was is not _MISSING and getattr(random, name, None) is not was:
-                setattr(random, name, was)
         for (mod_name, attr), was in self._mods.items():
             mod = sys.modules.get(mod_name)
             if mod is not None and getattr(mod, attr, _MISSING) is not was:

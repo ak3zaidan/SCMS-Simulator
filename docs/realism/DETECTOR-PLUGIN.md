@@ -4,10 +4,17 @@
 on this host (Windows Server 2022, CPython 3.12.10, `PYTHONHASHSEED=0`) against an out-of-repo
 distribution installed as its own wheel. Nothing here is illustrative.
 
-**Full engine suite: `951 passed in 1033.74s`, exit 0.** Reference digest
+**Full engine suite: `995 passed in 1025.57s`, exit 0.** Reference digest
 `b25f2137cf14dd504d56bb88cd67cce273b6a6ac348f7c59ee6d3b4372257815` reproduced with the plugin
 distribution installed and with no plugins declared. Reproduce the functional evidence with
 `C:\Temp\scms_detector_demo\ACCEPTANCE.ps1`.
+
+> **The out-of-process boundary now exists.** `"isolated": true` on a `check` entry runs it in its
+> own interpreter, where the run's ground truth is not present at all —
+> [**§2.8**](#28-isolated-mode--the-process-boundary-and-the-only-answer-for-code-you-cannot-review)
+> is the section for a detector you did not write. Same seed, same scores, same `data_digest`;
+> ~40 µs per delivered message; the hostile frame-walking detector that files 1 910 label-derived
+> reports in process files **zero** there. What it does not close is measured in the same section.
 
 > **The safety claim in this document was wrong until 2026-08-31 and is now stated correctly.**
 > An earlier revision of §1.2 called the `Observation` boundary "a boundary you cannot walk around".
@@ -116,8 +123,10 @@ build anything on top of this seam.
 > **An in-process detector plugin is TRUSTED code.** It runs inside the engine's interpreter with
 > the engine's privileges, exactly like any other installed dependency. The `Observation` boundary
 > stops *accidental* leakage and makes *deliberate* leakage deliberate, reviewable and detectable.
-> It does not — and cannot — stop a plugin that means to read the labels. A detector you genuinely
-> do not trust must not be run in this mode.
+> It does not — and cannot — stop a plugin that means to read the labels. **A detector you genuinely
+> do not trust runs with `"isolated": true`** ([§2.8](#28-isolated-mode--the-process-boundary-and-the-only-answer-for-code-you-cannot-review)),
+> in its own interpreter, where the labels are not present — same scores, same seed, same digest,
+> about 40 µs per message.
 
 ### 2.2 The vector, stated rather than left for you to find
 
@@ -157,21 +166,26 @@ Python gives every callable in a process the same reflective powers: `sys._getfr
 `inspect.currentframe`, `gc.get_objects`, `gc.get_referrers`, module globals, `__subclasses__`,
 `__closure__`, `ctypes`. No arrangement of frozen dataclasses, wrapper objects or namespaced
 mappings changes that, and stacking more wrappers only makes a false claim harder to disprove. So
-the engine does three things that *are* true, and claims nothing more:
+the engine does four things that *are* true, and claims nothing more:
 
 | layer | what it actually guarantees | what defeats it |
 |---|---|---|
 | **`Observation`** | no ground truth reachable **by name**; nothing attachable; no declared field writable via `setattr` / `object.__setattr__` / `del` | `type(obs).claimed_x.fget.__self__.__set__(obs, v)` — the saved slot descriptor |
 | **`NamespacedState`** | the mapping interface lands in `plugin:<id>`; reserved keys raise on write; `h` comes back a tuple and `streak` a read-only proxy over a **copy** | `object.__getattribute__(ns, "_st")` — the wrapper holds the engine's dict |
 | **the source gate** | refuses frame walking, `gc` reflection, trace hooks, `ctypes`, `eval`/`exec`, and engine-internal imports, at load, by line number | `getattr(sys, "_get" + "frame")`; an `eval`; a helper module the gate does not parse |
+| **the integrity monitor** (§2.6) | the RNG primitives, the engine's own gates and the boundary classes are the **same objects** at the end of the run that they were at the start, and the engine's stream advanced exactly as many words as it drew | a plugin that tampers, uses the tamper, and puts the binding back **before the next checkpoint**; and everything that moves nothing at all — a frame walk moves nothing |
 
-Both residues are **pinned by tests** (`tests/test_detector_trust_boundary.py`), so if a future
-change closes one, the test fails and this table has to be upgraded rather than left overstating.
+All three residues are **pinned by tests** (`tests/test_detector_trust_boundary.py`,
+`tests/test_plugin_integrity.py`), so if a future change closes one, the test fails and this table
+has to be upgraded rather than left overstating.
 
 The honest boundary is a process boundary: a detector in its own process, with an explicit message
-interface, where the oracle is simply not in the address space. That is the next phase, and it is
-the only answer for genuinely untrusted code. Until it exists, treat "who wrote this detector?" as
-the same question as "who wrote this dependency?".
+interface, where the oracle is simply not in the address space. **That exists now** — `"isolated":
+true`, [§2.8](#28-isolated-mode--the-process-boundary-and-the-only-answer-for-code-you-cannot-review),
+measured on the identical hostile class this section describes: in process its frame walk reaches
+`run_pipeline`'s locals and it files 1 910 reports built out of `is_attacker`; isolated it reaches
+seven frames of the serialiser and files none. For anything you run **in** process, the question
+"who wrote this detector?" is still the same question as "who wrote this dependency?".
 
 ### 2.4 The source gate
 
@@ -245,7 +259,325 @@ It is a config key, not a flag, so it replays and it is written verbatim into
 `"source_gate"` accepts `"on"` (default) and `"off"`; anything else is an error, never a silent
 default.
 
-### 2.5 What this means if you are running a benchmark
+### 2.5 When the engine checks a plugin — and why "when" was a defect
+
+Three defects in this seam were about **time**, not about data, and all three were measured on this
+engine before they were fixed.
+
+**Attestation used to run AFTER construction.** `build_channel` instantiated the run's plugin and
+only then called the conformance suite on it; `build_checks` repeated the ordering. A hostile
+`__init__` therefore executed before anything gated it. Measured, on the round-2 code, with a channel
+model that genuinely fails **C1, C2, C3 and C6b** and whose `__init__` is one line replacing
+`conformance.runner.run_ref` with a function that always says yes:
+
+```
+plugins.channel_model = {"ref": "…:AttestSubverterChannel", "conformance": "required"}
+  exit 0, manifest written,
+  manifest["plugins"]["loaded"][0]["conformance"] = {"passed": 99, "failed": 0, "ok": true}
+```
+
+Ninety-nine checks that were never run, recorded in the artifact as evidence of conformance. **An
+attestation performed by code the subject can rewrite attests to nothing.** Two changes:
+
+* attestation now runs **before** the run's instance is constructed, and
+* it runs in a **child interpreter** (`scms_sim_ref/conformance/attest.py`). Conformance has to build
+  the candidate to grade it, so *somewhere* a hostile `__init__` runs; now it runs in a process that
+  is discarded a moment later and shares no object with the run. The child brackets the suite with
+  its own integrity sentinel and reports what it saw, so a candidate that tampers while being
+  attested is refused whatever its check results say.
+
+The same model on this branch: `ConfigError … does not conform: ['C1_repeatable',
+'C2_call_order_independent', 'C3_global_rng_untouched', 'C6b_…']`, no output directory, and the
+plugin's constructor **never ran in the engine's process at all** — which is the property the test
+asserts, because the order is what the defect was.
+
+**A constructor is still arbitrary code**, so every third-party load — channel, check and fusion —
+is bracketed by an integrity snapshot. An `__init__` that rebinds `random.Random` or replaces
+`api.channel.check_outcome` is fatal **before step 0**, before an output directory exists.
+
+**And `__init__` is not the earliest hook.** `resolve()` calls `importlib.import_module`, so
+*module-level* code runs first — `random.Random = Impostor` at module scope is one line, and the
+source gate's name list does not contain it (and does not apply to the channel slot at all). Worse,
+the import happens inside `validate_config`, which resolves every declared ref. So the run's snapshot
+is the **first statement of `run_pipeline`**, taken before validation reads `cfg.plugins` at all.
+Checkpoints, in order: plugin resolution (import), after the channel plugin loads, after the
+detection layer loads, and the end of the run.
+
+### 2.6 Conformance is a sampling check, not a proof
+
+**Read this before you read a `conformance_report.json`.**
+
+A `random.Random` class rebind guarded on `if frame.step >= 30` passes **all four** of C3's traps.
+That is not a hole in the traps — they are correct, and they catch that exact rebind when it is
+installed inside the window they drive. It is a property of **any** fixed-window contract test:
+
+> **A conformance suite can only certify the behaviour it observed.**
+
+Lengthening the window moves the number an attacker waits out; it does not change the shape of the
+statement, so the window was not lengthened. What was added is monitoring that holds for the **whole
+run** (`src/scms_sim_ref/api/integrity.py`), armed whenever `cfg.plugins` declares anything:
+
+| instrument | what it certifies | what it cannot see |
+|---|---|---|
+| **identity snapshot** — 122 named objects: `random.Random` and every generator method on it, the module-level `random` bindings, `check_outcome`, `srcgate.gate`, `registry.resolve`/`verify_lock`, `run._attest`/`_data_digest`/`_write_manifest`, `Observation`, `NamespacedState`, `LinkOutcome`, a builtins core, and interpreter-wide trace/profile/`meta_path` hooks | at the end of the run the engine is made of the same objects it was made of at the start | a binding that was tampered with, used, and **restored** before the checkpoint |
+| **`WitnessedRandom`** — the engine's global stream counts Mersenne-Twister words (`random()` = 2, `getrandbits(k)` = `ceil(k/32)`), and the end state is replayed against a pristine generator | the engine's own stream advanced **exactly** as far as the draws it made would put it | a plugin drawing *through* the counted methods; the count itself is not derived from the engine's arithmetic |
+
+They are complementary, and the delayed attack shows why. Measured, all on the same 40-step
+grid-5×5 seed-17 scenario:
+
+| what the plugin does | before the monitor | on this branch |
+|---|---|---|
+| `random.Random = Impostor` at `frame.step >= 30` | **exit 0**, manifest written, digest `8700549dfa0669ac…` | `IntegrityError … at the END of the run`, **no manifest** |
+| the same model with the attack never firing (honest baseline) | digest `8700549dfa0669ac…` | identical |
+| `random.Random.random` rebound at step 30 and **put back** at step 34 | exit 0 | `the engine's global random stream is NOT where … counted Mersenne-Twister words … would put it` |
+
+**Read the first two rows together.** `Impostor` is a plain `random.Random` subclass, so the
+digest does not move — the attacking run and the honest run produce **the same bytes**. The pinned
+goldens, the two-run equality gate and the content-hash lock are all structurally blind to it,
+exactly as they are to a frame walk. Owning `random.Random` is a *capability*; what it is worth is
+whatever the next version of the plugin does with it, and by then it is twenty keyed
+`random.Random(f"{seed}:…")` construction sites deep in the engine.
+
+`manifest["plugins"]["integrity"]` records `armed`, `watched`, `verified_at` and
+`engine_rng_words` — present only in a run that declared plugins, so a manifest written without
+them is byte-identical to what it always was.
+
+**And the negative claim, because the whole section is worthless without it.** A *passing*
+verification means "nothing on the watch list moved". It does not mean the plugin was honest. A
+detector reading the labels through `sys._getframe` moves nothing on either list, and stays
+perfectly reproducible while doing it. The monitor is detection at named checkpoints, not
+containment. Pinned in
+`tests/test_plugin_integrity.py::test_the_monitor_is_not_a_sandbox_and_the_module_says_so`.
+
+### 2.7 `check_outcome` validates into a copy
+
+C7's runtime form used to validate by *reading* the caller's object and then hand **the same object**
+back. Nothing obliges a channel model to return the real `LinkOutcome` class, and an object whose
+`rssi_dbm` is a stateful `property` returns one value to the checker and another to the engine.
+Measured on this engine, a model whose outcome serves `-70.0` on its first read and `9999.0` on every
+read after it:
+
+| | `ma/ma_reports.jsonl` | digest |
+|---|---|---|
+| before | **2024 rows carrying `rssi_dbm = 9999.0`** (+9999 dBm ≈ 10³⁷ W, past the declared `[-140, 0]` band) | `2e053ed777edee94…` |
+| now | 2024 rows carrying `-70.0`, the value that was validated | `20557d1115f0b5dc…` |
+
+Every field is now read exactly once into a local, the *locals* are validated, and a fresh
+`LinkOutcome` built from coerced primitives is what the engine goes on to use. The plugin no longer
+holds the object the engine reads.
+
+### 2.8 Isolated mode — the process boundary, and the only answer for code you cannot review
+
+**This is the mode for a third-party submission.** The detector runs in its own interpreter; the
+engine serialises the `Observation` — and only the `Observation` — to it and reads back a score. The
+broadcast dict, the `Vehicle`, the `PipelineConfig` and the engine's global `random.Random(cfg.seed)`
+are not sent, are not referenced by anything that is sent, and **do not exist in that process at
+all**. It is one config key:
+
+```jsonc
+"plugins": {
+  "check": ["@builtins",
+            {"ref": "their_detectors.threshold:TheirCheck",
+             "params": {"tolerance_mps": 3.0},
+             "isolated": true}]
+}
+```
+
+`isolated` is a config key rather than a flag, so it lands verbatim in
+`manifest["config"]["plugins"]`, it replays, and `manifest["plugins"]["loaded"][*]` carries
+`"isolated": true` — a dataset produced this way says so in its own lock.
+
+**The property that makes it usable: the same detector gives the same answer.** Measured on this
+host, one 300 s / 593-vehicle run (`--flow --road grid --grid 6 --duration 300 --arrival-rate 2
+--attacker-pct 0.15 --traffic-lights --seed 42`), the real `scms-demo-detector` at
+`tolerance_mps = 3.0`:
+
+| configuration | in-process `data_digest` | isolated `data_digest` | equal |
+|---|---|---|---|
+| `["@builtins", plugin]` | `81c194edbadecc47b5c437bee584e46135391467f0447d91f0445c66e4a1d78d` | *same* | **yes** |
+| plugin alone | `d71b29f0eb4d52900f22a6adb933e3eb3bd30f05824b102600862c66c9f99f57` | *same* | **yes** |
+
+Every count matched too — 7 856 reports / 152 revoked on the first row, 477 / 19 on the second — and
+the first row's digest is the one §5.2 already records for the **in-process** run, so isolated mode
+reproduces a number this document pinned before the mode existed.
+
+**Three things make that hold, and each one was a decision.**
+
+1. **JSON round-trips a float exactly.** `json.dumps` renders through `float.__repr__`, the shortest
+   string that decodes back to the same double, so a score is bit-identical across the pipe. Pinned
+   per field in `tests/test_detector_isolation.py` with `repr()` rather than `==`, because `==` would
+   pass for two doubles that merely printed the same.
+2. **The child derives randomness the same way the engine would have.** `RngNamespace(seed,
+   plugin_id)` is a pure function of `(seed, replicate, plugin, label, ids, step)`, so the worker
+   builds its own from the two values it is told and draws the identical words. The engine announces
+   the step on every `EVAL`; nothing about the stream depends on which process it is in.
+3. **The engine keeps owning the state.** The plugin's `state["plugin:<id>"]` crosses on every
+   message and comes back, so the engine's own pruning of `last_claimed` still governs its lifetime.
+   The cost is that an isolated check's state must be **JSON** — numbers, strings, booleans, lists,
+   dicts. A value that will not serialise is named at the first message
+   (`state['thing'] is not JSON-serialisable`) rather than dropped, because a silent drop would make
+   the two modes disagree on message 2, which is the worst possible way to learn about a constraint.
+
+**Transport: length-prefixed JSON over the child's stdin/stdout.** Four bytes big-endian, then that
+many bytes of UTF-8 JSON, strict lockstep, one reply per request, the sequence number echoed and
+asserted. The reasons, in order of weight, are in `api/isolate.py`'s docstring and worth repeating
+here because they are what makes the mode safe rather than merely separate:
+
+* **JSON is data, not code.** The reply comes from a process the untrusted detector runs inside, so
+  the parent must be unable to be harmed by a hostile reply. `pickle` — and therefore
+  `multiprocessing`, whose queues pickle — would hand that process arbitrary code execution *in the
+  engine*, which is precisely what this mode exists to prevent. A crafted JSON document is at worst
+  a wrong number, and every number is range-checked on arrival.
+* **No ambient resource.** No port to allocate (no ephemeral-port collision, no loopback firewall
+  prompt on Windows, no second process able to connect), no temp file to race. The pipe dies with the
+  parent, so an abandoned worker is reaped by the OS and not by a cleanup path that might not run.
+* Rejected for the same reasons, plus one each: a loopback socket (connectable by anything);
+  shared memory (needs a lock discipline, and a hostile child can corrupt the parent's view);
+  per-**step** batching as the channel ABI specifies (§2.3 of `PLUGIN-ARCHITECTURE.md`) — the fusion
+  consumes one message's score before the next message is scored, so batching a step means
+  restructuring the reception loop and re-pinning every golden.
+
+**Failure is loud, and the timeout is a fail-stop.** A worker that crashes, hangs, desynchronises,
+returns a non-number or reports a message count that does not match what it was sent **fails the
+run**. There is no branch on which any of those becomes a `0.0`: a dataset in which "the detector was
+broken" and "the detector saw nothing" are the same bytes is worse than no dataset. The watchdog is
+the only clock in the mode, and it can turn a run into a failure — never into a different run, which
+is what keeps the engine independent of the child's scheduling.
+
+```
+plugins.check 'their.det:TheirCheck': the isolated worker refused EVAL.
+  RuntimeError: detector exploded on purpose
+  ...their/det.py, line 41, in evaluate
+plugins.check 'their.det:Slow': the isolated detector did not answer within 60s and was killed.
+  A hung detector FAILS THE RUN -- there is no path on which a timeout becomes a score, because a
+  score that depends on the scheduler is not reproducible.
+```
+
+**The overhead, measured, on that same 300 s / 593-vehicle run.** A benchmark is worth a slow mode;
+you need the number to decide.
+
+| vector | observations scored | in-process | isolated | factor | per observation |
+|---|---:|---:|---:|---:|---:|
+| `@builtins` + plugin | 960 509 | 12.37 s | 53.49 s | **4.3×** | **+40.8 µs** |
+| plugin alone | 1 210 797 | 9.54 s | 53.85 s | **5.7×** | **+35.7 µs** |
+
+The round trip *is* the cost: 39.18 s of the 41.1 s delta was measured inside the proxy call, so
+95 % of the overhead is the exchange itself and essentially none of it is the engine. On a short run
+the fixed cost dominates instead — a 40 s grid-5×5 scenario goes 0.44 s → 2.14 s, of which ~1.0 s is
+the child interpreter starting. **Budget roughly 40 µs per delivered message per isolated check**,
+plus one second of process start.
+
+*An earlier build of this mode measured 50.6 µs, and the difference is worth naming because it is
+where the time in a scheme like this actually goes.* It was **not** the pipe: it was four redundant
+`json.dumps` calls per message, one per reserved state key, probing "will this serialise?" before
+encoding the payload that would have answered the same question. Encoding once and probing per key
+only when that fails took 20 % off the per-message cost. Both builds reproduced `81c194ed…`, which is
+the property that made the optimisation safe to make at all.
+
+**The proof: the same hostile detector, both ways.** A check whose `evaluate` is
+`sys._getframe(1).f_locals["b"]`, run on the 40 s grid-5×5 seed-17 scenario. In process it needs
+`"source_gate": "off"` — which is exactly what a reviewer who waved the submission through would
+have written.
+
+| | in-process (`source_gate: off`) | **isolated** |
+|---|---|---|
+| frames above the detector's own | 3: **`scms_sim_ref.mock_pipeline.run.run_pipeline`**, then the caller and the module | 6: `api/isolate.py`'s `_Worker.evaluate`, `serve`, `main`, its module, then `runpy` ×2 |
+| the caller's locals | ~300, including `b`, `cfg`, `rng`, `vehicles`, `gt_vehicle`, `last_claimed`, `pseudonym_info`, `revoked_vehicles` | `['_types', 'fields', 'msg', 'obs', 'self', 'state']` — the payload it just decoded, and nothing else |
+| `b` | `['cg','ch','conf','cs','cvf','cvt','cx','cy','digest','falsified','ghost','msg_count','sig_ok','station_type','thdg','tspd','veh','x','y']` | **not present in any frame** |
+| the oracle | `veh` = `Vehicle`, `is_attacker=True`, `attack_type='ConstPosOffset'`, true `x,y` = `466.45, 120.0`, `falsified`, `ghost` | **unreachable** |
+| the engine's global rng | `WitnessedRandom` | **unreachable** |
+| `scms_sim_ref` modules in the process | 22 | **8**, every one of them `scms_sim_ref.api.*`; `mock_pipeline` is never imported |
+| what it produced | **1 910 reports, every one of them ≥ 1.0 on the label**, 15 vehicles revoked, digest `7faa7aed9a3fe6f7…` | **0 reports**, 0 revoked, digest `9e97f83c0f7139d4…` |
+
+Read the last row twice. In process the label-reading detector produced a complete, perfectly
+reproducible dataset built out of the answers. Isolated, the identical class has no signal and files
+nothing — not because it was refused, but because there was nothing there to read.
+
+#### What isolated mode does **not** close
+
+**1. THE FILESYSTEM, and it is worse than "an earlier dataset is on the disk".** The child is an
+ordinary OS process running as the same user. It cannot reach the engine's objects; it can read the
+disk — and **the run streams its own ORACLE labels to the disk while the loop is still running.**
+
+Measured. An isolated detector declared alongside `@builtins` (so the built-in suite files reports
+and the stream fills), probing at its 20 000th message, mid-run, from its own process:
+
+```
+ground_truth/gt_report_labels.jsonl  -> readable, non-empty:
+  {"_visibility":"ORACLE","report_correctness":"correct","report_id":"rpt_00001",
+   "reporter_true_id":"veh_000","subject_true_id":"veh_001"}
+ma/ma_reports.jsonl                  -> readable, non-empty
+ground_truth/gt_vehicle.jsonl        -> FileNotFoundError   (written after the loop)
+manifest.json                        -> FileNotFoundError   (written after the loop)
+this repository's run.py             -> readable, 395 662 bytes
+a COMPLETED earlier run's gt_vehicle.jsonl -> readable:
+  {"_visibility":"ORACLE","attacker_role":"ConstPos",...,"is_attacker":true,
+   "true_vehicle_id":"veh_000","veh_type":"bus"}
+```
+
+`gt_report_labels.jsonl` is the **oracle verdict on every report filed so far in this same run**,
+with the true vehicle ids of reporter and subject. A hostile isolated detector that opens it gets a
+lagging, partial oracle: not the per-message `falsified` flag its own `Observation` is derived from,
+but enough to learn which certificates the ground truth calls attackers, in the run it is being
+graded on. The frame walk it replaces gave it the label *before* it scored; this gives it labels for
+messages already scored, which for a stateful detector watching the same senders is most of the way
+back.
+
+**So the claim this mode supports is narrower than "the detector cannot see the labels".** It is:
+**the run's ground truth is not in the detector's address space** — measured, `oracle_reachable =
+False`, the walk terminates in the serialiser. Everything the detector can still reach, it reaches as
+a *file*, which means the remedy is a file-system remedy and not a Python one:
+
+* give the worker a working directory and a user that cannot read the output directory (Windows: a
+  restricted-token or separate user account plus ACLs on `out_dir`; Linux: a different uid, or a
+  mount namespace);
+* or run the engine with `--out` on a volume the submitted code cannot see, and publish the dataset
+  only after the run;
+* or wrap the worker in an OS-level sandbox — which this mode makes *possible*, because there is now
+  exactly one process to wrap and it speaks exactly one pipe.
+
+None of those is implemented here, and none of them is claimed. This is asserted in
+`tests/test_detector_isolation.py::test_the_child_still_reads_the_filesystem_and_the_docs_say_so`
+and `::test_the_child_can_read_this_runs_streamed_oracle_labels` so this paragraph cannot quietly
+become false — the second test exists specifically because the first draft of this section said the
+same-run files were unreadable, and measuring it showed they are not.
+
+**2. The worker reports its own identity.** The child says where it loaded the plugin from; the
+parent hashes *those paths itself* (reading a file is not importing it), so `module_sha256`,
+`package_sha256` and the drift refusal on replay all still work — a replay re-probes in a child and
+compares. What the parent cannot check is that the paths are the ones the child actually imported: a
+worker that loads module A and names module B produces a self-consistent lock over the wrong files.
+The in-process mode has the strictly larger version of this hole (there the plugin can rewrite
+`registry.package_sha256` itself, which is why the integrity monitor watches it), but it is a hole.
+
+**3. Config-time schema introspection is given up.** `--dump-config-schema`, the GUI's advanced panel
+and the copilot cheat-sheet cannot show an isolated plugin's knobs, because reading `config_fields()`
+means running the plugin's code in the process that is asking. Its params are still validated against
+the plugin author's own `FieldSpec` bounds and its column still claimed — one phase later, off the
+worker's handshake, still before step 0 and before any output directory exists:
+
+```
+plugins.check.params.max_range_m=1.0 below minimum 10.0
+plugins.check.params: iso_det:ClaimedRangeThreshold declares no field 'nope'; known: [...]
+```
+
+**4. It is not a resource limit.** The child can allocate, spin, spawn its own processes and open
+sockets. The watchdog turns "does not answer" into a failed run; it does not cap what the detector
+does in the meantime. A public competition wants an OS-level sandbox around the worker — which this
+mode makes *possible* (there is a single process to wrap, speaking a single pipe) and does not itself
+provide.
+
+**5. A built-in cannot be isolated,** and that is a refusal rather than a limitation: a built-in *is*
+the engine, its knobs are engine config fields, and a round trip per message would buy nothing.
+
+**6. The source gate defaults OFF in this mode.** The gate refuses `sys._getframe`, `gc.get_referrers`
+and friends because *in process* they reach the engine's frame. Out of process they do not, so
+refusing a submission for containing the name would be theatre — and turning a real submission away
+for a construct that is now harmless is how a safety mode gets switched off. `"source_gate": "on"`
+still works and still screens the module the worker named, by **reading** the file rather than
+importing it.
+
+### 2.9 What this means if you are running a benchmark
 
 If you are collecting detectors from other people and comparing them:
 
@@ -261,7 +593,12 @@ If you are collecting detectors from other people and comparing them:
    Together they catch a detector that reads the oracle *off the observation*, at run time, which is
    a complementary instrument to the gate's static one. **Neither sees a frame walk**: measured, a
    frame-walking check passes all six with `ok = True` (§4.1).
-5. **For submissions you cannot review, wait for the out-of-process mode.**
+5. **For submissions you cannot review, run them isolated** ([§2.8](#28-isolated-mode--the-process-boundary-and-the-only-answer-for-code-you-cannot-review)):
+   `"isolated": true` on the config entry, and the labels are not in the detector's process. It costs
+   about 40 µs per delivered message (4.3× the wall clock of the run in the measured case) and it is
+   the only claim in this document that is a *boundary* rather than a guard rail. Read that section's
+   "what it does not close" before you build a public competition on it — the filesystem is still
+   shared, and that is measured rather than hand-waved.
 
 ---
 
@@ -408,6 +745,14 @@ plugin installed and importable but declared nowhere.
 Or let the engine refuse an unattested plugin before step 0, by declaring
 `"conformance": "required"` on the config entry. Measured: refusing
 `violators:OracleThreshold` that way raises `ConfigError` and **creates no output directory**.
+
+Two things about *when* and *where* that attestation happens, both of which were defects until
+2026-08-31 and are set out in full in [§2.5](#25-when-the-engine-checks-a-plugin--and-why-when-was-a-defect):
+it runs **before** the engine constructs your plugin, and it runs in a **child interpreter**, so a
+constructor cannot rewrite the machinery that judges it. Cost: one interpreter start per attested
+plugin (~1.0 s, against ~0.11 s when the suite ran in-process), paid only by a run that asked for it.
+The PEP 578 audit hook `C5`/`D5` installs — which can never be removed once added — is now paid by
+the child and discarded with it, instead of being left on the engine process for the rest of its life.
 
 ### 4.1 What the eight checks are, and what each one catches
 
@@ -767,7 +1112,11 @@ lock exists to prevent.
 {"ref": "pkg.module:Class",         // built-in name | entry-point name | dotted path
  "params": {"knob": 1.0},           // validated against the class's own FieldSpec bounds
  "conformance": "off" | "required", // "required" runs D1-D5,D7,D8 before step 0 and refuses failures
- "source_gate": "on" | "off"}       // "on" (default) scans the module for engine-internal reach (§2.4)
+ "source_gate": "on" | "off",       // "on" (default) scans the module for engine-internal reach (§2.4)
+ "isolated": false | true}          // true runs the check in its OWN interpreter (§2.8) -- the
+                                    // labels are not in its process. Refused for a built-in;
+                                    // defaults `source_gate` to "off"; state must be JSON;
+                                    // costs ~50 us per delivered message.
 ```
 
 `"@builtins"` as a bare array element expands to **the suite this engine version ships**
@@ -818,16 +1167,37 @@ A plugin declaring one is rejected at load with `CapabilityError`.
 * **Do not reach around the interface.** `sys._getframe`, `gc.get_referrers` and
   `import scms_sim_ref.mock_pipeline` are refused by the source gate (§2.4) and, more to the point,
   they make your detector's results worthless. Read §2 before deciding this rule does not apply to
-  you.
+  you. If your detector is going to be run **isolated** (§2.8) they will simply find nothing.
+* **If your detector may be run isolated, keep its state JSON.** `state[...]` crosses a process
+  boundary on every message in that mode, so it must hold numbers, strings, booleans, lists and
+  dicts. Derived objects belong on `self`, which lives in the worker for the whole run. A value that
+  will not serialise is refused by name at the first message, not silently dropped.
 
 ---
 
 ## 9. Known gaps
 
-1. **The out-of-process detector mode does not exist.** This is the load-bearing gap and everything
-   in §2 depends on it. Until a detector can run in its own process with the oracle outside its
-   address space, "untrusted detector" is not a supported configuration, and the guard rails in this
-   engine are exactly that.
+1. **~~The out-of-process detector mode does not exist.~~ It exists — `"isolated": true`, §2.8.**
+   Same digest as in process on a 593-vehicle 300 s run, both alongside the built-ins and alone; the
+   frame walk that reads the labels in process reaches only the serialiser's own frames; a crashing,
+   hanging or desynchronised worker fails the run. Cost: **~40 µs per delivered message per isolated
+   check** (4.3× the wall clock in the measured case) plus ~1 s of interpreter start.
+   *(The earlier estimate that a per-message exchange was "~10⁴ round trips too hot" was an order of
+   magnitude pessimistic for a PIPE: it is the right arithmetic for the 2 ms socket RTT
+   `PLUGIN-ARCHITECTURE.md` §2.3 uses for an ns-3 backend, and a local pipe on this host is ~40 µs,
+   which is 40× cheaper. Per-STEP batching remains the right shape for the CHANNEL slot and the wrong
+   one here, because the fusion consumes one message's score before the next message is scored.)*
+   What is **not** closed by it is set out in §2.8: the child shares the filesystem (measured — it
+   read a completed earlier run's `gt_vehicle.jsonl`), it reports its own module identity, it gives
+   up config-time schema introspection, and it is not a resource limit. Those are the next
+   increments, and three of the four want an OS-level sandbox rather than more Python.
+1b. **The integrity monitor checks at four named points, not continuously** — plugin resolution
+   (import), channel load, detection-layer load, end of run. A plugin that tampers, uses the tamper
+   and restores the binding before the next checkpoint is not seen by the identity snapshot — only
+   by `WitnessedRandom`, and only if what it touched was the engine's own stream. Continuous
+   enforcement is not achievable in-process; the next real increment is the same snapshot around
+   **each step**, which shrinks the window without closing it, and is a cost decision rather than a
+   design one.
 2. **The source gate parses one module.** It reads the module the plugin class is *defined in* — not
    the helper modules that module imports, and nothing resolved at run time. Widening it to the whole
    distribution is mechanical (`registry.package_root` already finds the tree) and is not claimed
@@ -861,13 +1231,18 @@ A plugin declaring one is rejected at load with `CapabilityError`.
 |---|---|
 | the interfaces | `src/scms_sim_ref/api/detect.py` — `Observation` (and `_seal`, which makes it read-only), `Check`, `Fusion`, `CheckBase`, `NamespacedState`, `VIOLATION_THRESHOLD` |
 | **the source gate** | `src/scms_sim_ref/api/srcgate.py` — the refusal list, the message, and the module docstring stating what it is not |
+| **the integrity monitor** | `src/scms_sim_ref/api/integrity.py` — `Sentinel` (the identity snapshot, §2.6), `WitnessedRandom` (the word-counting engine stream), and the module docstring stating what it is not |
+| **isolated (out-of-process) detectors** | `src/scms_sim_ref/api/isolate.py` — the wire protocol, `IsolatedCheck` (the engine-side proxy), `IsolatedRng`, and the child worker (`python -m scms_sim_ref.api.isolate --serve`). Its docstring states the transport decision and what the mode does not close |
+| **out-of-process attestation** | `src/scms_sim_ref/conformance/attest.py` — the child interpreter that grades a candidate before the engine ever constructs it |
 | the knobs | `src/scms_sim_ref/api/fields.py` — `FieldSpec` |
 | the randomness | `src/scms_sim_ref/api/rng.py` — `RngNamespace` |
 | the resolver + lock | `src/scms_sim_ref/api/registry.py` |
 | the built-in checks | `src/scms_sim_ref/mock_pipeline/detectors.py` — 15 `Check` classes + `StreakFusion`, and `BUILTIN_CHECKS` / `BUILTIN_CHECK_BY_CODE`, the fixed suite `@builtins` expands from |
 | the loader | `src/scms_sim_ref/mock_pipeline/run.py` — `default_check_refs`, `_assert_not_hijacked`, `_claim_column`, `build_checks` |
 | the contract | `src/scms_sim_ref/conformance/v1/detect.py` — `CheckContract`, D1–D8 |
-| **the trust-boundary tests** | `tests/test_detector_trust_boundary.py` — every claim in §2, including the two escapes it admits to |
+| **the trust-boundary tests** | `tests/test_detector_trust_boundary.py` — every claim in §2.1–§2.4, including the two escapes it admits to |
+| **the integrity tests** | `tests/test_plugin_integrity.py` — §2.5–§2.7: the hostile constructor on all three slots, the import-time rebind, the attestation ORDER, the step-30 delayed rebind that conformance reports `ok` on, the rebind-then-restore only the stream witness catches, and the stateful `LinkOutcome` |
+| **the isolation tests** | `tests/test_detector_isolation.py` — §2.8: identical digests both ways, the payload asserted against `Observation`'s own field list and against the serialised bytes, the same hostile class run BOTH ways, the crash / hang / desync / non-JSON-state refusals, and the filesystem hole |
 | the functional tests | `tests/test_detector_plugins.py` — the zero-engine-edits claim and the digests |
 | the design | `docs/realism/PLUGIN-ARCHITECTURE.md` §2.2, §3, §4, §5, §7 phase 3 |
 | the worked example | `C:\Temp\scms_detector_demo` (`scms-demo-detector 0.1.0`) |

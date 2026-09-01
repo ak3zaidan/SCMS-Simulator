@@ -2,6 +2,24 @@
 
 **Status:** **phases 0, 1 and 2 implemented**; phases 3-6 remain design.
 
+**Out-of-process DETECTORS shipped (2026-08-31), and one number in §2.3 below needs correcting.**
+`plugins.check[].isolated = true` runs a third-party check in its own interpreter
+(`src/scms_sim_ref/api/isolate.py`): the engine serialises the `Observation` — and only the
+`Observation` — over a length-prefixed JSON pipe and reads back a score, so the broadcast dict, the
+`Vehicle`, the config object and the global `rng` are not in that process at all. Measured on a 300 s
+593-vehicle run: **the same `data_digest` as the in-process path**
+(`81c194ed…` alongside the built-ins, `d71b29f0…` solo), at **+40.8 µs per delivered message /
+4.3× wall clock** over 960 509 observations. The identical hostile check that reads
+`sys._getframe(1).f_locals["b"]` files 1 910 label-derived reports in process and **zero** isolated,
+where its walk terminates in the serialiser's own frames. Full evidence, and the four things the mode
+does **not** close (the shared filesystem first among them), are in
+`docs/realism/DETECTOR-PLUGIN.md` §2.8.
+**The correction:** §2.3's round-trip arithmetic ("per-link IPC is ~10⁴× too slow") is right for the
+2 ms *socket* RTT it assumes for an ns-3 federate, and wrong by ~40× for a local *pipe*, which
+measures ~40 µs on this host. Per-step batching therefore remains the right ABI for the CHANNEL slot
+— where an out-of-process backend is a foreign runtime — and is the wrong shape for the DETECTOR
+slot, where the fusion consumes one message's score before the next message is scored.
+
 **Adversarial review (2026-08-31).** Phase 2 landed without its verifier. Six behavioural defects and
 three mis-transcribed digests were found and fixed; every one is reproduced, fixed and re-measured in
 **`PLUGIN-CONFORMANCE-EVIDENCE.md` §7**. Three of them share a shape worth naming here, because it is

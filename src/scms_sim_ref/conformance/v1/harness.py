@@ -237,8 +237,19 @@ _RANDOM_METHODS = (
 _INHERITED = object()
 
 
+#: Module-level `random` names the surface records alongside the class methods. `random.Random`
+#: ITSELF is here because rebinding the CLASS -- `random.Random = MyImpostor` -- is a distinct attack
+#: from rebinding one of its methods: it owns every `random.Random(f"{seed}:...")` the engine
+#: constructs AFTERWARDS (about twenty keyed sites), and it is what a delayed attack installs.
+#: Without it the restore path was incomplete in the worst possible way: the per-method loop wrote
+#: the engine's original methods onto the IMPOSTOR and left the impostor bound, so a suite run
+#: against such a model handed the rest of the process a rebound `random`.
+_RANDOM_MODULE_NAMES = ("Random", "SystemRandom", "_inst", "random", "seed", "getstate", "setstate")
+
+
 def random_class_surface() -> dict:
-    """Identity of every generator method on `random.Random`, plus the module-level bindings.
+    """Identity of every generator method on `random.Random`, the class itself, and the module-level
+    bindings.
 
     The instrument C3's third trap needs. Rebinding `random.Random.random` reaches EVERY stream in
     the process at once -- including the engine's private `random.Random(cfg.seed)`, whose draw
@@ -246,18 +257,22 @@ def random_class_surface() -> dict:
     perfectly intact. Comparing identities is the only way to see it.
     """
     surface = {name: random.Random.__dict__.get(name, _INHERITED) for name in _RANDOM_METHODS}
-    surface["random.random"] = random.random
-    surface["random.seed"] = random.seed
-    surface["random.getstate"] = random.getstate
-    surface["random.setstate"] = random.setstate
+    for name in _RANDOM_MODULE_NAMES:
+        surface[f"random.{name}"] = getattr(random, name, None)
     return surface
 
 
 def tampered_random_names(surface: dict) -> list:
-    """Sorted names in `surface` whose binding is no longer the one it recorded."""
-    out = [n for n in _RANDOM_METHODS if random.Random.__dict__.get(n, _INHERITED) is not surface[n]]
-    out += [n for n in ("random.random", "random.seed", "random.getstate", "random.setstate")
-            if getattr(random, n.split(".", 1)[1]) is not surface[n]]
+    """Sorted names in `surface` whose binding is no longer the one it recorded.
+
+    When the CLASS itself moved, only that is reported: every per-method comparison is then against a
+    different class and would list twenty consequences of one cause.
+    """
+    out = [n for n in (f"random.{m}" for m in _RANDOM_MODULE_NAMES)
+           if getattr(random, n.split(".", 1)[1], None) is not surface[n]]
+    if random.Random is surface["random.Random"]:
+        out += [n for n in _RANDOM_METHODS
+                if random.Random.__dict__.get(n, _INHERITED) is not surface[n]]
     return sorted(out)
 
 
@@ -265,9 +280,13 @@ def restore_random_class_surface(surface: dict) -> list:
     """Put back anything that moved. Returns the names that had been tampered with.
 
     A check that DETECTS a tamper and leaves it installed has poisoned the interpreter for
-    everything that runs after it, which is a worse outcome than not checking.
+    everything that runs after it, which is a worse outcome than not checking. The MODULE names go
+    back first: with `random.Random` rebound, the per-method loop would otherwise patch the impostor.
     """
     moved = tampered_random_names(surface)
+    for name in _RANDOM_MODULE_NAMES:
+        if getattr(random, name, None) is not surface[f"random.{name}"]:
+            setattr(random, name, surface[f"random.{name}"])
     for name in _RANDOM_METHODS:
         original = surface[name]
         if random.Random.__dict__.get(name, _INHERITED) is original:
@@ -279,8 +298,6 @@ def restore_random_class_surface(surface: dict) -> list:
                 pass
         else:
             setattr(random.Random, name, original)
-    for name in ("random.random", "random.seed", "random.getstate", "random.setstate"):
-        setattr(random, name.split(".", 1)[1], surface[name])
     return moved
 
 

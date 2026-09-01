@@ -1,0 +1,167 @@
+{
+  "reference_set": "v2x_awareness_conditions",
+  "title": "Boban & d'Orey cooperative awareness: the MEASUREMENT CONDITIONS behind the 0.90-at-200 m anchor",
+  "scope": "The single source of truth for WHAT the awareness anchor measured, so a model can be graded against it like-for-like. v2x_awareness.awareness_ratio_200m_urban_min pins the NUMBER; this set pins the CONDITIONS that number was produced under -- metric definition, pair population, transmit power, receiver sensitivity, antenna height, CAM rate, and the shot multiplicity Z. Read this before comparing any harness awareness value to 0.90.",
+  "curated_from": "Full text of M. Boban and P. M. d'Orey, 'Exploring the Practical Limits of Cooperative Awareness in Vehicular Communications', IEEE Transactions on Vehicular Technology 65(6):3904-3916, 2016; preprint arXiv:1503.06590v3 (21 Mar 2016), read in full on 2026-08-31. Every entry below is transcribed from that text; no value is inferred except where a `derivation` field says so.",
+  "why_this_file_exists": "docs/realism/PHASE2-GATE.md measured comm.awareness_ratio_200m = 0.115 on real Ingolstadt geometry against a >= 0.90 gate and correctly refused to tune the model to reach it until the reference's conditions were established. This file establishes them. FOUR conditions differ from the harness metric and every one moves the number: (1) the measured arm's pair population is a 3-9 vehicle instrumented TEST FLEET on a shared route, not every co-present pair in a city; (2) NAR is a >=1-of-N metric over a 1 s window at 10 Hz CAM, not a per-packet PDR; (3) the simulated arm assumed a -95 dBm receiver, 14 dB more sensitive than the harness's -81 dBm; (4) the reported figure is the LARGEST distance at which NAR still clears 0.90, i.e. a crossing distance, not the value at a fixed 200 m.",
+  "entries": {
+    "nar_definition": {
+      "value": {
+        "formula": "NAR(i, r, t) = ND(i, r, t) / NT(i, r, t)",
+        "numerator": "ND = number of vehicles within r around i FROM WHICH i received at least one message during t",
+        "denominator": "NT = total number of vehicles within r around i during t",
+        "time_window_s": 1.0,
+        "distance_binning": "annulus",
+        "nar_bin_width_m": 50.0,
+        "pdr_bin_width_m": 25.0,
+        "min_points_per_bin": 40
+      },
+      "unit": "definition",
+      "confidence": "anchored",
+      "cite": "Boban & d'Orey 2016, Section III-A.2 and III-D",
+      "source": "Section III-A.2: 'Neighborhood Awareness Ratio (NAR): the proportion of vehicles in a specific range from which a message was received in a defined time interval. Formally, for vehicle i, range r, and time interval t, NAR(i,r,t) = ND(i,r,t)/NT(i,r,t), where ND(i,r,t) is the number of vehicles within r around i from which i received a message in t and NT(i,r,t) is the total number of vehicles within r around i in t (we use t=1 second).' Section III-A closing note: 'when representing PDR and NAR, we consider a set of uniformly spaced distance bins (i.e., an annulus - region between two concentric circles around the vehicle, represented by r)'. Section III-D: 'Each distance bin is 25 meters for PDR and 50 meters for NAR and RNAR, with the plotted data point centered in the middle of the distance bin. ... For statistical relevance, we consider solely bins with at least 40 data points.'",
+      "note": "The ANNULUS convention matches realism_bench._curve_at, which already averages the bins overlapping [d - bin/2, d + bin/2] rather than integrating a disc. That part of the harness metric was never wrong. What differs is the pair population, the shot multiplicity and the link budget -- see nar_pair_population_measured, nar_shot_multiplicity_z and simulation_receiver_sensitivity_dbm."
+    },
+    "nar_pair_population_measured": {
+      "value": {
+        "population": "DRIVE-C2X instrumented test fleet only",
+        "vehicles_per_site": {"Gothenburg_SE": 6, "Helmond_NL": 9, "Tampere_FI": 3, "Trento_IT": 4},
+        "max_route_length_km": {"Gothenburg_SE": 11, "Helmond_NL": 5.5, "Tampere_FI": 22, "Trento_IT": 60},
+        "rsus": {"Gothenburg_SE": 0, "Helmond_NL": 0, "Tampere_FI": 0, "Trento_IT": 5}
+      },
+      "unit": "mixed",
+      "confidence": "anchored",
+      "cite": "Boban & d'Orey 2016, Table II and Section V opening",
+      "source": "Table II 'Description of measurement test sites and parameters' gives Number of Vehicles 6 / 9 / 3 / '3/4' and Route Length (Max.) 11 km / 5.5 km / 22 km / 60 km for Sweden / the Netherlands / Finland / Italy. Section V: 'the measurements analyzed in Section III are limited in scale (e.g., the number of communicating nodes is below 10 on all test sites)'. Section III-C: 'All nodes (vehicles and RSUs) record all received and transmitted messages during the several test runs.'",
+      "note": "DECISIVE FOR LIKE-FOR-LIKE. NT counts only the other INSTRUMENTED vehicles, because unequipped traffic emits nothing and is invisible to the log. Three to nine vehicles running the same test route are a route-following convoy population, overwhelmingly same-street and therefore LOS or NLOSv. A harness metric whose denominator is every co-present pair in a dense city -- including pairs on parallel streets separated by a block of buildings -- is measuring a DIFFERENT population, and the difference is the whole 0.115. The measured arm CANNOT be reproduced from our data: the per-link LOS state, the per-vehicle effective transmit power and the route topology are all unpublished. Grade against the SIMULATED arm instead (see simulation_conditions), which IS all-pairs."
+    },
+    "measurement_radio_conditions": {
+      "value": {
+        "stack": "ITS-G5, 5.9 GHz",
+        "nominal_tx_power_dbm": 21.0,
+        "effective_tx_power_dbm_vehicles_se_fi": [10.0, 20.0],
+        "effective_tx_power_dbm_vehicles_it": 27.0,
+        "effective_tx_power_dbm_rsu_it": 32.0,
+        "antenna": "roof-mounted omni-directional",
+        "antenna_height_m": [1.44, 1.66],
+        "rsu_antenna_height_m": [9.0, 11.0],
+        "cam_rate_hz": 10.0,
+        "cam_size_bytes": 100
+      },
+      "unit": "mixed",
+      "confidence": "anchored",
+      "cite": "Boban & d'Orey 2016, Section III-B, Section III-C, Table II",
+      "source": "Section III-B: 'The DRIVE-C2X system uses ITS-G5 compliant radios that operate in the 5.9 GHz frequency band. The default value for transmit power was set to 21 dBm. On vehicles, whose heights ranged from 1.4 meters to 1.7 meters, omni-directional antennas were placed on the roof. ... In the analyzed datasets, CAMs were sent at 10 Hz frequency and had the size of 100 Bytes.' Section III-C: 'In test sites in Sweden and Finland, combined with antenna gains and cable losses, the effective vehicle transmit power ranged between 10 and 20 dBm. ... Both vehicles and RSUs [Italy] have a nominal output power of 21 dBm. Combined with antenna gains and cable and insertion losses, this yields 27 dBm transmit power on the vehicles, and 32 dBm on RSUs.' Table II gives antenna heights approx. 1.55 / 1.44-1.66 / 1.5 / 1.49 m and RSU heights 9-11 m (Table I).",
+      "note": "RECEIVER SENSITIVITY IS NOT PUBLISHED FOR THE MEASURED ARM. Section V states the SIMULATIONS assumed -95 dBm 'in line with the sensitivity of devices used for DRIVE C2X measurements', which is the only sensitivity figure in the paper. The urban 200 m row of Table III therefore sits at an effective link budget somewhere in [10 - (-95), 20 - (-95)] = [105, 115] dB, and cannot be narrowed further from the text."
+    },
+    "nar_90pct_crossing_distance_m": {
+      "points": [
+        ["highway_v2v", "Sweden", 100.0],
+        ["highway_v2v", "Netherlands", 250.0],
+        ["highway_v2v", "Finland", 400.0],
+        ["highway_v2v", "Italy", 200.0],
+        ["suburban_v2v", "Sweden", 100.0],
+        ["suburban_v2v", "Netherlands", 150.0],
+        ["suburban_v2v", "Finland", 350.0],
+        ["urban_v2v", "Finland", 200.0],
+        ["highway_v2i", "Italy", 650.0]
+      ],
+      "unit": "[environment_linktype, test site, distance in m]",
+      "confidence": "anchored",
+      "cite": "Boban & d'Orey 2016, Table III",
+      "source": "Table III, 'Distance above which Neighborhood Awareness Ratio (NAR) falls below 90%'. Cells marked N/A in the paper (Sweden/Netherlands/Italy urban, Italy suburban, Sweden/Netherlands/Finland V2I) are omitted here rather than filled in.",
+      "note": "THE PROJECT GATE'S ENTIRE EMPIRICAL BASIS IS THE SINGLE ROW 'urban_v2v, Finland, 200 m' -- one test site, three vehicles, one measurement campaign. Note also the dispersion within one nominal environment: highway V2V ranges 100 m (Sweden) to 400 m (Finland), a factor of 4, and Sweden's SUBURBAN figure (100 m) is worse than Finland's URBAN figure (200 m). The paper says so explicitly: 'qualitative separation of environments into urban, suburban, and highway cannot be generalized across test sites'. A >= 0.90-at-200 m gate treats one cell of a nine-cell table with 4x internal spread as a universal constant. THIS IS A CROSSING DISTANCE, NOT A LEVEL: the comparable harness quantity is the distance at which the awareness curve crosses 0.90, not the awareness value read at a fixed 200 m."
+    },
+    "nar_shot_multiplicity_z": {
+      "value": {
+        "formula": "NAR(r, t) = 1 - (1 - PDR(r))^Z,  Z <= N",
+        "n_is": "number of CAM transmissions inside the window t",
+        "z_fitted": {
+          "finland_highway": 8.2886,
+          "finland_suburban": 4.1157,
+          "finland_urban": 5.4579,
+          "italy_highway": 2.1365,
+          "sweden_overall": 4.4798,
+          "netherlands_overall": 3.5713,
+          "finland_overall": 6.4821,
+          "finland_fig14_bestfit": 4.2768
+        },
+        "z_range": [2.1365, 8.2886],
+        "z_urban": 5.4579,
+        "z_practical_bounds": [2.0, 8.0]
+      },
+      "unit": "mixed",
+      "confidence": "anchored",
+      "cite": "Boban & d'Orey 2016, Section IV eq. (4), Figs. 11, 12, 14",
+      "source": "Section IV develops NAR(r,t) = 1 - (1 - PDR_r)^N for independent transmissions (eq. 3) and then discounts for the measured burstiness of CAM loss: 'we consider NAR(r,t) = 1 - (1 - PDR_r)^Z, where Z <= N' (eq. 4). Z is fitted per dataset with a non-linear MMSE estimator; the fitted values are printed in the Fig. 11 sub-captions (8.2886 Finland highway, 4.1157 Finland suburban, 5.4579 Finland urban, 2.1365 Italy highway, 4.4798 Sweden overall, 3.5713 Netherlands overall), in Fig. 12 (Sweden 4.4798, Finland overall 6.4821) and in Fig. 14 (Finland best fit 4.2768). Section IV: 'The relatively large range of Z values (between approx. 2 and 8)' and 'when actual measurements of NAR are not available to fit the parameter Z, the theoretical model can be used to give a relatively confident range of NAR values based on PDR measurements only' -- the paper's own recommended use of Z=2 and Z=8 as lower and upper bounds (Fig. 14).",
+      "derivation": "z_practical_bounds [2, 8] is the paper's own rounding of the fitted range, used by it as an upper/lower awareness envelope in Fig. 14. z_urban is the single URBAN fit (Fig. 11(c), Test Site Finland - Urban).",
+      "note": "THE LARGEST SINGLE LIKE-FOR-LIKE ERROR IN THE OLD GATE. NAR is a >=1-of-Z metric; a per-packet PDR is the Z=1 case. Inverting eq. (4), NAR = 0.90 corresponds to a PER-PACKET PDR of 1 - 0.1^(1/Z): 0.660 at Z=2.1365, 0.416 at Z=4.2768, 0.344 at the urban Z=5.4579, 0.243 at Z=8.2886. So the reference's 90% awareness demands a per-packet delivery of roughly ONE THIRD, not nine tenths. A harness whose engine emits ONE CAM per second (mock_pipeline dt=1.0) has N=1 and therefore Z=1 by construction: its awareness ratio IS a per-packet PDR and must be graded against 1 - 0.1^(1/Z_ref), never against 0.90."
+    },
+    "simulation_conditions": {
+      "value": {
+        "propagation_model": "GEMV^2 (Boban, Barros & Tonguz, IEEE TVT 63(9):4146-4164, 2014)",
+        "link_states": ["LOS", "NLOSv", "NLOSb"],
+        "urban_scene": "core of Porto, Portugal, bbox (41.1426,-8.6850)-(41.1624,-8.6203)",
+        "urban_vehicles": 2410,
+        "highway_scene": "12.5 km of the A28, centre (41.2327,-8.6954)",
+        "highway_vehicles": 404,
+        "vehicle_positions": "aerial photography (Ferreira et al.)",
+        "buildings": "OpenStreetMap building and foliage outlines",
+        "rx_sensitivity_dbm": -95.0,
+        "interference_modelled": false,
+        "cam_rate_hz_swept": [1.0, 5.0, 10.0],
+        "small_scale_variation": "per-1 s std-dev of received power drawn from measured fits: highway lognormal (mean 2.74, var 2.76) dB; urban extreme-value (mu 2.90, sigma 3.17) dB"
+      },
+      "unit": "mixed",
+      "confidence": "anchored",
+      "cite": "Boban & d'Orey 2016, Section V-A to V-E",
+      "source": "Section V-B: 'Urban environment, a core part of the city of Porto containing 2410 vehicles delimited by a rectangle with the following coordinates: (41.1426,-8.6850),(41.1624,-8.6203)'; 'Highway environment, comprising a 12.5 km stretch of A28 Highway ... containing 404 vehicles'; 'To ensure credible locations of vehicles, we used vehicle locations collected through aerial photography'. Section V-E: 'we do not consider interference generated by CAM exchange; therefore, the results in this section are an upper bound of awareness performance for the given transmit power and transmit rate. Also, note that the simulation results were generated with the assumption of -95 dBm receiver sensitivity threshold, in line with the sensitivity of devices used for DRIVE C2X measurements; given different receiver sensitivity thresholds of radios, the results we show in this section would be equivalent to changing the transmit power level by the same amount (i.e., NAR would be increased by the same amount by increasing sensitivity by 1 dB or by increasing transmit power by 1 dBs).'",
+      "note": "THIS ARM IS REPRODUCIBLE IN KIND AND THE MEASURED ARM IS NOT. 2410 vehicles over a real city core with real OSM buildings, classified LOS/NLOSv/NLOSb, is structurally the same experiment as a geometric-channel run on an OSM import: an ALL-PAIRS urban average including through-building links. It is therefore the correct anchor for comm.awareness_ratio_*. Two conditions must be carried across with it: the -95 dBm receiver, and the explicit absence of interference (so the harness comparison must use the PROPAGATION-only delivery probability, not one that has already been multiplied by a congestion or collision term). The paper's own sensitivity/power equivalence rule is what makes the anchor transferable to a different link budget -- see simulated_urban_nar90_by_link_budget."
+    },
+    "simulated_urban_nar90_by_link_budget": {
+      "points": [
+        [5.0, 100.0, 50.0],
+        [15.0, 110.0, 200.0],
+        [23.0, 118.0, 300.0]
+      ],
+      "unit": "[effective tx power dBm, link budget dB (tx - rx_sensitivity), distance in m at which urban NAR falls below 0.90]",
+      "confidence": "anchored",
+      "cite": "Boban & d'Orey 2016, Section V-E.1 and Figs. 18-19",
+      "source": "Section V-E.1: 'Fig. 18(a) shows that, at 5 dbm effective transmit power, awareness above 90% can be achieved only up to 50 m, irrespective of the CAM rate. For 15 dBm and 23 dBm, 90% awareness is achievable at 200 m and 300 m, respectively (Fig. 18(b), 18(c)).' The link-budget column is tx - (-95 dBm), using the sensitivity stated in the same section.",
+      "derivation": "The budget column is derived, not quoted: budget_dB = tx_dBm - rx_sensitivity_dBm with rx_sensitivity_dBm = -95.0 from simulation_conditions. The paper licenses this transformation explicitly ('given different receiver sensitivity thresholds ... equivalent to changing the transmit power level by the same amount'), which is what lets a harness at a DIFFERENT sensitivity be graded against this curve. Interpolate log-linearly in distance vs budget; do not extrapolate below 100 dB or above 118 dB.",
+      "note": "INTERNAL INCONSISTENCY IN THE SOURCE, RECORDED NOT SUPPRESSED: the same section later says 'To achieve the same performance [90% NAR at 400 m] in urban would require over 33 dB EIRP ... With realistic limits in mind, our results show that high awareness (above 90%) for urban environment can be achieved up to 250 m.' A 250 m reach at the 33 dBm regulatory ceiling is SHORTER than the 300 m the same text reports at 23 dBm. Only the three Fig. 18 points are pinned above; the 250 m and 400 m statements are recorded here and deliberately excluded from the interpolation. Treat any distance predicted from this curve as carrying at least the 250-vs-300 m discrepancy as uncertainty (~ -17%)."
+    },
+    "simulated_highway_nar90": {
+      "value": {"tx_power_dbm": 20.0, "link_budget_db": 115.0, "distance_m": 400.0,
+                "cam_per_window": 2},
+      "unit": "mixed",
+      "confidence": "anchored",
+      "cite": "Boban & d'Orey 2016, Section V-E.2",
+      "source": "Section V-E.2: 'it is interesting to note that the transmit power and rate required to reach 90% NAR at 400 m is approximately 20 dB and two CAM transmissions per period (Fig. 21). This shows that production-ready DSRC radios, often limited to 23 dBm EIRP, have the ability to provide high awareness in highways.' Budget derived as 20 - (-95).",
+      "note": "The abstract's '>500 m in highway' is NOT supported by either Table III (max measured 400 m, Finland) or this simulated figure (400 m at 20 dBm). v2x_awareness.awareness_ratio_500m_highway_min inherits that overstatement from the ROADMAP and should be read as an aspiration, not as a transcription of a published measurement."
+    },
+    "universal_awareness_floor": {
+      "value": {"distance_m": 100.0, "nar_min": 0.90},
+      "unit": "mixed",
+      "confidence": "anchored",
+      "cite": "Boban & d'Orey 2016, Section VI (Conclusions)",
+      "source": "Section VI: 'our results show that applications requiring high awareness levels (e.g., 90%) up to 100 m can be satisfied in virtually all environments. For larger distances, high awareness is possible in certain types of environments (e.g., highway), whereas in others the awareness is limited by the harsh propagation environment and regulatory limits on transmit power level (this is the case above 200 m in typical urban environments).'",
+      "derivation": "Consistent with nar_90pct_crossing_distance_m: the MINIMUM 90%-NAR crossing distance across all nine measured cells is 100 m (Sweden highway and Sweden suburban).",
+      "note": "THE ONLY ENVIRONMENT-INDEPENDENT CLAIM IN THE PAPER, and therefore the only awareness statement that can be gated without also pinning a site. Still carries the Z correction: at t = 1 s it means NAR(100 m) >= 0.90, i.e. per-packet PDR(100 m) >= 1 - 0.1^(1/Z)."
+    },
+    "harness_comparison_recipe": {
+      "value": {
+        "step_1": "measure the LOS/NLOSv/NLOSb composition per distance band on the scenario's own geometry",
+        "step_2": "compute the PROPAGATION-only per-packet delivery probability per band from the configured link budget and that composition (no congestion, no collision, no weather -- the reference simulation has none)",
+        "step_3": "convert the reference's NAR threshold to a per-packet threshold: p* = 1 - (1 - NAR*)^(1/Z)",
+        "step_4": "read the distance at which the modelled per-packet PDR crosses p* -- that is the quantity Table III and Fig. 18 report",
+        "step_5": "compare it against simulated_urban_nar90_by_link_budget interpolated AT THE HARNESS'S OWN LINK BUDGET, never at the reference's"
+      },
+      "unit": "procedure",
+      "confidence": "coarse",
+      "cite": "derived from this file's anchored entries",
+      "source": "Assembled 2026-08-31 from nar_definition, nar_shot_multiplicity_z, simulation_conditions and simulated_urban_nar90_by_link_budget. Implemented in src/scms_sim_ref/datagen/awareness.py.",
+      "note": "Step 5 is the step the retired gate skipped. Comparing a 104 dB harness budget (23 dBm into a -81 dBm receiver) against a figure produced at 110 dB (15 dBm into a -95 dBm receiver) charges the model 6 dB it was never configured to have."
+    }
+  }
+}

@@ -210,6 +210,45 @@ def speed_dev() -> float:
     return max(0.0, _envf("SCMS_SPEED_DEV", 0.1))
 
 
+# ---- demand source ---------------------------------------------------------------------------
+# InTAS ships its own calibrated-to-2019 route set and that stays the DEFAULT, so every number
+# already published against this scenario keeps reproducing. `SCMS_DEMAND=calibrated` swaps in a
+# route set produced by tools/calibrate_demand.py, whose simulated loop counts were fitted to
+# MEASURED Ingolstadt counts with SUMO's routeSampler. It is opt-in on purpose: the calibrated set
+# is derived from data with no formally stated licence, is specific to one clock window, and its
+# held-out error must be quoted with it.
+_DEMAND_SOURCES = ("intas", "calibrated")
+
+
+def demand_source() -> str:
+    """``intas`` (default) or ``calibrated`` (SCMS_DEMAND)."""
+    v = _envs("SCMS_DEMAND", "intas").lower()
+    return v if v in _DEMAND_SOURCES else "intas"
+
+
+def demand_routes() -> str:
+    """Path to the calibrated route file (SCMS_DEMAND_ROUTES); required by ``calibrated``."""
+    return _envs("SCMS_DEMAND_ROUTES", "")
+
+
+def demand_detectors() -> str:
+    """Optional replacement E1 additional file (SCMS_DEMAND_DETECTORS).
+
+    The layout shipped with InTAS places 74 of its 194 named loops on SUMO *sidewalk* lanes,
+    where they can never count a car; tools/calibrate_demand.py emits a repaired copy."""
+    return _envs("SCMS_DEMAND_DETECTORS", "")
+
+
+def demand_keep_routes() -> list:
+    """Source route files kept alongside the calibrated one (SCMS_DEMAND_KEEP_ROUTES).
+
+    Pedestrians and the scheduled bus network are NOT demand to be calibrated -- they are part
+    of the scenario on both sides of the comparison -- so they are kept by default."""
+    return [r.strip() for r in _envs("SCMS_DEMAND_KEEP_ROUTES",
+                                     "routes/ped.rou.xml,routes/BusRoutes.flow.xml").split(",")
+            if r.strip()]
+
+
 def speed_factor_spec() -> str:
     """Per-driver desired-speed distribution, SUMO ``normc(mean,dev,min,max)`` syntax.
 
@@ -720,7 +759,7 @@ _MANIFEST_HASH_MAX = 96 * 1024 * 1024        # skip hashing the ~1 GB InTAS rout
 _INPUT_PARAM_KEYS = ("duration", "seed", "scale", "max_vehicles", "target_flow", "lanes",
                      "road_network", "regime", "radio_range_m", "sumo_step_ms", "mosaic_sync_ms",
                      "car_follow_model", "speed_factor", "speed_dev", "od_mode", "rsus",
-                     "lateral_resolution_m", "lane_change_model")
+                     "lateral_resolution_m", "lane_change_model", "demand_source")
 
 
 def _sha256(path: Path) -> str:

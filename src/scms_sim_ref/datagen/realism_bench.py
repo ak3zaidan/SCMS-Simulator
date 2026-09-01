@@ -36,6 +36,17 @@ a PDR-vs-distance curve reconstructed from HONEST (false-positive) report links,
 awareness ratio at 100/200/300 m, the effective range, the gray-zone width, and the CAM
 inter-packet gap.
 
+AWARENESS IS ALSO MEASURED A SECOND, INDEPENDENT WAY (``datagen/awareness.py``, appended to the comm
+panel when a ``dataset_dir`` is available). The reconstructed curve above is *proportional* to PDR --
+normalised at the near band by an unknown constant -- so it cannot be compared to any absolute
+threshold, and the 0.90 anchor it used to be graded against turns out to be a >=1-of-Z per-second
+NAR over a 3-9 vehicle test fleet at a 6 dB richer link budget (conditions transcribed in
+``refdata/v2x_awareness_conditions.json``, analysis in ``docs/realism/AWARENESS-GATE.md``). The
+second path classifies every co-present pair LOS/NLOSv/NLOSb on the scenario's own geometry and
+integrates the configured physics into an ABSOLUTE per-packet PDR, which can. The two agree on
+effective range to 3-13% wherever real building geometry (or no blockage model at all) is present,
+and diverge by 1.7x only under the synthetic urban-canyon fallback.
+
 Both panels work on datasets from EITHER producer -- the pure-Python `mock_pipeline` or the
 MOSAIC/SUMO layer -- by probing ``manifest.json``. Where a signal is absent (sampled emissions,
 unknown regime, too few points) the metric degrades to ``status="na"`` with a machine-readable
@@ -1775,7 +1786,8 @@ def _crossing(curve: dict, level: float) -> float | None:
 def comm_panel(emissions: list[dict], reports: list[dict], report_labels: list[dict],
                tracks: dict[str, dict], probe: dict, refdata: dict, *,
                t_bucket_s: float = T_BUCKET_S, dist_bin_m: float = DIST_BIN_M,
-               max_dist_m: float = MAX_LINK_DIST_M, regime: str | None = None) -> list[dict]:
+               max_dist_m: float = MAX_LINK_DIST_M, regime: str | None = None,
+               dataset_dir: str | None = None) -> list[dict]:
     P = "comm"
     out: list[dict] = []
     no_reports = (not reports or not report_labels)
@@ -1824,20 +1836,35 @@ def comm_panel(emissions: list[dict], reports: list[dict], report_labels: list[d
                               "normalized_ratio": _r(curve["normalized"][i])})
 
     reg = regime or probe.get("regime")
-    aw_ref = _ref(refdata, "v2x_awareness.awareness_ratio_200m_urban_min")
+    # THE 0.90 ANCHOR IS NOT ATTACHED HERE ANY MORE, and that is a correctness fix, not a
+    # relaxation. `v2x_awareness.awareness_ratio_200m_urban_min` = 0.90 comes from Boban & d'Orey's
+    # Neighbourhood Awareness Ratio, which (refdata/v2x_awareness_conditions.json, transcribed from
+    # the full text) is a ">= 1 message received in a 1 s window at 10 Hz CAM" metric over a 3-9
+    # vehicle instrumented test fleet on a shared route, at a link budget of ~110 dB. This row is a
+    # single-shot, all-pairs, city-wide ratio NORMALISED by an unknown constant. Grading it at 0.90
+    # is the same class of error as grading a simulation against itself: the number is real, the
+    # comparison is not like-for-like. `comm.nar90_equivalent_range_m` below is the restatement that
+    # IS comparable; this row stays, unchanged and ungated, as the raw observable it always was.
     for anchor in AWARENESS_ANCHORS_M:
         val, n_at = (_curve_at(curve, anchor) if curve is not None else (None, 0))
-        ref = aw_ref if (anchor == 200.0 and reg == "urban") else None
         out.append(_metric(
             f"comm.awareness_ratio_{int(anchor)}m", P,
-            f"Neighbour awareness ratio at {int(anchor)} m (normalised)",
-            val, "fraction", n_at, ref, SOFT,
-            reason=few or (None if ref is not None else
-                           "no reference gate at this distance/regime "
-                           "(v2x_awareness pins 200 m urban and 500 m highway)"),
+            f"Neighbour awareness ratio at {int(anchor)} m (normalised, all pairs)",
+            val, "fraction", n_at, None, SOFT,
+            reason=few or (
+                "UNGATED SINCE 2026-09-01 and deliberately so. This is an ALL-PAIRS, SINGLE-SHOT "
+                "ratio normalised at the near band; the 0.90 anchor it used to be graded against "
+                "is a >=1-of-Z per-second NAR over a 3-9 vehicle test fleet at a ~110 dB link "
+                "budget (v2x_awareness_conditions.nar_definition / nar_pair_population_measured / "
+                "nar_shot_multiplicity_z). See comm.nar90_equivalent_range_m for the comparable "
+                "restatement and comm.link_state_los_fraction_* for the quantity that explains "
+                "this number."),
             extra={"regime": reg, "reconstruction_method": method,
                    "normalization": "ratio of observed honest links to co-presence opportunities, "
-                                    "divided by the same ratio in the nearest populated bin"}))
+                                    "divided by the same ratio in the nearest populated bin",
+                   "retired_reference": "v2x_awareness.awareness_ratio_200m_urban_min",
+                   "retired_because": "conditions mismatch on pair population, shot multiplicity "
+                                      "and link budget; see refdata/v2x_awareness_conditions.json"}))
 
     d90 = _crossing(curve, 0.90) if curve is not None else None
     d20 = _crossing(curve, 0.20) if curve is not None else None
@@ -1881,6 +1908,24 @@ def comm_panel(emissions: list[dict], reports: list[dict], report_labels: list[d
         extra={"gap_p95_s": _r(_pct(ga, 95)), "gap_min_s": _r(float(ga.min()) if ga.size else None),
                "note": "one CAM per vehicle per step in the Python engine (1 Hz at dt=1.0 s); the "
                        "MOSAIC layer implements ETSI dynamic triggering (1-10 Hz)"}))
+
+    # ---- like-for-like awareness (datagen/awareness.py) ------------------------------------------
+    # Needs the scenario GEOMETRY (building polygons, vehicle types), which lives in the dataset
+    # directory rather than in the records this function is handed, so it is opt-in on that path
+    # being supplied. Never allowed to break the scorecard: a geometry failure degrades to one `na`
+    # row carrying the exception text, exactly like every other absent signal here.
+    if dataset_dir:
+        try:
+            from . import awareness as _aw
+            rep = _aw.awareness_report(dataset_dir, refdata_dir=refdata.get("dir"),
+                                       bin_m=dist_bin_m, max_dist_m=max_dist_m)
+            out.extend(_aw.panel_rows(rep, _metric, lambda k: _ref(refdata, k)))
+        except Exception as exc:                       # noqa: BLE001 - reported, never raised
+            out.append(_metric(
+                "comm.link_state_los_fraction", P,
+                "LOS fraction of the co-present pair population (all bands)",
+                None, "fraction", None, None, SOFT,
+                reason=f"link-state classification unavailable: {type(exc).__name__}: {exc}"))
     return out
 
 
@@ -1919,7 +1964,8 @@ def scorecard(dataset_dir: str, refdata: dict | str | None = None, *, regime: st
     traffic = traffic_panel(emissions, probe, rd, fd_cell_m=fd_cell_m, fd_window_s=fd_window_s,
                             regime=reg, gt=gt)
     comm = comm_panel(emissions, reports, rlabels, tracks, probe, rd, t_bucket_s=t_bucket_s,
-                      dist_bin_m=dist_bin_m, max_dist_m=max_dist_m, regime=reg)
+                      dist_bin_m=dist_bin_m, max_dist_m=max_dist_m, regime=reg,
+                      dataset_dir=dataset_dir)
     metrics = traffic + comm
     counts = {"pass": 0, "fail": 0, "na": 0}
     for m in metrics:

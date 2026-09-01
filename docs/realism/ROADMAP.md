@@ -115,7 +115,7 @@ New opt-in `radio_model="geometric"` in the reception loop (single choke point, 
 **Tasks (Java)**: buildings.poly.xml LOS attenuation in ScmsBeaconApp; **fix claimed-position NLOS bug** (true sender pos from ScmsBackend oracle); reactive DCC; unify weather-loss tables with Python's; generate the missing `sns/` dir for scms_smoke.
 **Files**: `mock_pipeline/run.py` (reception loop 2673-2752, pre-pass 2544-2650, config block + validate + _FIELD_META + CLI), `mock_pipeline/osm.py`, `schemas/records.py`, `datagen/featurize.py` (new column), `ScmsBeaconApp.java`, `gui/server.py` (pf_* entries: radio_model, dcc_enabled, building density), tests (`test_radio_propagation.py` additions; existing goldens untouched).
 **Benchmark gate** (Phase 0 comm panel, urban OSM scenario + highway scenario):
-- Awareness: ≥ 90% neighbor-awareness at 200 m urban and at 500 m highway under low load (reference: Boban & d'Orey 2015 measurement campaign).
+- ~~Awareness: ≥ 90% neighbor-awareness at 200 m urban and at 500 m highway under low load (reference: Boban & d'Orey 2015 measurement campaign).~~ **RETIRED 2026-09-01 — the comparison was not like-for-like.** The published figure is a ≥1-of-Z per-second NAR at 10 Hz CAM over a 3-vehicle instrumented fleet, quoted as a *crossing distance*, at a ~110 dB link budget; ours was a single-shot all-pairs ratio normalised by an unknown constant, read at a fixed 200 m, at 104 dB. Replaced by `comm.nar90_equivalent_range_m` + `comm.link_state_los_fraction_*` + `comm.pdr_gray_zone_ratio`. Full derivation and re-measurement in [`AWARENESS-GATE.md`](AWARENESS-GATE.md); conditions transcribed in `refdata/v2x_awareness_conditions.json`. The "500 m highway" half is unsupported by the source at all (Table III's largest measured highway figure is 400 m).
 - Gray zone exists: distance band where PDR falls 90%→20% spans ≥ 100 m (step-function models fail this; reference: Bai/Stancil/Krishnan MobiCom 2010 shape).
 - Pathloss unit test: implemented 37.885 formulas match published constants to 0.01 dB at d=100/500 m.
 - Shadowing correlation: empirical link-level autocorrelation e-folding distance 10±3 m (self-test against Gudmundson target).
@@ -159,8 +159,11 @@ New opt-in `radio_model="geometric"` in the reception loop (single choke point, 
 
 | Metric | Threshold | Reference |
 |---|---|---|
-| Awareness ratio @200 m urban / @500 m hwy | ≥90% low-load | Boban & d'Orey 2015 |
-| PDR gray-zone width (90%→20%) | ≥100 m | Bai/Stancil/Krishnan 2010 shape |
+| ~~Awareness ratio @200 m urban / @500 m hwy~~ **RETIRED 2026-09-01** | ~~≥90% low-load~~ | see [`AWARENESS-GATE.md`](AWARENESS-GATE.md) |
+| `comm.nar90_equivalent_range_m` (the crossing distance Table III actually reports) | Boban & d'Orey's simulated urban curve **evaluated at the run's own link budget** must lie inside the model's Z-sensitivity bracket (the source's own fitted Z ∈ [2.1365, 8.2886]) | Boban & d'Orey, IEEE TVT 65(6):3904–3916, 2016, Figs. 18–19; conditions pinned in `refdata/v2x_awareness_conditions.json` |
+| `comm.link_state_los_fraction_{100,200,300}m` | reported, never gated (it is a property of the map) | — |
+| `comm.pdr_gray_zone_ratio` (d20/d90, dimensionless) | ≥ 1.9191 | derived from `v2x_awareness.gray_zone_ratio_from_shadowing`, whose ratios the entry states are lower bounds |
+| PDR gray-zone width (90%→20%) | ≥100 m — *weak: passable by getting quieter, superseded by the ratio above* | Bai/Stancil/Krishnan 2010 shape |
 | Pathloss formula conformance | ≤0.01 dB vs 37.885 constants | 3GPP TR 37.885 |
 | Shadowing decorrelation distance | 10±3 m | ETSI TR 103 257-1 |
 | CBR @ high density (no DCC) | ≥0.55; with DCC steady ≤0.68 | ETSI TS 102 687 |

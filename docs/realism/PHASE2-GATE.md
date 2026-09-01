@@ -106,6 +106,25 @@ The next step is to establish what Boban & d'Orey actually measured — LOS-only
 pairs, or all pairs — and either restate the metric to match those conditions or replace the anchor
 with one whose conditions we can reproduce. Only then is the awareness number meaningful.
 
+### Answered (2026-09-01): [`AWARENESS-GATE.md`](AWARENESS-GATE.md)
+
+The paper was read in full and its conditions are pinned in `refdata/v2x_awareness_conditions.json`.
+The suspicion above was right, and it was worse than "all pairs vs LOS-only" — **four** conditions
+differ. The measured "200 m urban" is **one cell of Table III**: Tampere, a **three-vehicle**
+instrumented fleet on a shared 22 km route. NAR is a **>= 1-of-Z per-second** metric at 10 Hz CAM
+(eq. 4, Z fitted 2.14–8.29), so 0.90 NAR is a **per-packet PDR of 0.344** at the urban Z — while
+our engine emits one CAM per second and therefore reports per-packet PDR directly. And the
+simulated arm that *is* comparable (GEMV², Porto, 2410 vehicles, all pairs, real buildings) assumed
+a **−95 dBm** receiver: its 200 m point sits at a **110 dB** budget against our **104 dB**.
+
+Re-measured like-for-like, the Ingolstadt run's 90%-awareness-equivalent range is **103.5 m**
+against **87.1 m** from the reference's own urban power curve *evaluated at our budget* — 1.19x.
+**The geometric channel is broadly right at the power it is configured for; the gate was wrong.**
+The 0.115 is explained by composition: at 200 m only **6.0%** of co-present pairs are LOS and
+**90.9%** are building-blocked, now published as `comm.link_state_los_fraction_*`. Action 3 below
+("calibrate transmit power against the awareness anchor") is **withdrawn** — it would have tuned the
+radio to absorb a metric-definition error.
+
 The one conclusion that survives unchanged: **the disc model's step-function edge is genuinely
 fixed** — the gray zone passes in every geometric configuration, and `disc`'s 494.8 m "effective
 range" was only ever `radio_range_m` read back.

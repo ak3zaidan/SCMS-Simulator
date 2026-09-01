@@ -38,8 +38,8 @@ import sys
 
 from . import channel as _channel
 from . import detect as _detect
-from .errors import (CapabilityError, ConfigError, InterfaceVersionError, PluginDriftError,
-                     SignatureError)
+from .errors import (ApiError, CapabilityError, ConfigError, InterfaceVersionError,
+                     PluginDriftError, SignatureError)
 from .rng import check_plugin_id
 
 API_VERSION = "1.0"
@@ -122,11 +122,12 @@ class ProvenanceRecord:
     __slots__ = ("slot", "order", "ref", "resolved_via", "distribution", "version",
                  "dist_sha256", "module_sha256", "package_sha256", "interface_version",
                  "capabilities", "declared_streams", "params", "params_sha256",
-                 "provenance_incomplete", "conformance")
+                 "provenance_incomplete", "conformance", "isolated")
 
     def __init__(self, slot, order, ref, resolved_via, distribution, version, dist_sha256,
                  module_sha256, interface_version, capabilities, declared_streams, params,
-                 params_sha256, provenance_incomplete, conformance=None, package_sha256=None):
+                 params_sha256, provenance_incomplete, conformance=None, package_sha256=None,
+                 isolated=False):
         self.slot, self.order, self.ref = slot, order, ref
         self.resolved_via, self.distribution, self.version = resolved_via, distribution, version
         self.dist_sha256, self.module_sha256 = dist_sha256, module_sha256
@@ -146,6 +147,12 @@ class ProvenanceRecord:
         #: an absent field means "not attested", never "attested and failed", because a failing
         #: attestation raises before the run and no manifest is written at all.
         self.conformance = conformance
+        #: True when this plugin ran OUT OF PROCESS (`api/isolate.py`). Recorded in the lock and not
+        #: only in `manifest["config"]`, because it changes how the entry must be VERIFIED: an
+        #: isolated entry must not be re-resolved by importing the plugin into the verifying process
+        #: (`verify_lock` re-probes it in a child instead). Emitted only when true, so every manifest
+        #: written before this field is byte-identical to what it was.
+        self.isolated = bool(isolated)
 
     def to_dict(self) -> dict:
         d = {"slot": self.slot, "order": self.order, "ref": self.ref,
@@ -162,6 +169,8 @@ class ProvenanceRecord:
             d["provenance_incomplete"] = True
         if self.conformance:
             d["conformance"] = self.conformance
+        if self.isolated:
+            d["isolated"] = True
         return d
 
 
@@ -643,6 +652,28 @@ def verify_lock(lock: dict, *, allow_drift: bool = False) -> list:
         slot, ref = entry.get("slot"), entry.get("ref")
         if entry.get("resolved_via") == "builtin":
             continue
+        if entry.get("isolated"):
+            # THE ENTRY RAN OUT OF PROCESS, AND SO DOES ITS DRIFT CHECK. `resolve()` imports, and
+            # module-level code is an earlier hook than `__init__`; importing an isolated plugin
+            # HERE would run the very code the mode exists to keep out -- and a replay is exactly
+            # when an unreviewed third-party detector is most likely to be on the path. The child
+            # reports where it loaded from and this process hashes those files itself.
+            probed, err = _probe_isolated(slot, ref)
+            if probed is None:
+                drift = PluginDriftError(slot, ref, "resolution", entry.get("module_sha256"), err)
+                if not allow_drift:
+                    raise drift
+                drifts.append(drift.args[0])
+                continue
+            for fname in ("module_sha256", "package_sha256", "dist_sha256", "interface_version"):
+                expected, actual = entry.get(fname), probed.get(fname)
+                if expected is None or actual is None or expected == actual:
+                    continue
+                drift = PluginDriftError(slot, ref, fname, expected, actual)
+                if not allow_drift:
+                    raise drift
+                drifts.append(drift.args[0])
+            continue
         try:
             obj, how, iv, _shape = resolve(slot, ref)
         except ConfigError as e:
@@ -674,3 +705,18 @@ def verify_lock(lock: dict, *, allow_drift: bool = False) -> list:
     for msg in drifts:
         print(f"[plugins] DRIFT ALLOWED: {msg}", file=sys.stderr)
     return drifts
+
+
+def _probe_isolated(slot, ref):
+    """(hashes, None) for an isolated lock entry, or (None, reason). Never imports the plugin."""
+    from . import isolate as _isolate
+    try:
+        meta = _isolate.probe(str(slot), str(ref))
+    except ApiError as e:
+        return None, str(e)
+    except Exception as e:                                         # pragma: no cover - defensive
+        return None, f"{type(e).__name__}: {e}"
+    return {"module_sha256": meta.get("module_sha256"),
+            "package_sha256": meta.get("package_sha256"),
+            "dist_sha256": meta.get("dist_sha256"),
+            "interface_version": meta.get("interface_version")}, None

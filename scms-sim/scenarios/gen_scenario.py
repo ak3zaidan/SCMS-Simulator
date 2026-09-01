@@ -24,6 +24,12 @@ all recorded in the generated ``scms_scenario_manifest.json``):
     flattened by one uniform SCMS_VEH_* set (``SCMS_VEH_APPLY=1`` restores that).
   * **RSUs** are no longer stripped unconditionally — ``SCMS_RSUS`` (default ``auto``) places
     them on real junctions as soon as the Java layer ships an RSU application.
+  * **Demand source** (``SCMS_DEMAND``, default ``intas``). ``calibrated`` swaps ``route-files``
+    for a route set produced by ``tools/calibrate_demand.py`` with SUMO's ``routeSampler``, fitted
+    to counts MEASURED at the city's own signal loops rather than to InTAS's 2019 calibration.
+    Requires ``SCMS_DEMAND_ROUTES``; ``SCMS_DEMAND_DETECTORS`` additionally replaces the E1 layout
+    with the repaired one (74 of InTAS's 194 named loops sit on sidewalk lanes and count nothing).
+    The InTAS demand stays the default so published results keep reproducing.
 
     python gen_scenario.py <key> [--duration 300s] [--scale 1.0]
                                   [--max-vehicles N] [--target-flow F] [--lanes L] [--seed S]
@@ -199,6 +205,73 @@ def _tune_sumo(dst: Path, kind: str, vtype_params: dict = None) -> dict:
                 "SUMO SL2015 defaults (route map: the scenario's own route files own the vTypes "
                 "and must not be rewritten)"),
             "vtype_overrides": sorted(vtype_params or {})}
+
+
+def _apply_demand(dst: Path, kind: str) -> dict:
+    """Opt-in alternative demand source. Returns what was resolved, for the manifest.
+
+    ``SCMS_DEMAND=intas`` (the default) touches nothing: the scenario keeps the route set InTAS
+    calibrated against November 2019, so every result already published against it reproduces.
+
+    ``SCMS_DEMAND=calibrated`` points ``route-files`` at a route set built by
+    ``tools/calibrate_demand.py``, whose simulated induction-loop counts were fitted with SUMO's
+    ``routeSampler`` to counts MEASURED at the city's own signal loops. Pedestrians and the
+    scheduled bus network are kept from the source scenario (they are not demand under
+    calibration, and the count targets already have the scheduled bus passages subtracted).
+    ``SCMS_DEMAND_DETECTORS`` additionally swaps the E1 layout for the repaired one.
+
+    Nothing here is a scale factor: the swapped route file is a per-route sample count solved
+    against 55 independent counting locations. The route file's own ``.meta.json`` (written by
+    ``calibrate_demand.py sample``) carries the exact routeSampler invocation, the sha256 of every
+    input and the count windows that were fitted; the held-out error must be quoted from a
+    ``calibrate_demand.py grade`` report against a window that is NOT in that list.
+    """
+    src = mapgen.demand_source()
+    info = {"demand_source": src, "demand_routes": None, "demand_detectors": None,
+            "demand_kept_routes": None}
+    if src == "intas":
+        return info
+    if kind != "route":
+        raise SystemExit("SCMS_DEMAND=calibrated applies to route maps (InTAS) only; "
+                         f"'{kind}' maps get their demand from MOSAIC vehicle flows.")
+    routes = mapgen.demand_routes()
+    if not routes:
+        raise SystemExit("SCMS_DEMAND=calibrated requires SCMS_DEMAND_ROUTES=<calibrated .rou.xml>."
+                         " Build one with tools/calibrate_demand.py (layout -> candidates -> "
+                         "targets -> sample).")
+    rp = Path(routes).expanduser().resolve()
+    if not rp.exists():
+        raise SystemExit(f"SCMS_DEMAND_ROUTES: {rp} does not exist")
+    dets = mapgen.demand_detectors()
+    dp = Path(dets).expanduser().resolve() if dets else None
+    if dp and not dp.exists():
+        raise SystemExit(f"SCMS_DEMAND_DETECTORS: {dp} does not exist")
+    keep = mapgen.demand_keep_routes()
+    kept_all = []
+    for cfg in _sumocfgs(dst):
+        txt = cfg.read_text(encoding="utf-8", errors="replace")
+        old = [r.strip() for r in (_cfg_get(txt, "route-files") or "").split(",") if r.strip()]
+        kept = [r for r in keep if r in old]
+        kept_all = kept
+        rel = os.path.relpath(rp, cfg.parent).replace("\\", "/")
+        txt = _cfg_set(txt, "route-files", ",".join(kept + [rel]), "input")
+        if dp:
+            adds = [x.strip() for x in (_cfg_get(txt, "additional-files") or "").split(",")
+                    if x.strip()]
+            rel_d = os.path.relpath(dp, cfg.parent).replace("\\", "/")
+            # the repaired layout REPLACES the shipped one; loading both would define every
+            # detector id twice and SUMO refuses to start.
+            adds = [a for a in adds if Path(a).name != "InTAS_E1.add.xml"]
+            txt = _cfg_set(txt, "additional-files", ",".join(adds + [rel_d]), "input")
+        cfg.write_text(txt, encoding="utf-8")
+    info.update({"demand_routes": str(rp), "demand_detectors": (str(dp) if dp else None),
+                 "demand_kept_routes": kept_all,
+                 "demand_note": "routeSampler-calibrated against measured Ingolstadt loop counts "
+                                "(tools/calibrate_demand.py); the fitted count windows and the "
+                                "exact routeSampler invocation are in the route file's "
+                                ".meta.json side-car"})
+    print(f"[gen_scenario] demand: calibrated <- {rp}", file=sys.stderr)
+    return info
 
 
 def _vtype_overrides(proto_names: list[str]) -> dict:
@@ -386,6 +459,10 @@ def generate(key: str, duration=None, scale=None, max_vehicles=None,
             txt = scfg.read_text(encoding="utf-8")
             scfg.write_text(_cfg_set(txt, "scale", str(scale), "processing"), encoding="utf-8")
 
+    # demand source (default: the scenario's own routes). Runs before _tune_sumo so the
+    # step/lateral rewrites land on the final route-files/additional-files selection.
+    demand_res = _apply_demand(dst, kind)
+
     # SUMO/MOSAIC coupling: 100 ms sync + EIDM + per-driver speed distribution.
     sumo_res = _tune_sumo(
         dst, kind,
@@ -417,6 +494,7 @@ def generate(key: str, duration=None, scale=None, max_vehicles=None,
         "sumocfg": primary_cfg.name if primary_cfg else None,
         "net_file": net_file.name if net_file else None,
         "route_files": [r.strip() for r in route_files.split(",") if r.strip()],
+        **demand_res,
         **sumo_res,
     }
     inputs = [cfgp, mp, dst / "sumo" / "sumo_config.json", dst / "sns" / "sns_config.json",
@@ -425,6 +503,11 @@ def generate(key: str, duration=None, scale=None, max_vehicles=None,
     if net_file:
         inputs.append(net_file)
     inputs += sorted((dst / "sumo").glob("*.rou.xml"))
+    # an out-of-tree calibrated demand must still be hashed into the manifest, or the run is
+    # not reproducible from it
+    for extra in (demand_res.get("demand_routes"), demand_res.get("demand_detectors")):
+        if extra:
+            inputs.append(Path(extra))
     manifest = mapgen.write_scenario_manifest(dst, key, kind, resolved, inputs)
 
     return {"scenario_config": str(cfgp), "dataset_dir": str(REPO / "datasets" / key),
