@@ -117,6 +117,17 @@ MODULE_WATCH = (
      ("resolve", "instantiate", "verify_lock", "make_provenance", "check_capabilities",
       "module_sha256", "package_sha256", "package_root", "is_builtin", "register_builtin",
       "plugin_id_of", "canonical_bytes", "provenance_digest")),
+    # The message codec seam. `Claim` is the codec's half of the ORACLE firewall and the unit
+    # conversions are what makes an encoded PDU mean what it says; a plugin that rebinds either
+    # silently changes what every emitted PDU asserts. Not loaded on the default dataset path, and
+    # a module that is not loaded is simply not watched, so this costs nothing until a codec is.
+    ("scms_sim_ref.api.codec",
+     ("Claim", "StationView", "GeoFrame", "CODEC_SPEC", "ENGINE_CONVENTIONS",
+      "RESERVED_CAPABILITIES", "SIGNER_FORMS")),
+    ("scms_sim_ref.codecs.units",
+     ("iround", "heading_to_etsi", "speed_to_etsi", "latitude_to_etsi", "longitude_to_etsi",
+      "timestamp_its_ms", "generation_delta_time", "pos_confidence_ellipse",
+      "station_type_to_etsi", "ENGINE_STATION_TYPE", "UNAVAILABLE")),
     ("scms_sim_ref.api.srcgate", ("gate", "scan_source", "check_mode", "module_source")),
     ("scms_sim_ref.api.rng", ("RngNamespace", "check_plugin_id")),
     ("scms_sim_ref.api.integrity", ("Sentinel", "WitnessedRandom", "IntegrityError")),

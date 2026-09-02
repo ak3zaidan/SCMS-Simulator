@@ -130,6 +130,44 @@ class MaReport:
 
 
 @dataclass
+class MaWirePdu:
+    """One ENCODED protocol data unit, as octets, plus what encoded it.
+
+    The missing half of :class:`MaEvidenceMessage`. That record holds a message's *claimed field
+    values*; this one holds the **bytes**, which is what ETSI TS 103 759 actually requires:
+    `v2xPduEvidence` is `SEQUENCE (SIZE(1..MAX)) OF V2xPduStream` -- mandatory, minimum one -- so a
+    report carrying only field values is structurally not a report under any encoding.
+
+    Produced by `scms_sim_ref.api.codec.MessageCodec.evidence_pdu`. `profile_id` and
+    `asn1_module` / `asn1_tag` are recorded per PDU rather than once per run because the codec is a
+    plugin: two runs of the same scenario under different profiles must be distinguishable from the
+    artifact alone, and "which version of the standard" is not a question a hex string answers.
+
+    `pdu_hex` is lowercase hex, not base64: it diffs, greps and pastes into a decoder. MA-visible
+    by construction -- these are exactly the octets that crossed the air, so a receiver holds them
+    and nothing in them is ground truth. Nothing writes this record on the dataset path yet; wiring
+    it into `MaReport` is roadmap phase 5 and needs `run.py`, which this seam deliberately does not
+    touch.
+    """
+    msg_ref: str
+    subject_cert_digest: str          # HashedId8 hex -- NOT a real identity
+    gen_time: float
+    msg_type: str                     # cam|denm|vam
+    profile_id: str                   # native_v1 | etsi_cam_en302637_2 | ...
+    wire_format: str                  # json | uper
+    wire_size_bytes: int              # payload only; the security envelope is added by the codec
+    pdu_sha256: str
+    pdu_hex: str
+    asn1_module: Optional[str] = None   # e.g. "CAM-PDU-Descriptions"
+    asn1_tag: Optional[str] = None      # e.g. "v1.4.1" -- the ETSI Forge tag, never a bare version
+    signer: str = "none"                # none|digest|certificate (TS 103 097 signer alternation)
+    _visibility: str = MA
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class MaCertStatus:
     cert_digest: str
     first_seen: float

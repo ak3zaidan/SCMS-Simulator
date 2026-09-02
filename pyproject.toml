@@ -13,6 +13,17 @@ dependencies = ["cryptography>=42", "pydantic>=2"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+# Real ASN.1 UPER encoding of CAM / DENM / VAM against the vendored ETSI modules
+# (src/scms_sim_ref/codecs/asn1/). DELIBERATELY an extra and NOT in requirements.txt: the engine
+# imports and runs without it, the default `native_v1` codec needs nothing, and only CONSTRUCTING
+# an ETSI codec requires it -- which then fails at load time with the install command in the
+# message. Note asn1tools is not pure Python: it pulls `bitstruct`, which ships a C extension
+# (a prebuilt cp312-win_amd64 wheel exists, so it installs cleanly on this host).
+asn1 = ["asn1tools>=0.166"]
+# The INDEPENDENT decoder used to prove interoperability (tools/asn1_interop.py). A separate ASN.1
+# runtime with its own pre-compiled ETSI modules, so agreement is not self-confirmation. LGPL-2.1+,
+# test-only, never imported by the engine.
+interop = ["asn1tools>=0.166", "pycrate>=0.8"]
 
 [project.scripts]
 scms-poc = "scms_sim_ref.mock_pipeline.run:main"
@@ -26,6 +37,13 @@ where = ["src"]
 # puts src/ on sys.path, so the JSONs are found either way.)
 [tool.setuptools.package-data]
 "scms_sim_ref.datagen" = ["refdata/*.json"]
+# The vendored ETSI ITS ASN.1 modules, their BSD-3-Clause LICENSE files and PROVENANCE.json.
+# Without this a wheel omits them and every ETSI codec fails at construction with
+# FileNotFoundError instead of encoding anything. (In-tree runs are unaffected: conftest.py puts
+# src/ on sys.path.) Licence: BSD-3-Clause, Copyright 2019/2020 ETSI -- clause 1 permits source
+# redistribution provided the notice, conditions and disclaimer are retained, which shipping each
+# repository's own LICENSE beside its .asn does.
+"scms_sim_ref.codecs" = ["asn1/*.json", "asn1/*.md", "asn1/*/*.asn", "asn1/*/LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

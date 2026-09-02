@@ -22,6 +22,27 @@ No other file in `scms-sim/mosaic-apps/` is derived from third-party source: `Sc
 `ScmsRsuApp`, `CamDetector`, `SignedCam`, `ScmsBackend`, `AttackLib`, `Scms`, and `LinkageEngine`
 are original to this project (Apache-2.0) and only call published MOSAIC APIs.
 
+## Vendored ASN.1 (in this repository, under its own licence)
+
+| Path | Licence | Origin |
+| --- | --- | --- |
+| `src/scms_sim_ref/codecs/asn1/cdd_v1.3.1/ITS-Container.asn` | **BSD-3-Clause** (Copyright 2019 ETSI) | ETSI Forge `ITS/asn1/cdd_ts102894_2`, tag `v1.3.1` — ETSI TS 102 894-2 V1.3.1 |
+| `src/scms_sim_ref/codecs/asn1/cdd_v2.1.1/ETSI-ITS-CDD.asn` | **BSD-3-Clause** (Copyright 2019 ETSI) | same project, tag `v2.1.1` — ETSI TS 102 894-2 V2.1.1 |
+| `src/scms_sim_ref/codecs/asn1/cam_en302637_2_v1.4.1/CAM-PDU-Descriptions.asn` | **BSD-3-Clause** (Copyright 2019 ETSI) | ETSI Forge `ITS/asn1/cam_en302637_2`, tag `v1.4.1` — ETSI EN 302 637-2 V1.4.1 |
+| `src/scms_sim_ref/codecs/asn1/denm_en302637_3_v1.3.1/DENM-PDU-Descriptions.asn` | **BSD-3-Clause** (Copyright 2019 ETSI) | ETSI Forge `ITS/asn1/denm_en302637_3`, tag `v1.3.1` — ETSI EN 302 637-3 V1.3.1 |
+| `src/scms_sim_ref/codecs/asn1/vam_ts103300_3_v2.3.1/VAM-PDU-Descriptions.asn`, `motorcyclist-special-container.asn` | **BSD-3-Clause** (Copyright 2020 ETSI) | ETSI Forge `ITS/asn1/vam-ts103300_3`, tag `v2.3.1` — ETSI TS 103 300-3 V2.3.1 |
+
+Every file is committed **unmodified**, beside the upstream repository's own `LICENSE` (clause 1 of
+BSD-3-Clause: source redistribution requires retaining the notice, conditions and disclaimer).
+`src/scms_sim_ref/codecs/asn1/PROVENANCE.json` pins project, tag, commit sha and sha256 for each;
+`tools/fetch_etsi_asn1.py --check` re-verifies them against the Forge, and
+`tests/test_message_codec.py::test_vendored_asn1_is_bsd3_and_pinned` re-hashes them offline on
+every test run.
+
+**SAE J2735 is deliberately absent**: its ASN.1 is sold commercially (`J2735ASN-2024`) and cannot be
+vendored. Every ETSI module needed here is BSD-3-Clause on the Forge, which is why the message layer
+is ETSI-first.
+
 ## Used, not redistributed
 
 | Component | Licence | How it is used |
@@ -32,6 +53,8 @@ are original to this project (Apache-2.0) and only call published MOSAIC APIs.
 | InTAS (Ingolstadt Traffic Scenario) | see the submodule | Consumed through the VeReMi-NextGen submodule; its route files are directory-junctioned into generated scenarios, never copied into this repository. |
 | OpenStreetMap data | ODbL 1.0 | Fetched on demand via Overpass for `osm_*` map keys and cached under `scms-sim/scenarios/_mapcache`. © OpenStreetMap contributors. Derived networks inherit ODbL obligations. |
 | `cryptography`, `pydantic`, `numpy`, `pandas`, `pytest` | Apache-2.0 / MIT / BSD | Ordinary pip dependencies, not vendored. |
+| `asn1tools` (+ `bitstruct`, `pyparsing`) | MIT | **Optional** extra `scms-sim-ref[asn1]`. Compiles the vendored ETSI modules and produces the UPER octets. Not in `requirements.txt`; the engine imports and runs without it. |
+| `pycrate` | **LGPL-2.1+** | **Optional**, test-only extra `scms-sim-ref[interop]`. The INDEPENDENT decoder in `tools/asn1_interop.py`, used only to check that a foreign ASN.1 runtime with its own copy of the ETSI modules agrees with our octets. Never imported by the engine, never redistributed. |
 
 ## Reference data
 

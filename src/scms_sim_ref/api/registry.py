@@ -37,6 +37,7 @@ import os
 import sys
 
 from . import channel as _channel
+from . import codec as _codec
 from . import detect as _detect
 from .errors import (ApiError, CapabilityError, ConfigError, InterfaceVersionError,
                      PluginDriftError, SignatureError)
@@ -73,7 +74,36 @@ INTERFACE: dict = {
         _detect.INTERFACE_NAME, _detect.INTERFACE_VERSION, _detect.MAX_MINOR,
         {"fusion": _detect.FUSION_SPEC},
     ),
+    "message_codec": (
+        _codec.INTERFACE_NAME, _codec.INTERFACE_VERSION, _codec.MAX_MINOR,
+        {"codec": _codec.CODEC_SPEC},
+    ),
 }
+
+#: slot -> the module whose IMPORT registers that slot's built-ins, imported ON DEMAND the first
+#: time the slot is looked at.
+#:
+#: `channel_model`, `check`, `fusion` and `mobility` are registered as a side effect of importing
+#: `run.py` / `detectors.py`, which every engine entry point does anyway. `message_codec` has no
+#: such natural importer: nothing on the default dataset path constructs a codec, and adding an
+#: unconditional import of the codecs package to `run.py` would make an OPTIONAL feature a
+#: mandatory import. Resolving the slot is therefore what pulls the package in -- and the package
+#: itself imports no third-party module, so this stays free. `ImportError` is swallowed: a
+#: stripped-down install without the `codecs` package must still be able to resolve a third-party
+#: codec by dotted path.
+_LAZY_REGISTRARS = {"message_codec": "scms_sim_ref.codecs"}
+_LAZY_DONE: set = set()
+
+
+def _ensure_builtins(slot: str) -> None:
+    mod = _LAZY_REGISTRARS.get(slot)
+    if mod is None or slot in _LAZY_DONE:
+        return
+    _LAZY_DONE.add(slot)
+    try:
+        importlib.import_module(mod)
+    except ImportError:                                    # pragma: no cover - stripped install
+        pass
 
 #: slot -> (known capabilities, capabilities refused from anything that is not a built-in). Both
 #: sets are the SLOT's, not the channel's: a detector declaring `rssi` means "reads obs.rssi_dbm",
@@ -82,6 +112,7 @@ CAPABILITIES: dict = {
     "channel_model": (_channel.KNOWN_CAPABILITIES, _channel.RESERVED_CAPABILITIES),
     "check": (_detect.KNOWN_CAPABILITIES, _detect.RESERVED_CAPABILITIES),
     "fusion": (_detect.KNOWN_CAPABILITIES, _detect.RESERVED_CAPABILITIES),
+    "message_codec": (_codec.KNOWN_CAPABILITIES, _codec.RESERVED_CAPABILITIES),
 }
 
 
@@ -97,15 +128,18 @@ def register_builtin(slot: str, name: str, obj) -> None:
 
 def builtin_names(slot: str) -> tuple:
     """Registration (display) order -- what the CLI and the GUI dropdown publish."""
+    _ensure_builtins(slot)
     return tuple(_BUILTINS[slot])
 
 
 def builtin_names_sorted(slot: str) -> tuple:
     """Sorted snapshot -- the only order used anywhere a digest can see it."""
+    _ensure_builtins(slot)
     return tuple(sorted(_BUILTINS[slot]))
 
 
 def builtin(slot: str, name: str):
+    _ensure_builtins(slot)
     return _BUILTINS[slot].get(name)
 
 
@@ -538,6 +572,7 @@ def resolve(slot: str, ref: str):
     """Three tiers, in this order, with every failure fatal here rather than at step k > 0."""
     if slot not in _BUILTINS:
         raise ConfigError(f"unknown plugin slot {slot!r}; known: {SLOTS}")
+    _ensure_builtins(slot)
     ref = str(ref)
     if ref in _BUILTINS[slot]:
         obj, how = _BUILTINS[slot][ref], "builtin"

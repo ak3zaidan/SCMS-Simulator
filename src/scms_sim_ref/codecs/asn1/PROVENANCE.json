@@ -1,0 +1,94 @@
+{
+  "files": {
+    "cam_en302637_2_v1.4.1/CAM-PDU-Descriptions.asn": {
+      "bytes": 4041,
+      "commit": "fed28cfe5c930dd9d3109ff1162c28008697754a",
+      "path": "CAM-PDU-Descriptions.asn",
+      "project": "ITS/asn1/cam_en302637_2",
+      "sha256": "78e42dbd0dc95d9f2fa7bf1b00d7484dfb8b1b89b064a2f34c60372a775f0449",
+      "tag": "v1.4.1"
+    },
+    "cam_en302637_2_v1.4.1/LICENSE": {
+      "bytes": 1475,
+      "commit": "fed28cfe5c930dd9d3109ff1162c28008697754a",
+      "path": "LICENSE",
+      "project": "ITS/asn1/cam_en302637_2",
+      "sha256": "8f102e377f1ad7ed9fa90d9dd6cb9ab75e071949dcdb8cb413a10dc98d80b9d4",
+      "tag": "v1.4.1"
+    },
+    "cdd_v1.3.1/ITS-Container.asn": {
+      "bytes": 19745,
+      "commit": "2d2450e79aab4c7032ef615b72ddefaf2e5ba8a9",
+      "path": "ITS-Container.asn",
+      "project": "ITS/asn1/cdd_ts102894_2",
+      "sha256": "afc658e2ad6382539a7710dd2607051a5416b5ed9cb3e681a6d52328cde8d0f9",
+      "tag": "v1.3.1"
+    },
+    "cdd_v1.3.1/LICENSE": {
+      "bytes": 1475,
+      "commit": "2d2450e79aab4c7032ef615b72ddefaf2e5ba8a9",
+      "path": "LICENSE",
+      "project": "ITS/asn1/cdd_ts102894_2",
+      "sha256": "8f102e377f1ad7ed9fa90d9dd6cb9ab75e071949dcdb8cb413a10dc98d80b9d4",
+      "tag": "v1.3.1"
+    },
+    "cdd_v2.1.1/ETSI-ITS-CDD.asn": {
+      "bytes": 282297,
+      "commit": "55ae879d4b681514764aba37fe2f9856b70b09d8",
+      "path": "ETSI-ITS-CDD.asn",
+      "project": "ITS/asn1/cdd_ts102894_2",
+      "sha256": "13d6893406459a7b99bc322c3bae8e63f95114bad2ffc6e258b53ab35f02c5a0",
+      "tag": "v2.1.1"
+    },
+    "cdd_v2.1.1/LICENSE": {
+      "bytes": 1475,
+      "commit": "55ae879d4b681514764aba37fe2f9856b70b09d8",
+      "path": "LICENSE",
+      "project": "ITS/asn1/cdd_ts102894_2",
+      "sha256": "8f102e377f1ad7ed9fa90d9dd6cb9ab75e071949dcdb8cb413a10dc98d80b9d4",
+      "tag": "v2.1.1"
+    },
+    "denm_en302637_3_v1.3.1/DENM-PDU-Descriptions.asn": {
+      "bytes": 3733,
+      "commit": "a3c35c217f320e2b1c898c178c5b1b5f46d07cef",
+      "path": "DENM-PDU-Descriptions.asn",
+      "project": "ITS/asn1/denm_en302637_3",
+      "sha256": "c5025c63ad99c6c2d5e8cfc22e32f6e513885e388f09ccf5227f3cee0be333ce",
+      "tag": "v1.3.1"
+    },
+    "denm_en302637_3_v1.3.1/LICENSE": {
+      "bytes": 1475,
+      "commit": "a3c35c217f320e2b1c898c178c5b1b5f46d07cef",
+      "path": "LICENSE",
+      "project": "ITS/asn1/denm_en302637_3",
+      "sha256": "8f102e377f1ad7ed9fa90d9dd6cb9ab75e071949dcdb8cb413a10dc98d80b9d4",
+      "tag": "v1.3.1"
+    },
+    "vam_ts103300_3_v2.3.1/LICENSE": {
+      "bytes": 1476,
+      "commit": "321f1c17b602dbf67140f7435f11839630ef7cb9",
+      "path": "LICENSE",
+      "project": "ITS/asn1/vam-ts103300_3",
+      "sha256": "affd06519a9ec9ad6f0a3f6457a3772a12d609632e91ddfeb0ea5cab94b553e5",
+      "tag": "v2.3.1"
+    },
+    "vam_ts103300_3_v2.3.1/VAM-PDU-Descriptions.asn": {
+      "bytes": 12589,
+      "commit": "321f1c17b602dbf67140f7435f11839630ef7cb9",
+      "path": "VAM-PDU-Descriptions.asn",
+      "project": "ITS/asn1/vam-ts103300_3",
+      "sha256": "5631c6d2534a7883fe329f9fe40f45b039e3c9d0611560ea7ef20d3a9ba3d11f",
+      "tag": "v2.3.1"
+    },
+    "vam_ts103300_3_v2.3.1/motorcyclist-special-container.asn": {
+      "bytes": 1338,
+      "commit": "321f1c17b602dbf67140f7435f11839630ef7cb9",
+      "path": "motorcyclist-special-container.asn",
+      "project": "ITS/asn1/vam-ts103300_3",
+      "sha256": "846a7517c3de316292e331e39cd69446d5a281a2fd0b73fff5d804b1022c2f0f",
+      "tag": "v2.3.1"
+    }
+  },
+  "licence": "BSD-3-Clause (Copyright 2019 ETSI) -- see the LICENSE beside each .asn",
+  "source": "https://forge.etsi.org/rep/ITS/asn1"
+}
