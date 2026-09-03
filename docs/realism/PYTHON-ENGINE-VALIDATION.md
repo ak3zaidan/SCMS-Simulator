@@ -16,16 +16,87 @@ Two things close that gap:
   `time_to_teleport`, `split_on_gap` — without which a real city's peak hour cannot be frozen at
   all. Each was forced by a measured failure, not by taste; see section 6.
 
-**KEEP TWO QUESTIONS APART.** *Is the mobility adapter faithful?* and *is the demand right?* are
-different questions with different answers. The adapter is measured here and it is exact. The demand
-is a known, separately documented deficit being calibrated in another workstream, and every count
-number below inherits it.
+**KEEP THE QUESTIONS APART.** *Is the mobility adapter faithful?* and *is the demand right?* are
+different questions with different answers. The adapter is measured here and it is exact — over a
+full peak hour, all 5,949,526 emitted samples. The demand is a known, separately documented deficit
+being calibrated in another workstream, and every count number below inherits it.
+
+The peak hour forced a **third** question out into the open, which the 300 s window had hidden:
+*does the DATASET preserve the mobility?* It does not. SCMS enforcement revokes 61.4% of the
+vehicles and a revoked vehicle stops emitting, so the dataset keeps only 43.8% of the vehicle-steps
+and 46.8% of the loop crossings the trace contains. That term is larger than the demand deficit and
+is not about traffic at all. Section 1 separates all three; conflating them is the main way to
+misread this document.
 
 ---
 
 ## 1. The headline
 
-<!--HOUR-HEADLINE-->
+A **full clock hour of the InTAS AM peak** — SUMO 25201–28800 s, which is **2023-11-14
+06:00–07:00 UTC**, entered warm after 3,600 discarded warm-up steps from 21600 — was frozen
+(14,896 trajectories, **13,589,568 vehicle-steps**, 301 teleports, 156 gap splits, 2 collisions,
+sha256 `5169914b…`), driven through the Python engine at `dt = 1.0`, `emit_sample_prob = 1.0`,
+seed 42, and the engine's **own emitted dataset** was counted at Ingolstadt's real induction loops
+and graded against what the city measured. The window is genuinely at peak: **3,781 concurrent
+vehicles at the median** (min 3,551, max 3,944 — a 1.08× spread, so it is stationary, not a fill
+transient), 40.7% of them halting, median network speed 5.71 m/s.
+
+### The engine's dataset against reality
+
+23 comparable stations, **45,713 measured vehicles**, InTAS-matched detectors only, counts read
+through `sumo_realism.py --ref-counts` with no producer-specific branch. Counter set to
+`--exclusive-gates`, whose own error against SUMO's loops on this same run is **+0.41%** (section 3).
+
+| source | modelled | ÷ measured | rel. error | median station GEH | p85 | stations with GEH < 5 |
+|---|---|---|---|---|---|---|
+| SUMO's own `<e1Detector>` loops | 21,095 | 0.4615 | −53.85% | 25.52 | 43.88 | **0 / 23** |
+| the frozen trace (SUMO's positions) | 21,163 | 0.4630 | −53.71% | 25.53 | 43.85 | **0 / 23** |
+| **the Python engine's dataset** | **10,080** | **0.2205** | **−77.95%** | **42.94** | 57.85 | **0 / 23** |
+
+**All four FHWA gates fail on every row, and the gate is RED.** Not one station of 23 reaches
+GEH < 5; the threshold is 0.85 of them. This is not a marginal result and it is not presented as one.
+
+**Nothing here was fitted to these counts.** The InTAS demand is upstream and predates the archive
+query; no scale factor, per-station adjustment, seed choice or window choice was applied. The
+calibrated/held-out distinction that governs the demand workstream does not arise, because there was
+no calibration step — this window is held out by construction.
+
+### Three questions, three different answers
+
+The gap between the last two rows is 2.1×, and it is not the traffic. Three readings of **literally
+the same trajectories** separate the causes cleanly, and they **multiply**:
+
+| | measured | what it is |
+|---|---|---|
+| **Is the mobility adapter faithful?** | **YES, exactly** | Of **5,949,526** emitted ground-truth samples, **5,949,526** carry a position SUMO actually reported at that step, and **5,949,526** carry the matching speed. Position match fraction **1.000**, speed **1.000**, zero misses, zero steps with any miss, all 14,896 trajectories present. Tested by set membership against the frozen frame, so no id mapping is assumed. |
+| **Is the demand right?** | **NO — 0.4630** | The frozen trace, i.e. SUMO's own motion with no SCMS layer at all, records 21,163 against 45,713. All 23 stations under-produce, **none over-produces**, ratios **0.1796 – 0.7418**, median 0.4846. SUMO's own loops give the same answer (0.4615; ratios 0.1744 – 0.7416, median 0.4803), so this is InTAS's demand model, not anything the Python engine did. |
+| **Does the DATASET preserve the mobility?** | **NO — 0.4677** | The engine's dataset records **11,100** crossings against the trace's **23,733** on the same 25 stations: **−53.23%**, median station GEH 18.46, per-station kept fraction 0.3496 – 0.5832. |
+
+Against reality the engine's dataset therefore lands at **0.0704 – 0.4179 of measured, median
+0.2370, and again not one station over-produces** — but only the middle row of that table is a
+statement about traffic.
+
+0.4630 × 0.4677 = 0.2166, against the 0.2205 measured directly. **The dataset's −77.95% is a demand
+deficit and a dataset deficit multiplied together, and only the first of them is about traffic.**
+
+### The third term is SCMS enforcement, and at peak it dominates
+
+A revoked vehicle stops broadcasting, so its kinematic record ends at revocation while it keeps
+driving. At 300 s that cost −7.3% of crossings (section 2). Over the peak hour:
+
+* **9,143 of 14,896 vehicles revoked — 61.38%.**
+* **5,949,526 of 13,589,568 vehicle-steps survive — 43.78%.** 7,640,042 are absent.
+* A revoked vehicle's record spans **296.3 s against 560.6 s** for one never revoked.
+* Detection **precision 0.308**, recall 0.974, 2,889 attackers. So of the 9,143 revocations,
+  ~2,814 caught an attacker and **~6,329 were benign vehicles wrongly revoked** — and it is mostly
+  those false revocations that are deleting the traffic.
+
+**This is the SCMS layer working as configured, not a mobility defect** — but it means
+`gt_emissions_sample.jsonl` from a peak-hour run is **not a traffic sample**, and any flow, density
+or headway computed from it is low by a factor that grows with the run length and with the MA's
+false-positive rate. That was invisible at 300 s.
+
+
 
 ---
 
@@ -43,6 +114,23 @@ Same run, two files: the frozen SUMO artifact and the engine's own ground truth.
 
 Every emitted ground-truth sample is the frozen SUMO state, to the artifact's 3-decimal
 quantisation. There is no drift, no interpolation and no re-integration: the adapter is a pass-through.
+
+**And it stays exact at 8.4× the sample count and 44.6× the vehicles.** Re-measured on the AM-peak
+hour by a method that
+assumes no id mapping at all — for each emitted sample, is its `(true_x, true_y)` a member of the
+set of positions SUMO reported at the corresponding trace step?
+
+| | 0–300 s | **AM peak hour** |
+|---|---|---|
+| vehicles | 334 | **14,896** (all of them) |
+| emissions checked | 709,454 | **5,949,526** |
+| positions that are a frozen SUMO position | 709,454 (**1.000**) | **5,949,526 (1.000)** |
+| speeds that also match | 709,454 (**1.000**) | **5,949,526 (1.000)** |
+| steps with any mismatch | 0 | **0** |
+
+Whatever is wrong with the numbers in section 1, **it is not the adapter**, and that is now measured
+over a congested peak hour with teleports and gap splits in the trace rather than over five clean
+minutes at midnight.
 
 Two things the comparison also pins down, neither of which is drift:
 
@@ -277,34 +365,83 @@ engine's own IDM. This is the clean A/B: **identical config, identical network (
 `--road sumo`), identical dt (0.1 s), identical seed, identical duration and identical
 `emit_sample_prob`; the only field that differs is `mobility_source`.**
 
-| metric | internal IDM | SUMO replay | reference | verdict |
+**Read this first table as superseded.** It is the 0–300 s window, which is local midnight with ~290
+concurrent vehicles; the verdict column is what that window appeared to say, and the peak-hour
+section below overturns two of the three.
+
+| metric | internal IDM | SUMO replay | reference | verdict AT MIDNIGHT (superseded) |
 |---|---|---|---|---|
-| `traffic.overlap_events` | **20 (HARD FAIL)** | **0 (pass)** | ≤ 0 | **CONFIRMED — fixed** |
-| `traffic.fd_capacity_veh_h_lane` | 182.5 (fail) | 811.7 (fail) | 1800–2400 | **partly — 4.4× better, still fails** |
-| `traffic.headway_ks_shifted_exponential` | 0.1498 (pass) | 0.1936 (fail) | ≤ 0.15 | **REFUTED — worse** |
+| `traffic.overlap_events` | **20 (HARD FAIL)** | **0 (pass)** | ≤ 0 | CONFIRMED — fixed → **holds at peak** |
+| `traffic.fd_capacity_veh_h_lane` | 182.5 (fail) | 811.7 (fail) | 1800–2400 | partly — 4.4× better → **the gate is inapplicable** |
+| `traffic.headway_ks_shifted_exponential` | 0.1498 (pass) | 0.1936 (fail) | ≤ 0.15 | REFUTED — worse → **REVERSES at peak** |
 
-One of three. Specifically:
+One of three — **at local midnight. Re-run at the AM peak, the verdicts change, and two of them
+change sign.**
 
-**Overlap events: the prediction was right.** Two distinct vehicles closer than 1 m at the same
-instant is a modelling failure, and the engine's IDM produces 20 of them in 240 sampled instants on
-this network. SUMO produces none, because SUMO has lanes, junction conflict resolution and a
-collision model, and the engine has one centreline per road.
+### The same A/B at the AM peak hour
 
-**FD capacity: the prediction was directionally right and quantitatively insufficient.** 182.5 →
-811.7 veh/h/lane is a 4.4× improvement and still less than half the 1800 veh/h/lane floor. This
-particular window (InTAS 0–300 s = local midnight, ~290 concurrent vehicles on a 3,289-junction
-network) cannot reach capacity on any engine — MOSAIC scores 945.4 on the same window. Section 1's
-AM-peak hour is the window where this metric can actually be tested.
+`realism_bench --regime urban`, both arms `dt = 1.0`, `emit_sample_prob = 1.0`, seed 42,
+`duration_s = 3600`, `road_network = sumo`, same 3,289-junction InTAS network; `mobility_source` is
+`sumo_replay` against `internal`.
 
-**Headway KS: the prediction was wrong, and the direction is informative.** The internal model
-passes (0.1498) and SUMO mobility fails (0.1936). A shifted exponential (Cowan M3) is what an
-unstructured arrival process looks like; the engine's IDM, spawning from a Poisson process and
-following a single leader, produces close to exactly that. Real signalised traffic does not — it
-platoons, so the headway distribution is bimodal (within-platoon at saturation headway, between-platoon
-long gaps) and fits a shifted exponential worse. **The metric is scoring the wrong thing: the
-engine's better score comes from having less structure, not more realism.** That is a defect in the
-gate, not in the mobility, and it should be re-derived against a platoon-aware model before it is
-quoted again.
+| metric | reference | internal IDM | SUMO replay | verdict at peak |
+|---|---|---|---|---|
+| sample pairs | — | 5,260,262 | 5,934,630 | |
+| `traffic.overlap_events` | ≤ 0 | **55,608 (HARD FAIL)** | **28 (hard fail)** | **CONFIRMED — 1,986× fewer** |
+| `traffic.fd_capacity_veh_h_lane` | 1800–2400 | 459.3 fail | 763.6 fail | **UNTESTABLE — see below** |
+| `traffic.headway_ks_shifted_exponential` | ≤ 0.15 | **0.1741 fail** | **0.1139 PASS** | **CONFIRMED — reversed** |
+| `traffic.teleport_events` | ≤ 0 | 0 pass | **1 hard fail** | new at peak |
+| `traffic.lateral_discontinuity_events` | 0 | 0.5955 fail | 0.6311 fail | both fail |
+| `traffic.accel_within_hard_bound_frac` | = 1.0 | 0.999843 fail | 0.999964 fail | both fail |
+| speed p50 / p95 / max (m/s) | 3–14 / 8–22 / ≤60 | 5.60 / 13.69 / 19.66 | 4.772 / 17.16 / 55.60 | both pass |
+| moving fraction | ≥ 0.5 | 0.9403 pass | 0.9583 pass | both pass |
+
+**Overlap events: confirmed, and far more strongly than at 300 s.** The engine's own IDM produces
+**55,608** distinct-vehicle overlaps in 240 sampled instants at peak density, against **28** for
+SUMO's trajectories — a factor of 1,986. The replay is no longer exactly zero, which the 300 s window
+suggested it would be; 28 overlaps is SUMO's sublane model letting vehicles pass within 1 m at
+junction internal lanes, not a replay artefact. The conclusion is unchanged and the margin is
+enormous.
+
+**Headway KS: the 300 s result was an artefact of the midnight window, and the prediction was
+right after all.** At the peak the ordering is exactly reversed — **SUMO replay passes at 0.1139**
+and **the internal IDM fails at 0.1741**, against 0.1936 fail / 0.1498 pass at midnight. So the
+earlier reading, that "the metric rewards the absence of structure", does not survive contact with
+real density: with ~3,800 concurrent vehicles the real mobility fits the shifted exponential
+*better* than the hand-rolled one does. What the midnight window was measuring was 290 vehicles
+scattered over 3,289 junctions, where a replayed arrival stream is close to deterministic and a
+Poisson spawner is close to exponential by construction. **The gate is fine; the window was wrong.**
+Section 8's open item 3 is withdrawn.
+
+**FD capacity: the prediction cannot be tested on this scenario at all, and the peak hour is what
+proves it.** 459.3 → 763.6 veh/h/lane is again a large improvement that again falls far short of the
+1800 veh/h/lane floor. But the reason is not the car-following model in either arm:
+
+| per-lane hourly flow at the AM peak | max | p95 | median | lanes ≥ 1800 | lanes ≥ 900 |
+|---|---|---|---|---|---|
+| SUMO's own loops on this run (194 loops, 119 with flow) | **713** | 530 | 156 | **0** | **0** |
+| **REALITY — the city's own loops (167 InTAS-matched)** | **960** | 629 | 253 | **0** | **1** |
+
+**Not one instrumented lane in Ingolstadt carries 900 veh/h at its busiest hour, and none comes
+within half of the 1800 veh/h/lane reference floor.** The band is a freeway-capacity anchor
+(Cassidy & Bertini lineage) and this is a mid-size German city's signalised arterial network: the
+metric is inapplicable here, and **no mobility model driving real Ingolstadt demand on the real
+Ingolstadt network could ever pass it.** The 300 s section's claim that "the AM-peak hour is the
+window where this metric can actually be tested" is therefore **wrong, and this measurement retracts
+it.** `fd_capacity` should be gated only on scenarios whose links actually reach capacity, or
+re-anchored per road class; quoting it as a realism verdict on InTAS says nothing about the engine.
+
+**One caveat that is not resolved, stated rather than smoothed.** The two arms are *not* matched on
+density, and cannot be: `arrival_rate` is inert under `sumo_replay` (vehicles come from the trace),
+so the internal arm has to be given some rate, and it was given 5.0/s. Measured consequence — the
+replay arm is **stationary at 3,552 → 3,845 active (1.08× spread)** because the warm-up filled the
+network first, while the internal arm **climbs monotonically from 0 to 10,764 and never reaches
+steady state**, ending at 2.8× the replay's density. For `overlap_events` and `fd_capacity` the
+confound runs *in the internal arm's favour* — more vehicles means more chances to reach capacity,
+and its 55,608 overlaps are being compared against a lower-density baseline — so those two
+conclusions survive it. **The headway comparison is genuinely confounded by it** and would need a
+density-matched internal control to be clean; that run was not made, and its absence is why the
+headway row says "reversed" rather than "settled".
 
 ---
 
@@ -439,6 +576,19 @@ python -m scms_sim_ref.datagen.realism_bench datasets\py_intas_hour --regime urb
   --json .realism_cache\pyeng\scorecard_py_intas_hour.json
 ```
 
+**Measured wall clock**, so the next person can budget. The engine replay over the frozen hour took
+**55 min 49 s** (00:31:58 → manifest at 01:27:47) with nothing else running, producing a 1.72 GiB
+`gt_emissions_sample.jsonl` of 5,949,526 rows. The four analysis passes — both crossing counts, the
+adapter check and the scorecard — run in **1 min 50 s** together on 16 cores. The freeze itself
+(SUMO 21600–28800 at 0.1 s, i.e. 72,000 integration steps of which every tenth is recorded) and the
+internal-mobility control were run CONCURRENTLY by an earlier session — 17:22→18:29:34 and
+17:23→18:30:31 — so each took **at most ~68 min** and neither figure is a clean single-process
+measurement; budget them as ~1 h each and expect better alone. Roughly **two hours per
+(freeze + replay) arm**, which is why the number of arms has to be chosen before starting rather
+than discovered. **Re-running the replay reproduced the previous run's flow log line-for-line** on
+all nine shared checkpoints (active / spawned / reports / revoked), so the engine side is
+deterministic and a killed run can simply be restarted rather than redesigned.
+
 `engine_detectors.py` writes an E1-shaped XML on purpose: `sumo_realism.py` reads it through its
 existing `parse_e1_output`, so the Python engine is graded by the same code path, the same station
 grouping and the same criteria as the MOSAIC engine, with no producer-specific branch anywhere.
@@ -474,6 +624,18 @@ So taking the archive at face value would have credited Ingolstadt with 52,074 v
 (3120, 3130) are registered but have zero observations in the entire archive and are never emitted —
 a zero there would silently corrupt a GEH.
 
+### What this file does and does not contain of the measured counts
+
+The Stadt Ingolstadt / SAVeNoW loop counts have **no formally stated licence** (TUM catalogue:
+"License Not Specified"), so nothing derived from them is committed as data and the `--i-know` guard
+was never used. `refcounts_A.json` lives under `.realism_cache/` and every dataset under `datasets/`;
+both are gitignored, verified. What this prose *does* contain is **aggregate statistics**: the
+23-station total (45,713 and its 52,074 whole-intersection counterpart), per-station model÷measured
+ratios and GEH values, the five worst inflation percentages above, and one distributional summary of
+per-lane flow (max 960, p95 629, median 253 over 167 loops) that section 5 needs in order to show the
+`fd_capacity` gate is unreachable. It contains **no raw observations, no per-detector counts and no
+time series.** If the licence is ever formally stated, this paragraph is what should be revisited.
+
 ---
 
 ## 8. Open
@@ -494,17 +656,34 @@ a zero there would silently corrupt a GEH.
    56.351 m/s (Python) against 56.34 m/s (MOSAIC). Closing this is a MOSAIC-side emission-schema
    change, not an analysis change.
 
-3. **`traffic.headway_ks_shifted_exponential` appears to reward the absence of structure.** The
-   engine's Poisson-spawned single-leader IDM fits a shifted exponential BETTER (0.1498, pass) than
-   real signalised traffic does (0.1936, fail), because platooning makes the real distribution
-   bimodal. The gate should be re-derived against a platoon-aware headway model before it is quoted
-   as a realism result in either direction.
+3. ~~**`traffic.headway_ks_shifted_exponential` appears to reward the absence of structure.**~~
+   **WITHDRAWN by the peak-hour measurement (section 5).** That reading rested on the 300 s midnight
+   window, where the internal IDM scored 0.1498 (pass) and SUMO replay 0.1936 (fail). At the AM peak
+   the ordering reverses — SUMO replay **0.1139 (pass)**, internal IDM **0.1741 (fail)** — so the
+   gate does not reward the absence of structure; the midnight window simply had 290 vehicles on a
+   3,289-junction network and was measuring almost nothing. What remains open is only that the two
+   arms are not density-matched (section 5's last paragraph), so a density-matched internal control
+   would be needed to call the headway comparison settled rather than merely reversed.
 
-4. **A revoked vehicle stops emitting, so the dataset's kinematic record ends at revocation.**
-   Measured on the 300 s run: 27 of 334 vehicles, −9.23% of vehicle-steps, −7.3% of loop crossings.
-   Anything computed from `gt_emissions_sample.jsonl` — including every traffic-panel metric and
-   every flow count — is low by the enforced fraction. Either state it per dataset or emit ground
-   truth independently of enforcement.
+4. **A revoked vehicle stops emitting, and at peak that is the largest single distortion in the
+   dataset — bigger than the demand deficit.** Measured on the 300 s run: 27 of 334 vehicles,
+   −9.23% of vehicle-steps, −7.3% of loop crossings. Measured on the **peak hour: 9,143 of 14,896
+   vehicles revoked (61.38%), 5,949,526 of 13,589,568 vehicle-steps surviving (43.78%), 11,100 of
+   23,733 loop crossings surviving (46.77%)** — and with detection precision 0.308, about 6,329 of
+   those 9,143 revocations were benign vehicles. Anything computed from `gt_emissions_sample.jsonl`
+   — every traffic-panel metric and every flow count — is low by that fraction, which **grows with
+   run length and with the MA's false-positive rate**, so it cannot be corrected by a constant.
+   Either emit ground truth independently of enforcement, or stamp the surviving fraction into the
+   manifest so a consumer can see it. This is the most consequential open item in this document.
+
+4b. **The peak-hour replay trips two hard gates the 300 s replay did not**: `teleport_events` = 1
+   and `overlap_events` = 28. Neither is the adapter — section 1 shows every emitted sample is an
+   exact frozen SUMO state — so both are SUMO's own behaviour surviving the replay: 28 sublane
+   near-passes at junction internal lanes, and one displacement above the speed bound. Note
+   `split_on_gap` only splits a trajectory when the vehicle LEAVES `getIDList()`; the freeze recorded
+   **301 teleports but only 156 gap splits**, so 145 teleports left no gap to split on, and one of
+   them is visible as that jump. Worth deciding whether the freeze should detect a teleport by
+   displacement as well as by absence.
 
 5. **The crossing counter's bias is now measured over a full hour and mostly removed — the residual
    is +0.41%.** The "about +5%" from the 300 s windows was two effects stacked, and section 3 takes
@@ -526,5 +705,23 @@ a zero there would silently corrupt a GEH.
    step has to be driven from a dumped-and-patched config. `--dump-config` also writes AFTER the
    run completes, so it cannot be used to prepare a config without first completing a throwaway run.
 
-8. **The mobility A/B is at 300 s and midnight density.** A full-hour internal-mobility control at
-   AM-peak concurrency was not run; the FD-capacity comparison at peak is therefore one-sided.
+8. ~~**The mobility A/B is at 300 s and midnight density.**~~ **CLOSED — section 5 now carries the
+   full-hour A/B at AM-peak concurrency**, and it changed two of the three verdicts. What replaced
+   it is a narrower objection: the two arms cannot be density-matched, because `arrival_rate` is
+   inert under `sumo_replay`, so the internal arm ran at 5.0/s and climbed from 0 to 10,764 active
+   while the replay arm sat stationary at 3,552–3,845. See section 5's final paragraph for which
+   conclusions survive that and which do not.
+
+9. **`traffic.fd_capacity_veh_h_lane` is not applicable to this scenario and should stop being
+   reported as a verdict on it.** At the real AM peak, the busiest of Ingolstadt's 167 InTAS-matched
+   loops carries **960 veh/h**, the median 253, and **none reaches the 1800 veh/h/lane reference
+   floor** — the band is a freeway anchor and this is a signalised city network. The gate needs a
+   per-road-class anchor, or a scenario whose links actually saturate, before any engine's score on
+   it means anything.
+
+10. **A held-out window was not run for this document, and would be cheap.** Everything here is
+   window A (2023-11-14 06:00–07:00Z). Nothing was fitted to it, so it is held out by construction
+   and no overfitting is possible — but the *demand* conclusion would still be stronger stated
+   across window B (2023-11-15 15:00–16:00Z), where `GEH-RESULT.md` already measured −58.3% on the
+   MOSAIC path. The engine-side terms (adapter fidelity, enforcement survival, counter bias) are
+   window-independent by construction and would not need re-measuring.
