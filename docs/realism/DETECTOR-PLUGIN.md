@@ -15,6 +15,12 @@ distribution installed and with no plugins declared. Reproduce the functional ev
 > is the section for a detector you did not write. Same seed, same scores, same `data_digest`;
 > ~40 µs per delivered message; the hostile frame-walking detector that files 1 910 label-derived
 > reports in process files **zero** there. What it does not close is measured in the same section.
+>
+> **Corrected 2026-09-02.** The first version of §2.8 said this run's own oracle files were
+> unreadable while the loop ran; that was false — they were **streamed**, and an isolated detector
+> was measured reading them. The engine now withholds every ORACLE output until the last worker has
+> been reaped, so the sentence is true of the code and not only of the intent. `ISOLATION-ORACLE-LEAK.md`
+> is the whole diagnosis, fix and measurement.
 
 > **The safety claim in this document was wrong until 2026-08-31 and is now stated correctly.**
 > An earlier revision of §1.2 called the `Observation` boundary "a boundary you cannot walk around".
@@ -180,12 +186,15 @@ All three residues are **pinned by tests** (`tests/test_detector_trust_boundary.
 has to be upgraded rather than left overstating.
 
 The honest boundary is a process boundary: a detector in its own process, with an explicit message
-interface, where the oracle is simply not in the address space. **That exists now** — `"isolated":
-true`, [§2.8](#28-isolated-mode--the-process-boundary-and-the-only-answer-for-code-you-cannot-review),
+interface, where the oracle is simply not in the address space — **and, since the address space was
+never the only place the oracle lived, not on the disk either while that process is alive.** Both
+halves exist now — `"isolated": true`,
+[§2.8](#28-isolated-mode--the-process-boundary-and-the-only-answer-for-code-you-cannot-review),
 measured on the identical hostile class this section describes: in process its frame walk reaches
 `run_pipeline`'s locals and it files 1 910 reports built out of `is_attacker`; isolated it reaches
-seven frames of the serialiser and files none. For anything you run **in** process, the question
-"who wrote this detector?" is still the same question as "who wrote this dependency?".
+seven frames of the serialiser, finds no `ground_truth/` directory to open, and files none. For
+anything you run **in** process, the question "who wrote this detector?" is still the same question
+as "who wrote this dependency?".
 
 ### 2.4 The source gate
 
@@ -493,54 +502,102 @@ Read the last row twice. In process the label-reading detector produced a comple
 reproducible dataset built out of the answers. Isolated, the identical class has no signal and files
 nothing — not because it was refused, but because there was nothing there to read.
 
-#### What isolated mode does **not** close
+#### The other half: this run's ground truth is not on the DISK either
 
-**1. THE FILESYSTEM, and it is worse than "an earlier dataset is on the disk".** The child is an
-ordinary OS process running as the same user. It cannot reach the engine's objects; it can read the
-disk — and **the run streams its own ORACLE labels to the disk while the loop is still running.**
-
-Measured. An isolated detector declared alongside `@builtins` (so the built-in suite files reports
-and the stream fills), probing at its 20 000th message, mid-run, from its own process:
+Process isolation empties the detector's address space. It does not, by itself, empty the
+**filesystem**, and for one round of this document that difference was not stated — §2.8 asserted the
+run's own oracle files were unreadable while the loop was going, and that was false. `run.py`
+**STREAMED** `ground_truth/gt_report_labels.jsonl` as the loop proceeded, so an isolated detector,
+declared alongside `@builtins` and probing at its 20 000th message, read this:
 
 ```
 ground_truth/gt_report_labels.jsonl  -> readable, non-empty:
   {"_visibility":"ORACLE","report_correctness":"correct","report_id":"rpt_00001",
    "reporter_true_id":"veh_000","subject_true_id":"veh_001"}
-ma/ma_reports.jsonl                  -> readable, non-empty
-ground_truth/gt_vehicle.jsonl        -> FileNotFoundError   (written after the loop)
-manifest.json                        -> FileNotFoundError   (written after the loop)
-this repository's run.py             -> readable, 395 662 bytes
+```
+
+The oracle verdict on every report filed so far in the same run, with the true vehicle ids of
+reporter and subject. Not the per-message `falsified` flag — but enough to learn which certificates
+the ground truth calls attackers, in the run the detector is being graded on. **That is now closed.**
+
+**When any check is `isolated`, the engine does not write ORACLE output while a worker is alive.**
+The two streamed ground-truth tables go to a `_WithheldStream` — which accepts the same writes and
+creates nothing — and the workers are FINISHed and reaped *immediately after the step loop*, before
+`_write_side_files` runs. So the guarantee covers the whole ground-truth set, `gt_vehicle.jsonl`
+(`is_attacker` per vehicle) included, and not merely the two files that used to stream. The identical
+probe now measures:
+
+```
+out_dir listing (mid-run, message 20 000)  -> ['ma']
+ground_truth/                              -> does not exist
+ground_truth/gt_report_labels.jsonl        -> FileNotFoundError
+child's working directory                  -> a fresh empty temp dir; os.listdir('.') == []
+environment variables naming out_dir       -> none
+```
+
+`ma/ma_reports.jsonl` is still streamed on purpose, and it stays readable: it is MA-visible — no
+`_visibility: ORACLE` row, no true id, no `falsified` flag — so a child that opens it learns the
+built-in suite's `detnorm_*` scores for messages already processed, not the answers. Withholding it
+too would cost every long run its memory bound for a file that contains no labels. Conversely
+`live_interval_s > 0` with an isolated check is now a **`ConfigError`** rather than a silent
+downgrade — `live_state.json` is written during the loop and marks every attacker with state byte 1.
+
+**The cost, measured** on the InTAS AM peak (`intas.trace`, 1 188 vehicles, 158 767 vehicle-steps,
+300 s, seed 42), run twice with the CPU work held identical:
+
+| | streamed | withheld |
+|---|---:|---:|
+| `data_digest` | `c4a7cddeb4ef58dd254ad051186911ebfd2c0e143b84115ac8f8d967eb082491` | *same* |
+| peak working set | 254.2 MB | **258.3 MB** (+4.1 MB, +1.6 %) |
+| oracle bytes held | — | 3.17 MiB, no spill |
+
+Above a shared ceiling of **384 MiB** of withheld output the overflow spills to
+`<out_dir>/.withheld/*.sealed`, XORed with a 32-byte `os.urandom` key held only in the engine's
+memory; `commit()` unseals it into the real file and deletes it. So the claim has two tiers and both
+are true as written: **under the ceiling there is nothing on disk to read; over it there is a file
+that holds nothing readable.** The measured cost of the second tier is +0.1 MB of RSS and ~2 s per
+212 MiB round trip, byte-exact. `docs/realism/ISOLATION-ORACLE-LEAK.md` has the full table, including
+the two defects the measurement itself caught (a 1.44× RSS ratio fixed by compacting rows into 8 MiB
+blocks, and a 754 MB commit-time transient fixed by writing one block at a time).
+
+Additionally — **defence in depth, and stated separately because it is weaker** — the worker starts
+in a fresh empty working directory rather than the engine's, and `child_env` drops every environment
+variable and every `PYTHONPATH` entry that names the output directory (`PATH`-shaped values are
+filtered, not deleted). That removes the paths the child is *handed*. It does not remove the paths it
+could *find*: `scms_sim_ref.__file__` names this repository, and an absolute path works from any
+working directory.
+
+Pinned by `::test_the_child_cannot_read_this_runs_oracle_labels` (told the exact path, base64-encoded
+so the env scrub cannot make the measurement vacuous, it finds nothing) and by
+`::test_without_an_isolated_detector_the_labels_are_still_streamed`, which keeps the old assertion
+alive in process — where streaming still happens and must keep happening.
+
+#### What isolated mode does **not** close
+
+**1. EVERY OTHER DATASET ON THE MACHINE.** The child is an ordinary OS process running as the same
+user. It cannot reach the engine's objects and it cannot read this run's labels, because they do not
+exist yet — but it reads the **filesystem**:
+
+```
 a COMPLETED earlier run's gt_vehicle.jsonl -> readable:
   {"_visibility":"ORACLE","attacker_role":"ConstPos",...,"is_attacker":true,
    "true_vehicle_id":"veh_000","veh_type":"bus"}
+this repository's run.py                   -> readable
 ```
 
-`gt_report_labels.jsonl` is the **oracle verdict on every report filed so far in this same run**,
-with the true vehicle ids of reporter and subject. A hostile isolated detector that opens it gets a
-lagging, partial oracle: not the per-message `falsified` flag its own `Observation` is derived from,
-but enough to learn which certificates the ground truth calls attackers, in the run it is being
-graded on. The frame walk it replaces gave it the label *before* it scored; this gives it labels for
-messages already scored, which for a stateful detector watching the same senders is most of the way
-back.
+A determined child can walk the disk looking for one, and the empty working directory does not stop
+it. The remedy is a file-system remedy and not a Python one:
 
-**So the claim this mode supports is narrower than "the detector cannot see the labels".** It is:
-**the run's ground truth is not in the detector's address space** — measured, `oracle_reachable =
-False`, the walk terminates in the serialiser. Everything the detector can still reach, it reaches as
-a *file*, which means the remedy is a file-system remedy and not a Python one:
-
-* give the worker a working directory and a user that cannot read the output directory (Windows: a
-  restricted-token or separate user account plus ACLs on `out_dir`; Linux: a different uid, or a
-  mount namespace);
-* or run the engine with `--out` on a volume the submitted code cannot see, and publish the dataset
-  only after the run;
-* or wrap the worker in an OS-level sandbox — which this mode makes *possible*, because there is now
+* give the worker a user that cannot read your dataset directories (Windows: a restricted token or a
+  separate account plus ACLs; Linux: a different uid, or a mount namespace);
+* or run the benchmark on a host that holds no other ground truth, and publish datasets only after
+  the run;
+* or wrap the worker in an OS-level sandbox — which this mode makes *possible*, because there is
   exactly one process to wrap and it speaks exactly one pipe.
 
-None of those is implemented here, and none of them is claimed. This is asserted in
-`tests/test_detector_isolation.py::test_the_child_still_reads_the_filesystem_and_the_docs_say_so`
-and `::test_the_child_can_read_this_runs_streamed_oracle_labels` so this paragraph cannot quietly
-become false — the second test exists specifically because the first draft of this section said the
-same-run files were unreadable, and measuring it showed they are not.
+None of those is implemented here, and none of them is claimed. Asserted in
+`tests/test_detector_isolation.py::test_the_child_still_reads_the_filesystem_and_the_docs_say_so`, so
+this paragraph cannot quietly become false.
 
 **2. The worker reports its own identity.** The child says where it loaded the plugin from; the
 parent hashes *those paths itself* (reading a file is not importing it), so `module_sha256`,
@@ -594,11 +651,16 @@ If you are collecting detectors from other people and comparing them:
    a complementary instrument to the gate's static one. **Neither sees a frame walk**: measured, a
    frame-walking check passes all six with `ok = True` (§4.1).
 5. **For submissions you cannot review, run them isolated** ([§2.8](#28-isolated-mode--the-process-boundary-and-the-only-answer-for-code-you-cannot-review)):
-   `"isolated": true` on the config entry, and the labels are not in the detector's process. It costs
-   about 40 µs per delivered message (4.3× the wall clock of the run in the measured case) and it is
-   the only claim in this document that is a *boundary* rather than a guard rail. Read that section's
-   "what it does not close" before you build a public competition on it — the filesystem is still
-   shared, and that is measured rather than hand-waved.
+   `"isolated": true` on the config entry, and **this run's labels are neither in the detector's
+   process nor on the disk while it runs** — the two ORACLE tables are withheld until the worker has
+   been reaped, at a measured +4.1 MB of peak working set on the InTAS AM peak. It costs about 40 µs
+   per delivered message (4.3× the wall clock of the run in the measured case) and it is the only
+   claim in this document that is a *boundary* rather than a guard rail.
+6. **Then read §2.8's "what it does not close" before you build a public competition on it.** The
+   **filesystem** is still shared: every *other* dataset on the host is one `open()` away from the
+   submitted code, and that is measured rather than hand-waved. Run the benchmark on a machine that
+   holds no other ground truth, or put an OS-level sandbox around the worker — isolated mode makes
+   that possible (one process, one pipe) and does not provide it.
 
 ---
 
@@ -1187,10 +1249,14 @@ A plugin declaring one is rejected at load with `CapabilityError`.
    `PLUGIN-ARCHITECTURE.md` §2.3 uses for an ns-3 backend, and a local pipe on this host is ~40 µs,
    which is 40× cheaper. Per-STEP batching remains the right shape for the CHANNEL slot and the wrong
    one here, because the fusion consumes one message's score before the next message is scored.)*
-   What is **not** closed by it is set out in §2.8: the child shares the filesystem (measured — it
-   read a completed earlier run's `gt_vehicle.jsonl`), it reports its own module identity, it gives
-   up config-time schema introspection, and it is not a resource limit. Those are the next
-   increments, and three of the four want an OS-level sandbox rather than more Python.
+   **This run's own ground truth is withheld while the worker is alive** (added 2026-09-02, after it
+   was measured leaking): the two streamed ORACLE tables are buffered and the workers are reaped
+   before any of them is written, so the child finds no `ground_truth/` at all — +4.1 MB of peak
+   working set on the InTAS AM peak, same `data_digest`. What is **not** closed by it is set out in
+   §2.8: the child shares the filesystem with **every other dataset on the host** (measured — it read
+   a completed earlier run's `gt_vehicle.jsonl`), it reports its own module identity, it gives up
+   config-time schema introspection, and it is not a resource limit. Those are the next increments,
+   and three of the four want an OS-level sandbox rather than more Python.
 1b. **The integrity monitor checks at four named points, not continuously** — plugin resolution
    (import), channel load, detection-layer load, end of run. A plugin that tampers, uses the tamper
    and restores the binding before the next checkpoint is not seen by the identity snapshot — only

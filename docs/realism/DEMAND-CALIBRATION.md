@@ -16,6 +16,12 @@ character, and only the middle one is a demand problem at all:
 | 2. Demand deficit routeSampler can address | +8.4 pp | +11.2 pp | Yes, and it transfers to unseen days |
 | 3. Network cannot carry the measured flow | −27.1 pp residual | −24.1 pp residual | **No** |
 
+*Basis:* components 1 and 2 are differences measured on the **calibration** set (the set on which
+the decomposition is defined); component 3 is the **held-out** residual, which is the headline number
+of §5. On the AM band the two sets agree to 0.1 pp so the choice is immaterial; on the noisier PM
+band the same two components read +19.2 pp and +12.5 pp if measured on the held-out set instead.
+Every individual figure is reproduced per-window in Appendix A.
+
 Component 3 is a hard ceiling. Loading more vehicles does not produce more counted vehicles; it
 produces queues. That is a statement about the InTAS **network and signal plans**, not about its
 demand, and no demand calibration can reach it.
@@ -173,7 +179,10 @@ calibrated PM **123 min**.
 ### The headline: held-out
 
 **Repaired layout — the honest instrument.** Modelled totals are one number per run; measured totals
-are the mean across the windows in that set.
+are the mean across the windows in that set. **Appendix A grades all 36 windows individually** —
+every window's own totals, relative error, median GEH, ratio quartiles and four gate values — since
+a mean across a set can hide a window that behaves differently, and the PM held-out set contains
+exactly such a window (Wed 22 Nov).
 
 | Run | Set | n | modelled | measured | **rel. error** | **median GEH** | GEH<5 | in FHWA tol. |
 |---|---|---|---|---|---|---|---|---|
@@ -253,14 +262,43 @@ routeSampler was actually able to constrain:
 
 Fully constrained stations improve substantially **on days routeSampler never saw** — mean GEH 14.3
 → 8.0 (AM). Partially constrained stations do not improve and in the AM band get slightly worse.
-And the cleanest single case: **station 8005, which has no counting edge at all**, goes 0.32 → 0.31
-(AM held-out) — routeSampler changed nothing where it could see nothing. That is the calibration
-behaving exactly as its mathematics says it must, and it is the strongest evidence that the method
-was applied honestly.
+The single most informative case is **station 8005, which has no counting edge at all**
+(`station_constrained_fraction` 0.00), and it cuts both ways:
 
-Individual AM held-out (21 Nov) movements, largest first: `8604` 0.49 → 0.95, `4070` 0.57 → 0.87,
-`4240` 0.78 → 1.00, `1010` 0.43 → 0.68, `5060` 1.90 → 1.09 (an overshoot corrected). Against those:
-`6030` 0.77 → 0.56 and `3150` 0.69 → 0.55 got **worse** — matching some loops does push others away.
+| Band | held-out window | baseline ratio | calibrated ratio |
+|---|---|---|---|
+| AM | 21 Nov / 23 Nov | 0.32 / 0.32 | **0.31 / 0.30** |
+| PM | 21 Nov / 22 Nov / 23 Nov | 0.25 / 0.30 / 0.23 | **0.52 / 0.64 / 0.48** |
+
+In the AM band routeSampler changed nothing where it could see nothing — the calibration behaving
+exactly as its mathematics says it must. **In the PM band the same unconstrained station roughly
+doubles.** That is not a fitting artefact but an *indirect* one: PM candidate routes are much longer
+(91.9 edges against 69.9 in the AM pool), so routes selected to satisfy counting edges elsewhere
+sweep through 8005's edges as a side effect.
+
+This is worth stating against interest. The AM result alone would read as clean evidence that the
+method only moves what it is entitled to move; the PM result shows the calibration also makes large,
+**unverifiable** changes to flow at locations where no measurement exists to check them. A doubling
+at an unconstrained station could be right or badly wrong, and nothing in this exercise can tell
+which. That is a limitation of the method, not a defect of this particular run, and it applies to
+the whole ~30 % of measured flow the counting edges do not constrain.
+
+**Does matching some loops push others away? Yes, measurably.** Counting stations whose `|ratio−1|`
+fell versus rose, on held-out days (repaired layout, 21 Nov):
+
+| Band | improved | worsened | of |
+|---|---|---|---|
+| AM held-out 21 Nov | 16 | **7** | 23 |
+| PM held-out 21 Nov | 17 | **6** | 23 |
+
+Individual AM movements, largest first: `5060` 1.90 → 1.09 (an overshoot corrected, GEH 19.4 → 2.2),
+`8604` 0.49 → 0.95 (GEH 23.3 → 2.1), `4070` 0.57 → 0.87, `1010` 0.43 → 0.68, `4240` 0.78 → 1.00.
+Against those, `6030` 0.77 → 0.56 (GEH 9.5 → 18.8) and `3150` 0.69 → 0.55 (GEH 15.9 → 24.2) got
+**worse**. In the PM band the calibration also *creates* an overshoot where none existed: `5012`
+0.84 → **1.27**, the only held-out station above 1.25× in that window. So the fit is genuinely
+over-determined — 55 counting edges against one degree of freedom per candidate route — and
+satisfying some counting locations demonstrably costs accuracy at others. It is not a free lunch
+that simply scales every station toward its target.
 
 ---
 
@@ -272,6 +310,28 @@ routeSampler solved its problem. SUMO then failed to execute the solution.
 |---|---|---|
 | AM graded hour | 31,040 / 31,046 (**99.98 %**) | 24,071 / 31,046 (**−22.5 %**) |
 | PM graded hour | 34,364 / 34,948 (98.33 %) | 24,250 / 34,948 (**−30.6 %**) |
+
+**Two failure modes could explain a shortfall — the candidate pool being unable to supply the missing
+flow, or matching some loops forcing others to overshoot — and the mismatch output distinguishes
+them.** routeSampler writes a per-edge residual (`calibrated_*.rou_mismatch.xml`); across all 55
+counting edges it reports:
+
+| Band | interval | edges with a non-zero deficit | total deficit | overflow |
+|---|---|---|---|---|
+| AM | warm-up / graded | 1 / 1 (`26180725#0`) | +4 / +6 veh | **0** |
+| PM | warm-up / graded | 1 / 1 (`172517198#0`) | +685 / +584 veh | **0** |
+
+So: *(a)* **the candidate pool can supply the requested flow** almost everywhere — the AM residual is
+6 vehicles in 31,046 (0.02 %). The one genuine pool-insufficiency is a single PM edge,
+`172517198#0`, short 584 vehicles, and it accounts for the entire PM assignment shortfall (34,948 −
+34,364 = 584). *(b)* **Overflow is exactly zero in every interval** — routeSampler never had to
+overshoot one counting location in order to satisfy another. At the *assignment* stage there is no
+loop-versus-loop conflict at all.
+
+That matters, because the station-level trade-off documented in §5 (7 of 23 AM stations get worse) is
+therefore **not** a property of the fit — it appears only after SUMO executes the route set. The
+deficit is created between a solved assignment and its execution, which is what the rest of this
+section pins down.
 
 Three diagnostics identify the mechanism, and they rule out the obvious explanations.
 
@@ -321,17 +381,23 @@ window edge: all of those are present in the warm-up hour too, and it succeeded.
 carrying 31,046 veh/h where 22,710 veh/h is carried perfectly. The ceiling sits between those two
 numbers.
 
-The network state confirms it. Running vehicles, warm-up start → graded-hour end:
+The network state confirms it. Running vehicles from the warm-up start to the **final step of the
+graded hour** (`running`, `halting` and the end-state network mean speed from `summary-output`;
+trip-mean speed and teleports from `statistic-output`):
 
-| Run | running (start → end) | mean speed | halting at end | teleports (jam) |
-|---|---|---|---|---|
-| baseline AM | 5 → 3,768 (**plateaus ~3,800**) | 7.88 m/s | 1,554 | 365 (49) |
-| **calibrated AM** | 2 → **6,959, still rising** | 7.16 m/s | 4,026 | 541 (144) |
-| baseline PM | 6 → 3,404 (plateaus) | 9.35 m/s | 1,170 | 400 (82) |
-| **calibrated PM** | 3 → **9,021, still rising** | 6.32 m/s | 5,737 | **1,016 (400)** |
+| Run | running (start → end) | peak running | halting at end | mean speed at end | trip-mean speed | teleports (jam) |
+|---|---|---|---|---|---|---|
+| baseline AM | 5 → 3,921 | 3,944 — **plateau** | 2,089 (53 %) | 4.29 m/s | 7.88 m/s | 365 (49) |
+| **calibrated AM** | 2 → **7,843** | 7,843 = the end value — **still rising** | 5,028 (64 %) | 2.90 m/s | 7.16 m/s | 541 (144) |
+| baseline PM | 6 → 3,298 | 3,411 — **plateau** | 1,411 (43 %) | 5.49 m/s | 9.35 m/s | 400 (82) |
+| **calibrated PM** | 3 → **9,704** | 9,704 = the end value — **still rising** | 6,803 (70 %) | 2.26 m/s | 6.32 m/s | **1,016 (400)** |
 
-The baseline reaches steady state. **Neither calibrated run ever does.** Vehicles enter (28,146 of
-28,461 loaded, AM) and accumulate. PM mean speed falls to 6.32 m/s with 64 % of vehicles halted.
+The distinction is exact and not a matter of degree: in both baseline runs the peak running count is
+reached *before* the end of the graded hour and the network then holds level (AM peaks at 3,944 and
+ends at 3,921). In both calibrated runs the peak **is** the final step — the vehicle count is still
+climbing when the graded hour ends, so no steady state was ever reached. Vehicles enter (28,146 of
+28,461 loaded, AM) and accumulate. In the calibrated PM run 70 % of vehicles are halted at the end
+and the instantaneous network mean speed has fallen to 2.26 m/s.
 
 So: **the InTAS network, driven by InTAS's own route pool, saturates at roughly 24,000–24,500
 vehicles/hour summed over these 55 counting edges, against a measured 31,046 (AM) and 34,948 (PM).**
@@ -350,8 +416,18 @@ Summing modelled loops with no measured counterpart inflates the modelled side. 
 reference's own `matched_detector_ids` is the correct like-for-like rule, and it makes the as-shipped
 AM baseline **−55.7 %**, not −53.9 %.
 
-The baseline runs here reproduce the documented runs exactly at detector level (identical modelled
-totals, median GEH 27.072 AM / 30.894 PM), so this is a grading-rule difference, not a run difference.
+The baseline runs here reproduce the documented runs **exactly** at detector level, so this is a
+grading-rule difference and not a run difference. Comparing the graded hour of
+`gehA_InTAS_Detectors_Output.xml` (the run behind `GEH-RESULT.md`) against
+`bAM_InTAS_Detectors_Output.xml` loop by loop:
+
+| Band | documented run | baseline run here | loops differing |
+|---|---|---|---|
+| AM `25200–28800` | 23,642 over 194 loops | 23,642 over 196 loops | **0** |
+| PM `57600–61200` | 22,474 over 194 loops | 22,474 over 196 loops | **0** |
+
+Not one loop differs by a single vehicle (the 196 vs 194 is only the two unnamed InTAS gate counters
+that the merged layout also emits). Median GEH is likewise identical: 27.072 AM / 30.894 PM.
 
 **The much larger correction is the layout defect of §3**, which the documented result did not
 account for at all.
@@ -372,9 +448,12 @@ concentrated precisely where routeSampler had counts to fit. That is a real, tra
    route sets reproduce the same loop counts. Nothing here constrains which one is correct.
 3. **Turning proportions are not validated.** No turn-count data was used. The loops are approach
    counters; how flow splits at each junction is unconstrained.
-4. **Uninstrumented roads are not validated.** ~30 % of measured station flow sits on edges with no
-   counting constraint, and the entire network away from these 25 junctions has none at all. Station
-   8005 demonstrates the consequence directly: no constraint, no improvement.
+4. **Uninstrumented roads are not validated, and the calibration still changes them.** ~30 % of
+   measured station flow sits on edges with no counting constraint, and the entire network away from
+   these 25 junctions has none at all. Station 8005 (zero counting edges) shows both failure modes:
+   unchanged in the AM band (0.32 → 0.31) but roughly **doubled** in the PM band (0.23 → 0.48) as a
+   side effect of routes fitted elsewhere. Flow at unconstrained locations moves without any
+   measurement able to say whether it moved toward reality or away from it.
 5. **The route pool is biased by construction.** 6,313 AM / 5,146 PM candidate routes touch no
    counting location and were dropped. The calibrated demand over-represents instrumented corridors.
 6. **Vintage.** InTAS demand is calibrated to **November 2019**; every count here is **November
@@ -480,12 +559,49 @@ python tools/calibrate_demand.py edges --cov-out .cache/calib/layout/cAM_calib_c
 The 22 InTAS route-file hashes are recorded in `.cache/calib/cand_am.rou.meta.json`. The reference
 window hashes are recorded in `.cache/calib/targets_*.edg.meta.json` and in each grade report.
 
+### Independent re-verification
+
+The whole grading chain was re-run from the stored detector outputs into a separate directory
+(`.cache/calib/verify/`) and checked against the originals:
+
+- All 12 input hashes above re-computed and matched.
+- `layout` re-derived from `InTAS_E1.add.xml` + the net: `calib_layout.add.xml`,
+  `InTAS_E1_fixed.add.xml` and `InTAS_E1_cov.add.xml` byte-identical; the `detectors` and `edges`
+  maps compare equal (`layout_map.json` differs only in the embedded output paths). Same counts:
+  196 detectors / 194 named / 25 stations / 96 edges, 74 → 0 on non-car lanes, 159 moved, 0 problems.
+- All **8 grade reports byte-identical** to the stored ones, so all 36 window-gradings reproduce.
+- `report` reproduces the same calibration/held-out/gap table.
+- The §6 within-hour bin profile recomputed independently from the `fx_` detector output: identical
+  to the table above in every cell.
+- `make_calibrated_intas.ps1` is idempotent — re-running it leaves all four sumocfgs byte-identical,
+  and `InTAS_buildings.sumocfg` unchanged.
+- §3's defect measurement re-derived: the 74 flagged loops record **exactly 0** in the baseline AM
+  graded hour, and the loops they map to measured 16,673 of 45,713 (36.5 %).
+- §4's pool, coverage and bus figures re-derived from the meta side-cars; §6's per-lane target
+  intensities (median 226 / 243 veh/h/lane, max 692 / 903) and the occupancy-versus-speed table
+  recomputed from the `cov_` and `fx_` outputs — all identical.
+- §4's seed check re-read: seeds 7 / 42 / 123 give 28,272 / 28,229 / 28,014 vehicles, all at 99.98 %
+  and GEH<5 = 100 %.
+- §7's control re-run loop by loop: **0 of 194 loops differ** between the runs behind `GEH-RESULT.md`
+  and the baseline runs here, in both bands.
+- The recorded routeSampler invocations carry no `--optimize`, `--total-count` or
+  `--minimize-vehicles`: the only free parameters were the window, the seed and the targets.
+
+Scripts for each of these live in `.cache/calib/verify/scripts/`.
+
+Three things were **corrected** during that pass: the §6 network-state table (its running/halting
+values had been read at arbitrary mid-run timesteps rather than at the end of the graded hour); the
+station-8005 discussion in §5 (which quoted only the AM band, where the unconstrained station does
+not move, and omitted the PM band, where it roughly doubles); and the §10 claim that this document
+contains no count data, which was not true as written.
+
 ---
 
 ## 10. Licence and data hygiene
 
 The Stadt Ingolstadt / SAVeNoW loop counts carry **no formally stated licence** (TUM catalogue:
-"License Not Specified"). Nothing derived from them is committed. Every stage of
+"License Not Specified"). **No count data and no per-detector derivative is committed** — only the
+aggregate validation statistics this document reports, delimited precisely below. Every stage of
 `calibrate_demand.py` that touches counts refuses to write inside the repository unless the
 destination is under a git-ignored cache root; the `--i-know` guard exists for a future written
 licence and **was not used**. Verified:
@@ -494,8 +610,19 @@ licence and **was not used**. Verified:
   candidate pools, both calibrated route sets, all detector outputs and all grade reports live there.
 - `scms-sim/scenarios/gen_*/` is git-ignored (`.gitignore:27`) — the opt-in sumocfgs are not
   committed either, which is why `make_calibrated_intas.ps1` exists.
-- The only tracked files this work adds are this document and that script. Neither contains count
-  data; the script writes configuration that *points* at the cache.
+- The only tracked files this work adds are this document and that script. The script contains no
+  count data at all — it writes configuration that *points* at the cache.
+
+**What this document itself contains, stated precisely.** It is not free of count-derived numbers,
+and claiming otherwise would be false. It carries **aggregate validation statistics**: per-window
+measured totals over 23 stations, per-station ratios and GEH values, and quartiles of those
+distributions. It does **not** reproduce the dataset: no per-detector counts, no 15-minute bins, no
+per-station absolute measured volumes, and nothing from which the original series could be
+reconstructed. That is the irreducible minimum needed to state a validation result at all — a
+validation report that quoted no measured quantity would assert its conclusion without evidence —
+and it matches the level of detail already published in `GEH-RESULT.md` and `GEH-VALIDATION.md`.
+The raw and per-detector data stay in `.cache/`. If a licence is ever formally stated, this is the
+paragraph to revisit.
 
 ## 11. What to do next
 
@@ -509,3 +636,67 @@ licence and **was not used**. Verified:
    effort on demand.
 4. **Get turn counts if the deficit matters.** Loop counts alone cannot constrain routing, and §8.2–3
    will remain open without them.
+
+---
+
+## Appendix A — every window, graded individually
+
+The tables of §5 report the mean across the windows of each set. This appendix reports **each of the 18 window-gradings per layout on its own**, which is what the four FHWA gates are actually evaluated on. `n` is 23 comparable stations throughout; modelled is one number per run (the same simulated hour is graded against every reference day).
+
+
+### Repaired layout — the honest instrument
+
+| Run | Set | Window (`15:00–16:00Z` = PM, `06:00–07:00Z` = AM) | modelled | measured | rel. err | med GEH | GEH<5 | min | p25 | med | p75 | max | <0.75× | >1.25× | gates |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| baseline-AM | calibration | Thu 16 Nov `0600Z` | 29,098 | 44,370 | -34.4 % | 16.69 | 3/23 | 0.31 | 0.54 | 0.62 | 0.82 | 2.06 | 14 | 1 | **0/4** |
+| baseline-AM | calibration | Tue 14 Nov `0600Z` | 29,098 | 45,713 | -36.4 % | 17.68 | 3/23 | 0.32 | 0.53 | 0.63 | 0.78 | 1.60 | 16 | 1 | **0/4** |
+| baseline-AM | **held-out** | Thu 23 Nov `0600Z` | 29,098 | 45,522 | -36.1 % | 15.16 | 5/23 | 0.32 | 0.53 | 0.65 | 0.79 | 1.11 | 15 | 0 | **0/4** |
+| baseline-AM | **held-out** | Tue 21 Nov `0600Z` | 29,098 | 44,724 | -34.9 % | 16.46 | 3/23 | 0.32 | 0.56 | 0.67 | 0.76 | 1.90 | 15 | 1 | **0/4** |
+| calibrated-AM | calibration | Thu 16 Nov `0600Z` | 32,885 | 44,370 | -25.9 % | 14.19 | 8/23 | 0.30 | 0.60 | 0.74 | 0.97 | 1.17 | 12 | 0 | **0/4** |
+| calibrated-AM | calibration | Tue 14 Nov `0600Z` | 32,885 | 45,713 | -28.1 % | 15.52 | 8/23 | 0.30 | 0.59 | 0.71 | 0.91 | 1.04 | 12 | 0 | **0/4** |
+| calibrated-AM | **held-out** | Thu 23 Nov `0600Z` | 32,885 | 45,522 | -27.8 % | 15.02 | 8/23 | 0.30 | 0.59 | 0.70 | 0.92 | 1.11 | 13 | 0 | **0/4** |
+| calibrated-AM | **held-out** | Tue 21 Nov `0600Z` | 32,885 | 44,724 | -26.5 % | 13.13 | 8/23 | 0.31 | 0.61 | 0.76 | 0.94 | 1.12 | 11 | 0 | **0/4** |
+| baseline-PM | calibration | Thu 16 Nov `1500Z` | 27,619 | 48,988 | -43.6 % | 22.76 | 0/23 | 0.23 | 0.52 | 0.58 | 0.65 | 1.46 | 20 | 1 | **0/4** |
+| baseline-PM | calibration | Wed 15 Nov `1500Z` | 27,619 | 48,169 | -42.7 % | 21.37 | 1/23 | 0.23 | 0.49 | 0.61 | 0.69 | 1.32 | 20 | 1 | **0/4** |
+| baseline-PM | **held-out** | Thu 23 Nov `1500Z` | 27,619 | 42,735 | -35.4 % | 14.41 | 3/23 | 0.23 | 0.57 | 0.68 | 0.80 | 1.03 | 15 | 0 | **0/4** |
+| baseline-PM | **held-out** | Tue 21 Nov `1500Z` | 27,619 | 49,034 | -43.7 % | 20.52 | 1/23 | 0.25 | 0.50 | 0.58 | 0.69 | 1.08 | 19 | 0 | **0/4** |
+| baseline-PM | **held-out** | Wed 22 Nov `1500Z` | 27,619 | 39,950 | -30.9 % | 10.74 | 8/23 | 0.30 | 0.55 | 0.77 | 0.95 | 1.20 | 10 | 0 | **0/4** |
+| calibrated-PM | calibration | Thu 16 Nov `1500Z` | 33,094 | 48,988 | -32.4 % | 16.75 | 3/23 | 0.45 | 0.54 | 0.66 | 0.83 | 1.29 | 13 | 1 | **0/4** |
+| calibrated-PM | calibration | Wed 15 Nov `1500Z` | 33,094 | 48,169 | -31.3 % | 15.47 | 3/23 | 0.45 | 0.56 | 0.69 | 0.80 | 1.44 | 14 | 1 | **0/4** |
+| calibrated-PM | **held-out** | Thu 23 Nov `1500Z` | 33,094 | 42,735 | -22.6 % | 12.25 | 3/23 | 0.48 | 0.63 | 0.78 | 0.88 | 1.42 | 10 | 2 | **0/4** |
+| calibrated-PM | **held-out** | Tue 21 Nov `1500Z` | 33,094 | 49,034 | -32.5 % | 15.31 | 2/23 | 0.44 | 0.53 | 0.68 | 0.83 | 1.27 | 14 | 1 | **0/4** |
+| calibrated-PM | **held-out** | Wed 22 Nov `1500Z` | 33,094 | 39,950 | -17.2 % | 7.65 | 8/23 | 0.46 | 0.65 | 0.90 | 1.11 | 1.82 | 9 | 2 | **0/4** |
+
+### As-shipped layout — for continuity with `GEH-RESULT.md`
+
+| Run | Set | Window (`15:00–16:00Z` = PM, `06:00–07:00Z` = AM) | modelled | measured | rel. err | med GEH | GEH<5 | min | p25 | med | p75 | max | <0.75× | >1.25× | gates |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| baseline-AM | calibration | Thu 16 Nov `0600Z` | 20,267 | 44,370 | -54.3 % | 25.70 | 1/23 | 0.12 | 0.34 | 0.46 | 0.60 | 0.95 | 21 | 0 | **0/4** |
+| baseline-AM | calibration | Tue 14 Nov `0600Z` | 20,267 | 45,713 | -55.7 % | 27.07 | 0/23 | 0.12 | 0.33 | 0.47 | 0.57 | 0.74 | 23 | 0 | **0/4** |
+| baseline-AM | **held-out** | Thu 23 Nov `0600Z` | 20,267 | 45,522 | -55.5 % | 25.88 | 0/23 | 0.12 | 0.35 | 0.46 | 0.55 | 0.76 | 22 | 0 | **0/4** |
+| baseline-AM | **held-out** | Tue 21 Nov `0600Z` | 20,267 | 44,724 | -54.7 % | 26.91 | 1/23 | 0.12 | 0.35 | 0.49 | 0.57 | 0.88 | 22 | 0 | **0/4** |
+| calibrated-AM | calibration | Thu 16 Nov `0600Z` | 22,458 | 44,370 | -49.4 % | 27.16 | 1/23 | 0.16 | 0.39 | 0.50 | 0.68 | 0.88 | 20 | 0 | **0/4** |
+| calibrated-AM | calibration | Tue 14 Nov `0600Z` | 22,458 | 45,713 | -50.9 % | 27.05 | 1/23 | 0.17 | 0.39 | 0.49 | 0.61 | 0.89 | 21 | 0 | **0/4** |
+| calibrated-AM | **held-out** | Thu 23 Nov `0600Z` | 22,458 | 45,522 | -50.7 % | 27.82 | 1/23 | 0.17 | 0.36 | 0.47 | 0.63 | 0.95 | 21 | 0 | **0/4** |
+| calibrated-AM | **held-out** | Tue 21 Nov `0600Z` | 22,458 | 44,724 | -49.8 % | 25.09 | 1/23 | 0.17 | 0.39 | 0.51 | 0.61 | 0.93 | 21 | 0 | **0/4** |
+| baseline-PM | calibration | Thu 16 Nov `1500Z` | 19,269 | 48,988 | -60.7 % | 32.88 | 0/23 | 0.06 | 0.32 | 0.40 | 0.49 | 0.71 | 23 | 0 | **0/4** |
+| baseline-PM | calibration | Wed 15 Nov `1500Z` | 19,269 | 48,169 | -60.0 % | 30.89 | 0/23 | 0.06 | 0.33 | 0.41 | 0.50 | 0.64 | 23 | 0 | **0/4** |
+| baseline-PM | **held-out** | Thu 23 Nov `1500Z` | 19,269 | 42,735 | -54.9 % | 25.30 | 0/23 | 0.06 | 0.39 | 0.45 | 0.52 | 0.79 | 22 | 0 | **0/4** |
+| baseline-PM | **held-out** | Tue 21 Nov `1500Z` | 19,269 | 49,034 | -60.7 % | 31.94 | 0/23 | 0.07 | 0.33 | 0.40 | 0.49 | 0.62 | 23 | 0 | **0/4** |
+| baseline-PM | **held-out** | Wed 22 Nov `1500Z` | 19,269 | 39,950 | -51.8 % | 22.37 | 0/23 | 0.09 | 0.37 | 0.49 | 0.63 | 0.86 | 20 | 0 | **0/4** |
+| calibrated-PM | calibration | Thu 16 Nov `1500Z` | 22,004 | 48,988 | -55.1 % | 31.81 | 1/23 | 0.19 | 0.36 | 0.43 | 0.54 | 0.92 | 21 | 0 | **0/4** |
+| calibrated-PM | calibration | Wed 15 Nov `1500Z` | 22,004 | 48,169 | -54.3 % | 30.14 | 1/23 | 0.20 | 0.39 | 0.43 | 0.53 | 0.92 | 22 | 0 | **0/4** |
+| calibrated-PM | **held-out** | Thu 23 Nov `1500Z` | 22,004 | 42,735 | -48.5 % | 24.83 | 0/23 | 0.18 | 0.47 | 0.51 | 0.61 | 0.82 | 22 | 0 | **0/4** |
+| calibrated-PM | **held-out** | Tue 21 Nov `1500Z` | 22,004 | 49,034 | -55.1 % | 27.77 | 0/23 | 0.20 | 0.36 | 0.42 | 0.55 | 0.81 | 22 | 0 | **0/4** |
+| calibrated-PM | **held-out** | Wed 22 Nov `1500Z` | 22,004 | 39,950 | -44.9 % | 20.12 | 2/23 | 0.25 | 0.40 | 0.52 | 0.76 | 1.16 | 17 | 0 | **0/4** |
+
+**Every one of the 36 window-gradings fails all four FHWA gates.** The best value reached by any window on any gate:
+
+| Gate | threshold | best over all 36 windows | still fails by |
+|---|---|---|---|
+| `geh.link_pass_fraction` | ≥ 0.85 | 0.3478 | 0.50 |
+| `geh.total_flow_geh` | ≤ 4.0 | 35.88 | 9× |
+| `geh.total_flow_rel_error` | ≤ 0.05 | 0.1716 | 3.4× |
+| `geh.link_flow_tolerance_pass_fraction` | ≥ 0.85 | 0.3478 | 0.50 |
+
+The two best-case rows are both `calibrated-PM` against **Wed 22 Nov**, the lightest day in the reference (39,950 vehicles against ~48,600 on the calibration days) — that is, the model comes closest to reality on the day reality came closest to the model.

@@ -68,21 +68,52 @@ message is consumed by the fusion before the next message is scored, so batching
 restructuring the reception loop and re-pinning every golden -- see `docs/realism/DETECTOR-PLUGIN.md`
 for the measured cost of not doing it).
 
-WHAT THIS DOES NOT CLOSE
-------------------------
-The child is an ordinary OS process running as the same user. It cannot reach the engine's objects,
-but it can read the filesystem -- including this repository, any dataset directory on it, **and this
-run's own `ground_truth/gt_report_labels.jsonl`, which the engine STREAMS while the loop is still
-going**. Measured: an isolated detector opened that file at its 20 000th message and read
-``{"_visibility":"ORACLE","report_correctness":"correct",...,"subject_true_id":"veh_001"}``. So the
-claim this module supports is exactly one sentence, and not a word more:
+THE RUN'S OWN GROUND TRUTH IS NOT WRITTEN WHILE THE CHILD IS ALIVE
+-----------------------------------------------------------------
+Isolation began by closing the *address space* and leaving the *filesystem* open, and that was not
+enough: the engine STREAMED ``ground_truth/gt_report_labels.jsonl`` as the loop ran, so a detector
+that opened it at its 20 000th message read the oracle verdict -- plus ``reporter_true_id`` and
+``subject_true_id`` -- for every report filed so far, in the very run it was being graded on.
+Measured, and then closed.
 
-    **The run's ground truth is not in the child's ADDRESS SPACE, and the frame walk that reads it
-    in-process finds only this module's own frames.**
+The engine now WITHHOLDS every ORACLE output while any isolated check is loaded
+(`mock_pipeline/run.py`, ``_WithheldStream``): the rows are buffered and the files are created only
+after the last worker has been reaped. So during the run there is nothing for the child to open --
+not an empty file, not a partial one, no ``ground_truth/`` directory at all. Measured cost on the
+InTAS AM peak (1 188 vehicles, 158 767 vehicle-steps): 3.2 MiB held, **+4.1 MB of peak working set**,
+same ``data_digest``.
 
-Everything the detector can still reach it reaches as a *file*, so the remedy is a file-system one --
-a restricted user, ACLs on the output directory, or an OS-level sandbox around the worker, which this
-mode makes possible (one process, one pipe) and does not itself provide.
+**Where that degrades, stated rather than buried.** Past ``run.WITHHELD_MEMORY_BYTES`` (384 MiB of
+withheld output across both tables) the overflow spills to ``<out_dir>/.withheld/*.sealed``, XORed
+with an ``os.urandom`` key held only in the engine's memory; the real file is unsealed from it once
+the worker is gone. So the claim has two tiers and both are true as written: **under the ceiling
+there is nothing on disk to read; over it there is a file that holds nothing readable.**
+``docs/realism/ISOLATION-ORACLE-LEAK.md`` has the measurement of both.
+
+``ma/ma_reports.jsonl`` is MA-visible and is still streamed, so a child can read the built-in suite's
+scores for messages already processed. That is not the answer key -- no ``_visibility: ORACLE`` row,
+no true id, no ``falsified`` flag -- and withholding it too would cost every long run its memory
+bound, so it is a deliberate choice and it is named here rather than left to be discovered.
+
+Defence in depth, and it is only that: the child is started in a **fresh empty working directory**
+(so a relative path cannot land in the dataset), and its environment is scrubbed of every variable
+and every ``PYTHONPATH`` entry whose value names the output directory (:func:`child_env`).
+
+WHAT THIS STILL DOES NOT CLOSE
+------------------------------
+The child remains an ordinary OS process running as the same user. It cannot reach the engine's
+objects and it cannot read this run's labels, because they do not exist yet -- but it CAN read the
+filesystem: this repository (``scms_sim_ref.__file__`` names it), and any OTHER dataset directory on
+the machine, including a completed earlier run's ``ground_truth/*.jsonl``. A determined child can
+walk the disk looking for one. So the claim this module supports is exactly these two sentences, and
+not a word more:
+
+    **The run's ground truth is not in the child's ADDRESS SPACE -- the frame walk that reads it
+    in-process finds only this module's own frames -- and it is not on DISK while the child is
+    alive.** Other datasets on the same machine are readable by the child, and keeping them out of
+    reach is an operational matter (a separate user, ACLs, or an OS-level sandbox around the worker,
+    which this mode makes possible -- one process, one pipe -- and does not itself provide).
+
 `docs/realism/DETECTOR-PLUGIN.md` section 2.8 has the full measurement.
 """
 from __future__ import annotations
@@ -90,8 +121,10 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import weakref
@@ -335,15 +368,20 @@ class IsolatedCheck:
 
     __slots__ = ("slot", "ref", "declared", "seed", "env", "timeout", "start_timeout", "meta",
                  "plugin_id", "reason_code", "precision", "soft", "msg_types", "vru_suppressed",
-                 "capabilities", "interface_version", "resolved_via", "params", "rng",
+                 "capabilities", "interface_version", "resolved_via", "params", "rng", "deny",
                  "_proc", "_in", "_out", "_seq", "_deadline", "_watchdog", "_stop", "_stderr",
-                 "_stderr_thread", "_timed_out", "_closed", "_evaluated", "_ns", "__weakref__")
+                 "_stderr_thread", "_timed_out", "_closed", "_evaluated", "_ns", "_workdir",
+                 "__weakref__")
 
     def __init__(self, ref: str, declared: dict, *, seed: int, env: dict,
                  timeout: float = DEFAULT_TIMEOUT_S,
-                 start_timeout: float = DEFAULT_START_TIMEOUT_S, slot: str = "check"):
+                 start_timeout: float = DEFAULT_START_TIMEOUT_S, slot: str = "check",
+                 deny=()):
         self.slot, self.ref = str(slot), str(ref)
         self.declared = dict(declared or {})
+        #: Directories the child must not be POINTED AT -- the run's output directory. See
+        #: :func:`child_env`; defence in depth, never the primary containment.
+        self.deny = tuple(str(d) for d in (deny or ()))
         self.seed, self.env = int(seed), dict(env or {})
         self.timeout = float(timeout)
         self.start_timeout = float(start_timeout)
@@ -366,6 +404,7 @@ class IsolatedCheck:
         self._timed_out = False
         self._closed = False
         self._ns = ""
+        self._workdir = None
 
     # -- lifecycle ---------------------------------------------------------------------------- #
     def spawn(self) -> dict:
@@ -376,6 +415,12 @@ class IsolatedCheck:
         plugin's ``__init__`` is allowed to run anywhere.
         """
         cmd = [sys.executable, "-X", "utf8", "-m", "scms_sim_ref.api.isolate", "--serve"]
+        # A FRESH EMPTY working directory, not the engine's. Defence in depth: `out/run7` typed by a
+        # plugin resolves against a directory that holds nothing, and `os.listdir(".")` is empty. It
+        # is NOT containment -- an absolute path still works and the child can walk the disk -- so it
+        # is stated as a second line and never as the claim. `child_env` re-adds the parent's cwd to
+        # `PYTHONPATH`, so nothing that used to import stops importing.
+        self._workdir = tempfile.mkdtemp(prefix="scms-detector-")
         try:
             # BUFFERED pipes on purpose. With `bufsize=0` the handles are raw `FileIO`, whose
             # `write()` is allowed to be SHORT on a pipe -- a truncated frame that would surface as
@@ -384,8 +429,9 @@ class IsolatedCheck:
             # wants. Every write is explicitly flushed.
             self._proc = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                env=child_env(), cwd=os.getcwd())
+                env=child_env(self.deny), cwd=self._workdir)
         except OSError as e:
+            self._drop_workdir()
             raise IsolationError(
                 f"plugins.check {self.ref!r}: isolated=true, but the detector child could not be "
                 f"started ({' '.join(cmd[:4])}...): {e}") from None
@@ -500,6 +546,7 @@ class IsolatedCheck:
         _LIVE.discard(self)
         proc = self._proc
         if proc is None:
+            self._drop_workdir()
             return
         try:
             if proc.stdin is not None and not proc.stdin.closed:
@@ -520,8 +567,21 @@ class IsolatedCheck:
                     stream.close()
             except OSError:
                 pass
+        self._drop_workdir()
 
-    def __del__(self):                                   # pragma: no cover - GC timing
+    def _drop_workdir(self) -> None:
+        """Remove the child's sandbox directory. Best-effort: a plugin may have left files in it,
+        and on Windows a handle the dying child has not released yet makes the unlink fail. Never
+        fatal -- a leftover temp directory is a tidiness problem, not a correctness one."""
+        path, self._workdir = self._workdir, None
+        if path:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def workdir(self):
+        """The child's working directory while it is running, or None. Test/diagnostic only."""
+        return self._workdir
+
+    def __del__(self):                                 # pragma: no cover - GC timing
         """Last-resort reaping. `CheckSuite.close()` is the intended path; this catches a run that
         raised before reaching it, which matters for the in-process multi-run drivers where the
         engine process outlives the run and the pipe would otherwise stay open."""
@@ -627,7 +687,24 @@ def _fallback_pid(ref: str) -> str:
     return out[:32] or "plugin"
 
 
-def child_env() -> dict:
+def _norm(path) -> str:
+    """An absolute, case-folded, separator-normalised path for CONTAINMENT tests only."""
+    try:
+        return os.path.normcase(os.path.abspath(os.fspath(path)))
+    except (TypeError, ValueError):                      # pragma: no cover - unusable path
+        return ""
+
+
+def _is_within(path: str, root: str) -> bool:
+    """True when `path` IS `root` or lives under it. Both already through :func:`_norm`."""
+    if not path or not root:
+        return False
+    if path == root:
+        return True
+    return path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def child_env(deny=()) -> dict:
     """The child's environment: this interpreter's `sys.path`, carried over as `PYTHONPATH`.
 
     The same decision `conformance/attest.py` documents, for the same reason: what the child must be
@@ -636,16 +713,55 @@ def child_env() -> dict:
     the plugin. `PYTHONHASHSEED` is pinned for the same reason the engine pins it for itself: not for
     the RNG (`random.Random(<str>)` is seeded from sha512 of the key and is hash-seed independent),
     but so set and dict iteration order inside the PLUGIN is stable across processes and runs.
+
+    **`deny` names directories the child must not be POINTED AT** -- in practice the run's output
+    directory. Every `PYTHONPATH` entry inside one, and every environment variable whose value names
+    one, is dropped. This is defence in depth and nothing more: it removes the paths the child is
+    *handed*, not the paths it could *find*. `scms_sim_ref.__file__` still names this repository and
+    the child can still walk the disk. What actually keeps this run's labels away from it is that
+    they are not written until it has exited (see the module docstring).
+
+    The parent's own working directory is carried over EXPLICITLY, because the child is started in a
+    fresh empty one (:meth:`IsolatedCheck.spawn`) and `python -m` would otherwise have put the
+    sandbox on `sys.path` in its place -- which would make a plugin that resolves only from the cwd
+    unresolvable for a reason that has nothing to do with the plugin.
     """
+    denied = tuple(d for d in (_norm(p) for p in deny) if d)
     env = dict(os.environ)
+    if denied:
+        # A benchmark host that exported the dataset path (`SCMS_OUT=...`) would otherwise hand the
+        # child the one path this mode is trying not to hand it. Values are treated as
+        # `os.pathsep`-separated lists so a PATH-like variable is FILTERED rather than deleted --
+        # deleting `PATH` on Windows would break the child for reasons unrelated to the dataset.
+        for name, value in list(env.items()):
+            if not isinstance(value, str) or not value:
+                continue
+            parts = value.split(os.pathsep)
+            # ABSOLUTE components only. `_norm` resolves a relative string against the parent's cwd,
+            # so testing `PROCESSOR_LEVEL=6` would ask whether `<cwd>/6` is inside the dataset -- a
+            # question with a surprising answer for any run whose out_dir happens to BE the cwd. A
+            # relative name is also useless to the child, whose cwd is an empty sandbox.
+            kept = [p for p in parts
+                    if not (os.path.isabs(p) and any(_is_within(_norm(p), d) for d in denied))]
+            if len(kept) == len(parts):
+                continue
+            if kept:
+                env[name] = os.pathsep.join(kept)
+            else:
+                env.pop(name, None)
     entries, seen = [], set()
-    for p in sys.path:
-        if isinstance(p, str) and p and p not in seen:
-            seen.add(p)
-            entries.append(p)
+    for p in list(sys.path) + [os.getcwd()]:
+        if not isinstance(p, str) or not p:
+            continue
+        absolute = os.path.abspath(p)
+        if absolute in seen or any(_is_within(_norm(absolute), d) for d in denied):
+            continue
+        seen.add(absolute)
+        entries.append(absolute)
     env["PYTHONPATH"] = os.pathsep.join(entries)
     env.setdefault("PYTHONHASHSEED", "0")
     env.pop("PYTHONSTARTUP", None)
+    env.pop("PWD", None)                                 # would name the parent's cwd, not the child's
     return env
 
 

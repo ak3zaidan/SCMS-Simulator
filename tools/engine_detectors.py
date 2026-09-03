@@ -81,6 +81,10 @@ DEFAULT_HALF_WIDTH_M = 1.6     # half a SUMO lane (3.2 m). See the module docstr
 COS_ALONG_MIN = 0.5            # travel direction within 60 deg of the lane's -- rejects a vehicle
                                # crossing the loop sideways on the conflicting arm of a junction
 CELL_M = 100.0                 # spatial index cell for the detector lookup
+RIVAL_PAD_M = 0.0              # slack added to (w_a + w_b) when deciding two gates are rivals; see
+                               # build_rival_groups(). 0.0 = the gates' sensitive strips must
+                               # actually overlap before either is allowed to steal the other's
+                               # vehicle.
 MAX_STEP_M = CELL_M            # a sample pair further apart than this is not a movement we can
                                # interpolate through (a teleport, or a resumed track); skipped and
                                # counted in `skipped_long_steps`. It is EQUAL TO the cell size on
@@ -143,6 +147,56 @@ def build_gates(net_path: str, det_add: str, half_width_m: float = DEFAULT_HALF_
         raise ValueError(f"{len(missing_lanes)} detector lane(s) are not in {net_path}: "
                          f"{missing_lanes[:5]} -- the .add.xml and the .net.xml do not match")
     return gates
+
+
+def build_rival_groups(gates: dict, pad_m: float = RIVAL_PAD_M) -> dict[str, int]:
+    """``{detector_id: group_id}`` for gates that can each see the OTHER one's road.
+
+    WHY. SUMO's ``<e1Detector>`` is a LANE-BOUND device: it sees a vehicle only if the vehicle's
+    ``laneID`` is the detector's lane, so two loops on different roads never share a vehicle no
+    matter how close the roads run. This counter has positions and no lane identity, so where two
+    roads run closer together than the loops' own sensitive strips, one vehicle trips both loops and
+    the station sums it twice.
+
+    That is not hypothetical and it is not widespread. In the InTAS layout it happens at exactly TWO
+    of the 19,110 gate pairs -- ``1010_6``/``1010_8`` (2.47 m apart) and ``1010_7``/``1010_9``
+    (2.51 m apart), edge ``172515813`` against edge ``201278218#0``, tangents 13.6 deg apart -- and
+    those four loops carry the whole of station 1010's measured +29.9% over-count against SUMO's own
+    loops on the same run.
+
+    Two gates are RIVALS when they sit on different EDGES (same-edge lanes are already handled by
+    capping the half-width at half a lane), their gate points are no further apart than the sum of
+    their half-widths, and their tangents agree to within the same 60 deg the direction gate uses.
+    Rivalry is transitive-closed into groups, so a chain of three near-parallel roads resolves as
+    one group rather than as two overlapping pairs.
+    """
+    ids = sorted(gates)
+    parent = {d: d for d in ids}
+
+    def find(d):
+        while parent[d] != d:
+            parent[d] = parent[parent[d]]
+            d = parent[d]
+        return d
+
+    for i, a in enumerate(ids):
+        ga = gates[a]
+        for b in ids[i + 1:]:
+            gb = gates[b]
+            if ga["edge"] == gb["edge"]:
+                continue
+            if math.hypot(ga["p"][0] - gb["p"][0], ga["p"][1] - gb["p"][1]) > ga["w"] + gb["w"] + pad_m:
+                continue
+            if ga["t"][0] * gb["t"][0] + ga["t"][1] * gb["t"][1] < COS_ALONG_MIN:
+                continue
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+    by_root: dict[str, list[str]] = {}
+    for d in ids:
+        by_root.setdefault(find(d), []).append(d)
+    roots = {r: i for i, r in enumerate(sorted(r for r, m in by_root.items() if len(m) > 1))}
+    return {d: roots[r] for r, m in by_root.items() if r in roots for d in m}
 
 
 def _point_and_tangent(shape, offset):
@@ -210,7 +264,8 @@ def iter_dataset(path: str, field: str = "true"):
 # counting
 # ------------------------------------------------------------------------------------------------
 def count_crossings(samples, gates: dict, *, offset=(0.0, 0.0), cell_m: float = CELL_M,
-                    max_step_m: float = MAX_STEP_M, progress_every: int = 0) -> dict:
+                    max_step_m: float = MAX_STEP_M, progress_every: int = 0,
+                    rival_groups: dict[str, int] | None = None) -> dict:
     """Stream ``(veh, t, x, y)`` and return per-detector crossing counts.
 
     Samples for one vehicle must arrive in time order; they may be interleaved with other vehicles'
@@ -221,6 +276,13 @@ def count_crossings(samples, gates: dict, *, offset=(0.0, 0.0), cell_m: float = 
     it is within one cell of the segment's START -- which makes a single lookup on the start cell a
     provable superset of the gates that pair can cross. ``max_step_m > cell_m`` would break that, so
     they are tied together.
+
+    ``rival_groups`` (from :func:`build_rival_groups`; default ``None`` = OFF, so the plain gate is
+    bit-for-bit unchanged) makes a group of mutually-overlapping cross-edge loops EXCLUSIVE: a
+    vehicle is awarded to at most one loop of the group -- the one it passed CLOSEST TO laterally --
+    instead of to every loop whose sensitive strip it happened to enter. That restores what SUMO
+    gets for free from lane membership. Because the two loops of a group need not be crossed on the
+    same sample pair, the winner is resolved at the END of the stream, not on the first hit.
     """
     if max_step_m > cell_m:
         raise ValueError(f"max_step_m ({max_step_m}) must not exceed cell_m ({cell_m}); the "
@@ -237,6 +299,10 @@ def count_crossings(samples, gates: dict, *, offset=(0.0, 0.0), cell_m: float = 
     last: dict = {}
     n_samples = n_pairs = skipped_long = 0
     t_min = t_max = None
+    rivals = rival_groups or {}
+    # (vehicle, group) -> (best |lateral offset|, winning detector). Only gates that are in a rival
+    # group ever land here, so on a layout with none this dict stays empty and costs nothing.
+    contested: dict[tuple, tuple[float, str]] = {}
     for veh, t, x, y in samples:
         x += ox
         y += oy
@@ -278,15 +344,28 @@ def count_crossings(samples, gates: dict, *, offset=(0.0, 0.0), cell_m: float = 
             u = -sa / denom
             cxp = px + u * dx - gx
             cyp = py + u * dy - gy
-            if abs(-cxp * ty + cyp * tx) > g["w"]:     # |(C-P).N|, N = left normal of T
+            lateral = abs(-cxp * ty + cyp * tx)        # |(C-P).N|, N = left normal of T
+            if lateral > g["w"]:
                 continue
-            counts[did] += 1
+            grp = rivals.get(did)
+            if grp is None:
+                counts[did] += 1
+            else:
+                key = (veh, grp)
+                best = contested.get(key)
+                if best is None or lateral < best[0]:
+                    contested[key] = (lateral, did)
         if progress_every and n_samples % progress_every == 0:
             print(f"  ... {n_samples:,} samples, {sum(counts.values()):,} crossings",
                   file=sys.stderr, flush=True)
+    n_contested = len(contested)
+    for _lateral, did in contested.values():
+        counts[did] += 1
     return {"counts": counts, "n_samples": n_samples, "n_pairs": n_pairs,
             "n_vehicles": len(last), "skipped_long_steps": skipped_long,
-            "t_min": t_min, "t_max": t_max}
+            "t_min": t_min, "t_max": t_max,
+            "n_rival_gates": len(rivals), "n_rival_groups": len(set(rivals.values())),
+            "n_contested_awards": n_contested}
 
 
 def write_e1_xml(path: str, counts: dict[str, int], begin: float, end: float, gates: dict,
@@ -336,10 +415,17 @@ def main(argv=None) -> int:
     p.add_argument("--time-offset", type=float, default=0.0,
                    help="added to every sample time before the --begin/--end window is applied")
     p.add_argument("--progress", type=int, default=0, help="print progress every N samples")
+    p.add_argument("--exclusive-gates", action="store_true",
+                   help="award a vehicle to at most ONE of a group of overlapping loops on "
+                        "DIFFERENT edges -- the one it passed closest to. SUMO's own loops get "
+                        "this for free from lane membership; a position-only counter does not, and "
+                        "where two roads run closer together than the loops' sensitive strips both "
+                        "loops see the same vehicle. Default OFF so the plain gate is unchanged.")
     a = p.parse_args(argv)
 
     ox, oy = (float(v) for v in a.offset.split(","))
     gates = build_gates(a.net, a.det_add, half_width_m=a.half_width)
+    rival_groups = build_rival_groups(gates) if a.exclusive_gates else None
     src_desc = a.trace or a.dataset
     stream = iter_trace(a.trace) if a.trace else iter_dataset(a.dataset, a.field)
     if a.time_offset:
@@ -349,7 +435,8 @@ def main(argv=None) -> int:
         hi = math.inf if a.end is None else a.end
         stream = ((v, t, x, y) for v, t, x, y in stream if lo <= t <= hi)
 
-    res = count_crossings(stream, gates, offset=(ox, oy), progress_every=a.progress)
+    res = count_crossings(stream, gates, offset=(ox, oy), progress_every=a.progress,
+                          rival_groups=rival_groups)
     begin = a.begin if a.begin is not None else (res["t_min"] or 0.0)
     end = a.end if a.end is not None else (res["t_max"] or 0.0)
     write_e1_xml(a.out, res["counts"], begin, end, gates, note=os.path.basename(str(src_desc)))
@@ -361,6 +448,10 @@ def main(argv=None) -> int:
     summary = {"source": str(src_desc), "field": (a.field if a.dataset else "trace"),
                "net": a.net, "det_add": a.det_add, "out": a.out,
                "half_width_m": a.half_width, "cos_along_min": COS_ALONG_MIN,
+               "exclusive_gates": bool(a.exclusive_gates),
+               "n_rival_gates": res.get("n_rival_gates", 0),
+               "n_rival_groups": res.get("n_rival_groups", 0),
+               "n_contested_awards": res.get("n_contested_awards", 0),
                "n_detectors": len(gates), "n_samples": res["n_samples"],
                "n_pairs": res["n_pairs"], "n_vehicles": res["n_vehicles"],
                "skipped_long_steps": res["skipped_long_steps"],

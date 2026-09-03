@@ -1415,6 +1415,17 @@ def _checks_selection(cfg, *, station_types: bool, denm: bool) -> tuple:
                 f"the engine, its knobs are engine config fields, and running it out of process "
                 f"would buy nothing and cost a round trip per message. Isolation exists for "
                 f"third-party code you have not reviewed.")
+        if isolated and float(getattr(cfg, "live_interval_s", 0.0) or 0.0) > 0:
+            # `live_state.json` is written DURING the loop and carries a per-vehicle state byte in
+            # which 1 == attacker -- the oracle, refreshed every `live_interval_s`, in a file the
+            # child can open. Withholding the ground-truth streams while leaving this on would make
+            # the mode's claim false again, so the combination is refused rather than silently
+            # degraded: a benchmark host that asked for a live map gets told, not disarmed.
+            raise ConfigError(
+                "plugins.check[].isolated=true with live_interval_s>0: live_state.json is written "
+                "while the run is going and marks every attacker (state 1), so an isolated "
+                "third-party detector could read the oracle out of it. Set live_interval_s=0 (drop "
+                "--live-interval) for a run that grades a submitted detector.")
         # THE SOURCE GATE DEFAULTS OFF FOR AN ISOLATED CHECK, and that is the honest default rather
         # than a weakening. The gate is a static name-match whose entire justification is that an
         # in-process detector's `sys._getframe` reaches the reception loop's broadcast dict; out of
@@ -1737,7 +1748,8 @@ def _load_isolated_check(cfg, order, ref, declared, mode, sgate, columns, prov, 
     # turn a run into a failure, and adding a config field would put a number that cannot affect any
     # result into `manifest["config"]` and into `config_schema()`.
     worker = _isolate.IsolatedCheck(ref, declared, seed=cfg.seed, env=_detector_env(cfg),
-                                    timeout=_isolate.DEFAULT_TIMEOUT_S)
+                                    timeout=_isolate.DEFAULT_TIMEOUT_S,
+                                    deny=(cfg.out_dir,) if cfg.out_dir else ())
     workers.append(worker)
     meta = worker.spawn()
     if sgate == "on":
@@ -4659,12 +4671,28 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     stream = cfg.traffic_flow
     stream_counts = {"reports": 0, "labels": 0, "emit": 0}
     fh_rep = fh_lbl = fh_emit = None
+    # ---- WITHHOLDING, when a third-party detector is running out of process --------------------- #
+    # An isolated check is an ordinary OS process with ordinary read access to this directory, so
+    # streaming the ORACLE files while it runs hands it the answer key for the run it is being graded
+    # on -- measured, and the whole reason `docs/realism/ISOLATION-ORACLE-LEAK.md` exists. While any
+    # worker is alive the two ground-truth streams go to `_WithheldStream`s and are laid down only
+    # after the last one has been reaped. `ma/ma_reports.jsonl` is NOT withheld: it is MA-VISIBLE, it
+    # is the detector's own output rather than the answer, and it is the file the GUI tails.
+    withheld: list = []
+    _withhold_budget = [WITHHELD_MEMORY_BYTES]
     if stream:
         os.makedirs(os.path.join(cfg.out_dir, "ma"), exist_ok=True)
-        os.makedirs(os.path.join(cfg.out_dir, "ground_truth"), exist_ok=True)
         fh_rep = open(os.path.join(cfg.out_dir, "ma", "ma_reports.jsonl"), "w", encoding="utf-8", newline="\n")
-        fh_lbl = open(os.path.join(cfg.out_dir, "ground_truth", "gt_report_labels.jsonl"), "w", encoding="utf-8", newline="\n")
-        fh_emit = open(os.path.join(cfg.out_dir, "ground_truth", "gt_emissions_sample.jsonl"), "w", encoding="utf-8", newline="\n")
+        _lbl_path = os.path.join(cfg.out_dir, "ground_truth", "gt_report_labels.jsonl")
+        _emit_path = os.path.join(cfg.out_dir, "ground_truth", "gt_emissions_sample.jsonl")
+        if suite.workers:
+            fh_lbl = _WithheldStream(_lbl_path, _withhold_budget)
+            fh_emit = _WithheldStream(_emit_path, _withhold_budget)
+            withheld = [fh_lbl, fh_emit]
+        else:
+            os.makedirs(os.path.join(cfg.out_dir, "ground_truth"), exist_ok=True)
+            fh_lbl = open(_lbl_path, "w", encoding="utf-8", newline="\n")
+            fh_emit = open(_emit_path, "w", encoding="utf-8", newline="\n")
 
     def flush_streams():
         for row in ma_reports:
@@ -5622,6 +5650,22 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         for fh in (fh_rep, fh_lbl, fh_emit):
             fh.close()
 
+    # ---- REAP THE ISOLATED WORKERS BEFORE ANY ORACLE FILE EXISTS ----
+    # The step loop is over, so nothing below needs a worker except `suite.provenance()`, which reads
+    # what FINISH returned. Reaping here rather than after the digest is what makes the withholding
+    # claim true of the WHOLE ground-truth set and not just the two streamed files: `gt_vehicle`,
+    # `gt_attacks`, `gt_identity_map` and `gt_linkage_revocation` are written by `_write_side_files`
+    # a few lines below, and until this call the child was still running and could have opened them.
+    # `CheckSuite.close()` is idempotent (`IsolatedCheck.finish` returns {} once closed), so the
+    # later call on the normal path is a no-op and every error path still reaps.
+    suite.close()
+    try:
+        for _w in withheld:                               # nothing exists on disk until here
+            _w.commit()
+    finally:
+        for _w in withheld:                               # never leave a sealed spill behind
+            _w.discard()
+
     # ---- attack ground truth (with onset) ----
     gt_attacks = [R.GtAttack(
         attack_id=f"atk_{v.vid}", true_vehicle_id=f"veh_{v.vid:03d}", attack_type=v.attack_type,
@@ -5686,7 +5730,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     chan.close()                       # ALWAYS called, including on the SIGINT finalisation path
     # Isolated detector workers: FINISH (which collects their declared streams for the manifest and
     # asserts they scored every message they were sent) and reap the processes. Before
-    # `suite.provenance()` below, which reads what FINISH returned.
+    # `suite.provenance()` below, which reads what FINISH returned. On the flow path this already
+    # happened immediately after the step loop -- before any ORACLE file was written -- and
+    # `close()` is idempotent; this call is what covers a run that never reached that point.
     suite.close()
     # The manifest is about to claim that THIS config produced THIS data. Check that first: a
     # mid-run write leaves a dataset that neither the old nor the new value describes, so the honest
@@ -5712,6 +5758,221 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                      n_investigations=len(ma_investigations), n_revoked=len(revoked_vehicles),
                      revoked_cert_digests=sorted(revoked_digests), data_digest=data_digest,
                      counts=dict(cert_status=len(ma_cert_status), gt_reports=n_gt_reports))
+
+
+# --------------------------------------------------------------------------- #
+# Withholding ORACLE output while a third-party detector is alive
+# --------------------------------------------------------------------------- #
+#: Total bytes of withheld ORACLE output the engine will hold in memory before it starts SEALING the
+#: overflow to disk instead. Not a config field, deliberately, for the same reason
+#: `isolate.DEFAULT_TIMEOUT_S` is not one: it cannot change a single output byte, it does not belong
+#: in `manifest["config"]`, and a number that cannot affect a result must not look replayable.
+#:
+#: MEASURED, on this host (`docs/realism/ISOLATION-ORACLE-LEAK.md` has the table). The InTAS AM peak
+#: -- 1 188 vehicles, 158 767 vehicle-steps, 300 s -- withholds 3.2 MiB and costs +4.1 MB of peak
+#: working set, 1.6 % of the run's own 254 MB, with no spill and the same `data_digest`. The
+#: heaviest dataset in this repository (a 0.1 s-step InTAS replay, 1 595 741 reports) writes 212 MiB
+#: of labels plus 210 MiB of emission samples; at the measured 1.008 bytes of RSS per byte held,
+#: buffering all of it would cost ~442 MB. 384 MiB keeps the whole label table and most of the
+#: emission table in memory and seals the rest. Below the ceiling nothing whatsoever exists on disk;
+#: above it, what exists is ciphertext at +0.1 MB of RSS and ~2 s per 212 MiB round trip.
+WITHHELD_MEMORY_BYTES = 384 << 20
+
+#: Keystream block for the spill. One `shake_128` call yields the whole block, so sealing 200 MB
+#: costs ~200 hash calls rather than millions of 32-byte ones.
+_SEAL_BLOCK = 1 << 20
+
+#: Rows are joined into blocks of about this size as they arrive. See `_WithheldStream.write`.
+_COMPACT_BYTES = 8 << 20
+
+
+def _seal_keystream(key: bytes, block: int) -> bytes:
+    return hashlib.shake_128(key + block.to_bytes(8, "big")).digest(_SEAL_BLOCK)
+
+
+def _seal_xor(data: bytes, key: bytes, block: int) -> bytes:
+    """XOR one aligned block with its keystream, through a big-int so the loop runs in C.
+
+    An involution: the same call unseals. `int.from_bytes` drops leading zero BITS, never bytes,
+    and `to_bytes(len(data))` restores the exact width -- so this round-trips byte-for-byte,
+    including a block that begins with NUL.
+    """
+    if not data:
+        return b""
+    ks = _seal_keystream(key, block)[:len(data)]
+    return (int.from_bytes(data, "big") ^ int.from_bytes(ks, "big")).to_bytes(len(data), "big")
+
+
+class _WithheldStream:
+    """An ORACLE output stream that must not be READABLE while an isolated detector is alive.
+
+    **Why this exists.** `run_pipeline` streams `ma/ma_reports.jsonl`,
+    `ground_truth/gt_report_labels.jsonl` and `ground_truth/gt_emissions_sample.jsonl` as the loop
+    goes, to keep a multi-hour run memory-bounded. The first two of those are fine to stream; the
+    ground-truth pair is the ANSWER KEY, and an isolated third-party detector is an ordinary OS
+    process that can open any file the engine has written. Measured, before this class existed: a
+    detector opened `gt_report_labels.jsonl` at its 20 000th message and read the oracle verdict --
+    plus `reporter_true_id` and `subject_true_id` -- for every report filed so far in the run it was
+    being graded on.
+
+    So when any check is `isolated`, the two ground-truth streams are given one of these instead of a
+    file handle. It accepts exactly the writes the file handle accepted, in the same order, and
+    :meth:`commit` -- called only after the last worker has been REAPED -- lays them down. The bytes
+    are the concatenation of the same strings through the same encoding, so the dataset is
+    byte-identical and `test_isolated_and_in_process_agree_bit_for_bit` is what proves it.
+
+    **Two tiers, because the memory is not free.** Up to `budget` bytes across all withheld streams
+    the rows are held in memory and NOTHING exists on disk -- no file, no `ground_truth/` directory,
+    nothing to open. Past that the overflow spills to `<out_dir>/.withheld/<name>.sealed`, XORed with
+    a 32-byte `os.urandom` key that is never written anywhere; `commit` unseals it into the real file
+    and deletes it. A child that finds the spill reads noise. The degradation is stated rather than
+    hidden: past the ceiling the claim weakens from "nothing on disk" to "nothing readable on disk".
+
+    The key is per-stream, per-run, and drawn from `os.urandom` -- NOT from any engine RNG. It never
+    touches a value that reaches the digest (the plaintext is restored bit-for-bit before anything
+    hashes it), so this cannot move a golden, and it does not consume an engine stream.
+    """
+
+    __slots__ = ("path", "name", "_chunks", "_small", "_small_n", "_mem", "_budget", "_spill",
+                 "_spill_path", "_key", "_pending", "_block", "_spilled", "_total")
+
+    def __init__(self, path: str, budget: list):
+        self.path = path
+        self.name = os.path.basename(path)
+        #: Shared, mutable, one-element budget: every withheld stream of a run draws from the same
+        #: ceiling, so two streams cannot each spend it.
+        self._budget = budget
+        self._chunks: list[str] = []                     # compacted, ~_COMPACT_BYTES each
+        self._small: list[str] = []                      # the rows since the last compaction
+        self._small_n = 0
+        self._mem = 0
+        self._total = 0
+        self._spill = None
+        self._spill_path = None
+        self._key = None
+        self._pending = bytearray()
+        self._block = 0
+        self._spilled = 0
+
+    # -- the file-handle surface the streaming path uses ------------------------------------- #
+    def write(self, text: str) -> None:
+        n = len(text)
+        self._total += n
+        if self._spill is None and self._budget[0] >= n:
+            self._budget[0] -= n
+            self._small.append(text)
+            self._small_n += n
+            self._mem += n
+            if self._small_n >= _COMPACT_BYTES:
+                # COMPACTION, and it is what makes the memory tier affordable. A ground-truth row is
+                # ~140 characters, and a `str` costs its characters plus a 49-byte header plus a
+                # pointer: holding 1.6 M of them individually measured 1.44 bytes of RSS per byte of
+                # output. Joined into 8 MiB blocks the ratio is ~1.0, so the ceiling below buys
+                # nearly its own size in real output rather than two thirds of it.
+                self._chunks.append("".join(self._small))
+                self._small, self._small_n = [], 0
+            return
+        self._spill_write(text)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        """The loop's own close. A no-op on purpose: :meth:`commit` is the only thing that creates
+        the file, and it must not happen until the workers are gone."""
+
+    # -- the spill --------------------------------------------------------------------------- #
+    def _spill_write(self, text: str) -> None:
+        if self._spill is None:
+            self._key = os.urandom(32)
+            root = os.path.join(os.path.dirname(self.path), os.pardir, ".withheld")
+            root = os.path.normpath(root)
+            os.makedirs(root, exist_ok=True)
+            self._spill_path = os.path.join(root, self.name + ".sealed")
+            self._spill = open(self._spill_path, "wb")
+        self._pending.extend(text.encode("utf-8"))
+        while len(self._pending) >= _SEAL_BLOCK:
+            chunk = bytes(self._pending[:_SEAL_BLOCK])
+            del self._pending[:_SEAL_BLOCK]
+            self._spill.write(_seal_xor(chunk, self._key, self._block))
+            self._block += 1
+            self._spilled += len(chunk)
+
+    def commit(self) -> str:
+        """Create the real file. **Call only after every isolated worker has been reaped.**"""
+        if self._spill is not None:
+            if self._pending:
+                self._spill.write(_seal_xor(bytes(self._pending), self._key, self._block))
+                self._spilled += len(self._pending)
+                self._pending = bytearray()
+            self._spill.close()
+            self._spill = None
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        if self._small:
+            self._chunks.append("".join(self._small))
+            self._small, self._small_n = [], 0
+        # BINARY, and that is not a style choice: the spill is sealed in fixed 1 MiB blocks, so a
+        # block boundary can fall in the middle of a multi-byte UTF-8 sequence and a per-block
+        # `.decode()` would raise on it. Writing bytes also makes the byte-identity with the streamed
+        # path trivially true -- `newline="\n"` on the streaming handle means no translation either.
+        with open(self.path, "wb") as fh:
+            # One compacted block at a time, each released as it lands: joining the whole buffer
+            # first would materialise the entire file as a `str` AND as `bytes` on top of what is
+            # already held -- measured at 754 MB peak for a 212 MiB table, against 306 MB held.
+            for i, chunk in enumerate(self._chunks):
+                fh.write(chunk.encode("utf-8"))
+                self._chunks[i] = ""
+            self._budget[0] += self._mem
+            self._chunks, self._mem = [], 0
+            if self._spill_path:
+                with open(self._spill_path, "rb") as sealed:
+                    block = 0
+                    while True:
+                        chunk = sealed.read(_SEAL_BLOCK)
+                        if not chunk:
+                            break
+                        fh.write(_seal_xor(chunk, self._key, block))
+                        block += 1
+        self.discard()
+        return self.path
+
+    def discard(self) -> None:
+        """Drop the sealed spill without publishing it. Safe on every path, idempotent."""
+        if self._spill is not None:
+            try:
+                self._spill.close()
+            except OSError:                              # pragma: no cover
+                pass
+            self._spill = None
+        if self._spill_path:
+            try:
+                os.remove(self._spill_path)
+            except OSError:                              # pragma: no cover
+                pass
+            try:
+                os.rmdir(os.path.dirname(self._spill_path))
+            except OSError:
+                pass
+            self._spill_path = None
+        self._key = None
+
+    # -- what the measurement reports -------------------------------------------------------- #
+    @property
+    def sealed_path(self):
+        """Where the overflow is sealed, or None while everything is still in memory."""
+        return self._spill_path
+
+    @property
+    def buffered_bytes(self) -> int:
+        return self._mem
+
+    @property
+    def sealed_bytes(self) -> int:
+        return self._spilled + len(self._pending)
+
+    @property
+    def total_bytes(self) -> int:
+        return self._total
 
 
 # --------------------------------------------------------------------------- #

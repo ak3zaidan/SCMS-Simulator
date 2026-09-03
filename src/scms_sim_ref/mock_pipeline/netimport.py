@@ -30,7 +30,11 @@ from (median error 5 mm, max 1 cm over the 206 junctions whose SUMO id is still 
 SCHEMA. The output is `osm.network_document`: the legacy `{nodes, edges}` (undirected, unchanged
 for every existing consumer) plus `directed_edges` -- one record per legal direction of travel,
 carrying that direction's lane count, the posted speed and the edge's curve geometry -- and
-`signal_nodes`. `roads.edges_from_directed` turns those records into engine edge specs, so a
+`signal_nodes`. With ``--signals`` it also carries ``signal_programs``: the REAL ``<tlLogic>`` phase
+programs -- state strings, phase durations, minDur/maxDur, offset -- plus the
+``(from junction, to junction) -> phase-index`` mapping that makes a program usable by a vehicle.
+See ``signals.py``; MEASURED on InTAS, 98 programs over 98 junctions, cycle median 90 s.
+`roads.edges_from_directed` turns those records into engine edge specs, so a
 netconvert import loads into `CustomNetwork` directly. Two conventions are load-bearing there:
 `shape` holds INTERMEDIATE vertices only (junction coordinates implied), and the two directions of
 one physical road must carry mirror-image shapes -- netconvert does NOT (each carriageway has its
@@ -41,6 +45,8 @@ CLI:
     python -m scms_sim_ref.mock_pipeline.netimport --city ingolstadt --out ing_net.json
     python -m scms_sim_ref.mock_pipeline.netimport --city ingolstadt --strong --turns --out d.json
     python -m scms_sim_ref.mock_pipeline.netimport --net some.net.xml --out net.json --no-geo
+    python -m scms_sim_ref.mock_pipeline.netimport --net ingolstadt.net.xml --signals --strong \
+        --no-geo --out intas.json
 """
 from __future__ import annotations
 
@@ -507,8 +513,12 @@ def _canonicalise_shapes(directed: list, coords: list) -> int:
     return replaced
 
 
-def read_net(net_path: str):
-    """`sumolib.net.readNet` with a useful error when sumolib is missing."""
+def read_net(net_path: str, *, programs: bool = False):
+    """`sumolib.net.readNet` with a useful error when sumolib is missing.
+
+    `programs=True` additionally parses the `<tlLogic>` elements (sumolib's `withPrograms`, which
+    defaults OFF and silently yields NO programs at all when left off). Required for
+    `net_to_network(signals=True)`; costs nothing on the default path."""
     try:
         import sumolib                          # noqa: PLC0415  (optional heavy dependency)
     except ImportError:                          # pragma: no cover - toolchain always has it
@@ -516,7 +526,54 @@ def read_net(net_path: str):
                            "the SUMO_HOME/tools copy)") from None
     if not os.path.exists(net_path):
         raise FileNotFoundError(net_path)
+    if programs:
+        return sumolib.net.readNet(net_path, withPrograms=True)
     return sumolib.net.readNet(net_path)
+
+
+def _extract_signals(net, by_id: dict, eidx: dict, remap: dict, old_to_new_dir: dict,
+                     kept_dir: list, sig: list) -> tuple[list, dict]:
+    """The REAL `<tlLogic>` programs of `net`, in THIS import's final node indices.
+
+    Two closures carry every index remap the importer performs (the coordinate dedupe `by_id`, the
+    connected-component `remap`, and the directed-record compaction `old_to_new_dir`) into
+    `signals.extract`, so that module never has to know how the graph was trimmed. Getting this
+    wrong is the failure mode the whole exercise is about: an approach mapped to the wrong graph
+    node produces a junction whose signals are internally consistent and completely fictional.
+
+    Raises if the net was read WITHOUT `withPrograms=True` -- an empty signal layer that looks like
+    "this city has no signals" is exactly the silent failure to avoid."""
+    from . import signals as _signals          # noqa: PLC0415  (only on the opt-in path)
+
+    programs = _signals.programs_from_net(net)
+    if not programs:
+        raise ValueError(
+            "signals=True but this net yielded no <tlLogic> programs. Read it with "
+            "`read_net(path, programs=True)` (sumolib's withPrograms defaults OFF and drops every "
+            "program silently), or import a net that carries traffic-light programs.")
+
+    def node_index(sumo_node_id):
+        ci = by_id.get(sumo_node_id)
+        return remap.get(ci) if ci is not None else None
+
+    def edge_endpoints(sumo_edge_id):
+        k = eidx.get(sumo_edge_id)
+        if k is None:
+            return None
+        nk = old_to_new_dir.get(k)
+        if nk is None:
+            return None
+        rec = kept_dir[nk]
+        return (rec["a"], rec["b"])
+
+    records, st = _signals.extract(net, node_index, edge_endpoints, programs=programs)
+    st.update(_signals.program_stats(programs))
+    placed = {r["node"] for r in records}
+    st["signal_nodes"] = len(sig)
+    st["signal_nodes_with_program"] = len(placed & set(sig))
+    st["program_nodes_not_typed_traffic_light"] = len(placed - set(sig))
+    st["coverage_of_signal_nodes"] = (round(len(placed & set(sig)) / len(sig), 4) if sig else None)
+    return records, st
 
 
 def net_to_network(net, *, projection: dict | None = None, expect_bbox_xy: list | None = None,
@@ -524,6 +581,7 @@ def net_to_network(net, *, projection: dict | None = None, expect_bbox_xy: list 
                    strong: bool = False, vclass: str | None = "passenger",
                    min_edge_m: float = 1.0, round_m: int = 1,
                    undirected_shapes: bool = False, surface: bool = False,
+                   signals: bool = False,
                    ) -> tuple[list, list, dict]:
     """A sumolib net -> (nodes, edges, info) in custom-network form.
 
@@ -552,7 +610,15 @@ def net_to_network(net, *, projection: dict | None = None, expect_bbox_xy: list 
     False the array is byte-identical to what every existing consumer reads.
 
     `surface=True` additionally emits `info["road_surface"]` -- see `road_surface()`. It is map
-    geometry for `dist_to_road`, NOT topology: no node, no edge and no route changes because of it."""
+    geometry for `dist_to_road`, NOT topology: no node, no edge and no route changes because of it.
+
+    `signals=True` additionally emits `info["signal_programs"]` -- the REAL `<tlLogic>` phase
+    programs (state strings, durations, minDur/maxDur, offset) together with the
+    movement -> phase-index mapping, keyed on THIS import's node indices. See `signals.py`; the net
+    must have been read with `read_net(path, programs=True)` or there are no programs to take.
+    Left False, `info` carries no such key and every existing consumer reads byte-identical output.
+    MEASURED on InTAS: 98 programs, 98 junctions placed, cycle median 90 s, 20 of the 98
+    effectively actuated."""
     tf, param = _transformer(net, projection)
     nodes_all = [n for n in net.getNodes() if n.getType() != "internal"]
     edges_all = [e for e in net.getEdges()
@@ -705,6 +771,11 @@ def net_to_network(net, *, projection: dict | None = None, expect_bbox_xy: list 
         sig = sorted({remap[by_id[n.getID()]] for n in nodes_all
                       if n.getType().startswith("traffic_light")
                       and by_id.get(n.getID()) in remap})
+        sig_records: list = []
+        sig_stats: dict = {}
+        if signals:
+            sig_records, sig_stats = _extract_signals(net, by_id, eidx, remap, old_to_new_dir,
+                                                      kept_dir, sig)
         info = dict(stats)
         info.update(kept_nodes=len(out_nodes), kept_edges=len(out_edges),
                     directed_edges=kept_dir, signal_nodes=sig,
@@ -733,6 +804,9 @@ def net_to_network(net, *, projection: dict | None = None, expect_bbox_xy: list 
         info["undirected_shapes"] = bool(undirected_shapes)
         info["alignment"] = _assert_alignment(out_nodes, expect_bbox_xy)
         info.update(topology_stats(out_nodes, out_edges, kept_dir, sig))
+        if signals:
+            info["signal_programs"] = sig_records
+            info["signal_program_stats"] = sig_stats
         if surface:
             info["road_surface"] = road_surface(net, tf, vclass=vclass)
             info["road_surface_stats"] = {
@@ -789,8 +863,11 @@ def topology_stats(nodes: list, edges: list, directed: list, signal_nodes=()) ->
 
 
 def import_net(net_path: str, **kw) -> tuple[list, list, dict]:
-    """Convenience: read a `.net.xml` from disk and convert it (see `net_to_network`)."""
-    return net_to_network(read_net(net_path), **kw)
+    """Convenience: read a `.net.xml` from disk and convert it (see `net_to_network`).
+
+    `signals=True` also switches the READ to `withPrograms=True`, because sumolib drops every
+    `<tlLogic>` otherwise and the caller would get a silently signal-free city."""
+    return net_to_network(read_net(net_path, programs=bool(kw.get("signals"))), **kw)
 
 
 def net_cache_path(bbox, cache_dir: str, args=NETCONVERT_OSM_ARGS) -> str:
@@ -803,7 +880,7 @@ def net_cache_path(bbox, cache_dir: str, args=NETCONVERT_OSM_ARGS) -> str:
 
 def import_city(city_or_bbox, cache_dir: str = "datasets/_osmcache", *, max_nodes: int = 0,
                 shapes: bool = True, turns: bool = False, strong: bool = False, geo: bool = True,
-                args=NETCONVERT_OSM_ARGS, extra_args=(),
+                args=NETCONVERT_OSM_ARGS, extra_args=(), signals: bool = False,
                 overwrite: bool = False) -> tuple[list, list, dict]:
     """City name (or bbox) -> netconvert -> (nodes, edges, info), in osm.py's projection frame.
 
@@ -827,9 +904,11 @@ def import_city(city_or_bbox, cache_dir: str = "datasets/_osmcache", *, max_node
         lon0, lat0 = projection["lon0"], projection["lat0"]
         expect = [(bbox[0] - lon0) * projection["kx"], (bbox[1] - lat0) * projection["ky"],
                   (bbox[2] - lon0) * projection["kx"], (bbox[3] - lat0) * projection["ky"]]
-    nodes, edges, info = net_to_network(read_net(net_path), projection=projection,
+    nodes, edges, info = net_to_network(read_net(net_path, programs=signals),
+                                        projection=projection,
                                         expect_bbox_xy=expect, max_nodes=max_nodes,
-                                        shapes=shapes, turns=turns, strong=strong)
+                                        shapes=shapes, turns=turns, strong=strong,
+                                        signals=signals)
     info["bbox"] = list(bbox)
     info["net_path"] = net_path
     info["network_meta"] = {"source": "netconvert", "schema": NETWORK_SCHEMA_VERSION,
@@ -840,6 +919,20 @@ def import_city(city_or_bbox, cache_dir: str = "datasets/_osmcache", *, max_node
                             "signal_nodes": len(info["signal_nodes"]),
                             "oneway_share": info["oneway_share"], "lane_km": info["lane_km"]}
     return nodes, edges, info
+
+
+def signal_document(nodes: list, edges: list, info: dict, *, buildings: list | None = None) -> dict:
+    """`osm.network_document` plus the optional `signal_programs` layer.
+
+    Kept HERE rather than folded into `osm.network_document` for one deliberate reason: the base
+    document's key set is what every existing consumer reads, and a document written without
+    `signals=True` must be byte-identical to what it always was. `info` carrying no
+    `signal_programs` therefore adds no key at all, and a reader that predates the layer sees the
+    exact document it saw before."""
+    doc = network_document(nodes, edges, info, buildings=buildings)
+    if info.get("signal_programs"):
+        doc["signal_programs"] = info["signal_programs"]
+    return doc
 
 
 def main(argv=None) -> int:
@@ -853,6 +946,10 @@ def main(argv=None) -> int:
     p.add_argument("--max-nodes", type=int, default=0,
                    help="0 (default) = no node cap; netconvert output has no fake curve nodes")
     p.add_argument("--turns", action="store_true", help="export permitted successors per edge")
+    p.add_argument("--signals", action="store_true",
+                   help="export the REAL <tlLogic> traffic-light programs (phase state strings, "
+                        "durations, minDur/maxDur, offset) plus the movement -> phase-index "
+                        "mapping, as a `signal_programs` layer")
     p.add_argument("--strong", action="store_true",
                    help="keep only the largest STRONGLY connected component (do this whenever the "
                         "consumer honours one-ways: a clipped extract leaves junctions with no "
@@ -871,21 +968,26 @@ def main(argv=None) -> int:
         if a.frame_city:
             frame = road_projection(fetch_osm(CITY_BBOXES[a.frame_city], a.cache))
         nodes, edges, info = import_net(a.net, max_nodes=a.max_nodes, shapes=not a.no_shapes,
-                                        turns=a.turns, strong=a.strong, projection=frame)
+                                        turns=a.turns, strong=a.strong, projection=frame,
+                                        signals=a.signals)
     else:
         target = a.city if a.city else [float(v) for v in a.bbox.split(",")]
         nodes, edges, info = import_city(target, a.cache, max_nodes=a.max_nodes,
                                          shapes=not a.no_shapes, turns=a.turns, strong=a.strong,
-                                         geo=not a.no_geo)
-    doc = network_document(nodes, edges, info)
+                                         geo=not a.no_geo, signals=a.signals)
+    doc = signal_document(nodes, edges, info)
     with open(a.out, "w", encoding="utf-8") as fh:
         json.dump(doc, fh)
     keys = ("n_nodes", "n_edges", "n_directed_edges", "oneway_share", "intersections_deg_ge3",
             "degree_histogram", "lane_histogram", "lane_km", "n_signal_nodes", "dropped_classes")
     print(f"wrote {a.out}: " + json.dumps({k: info[k] for k in keys if k in info}))
+    if a.signals:
+        print("signal_programs: " + json.dumps(info.get("signal_program_stats", {}),
+                                               sort_keys=True, default=str))
     if a.stats:
         print(json.dumps({k: v for k, v in info.items()
-                          if k not in ("directed_edges", "network_meta")},
+                          if k not in ("directed_edges", "network_meta", "signal_programs",
+                                       "road_surface")},
                          indent=1, sort_keys=True, default=str))
     return 0
 

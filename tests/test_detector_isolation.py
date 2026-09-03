@@ -23,13 +23,22 @@ So the assertions below are, in order:
 3. **The frame walk finds only the serialiser.** The identical hostile check is run BOTH ways; in
    process it reaches `run_pipeline`'s locals and files a report on every message from the label,
    isolated it reaches seven frames of `api/isolate.py` and files nothing.
-4. **Failure is loud.** A crashing, hanging or lying worker fails the run. There is no path on which
+4. **The run's own ground truth is not on DISK while the child is alive.** This one is an inversion:
+   the engine used to STREAM `ground_truth/gt_report_labels.jsonl` as the loop went, and a detector
+   in the child opened it at message 20 000 and read the oracle verdict — plus `reporter_true_id`
+   and `subject_true_id` — for every report filed so far, in the run it was being graded on. The
+   assertion that pinned that now pins its opposite: **told the exact path, the child finds no
+   `ground_truth/` at all.** Its old form is kept, unchanged, for the IN-PROCESS run, where
+   streaming still happens and must keep happening — a long flow run's memory bound depends on it.
+5. **Failure is loud.** A crashing, hanging or lying worker fails the run. There is no path on which
    an isolated detector silently scores 0.0, because a dataset in which "the detector was broken"
    and "the detector saw nothing" are the same bytes is worse than no dataset.
-5. **The residue is pinned too.** The child is an ordinary OS process: it reads the filesystem, this
-   repository included. That is asserted here so the documentation cannot quietly stop saying it.
+6. **The residue is pinned too.** The child is still an ordinary OS process: it reads the
+   filesystem, this repository and any OTHER dataset on the machine included. That is asserted here
+   so the documentation cannot quietly stop saying it.
 """
 
+import base64
 import importlib
 import json
 import os
@@ -44,6 +53,7 @@ from scms_sim_ref.api.errors import ConfigError
 from scms_sim_ref.conformance.v1.detect import observation
 from scms_sim_ref.mock_pipeline import PipelineConfig, run_pipeline
 from scms_sim_ref.mock_pipeline import run as RM
+from scms_sim_ref.mock_pipeline.run import WITHHELD_MEMORY_BYTES  # noqa: F401 (documented ceiling)
 
 _CFG = dict(seed=17, traffic_flow=True, road_network="grid", duration_s=40, arrival_rate=1.5,
             grid_w=5, grid_h=5, attacker_pct=0.25)
@@ -199,8 +209,11 @@ _HOSTILE_SRC = '''\
 """A detector that reads the labels it is supposed to be predicting -- if it can reach them.
 
 Writes what its frame walk found to `$ISO_TEST_REPORT`, so the test can COMPARE the two modes
-instead of inferring the difference from a failure.
+instead of inferring the difference from a failure. It probes BOTH the address space (the frame
+walk) and the disk (this run's own `ground_truth/`), because those are two different claims and the
+guide has already been wrong about the second one once.
 """
+import base64
 import json
 import os
 import sys
@@ -250,15 +263,35 @@ class FrameWalker(CheckBase):
             path = os.environ.get("ISO_TEST_REPORT")
             if path:
                 prior = os.environ.get("ISO_TEST_PRIOR_GT", "")
-                fs = {"probe_at_call": self.calls}
+                fs = {"probe_at_call": self.calls, "cwd": os.getcwd()}
+                try:
+                    fs["cwd_entries"] = sorted(os.listdir("."))[:20]
+                except OSError as e:
+                    fs["cwd_entries"] = "REFUSED: " + type(e).__name__
                 if prior:
                     try:
                         with open(prior, encoding="utf-8") as fh:
                             fs["prior_gt_first_row"] = fh.readline().strip()[:200]
                     except OSError as e:
                         fs["prior_gt_first_row"] = "REFUSED: " + type(e).__name__
-                out_dir = os.environ.get("ISO_TEST_OUT_DIR", "")
-                if out_dir:
+                # THE RUN'S OWN OUTPUT DIRECTORY, handed over BASE64-ENCODED on purpose. The engine
+                # scrubs every environment value that names the output directory, so a plain
+                # variable would be gone and the measurement would degrade to "it was not told the
+                # path" -- the weak claim. Encoded, it survives the scrub, and what is measured is
+                # the strong one: a child that knows the exact path finds nothing there.
+                b64 = os.environ.get("ISO_TEST_OUT_DIR_B64", "")
+                if b64:
+                    out_dir = base64.b64decode(b64.encode("ascii")).decode("utf-8")
+                    low = out_dir.lower().rstrip(os.sep)
+                    fs["env_leaks"] = sorted(
+                        k for k, v in os.environ.items()
+                        for p in str(v).lower().split(os.pathsep)
+                        if p == low or p.startswith(low + os.sep))
+                    fs["gt_dir_exists"] = os.path.isdir(os.path.join(out_dir, "ground_truth"))
+                    try:
+                        fs["out_dir_entries"] = sorted(os.listdir(out_dir))
+                    except OSError as e:
+                        fs["out_dir_entries"] = "REFUSED: " + type(e).__name__
                     lp = os.path.join(out_dir, "ground_truth", "gt_report_labels.jsonl")
                     try:
                         with open(lp, "rb") as fh:
@@ -494,12 +527,15 @@ def test_the_child_still_reads_the_filesystem_and_the_docs_say_so(iso_plugin, tm
                                                                   monkeypatch):
     """**The residual hole, pinned so it cannot quietly stop being documented.**
 
-    Process isolation takes the run's ground truth out of the detector's ADDRESS SPACE. It does not
-    take it off the DISK: the child runs as the same user, so a completed earlier run's
-    `ground_truth/*.jsonl` in a directory it can guess is readable. The honest mitigations are
-    operational (run the benchmark against datasets the submitter's process cannot reach, or under
-    an OS-level sandbox), and the honest thing to do here is assert the hole rather than imply it is
-    closed.
+    THIS RUN's ground truth is now neither in the detector's address space nor on the disk while it
+    is alive. **Every OTHER dataset on the machine still is.** The child runs as the same user, so a
+    completed earlier run's `ground_truth/*.jsonl` — the thing a benchmark host most plausibly has
+    lying around — is readable with one `open()`, and the restricted working directory does not
+    change that: an absolute path still works and a determined child can walk the disk.
+
+    The honest mitigations are operational (run the benchmark against a host whose other datasets
+    the submitter's process cannot reach, or under an OS-level sandbox), and the honest thing to do
+    here is assert the hole rather than imply it is closed.
     """
     prior = tmp_path / "prior_gt.jsonl"
     prior.write_text('{"_visibility":"ORACLE","is_attacker":true}\n', encoding="utf-8")
@@ -516,36 +552,258 @@ def test_the_child_still_reads_the_filesystem_and_the_docs_say_so(iso_plugin, tm
     assert "filesystem" in ISO.__doc__
 
 
-def test_the_child_can_read_this_runs_streamed_oracle_labels(iso_plugin, tmp_path, monkeypatch):
-    """**The worse half of the same hole, and the reason this test exists at all.**
+def test_the_child_cannot_read_this_runs_oracle_labels(iso_plugin, tmp_path, monkeypatch):
+    """**The hole this mode was built to close, now measured CLOSED. This is the gate.**
 
-    The first draft of the guide's §2.8 said the run's OWN oracle files were unreadable while the
-    loop was going, so a detector could not see the labels of the run it was being graded on. That is
-    false, and measuring it is what showed it: `ground_truth/gt_report_labels.jsonl` is STREAMED, so
-    by message 20 000 it already holds the oracle verdict — plus `reporter_true_id` and
-    `subject_true_id` — for every report filed so far.
+    This assertion used to read the other way round, and the inversion is the point of the change it
+    pins. `ground_truth/gt_report_labels.jsonl` was STREAMED as the loop went, so by message 20 000
+    it already held the oracle verdict — plus `reporter_true_id` and `subject_true_id` — for every
+    report filed so far, and an isolated detector opened it and read them. The engine now WITHHOLDS
+    both ORACLE streams while any worker is alive: the rows are buffered and the files are created
+    only after the last child has been reaped.
 
-    The detector has to be declared alongside `@builtins` for that to be visible, because a detector
-    that fires nothing produces nothing to stream, and the first measurement was quietly reading an
-    empty file and calling it a closed hole.
+    Three properties are measured here, and the middle one is the one that matters:
 
-    What survives is the narrower claim: the ground truth is not in the child's ADDRESS SPACE
-    (`oracle["oracle"] is False` here too). What does not survive is any claim about the disk.
+    1. the address-space claim still holds (`oracle is False`);
+    2. **the child, told the exact output path, finds no `ground_truth/` directory at all** — not an
+       empty file, not a partial one. The path is handed over base64-encoded precisely so that this
+       is not accidentally measuring the weaker "it was not told where to look";
+    3. the environment genuinely does not name the dataset either, and the working directory is a
+       fresh empty one — the defence-in-depth half, asserted separately so it can never be mistaken
+       for the containment.
+
+    The detector is declared alongside `@builtins` deliberately. A detector that fires nothing
+    produces nothing to stream, and the FIRST version of this measurement read an empty file and
+    concluded the hole was closed. With the built-in suite running there are real labels to find, so
+    "found nothing" is a statement about the engine and not about the workload.
+
+    And the data is not lost: the same file is complete and correct once the run ends.
     """
     report = tmp_path / "stream_findings.json"
     monkeypatch.setenv("ISO_TEST_REPORT", str(report))
     out = tmp_path / "stream"
-    monkeypatch.setenv("ISO_TEST_OUT_DIR", str(out))
-    run_pipeline(_cfg(out, ["@builtins", _entry(HOSTILE, isolated=True)], duration_s=40))
+    monkeypatch.setenv("ISO_TEST_OUT_DIR_B64",
+                       base64.b64encode(str(out).encode("utf-8")).decode("ascii"))
+    res = run_pipeline(_cfg(out, ["@builtins", _entry(HOSTILE, isolated=True)], duration_s=40))
     found = json.loads(report.read_text(encoding="utf-8"))
-    assert found["oracle"] is False              # the address-space claim still holds
-    labels = found["filesystem"].get("run_labels", {})
-    assert labels.get("read") is True and labels.get("size", 0) > 0, (
-        "the streamed oracle label file was expected to be readable AND non-empty from the child; "
-        "if this now fails because the engine stopped streaming it, the guide's §2.8 must be "
-        "rewritten rather than this assertion relaxed")
+    fs = found["filesystem"]
+    assert found["oracle"] is False                        # 1. the address-space claim still holds
+    assert fs["probe_at_call"] == 20000, (
+        "the probe must land deep into the run: at message 1 a STREAMED file would also be empty, "
+        "which is exactly the way the first measurement of this hole fooled itself")
+
+    # 2. THE CLAIM. Knowing the exact path, mid-run, the child finds nothing.
+    assert fs["gt_dir_exists"] is False, (
+        "ground_truth/ existed while an isolated detector was running; if the engine has gone back "
+        "to streaming ORACLE output, the guide's claim is false again and this is where it shows")
+    assert fs["run_labels"] == {"read": False, "error": "FileNotFoundError"}, fs["run_labels"]
+    assert not any(str(e).startswith("ground_truth") for e in fs["out_dir_entries"])
+    # ... and it is not merely that the labels lag: NOTHING of the oracle is on disk yet.
+    assert sorted(fs["out_dir_entries"]) == ["ma"], fs["out_dir_entries"]
+
+    # 3. Defence in depth, stated as a SEPARATE claim because it is a weaker one.
+    assert fs["env_leaks"] == [], f"the child's environment named the dataset: {fs['env_leaks']}"
+    assert fs["cwd_entries"] == [], f"the child's cwd was not empty: {fs['cwd']}"
+    assert os.path.normcase(fs["cwd"]) != os.path.normcase(os.getcwd())
+
+    # And the withholding is not data loss: the file is complete, correct and ORACLE-marked after.
+    labels = (tmp_path / "stream" / "ground_truth" / "gt_report_labels.jsonl").read_text(
+        encoding="utf-8")
+    rows = [json.loads(ln) for ln in labels.splitlines() if ln.strip()]
+    assert len(rows) == res.n_reports > 0
+    assert all(r["_visibility"] == "ORACLE" for r in rows)
+    assert all({"report_correctness", "reporter_true_id", "subject_true_id"} <= set(r)
+               for r in rows)
+
+
+def test_without_an_isolated_detector_the_labels_are_still_streamed(iso_plugin, tmp_path,
+                                                                    monkeypatch):
+    """**The regression guard, and the old assertion kept alive in the domain where it is true.**
+
+    Streaming is what keeps a multi-hour flow run memory-bounded, so the withholding has to be
+    exactly as narrow as its justification: no worker out of process, no buffering. This is the
+    identical measurement the previous test used to make -- the SAME detector, the SAME probe, the
+    SAME assertions on the bytes it read -- run IN PROCESS, where it still succeeds.
+
+    Two things follow. A future change that started withholding unconditionally fails here (and
+    would have quietly cost every long run its memory bound); a future change that stopped
+    withholding fails in the test above. The pair brackets the behaviour from both sides.
+    """
+    report = tmp_path / "inproc_stream_findings.json"
+    monkeypatch.setenv("ISO_TEST_REPORT", str(report))
+    out = tmp_path / "plain"
+    monkeypatch.setenv("ISO_TEST_OUT_DIR_B64",
+                       base64.b64encode(str(out).encode("utf-8")).decode("ascii"))
+    run_pipeline(_cfg(out, ["@builtins", _entry(HOSTILE, gate="off")], duration_s=40))
+    fs = json.loads(report.read_text(encoding="utf-8"))["filesystem"]
+    assert fs["probe_at_call"] == 20000
+    assert fs["gt_dir_exists"] is True
+    labels = fs["run_labels"]
+    assert labels["read"] is True and labels["size"] > 0, (
+        "an ordinary flow run must still STREAM its ground truth; if this fails the engine has "
+        "started buffering on the default path and every long run just lost its memory bound")
     assert '"_visibility":"ORACLE"' in labels["head"]
     assert "report_correctness" in labels["head"] and "subject_true_id" in labels["head"]
+    # In process the environment is not scrubbed and the cwd is the engine's, because there is no
+    # child: those two mitigations exist only for the isolated path and are asserted only there.
+    assert os.path.normcase(fs["cwd"]) == os.path.normcase(os.getcwd())
+
+
+# ================================================ 3b. WITHHOLDING, AS A MECHANISM ============= #
+def test_every_worker_has_exited_before_the_first_ground_truth_byte_is_written(iso_plugin, tmp_path,
+                                                                               monkeypatch):
+    """**The ordering, asserted on the OS rather than on the source.**
+
+    Withholding the two streamed tables would be half a fix: `gt_vehicle.jsonl` carries `is_attacker`
+    for every vehicle, and `_write_side_files` used to run while the children were still alive --
+    `suite.close()` was after the digest. It now runs immediately after the step loop, and what makes
+    that checkable is `Popen.poll()`: at the moment any ground-truth file is created, every worker
+    process must already have an exit status.
+
+    A revert that moves the reap back fails here even though every other assertion in this file still
+    passes, because nothing else looks at WHEN the child died.
+    """
+    workers, order = [], []
+    real_spawn, real_side = ISO.IsolatedCheck.spawn, RM._write_side_files
+    real_commit = RM._WithheldStream.commit
+
+    def dead():
+        return [w for w in workers if w._proc is not None and w._proc.poll() is None]
+
+    def spawn(self):
+        workers.append(self)
+        return real_spawn(self)
+
+    def side(*a, **kw):
+        order.append("side_files")
+        assert not dead(), "gt_vehicle.jsonl was written while a detector child was still running"
+        return real_side(*a, **kw)
+
+    def commit(self):
+        order.append(self.name)
+        assert not dead(), f"{self.name} was written while a detector child was still running"
+        return real_commit(self)
+
+    monkeypatch.setattr(ISO.IsolatedCheck, "spawn", spawn)
+    monkeypatch.setattr(RM, "_write_side_files", side)
+    monkeypatch.setattr(RM._WithheldStream, "commit", commit)
+    res = run_pipeline(_cfg(tmp_path / "order", [_entry(REF, params=PARAMS, isolated=True)],
+                            duration_s=20))
+    assert workers and order[:3] == ["gt_report_labels.jsonl", "gt_emissions_sample.jsonl",
+                                     "side_files"]
+    assert os.path.isfile(os.path.join(res.out_dir, "ground_truth", "gt_vehicle.jsonl"))
+
+
+
+def test_the_withheld_stream_reproduces_the_streamed_bytes_exactly(tmp_path):
+    """`_WithheldStream` must be a drop-in for the file handle it replaces, or the two modes diverge.
+
+    That equality is what `test_isolated_and_in_process_agree_bit_for_bit` depends on at the level of
+    the whole dataset; this asserts it at the level of the bytes, including the SPILL path, which
+    that test cannot reach without a 384 MiB run.
+    """
+    rows = [json.dumps({"i": i, "s": "café-über-日本"}) + "\n" for i in range(400)]
+    plain = tmp_path / "streamed" / "gt.jsonl"
+    plain.parent.mkdir(parents=True)
+    with open(plain, "w", encoding="utf-8", newline="\n") as fh:
+        for r in rows:
+            fh.write(r)
+
+    for label, budget in (("all in memory", [1 << 20]), ("all spilled", [0]),
+                          ("half spilled", [sum(len(r) for r in rows) // 2])):
+        out = tmp_path / label.replace(" ", "_") / "ground_truth" / "gt.jsonl"
+        sink = RM._WithheldStream(str(out), budget)
+        for r in rows:
+            sink.write(r)
+        sink.close()
+        assert not out.parent.exists(), f"{label}: the directory existed before commit"
+        sink.commit()
+        assert out.read_bytes() == plain.read_bytes(), label
+        assert sink.sealed_path is None, f"{label}: the sealed spill was left behind"
+
+
+def test_the_spill_holds_no_readable_oracle_and_is_removed(tmp_path, monkeypatch):
+    """Past the memory ceiling the overflow goes to disk, and what goes to disk is CIPHERTEXT.
+
+    This is the one place the claim degrades: below `WITHHELD_MEMORY_BYTES` there is nothing on
+    disk at all; above it there is a file, and the honest statement about that file is that it holds
+    nothing readable and that its key exists only in the engine's memory. Both halves asserted --
+    the plaintext is absent from the sealed bytes, and the sealed file is gone once the run ends.
+
+    `_SEAL_BLOCK` is shrunk to 64 bytes so the block boundaries fall INSIDE the multi-byte UTF-8
+    sequences below; sealing in fixed blocks and decoding per block would raise on exactly that, and
+    it is why `commit()` writes the final file in binary.
+    """
+    monkeypatch.setattr(RM, "_SEAL_BLOCK", 64)
+    rows = [json.dumps({"subject_true_id": f"veh_{i:03d}", "note": "ééé日"},
+                       ensure_ascii=False) + "\n" for i in range(200)]
+    out = tmp_path / "run" / "ground_truth" / "gt_report_labels.jsonl"
+    sink = RM._WithheldStream(str(out), [0])
+    for r in rows:
+        sink.write(r)
+    sealed = sink.sealed_path
+    assert sealed and os.path.isfile(sealed)
+    blob = open(sealed, "rb").read()
+    assert b"subject_true_id" not in blob and b"veh_000" not in blob
+    assert blob != "".join(rows).encode("utf-8")
+    sink.commit()
+    assert out.read_bytes() == "".join(rows).encode("utf-8")
+    assert not os.path.exists(sealed) and not os.path.isdir(os.path.dirname(sealed))
+
+
+def test_the_memory_ceiling_is_shared_across_the_withheld_streams(tmp_path):
+    """One budget for the run, not one per stream: two streams cannot each spend the ceiling."""
+    budget = [10]
+    a = RM._WithheldStream(str(tmp_path / "a" / "gt_a.jsonl"), budget)
+    b = RM._WithheldStream(str(tmp_path / "b" / "gt_b.jsonl"), budget)
+    a.write("12345\n")                       # 6 bytes -> memory, 4 left
+    b.write("12345\n")                       # 6 bytes -> over the shared ceiling -> spilled
+    assert (a.buffered_bytes, a.sealed_bytes) == (6, 0)
+    assert (b.buffered_bytes, b.sealed_bytes) == (0, 6)
+    a.discard()
+    b.discard()
+
+
+def test_child_env_drops_every_path_that_names_the_output_directory(tmp_path, monkeypatch):
+    """The defence-in-depth half, asserted directly on the function rather than through a run.
+
+    It scrubs what the child is HANDED. It does not, and is not claimed to, stop the child looking:
+    the repository stays on the import path (it has to -- that is where `scms_sim_ref` is) and
+    `scms_sim_ref.__file__` names it regardless.
+    """
+    out = tmp_path / "dataset"
+    (out / "ground_truth").mkdir(parents=True)
+    monkeypatch.setenv("SCMS_OUT", str(out))
+    monkeypatch.setenv("SCMS_GT", str(out / "ground_truth"))
+    monkeypatch.setenv("SCMS_ELSEWHERE", str(tmp_path / "other"))
+    monkeypatch.setenv("PATHLIKE", os.pathsep.join([str(tmp_path / "keep"), str(out / "bin")]))
+    monkeypatch.setattr(ISO.sys, "path", [str(out), str(out / "plugins"), str(tmp_path / "libs")])
+
+    env = ISO.child_env((str(out),))
+    assert "SCMS_OUT" not in env and "SCMS_GT" not in env
+    assert env["SCMS_ELSEWHERE"] == str(tmp_path / "other")       # only the dataset is scrubbed
+    assert env["PATHLIKE"] == str(tmp_path / "keep")              # filtered, not deleted
+    entries = env["PYTHONPATH"].split(os.pathsep)
+    assert str(tmp_path / "libs") in entries
+    assert not any(ISO._is_within(ISO._norm(p), ISO._norm(out)) for p in entries)
+    # The parent's cwd is carried explicitly, because the child no longer starts in it and `-m`
+    # would otherwise have put the empty sandbox on `sys.path` in its place.
+    assert os.getcwd() in entries
+    # ... and with nothing denied it is the plain carry-over it always was.
+    assert str(out) in ISO.child_env().get("PYTHONPATH", "").split(os.pathsep)
+
+
+def test_a_live_map_and_an_isolated_detector_are_refused_together(iso_plugin, tmp_path):
+    """`live_state.json` is written DURING the loop and marks every attacker (state 1) -- the oracle,
+    refreshed on a timer, in a file the child can open. Withholding the ground-truth streams while
+    leaving that on would make the claim false again, so the combination is refused rather than
+    silently disarmed: a host that asked for a live map is told, not overruled."""
+    with pytest.raises(ConfigError) as e:
+        run_pipeline(_cfg(tmp_path / "live", [_entry(REF, params=PARAMS, isolated=True)],
+                          live_interval_s=1.0))
+    assert "live_state.json" in str(e.value) and "live_interval_s=0" in str(e.value)
+    # Either one alone is fine.
+    assert run_pipeline(_cfg(tmp_path / "live_ok", ["@builtins"], live_interval_s=1.0)).n_vehicles
 
 
 # ============================================================== 4. LOUD FAILURE ================ #
@@ -714,3 +972,21 @@ def test_the_module_states_what_it_does_not_close():
     assert "filesystem" in doc
     assert "pickle" in doc and "code" in doc
     assert "address space" in doc and "ordinary OS process" in doc
+    # ... and BOTH halves of what it now does close, so neither can quietly stop being stated.
+    assert "WITHHOLDS" in doc and "not on DISK" in doc
+
+
+def test_the_documentation_states_the_two_tiers_and_the_residue():
+    """Three claims live in prose and only in prose, and this project has already had to withdraw
+    one containment claim: what is ENFORCED, what DEGRADES above the memory ceiling, and what is
+    still only convention. Each is pinned to a phrase here."""
+    docs = os.path.join(os.path.dirname(__file__), os.pardir, "docs", "realism")
+    guide = open(os.path.join(docs, "DETECTOR-PLUGIN.md"), encoding="utf-8").read().lower()
+    leak = open(os.path.join(docs, "ISOLATION-ORACLE-LEAK.md"), encoding="utf-8").read().lower()
+    for text, where in ((guide, "DETECTOR-PLUGIN.md"), (leak, "ISOLATION-ORACLE-LEAK.md")):
+        assert "withhold" in text or "withheld" in text, where       # what is enforced
+        assert "ciphertext" in text or "sealed" in text, where       # where it degrades, and to what
+        assert "filesystem" in text, where                           # what is still convention
+    assert str(RM.WITHHELD_MEMORY_BYTES >> 20) in leak, (
+        "the ceiling above which the claim weakens from 'nothing on disk' to 'nothing readable on "
+        "disk' must be stated in MiB in the document that explains it")

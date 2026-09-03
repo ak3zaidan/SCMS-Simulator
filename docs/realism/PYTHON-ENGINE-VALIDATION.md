@@ -54,12 +54,17 @@ exactly; `k = round(t/dt) - 1` leaves a mean 1.102 m residual, which is one 0.1 
 Irrelevant to an hour-long count, load-bearing if you align a dataset against a SUMO output file.
 
 **9.23% of the vehicle-steps are missing, and enforcement is why.** 781,575 − 709,454 = 72,121
-absent samples, and they belong to exactly **27 vehicles — precisely the 27 the MA revoked**. A
-revoked vehicle stops broadcasting (`enforced(tx, t)` skips it in the broadcast pre-pass), so its
-kinematic record ends at revocation while it keeps driving in the simulation. That is the SCMS layer
-working, but it means **a traffic count taken from the dataset undercounts by the enforced
-fraction** — measured at −7.3% on the 300 s window (228 crossings from the dataset against 246 from
-the trace). Anyone measuring flow from `gt_emissions_sample.jsonl` needs to know that.
+absent samples, and they belong to exactly **27 vehicles — precisely the 27 the MA revoked**
+(`gt_linkage_revocation.jsonl` has 27 rows; all 27 appear in the dataset). A revoked vehicle stops
+broadcasting (`enforced(tx, t)` skips it in the broadcast pre-pass), so its kinematic record ends at
+revocation while it keeps driving in the simulation. The truncation is not marginal per vehicle:
+a revoked vehicle's record spans **15.90 s on average against 229.59 s** for a vehicle that is never
+revoked — 160 emissions against 2,297. That is the SCMS layer working, but it means **a traffic
+count taken from the dataset undercounts by the enforced fraction** — measured at −7.3% on the 300 s
+window (228 crossings from the dataset against 246 from the trace). Anyone measuring flow from
+`gt_emissions_sample.jsonl` needs to know that. **At the peak hour this term stops being a footnote
+and becomes the largest single difference between the dataset and the traffic it replays; see
+section 1.**
 
 ---
 
@@ -80,7 +85,59 @@ on the conflicting arm trips the loop.
 | InTAS 0–300 s, step 0.1 s, seed 42 | 246 | 233 | **+5.58%** |
 | InTAS 25200–25500 s, step 1.0 s, seed 257318856 | 325 | 312 | **+4.31%** (median station GEH **0.0011**, p85 0.269) |
 
-<!--HOUR-COUNTER-->
+**Over a full clock hour the counter is far better than either 300 s row suggests, and the residual
+had a findable cause.** Same three controls, all graded through `sumo_realism.py` against the SUMO
+run's own loops (so every figure below is duration-normalised to veh/h — that basis makes the first
+row read +5.61% where the raw ratio 246/233 above reads +5.58%):
+
+| control | window | vehicles | count | SUMO's loops | delta | with `--exclusive-gates` | delta |
+|---|---|---|---|---|---|---|---|
+| 0–300 s, dt 0.1, seed 42 (local midnight) | 300 s | 334 | 246 | 232.9 | +5.61% | **238** | **+2.18%** |
+| 25200–25500 s, dt 1.0, seed 257318856 (AM, entered cold) | 300 s | 1,188 | 325 | 311.0 | +4.52% | **320** | **+2.91%** |
+| **25201–28800 s, dt 1.0, seed 42, warmed (the AM peak hour)** | 3,599 s | 14,896 | 24,180 | 23,635.4 | **+2.30%** | **23,733** | **+0.41%** |
+
+**The +2.30% was not spread over the network: 24 of 25 stations were already inside ±3.1%**
+(median station GEH 0.132) **and one station, 1010, was +29.93%** (1,938 against 1,491.6, GEH
+10.78 — the only station outside the seed-stability band). Localising it per detector: of station
+1010's 16 loops, **two carry the entire excess** — `1010_7` counted 448 against SUMO's 216, and
+`1010_9` counted 446 against SUMO's 232. Note what those numbers are: 216 + 232 = **448**. Each of
+the two loops was counting the union of both.
+
+**The cause is that an `<e1Detector>` is LANE-BOUND and a position is not.** SUMO's loop sees a
+vehicle only if the vehicle's `laneID` is the detector's lane, so two loops on different roads never
+share a vehicle however close the roads run. This counter has positions and no lane identity. Loops
+`1010_7` (edge `172515813`) and `1010_9` (edge `201278218#0`) sit 2.514 m apart with tangents 13.6°
+apart — and decomposed on the direction of travel that gap is **2.427 m ALONG and only 0.656 m
+ACROSS**, so each loop's ±1.6 m strip covers the other road's centreline and both count every
+vehicle on either road. (`1010_6`/`1010_8` are the same pair one lane over: 2.466 m apart, 1.179 m
+across.)
+
+**It is not double-counting and the census proves it.** Streaming the hour and recording crossings
+per (detector, vehicle): all 24,180 crossings are distinct (detector, vehicle) pairs, multiplicity
+histogram `{1: 24180}`, zero repeats anywhere in the network. Every excess crossing is a *different*
+vehicle — one that was on the other road.
+
+**And it is not a widespread hazard.** Over the whole InTAS layout, gate pairs that sit on different
+edges, closer than the sum of their half-widths, and within the direction gate's 60°, number
+**exactly 2 of the 19,110 pairs** — and both are this location. (Nine pairs overlap on the *same*
+edge, which is the case the half-lane cap already handles.)
+
+`--exclusive-gates` (default OFF, so every number published before it is unchanged, and the default
+freeze path re-verified byte-identical at sha256 `78fd92bf…`) awards a vehicle to at most one loop
+of such a group — the one it passed closest to laterally, which is what SUMO gets for free from lane
+membership. On the hour it moves **exactly one station**: 1010 goes 1,938 → **1,491** against SUMO's
+1,491.6, ratio 0.9996, GEH 10.78 → **0.015**. Network total +2.30% → **+0.41%**, median station GEH
+0.1231, p85 0.3914, and **every one of the 25 stations inside the band** (was 24).
+
+**What the residual +0.41% is, and why it shrinks with the window.** The excess is a per-VEHICLE
+boundary term, not a per-crossing one: 97.6 excess crossings over 14,896 vehicles = **0.0066 per
+vehicle** on the hour, against 8 over 1,188 = **0.0067 per vehicle** on the cold AM 300 s — the same
+number. What differs is how many crossings a vehicle contributes: 1.59 each over an hour against
+0.26 each over 300 s. So the same front-crossing-versus-completely-passed edge effect is +2.9% of a
+300 s count and +0.41% of an hour's. **A full clock hour is not merely the right window for GEH; it
+is the window where this counter is nearly unbiased.**
+
+
 
 **The bias is the gate definition, not the sample rate.** Re-counting the same 0.1 s trajectory at
 progressively coarser sampling:
@@ -90,17 +147,23 @@ progressively coarser sampling:
 | crossings | 246 | 246 | 246 | 248 | 248 (1,403 pairs too long to interpolate) |
 | vs SUMO's 233 | +5.58% | +5.58% | +5.58% | +6.44% | +6.44% |
 
-Going from SUMO's own integration step to 1 Hz costs **0.86 percentage points**. The remaining
-+5.6% is the semantic difference: this counts the FRONT crossing the loop, `nVehContrib` counts a
-vehicle that has COMPLETELY passed it.
+Going from SUMO's own integration step to 1 Hz costs **0.86 percentage points**. The remainder is
+the two effects taken apart above — lane-blind cross-talk, and FRONT-crossing against
+`nVehContrib`'s COMPLETELY-passed.
 
 Half-width sensitivity on the 25200–25500 s control: 318 / 319 / 321 / 325 / 325 crossings at
 W = 0.8 / 1.0 / 1.2 / 1.6 / 2.0 m (the last is capped by the lane's own half-width). The gate can
 never be widened past half a lane, because a station's count is the SUM over its per-lane loops and
-a wider gate lets one vehicle be counted by its neighbour's loop too.
+a wider gate lets one vehicle be counted by its neighbour's loop too. Note what this sweep does
+*not* fix: narrowing to W = 0.8 m still leaves the 1010 cross-talk, because that pair's lateral
+separation is 0.656 m. Only lane identity — or `--exclusive-gates`, which reconstructs it — removes
+it.
 
-**Direction of the bias.** The counter over-counts by ~5%, so a model that under-produces looks
-better than it is. **Every deficit reported below is therefore a LOWER BOUND on the true deficit.**
+**Direction of the bias.** The counter over-counts, so a model that under-produces looks better than
+it is, and **every deficit reported below is therefore a LOWER BOUND on the true deficit.** On the
+graded AM peak hour that bias is **+2.30% with the default gate and +0.41% with `--exclusive-gates`**
+— which is to say it is now roughly two orders of magnitude smaller than the deficit it sits on top
+of, and cannot be the explanation for anything in section 1.
 
 ---
 
@@ -121,6 +184,24 @@ CALIBRATED how much a realization is worth: `tools/calibration/seed_stability_in
 20 seeds, 190 same-scenario pairs, network-total loop-count **cv = 2.62%** (upper CL 2.97%),
 dispersion φ = 0.218. Anything larger than that band is the engines differing, not the seed.
 
+**And at the AM peak hour it could not be made to mean anything at all, for three separate reasons,
+each measured rather than assumed.** (i) `scms-sim/scenarios/gen_intas_urban_low/scenario_config.json`
+declares `"duration": "300s"` and its `sumo_config.json` points at a `.sumocfg` whose `<begin>` is
+`0`; MOSAIC's `SumoAmbassador` steps SUMO forward from there, so reaching SUMO 25200 s means
+federating **seven hours** of Ingolstadt with the application federate live on every vehicle — and
+the peak carries 3,781 concurrent vehicles against the 300 s window's 334 total. There is no
+`--begin` seam on the MOSAIC side to skip it, which is precisely what `warmup_steps` gave the freeze.
+(ii) The upstream scenario that *does* cover this window,
+`third_party/veremi-nextgen/…/scenarios/InTAS_urban_7_9_trainval`, sets `"duration": "24h"` and
+requires the **`omnetpp` federate, which is not installed in this toolchain**; its vendored
+`InTAS_Detectors_Output.xml` contains **0 `<interval>` rows**, so it carries no counts either.
+(iii) Even if both were solved, the missing ambassador seed still makes it a different realization.
+
+**So the hour's "same mobility" comparison is a different and stronger one than the 300 s
+Python-vs-MOSAIC panel below: three independent readings of LITERALLY THE SAME TRAJECTORIES** —
+SUMO's own induction loops, the frozen artifact, and the engine's emitted dataset. Nothing there is
+a realization difference, so every gap is attributable. It is in section 1.
+
 ### MOSAIC's "full trace" is not a full trace
 
 At `emit_sample_prob = 1.0` / `SCMS_EMIT_SAMPLE = 1.0`:
@@ -138,18 +219,20 @@ traffic panel is taken over wider, ragged gaps on the MOSAIC side.
 
 ### Loop counts, all four sources, 0–300 s
 
-| source | network-total crossings | vs SUMO's own loops (seed 42) |
-|---|---|---|
-| SUMO's own `<e1Detector>` output | 233 | — |
-| frozen trace (SUMO's positions, 0.1 s) | 246 | +5.61%, median station GEH 0.0011, **4/4 seed-stability gates PASS** |
-| **Python engine dataset** | **228** | **−2.11%**, median station GEH 0.0018, station pass fraction **1.00**, **4/4 gates PASS** |
-| MOSAIC dataset | 251 | +7.76%, median station GEH 0.534, station pass fraction 0.826, **2/4 gates FAIL** |
+| source | crossings | `--exclusive-gates` | vs SUMO's own loops (seed 42) |
+|---|---|---|---|
+| SUMO's own `<e1Detector>` output | 233 | — | — |
+| frozen trace (SUMO's positions, 0.1 s) | 246 | **238** | +5.61%, median station GEH 0.0011, **4/4 seed-stability gates PASS** |
+| **Python engine dataset** | **228** | **221** | **−2.11%**, median station GEH 0.0018, station pass fraction **1.00**, **4/4 gates PASS** |
+| MOSAIC dataset | 251 | 242 | +7.76%, median station GEH 0.534, station pass fraction 0.826, **2/4 gates FAIL** |
 
 The Python engine's dataset reproduces the loop counts of the SUMO run it replays to inside the
-calibrated same-scenario band, at every station. (Its −2.11% is the counter's +5.6% over-count and
-enforcement's −7.3% partially cancelling.) MOSAIC's dataset does not reproduce a *different* SUMO
-run's counts station by station — which is exactly what a different realization looks like, and is
-the reason the seed-stability calibration exists.
+calibrated same-scenario band, at every station. (Its −2.11% is the counter's over-count and
+enforcement's −7.3% partially cancelling — under the exclusive gate the same two terms read
+238 → 221 = **−7.14%** enforcement against a +2.18% counter bias, which is the same story with the
+two terms cleanly separated.) MOSAIC's dataset does not reproduce a *different* SUMO run's counts
+station by station — which is exactly what a different realization looks like, and is the reason the
+seed-stability calibration exists.
 
 ### The traffic panel, side by side
 
@@ -311,27 +394,45 @@ python tools\fetch_ingolstadt_counts.py `
 # -> 23 stations, 45,713 veh, duration_s 3600.
 
 # --- 1. freeze the AM-peak hour: SUMO integrates at 0.1 s, the artifact samples at 1 Hz ---
+#     every flag below is read back off the artifact's own `#meta` line, which is the authority.
+#     --seed (not --run-seed): the derived seed SIGSEGVs on this window, see section 6.
 python -m scms_sim_ref.mock_pipeline.sumo_trace `
   --net C:/Temp/smob/ingolstadt.net.xml `
   --sumocfg scms-sim/scenarios/gen_intas_urban_low/sumo/InTAS_buildings.sumocfg `
-  --out C:/Temp/smob2/intas_hour.trace --run-seed 42 `
-  --steps 3600 --dt 1.0 --begin 21600 --warmup 3600 --substeps 10
+  --out C:/Temp/smob2/intas_hour.trace --seed 42 `
+  --steps 3600 --dt 1.0 --begin 21600 --warmup 3600 --substeps 10 `
+  --time-to-teleport 300 --split-on-gap
+# -> 14,896 trajectories, 13,589,568 vehicle-steps, 301 teleports, 156 gap splits, 2 collisions,
+#    sha256 5169914b942b4ad495256354ea9c87068b8c1426e23445b90effd6f4a5daf2ab
 # the same process writes InTAS_Detectors_Output.xml (SUMO's own loops for this exact run) into
 # the scenario dir -- COPY IT OUT, generated scenario dirs are regenerated by other tooling.
 
 # --- 2. drive the Python engine over it (dt/emit_sample_prob have no CLI flag: dump and patch) ---
 python -m scms_sim_ref.mock_pipeline.run --config <cfg>.json --out datasets\py_intas_hour
+# cfg: mobility_source=sumo_replay, road_network=sumo, dt=1.0, duration_s=3600,
+#      emit_sample_prob=1.0, sumo_trace + sumo_trace_sha256 as above, seed 42.
 
 # --- 3. count loop crossings from the engine's own dataset, and from the trace as a control ---
+#     NOTE --time-offset, NOT --begin/--end: the engine labels this window t = 0..3599, so a
+#     --begin 25201 window filter would discard every sample.
 python tools\engine_detectors.py --net C:/Temp/smob/ingolstadt.net.xml `
   --det-add scms-sim\scenarios\gen_intas_urban_low\sumo\InTAS_E1.add.xml `
-  --dataset datasets\py_intas_hour --begin 25201 --end 28800 `
-  --out .realism_cache\pyeng\hour_engine.det.xml
+  --dataset datasets\py_intas_hour --time-offset 25201 --exclusive-gates `
+  --out .realism_cache\pyeng\hour_engine.det.xml --json .realism_cache\pyeng\hour_engine.json
+python tools\engine_detectors.py --net C:/Temp/smob/ingolstadt.net.xml `
+  --det-add scms-sim\scenarios\gen_intas_urban_low\sumo\InTAS_E1.add.xml `
+  --trace C:/Temp/smob2/intas_hour.trace --exclusive-gates `
+  --out .realism_cache\pyeng\hour_trace.det.xml --json .realism_cache\pyeng\hour_trace.json
 
 # --- 4. grade against reality with the UNCHANGED FHWA path ---
 python tools\sumo_realism.py --det-out .realism_cache\pyeng\hour_engine.det.xml `
   --det-add scms-sim\scenarios\gen_intas_urban_low\sumo\InTAS_E1.add.xml `
   --ref-counts .realism_cache\pyeng\refcounts_A.json --seed 42
+
+# --- 4b. the counter's OWN error: same mobility, SUMO's own loops as the reference ---
+python tools\sumo_realism.py --det-out .realism_cache\pyeng\hour_trace.det.xml `
+  --det-add scms-sim\scenarios\gen_intas_urban_low\sumo\InTAS_E1.add.xml `
+  --ref-det-out .realism_cache\pyeng\hour_InTAS_Detectors_Output.xml --begin 25200 --end 28800
 
 # --- 5. the realism scorecard ---
 python -m scms_sim_ref.datagen.realism_bench datasets\py_intas_hour --regime urban `
@@ -353,22 +454,39 @@ movement inside the 3,600 s graded window. `engine_detectors.py` writes that spa
 ### The detector-subset rule, applied
 
 Only **10 of the 25 named InTAS stations** have a detector set identical to the city's
-(`detector_sets_identical`); the archive instruments MORE loops than InTAS at 12 of the remaining
-15 — station 6030 has 9 API detectors against 3 InTAS ones (+200% if summed naively), 8005 8 vs 4
-(+100%), 5060 7 vs 4 (+75%). `fetch_ingolstadt_counts.py` sums only the InTAS-MATCHED detectors,
-which makes the reference a **lower bound** at those stations and therefore flatters the model.
-Two stations (3120, 3130) are registered but have zero observations in the entire archive and are
-never emitted — a zero there would silently corrupt a GEH.
+(`detector_sets_identical`); the archive instruments MORE loops than InTAS at **12 of the remaining
+15**. `fetch_ingolstadt_counts.py` sums only the InTAS-MATCHED detectors, which makes the reference
+a **lower bound** at those stations and therefore flatters the model. The size of that choice,
+measured on this window from the archive's own whole-intersection stream against the matched-subset
+sum (`whole_intersection_inflation_pct`):
+
+| station | InTAS loops | archive loops | matched | naive whole-intersection over-count |
+|---|---|---|---|---|
+| 5060 | 4 | 7 | 4 | **+92.88%** |
+| 6030 | 4 | 9 | 3 | +75.85% |
+| 4250 | 6 | 9 | 6 | +54.99% |
+| 4070 | 5 | 7 | 5 | +52.14% |
+| 8001 | 9 | 11 | 9 | +39.49% |
+| **all 23 comparable** | — | — | — | **45,713 → 52,074 = +13.92%** |
+
+So taking the archive at face value would have credited Ingolstadt with 52,074 vehicles instead of
+45,713 and shrunk the reported deficit by about a sixth, for free and wrongly. Two stations
+(3120, 3130) are registered but have zero observations in the entire archive and are never emitted —
+a zero there would silently corrupt a GEH.
 
 ---
 
 ## 8. Open
 
-1. **The Python-vs-MOSAIC comparison is same-scenario, not same-trajectory.** MOSAIC drives its own
-   SUMO, injects `mosaic_types.add.xml`, and its `SumoAmbassador` log records no `--seed`, so the
-   realization cannot be forced to match a `freeze()`. Bounding it with the calibrated seed-stability
-   null is the best available substitute. A literal same-trajectory comparison needs either a
-   replay seam on the MOSAIC side or an exposed ambassador seed.
+1. **The Python-vs-MOSAIC comparison is same-scenario, not same-trajectory, and at the AM peak it
+   is not runnable at all.** MOSAIC drives its own SUMO, injects `mosaic_types.add.xml`, and its
+   `SumoAmbassador` log records no `--seed`, so the realization cannot be forced to match a
+   `freeze()`. At the peak there is the further obstacle that MOSAIC has no `--begin` seam — its
+   scenario declares `"duration": "300s"` over a `.sumocfg` beginning at 0, so SUMO 25200 s is seven
+   federated hours away — and the one upstream scenario covering 07:00–09:00
+   (`InTAS_urban_7_9_trainval`) needs the `omnetpp` federate, which is not installed here, and ships
+   a detector output with 0 `<interval>` rows. A literal same-trajectory comparison needs a replay
+   seam on the MOSAIC side; a peak-hour one needs that plus a warm-up seam plus OMNeT++.
 
 2. **MOSAIC does not write `true_speed` / `true_heading`** (ADR 0002), so `realism_bench`
    finite-differences its positions and its speed and lateral-discontinuity metrics are not
@@ -388,11 +506,17 @@ never emitted — a zero there would silently corrupt a GEH.
    every flow count — is low by the enforced fraction. Either state it per dataset or emit ground
    truth independently of enforcement.
 
-5. **The crossing counter over-counts `nVehContrib` by about +5%**, because it counts the front
-   crossing the loop while SUMO counts a vehicle that has completely passed it. Offsetting the gate
-   by a vehicle length would close most of it. Not done: the bias is identical for every trajectory
-   source, so it cancels in every engine-to-engine comparison, and against reality it is
-   conservative — it makes an under-producing model look better than it is.
+5. **The crossing counter's bias is now measured over a full hour and mostly removed — the residual
+   is +0.41%.** The "about +5%" from the 300 s windows was two effects stacked, and section 3 takes
+   them apart. (a) *Lane-blind cross-talk*: two roads running 0.656 m apart across the direction of
+   travel let each loop count the other's traffic; it occurs at exactly 2 of the 19,110 gate pairs
+   in the InTAS layout, both at station 1010, and `--exclusive-gates` removes it (station 1010
+   1,938 → 1,491 against SUMO's 1,491.6). (b) *Front-crossing versus completely-passed*: a
+   per-vehicle boundary term of **0.0066 excess crossings per vehicle**, which is +2.9% of a 300 s
+   count and +0.41% of an hour's. Still open: `--exclusive-gates` is not the default, because
+   turning it on would silently change every number published before it; and (b) could be closed by
+   offsetting the gate a vehicle length, which is not done because the bias is identical for every
+   trajectory source and cancels in every engine-to-engine comparison.
 
 6. **The engine's emission timestamp is one `dt` behind the SUMO time the artifact declares for the
    same state.** Positions are exact; only the label differs. Harmless for an hour-long count,

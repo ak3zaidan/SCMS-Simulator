@@ -155,6 +155,93 @@ def test_a_step_longer_than_the_index_cell_is_refused_not_guessed():
         ed.count_crossings(iter(samples), _one_gate(), cell_m=50.0, max_step_m=500.0)
 
 
+# --------------------------------------------------------------------------- #
+# two roads closer together than the loops' own strips
+# --------------------------------------------------------------------------- #
+LAT, ALONG = 0.66, 2.42     # the measured InTAS 1010_7 -> 1010_9 offset, decomposed on 1010_7's
+                            # tangent: the two roads are 2.51 m apart but only 0.66 m of that is
+                            # ACROSS the direction of travel, which is why each loop's +-1.6 m
+                            # strip covers the other road's centreline.
+
+
+def _two_close_gates(lat=LAT, along=ALONG):
+    """Two loops on DIFFERENT edges, near-parallel -- the measured InTAS station-1010 geometry.
+
+    There, edges 172515813 and 201278218#0 carry loops 2.47 m and 2.51 m apart with tangents
+    13.6 deg apart, and each counts the other road's traffic as well as its own.
+    """
+    return {"a": {"p": (0.0, 0.0), "t": (1.0, 0.0), "w": 1.6, "station": "S",
+                  "lane": "ea_0", "edge": "ea"},
+            "b": {"p": (along, lat), "t": (1.0, 0.0), "w": 1.6, "station": "S",
+                  "lane": "eb_0", "edge": "eb"}}
+
+
+def test_two_roads_closer_than_the_gate_width_each_see_the_others_traffic():
+    """The defect, stated as a test: ONE vehicle on road A trips BOTH loops, so the station doubles."""
+    gates = _two_close_gates()
+    samples = [("v", 0.0, -5.0, 0.0), ("v", 1.0, 5.0, 0.0)]      # drives road A, on its centreline
+    res = ed.count_crossings(iter(samples), gates)
+    assert res["counts"] == {"a": 1, "b": 1}, "both loops counted the same vehicle"
+
+
+def test_exclusive_gates_award_the_vehicle_to_the_loop_it_passed_closest_to():
+    gates = _two_close_gates()
+    groups = ed.build_rival_groups(gates)
+    assert set(groups) == {"a", "b"} and len(set(groups.values())) == 1
+    samples = [("v", 0.0, -5.0, 0.0), ("v", 1.0, 5.0, 0.0)]      # on A's centreline, 0.66 m from B's
+    res = ed.count_crossings(iter(samples), gates, rival_groups=groups)
+    assert res["counts"] == {"a": 1, "b": 0}
+    assert res["n_contested_awards"] == 1 and res["n_rival_groups"] == 1
+
+    gates2 = _two_close_gates()
+    s2 = [("v", 0.0, -5.0, LAT), ("v", 1.0, 5.0, LAT)]           # the same vehicle on B's centreline
+    res2 = ed.count_crossings(iter(s2), gates2, rival_groups=ed.build_rival_groups(gates2))
+    assert res2["counts"] == {"a": 0, "b": 1}
+
+
+def test_exclusive_gates_resolve_across_sample_pairs_not_just_within_one():
+    """The two loops of a group need not be crossed on the same step, so the award is deferred."""
+    gates = {"a": {"p": (0.0, 0.0), "t": (1.0, 0.0), "w": 1.6, "station": "S",
+                   "lane": "ea_0", "edge": "ea"},
+             "b": {"p": (6.0, 2.5), "t": (1.0, 0.0), "w": 1.6, "station": "S",
+                   "lane": "eb_0", "edge": "eb"}}
+    groups = ed.build_rival_groups(gates, pad_m=8.0)             # force them into one group
+    assert len(set(groups.values())) == 1
+    samples = [("v", 0.0, -2.0, 1.0), ("v", 1.0, 3.0, 1.0), ("v", 2.0, 9.0, 1.0)]
+    res = ed.count_crossings(iter(samples), gates, rival_groups=groups)
+    assert sum(res["counts"].values()) == 1, "one vehicle, one award, though it crossed two planes"
+    assert res["counts"]["a"] == 1, "it passed 1.0 m from a and 1.5 m from b"
+
+
+def test_gates_on_the_SAME_edge_are_never_rivals():
+    """Adjacent lanes of one road are already handled by capping the half-width at half a lane;
+    treating them as rivals would delete a genuine second vehicle."""
+    gates = {"a": {"p": (0.0, 0.0), "t": (1.0, 0.0), "w": 1.6, "station": "S",
+                   "lane": "e_0", "edge": "e"},
+             "b": {"p": (0.0, 2.5), "t": (1.0, 0.0), "w": 1.6, "station": "S",
+                   "lane": "e_1", "edge": "e"}}
+    assert ed.build_rival_groups(gates) == {}
+
+
+def test_rival_groups_ignore_roads_that_merely_cross():
+    """Two roads meeting at a junction are not rivals: the direction gate already separates them."""
+    gates = {"a": {"p": (0.0, 0.0), "t": (1.0, 0.0), "w": 1.6, "station": "S",
+                   "lane": "ea_0", "edge": "ea"},
+             "b": {"p": (0.0, 1.0), "t": (0.0, 1.0), "w": 1.6, "station": "S",
+                   "lane": "eb_0", "edge": "eb"}}
+    assert ed.build_rival_groups(gates) == {}
+
+
+def test_exclusive_gates_are_inert_where_no_two_roads_overlap():
+    """Default OFF, and even switched ON it must not change a layout that has no rival pair."""
+    gates = _one_gate()
+    assert ed.build_rival_groups(gates) == {}
+    samples = [("v", 0.0, -5.0, 0.0), ("v", 1.0, 5.0, 0.0)]
+    plain = ed.count_crossings(iter(samples), gates)
+    excl = ed.count_crossings(iter(samples), gates, rival_groups=ed.build_rival_groups(gates))
+    assert plain["counts"] == excl["counts"] == {"d": 1}
+
+
 def test_interleaved_vehicles_do_not_bleed_into_each_others_tracks():
     """The frozen trace is sorted by STEP, not by vehicle, so the counter must key on the vehicle."""
     samples = [("a", 0.0, -5.0, 0.0), ("b", 0.0, 5.0, 0.0),
