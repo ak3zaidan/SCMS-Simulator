@@ -156,9 +156,23 @@ public final class RxChannel {
 
     // ------------------------------------------------------------------ per-receiver state
     private final Random chanRng;
+    /**
+     * Channel-load meter. Constructed for EVERY receiver, not only when {@code SCMS_DCC=1}: the
+     * channel busy ratio is a MEASUREMENT of the scene, and a DCC-off run that reports no CBR at all
+     * cannot be compared against a DCC-on one -- the on/off delta would be a difference between a
+     * number and a blank. {@link #DCC_ENABLED} decides only whether the resulting interval floor is
+     * APPLIED to CAM generation ({@link #dccMinIntervalS}), never whether CBR is observed.
+     */
     private final Dcc dcc;
     /** Deterministic per-receiver salt for the shadowing streams: SHA-256(label|seed|unitId). */
     private final long shadowSalt;
+    /** This receiver's unit id, carried only so the per-link trace can name it. */
+    private final String unitId;
+    /**
+     * Dedicated sampling stream for {@link LinkTrace}. Seeded exactly like the shadowing streams and
+     * touched only when the trace is enabled, so switching tracing on cannot move a delivery verdict.
+     */
+    private final Random traceRng;
 
     private double chanWinStart = Double.NEGATIVE_INFINITY;
     private int chanCount;
@@ -167,6 +181,9 @@ public final class RxChannel {
     private final Map<Long, Link> links = GEOMETRIC ? new HashMap<>() : null;
     private double lastRssiDbm = Double.NaN;
     private boolean lastLos = true;
+    private double lastDistM = Double.NaN;
+    private double lastTxX = Double.NaN;
+    private double lastTxY = Double.NaN;
 
     private long sensed;
     private long delivered;
@@ -190,9 +207,11 @@ public final class RxChannel {
         // Identical seeding to the pre-Phase-2 per-app RNG, so the legacy draw sequence is unchanged.
         this.chanRng = new Random(0x9E3779B97F4A7C15L ^ (long) unitId.hashCode());
         this.shadowSalt = ScmsBackend.streamSeed("channel-shadow", unitId);
-        this.dcc = DCC_ENABLED
-                ? new Dcc(DCC_FRAME_BYTES, DCC_DATA_RATE_MBPS, DCC_PROBE_S, DCC_WINDOW_S,
-                        DCC_STATE_HOLD_S, DCC_MAC_OVERHEAD_US)
+        this.unitId = unitId;
+        this.dcc = new Dcc(DCC_FRAME_BYTES, DCC_DATA_RATE_MBPS, DCC_PROBE_S, DCC_WINDOW_S,
+                DCC_STATE_HOLD_S, DCC_MAC_OVERHEAD_US);
+        this.traceRng = LinkTrace.enabled()
+                ? new Random(ScmsBackend.streamSeed("link-trace", unitId))
                 : null;
     }
 
@@ -211,23 +230,33 @@ public final class RxChannel {
      */
     public boolean deliver(String senderDigest, double t, double selfX, double selfY, boolean haveSelf) {
         sensed++;
-        if (dcc != null) {
-            dcc.sense(t);   // CBR counts everything the PHY hears, before any decode-side drop
-        }
+        dcc.sense(t);   // CBR counts everything the PHY hears, before any decode-side drop
         lastRssiDbm = Double.NaN;
+        lastDistM = Double.NaN;
+        // Sampling decision taken FIRST and off a dedicated stream, so the trace never reorders the
+        // channel RNG and a traced run and an untraced one deliver exactly the same frames.
+        boolean trace = traceRng != null && (LinkTrace.PROB >= 1.0 || traceRng.nextDouble() < LinkTrace.PROB);
         // 1) weather attenuation (unified table; same RNG position as before)
         if (WEATHER_DROP > 0 && chanRng.nextDouble() < WEATHER_DROP) {
             droppedWeather++;
+            if (trace) {
+                LinkTrace.row(t, unitId, lastDistM, "NA", lastRssiDbm, "wx",
+                        selfX, selfY, lastTxX, lastTxY);
+            }
             return false;
         }
         // 2) obstruction. Geometry always from the sender's TRUE position (back-end ORACLE).
         // A receiver with no resolvable position of its own (haveSelf == false: an RSU the mapping
         // gave no coordinates, or a vehicle before its first mobility update) has no link geometry
         // to evaluate, so the frame passes. That is the same degradation the legacy NLOS stage
-        // already applied, and it fails OPEN — never toward using the claimed position instead.
+        // already applied, and it fails OPEN -- never toward using the claimed position instead.
         if (GEOMETRIC) {
             if (haveSelf && !geometricDeliver(senderDigest, t, selfX, selfY)) {
                 droppedGeometric++;
+                if (trace) {
+                    LinkTrace.row(t, unitId, lastDistM, lastLos ? "LOS" : "NLOSb", lastRssiDbm,
+                            "geom", selfX, selfY, lastTxX, lastTxY);
+                }
                 return false;
             }
         } else if (NLOS_INTENSITY > 0 && haveSelf) {
@@ -252,11 +281,24 @@ public final class RxChannel {
             double pDrop = Math.min(0.95, (double) (chanLoad - CHAN_CAPACITY) / CHAN_CAPACITY);
             if (chanRng.nextDouble() < pDrop) {
                 droppedCongestion++;
+                if (trace) {
+                    LinkTrace.row(t, unitId, lastDistM, linkState(), lastRssiDbm, "cong",
+                            selfX, selfY, lastTxX, lastTxY);
+                }
                 return false;
             }
         }
         delivered++;
+        if (trace) {
+            LinkTrace.row(t, unitId, lastDistM, linkState(), lastRssiDbm, "ok",
+                    selfX, selfY, lastTxX, lastTxY);
+        }
         return true;
+    }
+
+    /** LOS/NLOSb label for the trace; {@code NA} outside the geometric model, where none was taken. */
+    private String linkState() {
+        return !GEOMETRIC || Double.isNaN(lastDistM) ? "NA" : (lastLos ? "LOS" : "NLOSb");
     }
 
     /**
@@ -282,6 +324,9 @@ public final class RxChannel {
             }
         }
         double d = Math.hypot(txTrue[0] - rxX, txTrue[1] - rxY);
+        lastDistM = d;
+        lastTxX = txTrue[0];
+        lastTxY = txTrue[1];
         double pl;
         if (!URBAN) {
             pl = PathLoss.highwayLos(d, FC_GHZ);
@@ -290,7 +335,7 @@ public final class RxChannel {
         } else {
             pl = PathLoss.urbanNlos(d, FC_GHZ);
         }
-        // Keyed on (scenario seed, opaque TRUE-vehicle key, this receiver) — never on the digest, so
+        // Keyed on (scenario seed, opaque TRUE-vehicle key, this receiver) -- never on the digest, so
         // a pseudonym rotation continues the SAME shadowing process instead of resampling it.
         Link link = links.computeIfAbsent(backend.channelLinkKey(senderDigest),
                 k -> new Link(new Random(k ^ shadowSalt)));
@@ -339,7 +384,7 @@ public final class RxChannel {
      * <p>NOT yet written into {@code ma_reports}, and the reason is a trap worth recording: the
      * colluding-attacker path files reports through {@code ScmsBackend.maybeCollude} WITHOUT having
      * received a frame. If honest reports carried an RSSI and fabricated ones did not, "rssi_dbm is
-     * absent" would be a perfect, unintended oracle for a false accusation — the collusion attack
+     * absent" would be a perfect, unintended oracle for a false accusation -- the collusion attack
      * would become trivially detectable for entirely the wrong reason. Landing this field requires
      * the collusion path to synthesise a plausible RSSI first.
      */
@@ -347,7 +392,7 @@ public final class RxChannel {
         return lastRssiDbm;
     }
 
-    /** LOS state of the most recent geometric evaluation. ORACLE-derived — diagnostics and channel
+    /** LOS state of the most recent geometric evaluation. ORACLE-derived -- diagnostics and channel
      *  physics only; it must never reach a report or a feature. */
     public boolean lastLos() {
         return lastLos;
@@ -355,29 +400,34 @@ public final class RxChannel {
 
     // ------------------------------------------------------------------ DCC (transmit side)
 
-    /** The reactive-DCC CAM interval floor for this station right now, or 0 when DCC is off. */
+    /**
+     * The reactive-DCC CAM interval floor for this station right now, or 0 when DCC is off.
+     *
+     * <p>The meter runs either way -- {@link Dcc#currentMinIntervalS} is what latches the DCC state
+     * and accumulates the CBR statistics, so calling it unconditionally is what makes a DCC-off run
+     * report the same CBR observable a DCC-on run reports. Only the returned FLOOR is gated: with
+     * {@code SCMS_DCC=0} this returns 0.0 and {@code ScmsBeaconApp} keeps the bare ETSI
+     * T_GenCamMin, exactly as before.
+     */
     public double dccMinIntervalS(double t) {
-        return (dcc == null) ? 0.0 : dcc.currentMinIntervalS(t);
+        double floorS = dcc.currentMinIntervalS(t);
+        return DCC_ENABLED ? floorS : 0.0;
     }
 
     public double dccCbr() {
-        return (dcc == null) ? 0.0 : dcc.currentCbr();
+        return dcc.currentCbr();
     }
 
     public double dccRateHz() {
-        return (dcc == null) ? 0.0 : dcc.currentRateHz();
+        return dcc.currentRateHz();
     }
 
     public void dccNoteAllowed() {
-        if (dcc != null) {
-            dcc.noteAllowed();
-        }
+        dcc.noteAllowed();
     }
 
     public void dccNoteSuppressed() {
-        if (dcc != null) {
-            dcc.noteSuppressed();
-        }
+        dcc.noteSuppressed();
     }
 
     /** Push this receiver's channel counters into the back-end run totals (call at shutdown). */
@@ -385,9 +435,8 @@ public final class RxChannel {
         ScmsBackend backend = ScmsBackend.instance();
         backend.noteChannel(sensed, delivered, droppedWeather, droppedGeometric,
                 droppedCongestion, nlosbLinks,
-                dcc == null ? 0 : dcc.allowedCount(), dcc == null ? 0 : dcc.suppressedCount(),
-                dcc == null ? 0 : dcc.cbrSamples(), dcc == null ? 0.0 : dcc.cbrSum(),
-                dcc == null ? 0.0 : dcc.cbrMax());
+                dcc.allowedCount(), dcc.suppressedCount(),
+                dcc.cbrSamples(), dcc.cbrSum(), dcc.cbrMax());
         // The footprint index is a JVM singleton, so its live counters and the projection-alignment
         // verdict are global; every receiver publishes the same snapshot and the last one wins.
         BuildingIndex bi = buildings;
@@ -407,17 +456,23 @@ public final class RxChannel {
         p.put("SCMS_NLOS", NLOS_INTENSITY);
         p.put("SCMS_WEATHER_RADIO_LOSS", WEATHER_DROP);
         p.put("SCMS_DCC", DCC_ENABLED);
-        if (DCC_ENABLED) {
-            p.put("SCMS_DCC_FRAME_BYTES", DCC_FRAME_BYTES);
-            p.put("SCMS_DCC_DATA_RATE_MBPS", DCC_DATA_RATE_MBPS);
-            p.put("SCMS_DCC_PROBE_S", DCC_PROBE_S);
-            p.put("SCMS_DCC_WINDOW_S", DCC_WINDOW_S);
-            p.put("SCMS_DCC_STATE_HOLD_S", DCC_STATE_HOLD_S);
-            p.put("SCMS_DCC_MAC_OVERHEAD_US", DCC_MAC_OVERHEAD_US);
-            p.put("dcc_frame_airtime_s", round6(Dcc.airtimeSeconds(DCC_FRAME_BYTES, DCC_DATA_RATE_MBPS)
-                    + DCC_MAC_OVERHEAD_US * 1e-6));
-            p.put("dcc_reference", "ETSI TS 102 687 reactive DCC (refdata/etsi_cam_dcc.json,"
-                    + " refdata/phy_80211p_profile.json)");
+        // The CBR meter's constants are published whether or not DCC acts on them: with SCMS_DCC=0
+        // counts.dcc still carries a measured cbr_mean/cbr_max, and a reader has to be able to see
+        // the airtime and window that number was computed with.
+        p.put("SCMS_DCC_FRAME_BYTES", DCC_FRAME_BYTES);
+        p.put("SCMS_DCC_DATA_RATE_MBPS", DCC_DATA_RATE_MBPS);
+        p.put("SCMS_DCC_PROBE_S", DCC_PROBE_S);
+        p.put("SCMS_DCC_WINDOW_S", DCC_WINDOW_S);
+        p.put("SCMS_DCC_STATE_HOLD_S", DCC_STATE_HOLD_S);
+        p.put("SCMS_DCC_MAC_OVERHEAD_US", DCC_MAC_OVERHEAD_US);
+        p.put("dcc_frame_airtime_s", round6(Dcc.airtimeSeconds(DCC_FRAME_BYTES, DCC_DATA_RATE_MBPS)
+                + DCC_MAC_OVERHEAD_US * 1e-6));
+        p.put("dcc_reference", "ETSI TS 102 687 reactive DCC (refdata/etsi_cam_dcc.json,"
+                + " refdata/phy_80211p_profile.json)"
+                + (DCC_ENABLED ? "" : " -- MEASURED ONLY, the rate floor is not applied"));
+        if (LinkTrace.enabled()) {
+            p.put("SCMS_LINK_TRACE", LinkTrace.path());
+            p.put("SCMS_LINK_TRACE_PROB", LinkTrace.PROB);
         }
         if (GEOMETRIC) {
             p.put("SCMS_BUILDINGS", USE_BUILDINGS);
