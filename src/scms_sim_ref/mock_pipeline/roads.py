@@ -150,6 +150,41 @@ class Trip:
                 return self.nodes[k], self.cum[k] - s
         return None, math.inf
 
+    def next_movement(self, s: float):
+        """The next route intersection ahead of `s` AS A MOVEMENT:
+        ``((x, y), distance, from_xy, to_xy)``, or ``(None, inf, None, None)``.
+
+        `next_node` answers "which junction is next"; a REAL traffic-light program answers a
+        different question -- "what colour is MY movement", where the movement is the triple
+        (where I come from, this junction, where I am going). At a junction with a turn phase those
+        are genuinely different answers for a third of the cycle: at InTAS's
+        `cluster_13876325_281116670` the west approach's through movement is green for 27 s of the
+        90 s cycle and its left turn for a different 6 s, and they are never green together.
+
+        `from_xy` / `to_xy` are the PREVIOUS and NEXT true intersections on the route -- the nearest
+        non-None `nodes` entries either side of the junction -- so they are the same coordinates
+        `signals.SignalPlan` was keyed on. Either can be None at the ends of a route (the trip
+        starts or finishes at the junction), and the caller degrades to the approach's primary
+        movement exactly as `SignalPlan.links` documents.
+
+        Without `nodes` (the default, non-directed path) the driven vertices ARE the junctions, so
+        the neighbouring waypoints are used. Pure geometry, no rng, and nothing calls it unless a
+        signal plan is attached."""
+        nodes = self.nodes
+        cum = self.cum
+        for k in range(1, len(cum)):
+            if cum[k] <= s + 1e-6:
+                continue
+            if nodes is None:
+                nxt = self.wp[k + 1] if k + 1 < len(self.wp) else None
+                return self.wp[k], cum[k] - s, self.wp[k - 1], nxt
+            if nodes[k] is None:
+                continue
+            frm = next((nodes[j] for j in range(k - 1, -1, -1) if nodes[j] is not None), None)
+            to = next((nodes[j] for j in range(k + 1, len(nodes)) if nodes[j] is not None), None)
+            return nodes[k], cum[k] - s, frm, to
+        return None, math.inf, None, None
+
     def next_turn(self, s: float) -> tuple[float, float]:
         """The next interior vertex ahead where the route BENDS: (distance, bend_angle[deg]).
 
@@ -246,6 +281,60 @@ class _LaneFrameMixin:
     _lane_w = 3.5
     _side = -1.0                         # right-hand traffic
     _lanes_per_dir = 1
+    #: OPT-IN real `<tlLogic>` programs (see `set_signal_plan`). A CLASS attribute so every
+    #: topology answers `signal_char` uniformly without a getattr at the call site, and so a map
+    #: that never opts in allocates nothing and behaves exactly as it always did. Grid and ring maps
+    #: are procedural and have no real programs; only an imported city ever attaches one.
+    signal_plan = None
+
+    # ------------------------------------------------------------------ #
+    # OPT-IN: REAL traffic-light programs
+    # ------------------------------------------------------------------ #
+    def set_signal_plan(self, plan) -> dict:
+        """Attach the map's REAL `<tlLogic>` programs (a `signals.SignalPlan`), or None to drop them.
+
+        WHY THIS EXISTS. `node_phase` 2-colours the graph and hands the caller a 0/1 so it can split
+        one fixed cycle between "mostly E-W" and "mostly N-S". That model has one cycle length for
+        the whole city, no yellow, no turn phase, no offset, and no idea that the MOVEMENT decides
+        the colour -- and `run.py` applies it to every junction or to none. The InTAS net ships 98
+        real Ingolstadt programs: 98 of its 109 signalised junctions, cycles 77-116 s (median 90), 3
+        to 11 phases each, 1489 green characters of which 303 are permissive 'g', and every one of
+        them carrying yellow. Over one 90 s cycle across all 778 imported movements the real
+        programs show G 34.0 % / g 8.5 % / y 4.3 % / r 53.2 %, against the 2-colouring's flat 50/50
+        with no yellow at all.
+
+        A plan answers by COORDINATE, which is what makes it safe here: node indices do not survive
+        `largest_strong_component` (it remaps and returns no remap), coordinates do. `_coord_idx`
+        keys on the same exact float pair.
+
+        Returns the plan's own stats dict (empty when clearing). Nothing else changes: no node, no
+        edge, no route and no rng."""
+        self.signal_plan = plan
+        return dict(getattr(plan, "stats", {}) or {}) if plan is not None else {}
+
+    def signal_char(self, node, from_xy=None, to_xy=None, t: float = 0.0):
+        """The raw SUMO state character ('G'/'g'/'y'/'r'/...) for the movement
+        `from_xy -> node -> to_xy` at time `t`, or **None**.
+
+        None is the whole compatibility story: it means "no real program governs this", and the
+        caller must fall back to whatever it did before -- `node_phase` if it is running the toy
+        signals, gap acceptance if it is not. It is returned for an unsignalised junction, for a
+        junction whose program was not imported, for an approach the program does not control, and
+        for every map that never called `set_signal_plan` (which is every map by default).
+
+        Prefer the character over `signal_colour` wherever the answer feeds a yield decision: 'G'
+        owns the junction, 'g' is a green that must still give way."""
+        plan = self.signal_plan
+        if plan is None or node is None:
+            return None
+        return plan.char(node, from_xy, to_xy, t)
+
+    def signal_colour(self, node, from_xy=None, to_xy=None, t: float = 0.0):
+        """`"green"`/`"yellow"`/`"red"`/`"off"` for that movement, or None. See `signal_char`."""
+        plan = self.signal_plan
+        if plan is None or node is None:
+            return None
+        return plan.colour(node, from_xy, to_xy, t)
 
     def enable_directed_lanes(self, lane_width_m: float = 3.5, drive_side: str = "right",
                               lanes_per_dir: int = 1):
@@ -1109,6 +1198,9 @@ class CustomNetwork(_LaneFrameMixin):
         self._surface: dict = {}               # provenance counts, reported in the manifest
         self._phase: dict | None = None        # lazily-built deterministic node 2-colouring
         self._coord_idx: dict | None = None    # lazily-built coord -> node index (for node_phase)
+        # NB the OPT-IN real-signal layer (`set_signal_plan` / `signal_char`) lives on
+        # `_LaneFrameMixin` as a CLASS attribute defaulting to None, so nothing is allocated here
+        # and an un-opted map runs exactly the code it always ran.
 
     # ------------------------------------------------------------------ #
     # OPT-IN: the drivable SURFACE `dist_to_road` measures against
@@ -1262,7 +1354,12 @@ class CustomNetwork(_LaneFrameMixin):
     def node_phase(self, node) -> int:
         """Deterministic 0/1 signal phase for the intersection at (x, y) = `node` (a Trip waypoint),
         from the graph 2-colouring. Adjacent intersections alternate, so signals have a coherent
-        phase on any topology instead of the meaningless grid-coordinate arithmetic used before."""
+        phase on any topology instead of the meaningless grid-coordinate arithmetic used before.
+
+        THE TOY MODEL, and it is the one the realism harness fails on. It knows nothing about
+        movements, yellow, turn phases or offsets, and `run.py` applies it to every junction on the
+        map or to none. `set_signal_plan` / `signal_char` are the real-program path; this stays the
+        default and stays byte-identical."""
         if self._phase is None:
             self._phase = self._colouring()
         if self._coord_idx is None:

@@ -33,7 +33,11 @@ carrying that direction's lane count, the posted speed and the edge's curve geom
 `signal_nodes`. With ``--signals`` it also carries ``signal_programs``: the REAL ``<tlLogic>`` phase
 programs -- state strings, phase durations, minDur/maxDur, offset -- plus the
 ``(from junction, to junction) -> phase-index`` mapping that makes a program usable by a vehicle.
-See ``signals.py``; MEASURED on InTAS, 98 programs over 98 junctions, cycle median 90 s.
+See ``signals.py``. MEASURED end to end on InTAS with ``--signals --strong``: 98 programs on 98
+graph junctions (of 109 typed ``traffic_light``; the other 11 are pedestrian clusters with no
+``<tlLogic>`` at all), 1030 of 1042 controlled connections mapped to a movement, 778 movements over
+330 approaches, 1015 of 1032 state columns addressable, 0 junction-coordinate collisions, cycle
+median 90 s.
 `roads.edges_from_directed` turns those records into engine edge specs, so a
 netconvert import loads into `CustomNetwork` directly. Two conventions are load-bearing there:
 `shape` holds INTERMEDIATE vertices only (junction coordinates implied), and the two directions of
@@ -573,6 +577,10 @@ def _extract_signals(net, by_id: dict, eidx: dict, remap: dict, old_to_new_dir: 
     st["signal_nodes_with_program"] = len(placed & set(sig))
     st["program_nodes_not_typed_traffic_light"] = len(placed - set(sig))
     st["coverage_of_signal_nodes"] = (round(len(placed & set(sig)) / len(sig), 4) if sig else None)
+    # MEASURED on InTAS (--signals --strong --undirected-shapes): junctions 98, links_total 1042,
+    # links_mapped 1030, links_unmapped 10 (arms outside the strongly connected component),
+    # links_self_loop 2, state_columns 1032, state_columns_mapped 1015, movements 778,
+    # approaches_merged 1, joined_tls 0, coverage_of_signal_nodes 0.8991.
     return records, st
 
 

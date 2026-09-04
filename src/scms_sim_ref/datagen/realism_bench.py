@@ -8,10 +8,43 @@ read-only over a dataset directory, deterministic (no timestamps, no RNG), JSON 
 
     python -m scms_sim_ref.datagen.realism_bench <dataset_dir> [--refdata <dir>] [--json out.json]
 
-TRAFFIC panel (from ``ground_truth/gt_emissions_sample.jsonl``, ideally at ``emit_sample_prob=1.0``):
-per-vehicle finite-difference speeds and accelerations, time-headway distributions per spatial cell
-(an edge proxy -- the dataset schema carries no edge id), an Edie-generalised fundamental diagram
-over space-time cells, and two hard sim-health counters (teleports, vehicle overlaps).
+TRAFFIC panel: per-vehicle finite-difference speeds and accelerations, time-headway distributions
+per spatial cell (an edge proxy -- the dataset schema carries no edge id), an Edie-generalised
+fundamental diagram over space-time cells, and two hard sim-health counters (teleports, vehicle
+overlaps).
+
+**THE TRAFFIC PANEL MUST NOT BE READ OFF A STREAM THAT ENFORCEMENT TRUNCATES.**
+``ground_truth/gt_emissions_sample.jsonl`` is written INSIDE the engine's broadcast pre-pass, whose
+first statement is ``if enforced(tx, t): continue`` -- so a revoked vehicle's kinematic record ENDS
+at revocation while the vehicle keeps driving. That is exactly right for a detection dataset and
+exactly wrong for a traffic measurement, and the error is not a constant: it GROWS with run length
+and with the misbehaviour authority's false-positive rate. Measured on the InTAS AM peak hour --
+9,143 of 14,896 vehicles revoked (61.38%), 5,949,526 of 13,589,568 vehicle-steps surviving (43.78%),
+detection precision 0.308 so most of those revocations were BENIGN. At 60-300 s the same term costs
+-9% to -19% of the vehicle-steps, which is why it was invisible at the durations and densities this
+panel was previously measured at.
+
+``resolve_mobility_source`` therefore picks the traffic panel's input in this order, and NAMES the
+choice in the scorecard:
+
+  1. ``ground_truth/gt_mobility_oracle.jsonl`` -- the engine's opt-in un-enforced record
+     (``PipelineConfig.emit_mobility_oracle`` / ``--emit-mobility-oracle``): every active station,
+     every step, whatever the CRL says. Unbiased by construction, survivorship 1.000.
+  2. a frozen SUMO trace, when the caller ASKS for one (``--sumo-trace``, or ``--traffic-source
+     trace`` to use the path ``manifest["config"]["sumo_trace"]`` pins) -- for a ``sumo_replay``
+     dataset this IS the mobility, and it lets an already-generated dataset be re-measured without a
+     re-run. Never picked up implicitly: an absolute path that may or may not exist on this host
+     must not decide what a scorecard says.
+  3. ``gt_emissions_sample.jsonl`` -- the truncated fallback, marked ``truncated=True``. Its
+     survivorship is published beside every metric read from it, and the density-dependent metrics
+     (headways, fundamental diagram, overlaps) degrade to ``na`` below ``SURVIVORSHIP_MIN_FRAC``
+     rather than reporting a confidently wrong number.
+
+The unbiased record is ORACLE and stays ORACLE: it lives under ``ground_truth/``, carries
+``_visibility=ORACLE``, is withheld from an isolated third-party detector exactly like the answer
+key, and this module -- which never writes into ``ma/`` or ``ml/`` and emits only aggregates -- is
+the only consumer. The COMM panel deliberately keeps reading the BROADCAST stream: what the MA could
+hear is the honest input to a reception measurement.
 
 KINEMATIC SOURCE (ADR 0002). Where the emission record carries the simulator's own ``true_speed`` /
 ``true_heading``, those are used directly and the scorecard says so in ``kinematics_source`` (and in
@@ -67,6 +100,7 @@ import argparse
 import json
 import math
 import os
+import sys
 
 import numpy as np
 
@@ -105,6 +139,38 @@ MAX_TIME_BUCKETS = 240     # cap on co-presence snapshots examined (deterministi
 MAX_VEH_PER_BUCKET = 400   # cap on vehicles per snapshot (deterministic: lowest vehicle ids first)
 MOSAIC_ART_MAX_M = 1000.0  # ScmsBeaconApp ART_MAX_M default (env SCMS_ART_MAX_M), MOSAIC layer
 FULL_TRACE_MIN_PROB = 0.999   # emit_sample_prob at/above this counts as a full trace
+# --- traffic-panel mobility source + survivorship (see the module docstring) ---------------------
+EMISSIONS_REL = "ground_truth/gt_emissions_sample.jsonl"      # MA-hearable; ENFORCEMENT-TRUNCATED
+MOBILITY_ORACLE_REL = "ground_truth/gt_mobility_oracle.jsonl"  # un-enforced; the unbiased source
+LINKAGE_REVOCATION_REL = "ground_truth/gt_linkage_revocation.jsonl"
+GT_VEHICLE_REL = "ground_truth/gt_vehicle.jsonl"
+#: Below this fraction of surviving vehicle-steps a DENSITY-DEPENDENT metric read from the truncated
+#: stream is not a measurement of the traffic and is published as ``na``. 0.90 is deliberately
+#: generous: the peak hour sits at 0.4378 and the 300 s grid reference run at 0.8126, so the gate
+#: separates "a few vehicles went quiet" from "most of the traffic is missing" rather than trying to
+#: certify a tolerance nobody has calibrated.
+SURVIVORSHIP_MIN_FRAC = 0.90
+#: The metrics a missing vehicle changes DIRECTLY -- it removes a leader, a follower, a cell
+#: occupancy or an overlap partner -- so they are gated on survivorship. The per-sample
+#: distributional metrics (speed quantiles, acceleration fractions, lateral discontinuities per
+#: vehicle-km, moving fraction) are distorted only through WHICH steps survive; they carry the
+#: survivorship number but are not withheld, because the selection effect is second order and
+#: measurable (see docs/realism/TRAFFIC-PANEL-SURVIVORSHIP.md).
+SURVIVORSHIP_GATED_METRICS = (
+    "traffic.headway_p50_s", "traffic.headway_below_floor_frac",
+    "traffic.headway_ks_shifted_exponential", "traffic.fd_capacity_veh_h_lane",
+    "traffic.fd_backward_wave_speed_kmh", "traffic.overlap_events",
+)
+#: ... of which these are ONE-SIDED: truncation can only REMOVE vehicles, so it can only DECREASE a
+#: co-presence count. The truncated value is therefore a valid LOWER BOUND, and a value that already
+#: breaches a max-bound reference is a real breach that more traffic can only make worse. Withholding
+#: it would disarm a HARD CI gate on exactly the datasets that most need it (measured: the peak hour
+#: reads 28 overlaps truncated against 169 unbiased -- the truncated number is wrong, but it is not
+#: wrong about the failure). A PASS from the same number is worthless and is still withheld.
+SURVIVORSHIP_LOWER_BOUND_METRICS = ("traffic.overlap_events",)
+#: SUMO trace artifact tag (``mock_pipeline.sumo_trace.TRACE_FORMAT``), duplicated rather than
+#: imported so this module keeps its "numpy only, read-only" dependency contract.
+TRACE_FORMAT = "scms-sumo-trace/1"
 # --- ADR 0002: true speed / heading in the ground-truth record (consumed WHEN PRESENT) -----------
 GT_SPEED_FIELD = "true_speed"      # ORACLE scalar speed at emission time, m/s
 GT_HEADING_FIELD = "true_heading"  # ORACLE heading at emission time; the convention is DETECTED
@@ -327,12 +393,220 @@ def probe_dataset(dataset_dir: str) -> dict:
         "art_max_m": art_max_m,
         "radio_range_m": radio_range_m,
         "art_censored": art_censored,
+        # The replayed-mobility pin, so `resolve_mobility_source` can find the frozen trace a
+        # sumo_replay dataset was driven from without being told where it is. A path, not data --
+        # the trace is only READ, and only when it is still on disk.
+        "config": {"sumo_trace": cfg.get("sumo_trace"),
+                   "sumo_trace_sha256": cfg.get("sumo_trace_sha256"),
+                   "mobility_source": cfg.get("mobility_source"),
+                   "emit_mobility_oracle": bool(cfg.get("emit_mobility_oracle", False)),
+                   "duration_s": cfg.get("duration_s")},
         "has_emissions": os.path.exists(
             os.path.join(dataset_dir, "ground_truth", "gt_emissions_sample.jsonl")),
+        "has_mobility_oracle": os.path.exists(
+            os.path.join(dataset_dir, "ground_truth", "gt_mobility_oracle.jsonl")),
         "has_reports": os.path.exists(os.path.join(dataset_dir, "ma", "ma_reports.jsonl")),
         "has_report_labels": os.path.exists(
             os.path.join(dataset_dir, "ground_truth", "gt_report_labels.jsonl")),
     }
+
+
+# ================================================================================================
+# the traffic panel's MOBILITY SOURCE, and how much of the traffic it kept
+# ================================================================================================
+def read_sumo_trace(path: str, *, t0: float = 0.0) -> list[dict]:
+    """Read a frozen ``scms-sumo-trace/1`` artifact into emission-shaped rows.
+
+    For a ``mobility_source="sumo_replay"`` dataset this file IS the mobility -- the adapter is
+    measured bit-exact against it (max |dx|,|dy| = 0.000 m over 709,454 samples at 300 s, position
+    and speed match fraction 1.000 over 5,949,526 at the peak hour) -- and unlike the emission
+    stream it has never met the SCMS layer. It is therefore the unbiased source for an
+    ALREADY-GENERATED dataset, which is what makes an hour-long run re-measurable in minutes
+    instead of the ~2 h a re-run costs.
+
+    Two conversions, both load-bearing:
+
+      * **time.** The artifact's step *k* is SUMO time ``step0_sim_time + k*dt``; the engine labels
+        the same state ``t = k*dt``. Rows are stamped with the ENGINE's label (plus ``t0``) so a
+        trace-sourced panel and an emission-sourced one are directly comparable.
+      * **heading.** The artifact carries SUMO's convention (degrees CLOCKWISE from North); the
+        engine's is degrees counter-clockwise from East. ``(90 - angle) % 360`` converts it, which
+        is the same mapping ``HEADING_CONVENTIONS["deg_cw_from_north"]`` applies -- so the panel's
+        own convention detector independently re-confirms it on the resulting rows.
+
+    Vehicle ids are the trace's own SUMO ids (one interned string per vehicle, so a multi-million
+    row artifact costs one id object per trajectory rather than one per sample).
+    """
+    rows: list[dict] = []
+    dt = 1.0
+    names: dict[int, str] = {}
+    with open(path, encoding="utf-8") as fh:
+        head = fh.readline().strip()
+        if head != f"#{TRACE_FORMAT}":
+            raise ValueError(f"{path}: not a {TRACE_FORMAT} artifact (first line {head!r})")
+        for line in fh:
+            if not line:
+                continue
+            c = line[0]
+            if c == "#":
+                if line.startswith("#meta "):
+                    dt = float(json.loads(line[6:]).get("dt", 1.0) or 1.0)
+                continue
+            if c == "V":
+                p = line.split()
+                names[int(p[1])] = sys.intern(p[2])
+                continue
+            p = line.split()
+            if len(p) < 6:
+                continue
+            idx = int(p[1])
+            rows.append({
+                "t": round(t0 + int(p[0]) * dt, 6),
+                "true_vehicle_id": names.get(idx, f"trace_{idx}"),
+                "true_x": float(p[2]), "true_y": float(p[3]),
+                "true_speed": float(p[4]),
+                "true_heading": (90.0 - float(p[5])) % 360.0,
+            })
+    return rows
+
+
+def _manifest_survivorship(dataset_dir: str) -> dict | None:
+    """``manifest["counts"]["mobility_survivorship"]`` -- the engine's own step-loop tallies.
+
+    Stamped by every run since the survivorship change (``run._survivorship_block``) and outside
+    ``data_digest`` by construction, so it is present without having re-pinned anything. It is the
+    ONLY exact denominator a truncated dataset can carry: a stream that stops at revocation cannot
+    report what it did not record.
+    """
+    try:
+        with open(os.path.join(dataset_dir, "manifest.json"), encoding="utf-8") as fh:
+            blk = (json.load(fh).get("counts") or {}).get("mobility_survivorship")
+    except (OSError, ValueError):
+        return None
+    return blk if isinstance(blk, dict) else None
+
+
+def _count_lines(path: str) -> int:
+    n = 0
+    try:
+        with open(path, "rb") as fh:
+            for _ in fh:
+                n += 1
+    except OSError:
+        return 0
+    return n
+
+
+def resolve_mobility_source(dataset_dir: str, probe: dict, *, prefer: str = "auto",
+                            sumo_trace: str | None = None) -> dict:
+    """Choose the traffic panel's input and SAY WHICH ONE IT IS.
+
+    Returns ``{"source", "path", "rows", "truncated", "full_record", "note", "candidates"}``.
+    ``truncated=True`` means the rows came from the broadcast stream and stop at revocation; the
+    panel then publishes survivorship beside every metric and withholds the density-dependent ones
+    below ``SURVIVORSHIP_MIN_FRAC``.
+
+    ``prefer`` is ``auto`` (oracle, then trace, then emissions), or one of ``oracle`` / ``trace`` /
+    ``emissions`` to force a source -- forcing one that is not available is an error the caller
+    sees, not a silent fallback, because "which stream did this number come from" is exactly the
+    question this whole mechanism exists to answer.
+
+    **The trace is never picked up implicitly.** `manifest["config"]["sumo_trace"]` is an absolute
+    path on whatever machine froze it, so honouring it under ``auto`` would make one dataset score
+    differently on two hosts depending on whether that file happens to still be there -- a
+    host-dependent scorecard, which breaks this module's determinism contract. It is therefore used
+    only when the caller asks: ``sumo_trace=...`` names one directly, and ``prefer="trace"`` falls
+    back to the manifest's pin.
+    """
+    orc = os.path.join(dataset_dir, MOBILITY_ORACLE_REL)
+    emi = os.path.join(dataset_dir, EMISSIONS_REL)
+    cfg_trace = str((probe.get("config") or {}).get("sumo_trace") or "")
+    trace = sumo_trace or (cfg_trace if prefer == "trace" else "")
+    cands = {"oracle": orc if os.path.isfile(orc) else None,
+             "trace": trace if trace and os.path.isfile(trace) else None,
+             "emissions": emi if os.path.isfile(emi) else None}
+    order = ("oracle", "trace", "emissions") if prefer in ("auto", "") else (prefer,)
+    for kind in order:
+        p = cands.get(kind)
+        if not p:
+            continue
+        if kind == "trace":
+            rows = read_sumo_trace(p)
+            note = ("frozen SUMO trace: the mobility the replay reproduces bit-exactly, and it "
+                    "never met the SCMS layer")
+        else:
+            rows = _jsonl(p)
+            note = ("un-enforced ORACLE mobility record: every active station, every step, "
+                    "regardless of revocation" if kind == "oracle" else
+                    "BROADCAST emission stream: TRUNCATED at revocation -- a traffic metric read "
+                    "from it is low by the enforced fraction")
+        return {"source": kind, "path": p, "rows": rows, "truncated": kind == "emissions",
+                "full_record": kind != "emissions", "note": note,
+                "candidates": {k: bool(v) for k, v in cands.items()}}
+    if prefer not in ("auto", ""):
+        raise FileNotFoundError(
+            f"--traffic-source {prefer} requested but not available in {dataset_dir} "
+            f"(available: {sorted(k for k, v in cands.items() if v) or 'none'})")
+    return {"source": "none", "path": None, "rows": [], "truncated": True, "full_record": False,
+            "note": "no mobility record found", "candidates": {k: bool(v) for k, v in cands.items()}}
+
+
+def survivorship(dataset_dir: str, src: dict) -> dict:
+    """How much of the SIMULATED mobility the panel's input actually contains.
+
+    Three tiers, and the tier is always named in ``basis``:
+
+      * ``full_record`` -- the source is the un-enforced oracle stream or the frozen trace, so the
+        fraction is 1.0 by construction;
+      * ``manifest_counts`` -- the engine's own step-loop tallies (exact);
+      * ``unmeasurable`` -- an older dataset with neither. The revoked-vehicle fraction is still
+        exact (it is two file lengths), but the vehicle-STEP fraction is not recoverable, and the
+        obvious in-dataset estimator is measurably biased: never-revoked vehicles are systematically
+        SHORT-trip vehicles, because exposure is what earns a false positive. Measured on the
+        reference run, revoked vehicles average an 82.3 s simulated span against 68.2 s for the
+        never-revoked; on the peak hour the naive estimate reads 0.71 against a true 0.4378. So this
+        tier reports ``None`` and says why instead of publishing a number that flatters the dataset.
+    """
+    blk = _manifest_survivorship(dataset_dir) or {}
+    n_veh = int(blk.get("vehicles") or 0) or _count_lines(os.path.join(dataset_dir, GT_VEHICLE_REL))
+    n_rev = (int(blk["vehicles_revoked"]) if blk.get("vehicles_revoked") is not None
+             else _count_lines(os.path.join(dataset_dir, LINKAGE_REVOCATION_REL)))
+    out = {
+        "mobility_source": src.get("source"),
+        "vehicles": n_veh or None,
+        "vehicles_revoked": n_rev or (0 if n_veh else None),
+        "revoked_vehicle_frac": (round(n_rev / n_veh, 6) if n_veh else None),
+        "vehicle_steps_simulated": blk.get("vehicle_steps_simulated"),
+        "vehicle_steps_broadcast": blk.get("vehicle_steps_broadcast"),
+        "vehicle_steps_surviving_enforcement": None,
+        "vehicle_steps_survival_frac": None,
+        "mean_record_span_s_revoked": blk.get("mean_record_span_s_revoked"),
+        "mean_record_span_s_never_revoked": blk.get("mean_record_span_s_never_revoked"),
+        "mean_simulated_span_s_revoked": blk.get("mean_simulated_span_s_revoked"),
+        "mean_simulated_span_s_never_revoked": blk.get("mean_simulated_span_s_never_revoked"),
+        "basis": None, "note": None,
+    }
+    rev, ok = out["mean_record_span_s_revoked"], out["mean_record_span_s_never_revoked"]
+    out["record_span_truncation_ratio"] = (round(rev / ok, 6) if (rev and ok) else None)
+    if src.get("full_record"):
+        out["vehicle_steps_surviving_enforcement"] = len(src.get("rows") or []) or None
+        out["vehicle_steps_survival_frac"] = 1.0
+        out["basis"] = "full_record"
+        out["note"] = ("the traffic panel reads the un-enforced record, so nothing enforcement did "
+                       "is in these numbers; survivorship is 1.0 by construction")
+    elif blk.get("vehicle_steps_survival_frac") is not None:
+        out["vehicle_steps_surviving_enforcement"] = blk.get("vehicle_steps_broadcast")
+        out["vehicle_steps_survival_frac"] = float(blk["vehicle_steps_survival_frac"])
+        out["basis"] = "manifest_counts"
+        out["note"] = ("broadcast vehicle-steps over SIMULATED vehicle-steps, tallied in the "
+                       "engine's step loop (manifest.counts.mobility_survivorship)")
+    else:
+        out["basis"] = "unmeasurable"
+        out["note"] = ("this dataset predates the survivorship tallies and carries no un-enforced "
+                       "record, so the surviving vehicle-STEP fraction is not recoverable from it; "
+                       "re-run with emit_mobility_oracle=true, or point --sumo-trace at the frozen "
+                       "trace. The revoked-vehicle fraction beside it is still exact")
+    return out
 
 
 # ================================================================================================
@@ -1249,9 +1523,106 @@ def _wave_speed_kmh(fd: dict) -> tuple[float | None, int]:
 
 def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
                   fd_cell_m: float = FD_CELL_M, fd_window_s: float = FD_WINDOW_S,
-                  regime: str | None = None, gt: dict | None = None) -> list[dict]:
+                  regime: str | None = None, gt: dict | None = None,
+                  src: dict | None = None, surv: dict | None = None) -> list[dict]:
     P = "traffic"
     out: list[dict] = []
+    # WHICH STREAM THESE NUMBERS CAME FROM. `emissions` is whatever `resolve_mobility_source`
+    # picked -- the un-enforced oracle record, a frozen SUMO trace, or (marked truncated) the
+    # broadcast stream. A caller that passes neither gets the historical behaviour, which is the
+    # truncated one, and it is LABELLED as such rather than assumed to be traffic.
+    src = src or {"source": "emissions", "truncated": True, "full_record": False,
+                  "note": "caller supplied rows directly; provenance unknown, assumed broadcast"}
+    surv = surv or {"basis": "unmeasurable", "vehicle_steps_survival_frac": None,
+                    "revoked_vehicle_frac": None}
+    # A complete record is a complete record whatever `emit_sample_prob` was: the oracle stream and
+    # the trace are written per STEP, not per sampled message, so the sub-sampling caveat that
+    # gates headways and the fundamental diagram does not apply to them.
+    probe = dict(probe)
+    if src.get("full_record"):
+        probe["full_trace"] = True
+    surv_frac = surv.get("vehicle_steps_survival_frac")
+    # The one place the degradation rule lives. A density-dependent metric read from a stream that
+    # lost more than 1 - SURVIVORSHIP_MIN_FRAC of the traffic is not a measurement of the traffic;
+    # publishing it as `na` with the measured fraction is strictly more informative than publishing
+    # a confidently wrong number, which is what this panel did before.
+    rev_frac = surv.get("revoked_vehicle_frac")
+    if not src.get("truncated"):
+        surv_na = None
+    elif surv_frac is not None:
+        surv_na = (
+            f"the traffic panel's input is {src['source']}, which kept {surv_frac:.4f} of the "
+            f"simulated vehicle-steps (below the {SURVIVORSHIP_MIN_FRAC:g} floor): a revoked "
+            f"vehicle stops broadcasting, so this metric would be low by the enforced fraction. "
+            f"Re-run with emit_mobility_oracle=true, or pass --sumo-trace"
+            if surv_frac < SURVIVORSHIP_MIN_FRAC else None)
+    elif rev_frac is not None and (1.0 - rev_frac) < SURVIVORSHIP_MIN_FRAC:
+        # A LEGACY dataset: truncated input, and it carries neither the un-enforced record nor the
+        # step-loop tallies, so the exact surviving fraction is gone. What it does carry is the
+        # revoked-vehicle fraction, and `1 - revoked` is the standing-in PROXY -- the survivorship a
+        # run would have if every revoked vehicle were silenced the instant it spawned. It is not a
+        # bound in either direction (measured: it reads 0.386 against a true 0.438 on the InTAS peak
+        # hour, and 0.919 against 0.908 on the 300 s replay), so it is used ONLY to decide whether
+        # to withhold, never published as a number. Withholding on it is the conservative choice and
+        # the whole point of the finding: a legacy peak-hour dataset must not go on quietly
+        # publishing fd_capacity 763.6 when the traffic says 1130.0.
+        surv_na = (
+            f"the traffic panel's input is {src['source']} and its surviving vehicle-step fraction "
+            f"is NOT RECOVERABLE from this dataset. What is known is that the misbehaviour "
+            f"authority revoked {rev_frac:.4f} of the vehicles, each of which stops broadcasting "
+            f"at that instant, putting the 1-revoked proxy at {1.0 - rev_frac:.4f} -- below the "
+            f"{SURVIVORSHIP_MIN_FRAC:g} floor. The proxy is an ORDER OF MAGNITUDE CHECK, not a "
+            f"bound (it reads 0.386 against a true 0.438 on the InTAS peak hour), and it is used "
+            f"only to withhold, never published. Re-run with emit_mobility_oracle=true, or pass "
+            f"--sumo-trace, to measure this instead of withholding it")
+    else:
+        surv_na = None
+    src_detail = {"mobility_source": src.get("source"),
+                  "mobility_source_truncated": bool(src.get("truncated")),
+                  "vehicle_steps_survival_frac": surv_frac,
+                  "survivorship_basis": surv.get("basis")}
+    _src_name = src.get("path") or EMISSIONS_REL
+
+    # ---- survivorship, as metrics rather than as a footnote --------------------------------------
+    out.append(_metric(
+        "traffic.survivorship_vehicle_steps_frac", P,
+        # ENFORCEMENT only. `emit_sample_prob` sub-sampling is a separate, already-handled loss
+        # (`probe["full_trace"]` / the `thin` reason), and folding the two together would
+        # double-count one of them and blur which mechanism a low number is reporting.
+        "Vehicle-steps surviving SCMS enforcement, over vehicle-steps simulated",
+        surv_frac, "fraction", surv.get("vehicle_steps_simulated"),
+        ({"ref_id": "internal.mobility_survivorship_min", "unit": "fraction",
+          "min": SURVIVORSHIP_MIN_FRAC, "confidence": "engine invariant",
+          "cite": "internal integrity gate: SCMS enforcement truncates gt_emissions_sample.jsonl "
+                  "at revocation (docs/realism/TRAFFIC-PANEL-SURVIVORSHIP.md); a traffic metric "
+                  "read below this fraction measures enforcement, not traffic",
+          "source": "measured in the engine's step loop (manifest.counts.mobility_survivorship)"}
+         if surv_frac is not None else None),
+        SOFT,
+        reason=(None if surv_frac is not None else surv.get("note")),
+        extra={**src_detail, **{k: v for k, v in surv.items()
+                                if k not in ("basis", "note", "mobility_source")},
+               "survivorship_note": surv.get("note")}))
+    out.append(_metric(
+        "traffic.revoked_vehicle_frac", P,
+        "Vehicles the misbehaviour authority revoked (each stops broadcasting at that instant)",
+        surv.get("revoked_vehicle_frac"), "fraction", surv.get("vehicles"), None, SOFT,
+        reason=("informational: the CAUSE of any truncation above. It is not a realism defect -- "
+                "the SCMS layer is working as configured -- but with detection precision below 1 "
+                "most revocations are BENIGN vehicles, so it deletes traffic rather than attackers"
+                if surv.get("revoked_vehicle_frac") is not None else
+                "gt_linkage_revocation.jsonl / gt_vehicle.jsonl missing"),
+        extra={"vehicles_revoked": surv.get("vehicles_revoked"), "vehicles": surv.get("vehicles"),
+               "mean_record_span_s_revoked": surv.get("mean_record_span_s_revoked"),
+               "mean_record_span_s_never_revoked": surv.get("mean_record_span_s_never_revoked"),
+               "record_span_truncation_ratio": surv.get("record_span_truncation_ratio"),
+               "span_note": "record span is what the BROADCAST stream kept; the simulated spans "
+                            "beside it show revoked vehicles are the LONGER-TRIP ones, which is "
+                            "why the loss cannot be estimated from the surviving records",
+               "mean_simulated_span_s_revoked": surv.get("mean_simulated_span_s_revoked"),
+               "mean_simulated_span_s_never_revoked":
+                   surv.get("mean_simulated_span_s_never_revoked")}))
+
     # No early return on empty input: every metric below degrades to "na" with its own reason, so the
     # panel always has the SAME shape and a consumer can index it by metric id unconditionally.
     tracks = build_tracks(emissions)
@@ -1270,7 +1641,7 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
     out.append(_metric(
         "traffic.trace_segments", P, "Usable trajectory segments (finite-difference pairs)",
         n_seg, "count", n_seg, severity=SOFT,
-        reason=("ground_truth/gt_emissions_sample.jsonl is missing or empty" if not emissions
+        reason=(f"{_src_name} is missing or empty" if not emissions
                 else "informational: sample size for every other traffic metric"),
         extra={"vehicles_with_track": len(tracks),
                "segments_dropped_sampling_gap": int(segs.get("n_dropped_gap", 0)),
@@ -1283,7 +1654,7 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
         f"{FULL_TRACE_MIN_PROB}); per-vehicle trajectories are lossy -- rerun with "
         f"emit_sample_prob=1.0 (python) / SCMS_EMIT_SAMPLE=1.0 (MOSAIC)")
     few = (None if n_seg >= MIN_SAMPLES else
-           ("ground_truth/gt_emissions_sample.jsonl is missing or empty" if not emissions
+           (f"{_src_name} is missing or empty" if not emissions
             else f"only {n_seg} usable segments (need {MIN_SAMPLES})"))
 
     # ---- speeds -------------------------------------------------------------------------------
@@ -1335,7 +1706,7 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
     d_lat_abs = np.abs(kin["d_lat"][use]) if n_pair_all else np.zeros(0)
     n_rev = int((kin["reversal"] & use).sum()) if n_pair_all else 0
     lat_few = (None if (n_pair >= MIN_SAMPLES and v_km > 0.0) else
-               ("ground_truth/gt_emissions_sample.jsonl is missing or empty" if not emissions
+               (f"{_src_name} is missing or empty" if not emissions
                 else f"only {n_pair} of {n_pair_all} consecutive-sample steps can be scanned for a "
                      f"lane-change teleport (need {MIN_SAMPLES}): the step and the heading window "
                      f"it is measured against must all sit inside the {MAX_FD_DT_S:g} s "
@@ -1511,7 +1882,7 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
     # Sample floor, like accel (MIN_SAMPLES) and overlap (10 instants): with none, a dataset whose
     # every real jump lands across a dropped sampling gap reported "0 teleports, pass" off ONE pair.
     tele_few = (None if n_tele_pairs >= MIN_SAMPLES else
-                ("ground_truth/gt_emissions_sample.jsonl is missing or empty" if not emissions
+                (f"{_src_name} is missing or empty" if not emissions
                  else f"only {n_tele_pairs} consecutive-sample pairs (need {MIN_SAMPLES})"))
     out.append(_metric(
         "traffic.teleport_events", P, "Teleports (displacement implying a speed above the bound)",
@@ -1541,7 +1912,7 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
         (mv_frac if n_tracks >= LIVENESS_MIN_VEHICLES else None), "fraction", n_tracks,
         _ref(refdata, "kinematics.moving_vehicle_min_fraction"), HARD,
         reason=(None if n_tracks >= LIVENESS_MIN_VEHICLES else
-                ("ground_truth/gt_emissions_sample.jsonl is missing or empty" if not emissions
+                (f"{_src_name} is missing or empty" if not emissions
                  else f"only {n_tracks} vehicles carry a usable track "
                       f"(need {LIVENESS_MIN_VEHICLES})")),
         extra={"liveness_min_speed_mps": LIVENESS_MIN_SPEED_MPS,
@@ -1620,6 +1991,36 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
                              f"only {n_cong} congested-branch cells (need {min_cong})"),
         extra={"method": "negative slope of a least-squares line through cells denser than the "
                          "flow-maximising density"}))
+
+    # ---- provenance on every row, and WITHHOLDING of what the truncation invalidates -------------
+    # Two separate obligations, both from the same finding. (1) A traffic number is only
+    # interpretable next to the stream it came from, so every row carries its source and the
+    # surviving fraction -- no consumer of this scorecard can now read a flow, a headway or a
+    # fundamental diagram without seeing whether the vehicles were there. (2) Below the floor the
+    # DENSITY-DEPENDENT metrics are not published at all: a missing vehicle removes a leader, a
+    # follower, a cell occupancy or an overlap partner, so those numbers would be low by a factor
+    # that grows with the run length. `na` plus the measured fraction is the honest output.
+    for m in out:
+        if m["id"] in ("traffic.survivorship_vehicle_steps_frac", "traffic.revoked_vehicle_frac"):
+            continue
+        m.setdefault("details", {}).update(src_detail)
+        if not (surv_na and m["id"] in SURVIVORSHIP_GATED_METRICS):
+            continue
+        if m["id"] in SURVIVORSHIP_LOWER_BOUND_METRICS and m["status"] == "fail":
+            # A one-sided count that already breaches its bound: keep the FAIL, label the number.
+            m["details"]["survivorship_note"] = (
+                "LOWER BOUND: the missing vehicle-steps can only ADD co-presence events, so the "
+                "true count is at least this. Reported as a failure rather than withheld, because "
+                "more traffic cannot rescue it")
+            continue
+        # Withheld regardless of the row's PREVIOUS status: several of these are permanently `na`
+        # because they carry no gate (`headway_p50_s` is "informational"), and a consumer reads
+        # their VALUE anyway. A wrong value published under an `na` status is still a wrong value,
+        # so the number goes too -- with the original reason kept behind it.
+        was = m.get("reason")
+        m["status"] = "na"
+        m["value"] = None
+        m["reason"] = surv_na + (f" (previously: {was})" if was else "")
     return out
 
 
@@ -1936,10 +2337,17 @@ def scorecard(dataset_dir: str, refdata: dict | str | None = None, *, regime: st
               art_max_m: float | None = None, radio_range_m: float | None = None,
               t_bucket_s: float = T_BUCKET_S, dist_bin_m: float = DIST_BIN_M,
               max_dist_m: float = MAX_LINK_DIST_M, fd_cell_m: float = FD_CELL_M,
-              fd_window_s: float = FD_WINDOW_S) -> dict:
+              fd_window_s: float = FD_WINDOW_S, traffic_source: str = "auto",
+              sumo_trace: str | None = None) -> dict:
     """Score one dataset directory. Read-only, deterministic, never raises on a missing signal.
 
-    Raises FileNotFoundError only when `dataset_dir` itself is not a directory.
+    Raises FileNotFoundError only when `dataset_dir` itself is not a directory, or when
+    `traffic_source` names a source this dataset does not have.
+
+    The TRAFFIC panel and the COMM panel read DIFFERENT streams on purpose. Traffic takes the best
+    un-enforced mobility record available (see `resolve_mobility_source`); comm takes the broadcast
+    emissions, because what the MA could actually hear is the honest input to a reception
+    measurement. Reading traffic off the broadcast stream is the bias this split exists to remove.
     """
     dataset_dir = os.fspath(dataset_dir)
     if not os.path.isdir(dataset_dir):
@@ -1961,8 +2369,19 @@ def scorecard(dataset_dir: str, refdata: dict | str | None = None, *, regime: st
     tracks = build_tracks(emissions)
     gt = ground_truth_kinematics(tracks)
 
-    traffic = traffic_panel(emissions, probe, rd, fd_cell_m=fd_cell_m, fd_window_s=fd_window_s,
-                            regime=reg, gt=gt)
+    # THE TRAFFIC PANEL'S OWN INPUT, resolved and named. When it resolves to the emission stream
+    # this is the same object the comm panel uses, so nothing is read twice.
+    src = resolve_mobility_source(dataset_dir, probe, prefer=traffic_source, sumo_trace=sumo_trace)
+    surv = survivorship(dataset_dir, src)
+    if src["source"] == "emissions":
+        src["rows"] = emissions
+        traffic_rows, traffic_gt = emissions, gt
+    else:
+        traffic_rows = src["rows"]
+        traffic_gt = ground_truth_kinematics(build_tracks(traffic_rows))
+
+    traffic = traffic_panel(traffic_rows, probe, rd, fd_cell_m=fd_cell_m, fd_window_s=fd_window_s,
+                            regime=reg, gt=traffic_gt, src=src, surv=surv)
     comm = comm_panel(emissions, reports, rlabels, tracks, probe, rd, t_bucket_s=t_bucket_s,
                       dist_bin_m=dist_bin_m, max_dist_m=max_dist_m, regime=reg,
                       dataset_dir=dataset_dir)
@@ -1977,12 +2396,19 @@ def scorecard(dataset_dir: str, refdata: dict | str | None = None, *, regime: st
         "probe": probe,
         # ADR 0002: which estimator produced the kinematic metrics on THIS dataset. Every affected
         # metric repeats it in its own ``details.kinematics_source`` so a single row is self-auditing.
-        "kinematics_source": gt,
+        "kinematics_source": traffic_gt,
+        # WHICH STREAM THE TRAFFIC PANEL READ, and how much of the traffic it kept. Top-level
+        # rather than buried per metric, because "is this a traffic sample at all" precedes every
+        # question the panel answers. `rows` is dropped: the scorecard is aggregates only.
+        "traffic_source": {k: v for k, v in src.items() if k != "rows"},
+        "survivorship": surv,
         "refdata": {"dir": rd.get("dir"), "sets": sorted(rd.get("sets", {})),
                     "n_entries": len(rd.get("entries", {}))},
         "settings": {"regime": reg or "auto", "t_bucket_s": t_bucket_s, "dist_bin_m": dist_bin_m,
                      "max_dist_m": max_dist_m, "fd_cell_m": fd_cell_m, "fd_window_s": fd_window_s,
-                     "max_finite_difference_dt_s": MAX_FD_DT_S, "min_samples": MIN_SAMPLES},
+                     "max_finite_difference_dt_s": MAX_FD_DT_S, "min_samples": MIN_SAMPLES,
+                     "traffic_source": traffic_source,
+                     "survivorship_min_frac": SURVIVORSHIP_MIN_FRAC},
         "panels": {"traffic": traffic, "comm": comm},
         "summary": {**counts, "total": len(metrics),
                     "hard_failures": hard_fail, "soft_failures": soft_fail},
@@ -2072,6 +2498,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--fd-cell-m", type=float, default=FD_CELL_M, help="fundamental-diagram cell side (m)")
     p.add_argument("--fd-window-s", type=float, default=FD_WINDOW_S,
                    help="fundamental-diagram time window (s)")
+    p.add_argument("--traffic-source", choices=("auto", "oracle", "trace", "emissions"),
+                   default="auto",
+                   help="which mobility record the TRAFFIC panel reads: 'oracle' = the engine's "
+                        "un-enforced gt_mobility_oracle.jsonl, 'trace' = a frozen SUMO trace, "
+                        "'emissions' = the broadcast stream (TRUNCATED at revocation -- what this "
+                        "flag exists to stop being the silent default). 'auto' prefers them in "
+                        "that order. The COMM panel always reads the broadcast stream")
+    p.add_argument("--sumo-trace", default=None,
+                   help="path to the frozen SUMO trace to score the traffic panel from (default: "
+                        "the one manifest.config.sumo_trace pins, if it is still on disk)")
     p.add_argument("--markdown", action="store_true", help="print the compact scorecard lines instead of JSON")
     p.add_argument("--fail-on-hard", action="store_true",
                    help="exit 1 when a HARD metric fails (CI gate; default is measure-only exit 0)")
@@ -2081,7 +2517,8 @@ def main(argv: list[str] | None = None) -> int:
         p.error(f"dataset directory not found: {a.dataset_dir}")
     card = scorecard(a.dataset_dir, a.refdata, regime=a.regime, art_max_m=a.art_max_m,
                      radio_range_m=a.radio_range_m, t_bucket_s=a.t_bucket_s, dist_bin_m=a.bin_m,
-                     max_dist_m=a.max_dist_m, fd_cell_m=a.fd_cell_m, fd_window_s=a.fd_window_s)
+                     max_dist_m=a.max_dist_m, fd_cell_m=a.fd_cell_m, fd_window_s=a.fd_window_s,
+                     traffic_source=a.traffic_source, sumo_trace=a.sumo_trace)
     if a.markdown:
         text = "\n".join(render_lines(card, include_na=True))
         try:

@@ -479,3 +479,53 @@ Unifying on `deg_cw_from_north` remains a follow-up with its own digest move.
 the new fields) needs regeneration by the baselines owner; that regeneration will also flip the
 harness's `kinematics_source` from differenced positions to ground truth, which is the point of the
 ADR. The scorecards in `docs/realism/baselines/` follow from it.
+
+## The traffic panel was measuring enforcement (2026-09-03)
+
+Full write-up: [TRAFFIC-PANEL-SURVIVORSHIP.md](TRAFFIC-PANEL-SURVIVORSHIP.md). Short version:
+`PYTHON-ENGINE-VALIDATION.md` §1 found that `gt_emissions_sample.jsonl` from a long run is not a
+traffic sample — it is written inside the broadcast pre-pass, so a revoked vehicle's kinematic
+record ends at revocation while the vehicle keeps driving — and `realism_bench` computed its whole
+traffic panel from it. Fixed and re-measured.
+
+**What changed.** (1) `PipelineConfig.emit_mobility_oracle` / `--emit-mobility-oracle`, default OFF,
+writes `ground_truth/gt_mobility_oracle.jsonl` from *before* the enforcement gate: one row per
+active station per step, whatever the CRL says. (2) `manifest["counts"]["mobility_survivorship"]`
+now carries the step-loop tallies on **every** run — `counts` is outside `data_digest` by
+construction, so it is unconditional and moves nothing. (3) `realism_bench.resolve_mobility_source`
+picks oracle → frozen SUMO trace (only when asked for) → truncated emissions, names the choice in
+the scorecard, publishes survivorship as two first-class metrics, and withholds the
+density-dependent metrics below `SURVIVORSHIP_MIN_FRAC = 0.90`.
+
+**Digests.** Reference run still `b25f2137cf14dd50…`; default golden still
+`0bd93655a2d5bebb…`. Switching the opt-in on over `py_intas_300s` and `py_intas_300s_internal`
+leaves **10 of 10 pre-existing files byte-identical and adds exactly one**.
+
+**Survivorship measured.** Default golden **0.8863**; reference golden **0.8126** (the 300 s window
+this repo calibrates on was already losing 18.7% of its vehicle-steps); InTAS 300 s replay
+**0.9077**; **InTAS AM peak hour 0.4378** (5,949,526 of 13,589,568). The obvious in-dataset
+estimator reads 0.7106 there — it overstates survival **1.62×**, because exposure is what earns a
+false positive so never-revoked vehicles are systematically short-trip vehicles.
+
+**Verdicts that change** (unbiased source, same code, same settings): peak-hour replay
+`speed_p50` **4.772 pass → 1.432 FAIL**, `fd_capacity` **763.6 → 1130.0**, `overlap_events`
+**28 → 169**, `teleport_events` **1 → 11**, FD density p99 **24.83 → 53.83 veh/km/lane**,
+congested cells **240 → 2,043**; 300 s internal IDM `headway_ks` **0.1498 pass → 0.1562 FAIL**.
+The headway question is settled: the SUMO-vs-internal ordering at midnight survives the correction
+(0.2036 vs 0.1562, both now failing), and the peak-hour reversal strengthens (replay 0.1139 →
+**0.0830**).
+
+**The mechanism is a congestion filter.** Halting vehicle-steps survive into the dataset at
+**0.3638**, moving ones at **0.4898** — a stopped vehicle sits in a jam surrounded by neighbours,
+collects the co-located benign reports that trip the revocation threshold, and takes the rest of its
+congested trip out of the record. The dataset is biased toward free flow, which is why the congested
+branch of the fundamental diagram was the part that moved most.
+
+**The false-positive rate is DENSITY-driven, and measured rather than tuned.** At fixed 300 s,
+revocation precision falls 0.9167 → 0.3061 over a 31× concurrency range while **recall stays flat at
+0.90**; along the duration axis it plateaus at 0.54–0.58 from 300 s to 2400 s. Over a 12×
+concurrency range the *per-report* false-positive rate moves −7% while *revocation* precision
+collapses 59%, so what degrades is not the detector's judgement but an absolute
+`report_threshold_k = 3` inside a neighbourhood whose size is not held constant. The synthetic grid
+at 937 concurrent reproduces the real city's peak (precision 0.3061 vs 0.3077, 2.27 vs 2.25 false
+revocations per true one). No detector was touched.

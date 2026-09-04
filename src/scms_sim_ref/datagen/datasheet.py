@@ -305,6 +305,21 @@ def build(dataset_dir: str) -> str:
     if rcard:
         s = rcard["summary"]
         L.append("### Realism benchmark (measured, vs pinned reference summaries)")
+        # WHICH STREAM the traffic panel read comes BEFORE the pass/fail tally, because it decides
+        # what the tally is worth. `gt_emissions_sample.jsonl` stops at revocation, so a traffic
+        # metric taken from it is low by the enforced fraction -- which grows with run length and
+        # with the MA's false-positive rate (docs/realism/TRAFFIC-PANEL-SURVIVORSHIP.md).
+        ts, sv = rcard["traffic_source"], rcard["survivorship"]
+        frac = sv.get("vehicle_steps_survival_frac")
+        L.append(f"*Traffic panel read from **{ts['source']}** — {ts['note']}. "
+                 + (f"Vehicle-steps surviving enforcement: **{frac:.4f}** "
+                    f"({sv.get('basis')}). " if frac is not None else
+                    f"Vehicle-step survivorship: **not measurable** for this dataset "
+                    f"({sv.get('basis')}). ")
+                 + (f"The misbehaviour authority revoked **{sv['revoked_vehicle_frac']:.4f}** of the "
+                    f"vehicles, each of which stops broadcasting at that instant.*"
+                    if sv.get("revoked_vehicle_frac") is not None else "*"))
+        L.append("")
         L.append(f"*Engine `{rcard['probe']['engine']}`; {s['pass']} pass / {s['fail']} fail / "
                  f"{s['na']} not-applicable over {s['total']} metrics. Reference numbers are pinned "
                  f"in `datagen/refdata/` and every one carries a source citation; "

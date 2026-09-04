@@ -2023,6 +2023,24 @@ class PipelineConfig:
     net_delay_max: float = 2.0
     crl_propagation_delay: float = 2.0
     emit_sample_prob: float = 0.03       # per-message ground-truth emission sampling
+    # --- ORACLE mobility record (opt-in; DEFAULT OFF, so the default file set, the default
+    # `data_digest` and every pinned golden are byte-identical) -----------------------------------
+    # `gt_emissions_sample.jsonl` is written INSIDE the broadcast pre-pass, which means it is gated
+    # on `enforced()`: a revoked vehicle stops broadcasting, so its kinematic record ENDS at
+    # revocation while the vehicle keeps driving. That makes the emission stream a record of what
+    # the MA could HEAR, which is exactly right for a detection dataset and exactly wrong for a
+    # traffic measurement. Measured on the InTAS AM peak hour: 9,143 of 14,896 vehicles revoked
+    # (61.38%) and only 5,949,526 of 13,589,568 vehicle-steps surviving (43.78%) -- and with
+    # detection precision 0.308 most of those revocations were BENIGN vehicles. The loss GROWS with
+    # run length and with the false-positive rate, so it cannot be corrected by a constant.
+    # See docs/realism/TRAFFIC-PANEL-SURVIVORSHIP.md and PYTHON-ENGINE-VALIDATION.md section 1.
+    #
+    # With this on, the engine writes the mobility a SECOND time, from BEFORE the enforcement gate:
+    # every active station, every step, whatever the CRL says, whatever `emit_sample_prob` is and
+    # whatever the GNSS-jam draw did. `datagen.realism_bench` prefers it for the whole traffic panel.
+    # It is ORACLE (`ground_truth/`, `_visibility=ORACLE`, forbidden-key set) and is withheld from an
+    # isolated third-party detector exactly like the other two ground-truth streams.
+    emit_mobility_oracle: bool = False    # write ground_truth/gt_mobility_oracle.jsonl (un-enforced)
     # --- radio / channel realism ---
     radio_range_m: float = 500.0         # a receiver only hears transmitters within this range
     packet_loss_base: float = 0.0        # baseline per-message loss
@@ -3187,7 +3205,7 @@ def _field_group(name: str) -> str:
                           "ma_defense", "max_accel", "offroad", "rotate", "beacon", "net_delay",
                           "crl_", "sybil_min_certs", "sybil_cell_m")),
         ("Run", ("seed", "n_vehicles", "n_steps", "dt", "jmax", "out_dir", "verbose",
-                 "live_interval", "emit_sample")),
+                 "live_interval", "emit_sample", "emit_mobility_oracle")),
     ]
     for label, prefixes in g:
         if any(name == p or name.startswith(p) for p in prefixes):
@@ -3224,6 +3242,9 @@ _FIELD_META = {
     "n_steps": dict(h="Fixed-fleet simulation steps (ignored when duration_s > 0)", lo=0),
     "dt": dict(h="Simulation timestep", lo=0.1, hi=5, st=0.1, u="s"),
     "emit_sample_prob": dict(h="Per-message ground-truth emission sampling probability", lo=0, hi=1, st=0.01),
+    "emit_mobility_oracle": dict(h="Also write an ORACLE mobility record that is NOT gated on "
+                                   "broadcasting (every vehicle, every step, including after "
+                                   "revocation) — the unbiased source for the traffic panel"),
     "live_interval_s": dict(h="Write the live-map JSON every N sim-seconds (0 = off)", lo=0, u="s"),
     "verbose": dict(h="Print a progress heartbeat while running"),
     "jmax": dict(h="Linkage j-index period size (SCMS internal)", lo=1),
@@ -4309,6 +4330,23 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     ma_reports: list[dict] = []
     gt_report_labels: list[R.GtReportLabel] = []
     gt_emissions: list[dict] = []
+    # ---- ORACLE mobility record + SURVIVORSHIP accounting -----------------------------------------
+    # `gt_emissions` above is written inside the broadcast pre-pass and therefore stops at
+    # revocation. `gt_mobility` is the SAME motion recorded BEFORE that gate, and the counters
+    # beside it are what makes the difference between the two a published NUMBER instead of a
+    # footnote. The counters are UNCONDITIONAL (they land in `manifest["counts"]`, which
+    # `_data_digest` excludes by construction, so they move no digest) and cost one integer add per
+    # vehicle-step; the record itself is opt-in.
+    _mob_oracle = bool(cfg.emit_mobility_oracle)
+    gt_mobility: list[dict] = []
+    #: scalar vehicle-step tallies: simulated (every active station, every step), broadcast (the
+    #: ones that actually put a CAM on the air), enforced-out (skipped by the CRL), emitted (rows in
+    #: gt_emissions_sample after the emit_sample_prob draw).
+    surv = {"sim": 0, "bcast": 0, "enforced": 0, "emit": 0}
+    #: vid -> [first_t_present, last_t_present, n_steps_present, first_t_bcast, last_t_bcast,
+    #:         n_steps_bcast]. The mean RECORD SPAN of a revoked vehicle against a never-revoked one
+    #: is the single number that shows the truncation is not marginal per vehicle.
+    surv_span: dict[int, list] = {}
     # DENM (event-message) records. gt_denm carries the ORACLE real-vs-fake flag (label side only);
     # ma_denm_log is the MA-VISIBLE log of observed DENMs (no real/fake flag) that featurize turns into
     # leakage-safe per-subject DENM-count features. Both stay empty (and unwritten) on the default path.
@@ -4669,8 +4707,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
 
     # ---- streaming output (flow only): keep long runs memory-bounded ----
     stream = cfg.traffic_flow
-    stream_counts = {"reports": 0, "labels": 0, "emit": 0}
-    fh_rep = fh_lbl = fh_emit = None
+    stream_counts = {"reports": 0, "labels": 0, "emit": 0, "mob": 0}
+    fh_rep = fh_lbl = fh_emit = fh_mob = None
     # ---- WITHHOLDING, when a third-party detector is running out of process --------------------- #
     # An isolated check is an ordinary OS process with ordinary read access to this directory, so
     # streaming the ORACLE files while it runs hands it the answer key for the run it is being graded
@@ -4685,14 +4723,24 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         fh_rep = open(os.path.join(cfg.out_dir, "ma", "ma_reports.jsonl"), "w", encoding="utf-8", newline="\n")
         _lbl_path = os.path.join(cfg.out_dir, "ground_truth", "gt_report_labels.jsonl")
         _emit_path = os.path.join(cfg.out_dir, "ground_truth", "gt_emissions_sample.jsonl")
+        # The ORACLE mobility record is a ground-truth stream like the other two, so it takes the
+        # SAME withholding path: an isolated third-party detector must not be able to read the
+        # un-enforced trajectory of the run it is being graded on any more than it can read the
+        # answer key. Opened only when the opt-in is on -> the default run touches nothing here.
+        _mob_path = os.path.join(cfg.out_dir, "ground_truth", "gt_mobility_oracle.jsonl")
         if suite.workers:
             fh_lbl = _WithheldStream(_lbl_path, _withhold_budget)
             fh_emit = _WithheldStream(_emit_path, _withhold_budget)
             withheld = [fh_lbl, fh_emit]
+            if _mob_oracle:
+                fh_mob = _WithheldStream(_mob_path, _withhold_budget)
+                withheld.append(fh_mob)
         else:
             os.makedirs(os.path.join(cfg.out_dir, "ground_truth"), exist_ok=True)
             fh_lbl = open(_lbl_path, "w", encoding="utf-8", newline="\n")
             fh_emit = open(_emit_path, "w", encoding="utf-8", newline="\n")
+            if _mob_oracle:
+                fh_mob = open(_mob_path, "w", encoding="utf-8", newline="\n")
 
     def flush_streams():
         for row in ma_reports:
@@ -4705,6 +4753,11 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         stream_counts["labels"] += len(gt_report_labels)
         stream_counts["emit"] += len(gt_emissions)
         ma_reports.clear(); gt_report_labels.clear(); gt_emissions.clear()
+        if fh_mob is not None:
+            for row in gt_mobility:
+                fh_mob.write(ca.canonical_bytes(row).decode("utf-8") + "\n")
+            stream_counts["mob"] += len(gt_mobility)
+            gt_mobility.clear()
 
     def prune_state(step_now: int, active: dict) -> None:
         cutoff = step_now - cfg.state_prune_ttl
@@ -5064,10 +5117,50 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             # is untouched code reading untouched fields.
             _replay.advance(active_list, step, t)
 
+        # ---- THE UN-ENFORCED MOBILITY RECORD, taken HERE and not one line later ------------------
+        # This is the seam that matters. Everything below it -- the broadcast pre-pass, the channel,
+        # the detectors, the MA -- runs on what the SCMS layer permits, and the pre-pass's very first
+        # statement is `if enforced(tx, t): continue`. Reading traffic realism off anything downstream
+        # of that line measures ENFORCEMENT, not traffic: the peak-hour dataset keeps 43.78% of the
+        # vehicle-steps it simulated, and it is mostly FALSE revocations (precision 0.308) deleting
+        # them. So the mobility is recorded from up here, where the only thing that has happened to
+        # `active_list` is that it moved.
+        #
+        # NO RNG IS DRAWN and no state is mutated: `true_state(t)` is a pure read of the position the
+        # mobility provider just wrote (`cur_*` under car-following/replay, a closed form otherwise),
+        # and it is the identical call the pre-pass makes a few lines down. The tallies are integer
+        # adds. Both properties are what make this insertion byte-identical on the default path.
+        surv["sim"] += len(active_list)
+        for _v in active_list:
+            _sp = surv_span.get(_v.vid)
+            if _sp is None:
+                surv_span[_v.vid] = [t, t, 1, None, None, 0]
+            else:
+                _sp[1] = t
+                _sp[2] += 1
+        if _mob_oracle:
+            _mob_base = stream_counts["mob"] + len(gt_mobility)
+            for _i, _v in enumerate(active_list):
+                _mx, _my, _mv, _mh = _v.true_state(t)
+                gt_mobility.append(dict(
+                    mob_id=f"mob_{_mob_base + _i:09d}", t=round(t, 3),
+                    true_vehicle_id=f"veh_{_v.vid:03d}",
+                    true_x=round(_mx, 3), true_y=round(_my, 3),
+                    true_speed=round(_mv, 3), true_heading=round(_mh, 3),
+                    # WHY these two flags ride along: they are what lets a consumer reconstruct the
+                    # truncated stream exactly (filter on `broadcasting`) and measure the loss
+                    # without a second file. `revoked` is the CRL state, `broadcasting` is the
+                    # stricter thing the pre-pass actually tests (CRL propagation delay included).
+                    revoked=bool(_v.revoked and _v.revocation_time is not None
+                                 and t >= _v.revocation_time),
+                    broadcasting=(not enforced(_v, t)),
+                    is_vru=bool(_v.is_vru), _visibility=R.ORACLE))
+
         # PRE-PASS: every active broadcast this step (real pseudonyms + sybil ghosts)
         broadcasts: list[dict] = []
         for tx in active_list:
             if enforced(tx, t):
+                surv["enforced"] += 1
                 continue
             ps = tx.active_pseudonym(t, cfg.rotate_period_s)
             digest = ps["digest"]
@@ -5143,6 +5236,17 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                          cg=cg, sig_ok=sig_ok, cvf=cvf, cvt=cvt, station_type=declared_station,
                          tspd=tspeed, thdg=theading)
             broadcasts.append(b_cam)
+            # SURVIVORSHIP: this vehicle-step made it onto the air, so it is one the emission stream
+            # can carry. Counted HERE rather than as `sim - enforced` because the pre-pass has a
+            # second exit above (a GNSS outage goes silent without being revoked), and conflating a
+            # radio-silent step with an enforced one would understate enforcement's own share.
+            surv["bcast"] += 1
+            _sp = surv_span.get(tx.vid)
+            if _sp is not None:
+                if _sp[3] is None:
+                    _sp[3] = t
+                _sp[4] = t
+                _sp[5] += 1
             # ---- DENM (event-message) emission (opt-in; only when the DENM layer is enabled) ----
             # A FakeHazard attacker emits a PHANTOM hazard (emergency brake) while cruising -- its own
             # claimed speed contradicts the announced event. A benign vehicle emits a DENM only on a
@@ -5198,6 +5302,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     claimed_x=round(b["cx"], 3), claimed_y=round(b["cy"], 3), claimed_speed=round(b["cs"], 3),
                     pos_conf=round(b["conf"], 3), is_attacker=tx.is_attacker, is_faulty=tx.is_faulty,
                     falsified=bool(b["falsified"]), _visibility=R.ORACLE))
+                surv["emit"] += 1
 
         # sybil co-location: distinct certs at nearly the same point AND heading. Keying on heading
         # too means crossing traffic converging at an intersection (different headings) is not
@@ -5647,8 +5752,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             pass
 
     if stream:
-        for fh in (fh_rep, fh_lbl, fh_emit):
-            fh.close()
+        for fh in (fh_rep, fh_lbl, fh_emit, fh_mob):
+            if fh is not None:
+                fh.close()
 
     # ---- REAP THE ISOLATED WORKERS BEFORE ANY ORACLE FILE EXISTS ----
     # The step loop is over, so nothing below needs a worker except `suite.provenance()`, which reads
@@ -5708,12 +5814,21 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         for rel in ("ma/ma_reports.jsonl", "ground_truth/gt_report_labels.jsonl",
                     "ground_truth/gt_emissions_sample.jsonl"):
             data_files[rel] = os.path.join(cfg.out_dir, rel)
+        if _mob_oracle:
+            data_files["ground_truth/gt_mobility_oracle.jsonl"] = os.path.join(
+                cfg.out_dir, "ground_truth", "gt_mobility_oracle.jsonl")
         n_reports, n_gt_reports = stream_counts["reports"], stream_counts["labels"]
     else:
         data_files = _write_outputs(cfg, ma_reports, ma_investigations, ma_crl_events, ma_cert_status,
                                     gt_vehicle, gt_idmap, gt_attacks, gt_report_labels, gt_linkage_rev,
                                     gt_emissions)
         n_reports, n_gt_reports = len(ma_reports), len(gt_report_labels)
+        if _mob_oracle:
+            # fixed-fleet path: nothing was streamed, so the whole record is still in memory.
+            stream_counts["mob"] = len(gt_mobility)
+            data_files["ground_truth/gt_mobility_oracle.jsonl"] = _write_jsonl(
+                os.path.join(cfg.out_dir, "ground_truth", "gt_mobility_oracle.jsonl"),
+                sorted(gt_mobility, key=lambda r: r["mob_id"]))
     # DENM (event-message) outputs: an MA-VISIBLE observed-DENM log + the ORACLE real/fake ground truth.
     # Added to the digest ONLY when the DENM layer is enabled, so the DEFAULT file set (and digest) is
     # byte-identical. Written from bounded accumulators (never streamed), which is fine given the rate.
@@ -5740,7 +5855,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     _assert_config_unmoved(_cfg0, cfg, "during the run")
     _write_manifest(cfg, data_files, data_digest,
                     counts=dict(vehicles=len(vehicles), reports=n_reports,
-                                investigations=len(ma_investigations), revoked=len(revoked_vehicles)),
+                                investigations=len(ma_investigations), revoked=len(revoked_vehicles),
+                                mobility_survivorship=_survivorship_block(
+                                    cfg, surv, surv_span, revoked_vehicles, len(vehicles),
+                                    stream_counts["mob"] if _mob_oracle else None)),
                     plugins=plugin_block([chan_provenance()] + suite.provenance(),
                                          drift=_drift_allowed,
                                          integrity=({"armed": True,
@@ -6027,6 +6145,70 @@ def _file_sha256(path: str) -> str:
     with open(path, "rb") as fh:
         h.update(fh.read())
     return h.hexdigest()
+
+
+def _survivorship_block(cfg, surv: dict, surv_span: dict, revoked: dict, n_vehicles: int,
+                        n_oracle_rows: int | None) -> dict:
+    """How much of the simulated mobility the EMISSION stream actually kept — as a number.
+
+    `gt_emissions_sample.jsonl` is written downstream of `enforced()`, so a revoked vehicle's
+    kinematic record ends at revocation while the vehicle keeps driving. Over the InTAS AM peak hour
+    that deleted 56.22% of the vehicle-steps, and it is invisible at the 60-300 s durations the
+    engine's traffic metrics were previously read at. Publishing the ratio here means every consumer
+    of the dataset can SEE the truncation instead of inheriting it silently — and
+    `datagen.realism_bench` reads exactly this block to decide whether a traffic metric is
+    measurable at all.
+
+    Lives in ``manifest["counts"]``, which ``_data_digest`` excludes by construction, so this block
+    is unconditional and moves no digest. Every field is derived from integer tallies taken in the
+    step loop; nothing here re-reads a file or draws from an RNG.
+
+    ``vehicle_steps_survival_frac`` is the honest denominator: broadcast vehicle-steps over
+    SIMULATED vehicle-steps. Note it is NOT recoverable from the dataset's own contents — a stream
+    that stops at revocation cannot report what it did not record — which is why it is stamped into
+    the manifest rather than left to be estimated. (Estimating it from the surviving records is
+    measurably biased: never-revoked vehicles are systematically SHORT-trip vehicles, because
+    exposure is what earns a false positive.)
+    """
+    spans_rev, spans_ok, sim_rev, sim_ok = [], [], [], []
+    for vid, sp in surv_span.items():
+        sim_span = float(sp[1] - sp[0])
+        rec_span = 0.0 if sp[3] is None else float(sp[4] - sp[3])
+        if vid in revoked:
+            spans_rev.append(rec_span); sim_rev.append(sim_span)
+        else:
+            spans_ok.append(rec_span); sim_ok.append(sim_span)
+
+    def _mean(xs):
+        return round(sum(xs) / len(xs), 3) if xs else None
+
+    sim = int(surv["sim"])
+    bc = int(surv["bcast"])
+    out = {
+        "vehicle_steps_simulated": sim,
+        "vehicle_steps_broadcast": bc,
+        "vehicle_steps_enforced_out": int(surv["enforced"]),
+        "vehicle_steps_emitted": int(surv["emit"]),
+        "vehicle_steps_survival_frac": (round(bc / sim, 6) if sim else None),
+        "vehicles": int(n_vehicles),
+        "vehicles_revoked": len(revoked),
+        "revoked_vehicle_frac": (round(len(revoked) / n_vehicles, 6) if n_vehicles else None),
+        "mean_record_span_s_revoked": _mean(spans_rev),
+        "mean_record_span_s_never_revoked": _mean(spans_ok),
+        "mean_simulated_span_s_revoked": _mean(sim_rev),
+        "mean_simulated_span_s_never_revoked": _mean(sim_ok),
+        "emit_sample_prob": cfg.emit_sample_prob,
+        # The un-enforced record, when the opt-in wrote one. `oracle_rows == simulated` is the
+        # property that makes it the unbiased source, and it is asserted below rather than assumed.
+        "oracle_record": ("ground_truth/gt_mobility_oracle.jsonl" if n_oracle_rows is not None
+                          else None),
+        "oracle_rows": n_oracle_rows,
+    }
+    if n_oracle_rows is not None:
+        assert n_oracle_rows == sim, (
+            f"gt_mobility_oracle wrote {n_oracle_rows} rows for {sim} simulated vehicle-steps: the "
+            "un-enforced record must be one row per active station per step")
+    return out
 
 
 def _data_digest(out_dir: str, data_files: dict[str, str]) -> str:
@@ -6426,6 +6608,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--idm-min-gap", type=float, default=2.5, help="IDM jam distance (m)")
     p.add_argument("--idm-lookahead", type=float, default=70.0, help="IDM leader search distance (m)")
     p.add_argument("--live-interval", type=float, default=0.0, help="write live_state.json every N sim-seconds (GUI map)")
+    p.add_argument("--emit-mobility-oracle", action="store_true",
+                   help="also write ground_truth/gt_mobility_oracle.jsonl: the mobility BEFORE the "
+                        "enforcement gate (every vehicle, every step, including after revocation). "
+                        "The unbiased source for datagen.realism_bench's traffic panel; "
+                        "gt_emissions_sample.jsonl stops at revocation and is not one. Off by "
+                        "default, so the default file set and every pinned digest are unchanged")
     p.add_argument("--no-car-following", action="store_true", help="disable IDM car-following")
     p.add_argument("--turn-slowdown", action="store_true", help="slow into sharp grid corners (realer, harder)")
     p.add_argument("--traffic-lights", action="store_true", help="signalized intersections (grid)")
@@ -6571,6 +6759,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                          idm_time_headway=args.idm_time_headway, idm_min_gap=args.idm_min_gap,
                          idm_lookahead_m=args.idm_lookahead,
                          live_interval_s=args.live_interval,
+                         emit_mobility_oracle=args.emit_mobility_oracle,
                          traffic_lights=args.traffic_lights, gap_acceptance=args.gap_acceptance,
                          gps_jam_rate=args.gps_jam_rate,
                          max_total_vehicles=args.max_total_vehicles,

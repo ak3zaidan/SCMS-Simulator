@@ -84,6 +84,27 @@ TAG_KEYS = ("oneway", "lanes", "lanes:forward", "lanes:backward", "junction",
             "turn:lanes", "turn:lanes:forward", "turn:lanes:backward",
             "maxspeed", "width", "bridge", "tunnel", "layer", "access", "name")
 
+# --------------------------------------------------------------------------- #
+# PEDESTRIAN layer. Same cached extract, different question: where may a person
+# WALK. Read by `extract_footways` and reported by `extract_tag_stats`.
+# --------------------------------------------------------------------------- #
+#: `highway=*` classes that ARE a walkable way in their own right. `footway`/`pedestrian`/`steps`
+#: are unambiguous. `path` defaults to foot-legal on the OSM wiki, so it is kept unless the way says
+#: otherwise. `cycleway`/`track` are NOT walkable by default and are kept only on an explicit
+#: `foot=yes|designated|permissive` -- a cycleway is where the sidewalk is NOT.
+PED_WAY_ALWAYS = ("footway", "pedestrian", "steps", "path")
+PED_WAY_IF_FOOT = ("cycleway", "track")
+#: `foot=*` values that grant / deny access. `destination` is a legal but conditional grant and is
+#: counted as a grant, matching how a router treats it for a pedestrian.
+_FOOT_YES = {"yes", "designated", "permissive", "destination", "official"}
+_FOOT_NO = {"no", "private"}
+#: `sidewalk=*` (and the `sidewalk:left|right|both=*` scheme) values -> which sides of the ROAD carry
+#: a footway that is an ATTRIBUTE of the road rather than its own way. `separate` explicitly means
+#: "mapped as its own way", i.e. the geometry is in the footway layer, not implied here.
+SIDEWALK_KEYS = ("sidewalk", "sidewalk:left", "sidewalk:right", "sidewalk:both")
+#: `crossing=*` values that mean the crossing is SIGNAL-controlled (a pedestrian phase exists).
+CROSSING_SIGNALISED = {"traffic_signals", "signals"}
+
 
 def _parse_oneway(tags: dict, cls: str | None = None) -> tuple[int, bool]:
     """OSM direction tags -> (direction, reversible).
@@ -500,7 +521,10 @@ def extract_tag_stats(xml_text: str) -> dict:
             "traffic_signal_nodes_on_drivable_way": signal_nodes_on_road,
             "stop_nodes": stop_nodes, "give_way_nodes": give_way_nodes,
             "restriction_relations": sum(restrictions.values()),
-            "restriction_kinds": dict(sorted(restrictions.items()))}
+            "restriction_kinds": dict(sorted(restrictions.items())),
+            # PEDESTRIAN coverage (additive: a reader that predates this key sees what it always
+            # saw). Answers "can the sidewalk layer be READ from this map, or must it be DERIVED?"
+            "pedestrian": pedestrian_tag_stats(xml_text)}
 
 
 def network_document(nodes: list, edges: list, info: dict | None = None, *,
@@ -682,6 +706,258 @@ def extract_buildings(xml_text: str, projection: dict, road_bbox: list | None = 
     return out, info
 
 
+def _foot_allowed(tags: dict, cls: str) -> bool:
+    """Is this `highway=<cls>` way walkable? (see PED_WAY_ALWAYS / PED_WAY_IF_FOOT)"""
+    foot = (tags.get("foot") or "").strip().lower()
+    if foot in _FOOT_NO:
+        return False
+    if (tags.get("access") or "").strip().lower() in _FOOT_NO and foot not in _FOOT_YES:
+        return False
+    if cls in PED_WAY_ALWAYS:
+        return True
+    return cls in PED_WAY_IF_FOOT and foot in _FOOT_YES
+
+
+def _sidewalk_sides(tags: dict) -> tuple[frozenset, str]:
+    """OSM `sidewalk*` tags -> (sides present as an ATTRIBUTE of the road, raw verdict).
+
+    Sides are `{"left", "right"}` in WAY ORDER (OSM's own convention). The verdict distinguishes the
+    three cases a consumer must treat differently and which a naive read conflates:
+
+      * `"none"`   -- the road says it has no footway (`sidewalk=no`): build none.
+      * `"separate"` -- the footway EXISTS but is mapped as its own way: its geometry belongs to the
+        footway layer, so implying a sidewalk from the road as well would double-count it.
+      * `"both"` / `"left"` / `"right"` -- an attribute footway on those sides.
+      * `"untagged"` -- the road says nothing at all, which is the majority case on most extracts
+        and the one a derived-geometry fallback exists for.
+    """
+    vals = {k: (tags.get(k) or "").strip().lower() for k in SIDEWALK_KEYS}
+    if not any(vals.values()):
+        return frozenset(), "untagged"
+    sides = set()
+    verdicts = set()
+    main = vals["sidewalk"]
+    if main:
+        if main in ("both", "yes"):
+            sides |= {"left", "right"}
+        elif main in ("left", "right"):
+            sides.add(main)
+        elif main == "separate":
+            verdicts.add("separate")
+        elif main in ("no", "none"):
+            verdicts.add("none")
+    if vals["sidewalk:both"] in ("yes", "both"):
+        sides |= {"left", "right"}
+    elif vals["sidewalk:both"] == "separate":
+        verdicts.add("separate")
+    for s in ("left", "right"):
+        v = vals[f"sidewalk:{s}"]
+        if v in ("yes", s, "both"):
+            sides.add(s)
+        elif v == "separate":
+            verdicts.add("separate")
+        elif v in ("no", "none"):
+            verdicts.add("none")
+    if sides:
+        return frozenset(sides), ("both" if sides == {"left", "right"} else sorted(sides)[0])
+    if "separate" in verdicts:
+        return frozenset(), "separate"
+    if "none" in verdicts:
+        return frozenset(), "none"
+    return frozenset(), "untagged"
+
+
+def pedestrian_tag_stats(xml_text: str) -> dict:
+    """Coverage of the PEDESTRIAN tags in an extract. Pure measurement, no geometry, no graph.
+
+    This is the number that decides whether a sidewalk layer can be READ from the map or has to be
+    DERIVED from road geometry: `sidewalk_verdict` over the drivable ways says how many roads state
+    anything at all about their footway, and `ped_way_classes` says how much separately-mapped
+    footway geometry the same extract carries.
+    """
+    root = ET.fromstring(xml_text)
+    drivable = 0
+    verdicts: dict[str, int] = {}
+    sidewalk_vals: dict[str, int] = {}
+    ped_ways: dict[str, int] = {}
+    ped_rejected: dict[str, int] = {}
+    ped_vertices = 0
+    footway_role: dict[str, int] = {}
+    way_refs: set[str] = set()
+    for way in root.iter("way"):
+        tags = {t.get("k"): t.get("v") for t in way.findall("tag")}
+        cls = tags.get("highway")
+        if cls in HIGHWAY_SPEED:
+            drivable += 1
+            for nd in way.findall("nd"):
+                way_refs.add(nd.get("ref"))
+            _sides, verdict = _sidewalk_sides(tags)
+            verdicts[verdict] = verdicts.get(verdict, 0) + 1
+            for k in SIDEWALK_KEYS:
+                if tags.get(k):
+                    key = f"{k}={tags[k]}"
+                    sidewalk_vals[key] = sidewalk_vals.get(key, 0) + 1
+        elif cls in PED_WAY_ALWAYS or cls in PED_WAY_IF_FOOT:
+            if _foot_allowed(tags, cls):
+                ped_ways[cls] = ped_ways.get(cls, 0) + 1
+                ped_vertices += len(way.findall("nd"))
+                role = (tags.get("footway") or "").strip().lower()
+                if role:
+                    footway_role[role] = footway_role.get(role, 0) + 1
+            else:
+                ped_rejected[cls] = ped_rejected.get(cls, 0) + 1
+    crossings = 0
+    crossing_kinds: dict[str, int] = {}
+    crossings_on_road = 0
+    for nd in root.iter("node"):
+        tags = {t.get("k"): t.get("v") for t in nd.findall("tag")}
+        if tags.get("highway") != "crossing":
+            continue
+        crossings += 1
+        if nd.get("id") in way_refs:
+            crossings_on_road += 1
+        kind = (tags.get("crossing") or tags.get("crossing:markings") or "?").strip().lower()
+        crossing_kinds[kind] = crossing_kinds.get(kind, 0) + 1
+    den = max(1, drivable)
+    tagged = drivable - verdicts.get("untagged", 0)
+    return {"drivable_ways": drivable,
+            "sidewalk_tagged_ways": tagged,
+            "sidewalk_tagged_share": round(tagged / den, 4),
+            "sidewalk_verdict": dict(sorted(verdicts.items())),
+            "sidewalk_verdict_share": {k: round(v / den, 4) for k, v in sorted(verdicts.items())},
+            "sidewalk_values": dict(sorted(sidewalk_vals.items())),
+            "ped_way_classes": dict(sorted(ped_ways.items())),
+            "ped_ways": sum(ped_ways.values()),
+            "ped_way_vertices": ped_vertices,
+            "ped_ways_rejected": dict(sorted(ped_rejected.items())),
+            "footway_role": dict(sorted(footway_role.items())),
+            "crossing_nodes": crossings,
+            "crossing_nodes_on_drivable_way": crossings_on_road,
+            "crossing_kinds": dict(sorted(crossing_kinds.items())),
+            "crossing_nodes_signalised": sum(v for k, v in crossing_kinds.items()
+                                             if k in CROSSING_SIGNALISED)}
+
+
+def extract_footways(xml_text: str, projection: dict, road_bbox: list | None = None, *,
+                     margin_m: float = 250.0, simplify_tol_m: float = 1.0,
+                     min_length_m: float = 3.0, max_ways: int = 20000) -> tuple[list, list, dict]:
+    """Walkable ways + crossing nodes from the SAME cached Overpass XML -> projected metres.
+
+    Returns `(footways, crossings, info)`:
+
+      * `footways` -- open polylines `[[x, y], ...]`, one per walkable way (see `_foot_allowed`),
+        RDP-simplified to `simplify_tol_m` and dropped below `min_length_m`. These are REAL mapped
+        pedestrian surface, which is what makes them worth having: the derived sidewalk layer in
+        `vru.py` can only invent a footway beside a road, and roughly two thirds of the tagged
+        Ingolstadt roads say `sidewalk=separate` -- the footway exists, but only as its own way.
+      * `crossings` -- `[x, y, kind]` per `highway=crossing` node, `kind` from `crossing=*`
+        (`traffic_signals` => a real pedestrian phase, everything else => uncontrolled).
+      * `info` -- provenance, including the `pedestrian_tag_stats` coverage block.
+
+    `projection` MUST be `osm_to_network`'s `info["projection"]` for this exact XML, for the same
+    reason `extract_buildings` insists on it: the road origin is min(lat)/min(lon) over ROAD ways
+    only, so a re-derived origin slides the whole pedestrian layer off the streets while every
+    individual footway still looks perfectly plausible. The same alignment GATE is applied here.
+    """
+    lat0 = float(projection["lat0"])
+    lon0 = float(projection["lon0"])
+    kx = float(projection["kx"])
+    ky = float(projection["ky"])
+    root = ET.fromstring(xml_text)
+    latlon: dict[str, tuple[float, float]] = {}
+    for nd in root.iter("node"):
+        latlon[nd.get("id")] = (float(nd.get("lat")), float(nd.get("lon")))
+
+    raw = incomplete = short = 0
+    ways: list[list] = []
+    for way in root.iter("way"):
+        tags = {t.get("k"): t.get("v") for t in way.findall("tag")}
+        cls = tags.get("highway")
+        if cls not in PED_WAY_ALWAYS and cls not in PED_WAY_IF_FOOT:
+            continue
+        if not _foot_allowed(tags, cls):
+            continue
+        raw += 1
+        refs = [nd.get("ref") for nd in way.findall("nd")]
+        if len(refs) < 2 or any(r not in latlon for r in refs):
+            incomplete += 1              # Overpass clips ways at the bbox edge: drop, never guess
+            continue
+        pts = []
+        for r in refs:
+            la, lo = latlon[r]
+            pts.append([(lo - lon0) * kx, (la - lat0) * ky])
+        length = sum(math.dist(p, q) for p, q in zip(pts, pts[1:]))
+        if length < min_length_m:
+            short += 1
+            continue
+        if simplify_tol_m > 0 and len(pts) > 2:
+            pts = [list(p) for p in _rdp(pts, simplify_tol_m)]
+        ways.append(pts)
+
+    crossings: list[list] = []
+    for nd in root.iter("node"):
+        tags = {t.get("k"): t.get("v") for t in nd.findall("tag")}
+        if tags.get("highway") != "crossing":
+            continue
+        la, lo = latlon[nd.get("id")]
+        kind = (tags.get("crossing") or "").strip().lower()
+        crossings.append([(lo - lon0) * kx, (la - lat0) * ky,
+                          "traffic_signals" if kind in CROSSING_SIGNALISED else (kind or "unknown")])
+
+    info = {"ped_ways_raw": raw, "incomplete": incomplete, "dropped_below_min_length": short,
+            "projection": {"lat0": lat0, "lon0": lon0, "kx": kx, "ky": ky},
+            "tag_coverage": pedestrian_tag_stats(xml_text)}
+    if not ways:
+        info.update(footways=0, crossings=len(crossings))
+        return [], crossings, info
+
+    if road_bbox is not None:
+        rx0, ry0, rx1, ry1 = (float(v) for v in road_bbox)
+        cents = [(sum(p[0] for p in w) / len(w), sum(p[1] for p in w) / len(w)) for w in ways]
+        cxs = sorted(c[0] for c in cents)
+        cys = sorted(c[1] for c in cents)
+        med = (cxs[len(cxs) // 2], cys[len(cys) // 2])
+        # ALIGNMENT GATE -- identical in spirit to `extract_buildings`. A footway layer projected
+        # with a re-derived origin lands hundreds of metres off the roads it is supposed to parallel,
+        # and every individual polyline still looks like a footway. This is the only place that
+        # mistake is observable before it silently defines where pedestrians "legally" walk.
+        diag = math.hypot(rx1 - rx0, ry1 - ry0)
+        tol = max(margin_m, 0.5 * diag)
+        info["median_footway_centroid"] = [round(med[0], 2), round(med[1], 2)]
+        info["alignment_tolerance_m"] = round(tol, 1)
+        if not (rx0 - tol <= med[0] <= rx1 + tol and ry0 - tol <= med[1] <= ry1 + tol):
+            raise ValueError(
+                f"projected footways do not sit on the road network: median centroid "
+                f"{info['median_footway_centroid']} is outside the road bbox {[rx0, ry0, rx1, ry1]} "
+                f"widened by {tol:.0f} m. This is the projection trap -- the pedestrian layer must "
+                f"use the SAME (lat0, lon0, kx, ky) that osm_to_network derived from the ROAD ways "
+                f"(note ky = 110540.0, not 111320), never a re-derived origin.")
+        lo_x, lo_y, hi_x, hi_y = rx0 - margin_m, ry0 - margin_m, rx1 + margin_m, ry1 + margin_m
+        keep, inside = [], 0
+        for w, (cx, cy) in zip(ways, cents):
+            if rx0 <= cx <= rx1 and ry0 <= cy <= ry1:
+                inside += 1
+            if lo_x <= cx <= hi_x and lo_y <= cy <= hi_y:
+                keep.append(w)
+        info["centroid_inside_road_bbox_frac"] = round(inside / len(ways), 4)
+        ways = keep
+        crossings = [c for c in crossings if lo_x <= c[0] <= hi_x and lo_y <= c[1] <= hi_y]
+
+    ways.sort(key=lambda w: (round(w[0][0], 3), round(w[0][1], 3), len(w)))
+    if len(ways) > max_ways:
+        info["truncated_from"] = len(ways)
+        ways = ways[:max_ways]
+    out = [[[round(x, 2), round(y, 2)] for x, y in w] for w in ways]
+    crossings.sort(key=lambda c: (round(c[0], 3), round(c[1], 3)))
+    out_cross = [[round(c[0], 2), round(c[1], 2), c[2]] for c in crossings]
+    info["footways"] = len(out)
+    info["footway_vertices"] = sum(len(w) for w in out)
+    info["footway_total_m"] = round(sum(math.dist(p, q) for w in out for p, q in zip(w, w[1:])), 1)
+    info["crossings"] = len(out_cross)
+    info["crossings_signalised"] = sum(1 for c in out_cross if c[2] == "traffic_signals")
+    return out, out_cross, info
+
+
 def osm_cache_path(bbox: tuple, cache_dir: str) -> str:
     """Where `fetch_osm` keeps the raw extract for this bbox (a stable sha256 of the rounded bbox).
     Exposed so another importer -- netconvert -- can consume the SAME file instead of refetching."""
@@ -709,7 +985,7 @@ def fetch_osm(bbox: tuple, cache_dir: str) -> str:
 
 def import_city(city_or_bbox, cache_dir: str, max_nodes: int = 380,
                 buildings: bool = False, *, attrs: bool = False,
-                signals: bool = False) -> tuple[list, list, dict]:
+                signals: bool = False, footways: bool = False) -> tuple[list, list, dict]:
     """City name (see CITY_BBOXES) or explicit bbox -> (nodes, edges, info).
 
     With `buildings=True` the SAME cached extract is re-read for `building=*` footprints, projected
@@ -740,6 +1016,11 @@ def import_city(city_or_bbox, cache_dir: str, max_nodes: int = 380,
         polys, binfo = extract_buildings(xml_text, info["projection"], info["road_bbox"])
         info["buildings"] = polys
         info["buildings_info"] = binfo
+    if footways:
+        fw, cross, finfo = extract_footways(xml_text, info["projection"], info["road_bbox"])
+        info["footways"] = fw
+        info["crossings"] = cross
+        info["footways_info"] = finfo
     return nodes, edges, info
 
 
@@ -760,24 +1041,35 @@ def main(argv=None) -> int:
     p.add_argument("--signals", action="store_true",
                    help="keep highway=traffic_signals nodes -> signal_nodes (real signal "
                         "placement instead of signalising every intersection)")
+    p.add_argument("--footways", action="store_true",
+                   help="also extract walkable ways (highway=footway/pedestrian/steps/path) and "
+                        "highway=crossing nodes from the same cached extract -> footways/crossings "
+                        "in the output document (consumed by vru.py's sidewalk layer)")
     p.add_argument("--tag-stats", action="store_true",
                    help="print tag coverage of the cached extract and exit (no graph is built)")
+    p.add_argument("--ped-stats", action="store_true",
+                   help="print PEDESTRIAN tag coverage (sidewalk=*/footway ways/crossing nodes) "
+                        "of the cached extract and exit (no graph is built)")
     a = p.parse_args(argv)
     target = a.city if a.city else [float(v) for v in a.bbox.split(",")]
-    if a.tag_stats:
+    if a.tag_stats or a.ped_stats:
         bbox = CITY_BBOXES[target] if isinstance(target, str) else tuple(target)
-        print(json.dumps(extract_tag_stats(fetch_osm(bbox, a.cache)), indent=1, sort_keys=True))
+        fn = pedestrian_tag_stats if a.ped_stats else extract_tag_stats
+        print(json.dumps(fn(fetch_osm(bbox, a.cache)), indent=1, sort_keys=True))
         return 0
     if not a.out:
-        p.error("--out is required (or use --tag-stats)")
+        p.error("--out is required (or use --tag-stats / --ped-stats)")
     nodes, edges, info = import_city(target, a.cache, max_nodes=a.max_nodes, buildings=a.buildings,
-                                     attrs=a.attrs, signals=a.signals)
+                                     attrs=a.attrs, signals=a.signals, footways=a.footways)
     doc = network_document(nodes, edges, info,
                            buildings=info.get("buildings") if a.buildings else None)
+    if a.footways:
+        doc["footways"] = info["footways"]
+        doc["crossings"] = info["crossings"]
     with open(a.out, "w", encoding="utf-8") as fh:
         json.dump(doc, fh)
     shown = {k: v for k, v in info.items()
-             if k not in ("buildings", "directed_edges", "edge_attrs")}
+             if k not in ("buildings", "directed_edges", "edge_attrs", "footways", "crossings")}
     print(f"wrote {a.out}: {shown}")
     return 0
 

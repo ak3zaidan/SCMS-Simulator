@@ -36,6 +36,13 @@ def realism_summary(dataset_dir: str) -> dict:
     s = dict(card["summary"])
     s["engine"] = card["probe"]["engine"]
     s["emit_sample_prob"] = card["probe"]["emit_sample_prob"]
+    # WHICH STREAM the traffic panel read, and how much of the traffic it kept. Carried alongside
+    # pass/fail because a campaign row recording "12 pass / 3 fail" over a dataset whose emission
+    # stream lost half its vehicle-steps to revocation is recording enforcement, not realism.
+    s["traffic_source"] = card["traffic_source"]["source"]
+    s["traffic_source_truncated"] = bool(card["traffic_source"]["truncated"])
+    s["vehicle_steps_survival_frac"] = card["survivorship"]["vehicle_steps_survival_frac"]
+    s["revoked_vehicle_frac"] = card["survivorship"]["revoked_vehicle_frac"]
     return s
 
 
