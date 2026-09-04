@@ -294,6 +294,28 @@ def test_a_full_survivorship_dataset_is_not_degraded(oracle_run):
     assert m["traffic.overlap_events"]["status"] != "na"
 
 
+def test_the_compact_rendering_names_the_source_and_the_survivorship(oracle_run, plain_run):
+    """`render_lines` is what `datasheet.py` embeds, and it is the form a reader actually sees.
+
+    The JSON has carried `traffic_source`, `survivorship` and a per-row `details` copy all along --
+    but with `include_na=False` the two survivorship METRICS are themselves `na` on exactly the
+    datasets whose numbers need the caveat most (a legacy dataset has no tallies, so there is no
+    fraction to print), and the compact rendering would then show speeds and accelerations off an
+    enforcement-truncated stream while saying nothing about it. The first line now always says
+    which stream was read, and shouts when that stream is truncated."""
+    plain_dir, _ = plain_run
+    clean = rb.render_lines(rb.scorecard(oracle_run, regime="urban"))
+    assert clean[0].startswith("- Traffic panel read **oracle**")
+    assert "survivorship 1.0000" in clean[0] and "TRUNCATED" not in clean[0]
+
+    trunc = rb.render_lines(rb.scorecard(plain_dir, regime="urban"))
+    assert trunc[0].startswith("- Traffic panel read **emissions**")
+    assert "ENFORCEMENT-TRUNCATED" in trunc[0]
+    assert "--emit-mobility-oracle" in trunc[0]
+    # a run generated since the change CAN report its own fraction even from the truncated stream
+    assert "survivorship 0." in trunc[0]
+
+
 def test_forcing_an_unavailable_source_is_an_error_not_a_silent_fallback(plain_run):
     """'Which stream did this number come from' is the question the mechanism exists to answer."""
     plain_dir, _ = plain_run

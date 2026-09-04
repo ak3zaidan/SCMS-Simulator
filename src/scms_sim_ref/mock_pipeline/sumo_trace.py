@@ -782,7 +782,7 @@ class SumoReplayMobility:
 # --------------------------------------------------------------------------- #
 def engine_network(net_path: str, *, frame_city: str = "", cache_dir: str = "datasets/_osmcache",
                    directed: bool = False, strong: bool | None = None, max_nodes: int = 0,
-                   shapes: bool = True, surface: bool = True):
+                   shapes: bool = True, surface: bool = True, signals: bool = False):
     """Import a SUMO `.net.xml` as the ENGINE's network and return the transform used to do it.
 
     Returns `(nodes, edges, info, tf)`. `tf` is the very function `netimport` applied to the
@@ -824,7 +824,15 @@ def engine_network(net_path: str, *, frame_city: str = "", cache_dir: str = "dat
 
     `directed` is therefore no longer what selects the trim -- it is kept because callers pass it and
     because it still records which LAYER of the document the caller intends to build from. Pass
-    `strong=False` explicitly to opt out, which only a diagnostic should do."""
+    `strong=False` explicitly to opt out, which only a diagnostic should do.
+
+    `signals=True` additionally reads the net's REAL ``<tlLogic>`` programs and emits
+    ``info["signal_programs"]`` -- the per-junction phase strings plus the movement -> link-index
+    mapping, in THESE node indices (see `signals.py`). It also forces the sumolib read to
+    ``withPrograms=True``, because sumolib silently drops every ``<tlLogic>`` otherwise and the
+    caller would get a city whose signals do not exist rather than an error. Off by default: the
+    read is ~15% slower with programs on a 16.9 MB net, and nothing consumes the layer unless
+    `PipelineConfig.real_signals` is set."""
     from . import netimport                            # noqa: PLC0415  (needs sumolib)
 
     frame = None
@@ -834,12 +842,13 @@ def engine_network(net_path: str, *, frame_city: str = "", cache_dir: str = "dat
             raise ValueError(f"sumo_frame_city must be one of {sorted(CITY_BBOXES)} "
                              f"(got {frame_city!r})")
         frame = road_projection(fetch_osm(CITY_BBOXES[frame_city], cache_dir))
-    net = netimport.read_net(net_path)
+    net = netimport.read_net(net_path, programs=bool(signals))
     if strong is None:
         strong = True
     nodes, edges, info = netimport.net_to_network(net, projection=frame, strong=strong,
                                                   max_nodes=max_nodes, shapes=shapes,
-                                                  undirected_shapes=shapes, surface=surface)
+                                                  undirected_shapes=shapes, surface=surface,
+                                                  signals=bool(signals))
     tf, _param = netimport._transformer(net, frame)
     info = dict(info)
     info["projection"] = frame

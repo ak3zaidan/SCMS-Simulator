@@ -105,8 +105,35 @@ string-keyed stream that exists nowhere else, so enabling sidewalks perturbs no 
 not the vehicle fleet, not the existing `f"{seed}:vru:{vid}"` placement stream, not the channel.
 With sidewalks off, nothing in this module is imported into the run at all.
 
-NOT WIRED HERE (owned by `run.py`, see the task report): the config flags, the call that builds
-the network, the substitution of `trip=walk` in `make_vru`, and a pedestrian-aware yield.
+WIRED INTO THE ENGINE by ``PipelineConfig.sidewalks`` / ``--sidewalks`` (with `sidewalk_width_m`,
+`kerb_clearance_m`, `crossing_wait_max_s`), default OFF and gated on ``vru_pct > 0``, so no pinned
+digest can see it. `run.py` builds the network once after the map, and `make_vru` sets
+``trip=walk`` -- that substitution IS the behavioural change, because `Vehicle.true_state` already
+had a ``trip is not None`` branch. WHICH CROSSINGS ARE SIGNALISED comes from the same source the
+VEHICLES use -- every junction under `traffic_lights`, the imported `<tlLogic>` junctions under
+`real_signals`, none otherwise -- so the two populations at a junction are on one clock; under
+`real_signals` the walk signal is the complement of that ARM's own program links
+(`run._make_ped_signal_fn`) rather than of a second fixed cycle.
+
+MEASURED end to end on InTAS (`real_signals`, 300 s, dt 0.5, seed 42, 6,065 sampled VRU positions),
+both columns scored by `measure_positions` against ONE derived pedestrian layer:
+
+                                       sidewalks OFF        sidewalks ON
+    on a pedestrian-legal area            2.65 %              100.00 %
+    distance to a legal area  p95        66.827 m               0.000 m
+    distance to the nearest road  p95    58.220 m               8.500 m
+
+STILL NOT WIRED, and stated rather than implied: a pedestrian-aware YIELD. `run.car_follow` opens
+with `active_list = [v for v in active_list if v.cf]` and `make_vru` never sets `cf`, so a VRU is
+still absent from the IDM leader search, from the gap-acceptance claims and from the signal logic.
+A pedestrian on a crossing is overrun rather than braked for; see VEHICLES DO NOT YIELD above.
+
+A DEFECT FOUND AND FIXED WHILE WIRING THIS: `_crossing_wait` used to hand `signal_fn` the
+CROSSING's own heading, and a derived crossing joins one arm's two kerbs -- it runs PERPENDICULAR
+to the traffic it conflicts with. The signal was therefore being asked about the CROSS street: the
+pedestrian was held through the conflicting movement's red and released into its green, exactly
+inverted. The arm bearing is now recorded on the link at build time (`add_link(..., arm=...)`) and
+is what gets asked.
 """
 from __future__ import annotations
 
@@ -620,7 +647,7 @@ class SidewalkNetwork:
                 self.adj.append([])
             return i
 
-        def add_link(kind, na, nb, pts, junction=None, signalised=False) -> int:
+        def add_link(kind, na, nb, pts, junction=None, signalised=False, arm=None) -> int:
             cum = _polyline_cum(pts)
             if cum[-1] <= 1e-9 or na == nb:
                 return -1
@@ -628,8 +655,17 @@ class SidewalkNetwork:
                 raise ValueError(f"pedestrian network exceeds {MAX_PED_LINKS} links -- the road "
                                  f"map is too large to derive sidewalks for")
             k = len(self.links)
-            self.links.append({"kind": kind, "a": na, "b": nb, "pts": pts, "cum": cum,
-                               "len": cum[-1]})
+            rec = {"kind": kind, "a": na, "b": nb, "pts": pts, "cum": cum, "len": cum[-1]}
+            if arm is not None:
+                # Bearing (deg) of the ROAD ARM this crossing crosses, which is NOT the crossing's
+                # own heading: a derived crossing joins one arm's two kerbs, so it runs
+                # PERPENDICULAR to the traffic it conflicts with. Recorded at build time because
+                # only the builder knows which arm a crossing belongs to, and because a signal
+                # answer taken off the crossing's own heading is exactly 90 degrees wrong -- it
+                # holds the pedestrian through the conflicting movement's red and releases it into
+                # the green. See `_crossing_wait`.
+                rec["arm"] = float(arm) % 360.0
+            self.links.append(rec)
             self.junction_of.append(junction)
             self.signalised.append(bool(signalised))
             self.adj[na].append((nb, k))
@@ -768,8 +804,14 @@ class SidewalkNetwork:
                     sig = jn in osm_sig_nodes
                 else:
                     sig = sig_all or jn in sig_set
+                # the arm this crossing crosses: the edge's own direction at that junction. The
+                # crossing polyline joins the arm's two kerbs and is perpendicular to it, so this
+                # is the heading the signal must be asked about (see `add_link`).
+                _ap = e_pts[k]
+                (_ax, _ay), (_bx, _by) = ((_ap[0], _ap[1]) if end == 0 else (_ap[-1], _ap[-2]))
                 li = add_link(CROSSING, i0, i1, [self.pts[i0], self.pts[i1]],
-                              junction=nodes[jn], signalised=sig)
+                              junction=nodes[jn], signalised=sig,
+                              arm=math.degrees(math.atan2(_by - _ay, _bx - _ax)))
                 if li >= 0:
                     crossing_m += self.links[li]["len"]
                     n_signalised += 1 if sig else 0
@@ -1203,13 +1245,25 @@ class SidewalkNetwork:
         of the junction, not of the seed). Unsignalised -- a uniform draw bounded by
         `max_unsig`, standing in for gap acceptance, which cannot be modelled honestly while
         vehicles do not yield and pedestrians are outside the car-following state.
+
+        THE SIGNAL IS ASKED ABOUT THE ARM, NOT ABOUT THE CROSSING. A derived crossing joins one
+        arm's two kerbs, so its own heading is PERPENDICULAR to the traffic it conflicts with, and
+        a `signal_fn` given the crossing's heading answers about the cross street -- exactly 90
+        degrees wrong, which holds the pedestrian through the conflicting movement's red and
+        releases it into the green. `links[li]["arm"]` carries the real arm bearing, recorded at
+        build time; a crossing derived from a MAPPED footway has no single arm, so it falls back to
+        the perpendicular of its own heading, which is the same answer for a footway that crosses
+        the road it is filed against squarely.
         """
         if self.signalised[li] and signal_fn is not None and self.junction_of[li] is not None:
             node = self.junction_of[li]
+            arm = self.links[li].get("arm")
+            if arm is None:
+                arm = heading_deg + 90.0
             tt = 0.0
             limit = 300.0
             while tt < limit:
-                if signal_fn(node, heading_deg, t + tt):
+                if signal_fn(node, arm, t + tt):
                     return tt
                 tt += _SIGNAL_PROBE_S
             return 0.0

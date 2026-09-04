@@ -2455,9 +2455,36 @@ def _ref_text(ref: dict) -> str:
 _ICON = {"pass": "✅", "fail": "⚠️", "na": "—"}
 
 
+def source_line(card: dict) -> str:
+    """One line naming WHICH STREAM the traffic panel read and how much of the mobility survived.
+
+    The JSON carries `traffic_source` and `survivorship` as blocks and every traffic row repeats
+    them in `details`, but the compact rendering is what a datasheet embeds -- and with
+    `include_na=False` the two survivorship METRICS are themselves `na` on exactly the datasets
+    whose numbers most need the caveat (a legacy dataset carries no tallies, so
+    `survivorship_vehicle_steps_frac` has no value to print). Without this line such a scorecard
+    shows speeds and accelerations off an enforcement-truncated stream and says nothing about it.
+    """
+    src = card.get("traffic_source") or {}
+    surv = card.get("survivorship") or {}
+    kind = src.get("source", "?")
+    frac = surv.get("vehicle_steps_survival_frac")
+    if frac is not None:
+        state = f"survivorship {frac:.4f}"
+    else:
+        rv = surv.get("revoked_vehicle_frac")
+        state = ("survivorship UNMEASURABLE (this dataset carries no un-enforced record and no "
+                 "step-loop tallies" + (f"; {rv:.2%} of its vehicles were revoked)" if rv is not None
+                                        else ")"))
+    warn = ("  **ENFORCEMENT-TRUNCATED**: a revoked vehicle stops broadcasting, so this is a record "
+            "of what the MA could hear and not a traffic sample. Re-run with "
+            "`--emit-mobility-oracle`, or pass `--sumo-trace`." if src.get("truncated") else "")
+    return f"- Traffic panel read **{kind}**, {state}.{warn}"
+
+
 def render_lines(card: dict, include_na: bool = False) -> list[str]:
     """Compact one-line-per-metric rendering for the datasheet's realism scorecard."""
-    lines: list[str] = []
+    lines: list[str] = [source_line(card)]
     for panel in ("traffic", "comm"):
         rows = [m for m in card.get("panels", {}).get(panel, [])
                 if include_na or m["status"] != "na"]

@@ -1357,9 +1357,11 @@ class CustomNetwork(_LaneFrameMixin):
         phase on any topology instead of the meaningless grid-coordinate arithmetic used before.
 
         THE TOY MODEL, and it is the one the realism harness fails on. It knows nothing about
-        movements, yellow, turn phases or offsets, and `run.py` applies it to every junction on the
-        map or to none. `set_signal_plan` / `signal_char` are the real-program path; this stays the
-        default and stays byte-identical."""
+        movements, yellow, turn phases or offsets, and `cfg.traffic_lights` applies it to every
+        junction on the map or to none. `set_signal_plan` / `signal_char` are the real-program path
+        (`cfg.real_signals`), and where a real program governs a movement `run.car_follow` never
+        reaches this method; this stays the default, the fallback wherever no program governs, and
+        byte-identical."""
         if self._phase is None:
             self._phase = self._colouring()
         if self._coord_idx is None:

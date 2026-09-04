@@ -965,8 +965,9 @@ class InternalMobility:
     """The engine's OWN mobility, named so it can be SELECTED rather than merely assumed.
 
     `roads.random_trip` picks a shortest-path route, `run_pipeline.car_follow` integrates the
-    Intelligent Driver Model along it, and traffic lights come from `net.node_phase`'s 2-colouring.
-    This class holds no code: it is the registry entry that makes "internal" one option among
+    Intelligent Driver Model along it, and traffic lights come from `net.node_phase`'s 2-colouring
+    -- or, with `real_signals`, from the imported `<tlLogic>` program of the movement the vehicle is
+    actually making. This class holds no code: it is the registry entry that makes "internal" one option among
     several instead of the hard-coded only one, exactly as `disc` is for the channel. It is the
     DEFAULT and it is what every pinned golden was measured on."""
 
@@ -2157,6 +2158,50 @@ class PipelineConfig:
     idm_lookahead_m: float = 70.0        # leader search distance ahead
     traffic_lights: bool = False         # signalized intersections (grid nodes) -> stops & queues
     light_cycle_s: float = 24.0          # full signal cycle (half green per axis)
+    # --- REAL imported signal programs (mock_pipeline/signals.py) ------------------------------
+    # THE ACTIVATION SURFACE for `roads._LaneFrameMixin.set_signal_plan` / `signals.SignalPlan`.
+    # `traffic_lights` above is a TOY: one 24 s cycle for the whole city, split half/half between
+    # "mostly E-W" and "mostly N-S" off a graph 2-colouring, applied to EVERY junction or to none,
+    # with no yellow, no turn phase, no offset, and no notion that the MOVEMENT (which way you are
+    # turning) decides your colour. `real_signals` instead drives each junction from the
+    # `<tlLogic>` program the .net.xml actually ships -- InTAS carries 98 of them, cycles 77-116 s
+    # (86 of 98 exactly 90 s), 3-11 phases, 1042 controlled connections, 1489 green characters of
+    # which 303 are PERMISSIVE 'g', and every one of them carrying a yellow.
+    #
+    # THE THREE COLOURS ARE DISTINCT, behaviourally and not just in the record:
+    #   'G' protected green -- the movement owns the junction, proceed;
+    #   'g'/'s' permissive green -- proceed but GIVE WAY to the conflicting protected stream (a
+    #           permissive left crosses oncoming through traffic; flattening 'g' into 'G' would put
+    #           two head-on movements through each other at every permissive phase);
+    #   'y'/'u' yellow -- stop, unless already inside the dilemma zone (cannot stop at the
+    #           comfortable deceleration), which is the standard rule and keeps yellow from
+    #           manufacturing -6 m/s^2 emergency stops that read as attacks;
+    #   'r'     red -- stop.
+    # A junction the plan does not govern answers None and keeps TODAY'S behaviour exactly: the toy
+    # cycle when `traffic_lights` is on, no signal at all when it is off. That is what makes this
+    # composable with `traffic_lights` rather than an alternative to it.
+    #
+    # Only an IMPORTED city ships programs, so this needs road_network="sumo" (read straight from
+    # the .net.xml) or "custom" with a document carrying the `signal_programs` layer that
+    # `netimport.py --signals` writes. Default OFF -> `set_signal_plan` is never called, the map
+    # allocates nothing, `signal_char` is not reached, and NOT ONE rng draw is added (a movement's
+    # colour at time t is a pure function of the program), so every pinned golden holds.
+    real_signals: bool = False
+    # --- pedestrian infrastructure (mock_pipeline/vru.py) ---------------------------------------
+    # THE ACTIVATION SURFACE for `vru.SidewalkNetwork`. Without it a VRU is placed
+    # `offroad_tol_m * (1.3..2.0)` metres off a random junction in BOTH axes and walks a dead
+    # straight line for its whole life: measured on InTAS, 5.59% of its sampled positions are on a
+    # pedestrian-legal area and 54.47% are beyond `offroad_tol_m` of any road. With it, a VRU walks
+    # derived sidewalks, waits at the kerb and crosses at crossings. Draws exclusively from
+    # `f"{seed}:vruwalk:{vid}"`, a stream that exists nowhere else, so it perturbs neither the
+    # vehicle fleet nor the existing `f"{seed}:vru:{vid}"` placement stream. Default OFF, and
+    # reached only when vru_pct > 0 -> byte-identical on every pinned path.
+    sidewalks: bool = False
+    sidewalk_width_m: float = 2.0        # footway width (m); RASt 06 puts a two-way footway at 2.5,
+                                         # absolute minimum 1.5 -- 2.0 is the documented middle
+    kerb_clearance_m: float = 0.5        # gap from the kerb line to the inner edge of the footway
+    crossing_wait_max_s: float = 8.0     # longest kerb wait at an UNSIGNALISED crossing (a gap-
+                                         # acceptance surrogate: vehicles do not yield to pedestrians)
     # per-edge speed hierarchy (highway vs residential). OFF by default -> byte-identical output.
     # GRID: every arterial_every-th row & column is an arterial posted at arterial_speed_mps; all
     # other (local) roads are posted at local_speed_mps (0 for either tier = uncapped, i.e. the
@@ -2550,11 +2595,15 @@ def _parse_custom_network(s, *, directed: bool = False) -> tuple[list, list]:
     **326 nodes / 610 edges, `directed=True`, 160 one-way, 385 lane-specified.**
 
     What is still NOT consumed, stated rather than implied: `shape` polylines pass through
-    `edges_from_directed` and ARE honoured, but `signal_nodes` is ignored -- the engine's signals
-    come from `cfg.traffic_lights` on a grid. Wiring it up is not a one-liner and must not be done
-    carelessly: `largest_strong_component` REMAPS node indices and returns only counts, not the
-    remap, so a consumer that indexed the original `signal_nodes` into the trimmed graph would
-    signalise the wrong junctions. `buildings` is unaffected -- polygons in metres, not indices.
+    `edges_from_directed` and ARE honoured, but the bare `signal_nodes` index list is still ignored,
+    for the reason that made it dangerous in the first place -- `largest_strong_component` REMAPS
+    node indices and returns only counts, not the remap, so a consumer that indexed the original
+    `signal_nodes` into the trimmed graph would signalise the wrong junctions. The richer
+    `signal_programs` layer IS consumed, by `cfg.real_signals`, and it is safe for exactly the
+    reason the index list is not: `signals.SignalPlan.from_records` resolves every node index
+    against the DOCUMENT's own `nodes` array once, at build time, and then addresses junctions by
+    COORDINATE, which survives the trim unchanged. `buildings` is likewise unaffected -- polygons in
+    metres, not indices.
     """
     if isinstance(s, dict):
         doc = s
@@ -2586,6 +2635,84 @@ def _parse_custom_network(s, *, directed: bool = False) -> tuple[list, list]:
             f"{len(nodes)} nodes / {len(edges)} edges. A bbox clip that cuts every return path "
             f"leaves a map on which no round trip exists.")
     return nodes, edges
+
+
+def _make_ped_signal_fn(net, cfg):
+    """`signal_fn(junction_xy, arm_bearing_deg, t) -> may a pedestrian START crossing that arm?`
+
+    A crossing conflicts with the traffic travelling ALONG the arm it crosses, so the walk signal is
+    the complement of that arm's vehicle green. Which vehicle model answers that depends on what is
+    switched on, and the point of routing it through one factory is that the pedestrians and the
+    vehicles at a junction are then provably on ONE clock rather than two that agree by coincidence:
+
+      * `real_signals` -- the arm's own `<tlLogic>` links, pooled most-permissive-first, out of the
+        very `SignalPlan` `car_follow` reads. A pedestrian may step off the kerb exactly when no
+        conflicting vehicle movement is green. Yellow counts as NOT green here (a vehicle inside the
+        dilemma zone is still coming), which is the conservative reading and the one that matches
+        the clearance interval a real pedestrian phase has.
+      * `traffic_lights` only -- `vru.engine_signal_fn`, which reproduces `_light_green` exactly.
+      * both, at a junction with no imported program -- falls through to the toy cycle, which is
+        precisely "keep today's behaviour where there is no program".
+
+    Deterministic and RNG-free on every branch. Returns None when no crossing can be signalised, in
+    which case `SidewalkNetwork.walk` uses its unsignalised gap-acceptance surrogate throughout.
+    """
+    plan = getattr(net, "signal_plan", None)
+    toy = None
+    if cfg.traffic_lights:
+        from .vru import engine_signal_fn                # noqa: PLC0415  (opt-in path only)
+        toy = engine_signal_fn(net, cfg.light_cycle_s / 2.0)
+    if plan is None:
+        return toy
+    from .signals import GREEN, char_colour              # noqa: PLC0415  (opt-in path only)
+    # Per junction: the approaches, with the BEARING OF TRAVEL of each (from -> junction) and its
+    # pooled link indices. Built once here rather than per probe: `walk()` solves a kerb wait by
+    # stepping the signal forward in 0.5 s probes, so an O(approaches) scan inside that loop would
+    # be paid tens of thousands of times per pedestrian.
+    idx: dict = {}
+    for node_key in plan.programs:
+        rows = []
+        for frm, links in plan.approaches(node_key):
+            rows.append((math.degrees(math.atan2(node_key[1] - frm[1],
+                                                 node_key[0] - frm[0])) % 360.0, links))
+        if rows:
+            idx[node_key] = rows
+
+    def signal_fn(node_xy, arm_bearing_deg: float, t: float) -> bool:
+        key = (float(node_xy[0]), float(node_xy[1]))
+        rows = idx.get(key)
+        if rows is None:
+            return True if toy is None else toy(node_xy, arm_bearing_deg, t)
+        # every approach whose direction of travel lies along this arm, either way down it
+        links: list = []
+        for bearing, ls in rows:
+            d = _ang_diff(bearing, arm_bearing_deg)
+            if d <= 45.0 or d >= 135.0:
+                links.extend(ls)
+        if not links:
+            return True                    # no signalised vehicle movement uses this arm
+        return char_colour(plan.programs[key].char_of(t, links)) != GREEN
+
+    return signal_fn
+
+
+def _custom_network_doc(s):
+    """The custom-network document as a dict, or None when there is nothing parseable.
+
+    A read-only accessor for the OPTIONAL layers (`signal_programs` today) that
+    `_parse_custom_network` deliberately does not return -- it hands back `(nodes, edges)` and
+    nothing else, and every caller that needs a side layer would otherwise re-implement the
+    string/dict/JSON tri-state. Never raises: `_parse_custom_network` is the validator, and a
+    document malformed enough to fail here fails there with the design-actionable message."""
+    if isinstance(s, dict):
+        return s
+    if not s or not str(s).strip():
+        return None
+    try:
+        doc = json.loads(s)
+    except json.JSONDecodeError:
+        return None
+    return doc if isinstance(doc, dict) else None
 
 
 def _parse_buildings(s) -> list:
@@ -2860,6 +2987,55 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         # signalized, so it defers entirely to the signal -> it is most meaningful with traffic_lights=false.
     if cfg.light_cycle_s <= 0:
         raise ValueError(f"light_cycle_s must be > 0 (got {cfg.light_cycle_s})")
+    if cfg.real_signals:
+        # Only an IMPORTED city ships <tlLogic> programs. Grid/ring/spider are procedural and a
+        # `linear` road has no junctions at all, so the flag could only ever be a silent no-op
+        # there -- exactly the class of dead knob this repo refuses to ship.
+        if cfg.road_network not in ("sumo", "custom"):
+            raise ValueError(
+                f"real_signals needs road_network='sumo' (read the <tlLogic> programs straight out "
+                f"of the .net.xml) or 'custom' with a document carrying the `signal_programs` layer "
+                f"that `python -m scms_sim_ref.mock_pipeline.netimport --signals` writes (got "
+                f"road_network={cfg.road_network!r}): a procedural grid/ring/spider map has no real "
+                f"programs to import, so the flag would do nothing")
+        if not cfg.traffic_flow:
+            raise ValueError("real_signals needs traffic_flow=true: a signal is obeyed by the ROUTED "
+                             "car-following integrator, and a fixed-fleet vehicle drives a straight "
+                             "line past every junction")
+        if not cfg.car_following:
+            raise ValueError("real_signals needs car_following=true: the stop at a red is applied as "
+                             "a virtual stopped leader in the IDM, and there is no other brake")
+        if cfg.mobility_source != "internal":
+            # SUMO already ran the signal control that produced the frozen trajectory; the IDM
+            # integrator is OFF under replay (`cf_active`), so this would be read by nothing.
+            raise ValueError(
+                f"real_signals is meaningless with mobility_source={cfg.mobility_source!r}: a "
+                f"replayed trajectory was already driven through SUMO's own (actuated) signal "
+                f"control and the engine's car-following integrator is disabled under replay, so "
+                f"no vehicle would ever read the imported programs")
+        if cfg.road_network == "custom":
+            _doc = _custom_network_doc(cfg.custom_network)
+            if not (_doc or {}).get("signal_programs"):
+                raise ValueError(
+                    "real_signals=true but the custom_network document carries no `signal_programs` "
+                    "layer. Re-import the net with `python -m scms_sim_ref.mock_pipeline.netimport "
+                    "--net <city>.net.xml --signals --strong --out map.json`, or set "
+                    "real_signals=false")
+    if cfg.sidewalks:
+        # Sidewalks are derived from the ROAD graph, so `linear` (which builds no network object at
+        # all) has nothing to offset off. And they exist to carry VRUs: with vru_pct=0 nothing walks.
+        if cfg.road_network == "linear":
+            raise ValueError("sidewalks needs a routed road network (grid, ring, spider, custom or "
+                             "sumo): road_network='linear' has no graph to derive footways from")
+        if cfg.vru_pct <= 0:
+            raise ValueError("sidewalks needs vru_pct > 0: the pedestrian network exists to carry "
+                             "VRUs, and with none spawned nothing would ever walk on it")
+    if cfg.sidewalk_width_m <= 0:
+        raise ValueError(f"sidewalk_width_m must be > 0 (got {cfg.sidewalk_width_m})")
+    if cfg.kerb_clearance_m < 0:
+        raise ValueError(f"kerb_clearance_m must be >= 0 (got {cfg.kerb_clearance_m})")
+    if cfg.crossing_wait_max_s < 0:
+        raise ValueError(f"crossing_wait_max_s must be >= 0 (got {cfg.crossing_wait_max_s})")
     if cfg.grid_block_m <= 0:
         raise ValueError(f"grid_block_m must be > 0 (got {cfg.grid_block_m})")
     if not (0.0 <= cfg.grid_dropout <= 1.0):
@@ -3191,8 +3367,10 @@ def _field_group(name: str) -> str:
         ("Mobility", ("fleet", "trip_", "idm_", "demand", "arrival", "n_lanes", "lane_", "turn_",
                       "gap_acceptance", "car_following", "veh_length", "od_", "boundary",
                       "traffic_flow", "duration", "max_total", "nominal_speed", "state_prune", "vru_",
-                      "mobility_source", "sumo_trace", "sumo_cert_slack", "sumo_offroad")),
+                      "crossing_wait", "mobility_source", "sumo_trace", "sumo_cert_slack",
+                      "sumo_offroad")),
         ("Network", ("road_network", "grid", "custom_network", "traffic_lights", "light_cycle",
+                     "real_signals", "sidewalks", "sidewalk_width", "kerb_clearance",
                      "arterial", "local_speed", "directed_lanes", "drive_side",
                      "sumo_net", "sumo_frame_city")),
         ("Scenario events", ("events",)),
@@ -3362,6 +3540,18 @@ _FIELD_META = {
     "grid_dropout": dict(h="Fraction of grid roads removed (irregular grid; stays connected)", lo=0, hi=1, st=0.05),
     "traffic_lights": dict(h="Signalized intersections (stops + queues)"),
     "light_cycle_s": dict(h="Full signal cycle; half green per axis", lo=2, hi=120, u="s"),
+    "real_signals": dict(h="Drive each junction from the REAL <tlLogic> program the imported "
+                           ".net.xml ships — per-movement colour, yellow, and permissive green "
+                           "distinct from protected — instead of the toy 2-phase cycle. Needs an "
+                           "imported map (road_network sumo/custom); a junction with no program "
+                           "keeps today's behaviour"),
+    "sidewalks": dict(h="VRUs walk derived sidewalks and cross at crossings instead of random-"
+                        "walking off-road; needs vru_pct > 0 and a routed network"),
+    "sidewalk_width_m": dict(h="Footway width (sidewalks)", lo=0.5, hi=8, st=0.1, u="m"),
+    "kerb_clearance_m": dict(h="Gap from the kerb line to the inner edge of the footway",
+                             lo=0, hi=5, st=0.1, u="m"),
+    "crossing_wait_max_s": dict(h="Longest kerb wait at an UNSIGNALISED crossing (gap-acceptance "
+                                  "surrogate)", lo=0, hi=60, st=0.5, u="s"),
     "arterial_every": dict(h="Grid: every Nth row & column is a faster arterial road (0 = off)",
                            lo=0, hi=10, st=1),
     "arterial_speed_mps": dict(h="Speed limit on arterial roads (grid) / the whole ring (0 = uncapped)",
@@ -3680,6 +3870,28 @@ LANE_CHANGE_HOOK = None
 # with a small dict each time a vehicle YIELDS at an unsignalized intersection under gap-acceptance
 # (vid, t, node[x,y], dnode, speed, is_attacker, is_faulty). Tests use it to assert yields occur.
 GAP_YIELD_HOOK = None
+# Telemetry seam (default None -> zero effect, byte-identical): invoked with a small dict every time
+# a REAL imported <tlLogic> program governs a vehicle's next movement (vid, t, node[x,y], dnode,
+# char, action). Reached only when `real_signals` is on, and gated on the hook being set, so it can
+# never move a digest. Tests use it to assert that the colour a vehicle is told is the colour its own
+# movement has -- which is the one thing a plausible-looking wrong mapping would hide.
+SIGNAL_HOOK = None
+
+#: A permissive green ('g'/'s') grants no right of way, so the driver still needs a gap in the
+#: conflicting protected stream. HCM 6th edition puts the base critical headway for a PERMITTED
+#: left turn from an exclusive lane at 4.1 s; a conflicting vehicle further away than that in TIME
+#: is a gap this driver takes. Without a gap criterion a permissive left would simply wait out the
+#: whole opposing green and block its own approach, which is a modelling artifact rather than
+#: traffic.
+PERMISSIVE_CRITICAL_GAP_S = 4.1
+#: How sharp a turn has to be before it counts as turning ACROSS the opposing stream (deg of
+#: heading change through the junction). 20 deg keeps a curved through-movement out of it.
+PERMISSIVE_ACROSS_DEG = 20.0
+#: Yellow is a stop UNLESS the vehicle is already inside the dilemma zone -- it cannot reach the
+#: stop line's far side and cannot stop at its own comfortable deceleration, so it proceeds. Without
+#: this rule a yellow manufactures -6 m/s^2 emergency stops (the IDM's floor) out of ordinary
+#: traffic, which is a benign kinematic transient the detectors would then have to absorb.
+YELLOW_DILEMMA = True
 
 
 def run_pipeline(cfg: PipelineConfig) -> RunResult:
@@ -3838,7 +4050,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         from .sumo_trace import engine_network, file_sha256 as _net_sha
         _sumo_nodes, _sumo_edges, _sumo_info, _sumo_tf = engine_network(
             cfg.sumo_net, frame_city=cfg.sumo_frame_city,
-            directed=cfg.custom_network_directed)
+            directed=cfg.custom_network_directed, signals=cfg.real_signals)
         _sumo_net_sha = _net_sha(cfg.sumo_net)
         net = CustomNetwork(*_parse_custom_network(
             network_document(_sumo_nodes, _sumo_edges, _sumo_info),
@@ -3871,6 +4083,89 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     if cfg.directed_lanes and net is not None:
         net.enable_directed_lanes(lane_width_m=cfg.lane_width_m, drive_side=cfg.drive_side,
                                   lanes_per_dir=cfg.n_lanes)
+    # ---- OPT-IN REAL signal programs ---------------------------------------------------------- #
+    # `signals.SignalPlan` answers "what colour does THIS movement have at time t" out of the
+    # <tlLogic> the imported .net.xml ships. Attached to the map here, read by `car_follow` below,
+    # and NOTHING else changes: no node, no edge, no route, and no rng draw (a movement's colour is
+    # a pure function of the program, so a signalised run adds zero draws to any stream). Default
+    # OFF -> `set_signal_plan` is never called and `_LaneFrameMixin.signal_plan` stays the class
+    # attribute None, which is what makes `signal_char` a `plan is None` test at the call site
+    # rather than a getattr.
+    #
+    # THE PLAN IS KEYED ON COORDINATES, not node indices, and that is load-bearing rather than
+    # stylistic: `roads.largest_strong_component` (which every directed import runs through, and
+    # which `engine_network` now runs UNCONDITIONALLY) remaps node indices and returns no remap, so
+    # a plan carried across it by index would signalise the wrong junctions and still look entirely
+    # plausible. `from_records` resolves the record indices against the array they were WRITTEN
+    # against -- the importer's own `nodes`, before any further trim -- exactly once, here.
+    _sig_stats: dict = {}
+    if cfg.real_signals and net is not None:
+        from .signals import SignalPlan
+        if cfg.road_network == "sumo":
+            _sig_records = _sumo_info.get("signal_programs") or []
+            _sig_nodes = _sumo_nodes
+        else:                                      # "custom": the netimport --signals document
+            _sig_doc = _custom_network_doc(cfg.custom_network) or {}
+            _sig_records = _sig_doc.get("signal_programs") or []
+            _sig_nodes = _sig_doc.get("nodes") or []
+        _sig_stats = net.set_signal_plan(SignalPlan.from_records(_sig_records, _sig_nodes))
+        if not _sig_stats.get("programs"):
+            # A refusal, not a warning. `real_signals` past validate_config means the layer WAS
+            # present; landing zero programs on the graph means every record was skipped (node
+            # indices that do not address this `nodes` array), and the run would silently be the
+            # toy-signal run the flag exists to replace.
+            raise ValueError(
+                f"real_signals=true but no imported program landed on the graph: "
+                f"{len(_sig_records)} signal_programs records resolved to 0 junctions "
+                f"({_sig_stats.get('skipped_records', 0)} skipped). The records' node indices do "
+                f"not address the {len(_sig_nodes)} nodes they were read against.")
+        if _sig_stats.get("collisions"):
+            # Two DIFFERENT programs on one junction coordinate: the importer's node dedupe merged
+            # two signalised junctions, and half the movements would be lit by a program that does
+            # not govern them. Never silent.
+            raise ValueError(
+                f"real_signals: {_sig_stats['collisions']} junction coordinate(s) carry two "
+                f"different <tlLogic> programs -- the node dedupe merged two signalised junctions, "
+                f"so one program's movements would be lit by the other's phase string")
+        if cfg.verbose:
+            print(f"[real signals] {_sig_stats['programs']} programs on "
+                  f"{_sig_stats['approaches']} approaches / {_sig_stats['movements']} movements "
+                  f"(of {len(_sig_records)} records, {_sig_stats['skipped_records']} skipped)",
+                  flush=True)
+    # ---- OPT-IN pedestrian infrastructure ----------------------------------------------------- #
+    # `vru.SidewalkNetwork` derives one footway per side of every road edge, a crossing per junction
+    # arm and the corner links that join them, then hands out `PedestrianWalk` itineraries that drop
+    # straight into `Vehicle.true_state`'s existing `trip is not None` branch. Default OFF, and
+    # gated on vru_pct > 0, so nothing here is imported, built or drawn from on any pinned path.
+    _sidewalks = None
+    _ped_signal_fn = None
+    _sidewalk_stats: dict = {}
+    if cfg.sidewalks and net is not None and cfg.vru_pct > 0:
+        from . import vru as _vru
+        # WHICH CROSSINGS ARE SIGNALISED must be the same question the VEHICLES answer, or the two
+        # populations at one junction are on two different clocks. `signal_nodes=None` signalises
+        # every junction -- exactly what `traffic_lights` does to the vehicles -- and an explicit
+        # COORDINATE list signalises only those. Coordinates, never indices: the strong-component
+        # trim remaps indices and returns no remap (the same trap `set_signal_plan` documents).
+        _ped_sig_nodes = None                      # None = every junction (traffic_lights semantics)
+        if not cfg.traffic_lights:
+            _ped_sig_nodes = (sorted(net.signal_plan.programs) if net.signal_plan is not None
+                              else ())             # real programs only, or nothing at all
+        _sidewalks = _vru.build_sidewalks(
+            net, lane_width_m=cfg.lane_width_m, lanes_per_dir=cfg.n_lanes,
+            drive_side=cfg.drive_side, sidewalk_width_m=cfg.sidewalk_width_m,
+            kerb_clearance_m=cfg.kerb_clearance_m, signal_nodes=_ped_sig_nodes)
+        if _sidewalks is None:
+            raise ValueError("sidewalks=true but no pedestrian network could be derived from this "
+                             "road map")
+        _sidewalk_stats = _sidewalks.stats()
+        _ped_signal_fn = _make_ped_signal_fn(net, cfg)
+        if cfg.verbose:
+            print(f"[sidewalks] {_sidewalk_stats.get('ped_links', '?')} ped links "
+                  f"({_sidewalk_stats.get('sidewalk_total_m', '?')} m footway, "
+                  f"{_sidewalk_stats.get('crossings', '?')} crossings, "
+                  f"{_sidewalk_stats.get('signalised_crossings', '?')} signalised) over "
+                  f"{_sidewalk_stats.get('components', '?')} components", flush=True)
     # ---- OPT-IN SUMO-backed mobility: load the frozen trajectory ----------------------------- #
     # `mobility_source="internal"` (the default) leaves `_replay` None: not one line below runs, no
     # module is imported, no rng is drawn, every pinned golden holds. When it IS on, this is the
@@ -4140,10 +4435,30 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                                "ghost": False, "veh_vid": vid}
         gt_idmap.append(R.GtIdentityMap(true_vehicle_id=true_id, pseudonym_cert_digest=dig,
                                         i_period=0, valid_from=round(vf, 3), valid_to=round(vt, 3)))
+        # ---- OPT-IN: a real pedestrian itinerary on the derived sidewalk network ----------------
+        # `PedestrianWalk` exposes `.state(t)`, which is the whole of what `Vehicle.true_state`'s
+        # `trip is not None` branch needs, so substituting it here is the entire behavioural change:
+        # the VRU walks footways, waits at kerbs and crosses at crossings instead of holding one
+        # heading for its whole life. `spawn_x`/`lane_y` are set to the walk's own start so the
+        # spawn coordinate and the trajectory agree (they are read by the GUI and by the fixed-fleet
+        # path). Every draw comes from `f"{seed}:vruwalk:{vid}"` -- a stream that exists nowhere
+        # else -- so the `f"{seed}:vru:{vid}"` sequence below is untouched and a run with
+        # sidewalks off is byte-identical.
+        walk = None
+        if _sidewalks is not None:
+            walk = _sidewalks.walk(vid, cfg.seed, spawn_time, life, cfg.vru_speed_mps,
+                                   signal_fn=_ped_signal_fn,
+                                   unsignalised_max_wait_s=cfg.crossing_wait_max_s)
         # placement: near a network node but DELIBERATELY off the road centerline (a plaza / pedestrian
         # zone / separated path), i.e. > offroad_tol_m from any road in both axes, so a naive mapOffRoad
         # check WOULD flag them -- which is exactly why a VRU-declared beacon suppresses that detector.
-        if nodes:
+        # With a walk the START COMES FROM THE FOOTWAY and the five placement draws below are simply
+        # not taken, so this VRU's own `f"{seed}:vru:{vid}"` stream advances differently from a
+        # non-sidewalk run (its gps_q and wander parameters move). That is confined to VRUs on the
+        # opt-in path -- no vehicle stream, and no other VRU's stream, is touched.
+        if walk is not None:                               # on a footway, by construction
+            sx, sy = walk.start()
+        elif nodes:
             nx, ny = nodes[vr.randrange(len(nodes))]
             dx = cfg.offroad_tol_m * (1.3 + 0.7 * vr.random()) * (1.0 if vr.random() < 0.5 else -1.0)
             dy = cfg.offroad_tol_m * (1.3 + 0.7 * vr.random()) * (1.0 if vr.random() < 0.5 else -1.0)
@@ -4158,7 +4473,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             wander_w=0.1 + vr.random() * 0.2, phase=vr.random() * 6.283,
             gps_q=cfg.gps_quality_floor + vr.expovariate(cfg.gps_quality_lambda), is_faulty=False, attack_type="none",
             pseudonyms=pseudonyms, colluder=False, spawn_time=spawn_time,
-            finish_time=(spawn_time + life if cfg.traffic_flow else None), trip=None)
+            finish_time=(spawn_time + life if cfg.traffic_flow else None), trip=walk)
         v.is_vru = True
         v.veh_type, v.veh_length = "vru", 0.5
         vehicles.append(v)
@@ -4811,11 +5126,32 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     _lights = bool(cfg.traffic_lights and net is not None)
     _turn = bool(cfg.turn_slowdown and net is not None)
     _half_cycle = max(1.0, cfg.light_cycle_s / 2.0)
+    # REAL imported <tlLogic> programs (opt-in; see PipelineConfig.real_signals). `_real` is the only
+    # thing that switches on the movement-aware path below; with it off, `net.signal_plan` is the
+    # class attribute None, `_sig` collapses to `_lights`, and every branch is the one that was
+    # there before, in the same order, drawing the same nothing.
+    _real = bool(cfg.real_signals and net is not None and net.signal_plan is not None)
+    _sig = _lights or _real
+    # 'g' (green, give way) / 's' (green right-arrow, stop first) / 'o' (dark). Bound here rather
+    # than imported at module scope so a default run never imports `signals` at all.
+    _is_permissive = None
+    if _real:
+        from .signals import is_permissive as _is_permissive        # noqa: PLC0415
+    # Per-vehicle-step tally of what the signals actually SERVED, so a run can be judged on the
+    # colours it delivered rather than on the flag being set. Manifest-only (`counts`, which
+    # `_data_digest` excludes by construction), integer, and never read back into the simulation.
+    _sig_served = {"G": 0, "g": 0, "y": 0, "r": 0, "toy_green": 0, "toy_red": 0, "none": 0,
+                   "dilemma_go": 0, "permissive_yield": 0}
     # gap-acceptance at UNsignalized intersections: opt-in, and (like _turn) a no-op unless the world
     # supports it (routed car-following). It governs unsignalized nodes only, so with traffic_lights on
     # (every node signalized) it defers entirely to the signal -> effectively active only when _lights is
     # off. When off, none of the yield code below is reached and NO rng is drawn -> byte-identical output.
-    _gap = bool(cf_active and cfg.gap_acceptance and not _lights)
+    # WITH REAL SIGNALS it stops being vacuous under `_lights`: an imported program hands out
+    # PERMISSIVE greens ('g' -- 303 of InTAS's 1489 green characters), and a permissive green is
+    # precisely "proceed, but give way exactly as you would with no signal at all". So the claims
+    # are computed whenever a real plan is attached, and consumed only by the movements the program
+    # does not protect (`_permissive_yield` below).
+    _gap = bool(cf_active and cfg.gap_acceptance and (not _lights or _real))
     # discretionary (MOBIL) lane changes: opt-in, and (like _turn) a no-op unless the world supports it
     # (multi-lane + routed car-following). When off, none of the code/RNG below is reached.
     _lane_changes = bool(cf_active and cfg.n_lanes > 1 and cfg.lane_changes)
@@ -4981,6 +5317,57 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # static per-vehicle kinematics needed to score a neighbour's IDM accel in a MOBIL decision
         # (positions/speeds always come from `snap`; these don't change within a step). ON path only.
         params = {w.vid: (w.desired_speed, w.idm_a, w.idm_b) for w in active_list} if _lane_changes else None
+        # ---- REAL <tlLogic>: resolve each vehicle's own MOVEMENT colour once, then work out which
+        # PERMISSIVE greens have to give way ------------------------------------------------------
+        # Two passes and not one, for the same reason gap-acceptance is two: the answer depends on
+        # the other vehicles, so it must be computed from the frozen start-of-step `snap` or it
+        # would depend on iteration order. Everything here is a pure function of the programs, the
+        # geometry and that snapshot -- no rng, on either path. It runs BEFORE gap-acceptance
+        # because gap-acceptance has to know which movements a real program already governs.
+        sig_state: dict = {}          # vid -> (node, dnode, raw char or None, from_xy, to_xy)
+        perm_yield: dict = {}         # vid -> distance to the node, for a permissive green with no gap
+        if _real:
+            _across_sign = 1.0 if cfg.drive_side == "right" else -1.0
+            sclaims: dict = {}
+            for w in active_list:
+                node, dnode, frm, to = w.trip.next_movement(w.s_pos)
+                if node is None or dnode >= cfg.idm_lookahead_m:
+                    continue
+                ch = net.signal_char(node, frm, to, t)
+                sig_state[w.vid] = (node, dnode, ch, frm, to)
+                if ch is None:
+                    continue                      # no real program here -> the toy/none fallback
+                # signed heading change THROUGH the junction: +ve is counter-clockwise, i.e. a LEFT
+                # turn in this engine's math-convention heading. A left turn under right-hand
+                # traffic is the movement that crosses the oncoming stream; the roles mirror for
+                # drive_side="left". `to is None` (the route ends here) reads as straight ahead,
+                # which is the conservative answer -- it yields to crossing traffic but not to
+                # oncoming.
+                turn = 0.0
+                if frm is not None and to is not None:
+                    _a = math.degrees(math.atan2(node[1] - frm[1], node[0] - frm[0]))
+                    _b = math.degrees(math.atan2(to[1] - node[1], to[0] - node[0]))
+                    turn = ((_b - _a + 180.0) % 360.0) - 180.0
+                sclaims.setdefault((round(node[0], 2), round(node[1], 2)), []).append(
+                    (w.vid, ch, snap[w.vid][2], dnode, snap[w.vid][3], turn))
+            for lst in sclaims.values():
+                prot = [c for c in lst if c[1] == "G"]
+                if not prot:
+                    continue                      # nobody here has right of way to yield to
+                for vid_i, ch_i, h_i, d_i, _v_i, turn_i in lst:
+                    if not _is_permissive(ch_i):
+                        continue                  # 'G' owns the junction; 'y'/'r' already stop
+                    across = (turn_i * _across_sign) > PERMISSIVE_ACROSS_DEG
+                    for _vj, _cj, h_j, d_j, v_j, _tj in prot:
+                        dh = _ang_diff(h_i, h_j)
+                        # crossing traffic always conflicts; the near-OPPOSING stream conflicts only
+                        # for the movement that turns across it (a permissive left). Two opposing
+                        # THROUGH movements pass side by side and do not.
+                        if not (45.0 < dh < 135.0 or (across and dh >= 135.0)):
+                            continue
+                        if d_j / max(v_j, 0.1) <= PERMISSIVE_CRITICAL_GAP_S:
+                            perm_yield[vid_i] = d_i
+                            break
         # gap-acceptance: deterministic first-come yielding at UNsignalized intersections, computed from
         # the start-of-step `snap` so it is order-independent. Group approaching vehicles by the node they
         # are heading for; at each node the CLOSEST claimant has priority (ties -> lower vid). A vehicle
@@ -4991,6 +5378,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         if _gap:
             claims: dict = {}
             for w in active_list:
+                if sig_state.get(w.vid, (None, None, None, None, None))[2] is not None:
+                    # A REAL program governs this movement, so the junction is not "unsignalized"
+                    # for it and the first-come rule must not touch it -- a vehicle on a protected
+                    # green would otherwise yield to a closer vehicle sitting at a red. Empty
+                    # `sig_state` (real_signals off) makes this a no-op on every existing path.
+                    continue
                 node, dnode = w.trip.next_node(w.s_pos)
                 if node is None or dnode >= cfg.idm_lookahead_m:
                     continue
@@ -5029,16 +5422,61 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                             continue
                         if fwd < best_gap:
                             best_gap, best_v, best_len = fwd, wv, wl
-            if _lights:                                  # stop at a red signal on the next intersection
-                node, dnode = v.trip.next_node(v.s_pos)
+            _sig_stopped = False
+            if _sig:                                     # stop at a red signal on the next intersection
+                if _real:
+                    node, dnode, _ch, _frm, _to = sig_state.get(
+                        v.vid, (None, math.inf, None, None, None))
+                else:
+                    node, dnode = v.trip.next_node(v.s_pos)
+                    _ch = _frm = _to = None
                 if node is not None and dnode < cfg.idm_lookahead_m:
-                    phase = net.node_phase(node)         # stable 2-colouring (topology-agnostic)
-                    axis_x = abs(cosh) >= abs(sinh)      # travelling mostly E-W vs N-S
-                    if not _light_green(phase, axis_x, t):
+                    if _ch is None:
+                        # NO REAL PROGRAM GOVERNS THIS MOVEMENT -- an unsignalised junction, a
+                        # junction whose program was not imported, or an approach the program does
+                        # not control. Today's behaviour, unchanged: the toy 2-colouring when
+                        # `traffic_lights` is on, nothing at all when it is not.
+                        if _lights:
+                            phase = net.node_phase(node)  # stable 2-colouring (topology-agnostic)
+                            axis_x = abs(cosh) >= abs(sinh)   # travelling mostly E-W vs N-S
+                            _sig_stopped = not _light_green(phase, axis_x, t)
+                            _sig_served["toy_red" if _sig_stopped else "toy_green"] += 1
+                        else:
+                            _sig_served["none"] += 1
+                    elif _ch in ("r", "u"):              # red, and red+yellow ("do not enter" yet)
+                        _sig_stopped = True
+                        _sig_served["r"] += 1
+                    elif _ch == "y":
+                        # DILEMMA ZONE. Stop if it can still be done at this driver's comfortable
+                        # deceleration; otherwise clear the junction, which is what a real driver
+                        # does and what keeps yellow from manufacturing IDM-floor emergency stops.
+                        _sig_stopped = (not YELLOW_DILEMMA) or (
+                            dnode >= v.cur_v * v.cur_v / (2.0 * max(0.5, v.idm_b)))
+                        _sig_served["y"] += 1
+                        if not _sig_stopped:
+                            _sig_served["dilemma_go"] += 1
+                    elif _ch == "G":                     # protected: this movement owns the junction
+                        _sig_served["G"] += 1
+                    else:                                # 'g'/'s'/'o': green, but must give way
+                        _sig_served["g"] += 1
+                        if v.vid in perm_yield:
+                            _sig_stopped = True
+                            _sig_served["permissive_yield"] += 1
+                    if _sig_stopped:
                         stop_gap = max(0.0, dnode - 2.0)  # halt ~2 m before the stop line
                         if stop_gap < best_gap:
                             best_gap, best_v, best_len = stop_gap, 0.0, 0.0
-            elif _gap and v.vid in gap_stop:             # yield to conflicting cross-traffic (unsignalized)
+                    if SIGNAL_HOOK is not None and _ch is not None:   # telemetry seam (None default)
+                        SIGNAL_HOOK(dict(vid=v.vid, t=round(t, 3), node=list(node),
+                                         frm=(None if _frm is None else list(_frm)),
+                                         to=(None if _to is None else list(_to)),
+                                         dnode=round(dnode, 3), char=_ch,
+                                         stopped=bool(_sig_stopped)))
+            if (not _sig_stopped) and _gap and v.vid in gap_stop:
+                # yield to conflicting cross-traffic at an UNSIGNALIZED node. Unreachable while the
+                # toy signals are on and no real plan is attached (`_gap` is False there), which is
+                # exactly the pre-existing `elif`; with a real plan attached it governs the
+                # junctions the imported programs do not.
                 dnode = gap_stop[v.vid]                   # reuse the traffic-light stop mechanism: a virtual
                 stop_gap = max(0.0, dnode - 2.0)          # stopped leader ~2 m before the intersection line
                 if stop_gap < best_gap:
@@ -5858,7 +6296,14 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                                 investigations=len(ma_investigations), revoked=len(revoked_vehicles),
                                 mobility_survivorship=_survivorship_block(
                                     cfg, surv, surv_span, revoked_vehicles, len(vehicles),
-                                    stream_counts["mob"] if _mob_oracle else None)),
+                                    stream_counts["mob"] if _mob_oracle else None),
+                                # What the signals and the footways ACTUALLY did, as integers, so a
+                                # run is judged on the colours it served rather than on a flag being
+                                # set. Emitted only when the opt-in is on; `counts` is outside
+                                # `_data_digest` by construction either way.
+                                **({"signal_service": dict(_sig_served, plan=_sig_stats)}
+                                   if cfg.real_signals else {}),
+                                **({"sidewalks": _sidewalk_stats} if _sidewalk_stats else {})),
                     plugins=plugin_block([chan_provenance()] + suite.provenance(),
                                          drift=_drift_allowed,
                                          integrity=({"armed": True,
@@ -6617,6 +7062,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--no-car-following", action="store_true", help="disable IDM car-following")
     p.add_argument("--turn-slowdown", action="store_true", help="slow into sharp grid corners (realer, harder)")
     p.add_argument("--traffic-lights", action="store_true", help="signalized intersections (grid)")
+    p.add_argument("--real-signals", action="store_true",
+                   help="drive each junction from the REAL <tlLogic> program the imported .net.xml "
+                        "ships (per-movement colour, yellow, permissive 'g' distinct from protected "
+                        "'G') instead of the toy 2-phase cycle. Needs --road sumo (or --road custom "
+                        "with a map.json written by `netimport --signals`) + --flow. A junction with "
+                        "no program keeps today's behaviour exactly; off by default, so every pinned "
+                        "digest is unchanged")
+    p.add_argument("--sidewalks", action="store_true",
+                   help="VRUs walk derived sidewalks and cross at crossings (kerb waits, signal-"
+                        "aware where a signal exists) instead of random-walking off-road. Needs "
+                        "--vru-pct > 0 and a routed network; draws only from its own rng stream")
+    p.add_argument("--sidewalk-width", type=float, default=2.0,
+                   help="footway width (m) used to derive sidewalks")
+    p.add_argument("--kerb-clearance", type=float, default=0.5,
+                   help="gap (m) from the kerb line to the inner edge of the footway")
+    p.add_argument("--crossing-wait-max", type=float, default=8.0,
+                   help="longest kerb wait (s) at an UNSIGNALISED crossing (gap-acceptance surrogate)")
     p.add_argument("--gap-acceptance", action="store_true",
                    help="yield to conflicting cross-traffic at UNSIGNALIZED intersections (first-come "
                         "priority; needs --flow + a routed network; realistic slowing at junctions)")
@@ -6761,6 +7223,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                          live_interval_s=args.live_interval,
                          emit_mobility_oracle=args.emit_mobility_oracle,
                          traffic_lights=args.traffic_lights, gap_acceptance=args.gap_acceptance,
+                         real_signals=args.real_signals,
+                         sidewalks=args.sidewalks, sidewalk_width_m=args.sidewalk_width,
+                         kerb_clearance_m=args.kerb_clearance,
+                         crossing_wait_max_s=args.crossing_wait_max,
                          gps_jam_rate=args.gps_jam_rate,
                          max_total_vehicles=args.max_total_vehicles,
                          vru_pct=args.vru_pct, vru_speed_mps=args.vru_speed,

@@ -131,8 +131,32 @@ the mixin, so grid, ring and custom maps all answer it and a caller needs no get
 / `signal_colour` answer for a movement and return **None** when no real program governs it, which
 is what lets a caller keep its existing behaviour untouched; `signal_plan` is a CLASS attribute
 defaulting to None, so a map that never opts in allocates nothing. `roads.Trip.next_movement`
-supplies the (from, junction, to) triple. `run.py` is NOT wired to any of it yet -- it still calls
-`net.node_phase` -- so nothing on any default path reaches this module.
+supplies the (from, junction, to) triple.
+
+WIRED INTO THE ENGINE BY ``PipelineConfig.real_signals`` / ``--real-signals`` (default OFF, so
+nothing on a default path reaches this module and both pinned digests hold byte for byte). `run.py`
+attaches the plan after building the map, and `car_follow` resolves each vehicle's own movement once
+per step and acts on the CHARACTER, not merely on the colour:
+
+    'G'      proceed -- this movement owns the junction
+    'g'/'s'  proceed, but GIVE WAY to a conflicting protected stream inside the critical gap
+             (`run.PERMISSIVE_CRITICAL_GAP_S`, HCM 6th ed. 4.1 s for a permitted left); a permissive
+             left crosses the oncoming through movement, which is why 'g' must never be read as 'G'
+    'y'/'u'  stop, unless already inside the dilemma zone (v^2/2b > distance to the line)
+    'r'      stop
+    None     no real program governs this -- keep the caller's existing behaviour exactly
+
+MEASURED end to end on InTAS (internal IDM, 300 s, dt 0.5, 334 vehicles, seed 42), against the toy
+2-colouring the engine had before, on identical everything else:
+
+                                   toy (all 3289 junctions)   real (98 programs)
+    stops per vehicle, mean                     3.517                0.477
+    vehicle-steps stopped                      11.32 %               7.44 %
+    queue at a signalised junction, mean         1.089                1.275
+    ... p95 / max                                2 / 3                3 / 5
+
+The real programs take the phantom signals off the 3,191 junctions the city does not signalise and
+put LONGER queues on the 98 it does, which is the shape the toy model could not produce at all.
 
 NOTHING HERE DRAWS RNG. The colour of a movement at time t is a pure function of the program, so a
 signalised run adds zero draws to any stream and cannot move a pinned digest by that route.
@@ -492,6 +516,20 @@ class SignalPlan:
         if li is not None:
             return (li,)
         return self._appr.get((key, fk))
+
+    def approaches(self, node_xy):
+        """``[(from_xy, (link, ...)), ...]`` -- every APPROACH this plan controls at `node_xy`.
+
+        The movement queries above answer for one driver; this answers for a consumer that has to
+        reason about the junction as a whole and has no `from` coordinate to offer -- a PEDESTRIAN
+        deciding whether the arm it is about to cross is being served. Given an arm's bearing, the
+        approaches (anti)parallel to it are the ones a crossing of that arm conflicts with, and
+        `SignalProgram.char_of` over their pooled links answers "is any of that traffic green?".
+
+        Sorted by coordinate so a consumer that iterates is deterministic. Empty for a junction no
+        real program governs -- the same None-shaped answer `char` gives, and the same fallback."""
+        key = _key(node_xy)
+        return [(fk, ls) for (nk, fk), ls in sorted(self._appr.items()) if nk == key]
 
     def char(self, node_xy, from_xy=None, to_xy=None, t: float = 0.0):
         """The RAW SUMO character a vehicle at `from_xy -> node_xy -> to_xy` sees at `t`, or None.
