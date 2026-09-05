@@ -241,6 +241,12 @@ public final class ScmsBackend {
         AttackLib.State atk = null;
         List<String> ghosts = null;   // Sybil: extra identities mapped back to this device
         double lastX, lastY, lastSeenT = -1;   // true position, for the live map
+        // Radio geometry (channel physics only -- see truePoseOf / blockerSnapshot). blockerH is
+        // 0.0 until the unit's application declares its vehicle class, and stays 0.0 for an RSU: an
+        // RSU is a receiver, not an obstruction, exactly as the Python engine treats it.
+        double antennaH = org.scms.radio.PathLoss.ANTENNA_HEIGHT_VEHICLE_M;
+        double blockerH = 0.0;
+        long linkKey;                              // cached streamSeed("linkkey", unitId)
         double sBiasX, sBiasY, sensorLastT = -1;   // OU-correlated sensor bias state
         java.util.Random sRng;                     // per-vehicle sensor-noise RNG (seeded)
         double nextRotateT = Double.MAX_VALUE;     // next pseudonym rotation time
@@ -287,6 +293,7 @@ public final class ScmsBackend {
     private final Map<String, java.util.Set<String>> trustedReporters = new HashMap<>();  // subject veh -> trusted reporter vehs
     // Channel / DCC run totals, aggregated from every receiver at shutdown (manifest diagnostics).
     private long chSensed, chDelivered, chDropWeather, chDropObstruction, chDropCongestion, chNlosb;
+    private long chNlosv, chFaded;
     private long dccAllowedCams, dccSuppressedCams, dccCbrSamples;
     private double dccCbrSum, dccCbrMax;
     private Map<String, Object> channelIndexStats;
@@ -396,6 +403,10 @@ public final class ScmsBackend {
             d = new Dev();
             d.unitId = unitId;
             d.isRsu = true;
+            // Pole-mounted: ABOVE both TR 37.885 blocker heights, so an RSU link that a vehicle
+            // stands on takes the "one antenna below" 5.0 dB branch, never the 9.0 dB one. And an
+            // RSU is never itself a blocker (blockerH stays 0.0).
+            d.antennaH = org.scms.radio.PathLoss.ANTENNA_HEIGHT_RSU_M;
             d.i = 0;
             d.j = 0;
             d.certDigest = hex(sha("rsucert|" + MASTER_SEED + "|" + unitId), 8);
@@ -524,7 +535,116 @@ public final class ScmsBackend {
         if (d == null) {
             return 0L;
         }
-        return streamSeed("linkkey", d.unitId);
+        return linkKeyOf(d);
+    }
+
+    private static long linkKeyOf(Dev d) {
+        if (d.linkKey == 0L) {
+            d.linkKey = streamSeed("linkkey", d.unitId);
+        }
+        return d.linkKey;
+    }
+
+    /**
+     * ORACLE, radio physics only: {@code {trueX, trueY, antennaHeightM, opaqueLinkKey}} for the
+     * station behind a pseudonym. Exactly {@link #truePositionOf} plus the two quantities the NLOSv
+     * branch needs -- the transmitter's antenna height (which selects the TR 37.885 blockage branch)
+     * and its opaque link key (so the transmitter is not counted as an obstruction of its own link).
+     *
+     * <p>Returned as one array from one lock acquisition because this runs once per received frame;
+     * three separate synchronized getters would triple the per-frame locking on the hottest path in
+     * the app. The link key is a {@code long} widened to {@code double} deliberately NOT: it is
+     * returned through {@link #channelLinkKey} instead, which the caller already holds.
+     *
+     * @return {trueX, trueY, antennaHeightM}, or null before the station's first beacon
+     */
+    public synchronized double[] truePoseOf(String certDigest) {
+        Dev d = devByDigest.get(certDigest);
+        if (d == null || d.lastSeenT < 0) {
+            return null;
+        }
+        return new double[] {d.lastX, d.lastY, d.antennaH};
+    }
+
+    /** Antenna height (m) of one unit: 5.0 m for a pole-mounted RSU, 1.5 m for a vehicle OBU. */
+    public synchronized double antennaHeightOfUnit(String unitId) {
+        Dev d = devByUnit.get(unitId);
+        return d == null ? org.scms.radio.PathLoss.ANTENNA_HEIGHT_VEHICLE_M : d.antennaH;
+    }
+
+    /** Opaque channel link key of one unit, for the receiver's own "do not block myself" test. */
+    public static long channelLinkKeyOfUnit(String unitId) {
+        return streamSeed("linkkey", unitId);
+    }
+
+    /**
+     * Declare a unit's radio geometry: the height of its own antenna and the height of the body it
+     * presents to OTHER links as an obstruction. Called once per unit at application start-up.
+     *
+     * <p>A blocker height of 0.0 means "never obstructs" and is what an RSU keeps: infrastructure is
+     * a receiver, not a vehicle body on the road. The Python engine draws exactly the same
+     * distinction ({@code blocker_h_m = 0.0} for an RSU and for a VRU).
+     */
+    public synchronized void noteRadioGeometry(String unitId, double antennaHeightM,
+                                               double blockerHeightM) {
+        Dev d = devByUnit.get(unitId);
+        if (d == null) {
+            register(unitId);
+            d = devByUnit.get(unitId);
+        }
+        d.antennaH = antennaHeightM;
+        d.blockerH = d.isRsu ? 0.0 : blockerHeightM;
+        if (d.blockerH >= org.scms.radio.PathLoss.BLOCKER_HEIGHT_TRUCK_M) {
+            tallBlockersDeclared++;
+        }
+        blockersDeclared++;
+    }
+
+    private int blockersDeclared;
+    private int tallBlockersDeclared;
+
+    /** {@code {declared, tall}} blocker counts, for the manifest's fleet-composition line. */
+    public synchronized int[] blockerFleetComposition() {
+        return new int[] {blockersDeclared, tallBlockersDeclared};
+    }
+
+    /**
+     * Snapshot of every vehicle body that could obstruct a link right now, for
+     * {@link org.scms.radio.VehicleBlockers}.
+     *
+     * <p>ORACLE, radio physics only. A station is included when it has a non-zero blocker height (so
+     * never an RSU) and its true position is no older than {@code maxAgeS}: positions here are
+     * refreshed on every CAM, i.e. at the measured 2.94 Hz mean rate with a 1 s ETSI heartbeat
+     * ceiling, so a window a little wider than the heartbeat holds exactly the fleet that is
+     * currently on the road and drops vehicles that have left the simulation.
+     *
+     * <p>Identity never escapes: each entry carries the OPAQUE link key, not the unit id.
+     *
+     * @return {@code {keys[], xs[], ys[], hs[]}} boxed into one Object[] to keep it a single locked
+     *         pass over the fleet
+     */
+    public synchronized Object[] blockerSnapshot(double t, double maxAgeS) {
+        int n = 0;
+        for (Dev d : devByUnit.values()) {
+            if (d.blockerH > 0.0 && d.lastSeenT >= 0 && (t - d.lastSeenT) <= maxAgeS) {
+                n++;
+            }
+        }
+        long[] keys = new long[n];
+        double[] xs = new double[n];
+        double[] ys = new double[n];
+        double[] hs = new double[n];
+        int i = 0;
+        for (Dev d : devByUnit.values()) {
+            if (d.blockerH > 0.0 && d.lastSeenT >= 0 && (t - d.lastSeenT) <= maxAgeS) {
+                keys[i] = linkKeyOf(d);
+                xs[i] = d.lastX;
+                ys[i] = d.lastY;
+                hs[i] = d.blockerH;
+                i++;
+            }
+        }
+        return new Object[] {keys, xs, ys, hs};
     }
 
     /**
@@ -533,8 +653,11 @@ public final class ScmsBackend {
      */
     public synchronized void noteChannel(long sensed, long delivered, long dropWeather,
                                          long dropObstruction, long dropCongestion, long nlosbLinks,
+                                         long nlosvLinks, long fadedFrames,
                                          long dccAllowed, long dccSuppressed,
                                          long cbrSamples, double cbrSum, double cbrMax) {
+        chNlosv += nlosvLinks;
+        chFaded += fadedFrames;
         chSensed += sensed;
         chDelivered += delivered;
         chDropWeather += dropWeather;
@@ -554,6 +677,19 @@ public final class ScmsBackend {
             channelIndexStats = stats;
         }
     }
+
+    /**
+     * How many times the NLOSv blocker snapshot was rebuilt and how large it ever got. A JVM-wide
+     * singleton like the footprint index, so every receiver publishes the same snapshot and the last
+     * one wins.
+     */
+    public synchronized void noteBlockerIndex(long rebuilds, long peakCount) {
+        blockerRebuilds = rebuilds;
+        blockerPeakCount = peakCount;
+    }
+
+    private long blockerRebuilds;
+    private long blockerPeakCount;
 
     /** Records the driver profile a vehicle applied (ground truth + manifest fleet composition). */
     public synchronized void noteDriverProfile(String unitId, String profile) {
@@ -1008,6 +1144,20 @@ public final class ScmsBackend {
                 ch.put("dropped_obstruction", chDropObstruction);
                 ch.put("dropped_congestion", chDropCongestion);
                 ch.put("nlosb_links", chNlosb);
+                // NLOSv: links a VEHICLE body stood on (TR 37.885 blockage applied). Emitted only
+                // when the branch actually ran, so a SCMS_NLOSV=0 run's manifest is unchanged.
+                if (chNlosv > 0) {
+                    ch.put("nlosv_links", chNlosv);
+                    ch.put("nlosv_fraction", chSensed > 0 ? round3((double) chNlosv / chSensed) : 0.0);
+                    int[] fleet = blockerFleetComposition();
+                    ch.put("blockers_declared", fleet[0]);
+                    ch.put("blockers_truck_height", fleet[1]);
+                    ch.put("blocker_snapshots", blockerRebuilds);
+                    ch.put("blocker_peak_live", blockerPeakCount);
+                }
+                if (chFaded > 0) {
+                    ch.put("faded_frames", chFaded);
+                }
                 if (channelIndexStats != null) {
                     ch.put("buildings", channelIndexStats);
                 }

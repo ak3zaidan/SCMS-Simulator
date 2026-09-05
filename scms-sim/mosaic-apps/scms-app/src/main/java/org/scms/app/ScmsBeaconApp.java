@@ -97,6 +97,11 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         backend.register(id);
         cred = backend.getCredential(id);
         myDigest = cred.certDigest;
+        // Radio geometry BEFORE the channel is constructed: RxChannel resolves this receiver's own
+        // antenna height at construction, and the NLOSv blocker snapshot needs this vehicle's body
+        // height. Both are channel physics only -- neither reaches a report or a feature.
+        backend.noteRadioGeometry(id, org.scms.radio.PathLoss.ANTENNA_HEIGHT_VEHICLE_M,
+                blockerHeightOfSelf());
         channel = new RxChannel(id);
         noteScenario(backend);
         if ("nextgen".equals(ScmsBackend.SENSOR_MODEL)) {
@@ -114,6 +119,43 @@ public class ScmsBeaconApp extends AbstractApplication<VehicleOperatingSystem>
         }
         getOperatingSystem().getAdHocModule().enable(new AdHocModuleConfiguration()
                 .addRadio().channel(AdHocChannel.CCH).power(50).create());
+    }
+
+    /**
+     * The height of the body this vehicle presents to OTHER links as an obstruction, from its SUMO
+     * vehicle class (TR 37.885 blocker heights: 1.6 m car, 3.0 m truck --
+     * refdata/pathloss_3gpp_tr37885.nlosv_blocker_height_m).
+     *
+     * <p>MOSAIC's {@code VehicleType} carries the class SUMO assigned; the InTAS routes use
+     * {@code passenger} (-&gt; {@code Car}) and {@code bus} (-&gt; {@code PublicTransportVehicle}).
+     * Anything larger than a car -- goods vehicles, buses, works and exceptional-size vehicles,
+     * vehicles with a trailer, high-sided vehicles -- takes the truck height; a motorcycle takes the
+     * car height, as the refdata table does. An unknown class degrades to a car, which is the
+     * conservative direction (it can only ever REMOVE blockage, never invent it).
+     */
+    private double blockerHeightOfSelf() {
+        try {
+            org.eclipse.mosaic.lib.objects.vehicle.VehicleType vt =
+                    getOperatingSystem().getInitialVehicleType();
+            if (vt == null || vt.getVehicleClass() == null) {
+                return org.scms.radio.PathLoss.BLOCKER_HEIGHT_CAR_M;
+            }
+            switch (vt.getVehicleClass()) {
+                case HeavyGoodsVehicle:
+                case LightGoodsVehicle:
+                case PublicTransportVehicle:
+                case MiniBus:
+                case WorksVehicle:
+                case ExceptionalSizeVehicle:
+                case VehicleWithTrailer:
+                case HighSideVehicle:
+                    return org.scms.radio.PathLoss.BLOCKER_HEIGHT_TRUCK_M;
+                default:
+                    return org.scms.radio.PathLoss.BLOCKER_HEIGHT_CAR_M;
+            }
+        } catch (RuntimeException ex) {
+            return org.scms.radio.PathLoss.BLOCKER_HEIGHT_CAR_M;
+        }
     }
 
     /**

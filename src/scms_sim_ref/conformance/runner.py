@@ -18,11 +18,15 @@ import traceback
 from .v1 import harness as _H
 from .v1.channel import CHANNEL_CHECKS, SUITE_VERSION, ChannelModelContract, CheckSkipped
 from .v1.detect import DETECT_CHECKS, CheckContract
+from .v1.protocol import (PROTOCOL_CHECKS, REPORT_CHECKS, ProtocolProfileContract,
+                          ReportFormatContract)
 
 #: slot -> (contract class, ordered check ids). `--slot` on the CLI reads this, so registering a
 #: contract here is all it takes for `scms-poc conformance --slot check --ref ...` to work.
 CONTRACTS = {"channel_model": (ChannelModelContract, CHANNEL_CHECKS),
-             "check": (CheckContract, DETECT_CHECKS)}
+             "check": (CheckContract, DETECT_CHECKS),
+             "protocol_profile": (ProtocolProfileContract, PROTOCOL_CHECKS),
+             "report_format": (ReportFormatContract, REPORT_CHECKS)}
 
 PASS, FAIL, SKIP, WAIVED, ERROR = "PASS", "FAIL", "SKIP", "WAIVED", "ERROR"
 

@@ -8,6 +8,10 @@ from __future__ import annotations
 
 from .channel import CHANNEL_CHECKS, SUITE_VERSION, ChannelModelContract, CheckSkipped
 from .harness import DrawCounter, IoViolation, audit_guard, build_frames, build_ladder, trace
+from .protocol import (PROTOCOL_CHECKS, REPORT_CHECKS, ProtocolProfileContract,
+                       ReportFormatContract)
 
-__all__ = ["CHANNEL_CHECKS", "SUITE_VERSION", "ChannelModelContract", "CheckSkipped",
-           "DrawCounter", "IoViolation", "audit_guard", "build_frames", "build_ladder", "trace"]
+__all__ = ["CHANNEL_CHECKS", "PROTOCOL_CHECKS", "REPORT_CHECKS", "SUITE_VERSION",
+           "ChannelModelContract", "CheckSkipped", "DrawCounter", "IoViolation",
+           "ProtocolProfileContract", "ReportFormatContract",
+           "audit_guard", "build_frames", "build_ladder", "trace"]

@@ -50,7 +50,10 @@ from ..api.channel import (CAP_CBR, CAP_LEGACY_GLOBAL_RNG, CAP_LINK_STATE, CAP_R
                            CAP_STATEFUL, DELIVERED, LOSS_ADDITIVE_LEGACY,
                            LOSS_INDEPENDENT_SURVIVAL, LinkChannelModelBase, LinkOutcome,
                            PerLinkAdapter, StationSnapshot, StepFrame, Transmission)
+from ..api import codec as _api_codec
 from ..api import detect as _api_detect
+from ..api import profile as _api_profile
+from ..api import report as _api_report
 from ..api import integrity as _integrity
 from ..api import isolate as _isolate
 from ..api import srcgate as _srcgate
@@ -58,6 +61,7 @@ from ..api.detect import Observation
 from ..api.errors import ConfigError, PluginDriftError            # noqa: F401 (re-exported)
 from ..api.rng import RngNamespace
 from . import detectors as _detectors                             # registers the `check` builtins
+from ..codecs import etsi_rules as _etsi_rules       # stdlib-only; no ASN.1 runtime is touched
 from ..scms_core import crypto_abstract as ca
 from ..scms_core.linkage import CrlLinkageEntry, DeviceLinkageContext, linkage_seed_at
 from ..schemas import records as R
@@ -1296,6 +1300,385 @@ def build_channel(cfg, buildings=None, dt: float = 1.0):
 
 
 # --------------------------------------------------------------------------- #
+# The MESSAGE-CODEC seam (PLUGIN-ARCHITECTURE.md section 2.5 / D5)
+#
+# Built exactly the way `build_channel` is, and deliberately so: `_codec_selection` is
+# `_channel_selection` with one enum swapped, and the same two spellings resolve to the same object
+# -- a built-in NAME in `cfg.message_codec`, or `plugins.message_codec.ref` for anything else. That
+# is what makes a third party able to supply a whole protocol stack (a different CAM profile, a
+# C-V2X message set, a thresholding scheme's own PDU) without forking the engine, on the identical
+# machinery they already use to supply a detector or a channel model.
+#
+# THE ONE DIFFERENCE FROM EVERY OTHER SLOT: there is no default object. `radio_model` defaults to
+# `disc`, a real channel; `message_codec` defaults to `""`, which constructs NOTHING. A codec that
+# ran by default would encode every frame of every run -- and the whole point of the empty default
+# is that the pinned digests are reachable at ZERO cost, not merely at equal output.
+# --------------------------------------------------------------------------- #
+_CODEC_SECTION_KEYS = frozenset({"ref", "params", "conformance"})
+
+
+def _codec_selection(cfg):
+    """`(ref, params)` for the codec slot, or `(None, {})` when no codec is selected.
+
+    The `plugins` block wins over the enum, and the two disagreeing is a REFUSAL rather than a
+    precedence rule -- the same treatment `radio_model` vs `plugins.channel_model.ref` gets, for the
+    same reason: a config that names two different codecs does not mean what it says.
+    """
+    sel = (cfg.plugins or {}).get("message_codec") if isinstance(cfg.plugins, dict) else None
+    name = str(getattr(cfg, "message_codec", "") or "")
+    if not sel:
+        return (name or None), {}
+    if isinstance(sel, str):
+        sel = {"ref": sel}
+    if not isinstance(sel, dict) or "ref" not in sel:
+        raise ConfigError("plugins.message_codec must be a string or {'ref': ..., 'params': {...}}")
+    extra = sorted(set(sel) - _CODEC_SECTION_KEYS)
+    if extra:
+        raise ConfigError(f"plugins.message_codec: unknown key(s) {extra}; "
+                          f"known: {sorted(_CODEC_SECTION_KEYS)}")
+    params = sel.get("params") or {}
+    if not isinstance(params, dict):
+        raise ConfigError("plugins.message_codec.params must be an object")
+    ref = str(sel["ref"])
+    if name and name != ref:
+        raise ConfigError(
+            f"ambiguous codec selection: message_codec={name!r} and "
+            f"plugins.message_codec.ref={ref!r} disagree; set only one")
+    return ref, params
+
+
+def _codec_conformance(cfg) -> str:
+    sel = (cfg.plugins or {}).get("message_codec") if isinstance(cfg.plugins, dict) else None
+    mode = str(sel.get("conformance", "off")) if isinstance(sel, dict) else "off"
+    if mode not in CONFORMANCE_MODES:
+        raise ConfigError(f"plugins.message_codec.conformance must be one of "
+                          f"{list(CONFORMANCE_MODES)} (got {mode!r})")
+    return mode
+
+
+def build_codec(cfg):
+    """Resolve + construct the run's message codec, or return `(None, None)` when none is selected.
+
+    Same sentinel discipline as `build_channel`: the snapshot is taken BEFORE `resolve`, because
+    `resolve` imports the plugin's module and module-level code is an earlier hook than `__init__`.
+    A CONSTRUCTION failure -- `asn1tools` missing, an unknown parameter, an ETSI StationType name
+    that does not exist -- is fatal HERE, before step 0 and before an output directory exists, which
+    is exactly what conformance check C10 asks of every slot.
+    """
+    ref, params = _codec_selection(cfg)
+    if not ref:
+        return None, None
+    _guard = _integrity.Sentinel(armed=_integrity.armed_for(cfg))
+    cls, how, iv, _shape = _api_registry.resolve("message_codec", ref)
+    # The codec package keeps its OWN fixed in-tree mapping for exactly the reason the check slot
+    # does: `register_builtin` writes into a process-global dict, so any imported distribution could
+    # rebind `etsi_cam_en302637_2` to its own class and be resolved AS A BUILT-IN -- inheriting the
+    # built-in exemption from the source gate and from outcome validation. Identity against the
+    # shipped tuple is the whole check, and it is a named refusal rather than a silent substitution.
+    from .. import codecs as _codecs_pkg
+    if _codecs_pkg.is_hijacked(ref):
+        raise ConfigError(
+            f"plugins.message_codec {ref!r} resolved to "
+            f"{cls.__module__}.{getattr(cls, '__name__', cls)!r}, but {ref!r} is a BUILT-IN codec "
+            f"name owned by {_codecs_pkg.BUILTIN_CODEC_BY_NAME[ref].__module__}. Something called "
+            f"register_builtin('message_codec', {ref!r}, ...) and replaced it. Give the third-party "
+            f"profile its own ref.")
+    conformance = (_attest("message_codec", ref, params)
+                   if _codec_conformance(cfg) == "required" else None)
+    pid = _api_registry.plugin_id_of(cls, ref if ":" not in ref else ref.rsplit(":", 1)[-1].lower())
+    rng_ns = RngNamespace(cfg.seed, pid)
+    codec = _api_registry.instantiate(cls, params=params, rng=rng_ns, env={"config":
+                                                                          ReadOnlyConfig(cfg)})
+    if how != "builtin":
+        _guard.verify("while LOADING the message codec", subject=f"plugins.message_codec {ref!r}")
+    caps = _api_registry.check_capabilities("message_codec", ref, cls, how, codec.capabilities())
+
+    def _provenance():
+        return _api_registry.make_provenance("message_codec", 0, ref, cls, how, iv, caps,
+                                             rng_ns.declared_streams(), params,
+                                             conformance=conformance)
+
+    return codec, _provenance
+
+
+# --------------------------------------------------------------------------- #
+# The PROTOCOL-PROFILE seam (api/profile.py)
+#
+# One declaration says which protocol this run speaks. `build_profile` is `build_codec` with the
+# enum swapped and ONE addition: when nothing is declared, the ITS-G5 profile is synthesised FROM
+# THE LAYER FLAGS, so `--cam-rules` and `--dcc` keep meaning exactly what they meant and now mean it
+# THROUGH the seam. There is no path in this file that reads `codecs.etsi_rules` inside the step
+# loop any more: every ETSI constant, state machine, airtime and latency the engine uses arrives
+# through a profile method. That is the test of whether the seam is real -- delete the built-in and
+# the engine still runs whatever profile the config names.
+# --------------------------------------------------------------------------- #
+_PROFILE_SECTION_KEYS = frozenset({"ref", "params", "conformance"})
+
+#: The BUILT-IN profile synthesised from the layer flags when no profile is declared.
+DEFAULT_PROTOCOL_PROFILE = "etsi_its_g5"
+
+
+def _section(cfg, slot: str, keys: frozenset, enum_field: str):
+    """`(ref, params)` for a single-object plugin slot, or `(None, {})` when nothing is selected.
+
+    The shared body of `_codec_selection` / `_profile_selection` / `_report_format_selection`: the
+    `plugins` block wins over the enum field, and the two DISAGREEING is a refusal rather than a
+    precedence rule -- a config that names two different implementations of one slot does not mean
+    what it says.
+    """
+    sel = (cfg.plugins or {}).get(slot) if isinstance(cfg.plugins, dict) else None
+    name = str(getattr(cfg, enum_field, "") or "")
+    if not sel:
+        return (name or None), {}
+    if isinstance(sel, str):
+        sel = {"ref": sel}
+    if not isinstance(sel, dict) or "ref" not in sel:
+        raise ConfigError(f"plugins.{slot} must be a string or {{'ref': ..., 'params': {{...}}}}")
+    extra = sorted(set(sel) - keys)
+    if extra:
+        raise ConfigError(f"plugins.{slot}: unknown key(s) {extra}; known: {sorted(keys)}")
+    params = sel.get("params") or {}
+    if not isinstance(params, dict):
+        raise ConfigError(f"plugins.{slot}.params must be an object")
+    ref = str(sel["ref"])
+    if name and name != ref:
+        raise ConfigError(f"ambiguous {slot} selection: {enum_field}={name!r} and "
+                          f"plugins.{slot}.ref={ref!r} disagree; set only one")
+    return ref, params
+
+
+def _slot_conformance(cfg, slot: str) -> str:
+    sel = (cfg.plugins or {}).get(slot) if isinstance(cfg.plugins, dict) else None
+    mode = str(sel.get("conformance", "off")) if isinstance(sel, dict) else "off"
+    if mode not in CONFORMANCE_MODES:
+        raise ConfigError(f"plugins.{slot}.conformance must be one of {list(CONFORMANCE_MODES)} "
+                          f"(got {mode!r})")
+    return mode
+
+
+def profile_layers_on(cfg) -> bool:
+    """True when any layer of the built-in stack is requested by a flag rather than by a ref."""
+    return bool(cfg.message_codec or cfg.cam_generation_rules or cfg.dcc or cfg.net_latency_model
+                or (isinstance(cfg.plugins, dict) and cfg.plugins.get("message_codec")))
+
+
+def _profile_selection(cfg):
+    """`(ref, params)` for the protocol-profile slot, or `(None, {})`.
+
+    With nothing declared and at least one layer flag set, this synthesises the built-in:
+    `("etsi_its_g5", {...the flags...})`. The params are DERIVED FROM cfg rather than defaulted
+    inside the profile, so `manifest["config"]` still says exactly which layers ran and the run
+    replays from the config alone.
+    """
+    ref, params = _section(cfg, "protocol_profile", _PROFILE_SECTION_KEYS, "protocol_profile")
+    if ref:
+        return ref, params
+    if not profile_layers_on(cfg):
+        return None, {}
+    return DEFAULT_PROTOCOL_PROFILE, {"signer": cfg.message_signer,
+                                      "generation": bool(cfg.cam_generation_rules),
+                                      "congestion": bool(cfg.dcc),
+                                      "latency": bool(cfg.net_latency_model)}
+
+
+def build_profile(cfg, codec):
+    """Resolve + construct the run's protocol profile, or `(None, None)` when none is selected.
+
+    Same discipline as `build_channel` / `build_codec`, in the same order and for the same reasons:
+    the integrity sentinel is armed BEFORE `resolve` (module-level code is an earlier hook than
+    `__init__`), a built-in NAME may not be hijacked by a third party, attestation happens in a
+    child process before this one constructs anything, and every construction failure is fatal HERE,
+    before step 0 and before an output directory exists.
+
+    `codec` is the already-built `message_codec` -- built by `build_codec`, which owns that slot's
+    sentinel, hijack refusal and lock entry -- and is INJECTED through `env`. A third-party profile
+    is free to ignore it and return its own codec from `codec()`; the engine uses whatever
+    `profile.codec()` answers, so a stack that brings its own wire format needs no engine change.
+    """
+    ref, params = _profile_selection(cfg)
+    if not ref:
+        return None, None
+    _guard = _integrity.Sentinel(armed=_integrity.armed_for(cfg))
+    cls, how, iv, _shape = _api_registry.resolve("protocol_profile", ref)
+    from .. import codecs as _codecs_pkg
+    if _codecs_pkg.is_hijacked(ref, "protocol_profile"):
+        raise ConfigError(
+            f"plugins.protocol_profile {ref!r} resolved to "
+            f"{cls.__module__}.{getattr(cls, '__name__', cls)!r}, but {ref!r} is a BUILT-IN profile "
+            f"name owned by {_codecs_pkg.shipped('protocol_profile', ref).__module__}. Something "
+            f"called register_builtin('protocol_profile', {ref!r}, ...) and replaced it. Give the "
+            f"third-party stack its own ref.")
+    conformance = (_attest("protocol_profile", ref, params)
+                   if _slot_conformance(cfg, "protocol_profile") == "required" else None)
+    pid = _api_registry.plugin_id_of(cls, ref if ":" not in ref else ref.rsplit(":", 1)[-1].lower())
+    rng_ns = RngNamespace(cfg.seed, pid)
+    prof = _api_registry.instantiate(cls, params=params, rng=rng_ns,
+                                     env={"config": ReadOnlyConfig(cfg), "message_codec": codec})
+    if how != "builtin":
+        _guard.verify("while LOADING the protocol profile",
+                      subject=f"plugins.protocol_profile {ref!r}")
+    caps = _api_registry.check_capabilities("protocol_profile", ref, cls, how, prof.capabilities())
+
+    def _provenance():
+        return _api_registry.make_provenance("protocol_profile", 0, ref, cls, how, iv, caps,
+                                             rng_ns.declared_streams(), params,
+                                             conformance=conformance)
+
+    return prof, _provenance
+
+
+# --------------------------------------------------------------------------- #
+# The REPORT-FORMAT seam (api/report.py) -- the slot that was registered and EMPTY
+# --------------------------------------------------------------------------- #
+_REPORT_SECTION_KEYS = frozenset({"ref", "params", "conformance"})
+
+
+def _report_format_selection(cfg):
+    return _section(cfg, "report_format", _REPORT_SECTION_KEYS, "report_format")
+
+
+def build_report_format(cfg):
+    """Resolve + construct the run's misbehaviour-report format, or `(None, None)`.
+
+    `None` is the DEFAULT and means the engine writes its historic row inline. That is not a
+    fallback for a missing built-in -- `ma_report_v1` exists and reproduces that row exactly -- it is
+    the same discipline every other seam here follows: the pinned digests must be reachable at ZERO
+    cost, not merely at equal output, so the default constructs no object and calls nothing.
+    """
+    ref, params = _report_format_selection(cfg)
+    if not ref:
+        return None, None
+    _guard = _integrity.Sentinel(armed=_integrity.armed_for(cfg))
+    cls, how, iv, _shape = _api_registry.resolve("report_format", ref)
+    from .. import codecs as _codecs_pkg
+    if _codecs_pkg.is_hijacked(ref, "report_format"):
+        raise ConfigError(
+            f"plugins.report_format {ref!r} resolved to "
+            f"{cls.__module__}.{getattr(cls, '__name__', cls)!r}, but {ref!r} is a BUILT-IN format "
+            f"name owned by {_codecs_pkg.shipped('report_format', ref).__module__}. Something "
+            f"called register_builtin('report_format', {ref!r}, ...) and replaced it. Give the "
+            f"third-party format its own ref.")
+    conformance = (_attest("report_format", ref, params)
+                   if _slot_conformance(cfg, "report_format") == "required" else None)
+    pid = _api_registry.plugin_id_of(cls, ref if ":" not in ref else ref.rsplit(":", 1)[-1].lower())
+    rng_ns = RngNamespace(cfg.seed, pid)
+    fmt = _api_registry.instantiate(cls, params=params, rng=rng_ns,
+                                    env={"config": ReadOnlyConfig(cfg)})
+    if how != "builtin":
+        _guard.verify("while LOADING the report format", subject=f"plugins.report_format {ref!r}")
+    caps = _api_registry.check_capabilities("report_format", ref, cls, how, fmt.capabilities())
+
+    def _provenance():
+        return _api_registry.make_provenance("report_format", 0, ref, cls, how, iv, caps,
+                                             rng_ns.declared_streams(), params,
+                                             conformance=conformance)
+
+    return fmt, _provenance
+
+
+class WireEncoder:
+    """The engine's one call site into a codec: broadcast dict -> (PDU octets, wire size).
+
+    Holds the `StationView` per station kind (vehicle / VRU / RSU) rather than rebuilding it per
+    message -- it is frozen, it changes never, and constructing 2.2 million of them is 2.2 million
+    allocations the run does not need.
+
+    **The firewall applies here.** A :class:`~scms_sim_ref.api.codec.Claim` is built from the
+    MA-VISIBLE half of the broadcast dict only: the CLAIMED position, speed and heading, the
+    self-declared station type and the claimed generation time. `b["x"]`, `b["y"]` (the sender's
+    TRUE position), `b["falsified"]`, `b["ghost"]`, `b["tspd"]`, `b["thdg"]` and `b["veh"]` never
+    cross it -- which matters more here than anywhere else, because these octets are exactly what a
+    TS 103 759 `v2xPduEvidence` entry would carry into a report.
+    """
+
+    __slots__ = ("codec", "signer", "_views", "_frame", "bytes_by_type", "count_by_type", "_sizer")
+
+    def __init__(self, codec, signer: str = "digest", frame=None, epoch_unix=None, sizer=None):
+        self.codec = codec
+        self.signer = signer
+        #: WHO OWNS THE FRAME LENGTH. The profile does, when there is one: `wire_size_bytes` is
+        #: where the security envelope is accounted for, and accounting for it in two places is how
+        #: a CBR estimate silently ends up counting the certificate twice or not at all. With no
+        #: profile the codec answers directly, which is what every run before the seam did.
+        self._sizer = sizer if sizer is not None else codec.wire_size_bytes
+        f = frame if frame is not None else getattr(codec, "frame", _api_codec.DEFAULT_FRAME)
+        e = epoch_unix if epoch_unix is not None else getattr(
+            codec, "epoch_unix", _api_codec.DEFAULT_EPOCH_UNIX)
+        self._frame = f
+        self._views = {
+            "vehicle": _api_codec.StationView(frame=f, epoch_unix=e),
+            "rsu": _api_codec.StationView(frame=f, epoch_unix=e, is_rsu=True),
+        }
+        self.bytes_by_type: dict = {}
+        self.count_by_type: dict = {}
+
+    @staticmethod
+    def station_id(digest: str) -> int:
+        """ETSI `StationID` (0..2^32-1) from the pseudonym's HashedId8.
+
+        The top 32 bits of the certificate digest. It is NOT rotation-stable, and that is correct:
+        a StationID that survived a pseudonym change would defeat the pseudonym.
+        """
+        try:
+            return int(digest[:8], 16)
+        except (TypeError, ValueError):
+            return int(hashlib.sha256(str(digest).encode()).hexdigest()[:8], 16)
+
+    def claim_for(self, b: dict, msg_type: str) -> "_api_codec.Claim":
+        return _api_codec.Claim(
+            station_id=self.station_id(b["digest"]), cert_digest=str(b["digest"]),
+            msg_type=msg_type, gen_time=float(b["cg"]),
+            x=float(b["cx"]), y=float(b["cy"]), speed=float(b["cs"]), heading=float(b["ch"]),
+            pos_conf=float(b["conf"]), station_type=str(b.get("station_type", "vehicle")),
+            msg_count=int(b.get("msg_count", 1)), event_type=b.get("event_type"),
+            sig_ok=bool(b.get("sig_ok", True)),
+            cert_valid_from=float(b.get("cvf", 0.0)), cert_valid_to=float(b.get("cvt", 0.0)),
+            sequence_number=int(b.get("seq", 0)))
+
+    @staticmethod
+    def wire_msg_type(b: dict) -> str:
+        """The PDU a real station would actually send for this broadcast.
+
+        A DENM is a DENM; a station DECLARING `station_type="vru"` sends a VAM (TS 103 300-3), not a
+        CAM. Keyed on the SELF-DECLARED type, never on `veh.is_vru`, so a VruImpersonation attacker
+        that declares `vru` really does put a VAM on the air -- which is the whole shape of that
+        attack and would be lost if the oracle decided the PDU type.
+        """
+        if b.get("msg_type") == "denm":
+            return "denm"
+        return "vam" if b.get("station_type") == "vru" else "cam"
+
+    def encode(self, b: dict) -> tuple:
+        """`(payload octets, wire size in bytes, claim)` for one broadcast."""
+        mt = self.wire_msg_type(b)
+        claim = self.claim_for(b, mt)
+        view = self._views["rsu" if b["veh"].is_rsu else "vehicle"]
+        pdu = self.codec.evidence_pdu(claim, view)
+        size = int(self._sizer(claim, self.signer))
+        self.bytes_by_type[mt] = self.bytes_by_type.get(mt, 0) + len(pdu)
+        self.count_by_type[mt] = self.count_by_type.get(mt, 0) + 1
+        return pdu, size, claim
+
+    def size_for(self, claim, signer: str) -> int:
+        """Frame length for a claim under a GIVEN signer arm.
+
+        Used when a real security layer is active: the ARM is then decided by TS 103 097's
+        once-per-second attachment rule rather than by config, but the SIZE must still come from
+        the codec's measured envelope. See the note at the `seal()` call site for why the real
+        `SignedMessage`'s own length is the wrong number to charge airtime for.
+        """
+        return int(self._sizer(claim, signer))
+
+    def stats(self) -> dict:
+        out = {"pdus": dict(sorted(self.count_by_type.items())),
+               "payload_bytes": dict(sorted(self.bytes_by_type.items()))}
+        out["mean_payload_bytes"] = {
+            k: round(self.bytes_by_type[k] / self.count_by_type[k], 3)
+            for k in sorted(self.count_by_type) if self.count_by_type[k]}
+        return out
+
+
+# --------------------------------------------------------------------------- #
 # The DETECTOR seam (PLUGIN-ARCHITECTURE.md section 2.2 / phase 3)
 # --------------------------------------------------------------------------- #
 #: Keys one entry of the `plugins.check` ARRAY may carry. Closed so a typo is an error.
@@ -2335,6 +2718,73 @@ class PipelineConfig:
                                          # road exceeds this. A road-following vehicle sits within
                                          # half a carriageway of the centreline; anything scattered
                                          # means the two frames disagree.
+    # --- THE REAL PROTOCOL STACK (mock_pipeline/run.py + codecs/etsi_rules.py + scms_core) -------
+    # Five independent opt-ins that together turn "a bare dict on an abstract channel" into "a real
+    # PDU on a modelled 802.11p access layer under the real generation and congestion rules". Each
+    # one is INERT at its default, draws NO random number on any path, and is composable with the
+    # others; a run with all five off is byte-identical to every pinned digest.
+    #
+    # `message_codec` is the ACTIVATION SURFACE for the `message_codec` plugin slot, spelled the way
+    # `radio_model` spells the channel slot: a built-in NAME here, or `plugins.message_codec.ref`
+    # for a third party. "" (the default) means NO codec object is constructed at all -- not
+    # `native_v1`, which is a real object with a real cost -- so the default path is exactly what it
+    # was. With one selected, EVERY CAM, DENM and VAM is encoded through it, the resulting PDU
+    # LENGTH is what the channel charges airtime for, and the manifest's `standards_profile` becomes
+    # the codec's own `standards_claim()` instead of the engine's hard-coded "no ASN.1 encoding".
+    message_codec: str = ""              # "" = off | native_v1 | etsi_cam_en302637_2 | ...
+    # TS 103 097 signer alternation, consulted by `MessageCodec.wire_size_bytes` when
+    # `security_model="none"`. Worth 126 octets per frame on the measured envelope (93 vs 219), i.e.
+    # 168 us of airtime -- which is why it is a parameter and not a constant. With
+    # `security_model="ecdsa"` this field is IGNORED: the size then comes from the real
+    # `SignedMessage.wire_octets()`, and which arm a frame carries is decided by the once-per-second
+    # attachment rule the standard states, not by a config setting.
+    message_signer: str = "digest"       # none | digest | certificate
+    # EN 302 637-2 V1.4.1 clause 6.1.3 CAM generation rules: a CAM on a 4 m / 4 deg / 0.5 m/s
+    # dynamics trigger, floored at T_GenCamMin = 0.1 s, with a T_GenCamMax = 1.0 s heart-beat.
+    # OFF: one CAM per vehicle per step, i.e. a flat 1 Hz at the default dt. NOTE THE dt COUPLING:
+    # the rules can only fire faster than the heart-beat when the engine steps faster than it, so
+    # this knob is a no-op at dt >= 1.0 and its whole effect appears at dt <= 0.5.
+    cam_generation_rules: bool = False
+    # ETSI TS 102 687 V1.2.1 reactive DCC. Each station maps the CBR its OWN receiver measured on
+    # the previous step onto the 5-state table and takes T_off as a floor on its CAM interval. At
+    # low density it correctly does NOTHING (relaxed state, T_off 100 ms == T_GenCamMin); it only
+    # bites once CBR crosses 0.30. Requires cam_generation_rules (there is no rate to limit
+    # otherwise) and is refused without it rather than silently ignored.
+    dcc: bool = False
+    # Per-packet latency: propagation (d/c) + access (AIFS + backoff/(1-CBR) + PPDU airtime, on the
+    # REAL frame length) + a derived stack constant. Replaces `net_delay_max`'s uniform ingest draw,
+    # which is a report-upload delay with nothing to do with the channel. Deterministic by
+    # construction -- it draws NOTHING, where the uniform draw it replaces consumes one number from
+    # the global stream per report.
+    net_latency_model: bool = False
+    ma_backhaul_s: float = 0.0           # deterministic MA report upload delay added on top of the
+                                         # per-packet latency (net_latency_model only)
+    # Real cryptography. "ecdsa" provisions every pseudonym through the butterfly expansion
+    # (scms_core/provisioning.py), signs every PDU with ECDSA-P256-SHA256 over the 1609.2 double
+    # hash, and makes `sig_ok` the RESULT of a verification instead of a boolean the attack switch
+    # sets. It also makes the PCA unable to link a device's pseudonyms, which is the property the
+    # SCMS exists for and which the label scheme (`derive(f"key:{vid}:{k}")`) does not have.
+    security_model: str = "none"         # "none" | "ecdsa"
+    # THE PROTOCOL PROFILE -- which stack this run speaks, as ONE declaration.
+    #
+    # The four knobs above are the ITS-G5 profile's own layers, and leaving them spelled as engine
+    # booleans is what made "the network side is modular" untrue: a third party could supply a
+    # codec, but not a generation rule, not a congestion controller, not an airtime model and not a
+    # latency model. Every one of those now reaches the engine through `api.profile.ProtocolProfile`,
+    # and the built-in ITS-G5 stack is resolved through that seam like anybody else's.
+    #
+    # "" (the default) means: build `etsi_its_g5` IF any of the four layers above is on, and build
+    # NOTHING at all otherwise. So the default path constructs no profile object, and a run that
+    # says `--cam-rules` gets the built-in profile with its generation layer enabled -- the same
+    # object a third party would replace. A third-party stack is declared as
+    # `plugins.protocol_profile.ref`, exactly as a channel model or a detector is.
+    protocol_profile: str = ""           # "" = derive from the layer flags | etsi_its_g5 | ...
+    # THE MISBEHAVIOUR-REPORT FORMAT. A report's format is part of the protocol a deployment speaks,
+    # and this slot has been registered and EMPTY since the plugin architecture landed. "" keeps the
+    # engine's historic inline row; `ma_report_v1` is that identical row expressed through the seam
+    # (and is asserted byte-identical against the pinned golden); `ts103759_shape` re-shapes it into
+    # the TS 103 759 `TemplateAsr` three-field form carrying the real encoded evidence octets.
+    report_format: str = ""              # "" = off | ma_report_v1 | ts103759_shape | ...
 
     def derive(self, label: str, n: int = 32) -> bytes:
         return hashlib.sha256(f"{self.seed}|{label}".encode()).digest()[:n]
@@ -2938,6 +3388,48 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"radio_cap_sigma must be > 0 (got {cfg.radio_cap_sigma})")
     if cfg.radio_cap_max_mult < 1:
         raise ValueError(f"radio_cap_max_mult must be >= 1 (got {cfg.radio_cap_max_mult})")
+    # --- the real protocol stack (all five default-inert) --------------------------------------- #
+    _codec_builtins = _api_registry.builtin_names("message_codec")
+    if cfg.message_codec and cfg.message_codec not in _codec_builtins:
+        raise ValueError(
+            f"message_codec must be '' (off) or one of {'|'.join(_codec_builtins)} "
+            f"(got {cfg.message_codec!r}); a third-party wire format is declared via "
+            f"plugins.message_codec, not through this field")
+    if cfg.message_signer not in _api_codec.SIGNER_FORMS:
+        raise ValueError(f"message_signer must be one of {list(_api_codec.SIGNER_FORMS)} "
+                         f"(got {cfg.message_signer!r})")
+    if cfg.security_model not in ("none", "ecdsa"):
+        raise ValueError(f"security_model must be none|ecdsa (got {cfg.security_model!r})")
+    if cfg.dcc and not cfg.cam_generation_rules:
+        # Refused, not silently ignored: DCC's only actuator in this engine is the CAM service's
+        # T_GenCam floor, and with the flat one-CAM-per-step generator there is no rate to limit.
+        # Accepting it would put "dcc: true" in the manifest of a run where DCC did nothing.
+        raise ValueError("dcc=True requires cam_generation_rules=True: reactive DCC acts by "
+                         "raising the CAM service's minimum inter-CAM interval, and with the flat "
+                         "one-CAM-per-step generator there is no interval to raise")
+    if cfg.cam_generation_rules and cfg.dt > _etsi_rules.T_GEN_CAM_MAX_S:
+        raise ValueError(
+            f"cam_generation_rules=True needs dt <= {_etsi_rules.T_GEN_CAM_MAX_S} s (got "
+            f"{cfg.dt}): EN 302 637-2's heart-beat IS T_GenCamMax, so at a coarser step every step "
+            f"is a heart-beat and the dynamics triggers can never be the reason a CAM is sent. Use "
+            f"dt <= 0.5 for a run where the rules actually bind")
+    if cfg.ma_backhaul_s < 0:
+        raise ValueError(f"ma_backhaul_s must be >= 0 (got {cfg.ma_backhaul_s})")
+    # --- the protocol-profile and report-format seams --------------------------------------------- #
+    _profile_builtins = _api_registry.builtin_names("protocol_profile")
+    if cfg.protocol_profile and cfg.protocol_profile not in _profile_builtins:
+        raise ValueError(
+            f"protocol_profile must be '' (derive from the layer flags) or one of "
+            f"{'|'.join(_profile_builtins)} (got {cfg.protocol_profile!r}); a third-party stack is "
+            f"declared via plugins.protocol_profile, not through this field")
+    _report_builtins = _api_registry.builtin_names("report_format")
+    if cfg.report_format and cfg.report_format not in _report_builtins:
+        raise ValueError(
+            f"report_format must be '' (off) or one of {'|'.join(_report_builtins)} "
+            f"(got {cfg.report_format!r}); a third-party format is declared via "
+            f"plugins.report_format, not through this field")
+    _validate_profile_plugin(cfg)
+    _validate_report_format_plugin(cfg)
     if cfg.idm_accel <= 0 or cfg.idm_decel <= 0:
         raise ValueError(f"idm_accel and idm_decel must be > 0 (got {cfg.idm_accel}, {cfg.idm_decel})")
     if cfg.weather not in WEATHER_MULT:
@@ -3282,6 +3774,7 @@ def _validate_plugins(cfg) -> None:
         raise ValueError(f"plugins: slot(s) {unsupported} are declared but not yet consumed by this "
                          f"engine (consumed: {sorted(_CONSUMED_SLOTS)}); remove them or upgrade")
     _validate_detector_plugins(cfg)
+    _validate_codec_plugin(cfg)
     ref, params = _channel_selection(cfg)
     _channel_conformance(cfg)          # reject a bad `conformance` mode HERE, not at step 0
     cls, how, _iv, _shape = _api_registry.resolve("channel_model", ref)
@@ -3304,7 +3797,69 @@ def _validate_plugins(cfg) -> None:
 #: Plugin slots this engine actually CONSUMES. A declared-but-unconsumed slot is refused rather than
 #: ignored -- an ignored plugin section replays as a different run with exit code 0, which is the
 #: exact failure the lock exists to prevent.
-_CONSUMED_SLOTS = frozenset({"channel_model", "check", "fusion"})
+_CONSUMED_SLOTS = frozenset({"channel_model", "check", "fusion", "message_codec",
+                             "protocol_profile", "report_format"})
+
+
+def _validate_codec_plugin(cfg) -> None:
+    """Shape + params validation for the `message_codec` slot, at CONFIG time.
+
+    Resolves and validates but does NOT construct: `--check-config`, the GUI's validation pass and
+    the copilot must be able to reject `plugins.message_codec.params.lat0 = "north"` without
+    building a codec, and -- for the ETSI profiles -- without needing `asn1tools` installed at all,
+    since construction is the only thing that requires it.
+    """
+    ref, params = _codec_selection(cfg)
+    if not ref:
+        return
+    _codec_conformance(cfg)
+    cls, _how, _iv, _shape = _api_registry.resolve("message_codec", ref)
+    spec = _plugin_config_fields(cls)
+    for k, v in sorted(params.items()):
+        fs = spec.get(k)
+        if fs is None and spec:
+            raise ValueError(f"plugins.message_codec.params: {cls.__name__} declares no field "
+                             f"{k!r}; known: {sorted(spec)}")
+        if fs is not None:
+            fs.validate(f"plugins.message_codec.params.{k}", v)
+    own = inspect.getattr_static(cls, "validate_params", None)
+    if isinstance(own, (classmethod, staticmethod)):
+        getattr(cls, "validate_params")(params)
+
+
+def _validate_slot_plugin(cfg, slot: str, keys: frozenset, enum_field: str) -> None:
+    """Shape + params validation for a single-object slot, at CONFIG time.
+
+    Resolves and validates but does NOT construct, for the same reason `_validate_codec_plugin`
+    does: `--check-config`, the GUI's validation pass and the copilot must be able to reject
+    `plugins.protocol_profile.params.congestion = "yes"` without building a stack, and -- for the
+    ETSI profiles -- without needing `asn1tools` installed at all, since construction is the only
+    thing that requires it.
+    """
+    ref, params = _section(cfg, slot, keys, enum_field)
+    if not ref:
+        return
+    _slot_conformance(cfg, slot)
+    cls, _how, _iv, _shape = _api_registry.resolve(slot, ref)
+    spec = _plugin_config_fields(cls)
+    for k, v in sorted(params.items()):
+        fs = spec.get(k)
+        if fs is None and spec:
+            raise ValueError(f"plugins.{slot}.params: {cls.__name__} declares no field {k!r}; "
+                             f"known: {sorted(spec)}")
+        if fs is not None:
+            fs.validate(f"plugins.{slot}.params.{k}", v)
+    own = inspect.getattr_static(cls, "validate_params", None)
+    if isinstance(own, (classmethod, staticmethod)):
+        getattr(cls, "validate_params")(params)
+
+
+def _validate_profile_plugin(cfg) -> None:
+    _validate_slot_plugin(cfg, "protocol_profile", _PROFILE_SECTION_KEYS, "protocol_profile")
+
+
+def _validate_report_format_plugin(cfg) -> None:
+    _validate_slot_plugin(cfg, "report_format", _REPORT_SECTION_KEYS, "report_format")
 
 
 def _validate_detector_plugins(cfg) -> None:
@@ -3375,6 +3930,9 @@ def _field_group(name: str) -> str:
                      "sumo_net", "sumo_frame_city")),
         ("Scenario events", ("events",)),
         ("Plugins", ("plugins",)),
+        ("Protocol", ("message_codec", "message_signer", "cam_generation_rules", "dcc",
+                      "net_latency_model", "ma_backhaul_s", "security_model",
+                      "protocol_profile", "report_format")),
         ("Messages", ("denm",)),
         ("GNSS/sensor", ("gps_", "faulty", "weather")),
         ("Radio", ("radio", "packet", "nlos", "chan", "freq", "art_max", "stale", "pathloss",
@@ -3401,6 +3959,18 @@ _ENUM_OPTIONS = {
     # same rule as radio_model: sourced from the BUILT-IN REGISTRY so validate_config's message,
     # this list, the argparse choices and the GUI dropdown are one source of truth
     "mobility_source": list(_api_registry.builtin_names("mobility")),
+    # Same rule again, one slot over: the codec options come from the BUILT-IN REGISTRY (which the
+    # lazy registrar populates on first look), with "" prepended for "no codec at all". "" is not a
+    # registry entry and never can be -- it is the ABSENCE of a codec object, which is what makes
+    # the default path free rather than merely cheap.
+    "message_codec": ["", *_api_registry.builtin_names("message_codec")],
+    "message_signer": list(_api_codec.SIGNER_FORMS),
+    "security_model": ["none", "ecdsa"],
+    # Same rule, two slots over. "" on `protocol_profile` means "derive the built-in stack from the
+    # layer flags"; "" on `report_format` means the engine's historic inline row. Neither is a
+    # registry entry, and neither can be: both are the ABSENCE of an object.
+    "protocol_profile": ["", *_api_registry.builtin_names("protocol_profile")],
+    "report_format": ["", *_api_registry.builtin_names("report_format")],
     "road_network": ["linear", "grid", "ring", "spider", "custom", "sumo"],
     "drive_side": ["right", "left"],
     "demand_profile": ["uniform", "rush", "night"],
@@ -3630,6 +4200,43 @@ _FIELD_META = {
                               "reaches its firing score of 1.0 (lower fires more readily)", lo=2, hi=20),
     "sybil_cell_m": dict(h="Sybil co-location cell size: certs are binned to this grid; smaller demands "
                            "tighter co-location to flag", lo=0.5, hi=20, st=0.5, u="m"),
+    # Protocol (the real stack)
+    "message_codec": dict(h="Wire format for every CAM/DENM/VAM: '' (off, no codec constructed) | "
+                            "native_v1 (the engine's own representation, and the legacy 300 B "
+                            "airtime assumption) | etsi_cam_en302637_2 / etsi_denm_en302637_3 / "
+                            "etsi_vam_ts103300_3 (real UPER against the vendored ETSI ASN.1 "
+                            "modules). The encoded PDU LENGTH drives airtime, CBR and collision "
+                            "loss. Third-party profiles go through plugins.message_codec"),
+    "message_signer": dict(h="TS 103 097 signer alternation used for the frame's wire size when "
+                             "security_model=none: none | digest (HashedId8, +93 B) | certificate "
+                             "(+219 B). Ignored under security_model=ecdsa, where the real "
+                             "once-per-second attachment rule decides"),
+    "cam_generation_rules": dict(h="ETSI EN 302 637-2 CAM triggering: emit on a 4 m / 4 deg / "
+                                   "0.5 m/s dynamics change, floored at T_GenCamMin 0.1 s with a "
+                                   "T_GenCamMax 1.0 s heart-beat (needs dt <= 1.0; only binds "
+                                   "below 0.5). Off = one CAM per vehicle per step"),
+    "dcc": dict(h="ETSI TS 102 687 reactive DCC: the measured CBR selects a state and its T_off "
+                  "becomes a floor on the CAM interval. Correctly inert below CBR 0.30. Requires "
+                  "cam_generation_rules"),
+    "net_latency_model": dict(h="Per-packet latency (propagation + AIFS/backoff/airtime on the "
+                                "REAL frame length + a derived stack constant) in place of the "
+                                "uniform report-ingest draw. Deterministic: it draws nothing"),
+    "ma_backhaul_s": dict(h="Deterministic MA report-upload delay added on top of the per-packet "
+                            "latency (net_latency_model only)", lo=0, u="s"),
+    "security_model": dict(h="none = sig_ok is a boolean the attack switch sets (today). ecdsa = "
+                             "butterfly-provisioned pseudonyms, real ECDSA-P256 signing over the "
+                             "1609.2 double hash, and sig_ok as the RESULT of a verification"),
+    "protocol_profile": dict(h="WHICH PROTOCOL this run speaks, as one declaration: '' = build the "
+                               "built-in etsi_its_g5 stack from the four layer flags above (and "
+                               "nothing at all when they are off) | etsi_its_g5 explicitly. A "
+                               "profile owns the codec, the generation rules, the congestion "
+                               "controller, the wire-size accounting and the airtime/latency "
+                               "model. A third-party stack goes through plugins.protocol_profile"),
+    "report_format": dict(h="Misbehaviour-report format: '' (the engine's historic inline row) | "
+                            "ma_report_v1 (that identical row through the report_format seam) | "
+                            "ts103759_shape (the TS 103 759 TemplateAsr shape carrying the REAL "
+                            "encoded evidence octets; changes data_digest by construction). "
+                            "Third-party formats go through plugins.report_format"),
     # Radio
     "radio_range_m": dict(h="Vehicle reception range", lo=10, hi=2000, u="m"),
     "radio_model": dict(h="Reachability model: disc (hard range) | logdistance (soft path-loss + "
@@ -4002,6 +4609,153 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
               f"{0 if geo_chan.buildings is None else geo_chan.buildings.n_polygons}"
               f"{'' if geo_chan.buildings is not None else f' (canyon {cfg.radio_nlosb_density_per_km}/km)'}",
               flush=True)
+    # ---- THE PROTOCOL STACK: codec, PROFILE, report format, security ---------------------------
+    # Constructed here, before step 0, for the same reason the channel is: every failure a wire
+    # format, a protocol stack or a PKI can produce (a missing optional dependency, an unknown ETSI
+    # StationType name, a rejected parameter, an incoherent layer combination) must be fatal BEFORE
+    # any output directory exists.
+    #
+    # THE PROFILE IS THE SEAM (api/profile.py). Below this block the engine asks a `ProtocolProfile`
+    # -- never `codecs.etsi_rules`, and never a config flag -- when a station transmits, how often it
+    # is allowed to, what a frame weighs, what that costs on the air and how long it takes to
+    # arrive. The built-in ITS-G5 stack is resolved through that seam like anybody else's, which is
+    # the whole test of whether the seam is real. Each of profile, report format and security layer
+    # is independently None by default, and the whole block costs one `if` per feature on the
+    # default path.
+    _codec, codec_provenance = build_codec(cfg)
+    _assert_config_unmoved(_cfg0, cfg, "while constructing the message codec")
+    if _codec is not None and _armed:
+        _run_sentinel.verify("after LOADING the message codec")
+    # THE PROFILE. One object that owns the codec, the generation rules, the congestion controller,
+    # the wire-size accounting and the airtime/latency model. `None` when nothing asked for one, in
+    # which case not a single line below it executes and the default path is exactly what it was.
+    # The codec built above is INJECTED; a third-party profile may return its own from `codec()`,
+    # and everything downstream reads `_profile.codec()` rather than `_codec`.
+    _profile, profile_provenance = build_profile(cfg, _codec)
+    _assert_config_unmoved(_cfg0, cfg, "while constructing the protocol profile")
+    if _profile is not None and _armed:
+        _run_sentinel.verify("after LOADING the protocol profile")
+    _report_fmt, report_format_provenance = build_report_format(cfg)
+    _assert_config_unmoved(_cfg0, cfg, "while constructing the report format")
+    if _report_fmt is not None and _armed:
+        _run_sentinel.verify("after LOADING the report format")
+    if _profile is not None:
+        _declared_codec, _codec = _codec, _profile.codec()
+        if _declared_codec is not None and _codec is None:
+            # REFUSED, not silently ignored. The config asked for a wire format, the profile threw
+            # it away, and a run whose manifest says `message_codec: native_v1` while nothing was
+            # ever encoded is the "replays as a different run at exit 0" failure the whole plugin
+            # lock exists to prevent. A profile is entitled to bring its OWN codec -- that is the
+            # point of the seam -- but not to answer `None` to a declared one.
+            raise ConfigError(
+                f"protocol_profile {getattr(_profile, 'profile_id', '?')!r} returned None from "
+                f"codec() while the config declared message_codec="
+                f"{(cfg.message_codec or _codec_selection(cfg)[0])!r}. A profile may return its own "
+                f"codec, but discarding a declared one would put a wire format in the manifest of a "
+                f"run that never encoded anything. Drop the message_codec declaration, or have the "
+                f"profile consume env['message_codec'].")
+    #: The profile's declared capabilities, which is HOW the engine learns which layers are active.
+    #: Not `cfg.cam_generation_rules`: a third-party profile that supplies generation rules gets them
+    #: run without an engine flag, which is the whole point of the seam.
+    _prof_caps = frozenset(_profile.capabilities()) if _profile is not None else frozenset()
+    #: The encoder, or None. Built once; holds the frozen StationViews so the reception loop does
+    #: not allocate one per message. The frame LENGTH comes from the profile, which is where the
+    #: security envelope is accounted for.
+    _wire = (WireEncoder(_codec, cfg.message_signer, sizer=_profile.wire_size_bytes)
+             if _codec is not None else None)
+    _codec_claim = dict(_codec.standards_claim()) if _codec is not None else None
+    _profile_claim = dict(_profile.standards_claim()) if _profile is not None else None
+    if cfg.verbose and _profile is not None:
+        print(f"[protocol profile] {getattr(_profile, 'profile_id', '?')} "
+              f"layers={sorted(_prof_caps)}", flush=True)
+    if cfg.verbose and _codec is not None:
+        print(f"[message codec] {getattr(_codec, 'profile_id', cfg.message_codec)} "
+              f"signer={cfg.message_signer}", flush=True)
+    if cfg.verbose and _report_fmt is not None:
+        print(f"[report format] {getattr(_report_fmt, 'format_id', cfg.report_format)}", flush=True)
+    #: Per-station generation service state (EN 302 637-2 for the built-in). Absent -> the historic
+    #: one-message-per-station-per-step cadence.
+    _cam_state: dict = {} if _api_profile.CAP_GENERATION in _prof_caps else None
+    #: Per-station congestion-control entity (TS 102 687 for the built-in). Absent -> no rate limit.
+    _dcc_state: dict = {} if _api_profile.CAP_CONGESTION in _prof_caps else None
+    #: The last encoded PDU each pseudonym put on the air, for TS 103 759 `v2xPduEvidence`.
+    #:
+    #: Written ONLY when a report format actually declares `evidence_pdu`. The octets exist on every
+    #: run with a codec, but keeping them for a run that will never file them is an unconditional
+    #: allocation per broadcast on the hottest path in the engine -- and "the default path pays
+    #: nothing" is the rule every seam here is written to.
+    #:
+    #: One entry per PSEUDONYM, overwritten in place, so the store is O(pseudonyms ever seen) rather
+    #: than O(messages) -- and its bound is stated rather than assumed: the 1188-vehicle hour with
+    #: 300 s rotation reaches ~14k pseudonyms at ~400 B of PDU, i.e. ~6 MB. It is deliberately NOT
+    #: pruned with `last_claimed`: a report can legitimately be filed about a station whose
+    #: pseudonym has just rotated, and dropping the evidence for it would make `v2xPduEvidence`
+    #: absent exactly on the reports a rotation-aware analysis most wants.
+    _evidence_store: dict = {}
+    _evidence_on = (_report_fmt is not None and _codec is not None
+                    and _api_report.CAP_EVIDENCE_PDU in frozenset(_report_fmt.capabilities()))
+    #: The CBR each receiver measured LAST step -- the input DCC reacts to. One step of lag is not
+    #: an approximation, it is the causality: a station cannot react to a load it has not yet heard.
+    _cbr_measured: dict = {}
+    #: Trigger-reason tally and inter-CAM gaps, for the manifest's `protocol` block. Manifest-only,
+    #: hence outside `data_digest` by construction.
+    _cam_triggers: Counter = Counter()
+    _cam_gap_sum, _cam_gap_n, _cam_gap_max = 0.0, 0, 0.0
+    _cam_last_t: dict = {}
+    _cbr_sum, _cbr_n, _cbr_max = 0.0, 0, 0.0
+    _lat_sum, _lat_n, _lat_min, _lat_max = 0.0, 0, float("inf"), 0.0
+    #: Latency HISTOGRAM at 1 microsecond resolution, not a list of samples.
+    #:
+    #: Keeping every value would be exact and would also cost ~860 MB on the 1188-vehicle hour
+    #: (26.9 million delivered frames x 32 B per boxed float), which is more than the whole run's
+    #: working set. A microsecond-binned Counter is O(distinct latencies) -- a few thousand keys,
+    #: because the distribution is dominated by a constant -- and its quantiles are exact to 1 us,
+    #: three orders of magnitude below the millisecond the figures are reported in.
+    _lat_hist: Counter = Counter()
+    _wire_size_sum, _wire_size_n = 0, 0
+    #: Airtime per frame size, memoised. `ppdu_symbols` is a ceil over an integer division and the
+    #: engine sees a handful of distinct sizes, so this is a dict lookup instead of two divisions
+    #: and a ceil on every one of ~10^7 offered frames.
+    _airtime_cache: dict = {}
+
+    def _airtime_s(nbytes: int) -> float:
+        v = _airtime_cache.get(nbytes)
+        if v is None:
+            v = _profile.frame_airtime_s(nbytes)
+            _airtime_cache[nbytes] = v
+        return v
+
+    #: The security layer, or None. Imported INSIDE the branch: `scms_core.ecdsa_p256` probes the
+    #: ECDSA backend at import time (`SIGNING_MODE`), and a run that did not ask for real
+    #: cryptography must not pay for that probe -- the same discipline `scms_core/__init__` states.
+    _sec = None
+    if cfg.security_model == "ecdsa":
+        from ..scms_core import engine_security as _engine_security
+        # `crl` is held BY REFERENCE and is the very list `crl_entries` becomes below, so a
+        # revocation appended mid-run is immediately visible to every receiver's verifier -- which
+        # is what makes "present a revoked certificate" a receiver-side detection rather than
+        # engine-side bookkeeping.
+        _sec = _engine_security.SecurityLayer(cfg.derive, jmax=cfg.jmax)
+        if cfg.verbose:
+            from ..scms_core.ecdsa_p256 import SIGNING_MODE as _SIGNING_MODE
+            print(f"[security] ECDSA-P256 over the 1609.2 double hash; nonces={_SIGNING_MODE}; "
+                  f"butterfly provisioning (PCA sees one opaque token per certificate)", flush=True)
+    #: Attacks whose CURRENT implementation is an edit to a wire field that a real signature makes
+    #: unforgeable. Under `security_model="ecdsa"` each is re-expressed as a thing the attacker
+    #: DOES (see `scms_core.secured.SIGNATURE_ATTACKS`); the counter records how often the honest
+    #: form was unavailable, so the loss is measured rather than hidden.
+    _sec_refusals: Counter = Counter()
+    #: `secured.VerificationResult.status` tally over every delivered frame. Eight-valued, where
+    #: the boolean was two-valued: `unknown_issuer`, `cert_signature_invalid`, `cert_expired`,
+    #: `cert_not_yet_valid`, `cert_revoked`, `psid_not_permitted`, `cert_unavailable`,
+    #: `signature_invalid`, `ok`.
+    _verdicts: Counter = Counter()
+    #: vid -> (SignedBroadcast, cx, cy, cs, ch, cg): the first frame this station ever transmitted,
+    #: kept so a `DataReplay` attacker can re-emit a frame it really captured, signature included.
+    _sec_last_frame: dict = {}
+    #: A per-packet latency model is active iff the PROFILE declares it. For the built-in that is
+    #: exactly `cfg.net_latency_model`; for a third-party stack it is the stack's own declaration.
+    _lat_on = _api_profile.CAP_LATENCY in _prof_caps
     # The DENM (event-message) layer is active when benign DENMs are requested (denm_rate>0) OR the
     # opt-in FakeHazard attack is selected via any selector (it emits phantom DENMs even at denm_rate=0,
     # so it turns the layer on -- exactly as VruImpersonation enables the station_type machinery). When
@@ -4328,12 +5082,14 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                            else (spawn_time + life_hint if cfg.traffic_flow else None))
             life = life_hint if finish_time is None else max(cfg.dt, finish_time - spawn_time)
         n_rot = 1 if cfg.rotate_period_s <= 0 else max(1, math.ceil(life / cfg.rotate_period_s))
-        pseudonyms = []
+        # THE WINDOWS, computed first and identically on both paths. Under `security_model="ecdsa"`
+        # the whole device is provisioned in ONE butterfly batch -- which is the point: the RA
+        # drains its request queue in a device-mixing order, so the PCA never sees a device's
+        # certificates as a group. Issuing them one at a time inside the loop below would hand the
+        # PCA the arrival correlation the shuffle exists to destroy.
+        _windows = []
         for k in range(n_rot):
             i_k, j_k = k // cfg.jmax, (vid + k) % cfg.jmax
-            pk = ca.keypair_from_seed(cfg.derive(f"key:{vid}:{k}"))
-            dig = ca.hashed_id8(ca.public_bytes(pk)).hex()
-            pca.issue(dig, req_hash, i_k, j_k, la_h1, la_h2)
             vf = spawn_time + (k * cfg.rotate_period_s if cfg.rotate_period_s > 0 else 0.0)
             vt = spawn_time + ((k + 1) * cfg.rotate_period_s if cfg.rotate_period_s > 0 else life)
             if cf and k == n_rot - 1:
@@ -4341,6 +5097,26 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 # FINAL cert must stay valid for its whole presence, so cap it past the sim end -> a
                 # present benign vehicle can never show an "expired" cert (attacks override cvt/cvf).
                 vt = max(vt, total_time + cfg.dt)
+            _windows.append((i_k, j_k, vf, vt))
+        _ghost_windows = []
+        if _sec is not None and is_att and atype == "Sybil":
+            # A Sybil's ghosts are REAL CREDENTIALS it holds and uses simultaneously -- extra
+            # j-indices in i-period 0. That is what the attack is under a working SCMS: not forged
+            # certificates (those are `ForgedCertificate`, and a receiver rejects them on the
+            # issuer), but more legitimate pseudonyms than a station is entitled to run at once.
+            _ghost_windows = [(0, (cfg.jmax - 1 - g) % cfg.jmax, spawn_time, spawn_time + life)
+                              for g in range(cfg.sybil_ghosts)]
+        _creds = None
+        if _sec is not None:
+            _creds = _sec.provision(true_id, ctx, _windows + _ghost_windows, attacker=is_att)
+        pseudonyms = []
+        for k, (i_k, j_k, vf, vt) in enumerate(_windows):
+            if _creds is not None:
+                dig = _creds.credentials[k].digest
+            else:
+                pk = ca.keypair_from_seed(cfg.derive(f"key:{vid}:{k}"))
+                dig = ca.hashed_id8(ca.public_bytes(pk)).hex()
+            pca.issue(dig, req_hash, i_k, j_k, la_h1, la_h2)
             pseudonyms.append({"k": k, "i": i_k, "j": j_k, "digest": dig, "valid_from": vf, "valid_to": vt})
             pseudonym_info[dig] = {"i": i_k, "j": j_k, "lv": ctx.linkage_value_for(i_k, j_k),
                                    "ghost": False, "veh_vid": vid}
@@ -4386,8 +5162,11 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         if is_att and atype == "Sybil":
             for g in range(cfg.sybil_ghosts):
                 gj = (cfg.jmax - 1 - g) % cfg.jmax
-                gk = ca.keypair_from_seed(cfg.derive(f"ghost:{vid}:{g}"))
-                gdig = ca.hashed_id8(ca.public_bytes(gk)).hex()
+                if _creds is not None:
+                    gdig = _creds.credentials[len(_windows) + g].digest
+                else:
+                    gk = ca.keypair_from_seed(cfg.derive(f"ghost:{vid}:{g}"))
+                    gdig = ca.hashed_id8(ca.public_bytes(gk)).hex()
                 pca.issue(gdig, req_hash, 0, gj, la_h1, la_h2)
                 v.ghosts.append(gdig)
                 pseudonym_info[gdig] = {"i": 0, "j": gj, "lv": ctx.linkage_value_for(0, gj),
@@ -4424,11 +5203,15 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         true_id = f"veh_{vid:03d}"
         ra.bind(req_hash, true_id)
         j0 = vid % cfg.jmax
-        pk = ca.keypair_from_seed(cfg.derive(f"key:{vid}:0"))
-        dig = ca.hashed_id8(ca.public_bytes(pk)).hex()
-        pca.issue(dig, req_hash, 0, j0, la_h1, la_h2)
         vf = spawn_time
-        vt = max(spawn_time + life, total_time + cfg.dt)   # cert covers the VRU's whole presence -> a
+        vt0 = max(spawn_time + life, total_time + cfg.dt)
+        if _sec is not None:
+            dig = _sec.provision(true_id, ctx, [(0, j0, vf, vt0)]).credentials[0].digest
+        else:
+            pk = ca.keypair_from_seed(cfg.derive(f"key:{vid}:0"))
+            dig = ca.hashed_id8(ca.public_bytes(pk)).hex()
+        pca.issue(dig, req_hash, 0, j0, la_h1, la_h2)
+        vt = vt0                                           # cert covers the VRU's whole presence -> a
         pseudonyms = [{"k": 0, "i": 0, "j": j0, "digest": dig,    # benign VRU never shows an expired cert
                        "valid_from": vf, "valid_to": vt}]
         pseudonym_info[dig] = {"i": 0, "j": j0, "lv": ctx.linkage_value_for(0, j0),
@@ -4671,7 +5454,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     ma_investigations: list[R.MaInvestigation] = []
     ma_crl_events: list[R.MaCrlEvent] = []
     gt_linkage_rev: list[R.GtLinkageRevocation] = []
-    crl_entries: list[CrlLinkageEntry] = []
+    # THE SAME LIST OBJECT the security layer's verifier holds, when there is one. Not a copy: a
+    # revocation is `crl_entries.append(...)` mid-run, and a verifier handed a snapshot would keep
+    # accepting the revoked certificate for the rest of the run. This is what makes "an attacker
+    # presenting a revoked certificate" a RECEIVER-side verdict (`CERT_REVOKED`, recomputed from the
+    # published linkage seeds) rather than engine-side vid bookkeeping.
+    crl_entries: list[CrlLinkageEntry] = [] if _sec is None else _sec.crl
     subj_events: dict[str, list] = {}    # subject digest -> [(time, reporter_digest)] in a sliding window
     reported_vids: set[int] = set()       # true vids ever reported (for the live map colouring only)
     revoked_vehicles: dict[int, float] = {}          # vid -> revocation time (vehicle-level)
@@ -4869,6 +5657,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         _run_sentinel.verify("after LOADING the detection layer")
     DET_KEYS = suite.keys
     SOFT_KEYS = suite.soft_keys
+    #: The ORDERED column vocabulary handed to a report format. Order is load-bearing -- it fixes
+    #: `detnorm_*` key insertion order and therefore reaches `data_digest` through the canonical
+    #: serialisation -- so it is materialised once here rather than rebuilt per report.
+    _REPORT_DET_KEYS = (*DET_KEYS, *SOFT_KEYS)
     _DET_ZERO = suite.zero
     _CAM_PLAN, _DENM_PLAN = suite.cam_plan, suite.denm_plan
     _VRU_SUPPRESSED, _SIG_SUPPRESSED = suite.vru_suppressed, suite.sig_suppressed
@@ -4896,51 +5688,120 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 and filed_by.get(reporter_digest, 0) <= cfg.report_budget
                 and received_by.get(reporter_digest, 0) < cfg.reputation_max)
 
+    def _evidence_for(subject_digest: str) -> tuple:
+        """The encoded octets of the last PDU this subject transmitted, or `()`.
+
+        `()` rather than a placeholder: `v2xPduEvidence` is `SEQUENCE (SIZE(1..MAX))`, so an empty
+        sequence is not a valid encoding of "no evidence" and a format must be able to tell the
+        difference. The colluder path fabricates an accusation about a station it may never have
+        heard, and that report legitimately carries no PDU.
+        """
+        if not _evidence_on:
+            return ()
+        pdu = _evidence_store.get(subject_digest)
+        return (pdu,) if pdu is not None else ()
+
     def file_report(t, reporter_digest, subject_digest, subject_veh, reasons, det, conf,
                     cx, cy, px, py, malicious, sig_valid=True, station_type="vehicle",
-                    rssi_dbm=None, score=None, score_norm=None):
+                    rssi_dbm=None, score=None, score_norm=None, latency=0.0):
         # `score` / `score_norm` come from the FUSION's `ReportDecision` on the two detection paths
         # (that is what makes the summary scores the fusion layer's statement rather than the report
         # writer's); the collusion path, which fabricates its own vector with no fusion involved,
         # leaves them None and keeps the historical derivation.
         counters["report"] += 1
         rid = f"rpt_{counters['report']:05d}"
-        delay = rng.uniform(0.0, cfg.net_delay_max)
+        # THE TWO DELAYS, and they are different quantities.
+        #
+        # `latency` is the PER-PACKET air-interface latency of the frame this report is about:
+        # propagation + access + stack, computed from the real frame length and the receiver's
+        # measured CBR. It is when the receiver DETECTED, so it moves `detection_time`.
+        #
+        # `net_delay_max` is a REPORT-UPLOAD delay -- how long the report takes to reach the MA --
+        # and until now it was `rng.uniform(0, 2.0)`, an ingest delay with nothing to do with the
+        # channel and two orders of magnitude larger than one. Under `net_latency_model` it is
+        # replaced by `ma_backhaul_s`, a declared constant: the uniform draw is not made at all, so
+        # this path stops consuming from the global stream (which is exactly why the feature has to
+        # be opt-in -- removing a draw moves every downstream number, and that is a different run,
+        # not a corrupted one).
+        if _lat_on:
+            det_t = t + latency
+            ingest_t = det_t + cfg.ma_backhaul_s
+        else:
+            det_t = t
+            ingest_t = t + rng.uniform(0.0, cfg.net_delay_max)
         rep_veh = digest_to_vehicle[reporter_digest]
         if score is None:
             score = det.get(reasons[0], 1.0)
         if score_norm is None:
             score_norm = max(det.values()) if det else 1.0
-        row = R.MaReport(
-            report_id=rid, ingest_time=round(t + delay, 3), detection_time=t, generation_time=t,
-            reporter_cert_digest=reporter_digest, subject_cert_digest=subject_digest,
-            reason_codes=reasons,
-            detector_outputs=[{"check_id": reasons[0], "score": round(score, 3),
-                               "verdict": "fail"}],
-            cert_validity={"sig_valid": True, "not_expired": True, "not_revoked": True, "chain_ok": True},
-            evidence_msg_refs=[f"{rid}-m"],
-            st_bbox=[min(cx, px), min(cy, py), max(cx, px), max(cy, py)],
-            st_tstart=t, st_tend=t, duplicate_flag=False).to_dict()
-        row["detector_score"] = round(score, 3)
-        row["detector_score_norm"] = round(score_norm, 3)
-        row["subject_pos_confidence"] = round(conf, 3)
-        row["cert_crl_status"] = "active"
-        row["sig_valid"] = bool(sig_valid)
-        if _emit_station_type:                           # MA-VISIBLE self-declared station type on the
-            row["station_type"] = station_type          # subject's beacon; key absent by default (byte-identical)
-        if _emit_rssi:
-            # MA-VISIBLE received-signal strength of the subject's frame, in dBm. Legitimately
-            # measurable by the receiver PHY, so it is NOT ground truth and NOT in
-            # FORBIDDEN_FEATURE_KEYS -- but it is computed from the subject's TRUE position on the
-            # channel side (GeometricChannel.evaluate), never from the position the subject CLAIMS.
-            # That is the whole point: a Sybil ghost, or any position-falsifying attacker, carries
-            # the RSSI of its attacker's real location, so RSSI-vs-claimed-distance is a detector.
-            # None can only happen on a path with no received frame; the colluder path below
-            # synthesises one from its own true link geometry rather than leaving a NULL that would
-            # be a perfect oracle for "this accusation was fabricated".
-            row["rssi_dbm"] = None if rssi_dbm is None else round(float(rssi_dbm), 2)
-        for k in (*DET_KEYS, *SOFT_KEYS):
-            row[f"detnorm_{k}"] = round(det.get(k, 0.0), 3)
+        if _report_fmt is not None:
+            # THE REPORT-FORMAT SEAM. Everything below in the historic branch is `ma_report_v1`'s
+            # body; a format plugin renders the same MA-VISIBLE input its own way. The input carries
+            # `evidence_pdus` -- the real octets the codec put on the air for this subject -- so a
+            # format that wants a structurally valid TS 103 759 `v2xPduEvidence` has the bytes for
+            # it, which is the plumbing the previous stage identified as missing.
+            row = dict(_report_fmt.render(_api_report.ReportInput(
+                report_id=rid, ingest_time=ingest_t, detection_time=det_t, generation_time=t,
+                reporter_cert_digest=reporter_digest, subject_cert_digest=subject_digest,
+                reason_codes=tuple(reasons), round_detection=_lat_on,
+                detector_scores=dict(det), detector_keys=_REPORT_DET_KEYS,
+                score=score, score_norm=score_norm, subject_pos_confidence=conf,
+                sig_valid=bool(sig_valid), cert_crl_status="active",
+                station_type=(station_type if _emit_station_type else None),
+                rssi_dbm=rssi_dbm, emit_rssi=_emit_rssi,
+                st_bbox=(min(cx, px), min(cy, py), max(cx, px), max(cy, py)),
+                st_tstart=t, st_tend=t, duplicate_flag=False,
+                evidence_msg_refs=(f"{rid}-m",),
+                evidence_pdus=tuple(_evidence_for(subject_digest)),
+                evidence_profile_id=(getattr(_codec, "profile_id", None)
+                                     if _codec is not None else None),
+                cert_validity={"sig_valid": True, "not_expired": True, "not_revoked": True,
+                               "chain_ok": True})))
+            missing = [k for k in _api_report.REQUIRED_ROW_KEYS if k not in row]
+            if missing:
+                raise ConfigError(
+                    f"plugins.report_format {cfg.report_format or '(plugin)'!r} rendered a row "
+                    f"missing {missing}; the engine reads {list(_api_report.REQUIRED_ROW_KEYS)} "
+                    f"back off every row to sort and stream it, so a format that omits them does "
+                    f"not produce an unusual dataset, it produces a KeyError at write time")
+        else:
+            row = R.MaReport(
+                report_id=rid, ingest_time=round(ingest_t, 3),
+                # NOT rounded on the legacy path: `t` is written verbatim there and `round(t, 6)` is
+                # a different float for a dt that does not divide 1.0 exactly (t =
+                # 0.30000000000000004 rounds to 0.3), which would move the digest of any sub-second
+                # default run.
+                detection_time=(round(det_t, 6) if _lat_on else t),
+                generation_time=t,
+                reporter_cert_digest=reporter_digest, subject_cert_digest=subject_digest,
+                reason_codes=reasons,
+                detector_outputs=[{"check_id": reasons[0], "score": round(score, 3),
+                                   "verdict": "fail"}],
+                cert_validity={"sig_valid": True, "not_expired": True, "not_revoked": True,
+                               "chain_ok": True},
+                evidence_msg_refs=[f"{rid}-m"],
+                st_bbox=[min(cx, px), min(cy, py), max(cx, px), max(cy, py)],
+                st_tstart=t, st_tend=t, duplicate_flag=False).to_dict()
+            row["detector_score"] = round(score, 3)
+            row["detector_score_norm"] = round(score_norm, 3)
+            row["subject_pos_confidence"] = round(conf, 3)
+            row["cert_crl_status"] = "active"
+            row["sig_valid"] = bool(sig_valid)
+            if _emit_station_type:                       # MA-VISIBLE self-declared station type on the
+                row["station_type"] = station_type      # subject's beacon; key absent by default (byte-identical)
+            if _emit_rssi:
+                # MA-VISIBLE received-signal strength of the subject's frame, in dBm. Legitimately
+                # measurable by the receiver PHY, so it is NOT ground truth and NOT in
+                # FORBIDDEN_FEATURE_KEYS -- but it is computed from the subject's TRUE position on
+                # the channel side (GeometricChannel.evaluate), never from the position the subject
+                # CLAIMS. That is the whole point: a Sybil ghost, or any position-falsifying
+                # attacker, carries the RSSI of its attacker's real location, so RSSI-vs-claimed-
+                # distance is a detector. None can only happen on a path with no received frame; the
+                # colluder path below synthesises one from its own true link geometry rather than
+                # leaving a NULL that would be a perfect oracle for "this accusation was fabricated".
+                row["rssi_dbm"] = None if rssi_dbm is None else round(float(rssi_dbm), 2)
+            for k in (*DET_KEYS, *SOFT_KEYS):
+                row[f"detnorm_{k}"] = round(det.get(k, 0.0), 3)
         ma_reports.append(row)
         if malicious:
             correctness = "malicious_false_report"
@@ -4959,6 +5820,72 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         received_by[subject_digest] = received_by.get(subject_digest, 0) + 1
         touched_subjects.add(subject_digest)
 
+    def seal(b: dict, t: float, *, attack: str = "", replay_of=None) -> dict:
+        """Put ONE broadcast on the wire: encode it, sign it, and record what it weighs.
+
+        This is the single site where a message stops being a dict and becomes octets. Everything
+        downstream -- airtime, CBR, collision loss, per-packet latency -- reads `b["wire_bytes"]`,
+        so a codec that says a CAM is 41 octets and one that says 300 changes the CHANNEL, not just
+        a manifest field. With neither a codec nor a security layer the function adds one dict
+        lookup and returns, which is what keeps the default path free.
+
+        Order matters: ENCODE, then SIGN THE ENCODED OCTETS. 1609.2 `SignedDataPayload` carries the
+        facilities-layer PDU, so signing anything else would sign a thing that is not on the wire.
+        """
+        nonlocal _wire_size_sum, _wire_size_n
+        if _wire is None and _sec is None:
+            return b
+        payload, claim = None, None
+        if _wire is not None:
+            payload, size, claim = _wire.encode(b)
+            b["wire_bytes"] = size
+            if _evidence_on:
+                # These are exactly the octets that crossed the air, so a report carrying them is
+                # carrying evidence rather than a reference to evidence. Keyed on the PSEUDONYM, so
+                # a rotation legitimately loses the old identity's evidence -- which is what a real
+                # receiver would also experience.
+                _evidence_store[b["digest"]] = payload
+        if _sec is not None:
+            if payload is None:
+                # No codec selected but security is on: sign the engine's own canonical bytes, so
+                # the signature still covers the message CONTENT rather than a placeholder.
+                payload = ca.canonical_bytes({
+                    "d": b["digest"], "t": round(float(b["cg"]), 6),
+                    "x": round(float(b["cx"]), 6), "y": round(float(b["cy"]), 6),
+                    "v": round(float(b["cs"]), 6), "h": round(float(b["ch"]), 6),
+                    "st": b.get("station_type", "vehicle"), "mt": b.get("msg_type", "cam")})
+            if replay_of is not None:
+                sb = _sec.replay_of(replay_of)
+            else:
+                sb = _sec.sign(f"veh_{b['veh'].vid:03d}", b["digest"], payload, t,
+                               msg_type=WireEncoder.wire_msg_type(b), attack=attack,
+                               claimed_gen_time=b["cg"])
+            if sb is not None:
+                b["sec"] = sb
+                # WHICH LENGTH THE CHANNEL IS CHARGED, and it is deliberately NOT
+                # `len(sb.message.wire_octets())`.
+                #
+                # The signature is real; the SERIALISATION around it is this repository's own
+                # canonical, length-prefixed byte string, and `certificate.py` says in as many
+                # words that it is NOT TS 103 097 COER. Measured on this run it comes out ~200 B
+                # for an AT certificate against the 132 B that `pycrate` produces for the real COER
+                # structure -- a 51 % over-estimate that would land straight in CBR and in every
+                # collision probability derived from it.
+                #
+                # So: the security layer decides WHICH ARM the frame carries (the standard's
+                # once-per-second attachment rule, not a config field), and the CODEC supplies the
+                # SIZE of that arm from `SECURITY_ENVELOPE_BYTES`, which was measured against a real
+                # COER encoder. Real cryptography, measured airtime, and neither borrowing the
+                # other's error. With no codec there is nothing better to ask, so the object's own
+                # length stands -- and is over-stated by that same margin.
+                b["wire_bytes"] = (_wire.size_for(claim, sb.signer_form) if claim is not None
+                                   else sb.wire_bytes)
+        _bw = b.get("wire_bytes")
+        if _bw:
+            _wire_size_sum += _bw * int(b.get("msg_count", 1))
+            _wire_size_n += int(b.get("msg_count", 1))
+        return b
+
     def emit_denm(tx: Vehicle, b_cam: dict, real: bool, event_type: str, t: float) -> None:
         """Append a DECENTRALIZED EVENT MESSAGE (DENM) broadcast for `tx` this step, plus its MA-visible
         log row and its ORACLE ground-truth row. A DENM is a distinct, SIGNED broadcast kind
@@ -4973,11 +5900,15 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # MA-visible plausibility of a brake/stationary hazard from the sender's OWN claimed speed:
         # a real (slow/stopped) sender scores < 1; a phantom hazard from a cruising sender scores > 1.
         plaus = max(0.0, ev_spd) / cfg.denm_implausible_speed_mps
-        broadcasts.append(dict(
+        # `seq` is the DENM `ActionID.sequenceNumber`, which the ETSI codec puts on the wire and a
+        # receiver uses to correlate an update with the original event. Derived from the run-global
+        # DENM counter, so it is stable, MA-visible and never a function of ground truth.
+        broadcasts.append(seal(dict(
             veh=tx, digest=b_cam["digest"], cx=ev_x, cy=ev_y, cs=ev_spd, ch=b_cam["ch"],
             conf=b_cam["conf"], ghost=False, x=b_cam["x"], y=b_cam["y"], falsified=(not real),
             msg_count=1, cg=t, sig_ok=True, cvf=b_cam["cvf"], cvt=b_cam["cvt"],
-            station_type=b_cam["station_type"], msg_type="denm", event_type=event_type, denm_id=did))
+            station_type=b_cam["station_type"], msg_type="denm", event_type=event_type,
+            denm_id=did, seq=counters["denm"] % 65536), t))
         ma_denm_log.append(dict(                           # MA-VISIBLE (no real/fake flag): observed DENM
             denm_id=did, cert_digest=b_cam["digest"], detection_time=round(t, 3),
             event_type=event_type, claimed_x=round(ev_x, 3), claimed_y=round(ev_y, 3),
@@ -5627,6 +6558,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     continue                                      # GNSS outage -> no fix -> goes silent
             msg_count, cg, sig_ok = 1, t, True                    # CAMs; claimed gen time; signature ok
             cvf, cvt = ps["valid_from"], ps["valid_to"]           # cert validity window (MA-visible)
+            _replay_src = None                                    # a captured frame to re-emit verbatim
             if attacking:
                 cx, cy, cs, ch = attack_claim(tx, t, mx, my, tspeed, theading)
                 if tx.attack_type == "DoS":
@@ -5634,17 +6566,61 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 elif tx.attack_type == "DelayedMessages":
                     cg = t - cfg.delay_s                          # stale timestamp
                 elif tx.attack_type == "DataReplay":
-                    cg = t - 5.0 * cfg.dt                         # replayed frame carries its old gen time
+                    if _sec is None:
+                        cg = t - 5.0 * cfg.dt                     # replayed frame carries its old gen time
+                    else:
+                        # REAL REPLAY: re-emit a frame this attacker actually captured, octet for
+                        # octet, ORIGINAL SIGNATURE INCLUDED. The signature is VALID -- a legitimate
+                        # key made it over exactly these bytes -- and that is the correct model. A
+                        # replay is a FRESHNESS failure caught by `staleOrReplay` against
+                        # `generationTime`, never a crypto failure, and a scheme that flagged it as
+                        # one would be wrong about what signatures do. The claim fields are restored
+                        # from the capture too, so the dict the detectors read and the octets on the
+                        # wire agree -- which the "edit the timestamp and keep today's position"
+                        # form did not.
+                        _captured = _sec_last_frame.get(tx.vid)
+                        if _captured is None:
+                            _sec_refusals["DataReplay_no_captured_frame"] += 1
+                            cg = t - 5.0 * cfg.dt
+                        else:
+                            _replay_src, cx, cy, cs, ch, cg = _captured
                 elif tx.attack_type == "OutOfOrder":
                     cg = t - vrng[tx.vid].uniform(cfg.delay_s, 2.0 * cfg.delay_s)  # non-monotonic gen time
                 elif tx.attack_type == "DoSRandom":
                     msg_count = cfg.dos_burst                     # flood + random content (set in claim)
                 elif tx.attack_type == "InvalidSignature":
+                    # `sig_ok` here is the attacker's INTENT, and it is what the oracle `falsified`
+                    # label keys on. Under `security_model="ecdsa"` it is no longer what the
+                    # receiver believes: the frame is really signed with a key the certificate does
+                    # not name (`secured.sign_with_foreign_key`), and the `sig_ok` a receiver acts
+                    # on is the ECDSA verdict computed at reception. The two agreeing is a
+                    # measurable property of the run, not an assumption.
                     sig_ok = False                                # forged / tampered message
                 elif tx.attack_type == "ExpiredCert":
-                    cvt = t - 5.0                                 # reuse a cert past its validity
+                    if _sec is None:
+                        cvt = t - 5.0                             # reuse a cert past its validity
+                    else:
+                        # REAL: the validity period is a SIGNED certificate field, so an attacker
+                        # cannot edit it -- it can only present a certificate it genuinely holds
+                        # whose window has passed, i.e. one of its own earlier pseudonyms. An
+                        # attacker still inside its first rotation period has none and therefore
+                        # CANNOT mount this attack; the refusal is counted, not papered over.
+                        _cred = _sec.stale_credential(f"veh_{tx.vid:03d}", t)
+                        if _cred is None:
+                            _sec_refusals["ExpiredCert_no_stale_credential"] += 1
+                        else:
+                            digest = _cred.digest
+                            cvf, cvt = _cred.valid_from, _cred.valid_to
                 elif tx.attack_type == "NotYetValid":
-                    cvf = t + 5.0                                 # present a not-yet-valid cert
+                    if _sec is None:
+                        cvf = t + 5.0                             # present a not-yet-valid cert
+                    else:
+                        _cred = _sec.future_credential(f"veh_{tx.vid:03d}", t)
+                        if _cred is None:
+                            _sec_refusals["NotYetValid_no_future_credential"] += 1
+                        else:
+                            digest = _cred.digest
+                            cvf, cvt = _cred.valid_from, _cred.valid_to
             else:
                 cx, cy, cs, ch = mx, my, tspeed, theading
             # MA-VISIBLE self-declared station type carried on the beacon. Genuine VRUs always declare
@@ -5673,18 +6649,93 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                          ghost=False, x=x, y=y, falsified=falsified, msg_count=msg_count,
                          cg=cg, sig_ok=sig_ok, cvf=cvf, cvt=cvt, station_type=declared_station,
                          tspd=tspeed, thdg=theading)
-            broadcasts.append(b_cam)
-            # SURVIVORSHIP: this vehicle-step made it onto the air, so it is one the emission stream
-            # can carry. Counted HERE rather than as `sim - enforced` because the pre-pass has a
-            # second exit above (a GNSS outage goes silent without being revoked), and conflating a
-            # radio-silent step with an enforced one would understate enforcement's own share.
-            surv["bcast"] += 1
-            _sp = surv_span.get(tx.vid)
-            if _sp is not None:
-                if _sp[3] is None:
-                    _sp[3] = t
-                _sp[4] = t
-                _sp[5] += 1
+            # ---- EN 302 637-2 CAM GENERATION (opt-in) --------------------------------------- #
+            # Evaluated on the station's EGO STATE -- its true position, speed and heading -- and
+            # deliberately NOT on either of the two alternatives:
+            #
+            #  * not on the FALSIFIED claim, because the CAM service is a facilities-layer timer
+            #    that runs the same whether the application above it is lying. Keying the cadence
+            #    on the attack would make the message RATE a detector for the attack: a leak, not
+            #    a feature.
+            #  * not on the MEASURED (GNSS-noisy) fix. Measured here first, then rejected: with
+            #    `measure()`'s per-step noise the 4 m position trigger fires on the NOISE rather
+            #    than on the movement -- 1548 of 2806 CAMs at dt=0.1, a 0.168 s mean gap and a
+            #    5.94 Hz rate against the Java engine's 0.340 s / 2.94 Hz on the same rules. A real
+            #    station's ego position comes from a GNSS/INS fusion whose output is smoothed, and
+            #    the reference implementation triggers on the exact position, so the noisy fix is
+            #    both less realistic and not comparable. The residual is stated rather than hidden:
+            #    this engine has no ego-state estimator, so "true position" is standing in for the
+            #    output of one.
+            _emit_cam = True
+            if _cam_state is not None:
+                _cs_st = _cam_state.get(tx.vid)
+                if _cs_st is None:
+                    _cs_st = _profile.new_generation_state()
+                    _cam_state[tx.vid] = _cs_st
+                # 0.0 means "no congestion control is active". A generation rule applies its own
+                # floor on top (the built-in's `max(T_GenCamMin, 0.0)` is T_GenCamMin), which is
+                # what lets the engine stop knowing what any particular standard's floor is.
+                _floor = 0.0
+                if _dcc_state is not None:
+                    _dc = _dcc_state.get(tx.vid)
+                    if _dc is None:
+                        _dc = _profile.new_congestion_state()
+                        _dcc_state[tx.vid] = _dc
+                    # The CBR this station's OWN receiver measured last step. A station that has
+                    # heard nothing sits in the controller's idle state, which for reactive DCC
+                    # permits T_off == T_GenCamMin -- i.e. nothing the CAM service was not under.
+                    _dc.update(_cbr_measured.get(tx.vid, 0.0))
+                    _floor = _dc.min_interval_s()
+                _reason = _cs_st.evaluate(_api_profile.GenerationInput(
+                    t=t, x=x, y=y, speed=tspeed, heading=theading, dt=cfg.dt,
+                    min_interval_s=_floor, is_rsu=bool(tx.is_rsu),
+                    station_type=b_cam["station_type"]))
+                _emit_cam = bool(_reason)
+                if _reason:
+                    _cam_triggers[_reason] += 1
+                    _prev_t = _cam_last_t.get(tx.vid)
+                    if _prev_t is not None:
+                        # NOT `_gap`: that name is the run-level GAP-ACCEPTANCE flag
+                        # (`cf_active and cfg.gap_acceptance and ...`), read by `car_follow` on
+                        # every subsequent step. Binding a float to it here switched unsignalised
+                        # yielding ON mid-run and silently changed the mobility -- caught by the
+                        # "cam_generation_rules must be a no-op at dt = 1.0" test, which is exactly
+                        # what that test is for.
+                        _cam_gap = t - _prev_t
+                        _cam_gap_sum += _cam_gap
+                        _cam_gap_n += 1
+                        if _cam_gap > _cam_gap_max:
+                            _cam_gap_max = _cam_gap
+                    _cam_last_t[tx.vid] = t
+            if not _emit_cam:
+                # No CAM this step. DENMs are event-triggered and are NOT gated by the CAM
+                # service's timer, so the DENM block below still runs -- which is why this is a
+                # flag rather than a `continue`.
+                b_cam["suppressed"] = True
+            else:
+                seal(b_cam, t, attack=(tx.attack_type if attacking else ""),
+                     replay_of=_replay_src)
+                if (_sec is not None and tx.attack_type == "DataReplay"
+                        and _replay_src is None and b_cam.get("sec") is not None):
+                    # The capture. `setdefault` keeps the FIRST frame this station ever sent, which
+                    # -- because `attack_delay_s` is 2 s by default -- is an honest one it really
+                    # transmitted. That is what an eavesdropper would have recorded.
+                    _sec_last_frame.setdefault(tx.vid, (b_cam["sec"], cx, cy, cs, ch, cg))
+                broadcasts.append(b_cam)
+                # SURVIVORSHIP: this vehicle-step made it onto the air, so it is one the emission
+                # stream can carry. Counted HERE rather than as `sim - enforced` because the
+                # pre-pass has a second exit above (a GNSS outage goes silent without being
+                # revoked), and conflating a radio-silent step with an enforced one would
+                # understate enforcement's own share. Under `cam_generation_rules` a step where the
+                # CAM service did not fire is likewise not a step on the air, so it is not counted
+                # -- which keeps `bcast` the count of vehicle-steps `gt_emissions` can sample from.
+                surv["bcast"] += 1
+                _sp = surv_span.get(tx.vid)
+                if _sp is not None:
+                    if _sp[3] is None:
+                        _sp[3] = t
+                    _sp[4] = t
+                    _sp[5] += 1
             # ---- DENM (event-message) emission (opt-in; only when the DENM layer is enabled) ----
             # A FakeHazard attacker emits a PHANTOM hazard (emergency brake) while cruising -- its own
             # claimed speed contradicts the announced event. A benign vehicle emits a DENM only on a
@@ -5708,16 +6759,21 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                         emit_denm(tx, b_cam, real=True,
                                   event_type=("stationaryVehicle" if stationary
                                               else "emergencyElectronicBrakeLight"), t=t)
-            if attacking and tx.attack_type == "Sybil":     # fabricate co-located ghost identities
+            if attacking and tx.attack_type == "Sybil" and _emit_cam:
                 sr = vrng[tx.vid]
                 for gdig in tx.ghosts:
                     cert_first_seen.setdefault(gdig, t)
                     cert_last_seen[gdig] = t
-                    broadcasts.append(dict(veh=tx, digest=gdig, cx=cx + sr.uniform(-1, 1),
-                                           cy=cy + sr.uniform(-1, 1), cs=cs, ch=ch, conf=conf,
-                                           ghost=True, x=x, y=y, falsified=True, msg_count=1,
-                                           cg=t, sig_ok=True, cvf=0.0, cvt=total_time,
-                                           station_type="vehicle"))
+                    _bg = dict(veh=tx, digest=gdig, cx=cx + sr.uniform(-1, 1),
+                               cy=cy + sr.uniform(-1, 1), cs=cs, ch=ch, conf=conf,
+                               ghost=True, x=x, y=y, falsified=True, msg_count=1,
+                               cg=t, sig_ok=True, cvf=0.0, cvt=total_time,
+                               station_type="vehicle")
+                    # A ghost is a REAL extra pseudonym of the attacker under `security_model=
+                    # "ecdsa"` (provisioned as extra j-indices in `make_vehicle`), so it signs with
+                    # a genuine, verifiable credential -- which is exactly why co-location, not
+                    # cryptography, is what catches a Sybil.
+                    broadcasts.append(seal(_bg, t))
 
         # per-message ground-truth emission sampling (real CAM broadcasts only; DENMs have their own
         # dedicated ground-truth stream gt_denm, so they are excluded here)
@@ -5791,8 +6847,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 continue
             stations[_r.vid] = StationSnapshot(_r.vid, _p[0], _p[1], RSU_ANTENNA_HEIGHT_M, 0.0,
                                                True, False, None, _r.rx_range or 0.0)
+        # `size_bytes` is the REAL encoded length once a codec is on -- a measured 41-octet UPER CAM
+        # inside its measured 93-octet TS 103 097 digest envelope, not the 300 B both engines
+        # assumed. That number is what the channel charges airtime for, so selecting a codec changes
+        # the CBR a receiver measures and the collisions it suffers, not merely a manifest field.
         transmissions = [Transmission(bi, b["veh"].vid, b.get("msg_type", "cam"), b["msg_count"],
-                                      NATIVE_WIRE_SIZE_BYTES, b["digest"])
+                                      b.get("wire_bytes", NATIVE_WIRE_SIZE_BYTES), b["digest"])
                          for bi, b in enumerate(broadcasts)]
         # index-parallel with `broadcasts`: the SENDER's station snapshot per PDU. Resolved once per
         # step rather than once per candidate link (a Sybil ghost shares its attacker's snapshot,
@@ -5897,7 +6957,36 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                         link_meta.append(out)
             load = sum(b["msg_count"] for b, _ in in_range)
             cong = min(0.8, max(0.0, (load - cfg.chan_capacity) / max(1, cfg.chan_capacity)) * 0.5)
-            geo_cbr = chan.channel_busy_ratio(rx.vid, load)
+            if _wire is None:
+                geo_cbr = chan.channel_busy_ratio(rx.vid, load)
+            else:
+                # CBR FROM REAL AIRTIME. `chan.channel_busy_ratio(rx, load)` multiplies a MESSAGE
+                # COUNT by one hard-coded frame time, which is only right when every frame is the
+                # same size -- and the whole point of putting a codec on the wire is that they are
+                # not (a 41-octet UPER CAM in a digest envelope is 431.5 us; the same CAM with the
+                # certificate attached is 599.5 us; a DoS burst is `msg_count` of them). So the
+                # engine integrates `frame_airtime_s(size)` over the offered frames itself and hands
+                # the result to `collision_loss`, which is the term that actually consumes it.
+                # Computed engine-side rather than pushed through the channel interface because
+                # `channel_busy_ratio(rx_vid, offered)` takes a count, and reinterpreting its
+                # argument as airtime would silently change what a third-party model is being asked.
+                _at = 0.0
+                for _b, _ in in_range:
+                    _at += _b["msg_count"] * _airtime_s(_b.get("wire_bytes",
+                                                               NATIVE_WIRE_SIZE_BYTES))
+                geo_cbr = _profile.channel_busy_ratio(_at, cfg.dt)
+            if _dcc_state is not None:
+                # What THIS station will react to next step. Stored per receiver vid, which is the
+                # station that measured it -- DCC is a local feedback loop, not a global knob.
+                _cbr_measured[rx.vid] = geo_cbr
+            # Three float operations per receiver-step, unconditional, so the CBR the run actually
+            # experienced is a reported number rather than something a later analysis has to guess.
+            # Manifest-only (`_data_digest` excludes manifest.json by construction), so it moves no
+            # digest -- the same rule the survivorship counters are recorded under.
+            _cbr_sum += geo_cbr
+            _cbr_n += 1
+            if geo_cbr > _cbr_max:
+                _cbr_max = geo_cbr
             reporter_digest = rx.active_pseudonym(t, cfg.rotate_period_s)["digest"]
             for li, (b, dist) in enumerate(in_range):
                 rssi_dbm = None
@@ -5930,6 +7019,33 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     loss = cfg.packet_loss_base + cfg.nlos_loss * (dist / rr) + cong + wx_loss
                     if loss > 0 and rng.random() < loss:
                         continue                                # packet dropped on the channel
+                # ---- THE FRAME IS DELIVERED. What did it cost, and does it verify? -------------
+                # PER-PACKET LATENCY (opt-in). Propagation over the TRUE link distance, plus the
+                # access delay this frame's real length and this receiver's measured CBR imply,
+                # plus the derived stack constant. Deterministic -- no draw, which is what lets it
+                # be switched on without disturbing a single RNG stream.
+                lat = 0.0
+                if _lat_on:
+                    lat = _profile.link_latency_s(
+                        dist, geo_cbr, b.get("wire_bytes", NATIVE_WIRE_SIZE_BYTES))
+                    _lat_sum += lat
+                    _lat_n += 1
+                    _lat_hist[int(lat * 1e6)] += 1
+                    if lat < _lat_min:
+                        _lat_min = lat
+                    if lat > _lat_max:
+                        _lat_max = lat
+                # REAL VERIFICATION (opt-in). `sig_ok` stops being a field the sender set and
+                # becomes what THIS receiver concluded, at its own clock, against its own trust
+                # store and the live CRL. The certificate is established first and the signature is
+                # only evaluated if it survives -- a receiver that has already decided to drop a
+                # frame must not pay 36 us of ECDSA on it, which is the whole defence against
+                # signature flooding.
+                sig_ok_eff = b["sig_ok"]
+                if _sec is not None and b.get("sec") is not None:
+                    _vr = _sec.verify(b["sec"], t)
+                    sig_ok_eff = _vr.sig_ok
+                    _verdicts[_vr.status] += 1
                 if b.get("msg_type") == "denm":
                     # DENM (event message): the receiver checks whether the announced brake/stationary
                     # hazard CORROBORATES the sender's own observed kinematics. Scored by the checks
@@ -5937,7 +7053,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     # and decided by the fusion's event arm -- a one-shot claim has no history to
                     # streak over. An unverifiable (bad-sig) DENM carries no trustworthy content, so
                     # it is not scored at all.
-                    if b["sig_ok"] and _DENM_PLAN:
+                    if sig_ok_eff and _DENM_PLAN:
                         # An event message has no per-link history of its own. The sender's CAM
                         # state is used when this receiver already holds one (so a stateful check
                         # sees continuity); otherwise a throwaway dict, NOT a new `last_claimed`
@@ -5972,7 +7088,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                                         b["cx"], b["cy"], b["cx"], b["cy"], malicious=False,
                                         sig_valid=True, station_type=b["station_type"],
                                         rssi_dbm=rssi_dbm, score=decision.top_score,
-                                        score_norm=decision.score_norm)
+                                        score_norm=decision.score_norm, latency=lat)
                     continue
                 tx, digest, cx, cy, cs, ch, conf = (b["veh"], b["digest"], b["cx"], b["cy"],
                                                     b["cs"], b["ch"], b["conf"])
@@ -6012,7 +7128,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 # the sender's TRUE x/y, `falsified` and `ghost` -- never crosses this line.
                 obs = Observation(
                     digest, b["station_type"], cx, cy, cs, ch, conf, b["cg"], b["msg_count"],
-                    "cam", None, b["sig_ok"], b["cvf"], b["cvt"],
+                    "cam", None, sig_ok_eff, b["cvf"], b["cvt"],
                     rxx, rxy, rx_reach, rssi_dbm, link_meta[li].link_state, t, cfg.dt,
                     first_sight, ref[0], ref[1], ref[2], ref[3], ref[4],
                     prev[0], prev[1], prev[2], prev[3], prev[4],
@@ -6029,7 +7145,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 for _col, _ev, _prm, _rn, _wrap, _prec in _CAM_PLAN:
                     _v = _ev(obs, st if _wrap is None else _wrap_state(st, _wrap), _prm, _rn)
                     det[_col] = _v if _prec is None else _round_score(_v, _prec, _col)
-                if not b["sig_ok"]:
+                if not sig_ok_eff:
                     # signature fails -> the content cannot be trusted, so the plausibility detectors
                     # are moot; the receiver only reports the crypto-verification failure itself.
                     # (`signatureVerification` scored itself 1.5 above; this suppresses the rest,
@@ -6062,9 +7178,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                     continue
                 reasons = list(decision.reason_codes)
                 file_report(t, reporter_digest, digest, tx, reasons, det, conf,
-                            cx, cy, ref[0], ref[1], malicious=False, sig_valid=b["sig_ok"],
+                            cx, cy, ref[0], ref[1], malicious=False, sig_valid=sig_ok_eff,
                             station_type=b["station_type"], rssi_dbm=rssi_dbm,
-                            score=decision.top_score, score_norm=decision.score_norm)
+                            score=decision.top_score, score_norm=decision.score_norm,
+                            latency=lat)
 
         # COLLUSION pass: colluders file fabricated reports against benign victims. In flow mode
         # victims are chosen dynamically (nearby active benign vehicles); in fixed mode from the list.
@@ -6287,6 +7404,55 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     # happened immediately after the step loop -- before any ORACLE file was written -- and
     # `close()` is idempotent; this call is what covers a run that never reached that point.
     suite.close()
+
+    def _protocol_block() -> dict:
+        """`counts["protocol"]` -- what the real stack actually did, in measured numbers.
+
+        Empty (so the key is absent, so the manifest is byte-identical) unless a profile or the
+        security layer is active. **The engine COUNTS and the profile says what the counts mean**:
+        every tally below is an observation of this run, handed to `profile.report()`, which is what
+        lets a stack whose congestion controller has no state table (LIMERIC has a continuous
+        duty-cycle instead) report its own quantity in its own words with no engine knowledge of it.
+
+        Two blocks stay engine-side, deliberately. `cbr` is what THIS ENGINE'S receivers measured --
+        the profile supplied the estimator, but the measurement is the engine's, and it is reported
+        for a security-only run that has no profile at all. `security` is the PKI layer, which is
+        not part of the profile seam.
+        """
+        if _profile is None and _sec is None:
+            return {}
+        out: dict = {}
+        if _profile is not None:
+            out.update(_profile.report(_api_profile.ProtocolMeasurements(
+                generation_states=tuple(_cam_state.values()) if _cam_state else (),
+                congestion_states=tuple(_dcc_state.values()) if _dcc_state else (),
+                triggers=dict(_cam_triggers),
+                gaps=(_cam_gap_n, _cam_gap_sum, _cam_gap_max),
+                cbr=(_cbr_sum, _cbr_n, _cbr_max, cfg.dt),
+                wire=(_wire_size_sum, _wire_size_n),
+                codec_stats=(_wire.stats() if _wire is not None else {}),
+                latency_hist=dict(_lat_hist) if _lat_on else {},
+                latency=((_lat_sum, _lat_n, (_lat_min if _lat_n else 0.0), _lat_max)
+                         if _lat_on else (0.0, 0, 0.0, 0.0)))))
+        if _cbr_n and "cbr" not in out:
+            # THE FALLBACK, for a run whose profile did not claim the block (or that has no profile
+            # at all -- a security-only run still measures a CBR). Measured quantities ONLY: any
+            # constant here would be a standard's number published beside a run that may not speak
+            # that standard, which is exactly the kind of quiet fabrication the profile seam exists
+            # to remove.
+            out["cbr"] = {"mean": round(_cbr_sum / _cbr_n, 6), "max": round(_cbr_max, 6),
+                          "samples": _cbr_n, "window_s": cfg.dt}
+        if _sec is not None:
+            s = _sec.stats()
+            s["verdicts"] = dict(sorted(_verdicts.items()))
+            if _sec_refusals:
+                # Attacks that could NOT be mounted honestly, by name. An attacker with no expired
+                # credential genuinely cannot present one; recording the refusal is the difference
+                # between modelling that and quietly falling back to editing a wire field.
+                s["attack_refusals"] = dict(sorted(_sec_refusals.items()))
+            out["security"] = s
+        return {"protocol": out}
+
     # The manifest is about to claim that THIS config produced THIS data. Check that first: a
     # mid-run write leaves a dataset that neither the old nor the new value describes, so the honest
     # outcome is no manifest at all rather than a plausible one nobody can replay.
@@ -6303,8 +7469,18 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                                 # `_data_digest` by construction either way.
                                 **({"signal_service": dict(_sig_served, plan=_sig_stats)}
                                    if cfg.real_signals else {}),
-                                **({"sidewalks": _sidewalk_stats} if _sidewalk_stats else {})),
-                    plugins=plugin_block([chan_provenance()] + suite.provenance(),
+                                **({"sidewalks": _sidewalk_stats} if _sidewalk_stats else {}),
+                                # THE PROTOCOL STACK'S OWN MEASUREMENTS. Emitted only when at least
+                                # one of the five opt-ins is on, so a default manifest is
+                                # byte-identical; and `counts` is outside `_data_digest` by
+                                # construction either way. This is the block that turns "the CAM
+                                # rate is right" from a claim into a number a reader can check.
+                                **_protocol_block()),
+                    plugins=plugin_block([chan_provenance()] + suite.provenance()
+                                         + ([codec_provenance()] if codec_provenance else [])
+                                         + ([profile_provenance()] if profile_provenance else [])
+                                         + ([report_format_provenance()]
+                                            if report_format_provenance else []),
                                          drift=_drift_allowed,
                                          integrity=({"armed": True,
                                                      "verified_at": ["plugin resolution (import)",
@@ -6315,7 +7491,10 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                                                      "engine_rng_words": _integrity_words,
                                                      "ok": True}
                                                     if _armed else None)),
-                    config_snapshot=_cfg0, mobility=_mob_block)
+                    config_snapshot=_cfg0, mobility=_mob_block, codec_claim=_codec_claim,
+                    profile_claim=_profile_claim,
+                    report_claim=(dict(_report_fmt.standards_claim())
+                                  if _report_fmt is not None else None))
 
     return RunResult(out_dir=cfg.out_dir, n_vehicles=len(vehicles), n_reports=n_reports,
                      n_investigations=len(ma_investigations), n_revoked=len(revoked_vehicles),
@@ -6690,8 +7869,55 @@ STANDARDS_PROFILE = {
 }
 
 
+def standards_profile_for(cfg, codec_claim=None, profile_claim=None, report_claim=None) -> dict:
+    """`STANDARDS_PROFILE`, corrected for what the run's protocol stack ACTUALLY did.
+
+    The base dict is the honest claim for a run with no codec and no cryptography: "no ASN.1
+    encoding", "sig_ok is a simulated boolean". Both statements become FALSE the moment the
+    corresponding opt-in is on, and a manifest that kept saying them would be the one lie this
+    whole workstream exists to remove. The replacement text for the message layer is the CODEC'S
+    OWN `standards_claim()`, verbatim, never a sentence composed here -- section 6.5's rule is that
+    a profile states what it may honestly assert, and the engine is not entitled to improve on it.
+
+    Manifest-only, so this moves no digest.
+    """
+    prof = dict(STANDARDS_PROFILE)
+    if codec_claim:
+        prof["message"] = codec_claim.get("message", prof["message"])
+        for k in ("asn1_source", "asn1_licence", "asn1_modules", "caveats"):
+            if k in codec_claim:
+                prof[k] = codec_claim[k]
+    if getattr(cfg, "security_model", "none") == "ecdsa":
+        prof["cert"] = ("IEEE 1609.2-STRUCTURED explicit certificates carrying real ECDSA-P256 "
+                        "signatures over a canonical NON-COER serialisation this repository "
+                        "defines (scms_core/certificate.py). HashedId8 is 1609.2 6.4.3 over that "
+                        "preimage, so a production 1609.2 stack would compute a different one. "
+                        "NOT '1609.2 compliant' and NOT interoperable.")
+        prof["security_envelope"] = (
+            "IEEE 1609.2 SignedData SHAPE with a REAL ECDSA-P256-SHA256 signature over the 5.3.1 "
+            "double hash Hash(tbsData) || Hash(signer certificate), verified receiver-side against "
+            "a trust store, the certificate validity window and the live CAMP SCP2 linkage CRL. "
+            "sig_ok is the RESULT of that verification. The serialisation is canonical but NOT "
+            "TS 103 097 COER, so the octets are not interoperable; the cryptography is real.")
+        prof["provisioning"] = (
+            "CAMP SCP1 butterfly key expansion (scms_core/butterfly.py + provisioning.py): the RA "
+            "expands one caterpillar into per-(i,j) cocoons and drains a device-mixing queue, and "
+            "the PCA certifies B + c*G under a randomiser the RA never sees. The PCA's ledger "
+            "carries no device identifier, so it cannot group a device's certificates -- which the "
+            "single-request_hash label scheme it replaces could do perfectly.")
+    # THE PROFILE'S AND THE FORMAT'S OWN WORDS, verbatim and under their own keys. Same rule as the
+    # codec's: a component states what it may honestly assert and the engine is not entitled to
+    # improve on it. Emitted ONLY when one is active, so a default manifest is unchanged.
+    if profile_claim:
+        prof["protocol_profile"] = profile_claim
+    if report_claim:
+        prof["report_format"] = report_claim
+    return prof
+
+
 def _write_manifest(cfg, data_files, data_digest, counts, plugins=None,
-                    config_snapshot=None, mobility=None) -> None:
+                    config_snapshot=None, mobility=None, codec_claim=None,
+                    profile_claim=None, report_claim=None) -> None:
     manifest = {
         "dataset_version": __version__,
         "build_utc": datetime.now(timezone.utc).isoformat(),   # NOT part of data_digest
@@ -6709,7 +7935,7 @@ def _write_manifest(cfg, data_files, data_digest, counts, plugins=None,
         # MOSAIC/Java engine writes SUMO/ETSI headings (degrees clockwise from North), so a consumer
         # merging the two MUST read this field rather than assume. Manifest-only -> digest-safe.
         "conventions": {"heading": "deg_ccw_from_east", "speed": "m_s", "position": "m_local_xy"},
-        "standards_profile": dict(STANDARDS_PROFILE),
+        "standards_profile": standards_profile_for(cfg, codec_claim, profile_claim, report_claim),
         # Interpreter/host provenance. NOT cosmetic and NOT digest-bearing: Python's documented
         # reproducibility guarantee covers ONLY Random.random() -- gauss(), uniform(), choice() and
         # shuffle() carry NO cross-version guarantee, and the pinned goldens depend on `gauss` (the
@@ -6938,6 +8164,41 @@ def main(argv: Optional[list[str]] = None) -> int:
                         'installed entry point, then a dotted path "package.module:Class". '
                         'Empty (the default) = built-ins only, byte-identical. Example: '
                         '--plugins \'{"channel_model": {"ref": "myorg.radio:Rayleigh"}}\'')
+    # --- the real protocol stack (codecs/etsi_rules.py + scms_core/engine_security.py) ---------- #
+    p.add_argument("--message-codec", default="",
+                   choices=["", *_api_registry.builtin_names("message_codec")],
+                   help="encode every CAM/DENM/VAM through this wire format and let the resulting "
+                        "PDU LENGTH drive airtime/CBR/collision loss. '' (default) constructs no "
+                        "codec at all. A third-party profile is declared via plugins.message_codec")
+    p.add_argument("--message-signer", default="digest", choices=list(_api_codec.SIGNER_FORMS),
+                   help="TS 103 097 signer form used for the frame's wire size (none|digest|"
+                        "certificate); ignored under --security-model ecdsa")
+    p.add_argument("--cam-rules", action="store_true",
+                   help="ETSI EN 302 637-2 CAM generation rules (4 m / 4 deg / 0.5 m/s triggers, "
+                        "T_GenCamMin 0.1 s, T_GenCamMax 1.0 s) instead of one CAM per step")
+    p.add_argument("--dcc", action="store_true",
+                   help="ETSI TS 102 687 reactive DCC over the measured CBR (needs --cam-rules)")
+    p.add_argument("--protocol-profile", default="",
+                   choices=["", *_api_registry.builtin_names("protocol_profile")],
+                   help="WHICH PROTOCOL this run speaks, as one declaration. '' (default) builds "
+                        "the built-in etsi_its_g5 stack from the flags above, and nothing at all "
+                        "when they are off. A third-party stack -- its own codec, generation "
+                        "rules, congestion controller, airtime and latency model -- is declared "
+                        "via plugins.protocol_profile, because only a config field replays")
+    p.add_argument("--report-format", default="",
+                   choices=["", *_api_registry.builtin_names("report_format")],
+                   help="misbehaviour-report format: '' (the engine's historic inline row) | "
+                        "ma_report_v1 (the identical row through the report_format seam) | "
+                        "ts103759_shape (the TS 103 759 TemplateAsr shape with real evidence "
+                        "octets). Third-party formats go through plugins.report_format")
+    p.add_argument("--net-latency", action="store_true",
+                   help="per-packet propagation + access + stack latency in place of the uniform "
+                        "report-ingest delay (deterministic; draws no random number)")
+    p.add_argument("--ma-backhaul", type=float, default=0.0,
+                   help="deterministic MA report-upload delay on top of the per-packet latency (s)")
+    p.add_argument("--security-model", default="none", choices=["none", "ecdsa"],
+                   help="ecdsa: butterfly-provisioned pseudonyms, real ECDSA-P256 signatures, and "
+                        "sig_ok as the result of a verification rather than a flag")
     p.add_argument("--radio-env", choices=["urban", "highway"], default="urban",
                    help="geometric only: TR 37.885 LOS formula family (NLOS always uses urban)")
     p.add_argument("--radio-tx-power-dbm", type=float, default=23.0,
@@ -7248,6 +8509,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                          radio_tx_power_dbm=args.radio_tx_power_dbm,
                          radio_rx_sensitivity_dbm=args.radio_rx_sensitivity_dbm,
                          radio_nlosb_density_per_km=args.radio_nlosb_density_per_km,
+                         message_codec=args.message_codec, message_signer=args.message_signer,
+                         cam_generation_rules=args.cam_rules, dcc=args.dcc,
+                         net_latency_model=args.net_latency, ma_backhaul_s=args.ma_backhaul,
+                         security_model=args.security_model,
+                         protocol_profile=args.protocol_profile,
+                         report_format=args.report_format,
                          verbose=True,
                          out_dir=(args.out or "datasets/poc_run"))
     try:

@@ -23,12 +23,35 @@
  * randomness anywhere.
  *
  * {@code SCMS_RADIO_MODEL=geometric} (OPT-IN): the distance-ramp NLOS heuristic is replaced by a
- * real link budget. Building footprints ({@link BuildingIndex}) classify each link LOS or NLOSb,
- * 3GPP TR 37.885 ({@link PathLoss}) gives the large-scale loss, and a Gudmundson AR(1) process
- * carried PER LINK -- keyed on the opaque true-vehicle key, so a pseudonym rotation does not
- * resample the channel -- gives correlated shadowing. The frame is delivered when
- * {@code rssi >= sensitivity}. Weather and congestion still apply on top, off the original RNG, so
- * even the geometric branch leaves the legacy draw sequence intact.
+ * real link budget. Building footprints ({@link BuildingIndex}) and the fleet's own vehicle bodies
+ * ({@link VehicleBlockers}) classify each link LOS / NLOSv / NLOSb, 3GPP TR 37.885
+ * ({@link PathLoss}) gives the large-scale loss and the vehicle-blockage term, a Gudmundson AR(1)
+ * process carried PER LINK -- keyed on the opaque true-vehicle key, so a pseudonym rotation does not
+ * resample the channel -- gives correlated shadowing, and a per-packet Nakagami-m fade gives the
+ * small-scale term. The frame is delivered when {@code rssi >= sensitivity}. Weather and congestion
+ * still apply on top, off the original RNG, so even the geometric branch leaves the legacy draw
+ * sequence intact.
+ *
+ * <h2>The two terms this receiver used to be missing</h2>
+ * Both were measured against the Python engine in docs/realism/CROSS-ENGINE-RADIO.md §4 and both are
+ * now implemented, each behind its own knob and each defaulting ON:
+ *
+ * <ul>
+ *   <li>{@code SCMS_NLOSV=1} (default) -- vehicle blockage. {@link PathLoss#nlosvMeanDb} existed
+ *       from the first Phase-2 commit and was never called; see the {@link PathLoss} class comment
+ *       for the two reasons (a stale claim that the app had no fleet occupancy, and a boolean
+ *       signature that could not express the standard's three branches). 48.6% of InTAS-core pairs
+ *       at 200 m are NLOSv on the Python classifier, and this receiver charged them 0 dB.
+ *   <li>{@code SCMS_FADING=1} (default) -- per-packet Nakagami-m small-scale fading, m = 3 / 1.5 /
+ *       1.0 over 0-50 / 50-150 / &gt;150 m. Its absence was worth 23 percentage points of LOS PDR at
+ *       500 m against the Python engine.
+ * </ul>
+ *
+ * <p>Both draw from a per-link PACKET stream that is separate from the shadowing stream (the same
+ * split the Python engine makes between its {@code :shadow2:} and {@code :geo:} streams), so
+ * switching either off restores the previous draw sequence exactly and the default
+ * {@code SCMS_RADIO_MODEL=sns} path -- where {@link #geometricDeliver} never runs -- draws no new
+ * randomness at all.
  *
  * Default link budget follows the vendored VeReMi-NextGen omnetpp.ini (20 mW = 13.01 dBm,
  * sensitivity -81 dBm, 5.9 GHz, 10 MHz), which the roadmap adopts as calibration constants. That
@@ -55,6 +78,32 @@ public final class RxChannel {
     public static final boolean URBAN = !"highway".equals(env("SCMS_RADIO_REGIME", "urban"));
     /** Consult building footprints for the LOS/NLOSb decision (geometric model only). */
     public static final boolean USE_BUILDINGS = envI("SCMS_BUILDINGS", 1) != 0;
+    /**
+     * TR 37.885 NLOSv vehicle blockage (geometric model only). DEFAULT ON: leaving it off treats a
+     * vehicle-blocked link as clear LOS, which is the single largest per-state divergence from the
+     * Python engine. {@code SCMS_NLOSV=0} restores the pre-existing (LOS/NLOSb only) behaviour.
+     */
+    public static final boolean USE_NLOSV = envI("SCMS_NLOSV", 1) != 0;
+    /** Per-packet Nakagami-m small-scale fading. DEFAULT ON; {@code SCMS_FADING=0} restores none. */
+    public static final boolean USE_FADING = envI("SCMS_FADING", 1) != 0;
+    /**
+     * Lateral half width of a vehicle body for the blockage test, metres. Same default as the
+     * Python engine's {@code GEO_BLOCKER_HALF_WIDTH_M}, so a link the two engines both see is
+     * classified the same way by both.
+     */
+    public static final double NLOSV_HALF_WIDTH_M = envD("SCMS_NLOSV_HALF_WIDTH_M", 1.0);
+    /**
+     * How often the fleet blocker snapshot is rebuilt, seconds. 0.1 s is TR 37.885's own link-state
+     * re-evaluation cadence (refdata pathloss_3gpp_tr37885.link_state_update_interval_s) and MOSAIC's
+     * sync cadence.
+     */
+    public static final double NLOSV_REBUILD_S = envD("SCMS_NLOSV_REBUILD_S", 0.1);
+    /**
+     * Maximum age of a true position in the blocker snapshot, seconds. Positions refresh on every
+     * CAM (measured mean 0.340 s, ETSI T_GenCamMax ceiling 1.0 s), so 1.5 s holds the fleet that is
+     * actually on the road and drops vehicles that have left the simulation.
+     */
+    public static final double NLOSV_MAX_AGE_S = envD("SCMS_NLOSV_MAX_AGE_S", 1.5);
     /** 20 mW, the VeReMi-NextGen omnetpp.ini transmitter power. */
     public static final double TX_POWER_DBM = envD("SCMS_TX_POWER_DBM", 10.0 * Math.log10(20.0));
     public static final double RX_SENSITIVITY_DBM = envD("SCMS_RX_SENSITIVITY_DBM", -81.0);
@@ -131,6 +180,43 @@ public final class RxChannel {
         return buildings;
     }
 
+    // ------------------------------------------------------------------ shared vehicle blockers
+    /**
+     * The fleet's own bodies, as an obstruction set. Rebuilt from the back-end oracle once per
+     * {@link #NLOSV_REBUILD_S} EPOCH (an integer index, not a moving threshold, so the rebuild
+     * instants are a pure function of simulation time), and shared by every receiver in the JVM --
+     * a per-receiver copy would be the same snapshot rebuilt hundreds of times per epoch.
+     *
+     * <p>This is exactly the cadence the Python engine reclassifies at: it rebuilds
+     * {@code _VehicleBlockerIndex} once per step and caches each link's state for that step.
+     */
+    private static volatile VehicleBlockers blockers = VehicleBlockers.EMPTY;
+    /** Volatile: a non-volatile long read is not atomic, and this one gates the rebuild. */
+    private static volatile long blockerEpoch = Long.MIN_VALUE;
+    private static volatile long blockerRebuilds;
+    private static volatile long blockerPeakCount;
+
+    private static VehicleBlockers blockersAt(double t) {
+        long epoch = (long) Math.floor(t / Math.max(NLOSV_REBUILD_S, 1e-9));
+        if (epoch != blockerEpoch) {
+            rebuildBlockers(t, epoch);
+        }
+        return blockers;
+    }
+
+    private static synchronized void rebuildBlockers(double t, long epoch) {
+        if (epoch == blockerEpoch) {
+            return;   // another receiver in the same epoch got here first
+        }
+        Object[] snap = ScmsBackend.instance().blockerSnapshot(t, NLOSV_MAX_AGE_S);
+        VehicleBlockers vb = new VehicleBlockers((long[]) snap[0], (double[]) snap[1],
+                (double[]) snap[2], (double[]) snap[3], t);
+        blockers = vb;
+        blockerEpoch = epoch;
+        blockerRebuilds++;
+        blockerPeakCount = Math.max(blockerPeakCount, vb.size());
+    }
+
     public static String buildingsNote() {
         return buildingsNote;
     }
@@ -166,6 +252,16 @@ public final class RxChannel {
     private final Dcc dcc;
     /** Deterministic per-receiver salt for the shadowing streams: SHA-256(label|seed|unitId). */
     private final long shadowSalt;
+    /**
+     * Deterministic per-receiver salt for the PER-PACKET streams (NLOSv blockage draw, Nakagami
+     * fade): SHA-256("channel-packet"|seed|unitId). Deliberately a SECOND salt, so the per-packet
+     * draws never interleave with the AR(1) shadowing sequence and switching the new terms off
+     * reproduces the old run bit for bit.
+     */
+    private final long packetSalt;
+    /** This receiver's own antenna height (m) and opaque link key, resolved once at construction. */
+    private final double selfAntennaH;
+    private final long selfLinkKey;
     /** This receiver's unit id, carried only so the per-link trace can name it. */
     private final String unitId;
     /**
@@ -181,6 +277,7 @@ public final class RxChannel {
     private final Map<Long, Link> links = GEOMETRIC ? new HashMap<>() : null;
     private double lastRssiDbm = Double.NaN;
     private boolean lastLos = true;
+    private PathLoss.State lastState = PathLoss.State.LOS;
     private double lastDistM = Double.NaN;
     private double lastTxX = Double.NaN;
     private double lastTxY = Double.NaN;
@@ -191,15 +288,33 @@ public final class RxChannel {
     private long droppedGeometric;
     private long droppedCongestion;
     private long nlosbLinks;
+    private long nlosvLinks;
+    private long fadedFrames;
 
     /** AR(1) shadowing state for one (transmitter vehicle, this receiver) link. */
     private static final class Link {
+        final long key;
         final Random rng;
+        /**
+         * Per-PACKET stream for this link (NLOSv blockage, Nakagami fade), created lazily so a run
+         * with both terms off never constructs it. Keyed on the same opaque link key as the
+         * shadowing stream but salted differently, mirroring the Python engine's separate
+         * {@code :shadow2:} / {@code :geo:} streams.
+         */
+        Random pkt;
         double z = Double.NaN;       // unit-variance shadowing state
         double txX, txY, rxX, rxY;   // endpoint positions at the previous update
         boolean havePrev;
-        Link(Random rng) {
+        Link(long key, Random rng) {
+            this.key = key;
             this.rng = rng;
+        }
+
+        Random packetRng(long packetSalt) {
+            if (pkt == null) {
+                pkt = new Random(key ^ packetSalt);
+            }
+            return pkt;
         }
     }
 
@@ -207,6 +322,9 @@ public final class RxChannel {
         // Identical seeding to the pre-Phase-2 per-app RNG, so the legacy draw sequence is unchanged.
         this.chanRng = new Random(0x9E3779B97F4A7C15L ^ (long) unitId.hashCode());
         this.shadowSalt = ScmsBackend.streamSeed("channel-shadow", unitId);
+        this.packetSalt = ScmsBackend.streamSeed("channel-packet", unitId);
+        this.selfAntennaH = ScmsBackend.instance().antennaHeightOfUnit(unitId);
+        this.selfLinkKey = ScmsBackend.channelLinkKeyOfUnit(unitId);
         this.unitId = unitId;
         this.dcc = new Dcc(DCC_FRAME_BYTES, DCC_DATA_RATE_MBPS, DCC_PROBE_S, DCC_WINDOW_S,
                 DCC_STATE_HOLD_S, DCC_MAC_OVERHEAD_US);
@@ -254,7 +372,7 @@ public final class RxChannel {
             if (haveSelf && !geometricDeliver(senderDigest, t, selfX, selfY)) {
                 droppedGeometric++;
                 if (trace) {
-                    LinkTrace.row(t, unitId, lastDistM, lastLos ? "LOS" : "NLOSb", lastRssiDbm,
+                    LinkTrace.row(t, unitId, lastDistM, linkState(), lastRssiDbm,
                             "geom", selfX, selfY, lastTxX, lastTxY);
                 }
                 return false;
@@ -296,30 +414,38 @@ public final class RxChannel {
         return true;
     }
 
-    /** LOS/NLOSb label for the trace; {@code NA} outside the geometric model, where none was taken. */
+    /** Link-state label for the trace; {@code NA} outside the geometric model, where none was taken. */
     private String linkState() {
-        return !GEOMETRIC || Double.isNaN(lastDistM) ? "NA" : (lastLos ? "LOS" : "NLOSb");
+        return !GEOMETRIC || Double.isNaN(lastDistM) ? "NA" : lastState.label();
     }
 
     /**
-     * 3GPP TR 37.885 link budget with a building-derived LOS/NLOSb state and AR(1) shadowing.
+     * 3GPP TR 37.885 link budget with a LOS / NLOSv / NLOSb state, AR(1) shadowing and a per-packet
+     * Nakagami-m fade.
      *
-     * <p>All randomness comes from a dedicated stream keyed on
+     * <p>Classification precedence, identical to the Python engine's {@code _link_state}: a BUILDING
+     * between the antennas wins (NLOSb, its own path-loss formula, no vehicle term on top); otherwise
+     * the tallest VEHICLE strictly between them decides, and only if at least one antenna is below
+     * that vehicle's roof (TR 37.885's "both above" branch takes no loss and stays LOS); otherwise
+     * LOS.
+     *
+     * <p>All randomness comes from dedicated streams keyed on
      * {@code (scenario seed, opaque true-vehicle key, this receiver)} -- never the global channel
      * RNG -- so switching the model on cannot perturb the legacy draw sequence.
      */
     private boolean geometricDeliver(String senderDigest, double t, double rxX, double rxY) {
         ScmsBackend backend = ScmsBackend.instance();
-        double[] txTrue = backend.truePositionOf(senderDigest);
+        double[] txTrue = backend.truePoseOf(senderDigest);
         if (txTrue == null) {
             return true;   // emitter not on the oracle yet: never fall back to the CLAIMED position
         }
+        long txKey = backend.channelLinkKey(senderDigest);
         BuildingIndex bi = buildings;
-        boolean los = true;
+        boolean nlosb = false;
         if (bi != null) {
             bi.probe(rxX, rxY);
-            los = !bi.blocked(txTrue[0], txTrue[1], rxX, rxY);
-            if (!los) {
+            nlosb = bi.blocked(txTrue[0], txTrue[1], rxX, rxY);
+            if (nlosb) {
                 nlosbLinks++;
             }
         }
@@ -327,21 +453,47 @@ public final class RxChannel {
         lastDistM = d;
         lastTxX = txTrue[0];
         lastTxY = txTrue[1];
+
+        // --- link state ---------------------------------------------------------------------
+        PathLoss.State state = nlosb ? PathLoss.State.NLOSB : PathLoss.State.LOS;
+        int below = 0;
+        if (!nlosb && USE_NLOSV) {
+            double blockerH = blockersAt(t).tallestBlocker(txTrue[0], txTrue[1], rxX, rxY,
+                    txKey, selfLinkKey, NLOSV_HALF_WIDTH_M);
+            if (blockerH > 0.0) {
+                below = PathLoss.antennasBelowBlocker(txTrue[2], selfAntennaH, blockerH);
+                if (below > 0) {
+                    state = PathLoss.State.NLOSV;
+                    nlosvLinks++;
+                }
+            }
+        }
+        lastState = state;
+        lastLos = state != PathLoss.State.NLOSB;   // legacy accessor: "not building-blocked"
+
+        // --- large-scale loss ---------------------------------------------------------------
         double pl;
-        if (!URBAN) {
-            pl = PathLoss.highwayLos(d, FC_GHZ);
-        } else if (los) {
-            pl = PathLoss.urbanLos(d, FC_GHZ);
+        if (state == PathLoss.State.NLOSB) {
+            pl = URBAN ? PathLoss.urbanNlos(d, FC_GHZ) : PathLoss.highwayLos(d, FC_GHZ);
         } else {
-            pl = PathLoss.urbanNlos(d, FC_GHZ);
+            pl = URBAN ? PathLoss.urbanLos(d, FC_GHZ) : PathLoss.highwayLos(d, FC_GHZ);
         }
         // Keyed on (scenario seed, opaque TRUE-vehicle key, this receiver) -- never on the digest, so
         // a pseudonym rotation continues the SAME shadowing process instead of resampling it.
-        Link link = links.computeIfAbsent(backend.channelLinkKey(senderDigest),
-                k -> new Link(new Random(k ^ shadowSalt)));
-        double shadow = shadowDb(link, los, txTrue[0], txTrue[1], rxX, rxY);
-        lastLos = los;
-        lastRssiDbm = TX_POWER_DBM + 2.0 * ANTENNA_GAIN_DBI - pl - shadow;
+        Link link = links.computeIfAbsent(txKey, k -> new Link(k, new Random(k ^ shadowSalt)));
+        double shadow = shadowDb(link, state, txTrue[0], txTrue[1], rxX, rxY);
+
+        // --- per-packet terms, off the link's PACKET stream ----------------------------------
+        // Draw order matches the Python engine exactly: NLOSv blockage first, then the fade.
+        double rssi = TX_POWER_DBM + 2.0 * ANTENNA_GAIN_DBI - pl - shadow;
+        if (state == PathLoss.State.NLOSV) {
+            rssi -= PathLoss.nlosvExtraLossDb(link.packetRng(packetSalt), d, below);
+        }
+        if (USE_FADING) {
+            rssi += PathLoss.nakagamiFadeDb(link.packetRng(packetSalt), PathLoss.nakagamiM(d));
+            fadedFrames++;
+        }
+        lastRssiDbm = rssi;
         return lastRssiDbm >= RX_SENSITIVITY_DBM;
     }
 
@@ -349,21 +501,24 @@ public final class RxChannel {
      * Gudmundson AR(1) shadowing carried per link: {@code z <- rho*z + sqrt(1-rho^2)*N(0,1)} with
      * {@code rho = exp(-dd / d_corr)}, where {@code dd} is how far the two endpoints moved since the
      * last frame on this link. Keeping a unit-variance state and scaling by sigma at use time means a
-     * LOS<->NLOSb flip changes the magnitude (3 vs 4 dB) without discontinuously resampling.
+     * state flip changes the magnitude (3 dB LOS/NLOSv, 4 dB NLOSb) without discontinuously
+     * resampling. NLOSv keeps the LOS sigma but takes the NLOSb decorrelation distance (13 m), which
+     * is what TR 37.885 specifies and what the Python engine's TR37885_SHADOW_DECORR_M applies.
      *
      * <p>The old model drew i.i.d. per step AND keyed the draw on the CERT DIGEST, so a pseudonym
      * rotation resampled the channel. Here the key is the opaque true-vehicle key, which is stable
      * across rotation and identical for a Sybil ghost and its puppeteer -- both are the same radio.
      */
-    private double shadowDb(Link link, boolean los, double txX, double txY, double rxX, double rxY) {
-        double sigma = PathLoss.shadowSigmaDb(los);
+    private double shadowDb(Link link, PathLoss.State state, double txX, double txY,
+                            double rxX, double rxY) {
+        double sigma = state.sigmaDb();
         if (Double.isNaN(link.z)) {
             link.z = link.rng.nextGaussian();
         } else {
             double dd = link.havePrev
                     ? Math.hypot(txX - link.txX, txY - link.txY) + Math.hypot(rxX - link.rxX, rxY - link.rxY)
                     : Double.POSITIVE_INFINITY;
-            double rho = Math.exp(-dd / PathLoss.decorrelationM(los));
+            double rho = Math.exp(-dd / state.decorrM());
             link.z = rho * link.z + Math.sqrt(Math.max(0.0, 1.0 - rho * rho)) * link.rng.nextGaussian();
         }
         link.txX = txX;
@@ -393,9 +548,17 @@ public final class RxChannel {
     }
 
     /** LOS state of the most recent geometric evaluation. ORACLE-derived -- diagnostics and channel
-     *  physics only; it must never reach a report or a feature. */
+     *  physics only; it must never reach a report or a feature.
+     *  <p>NOTE: this is "not BUILDING-blocked". An NLOSv link reports true here, because it is a
+     *  line-of-sight link with a vehicle standing on it; {@link #lastLinkState} is the three-state
+     *  answer. */
     public boolean lastLos() {
         return lastLos;
+    }
+
+    /** LOS / NLOSv / NLOSb state of the most recent geometric evaluation. ORACLE-derived. */
+    public PathLoss.State lastLinkState() {
+        return lastState;
     }
 
     // ------------------------------------------------------------------ DCC (transmit side)
@@ -434,7 +597,7 @@ public final class RxChannel {
     public void publishStats() {
         ScmsBackend backend = ScmsBackend.instance();
         backend.noteChannel(sensed, delivered, droppedWeather, droppedGeometric,
-                droppedCongestion, nlosbLinks,
+                droppedCongestion, nlosbLinks, nlosvLinks, fadedFrames,
                 dcc.allowedCount(), dcc.suppressedCount(),
                 dcc.cbrSamples(), dcc.cbrSum(), dcc.cbrMax());
         // The footprint index is a JVM singleton, so its live counters and the projection-alignment
@@ -442,6 +605,9 @@ public final class RxChannel {
         BuildingIndex bi = buildings;
         if (bi != null) {
             backend.noteChannelIndex(bi.stats());
+        }
+        if (USE_NLOSV && GEOMETRIC) {
+            backend.noteBlockerIndex(blockerRebuilds, blockerPeakCount);
         }
     }
 
@@ -481,6 +647,28 @@ public final class RxChannel {
             p.put("SCMS_ANTENNA_GAIN_DBI", ANTENNA_GAIN_DBI);
             p.put("SCMS_CARRIER_GHZ", FC_GHZ);
             p.put("SCMS_BUILDING_CELL_M", BUILDING_CELL_M);
+            // The two Phase-2 propagation terms this receiver used to be missing. Published
+            // unconditionally inside the geometric block so a reader can tell, from the manifest
+            // alone, which physics produced the numbers.
+            p.put("SCMS_NLOSV", USE_NLOSV);
+            p.put("SCMS_FADING", USE_FADING);
+            if (USE_NLOSV) {
+                p.put("SCMS_NLOSV_HALF_WIDTH_M", NLOSV_HALF_WIDTH_M);
+                p.put("SCMS_NLOSV_REBUILD_S", NLOSV_REBUILD_S);
+                p.put("SCMS_NLOSV_MAX_AGE_S", NLOSV_MAX_AGE_S);
+                p.put("nlosv_reference", "3GPP TR 37.885 max(0, N(mu, sigma)), mu = "
+                        + "{9.0 both antennas below | 5.0 one below} + max(0, 15*log10(d) - 41), "
+                        + "sigma 4.5 / 4.0 dB (refdata/pathloss_3gpp_tr37885.nlosv_extra_loss_db); "
+                        + "blocker heights car " + PathLoss.BLOCKER_HEIGHT_CAR_M + " m / truck "
+                        + PathLoss.BLOCKER_HEIGHT_TRUCK_M + " m, antennas vehicle "
+                        + PathLoss.ANTENNA_HEIGHT_VEHICLE_M + " m / RSU "
+                        + PathLoss.ANTENNA_HEIGHT_RSU_M + " m");
+            }
+            if (USE_FADING) {
+                p.put("fading_reference", "Nakagami-m, m = 3 / 1.5 / 1.0 over 0-50 / 50-150 / >150 m"
+                        + " (refdata/nakagami_fading.m_by_distance_adopted), unit-mean"
+                        + " Gamma(shape=m, scale=1/m) per packet");
+            }
             p.put("pathloss_reference", "3GPP TR 37.885 (refdata/pathloss_3gpp_tr37885.json)");
             p.put("link_budget_db", round3(linkBudgetDb()));
             p.put("median_range_los_m", round3(PathLoss.medianRangeM(linkBudgetDb(), URBAN, true, FC_GHZ)));

@@ -39,6 +39,8 @@ import sys
 from . import channel as _channel
 from . import codec as _codec
 from . import detect as _detect
+from . import profile as _profile
+from . import report as _report
 from .errors import (ApiError, CapabilityError, ConfigError, InterfaceVersionError,
                      PluginDriftError, SignatureError)
 from .rng import check_plugin_id
@@ -49,7 +51,7 @@ API_VERSION = "1.0"
 #: argparse `choices` publish); every ITERATION for determinism-bearing purposes goes through
 #: :func:`builtin_names_sorted`.
 _BUILTINS: dict = {"channel_model": {}, "check": {}, "fusion": {}, "message_codec": {},
-                   "mobility": {}, "report_format": {}}
+                   "mobility": {}, "protocol_profile": {}, "report_format": {}}
 
 SLOTS: tuple = tuple(sorted(_BUILTINS))
 
@@ -78,6 +80,21 @@ INTERFACE: dict = {
         _codec.INTERFACE_NAME, _codec.INTERFACE_VERSION, _codec.MAX_MINOR,
         {"codec": _codec.CODEC_SPEC},
     ),
+    # The seam that makes "which protocol" ONE declaration rather than five booleans. The built-in
+    # ITS-G5 profile resolves through this entry exactly as a third-party stack does -- same
+    # signature check, same capability screening, same lock entry -- which is the whole test of
+    # whether the seam is real (api/profile.py).
+    "protocol_profile": (
+        _profile.INTERFACE_NAME, _profile.INTERFACE_VERSION, _profile.MAX_MINOR,
+        {"profile": _profile.PROFILE_SPEC},
+    ),
+    # The last EMPTY slot. A misbehaviour report's format is part of the protocol a deployment
+    # speaks, and a stack that is swappable on the air and hard-coded on the backhaul is only half
+    # swappable (api/report.py).
+    "report_format": (
+        _report.INTERFACE_NAME, _report.INTERFACE_VERSION, _report.MAX_MINOR,
+        {"report": _report.REPORT_SPEC},
+    ),
 }
 
 #: slot -> the module whose IMPORT registers that slot's built-ins, imported ON DEMAND the first
@@ -91,7 +108,12 @@ INTERFACE: dict = {
 #: itself imports no third-party module, so this stays free. `ImportError` is swallowed: a
 #: stripped-down install without the `codecs` package must still be able to resolve a third-party
 #: codec by dotted path.
-_LAZY_REGISTRARS = {"message_codec": "scms_sim_ref.codecs"}
+#: `protocol_profile` and `report_format` are registered by the same package for the same reason:
+#: nothing on the default dataset path constructs one, so resolving the slot is what pulls the
+#: package in and an engine that never asks pays nothing.
+_LAZY_REGISTRARS = {"message_codec": "scms_sim_ref.codecs",
+                    "protocol_profile": "scms_sim_ref.codecs",
+                    "report_format": "scms_sim_ref.codecs"}
 _LAZY_DONE: set = set()
 
 
@@ -113,6 +135,8 @@ CAPABILITIES: dict = {
     "check": (_detect.KNOWN_CAPABILITIES, _detect.RESERVED_CAPABILITIES),
     "fusion": (_detect.KNOWN_CAPABILITIES, _detect.RESERVED_CAPABILITIES),
     "message_codec": (_codec.KNOWN_CAPABILITIES, _codec.RESERVED_CAPABILITIES),
+    "protocol_profile": (_profile.KNOWN_CAPABILITIES, _profile.RESERVED_CAPABILITIES),
+    "report_format": (_report.KNOWN_CAPABILITIES, _report.RESERVED_CAPABILITIES),
 }
 
 

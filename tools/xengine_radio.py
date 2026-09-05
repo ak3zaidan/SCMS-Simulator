@@ -69,7 +69,10 @@ from scms_sim_ref.datagen import awareness as aw   # noqa: E402  (path set above
 BIN_M = aw.DIST_BIN_M          # 50 m: the reference's own NAR bin
 MAX_DIST_M = aw.MAX_DIST_M
 MIN_BAND_N = 200               # a band needs this many traced decisions before its PDR is quoted
-STATES = ("LOS", "NLOSb")
+# The Java receiver's own vocabulary, and the tokens it writes into link_trace.csv. NLOSv joined the
+# set when RxChannel gained the vehicle-blockage branch; a trace written before that carries no
+# NLOSv rows at all, so an old run still bins correctly and simply reports fraction 0.
+STATES = ("LOS", "NLOSv", "NLOSb")
 
 
 # =================================================================================================
@@ -79,9 +82,18 @@ STATES = ("LOS", "NLOSb")
 # engine uses -- transcribed here ONLY to evaluate the Java rule; any divergence between the two
 # engines' path loss would show up as a disagreement between this and awareness.propagation_pdr at
 # LOS, where the two models are otherwise identical.
-JAVA_PATHLOSS = {"LOS": (38.77, 16.7, 18.2), "NLOSb": (36.85, 30.0, 18.9)}
-JAVA_SHADOW_SIGMA = {"LOS": 3.0, "NLOSb": 4.0}
+# NLOSv uses the LOS formula plus its own censored-Gaussian blockage term, exactly as
+# PathLoss.State encodes it: sigma 3.0 dB (NOT the NLOSb 4.0, which would double-count blockage).
+JAVA_PATHLOSS = {"LOS": (38.77, 16.7, 18.2), "NLOSv": (38.77, 16.7, 18.2),
+                 "NLOSb": (36.85, 30.0, 18.9)}
+JAVA_SHADOW_SIGMA = {"LOS": 3.0, "NLOSv": 3.0, "NLOSb": 4.0}
 JAVA_FC_GHZ = 5.9
+# org.scms.radio.PathLoss.NLOSV_MU_BASE_DB / NLOSV_SIGMA_DB, indexed by antennas below the blocker.
+# Index 2 (both below) is the vehicle-to-vehicle case: OBU antennas sit at 1.5 m and the shortest
+# blocker is a 1.6 m car, so every V2V NLOSv link takes it. An RSU link (5 m pole) takes index 1.
+JAVA_NLOSV_BRANCH = {2: (9.0, 4.5), 1: (5.0, 4.0), 0: (0.0, 0.0)}
+# nakagami_fading.m_by_distance_adopted, mirrored in PathLoss.nakagamiM.
+JAVA_NAKAGAMI_BANDS = ((50.0, 3.0), (150.0, 1.5), (float("inf"), 1.0))
 
 
 def java_pathloss_db(state: str, d_m: float, fc_ghz: float = JAVA_FC_GHZ) -> float:
@@ -89,18 +101,53 @@ def java_pathloss_db(state: str, d_m: float, fc_ghz: float = JAVA_FC_GHZ) -> flo
     return a + b * math.log10(max(float(d_m), 1.0)) + c * math.log10(fc_ghz)
 
 
-def java_pdr(state: str, d_m: float, *, tx_power_dbm: float, rx_sensitivity_dbm: float,
-             antenna_gain_dbi: float = 0.0) -> float:
-    """P(rssi >= sensitivity) under the Java model: mean path loss + Gudmundson shadowing, nothing else.
+def java_nakagami_m(d_m: float) -> float:
+    for upper, m in JAVA_NAKAGAMI_BANDS:
+        if d_m <= upper:
+            return m
+    return JAVA_NAKAGAMI_BANDS[-1][1]
 
-    RxChannel.geometricDeliver is exactly ``tx + 2*gain - PL - sigma*z >= sens`` with ``z`` the AR(1)
-    shadowing state, whose MARGINAL is N(0,1) whatever the correlation, so this closed form is exact
-    for the per-packet delivery probability. There is no fading term and no NLOSv term in the Java
-    receiver -- both absences are divergences from the Python engine, not approximations here.
+
+def java_pdr(state: str, d_m: float, *, tx_power_dbm: float, rx_sensitivity_dbm: float,
+             antenna_gain_dbi: float = 0.0, fading: bool = True, nlosv: bool = True,
+             nlosv_branch: int = 2) -> float:
+    """P(rssi >= sensitivity) under the Java model, in closed form.
+
+    ``RxChannel.geometricDeliver`` computes, per frame::
+
+        rssi = tx + 2*gain - PL(state, d) - sigma*z [- max(0, N(mu, sig))] [+ 10*log10(Gamma(m,1/m))]
+
+    where ``z`` is the AR(1) shadowing state, whose MARGINAL is N(0,1) whatever the correlation, so
+    integrating over it is exact and not an approximation. The two bracketed terms are the ones the
+    receiver gained with the NLOSv/fading work and each is gated by its own env knob; ``fading`` and
+    ``nlosv`` here mirror ``SCMS_FADING`` / ``SCMS_NLOSV`` as the run's manifest reports them, so the
+    SAME function scores a before-run and an after-run and the comparison is like for like.
+
+    The quadrature nodes come from ``awareness`` (one audited integrator, shared with
+    ``propagation_pdr``); every CONSTANT is the Java one. That split is deliberate: reusing the
+    reference's integrator keeps the two engines numerically comparable, while keeping the Java
+    constants local means a future divergence in either engine still shows up here as a difference
+    rather than being defined away.
+
+    NOTE the decode floor. Java's is the bare sensitivity; the Python engine's is
+    ``max(sensitivity, noise + SNIR) = max(sens, -106)``. They coincide at -81 dBm and diverge only
+    for a sensitivity below -106 dBm, where the Java side would be the optimistic one.
     """
     margin = (float(tx_power_dbm) + 2.0 * float(antenna_gain_dbi)
               - java_pathloss_db(state, d_m) - float(rx_sensitivity_dbm))
-    return float(aw._norm_cdf(np.array([margin / JAVA_SHADOW_SIGMA[state]]))[0])
+    sigma = JAVA_SHADOW_SIGMA[state]
+    if fading:
+        g, wg = aw._fade_quadrature(java_nakagami_m(float(d_m)))
+        fade_db = 10.0 * np.log10(np.maximum(g, 1e-300))
+    else:
+        fade_db, wg = np.array([0.0]), np.array([1.0])
+    if state == "NLOSv" and nlosv:
+        mu_base, sig_v = JAVA_NLOSV_BRANCH[int(nlosv_branch)]
+        mu = mu_base + max(0.0, 15.0 * math.log10(max(float(d_m), 1.0)) - 41.0)
+        nodes, wl = aw._nlosv_quadrature(mu, sig_v)
+        z = (margin + fade_db[:, None] - nodes[None, :]) / sigma
+        return float((aw._norm_cdf(z) * wg[:, None] * wl[None, :]).sum())
+    return float((aw._norm_cdf((margin + fade_db) / sigma) * wg).sum())
 
 
 # =================================================================================================
@@ -128,6 +175,13 @@ def radio_config(man: dict) -> dict:
         "link_budget_db": round(tx + 2.0 * gain - sens, 3),
         "dcc_enabled": bool(ep.get("SCMS_DCC", False)),
         "buildings": bool(ep.get("SCMS_BUILDINGS", False)),
+        # Absent from every manifest written before RxChannel gained the two terms, and the default
+        # therefore has to be False: an old panel must keep scoring the radio that produced it.
+        "nlosv": bool(ep.get("SCMS_NLOSV", False)),
+        "fading": bool(ep.get("SCMS_FADING", False)),
+        "nlosv_half_width_m": ep.get("SCMS_NLOSV_HALF_WIDTH_M"),
+        "nlosv_rebuild_s": ep.get("SCMS_NLOSV_REBUILD_S"),
+        "nlosv_max_age_s": ep.get("SCMS_NLOSV_MAX_AGE_S"),
         "chan_capacity": ep.get("SCMS_CHAN_CAPACITY"),
         "weather_drop": ep.get("SCMS_WEATHER_RADIO_LOSS"),
         "sns_singlehop_radius_m": (man.get("config") or {}).get("radio_range_m"),
@@ -297,10 +351,10 @@ def counterfactual_curves(centres, frac, cfg: dict) -> dict:
     RADIO, because the composition weighting them is one measurement used twice.
     """
     floor_py = aw.decode_floor_dbm(cfg["rx_sensitivity_dbm"])
+    jkw = dict(tx_power_dbm=cfg["tx_power_dbm"], rx_sensitivity_dbm=cfg["rx_sensitivity_dbm"],
+               antenna_gain_dbi=cfg["antenna_gain_dbi"], fading=cfg["fading"], nlosv=cfg["nlosv"])
     java = np.array([sum((frac[s][i] if np.isfinite(frac[s][i]) else 0.0)
-                         * java_pdr(s, float(c), tx_power_dbm=cfg["tx_power_dbm"],
-                                    rx_sensitivity_dbm=cfg["rx_sensitivity_dbm"],
-                                    antenna_gain_dbi=cfg["antenna_gain_dbi"])
+                         * java_pdr(s, float(c), **jkw)
                          for s in STATES)
                     for i, c in enumerate(centres)])
     py = np.array([sum((frac[s][i] if np.isfinite(frac[s][i]) else 0.0)
@@ -311,20 +365,17 @@ def counterfactual_curves(centres, frac, cfg: dict) -> dict:
                   for i, c in enumerate(centres)])
     per_state = {}
     for s in STATES:
+        # A run with SCMS_NLOSV=0 emits no NLOSv rows at all, so quoting a Java NLOSv curve for it
+        # would be quoting a branch that did not run. Report None, exactly as this tool did for
+        # every state before the branch existed.
+        java_state = ([None] * len(centres) if (s == "NLOSv" and not cfg["nlosv"])
+                      else [java_pdr(s, float(c), **jkw) for c in centres])
         per_state[s] = {
-            "java": [java_pdr(s, float(c), tx_power_dbm=cfg["tx_power_dbm"],
-                              rx_sensitivity_dbm=cfg["rx_sensitivity_dbm"],
-                              antenna_gain_dbi=cfg["antenna_gain_dbi"]) for c in centres],
+            "java": java_state,
             "python": [aw.propagation_pdr(s, float(c), tx_power_dbm=cfg["tx_power_dbm"],
                                           decode_floor_dbm=floor_py, radio_env=cfg["radio_env"])
                        for c in centres],
         }
-    per_state["NLOSv"] = {
-        "java": [None] * len(centres),      # the Java receiver has no NLOSv branch at all
-        "python": [aw.propagation_pdr("NLOSv", float(c), tx_power_dbm=cfg["tx_power_dbm"],
-                                      decode_floor_dbm=floor_py, radio_env=cfg["radio_env"])
-                   for c in centres],
-    }
     return {"java_closed_form": java, "python_physics_same_scene": py, "per_state": per_state,
             "python_decode_floor_dbm": floor_py}
 
@@ -356,6 +407,13 @@ def measure(run_dir: str, bin_m: float = BIN_M, max_dist_m: float = MAX_DIST_M) 
             "dropped_congestion": ch.get("dropped_congestion"),
             "dropped_weather": ch.get("dropped_weather"),
             "nlosb_links": ch.get("nlosb_links"),
+            "nlosv_links": ch.get("nlosv_links"),
+            "nlosv_fraction_all_links": ch.get("nlosv_fraction"),
+            "blockers_declared": ch.get("blockers_declared"),
+            "blockers_truck_height": ch.get("blockers_truck_height"),
+            "blocker_snapshots": ch.get("blocker_snapshots"),
+            "blocker_peak_live": ch.get("blocker_peak_live"),
+            "faded_frames": ch.get("faded_frames"),
             "nlosb_fraction_all_links": ((ch.get("buildings") or {}).get("nlosb_fraction")),
             "buildings_indexed": ((ch.get("buildings") or {}).get("buildings")),
             "buildings_aligned": ((ch.get("buildings") or {}).get("aligned")),
@@ -412,10 +470,12 @@ def measure(run_dir: str, bin_m: float = BIN_M, max_dist_m: float = MAX_DIST_M) 
         {
             "d_lo_m": float(tr["edges"][i]), "d_hi_m": float(tr["edges"][i + 1]),
             "n_decisions": int(tr["n_total"][i]),
-            "los": _r(tr["fraction"]["LOS"][i]), "nlosb": _r(tr["fraction"]["NLOSb"][i]),
+            "los": _r(tr["fraction"]["LOS"][i]), "nlosv": _r(tr["fraction"]["NLOSv"][i]),
+            "nlosb": _r(tr["fraction"]["NLOSb"][i]),
             "pdr_propagation": _r(tr["pdr_propagation"][i]),
             "pdr_with_contention": _r(tr["pdr_with_contention"][i]),
             "pdr_los": _r(tr["pdr_by_state"]["LOS"][i]),
+            "pdr_nlosv": _r(tr["pdr_by_state"]["NLOSv"][i]),
             "pdr_nlosb": _r(tr["pdr_by_state"]["NLOSb"][i]),
             "mean_rssi_dbm": _r(tr["mean_rssi_dbm"]["LOS"][i], 2),
             "java_closed_form_pdr": _r(cf["java_closed_form"][i]),
@@ -730,17 +790,21 @@ def compare(mosaic_panels: dict, py_awareness_json: str | None,
     if any_panel:
         c = any_panel["config"]
         floor = aw.decode_floor_dbm(c["rx_sensitivity_dbm"])
+        # .get with a False default: a radio_panel.json written before the NLOSv/fading work has
+        # neither key, and must keep being scored against the radio that produced it.
+        c_nlosv, c_fading = bool(c.get("nlosv")), bool(c.get("fading"))
+        jkw = dict(tx_power_dbm=c["tx_power_dbm"], rx_sensitivity_dbm=c["rx_sensitivity_dbm"],
+                   antenna_gain_dbi=c["antenna_gain_dbi"], fading=c_fading, nlosv=c_nlosv)
         L += ["", f"## Per-state per-packet PDR at a matched {c['link_budget_db']} dB budget "
                   f"-- the radio with no scene in it", "",
+              f"Java physics on this arm: NLOSv {'on' if c_nlosv else 'OFF'}, "
+              f"Nakagami fading {'on' if c_fading else 'OFF'}.", "",
               "| d (m) | LOS java | LOS python | NLOSb java | NLOSb python | NLOSv java | NLOSv python |",
               "|---|---|---|---|---|---|---|"]
         for a in COMPARE_ANCHORS_M:
-            jl = java_pdr("LOS", a, tx_power_dbm=c["tx_power_dbm"],
-                          rx_sensitivity_dbm=c["rx_sensitivity_dbm"],
-                          antenna_gain_dbi=c["antenna_gain_dbi"])
-            jn = java_pdr("NLOSb", a, tx_power_dbm=c["tx_power_dbm"],
-                          rx_sensitivity_dbm=c["rx_sensitivity_dbm"],
-                          antenna_gain_dbi=c["antenna_gain_dbi"])
+            jl = java_pdr("LOS", a, **jkw)
+            jn = java_pdr("NLOSb", a, **jkw)
+            jv = java_pdr("NLOSv", a, **jkw) if c_nlosv else None
             pl_ = aw.propagation_pdr("LOS", a, tx_power_dbm=c["tx_power_dbm"],
                                      decode_floor_dbm=floor, radio_env=c["radio_env"])
             pn = aw.propagation_pdr("NLOSb", a, tx_power_dbm=c["tx_power_dbm"],
@@ -748,7 +812,8 @@ def compare(mosaic_panels: dict, py_awareness_json: str | None,
             pv = aw.propagation_pdr("NLOSv", a, tx_power_dbm=c["tx_power_dbm"],
                                     decode_floor_dbm=floor, radio_env=c["radio_env"])
             L.append("| {:g} | {:.4f} | {:.4f} | {:.4f} | {:.4f} | {} | {:.4f} |".format(
-                a, jl, pl_, jn, pn, "n/a -- no NLOSv branch", pv))
+                a, jl, pl_, jn, pn,
+                "n/a -- no NLOSv branch" if jv is None else f"{jv:.4f}", pv))
 
     # --- link-state composition, both engines, each on its own scene and on the shared one -----
     if pya or pym:
@@ -765,7 +830,8 @@ def compare(mosaic_panels: dict, py_awareness_json: str | None,
             q = pp.get(lo)
             L.append("| {}-{} m | {} | {} | {} |".format(
                 lo, lo + 50,
-                f"LOS {j['los']} / NLOSb {j['nlosb']}" if j else "-",
+                (f"LOS {j['los']} / NLOSv {j['nlosv']} / NLOSb {j['nlosb']}"
+                 if j and j.get("nlosv") else f"LOS {j['los']} / NLOSb {j['nlosb']}") if j else "-",
                 f"LOS {m['los']} / NLOSv {m['nlosv']} / NLOSb {m['nlosb']}" if m else "-",
                 f"LOS {q['los']} / NLOSv {q['nlosv']} / NLOSb {q['nlosb']}" if q else "-"))
     return L
@@ -783,6 +849,8 @@ def render(rep: dict) -> list[str]:
         f"sens={c['rx_sensitivity_dbm']} dBm gain={c['antenna_gain_dbi']} dBi "
         f"budget={c['link_budget_db']} dB  DCC={'on' if c['dcc_enabled'] else 'off'}  "
         f"SNS singlehop radius={c['sns_singlehop_radius_m']} m  chan_capacity={c['chan_capacity']}",
+        f"physics: NLOSv={'on' if c.get('nlosv') else 'OFF'}  "
+        f"Nakagami fading={'on' if c.get('fading') else 'OFF'}",
         "",
         "AGGREGATE (every frame SNS handed the app)",
         f"  sensed {ag['frames_sensed']}  delivered {ag['frames_delivered']}  "
@@ -791,6 +859,9 @@ def render(rep: dict) -> list[str]:
         f"  weather {ag['dropped_weather']}",
         f"  NLOSb fraction over all links {ag['nlosb_fraction_all_links']}  "
         f"({ag['buildings_indexed']} footprints, aligned={ag['buildings_aligned']})",
+        f"  NLOSv links {ag['nlosv_links']} (fraction {ag['nlosv_fraction_all_links']}) from "
+        f"{ag['blockers_declared']} declared blockers, {ag['blockers_truck_height']} at truck "
+        f"height; peak live {ag['blocker_peak_live']} over {ag['blocker_snapshots']} snapshots",
         "",
         "CBR (ETSI TS 102 687 meter, always measured)",
         f"  mean {cb['cbr_mean']}  max {cb['cbr_max']}  samples {cb['cbr_samples']}  "
@@ -812,13 +883,13 @@ def render(rep: dict) -> list[str]:
     L += ["", f"LINK TRACE  {lt['decisions_binned']} binned decisions "
               f"(sample p={lt['sample_probability']})",
           "",
-          "  band       n     LOS   NLOSb |  PDR(prop) PDR(+cont) | java-cf  py-phys",
-          "  " + "-" * 74]
+          "  band       n     LOS  NLOSv  NLOSb |  PDR(prop) PDR(+cont) | java-cf  py-phys",
+          "  " + "-" * 81]
     for b in rep["by_band"]:
         if b["n_decisions"] < MIN_BAND_N:
             continue
-        L.append("  {:>4.0f}-{:<4.0f} {:>8d}  {:>6} {:>6}  |  {:>7} {:>9}  | {:>7} {:>8}".format(
-            b["d_lo_m"], b["d_hi_m"], b["n_decisions"], b["los"], b["nlosb"],
+        L.append("  {:>4.0f}-{:<4.0f} {:>8d}  {:>6} {:>6} {:>6}  |  {:>7} {:>9}  | {:>7} {:>8}".format(
+            b["d_lo_m"], b["d_hi_m"], b["n_decisions"], b["los"], b["nlosv"], b["nlosb"],
             b["pdr_propagation"], b["pdr_with_contention"],
             b["java_closed_form_pdr"], b["python_physics_same_scene_pdr"]))
     tv = rep["trace_vs_closed_form"]

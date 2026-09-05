@@ -21,6 +21,10 @@ param(
     [ValidateSet('geometric', 'sns')][string]$RadioModel = 'geometric',
     [ValidateSet('0', '1')][string]$Dcc = '0',
     [ValidateSet('0', '1')][string]$Buildings = '1',
+    # TR 37.885 NLOSv vehicle blockage and per-packet Nakagami-m fading. Both default ON, matching
+    # the app's own defaults; pass 0 to reproduce the pre-NLOSv/pre-fading radio exactly.
+    [ValidateSet('0', '1')][string]$Nlosv = '1',
+    [ValidateSet('0', '1')][string]$Fading = '1',
     [double]$TraceProb = 0.3,
     [long]$Seed = 20260809,
     [string]$Root = 'datasets/xengine',
@@ -48,6 +52,8 @@ $env:SCMS_EMIT_SAMPLE      = '1.0'          # full emission trace: the CAM-gap d
 $env:SCMS_RADIO_MODEL      = $RadioModel
 $env:SCMS_RADIO_REGIME     = 'urban'
 $env:SCMS_BUILDINGS        = $Buildings
+$env:SCMS_NLOSV            = $Nlosv
+$env:SCMS_FADING           = $Fading
 $env:SCMS_TX_POWER_DBM     = "$TxPowerDbm"
 $env:SCMS_RX_SENSITIVITY_DBM = "$RxSensitivityDbm"
 $env:SCMS_WEATHER          = 'clear'        # isolate the propagation model from the weather table
@@ -56,7 +62,7 @@ $env:SCMS_LINK_TRACE       = (Join-Path $out 'link_trace.csv')
 $env:SCMS_LINK_TRACE_PROB  = "$TraceProb"
 
 $cfg = Join-Path $scen 'scenario_config.json'
-Write-Host "== arm '$Arm' : model=$RadioModel tx=$TxPowerDbm dBm sens=$RxSensitivityDbm dBm dcc=$Dcc buildings=$Buildings"
+Write-Host "== arm '$Arm' : model=$RadioModel tx=$TxPowerDbm dBm sens=$RxSensitivityDbm dBm dcc=$Dcc buildings=$Buildings nlosv=$Nlosv fading=$Fading"
 Write-Host "   scenario $cfg  ->  $out"
 $sw = [Diagnostics.Stopwatch]::StartNew()
 Push-Location $env:MOSAIC_HOME
@@ -70,7 +76,7 @@ try {
     foreach ($v in 'SCMS_OUT_DIR', 'SCMS_INPUTS_JSON', 'SCMS_SEED', 'SCMS_EMIT_SAMPLE',
                    'SCMS_RADIO_MODEL', 'SCMS_RADIO_REGIME', 'SCMS_BUILDINGS', 'SCMS_TX_POWER_DBM',
                    'SCMS_RX_SENSITIVITY_DBM', 'SCMS_WEATHER', 'SCMS_DCC', 'SCMS_LINK_TRACE',
-                   'SCMS_LINK_TRACE_PROB') {
+                   'SCMS_LINK_TRACE_PROB', 'SCMS_NLOSV', 'SCMS_FADING') {
         Remove-Item "Env:\$v" -ErrorAction SilentlyContinue
     }
 }

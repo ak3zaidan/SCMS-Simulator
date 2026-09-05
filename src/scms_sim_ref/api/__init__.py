@@ -19,6 +19,14 @@ What phase 1 ships (PLUGIN-ARCHITECTURE.md section 7):
   already emits.
 * :mod:`~scms_sim_ref.api.registry` -- the three-tier resolver and the content-hash provenance lock.
 * :mod:`~scms_sim_ref.api.errors` -- every failure is a LOAD-TIME failure.
+* :mod:`~scms_sim_ref.api.codec` -- the WIRE FORMAT: `Claim`, `StationView`, `MessageCodec`.
+* :mod:`~scms_sim_ref.api.profile` -- the PROTOCOL STACK: one declaration bundling the codec, the
+  generation rules, the congestion control, the security envelope and the wire-size accounting.
+  Five separate booleans are not a protocol; a profile is what makes "which protocol does this run
+  speak" a single, replayable, third-party-supplyable statement.
+* :mod:`~scms_sim_ref.api.report` -- the MISBEHAVIOUR-REPORT FORMAT, because a report's format is
+  part of the protocol a deployment speaks and a stack that is swappable on the air and hard-coded
+  on the backhaul is only half swappable.
 
 Safety posture, stated honestly (section 10): in-process plugins are **attested and detected, not
 sandboxed**. Capability by omission is the only strong control. Arbitrary code execution, native
@@ -38,17 +46,27 @@ from .detect import (Check, CheckBase, Fusion, FusionBase, NamespacedState, Obse
 from .errors import (ApiError, CapabilityError, ConfigError, InterfaceVersionError,
                      PluginDriftError, SignatureError)
 from .fields import FieldSpec
+from .profile import (CongestionState, GenerationInput, GenerationState, NO_MESSAGE,
+                      ProtocolMeasurements, ProtocolProfile, ProtocolProfileBase,
+                      generation_report)
 from .registry import API_VERSION, SLOTS, builtin_names, builtin_names_sorted, resolve
+from .report import (REQUIRED_ROW_KEYS, ReportFormat, ReportFormatBase, ReportInput)
 from .rng import RngNamespace
 
 __all__ = [
-    "API_VERSION", "INTERFACE_VERSION", "SLOTS", "UNBOUND", "VIOLATION_THRESHOLD",
+    "API_VERSION", "INTERFACE_VERSION", "NO_MESSAGE", "REQUIRED_ROW_KEYS", "SLOTS", "UNBOUND",
+    "VIOLATION_THRESHOLD",
     "ApiError", "BatchChannelModel", "CapabilityError", "Check", "CheckBase", "Claim",
-    "ConfigError", "DEFAULT_EPOCH_UNIX", "DEFAULT_FRAME", "DELIVERED", "ENGINE_CONVENTIONS",
-    "FieldSpec", "Fusion", "FusionBase", "GeoFrame", "InterfaceVersionError", "LINK_STATES",
+    "ConfigError", "CongestionState", "DEFAULT_EPOCH_UNIX", "DEFAULT_FRAME", "DELIVERED",
+    "ENGINE_CONVENTIONS",
+    "FieldSpec", "Fusion", "FusionBase", "GenerationInput", "GenerationState", "GeoFrame",
+    "InterfaceVersionError", "LINK_STATES",
     "LinkChannelModel", "LinkChannelModelBase", "LinkOutcome", "MessageCodec", "MessageCodecBase",
-    "NamespacedState", "Observation", "PerLinkAdapter", "PluginDriftError", "ReportDecision",
+    "NamespacedState", "Observation", "PerLinkAdapter", "PluginDriftError", "ProtocolMeasurements",
+    "ProtocolProfile", "ProtocolProfileBase", "ReportDecision", "ReportFormat", "ReportFormatBase",
+    "ReportInput",
     "RngNamespace", "SIGNER_FORMS", "SignatureError", "StationSnapshot", "StationView",
     "StepFrame", "Transmission",
-    "builtin_names", "builtin_names_sorted", "fires", "namespaced_key", "resolve",
+    "builtin_names", "builtin_names_sorted", "fires", "generation_report", "namespaced_key",
+    "resolve",
 ]

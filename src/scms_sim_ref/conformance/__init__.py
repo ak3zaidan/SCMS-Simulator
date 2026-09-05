@@ -26,9 +26,11 @@ suite in a determinism project is self-defeating. Every sequence here comes from
 """
 from __future__ import annotations
 
-from .v1 import (CHANNEL_CHECKS, SUITE_VERSION, ChannelModelContract, CheckSkipped,
-                 IoViolation)
-from .runner import ConformanceReport, run_contract, run_ref
+from .v1 import (CHANNEL_CHECKS, PROTOCOL_CHECKS, REPORT_CHECKS, SUITE_VERSION,
+                 ChannelModelContract, CheckSkipped, IoViolation, ProtocolProfileContract,
+                 ReportFormatContract)
+from .runner import CONTRACTS, ConformanceReport, run_contract, run_ref
 
-__all__ = ["CHANNEL_CHECKS", "SUITE_VERSION", "ChannelModelContract", "CheckSkipped",
-           "ConformanceReport", "IoViolation", "run_contract", "run_ref"]
+__all__ = ["CHANNEL_CHECKS", "CONTRACTS", "PROTOCOL_CHECKS", "REPORT_CHECKS", "SUITE_VERSION",
+           "ChannelModelContract", "CheckSkipped", "ConformanceReport", "IoViolation",
+           "ProtocolProfileContract", "ReportFormatContract", "run_contract", "run_ref"]

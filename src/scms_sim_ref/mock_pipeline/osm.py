@@ -13,6 +13,17 @@ frame as the road graph -- see the projection note on `osm_to_network` -- so the
 radio model can run a LOS/NLOSb blockage test against real city geometry with no new download, no
 new cache and no geometry dependency.
 
+ROAD/BUILDING REGISTRATION (`building_aware_roads=True`, the default for `--buildings`). RDP runs
+at a 10 m deviation tolerance, and a 10 m deviation is a whole building: chording away a curve moved
+**3.48 pp of the imported road length -- 95.2% of its halo-free road-in-building overlap -- into a
+footprint the unsimplified way never touched** on the Ingolstadt extract (measured, see
+`tools/osm_registration.py`). `osm_to_network(avoid_polygons=...)` constrains the simplification:
+a chord is rejected, and the deviating vertex kept, whenever the chord would enter a footprint the
+original chain does not. What is left over is map truth --
+`tunnel=building_passage` archways and the like -- and is reported rather than deleted, as
+`info["road_building_overlap"]` / the document's `through_building_edges`. Passing no polygons
+leaves every byte of the old output in place.
+
 TAG FIDELITY (opt-in, `attrs=True` / `signals=True`). The importer historically kept `highway` and
 `maxspeed` and threw the rest away, so every imported one-way street became bidirectional and every
 road had the engine's single global lane count. `attrs=True` now also keeps `oneway` (yes / -1 /
@@ -215,6 +226,187 @@ def _rdp(pts: list, tol: float) -> list:
     return [pts[0], pts[-1]]
 
 
+def _rdp_avoid(pts: list, tol: float, index: "FootprintIndex", stats: dict | None = None) -> list:
+    """RDP, but a chord may not move the road INTO a building the original chain misses.
+
+    This is the fix for the registration defect. Plain RDP is free to replace a curve by its chord
+    as long as the deviation stays under `tol`; at the importer's 10 m tolerance that chord can sit
+    a full building's width away from the street it replaces, and on the Ingolstadt extract it put
+    3.48 pp of the road length inside a footprint the real way never entered (95.2% of it).
+
+    The test is a SET difference, not a boolean: a chain that legitimately runs through an archway
+    keeps running through it, and only footprints the chain did not already enter can force a split.
+    That is what stops the constraint from exploding a `tunnel=building_passage` way back into every
+    one of its source vertices. Splitting is always at `imax`, strictly interior, so the recursion
+    terminates at the original polyline in the worst case."""
+    if len(pts) < 3:
+        return pts
+    ax, ay = pts[0]
+    bx, by = pts[-1]
+    dx, dy = bx - ax, by - ay
+    dd = math.hypot(dx, dy)
+    imax, dmax = 0, -1.0
+    for i in range(1, len(pts) - 1):
+        px, py = pts[i]
+        d = (abs(dx * (ay - py) - dy * (ax - px)) / dd) if dd > 0 else math.hypot(px - ax, py - ay)
+        if d > dmax:
+            imax, dmax = i, d
+    forced = False
+    if dmax <= tol:
+        chord = index.entered(ax, ay, bx, by)
+        if chord and (chord - index.polyline_entered(pts)):
+            forced = True                        # the chord walks into a wall the street misses
+    if dmax > tol or forced:
+        if forced and stats is not None:
+            stats["forced_splits"] = stats.get("forced_splits", 0) + 1
+        left = _rdp_avoid(pts[:imax + 1], tol, index, stats)
+        return left[:-1] + _rdp_avoid(pts[imax:], tol, index, stats)
+    return [pts[0], pts[-1]]
+
+
+# --------------------------------------------------------------------------- #
+# ROAD / BUILDING REGISTRATION. A road centreline inside a building footprint is
+# wrong on its face and corrupts every LOS classification on that link -- unless
+# the OSM way SAYS it goes through the building, which some of them do.
+# --------------------------------------------------------------------------- #
+#: `tunnel=*` values that put the carriageway inside/under built structure. `building_passage` is
+#: the archway-through-a-block tag and is by far the common one in a European old town.
+THROUGH_BUILDING_TUNNEL = {"building_passage", "building", "passage", "yes", "avalanche_protector"}
+#: `covered=*` values that put a roof over the carriageway (an arcade, a colonnade, a porte-cochere).
+THROUGH_BUILDING_COVERED = {"yes", "arcade", "colonnade", "roof", "booth"}
+#: step used to measure how much of an edge is really inside a footprint (see `_overlap_report`)
+_OVERLAP_STEP_M = 0.5
+
+
+def through_building_reason(tags: dict) -> str | None:
+    """Does this OSM way SAY it runs through, under or beneath built structure? -> reason, or None.
+
+    A way tagged `tunnel=building_passage` (Ingolstadt's Kavalier Heydeck gateway, Reitschulgasse,
+    Kreuzstrasse), `covered=arcade`, or `layer=-1` is *meant* to lie inside a building footprint.
+    That overlap is map truth and must be KEPT -- deleting it would delete a real street -- but it
+    must be kept FLAGGED, because a LOS classifier that finds a link endpoint on a building cell
+    needs to know whether it is looking at real geometry or at an import artefact.
+
+    The tag is only ever used to EXPLAIN an overlap that was actually measured; it never predicts
+    one (a `tunnel=yes` road bore under open ground overlaps nothing and is never reported)."""
+    t = (tags.get("tunnel") or "").strip().lower()
+    if t in THROUGH_BUILDING_TUNNEL:
+        return f"tunnel={t}"
+    c = (tags.get("covered") or "").strip().lower()
+    if c in THROUGH_BUILDING_COVERED:
+        return f"covered={c}"
+    if (tags.get("man_made") or "").strip().lower() == "tunnel":
+        return "man_made=tunnel"
+    raw = (tags.get("layer") or "").split(";")[0].strip()
+    try:
+        if float(raw) < 0:
+            return f"layer={raw}"
+    except ValueError:
+        pass
+    return None
+
+
+def _orient(ax, ay, bx, by, cx, cy) -> float:
+    """2x signed area of (a, b, c): > 0 iff c is left of the directed line a->b."""
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+
+
+def _seg_crosses(ax, ay, bx, by, cx, cy, dx, dy) -> bool:
+    """PROPER segment intersection: the two segments cross, they do not merely touch.
+
+    Touching is deliberately excluded -- all four orientations must be non-zero. A
+    `building_passage` way shares its end nodes with the wall it pierces, and a kerbside way often
+    ends exactly on a footprint corner; counting those as "enters the building" would fire the
+    constraint on geometry that is already correct. A chord through a polygon VERTEX is not lost by
+    this: it crosses the other edge at that vertex too."""
+    d1 = _orient(cx, cy, dx, dy, ax, ay)
+    d2 = _orient(cx, cy, dx, dy, bx, by)
+    d3 = _orient(ax, ay, bx, by, cx, cy)
+    d4 = _orient(ax, ay, bx, by, dx, dy)
+    if d1 == 0.0 or d2 == 0.0 or d3 == 0.0 or d4 == 0.0:
+        return False
+    return ((d1 > 0.0) != (d2 > 0.0)) and ((d3 > 0.0) != (d4 > 0.0))
+
+
+def _point_in_ring(x: float, y: float, ring) -> bool:
+    """Even-odd point-in-polygon against an OPEN vertex list (the closing edge is implied)."""
+    inside = False
+    n = len(ring)
+    j = n - 1
+    for i in range(n):
+        xi, yi = ring[i]
+        xj, yj = ring[j]
+        if (yi > y) != (yj > y) and x < xi + (y - yi) * (xj - xi) / (yj - yi):
+            inside = not inside
+        j = i
+    return inside
+
+
+class FootprintIndex:
+    """Grid index over building rings answering "which footprints does this SEGMENT enter?".
+
+    EXACT, unlike the runtime `_BuildingRaster`: no cells, so no one-cell wall halo. That matters
+    here -- the halo is a property of the LOS classifier and must not be allowed to drive the
+    importer into pinning vertices next to every wall in the city. A segment enters ring `i` when it
+    properly crosses one of the ring's edges (see `_seg_crosses`) or lies wholly inside it.
+    Deterministic; the returned set is a frozenset of ring indices."""
+
+    __slots__ = ("cell", "polygons", "_bbox", "_buckets")
+
+    def __init__(self, polygons, cell_m: float = 40.0):
+        self.cell = float(cell_m)
+        self.polygons = [[(float(p[0]), float(p[1])) for p in ring] for ring in polygons]
+        self._bbox: list = []
+        self._buckets: dict = {}
+        c = self.cell
+        for k, ring in enumerate(self.polygons):
+            xs = [p[0] for p in ring]
+            ys = [p[1] for p in ring]
+            bb = (min(xs), min(ys), max(xs), max(ys))
+            self._bbox.append(bb)
+            for ix in range(int(math.floor(bb[0] / c)), int(math.floor(bb[2] / c)) + 1):
+                for iy in range(int(math.floor(bb[1] / c)), int(math.floor(bb[3] / c)) + 1):
+                    self._buckets.setdefault((ix, iy), []).append(k)
+
+    def entered(self, x0: float, y0: float, x1: float, y1: float) -> frozenset:
+        """Ring indices this segment enters (empty for the overwhelmingly common clear segment)."""
+        c = self.cell
+        lo_x, hi_x = (x0, x1) if x0 <= x1 else (x1, x0)
+        lo_y, hi_y = (y0, y1) if y0 <= y1 else (y1, y0)
+        cand: set = set()
+        for ix in range(int(math.floor(lo_x / c)), int(math.floor(hi_x / c)) + 1):
+            for iy in range(int(math.floor(lo_y / c)), int(math.floor(hi_y / c)) + 1):
+                b = self._buckets.get((ix, iy))
+                if b:
+                    cand.update(b)
+        if not cand:
+            return frozenset()
+        hits = []
+        for k in cand:
+            bx0, by0, bx1, by1 = self._bbox[k]
+            if hi_x < bx0 or lo_x > bx1 or hi_y < by0 or lo_y > by1:
+                continue
+            ring = self.polygons[k]
+            n = len(ring)
+            for i in range(n):
+                ax, ay = ring[i]
+                bx, by = ring[(i + 1) % n]
+                if _seg_crosses(x0, y0, x1, y1, ax, ay, bx, by):
+                    hits.append(k)
+                    break
+            else:
+                if _point_in_ring(x0, y0, ring):
+                    hits.append(k)
+        return frozenset(hits)
+
+    def polyline_entered(self, pts) -> frozenset:
+        """Union of `entered` over consecutive vertices of an open polyline."""
+        out: set = set()
+        for p, q in zip(pts, pts[1:]):
+            out |= self.entered(p[0], p[1], q[0], q[1])
+        return frozenset(out)
+
+
 def _frame(road_latlon: list) -> dict:
     """The ONE definition of the local equirectangular frame: origin = min(lat)/min(lon) over the
     ROAD way nodes, kx = 111320*cos(mean_lat), ky = 110540. Every layer that shares the map --
@@ -248,7 +440,8 @@ def road_projection(xml_text: str) -> dict:
 
 
 def osm_to_network(xml_text: str, max_nodes: int = 380, tol_m: float = 10.0, *,
-                   attrs: bool = False, signals: bool = False) -> tuple[list, list, dict]:
+                   attrs: bool = False, signals: bool = False,
+                   avoid_polygons: list | None = None) -> tuple[list, list, dict]:
     """OSM XML -> (nodes, edges, info) in custom-network form. Deterministic for a given input.
 
     Escalates simplification (higher tolerance, then dropping minor road classes) until the graph
@@ -263,6 +456,14 @@ def osm_to_network(xml_text: str, max_nodes: int = 380, tol_m: float = 10.0, *,
     unchanged except for that pinning (which only happens when `signals=True`), so the default call
     is byte-for-byte what it always was.
 
+    `avoid_polygons` (building rings in THIS extract's own projected frame, i.e. what
+    `extract_buildings` returns) switches simplification from `_rdp` to `_rdp_avoid`, which refuses
+    any chord that would move the road into a footprint the unsimplified way misses, and adds
+    `info["road_building_overlap"]`: the edges whose geometry still ends up inside a footprint, each
+    with the reason its OSM way gives (`tunnel=building_passage`, `covered=arcade`, ... -- see
+    `through_building_reason`) or `"untagged"`. Those are kept, never dropped: a road under an
+    arcade is real. Nodes and edges are byte-for-byte what they always were when this is None.
+
     `info["projection"]` carries the EXACT local equirectangular frame the road nodes were projected
     with, `{"lat0","lon0","kx","ky"}` -- and `info["road_bbox"]` the projected extent of the kept
     component. Any other layer derived from the same extract (buildings, POIs, ...) MUST reuse that
@@ -275,6 +476,8 @@ def osm_to_network(xml_text: str, max_nodes: int = 380, tol_m: float = 10.0, *,
     for nd in root.iter("node"):
         latlon[nd.get("id")] = (float(nd.get("lat")), float(nd.get("lon")))
     ways = []                                    # (class, speed_mps, [node ids], attrs|None)
+    way_passage: dict[str, str] = {}             # OSM way id -> "tunnel=building_passage" etc.
+    way_ids: list = []
     for way in root.iter("way"):
         tags = {t.get("k"): t.get("v") for t in way.findall("tag")}
         cls = tags.get("highway")
@@ -285,8 +488,14 @@ def osm_to_network(xml_text: str, max_nodes: int = 380, tol_m: float = 10.0, *,
             continue
         speed = _parse_maxspeed(tags.get("maxspeed")) or HIGHWAY_SPEED[cls]
         ways.append((cls, speed, refs, _way_attrs(tags, cls) if attrs else None))
+        wid = way.get("id")
+        way_ids.append(wid)
+        reason = through_building_reason(tags)
+        if reason:
+            way_passage[wid] = reason
     if not ways:
         raise ValueError("no drivable roads found in the OSM extract")
+    fpindex = FootprintIndex(avoid_polygons) if avoid_polygons else None
     # OSM nodes tagged as real traffic signals (opt-in: costs one extra tag scan over ~10^4 nodes)
     signal_refs: set[str] = set()
     if signals:
@@ -308,16 +517,16 @@ def osm_to_network(xml_text: str, max_nodes: int = 380, tol_m: float = 10.0, *,
 
     for attempt in range(len(_DROP_ORDER) + 1):
         dropped = set(_DROP_ORDER[:attempt])
-        use = [(c, s, r, a) for c, s, r, a in ways if c not in dropped]
+        use = [(c, s, r, a, w) for (c, s, r, a), w in zip(ways, way_ids) if c not in dropped]
         tol = tol_m * (1.0 + 0.5 * attempt)      # simplify harder as we escalate
         if not use:
             break
         # graph nodes = way endpoints + nodes shared between ways
         counts: dict[str, int] = {}
-        for _c, _s, refs, _a in use:
+        for _c, _s, refs, _a, _w in use:
             for r in set(refs):
                 counts[r] = counts.get(r, 0) + 1
-        keep = {r for _c, _s, refs, _a in use for r in (refs[0], refs[-1])}
+        keep = {r for _c, _s, refs, _a, _w in use for r in (refs[0], refs[-1])}
         keep |= {r for r, n in counts.items() if n >= 2}
         if signal_refs:                          # pin signalised junctions (opt-in, see docstring)
             keep |= {r for r in signal_refs if r in counts}
@@ -335,19 +544,31 @@ def osm_to_network(xml_text: str, max_nodes: int = 380, tol_m: float = 10.0, *,
             return k
 
         edge_attr: dict[tuple[int, int], dict] = {}
-        for _c, speed, refs, wattrs in use:
+        edge_way: dict[tuple[int, int], str] = {}
+        rdp_stats: dict = {"forced_splits": 0, "vertices_plain": 0, "vertices_kept": 0}
+        for _c, speed, refs, wattrs, wid in use:
             # split the way at graph nodes, RDP-simplify each chain, emit straight edges
             chain = [refs[0]]
             for r in refs[1:]:
                 chain.append(r)
                 if r in keep:
-                    pts = _rdp([xy(q) for q in chain], tol)
+                    raw = [xy(q) for q in chain]
+                    if fpindex is None:
+                        pts = _rdp(raw, tol)
+                    else:                        # registration-preserving simplification, see above
+                        pts = _rdp_avoid(raw, tol, fpindex, rdp_stats)
+                        rdp_stats["vertices_plain"] += len(_rdp(raw, tol))
+                        rdp_stats["vertices_kept"] += len(pts)
                     for p, q in zip(pts, pts[1:]):
                         a, b = nid(p), nid(q)
                         if a != b and math.dist(nodes[a], nodes[b]) >= 1.0:
                             k2 = (min(a, b), max(a, b))
                             prev = edges.get(k2)
                             edges[k2] = max(prev or 0.0, speed)
+                            # remember which OSM way put this edge here: the only thing that can
+                            # say whether an overlap it has is `tunnel=building_passage` truth
+                            if k2 not in edge_way or wid in way_passage:
+                                edge_way[k2] = wid
                             if wattrs is not None and (prev is None or speed > prev):
                                 # attrs follow the speed rule: parallel ways collapsing onto one
                                 # edge keep the faster way's attributes, deterministically
@@ -408,9 +629,81 @@ def osm_to_network(xml_text: str, max_nodes: int = 380, tol_m: float = 10.0, *,
                         sig.append(remap[k])
                 info["signal_nodes"] = sorted(set(sig))
                 info["signal_refs_found"] = len(signal_refs)
+            if fpindex is not None:
+                kept = [k for k in sorted(edges) if k[0] in remap and k[1] in remap]
+                info["road_building_overlap"] = _overlap_report(
+                    out_nodes, out_edges, kept, edge_way, way_passage, fpindex, rdp_stats)
             return out_nodes, out_edges, info
     raise ValueError(f"extract still exceeds {max_nodes} nodes after dropping "
                      f"{_DROP_ORDER}; use a smaller bbox")
+
+
+def _overlap_report(out_nodes: list, out_edges: list, kept_keys: list, edge_way: dict,
+                    way_passage: dict, index: "FootprintIndex", rdp_stats: dict) -> dict:
+    """Which emitted edges still lie inside a footprint, and does the OSM way say they should?
+
+    This is the "classify what is not a defect" half of the registration fix. After constrained
+    simplification the only edges left inside a building are the ones whose source geometry was
+    already there, so each is looked up against `through_building_reason` and reported with the tag
+    that justifies it -- or with `"untagged"`, which is the residue a reader should be suspicious of.
+    Nothing is deleted here; the report is data, not a filter.
+
+    `inside_m` is the length of the edge that is ACTUALLY inside a ring, measured by walking the
+    edge at `_OVERLAP_STEP_M` and testing containment -- not the edge's whole length. The difference
+    matters: an edge that clips a footprint corner for 40 cm and an edge that runs 20 m down an
+    archway both "enter a building", and only the second one is worth anyone's attention. An edge
+    with `inside_m == 0` is a sub-step graze and is counted separately as `n_edges_grazing`."""
+    through = []
+    for i, ((a, b, *_r), key) in enumerate(zip(out_edges, kept_keys)):
+        ax, ay = out_nodes[a]
+        bx, by = out_nodes[b]
+        rings = index.entered(ax, ay, bx, by)
+        if not rings:
+            continue
+        length = math.dist((ax, ay), (bx, by))
+        n = max(1, int(length / _OVERLAP_STEP_M))
+        inside = 0
+        for s in range(n + 1):
+            t = s / n
+            px, py = ax + t * (bx - ax), ay + t * (by - ay)
+            if any(_point_in_ring(px, py, index.polygons[k]) for k in rings):
+                inside += 1
+        wid = edge_way.get(key)
+        through.append({"edge": i, "a": a, "b": b, "length_m": round(length, 1),
+                        "inside_m": round(inside * length / n, 1),
+                        "footprints": len(rings), "way": wid, "_rings": rings,
+                        "reason": way_passage.get(wid, "untagged")})
+    # OSM splits a street into several ways where a tag changes, so the archway's footprint usually
+    # laps a few decimetres onto the UNTAGGED way next door. Inherit the neighbour's reason when the
+    # two edges share a graph node AND the same footprint -- otherwise "untagged" would name a stub
+    # of the very passage two rows above it, and stop meaning "nobody knows why this is here".
+    tagged = [t for t in through if t["reason"] != "untagged"]
+    for t in through:
+        if t["reason"] != "untagged":
+            continue
+        for s in tagged:
+            if {t["a"], t["b"]} & {s["a"], s["b"]} and (t["_rings"] & s["_rings"]):
+                t["reason"] = s["reason"]
+                t["via_way"] = s["way"]
+                break
+    for t in through:
+        t.pop("_rings", None)
+    real = [t for t in through if t["inside_m"] > 0.0]
+    tagged = sum(1 for t in real if t["reason"] != "untagged")
+    total_m = sum(math.dist(out_nodes[e[0]], out_nodes[e[1]]) for e in out_edges)
+    over_m = sum(t["inside_m"] for t in real)
+    return {"edges": through,
+            "n_edges_through_building": len(real),
+            "n_edges_grazing": len(through) - len(real),
+            "n_tagged_passage": tagged,
+            "n_untagged": len(real) - tagged,
+            "road_length_m": round(total_m, 1),
+            "road_length_through_building_m": round(over_m, 1),
+            "road_length_through_building_frac": round(over_m / total_m, 6) if total_m else 0.0,
+            "rdp_forced_splits": rdp_stats.get("forced_splits", 0),
+            "rdp_vertices_plain": rdp_stats.get("vertices_plain", 0),
+            "rdp_vertices_kept": rdp_stats.get("vertices_kept", 0),
+            "footprints_indexed": len(index.polygons)}
 
 
 def _directed_from_attrs(edges: list, edge_attrs: list) -> list:
@@ -556,6 +849,16 @@ def network_document(nodes: list, edges: list, info: dict | None = None, *,
             doc[key] = info[key]
     if buildings:
         doc["buildings"] = buildings
+    ov = info.get("road_building_overlap")
+    if ov and ov.get("edges"):
+        # REAL overlaps only (constrained simplification has already removed the artefacts, and a
+        # sub-step corner graze is not an overlap): undirected-edge indices whose geometry runs
+        # through a footprint, each with the OSM reason and how much of it is inside.
+        # Additive; a reader that predates the key sees exactly the document it saw before.
+        real = [{k: e[k] for k in ("edge", "reason", "inside_m", "via_way") if k in e}
+                for e in ov["edges"] if e["inside_m"] > 0.0]
+        if real:
+            doc["through_building_edges"] = real
     meta = info.get("network_meta")
     if meta:
         doc["network_meta"] = dict(meta, schema=NETWORK_SCHEMA_VERSION)
@@ -985,13 +1288,25 @@ def fetch_osm(bbox: tuple, cache_dir: str) -> str:
 
 def import_city(city_or_bbox, cache_dir: str, max_nodes: int = 380,
                 buildings: bool = False, *, attrs: bool = False,
-                signals: bool = False, footways: bool = False) -> tuple[list, list, dict]:
+                signals: bool = False, footways: bool = False,
+                building_aware_roads: bool = True) -> tuple[list, list, dict]:
     """City name (see CITY_BBOXES) or explicit bbox -> (nodes, edges, info).
 
     With `buildings=True` the SAME cached extract is re-read for `building=*` footprints, projected
     with the road graph's own projection tuple, and returned as `info["buildings"]` (a list of open
     rings in metres) plus `info["buildings_info"]`. No extra download: `fetch_osm` is cached and
-    Overpass `/api/map` already returned the footprints."""
+    Overpass `/api/map` already returned the footprints.
+
+    `building_aware_roads` (default on, and only reachable at all with `buildings=True`) then runs
+    the graph a SECOND time with those footprints as an `avoid_polygons` constraint, so that RDP
+    cannot chord a street through a building it does not really enter. This changes the imported
+    graph -- that is the point of it; the first pass is kept only to derive the projection and the
+    road bbox the footprints must be extracted with, which are both simplification-independent (the
+    frame comes from the raw way nodes). Set it False to reproduce a map imported before the fix.
+    `info["road_building_overlap"]` reports what survives, tagged with the OSM reason, and
+    `info["unconstrained"]` records the graph the first pass produced so the cost is visible. The
+    price is one extra parse of the cached XML on a `--buildings` import; there is no extra
+    download and nothing on the default (`buildings=False`) path changes at all."""
     if isinstance(city_or_bbox, str):
         if city_or_bbox not in CITY_BBOXES:
             raise ValueError(f"unknown city {city_or_bbox!r}; have {sorted(CITY_BBOXES)} "
@@ -1014,6 +1329,24 @@ def import_city(city_or_bbox, cache_dir: str, max_nodes: int = 380,
                                 "signal_nodes": len(info.get("signal_nodes", []))}
     if buildings:
         polys, binfo = extract_buildings(xml_text, info["projection"], info["road_bbox"])
+        if building_aware_roads and polys:
+            # SECOND pass, constrained. The frame is derived from the raw road way nodes and is
+            # therefore identical between the passes, so the footprints stay registered; only the
+            # road vertices move (back to where the OSM way actually runs).
+            nodes, edges, info2 = osm_to_network(xml_text, max_nodes=max_nodes, attrs=attrs,
+                                                 signals=signals, avoid_polygons=polys)
+            info2["bbox"] = list(bbox)
+            if "network_meta" in info:
+                info2["network_meta"] = dict(info["network_meta"],
+                                             projection=info2["projection"],
+                                             road_bbox=info2["road_bbox"],
+                                             signal_nodes=len(info2.get("signal_nodes", [])),
+                                             building_aware_roads=True)
+            info2["unconstrained"] = {"kept_nodes": info["kept_nodes"],
+                                      "kept_edges": info["kept_edges"],
+                                      "rdp_tol_m": info["rdp_tol_m"],
+                                      "dropped_classes": info["dropped_classes"]}
+            info = info2
         info["buildings"] = polys
         info["buildings_info"] = binfo
     if footways:
@@ -1035,6 +1368,10 @@ def main(argv=None) -> int:
     p.add_argument("--buildings", action="store_true",
                    help="also extract building=* footprints from the same cached extract and "
                         "persist them beside the graph (consumed by radio_model=geometric)")
+    p.add_argument("--no-building-aware-roads", action="store_true",
+                   help="with --buildings: do NOT constrain RDP against the footprints. Reproduces "
+                        "a map imported before the registration fix (which put 3.48 pp of the "
+                        "Ingolstadt road length inside buildings the real ways never enter)")
     p.add_argument("--attrs", action="store_true",
                    help="keep oneway/lanes/roundabout/turn-lane tags -> directed_edges in the "
                         "output document (undirected edges stay for backward compatibility)")
@@ -1060,7 +1397,8 @@ def main(argv=None) -> int:
     if not a.out:
         p.error("--out is required (or use --tag-stats / --ped-stats)")
     nodes, edges, info = import_city(target, a.cache, max_nodes=a.max_nodes, buildings=a.buildings,
-                                     attrs=a.attrs, signals=a.signals, footways=a.footways)
+                                     attrs=a.attrs, signals=a.signals, footways=a.footways,
+                                     building_aware_roads=not a.no_building_aware_roads)
     doc = network_document(nodes, edges, info,
                            buildings=info.get("buildings") if a.buildings else None)
     if a.footways:
@@ -1070,6 +1408,9 @@ def main(argv=None) -> int:
         json.dump(doc, fh)
     shown = {k: v for k, v in info.items()
              if k not in ("buildings", "directed_edges", "edge_attrs", "footways", "crossings")}
+    if "road_building_overlap" in shown:         # the edge list is data for the document, not print
+        shown["road_building_overlap"] = {k: v for k, v in shown["road_building_overlap"].items()
+                                          if k != "edges"}
     print(f"wrote {a.out}: {shown}")
     return 0
 
