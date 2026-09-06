@@ -553,3 +553,64 @@ def test_sample_hits_the_counts_and_records_a_reproducible_invocation(tmp_path):
     # the recorded argv is the reproduction recipe: it must actually run
     r = subprocess.run([sys.executable] + meta["argv"], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-2000:]
+
+
+def test_sample_can_attach_vtype_params_without_changing_the_default(tmp_path):
+    """The default vType must stay byte-identical to the one every published result used."""
+    cands = tmp_path / "c.rou.xml"
+    cands.write_text('<routes>'
+                     + "".join(f'<route id="r{i}" edges="A B"/>' for i in range(20))
+                     + "</routes>", encoding="utf-8")
+    tgt = tmp_path / "t.edg.xml"
+    tgt.write_text('<data><interval id="c" begin="0" end="3600">'
+                   '<edge id="A" entered="10"/><edge id="B" entered="10"/>'
+                   "</interval></data>", encoding="utf-8")
+    plain = tmp_path / "plain.rou.xml"
+    cd.main(["sample", "--candidates", str(cands), "--targets", str(tgt), "--out", str(plain),
+             "--begin", "0", "--end", "3600", "--interval", "3600", "--seed", "7"])
+    assert '<vType id="calib_car" vClass="passenger"/>' in plain.read_text(encoding="utf-8")
+
+    withp = tmp_path / "withp.rou.xml"
+    cd.main(["sample", "--candidates", str(cands), "--targets", str(tgt), "--out", str(withp),
+             "--begin", "0", "--end", "3600", "--interval", "3600", "--seed", "7",
+             "--vtype-param", "junctionModel.ignoreIDs=1"])
+    txt = withp.read_text(encoding="utf-8")
+    assert '<param key="junctionModel.ignoreIDs" value="1"/>' in txt
+    assert "</vType>" in txt
+    meta = json.loads((tmp_path / "withp.rou.meta.json").read_text(encoding="utf-8"))
+    assert meta["vtype"]["params"] == {"junctionModel.ignoreIDs": "1"}
+
+
+def test_scenario_execute_assigned_routes_stops_sumo_replacing_the_calibrated_routes(tmp_path):
+    """routeSampler's product is a FIXED route set.
+
+    InTAS runs device.rerouting.probability 0.82, so SUMO replaces that route for 82 % of
+    vehicles -- once before insertion (pre-period, 60 s by default) and then every 300 s.
+    The opt-in calibrated cfg must be able to switch that off without touching InTAS's own.
+    """
+    src = tmp_path / "InTAS_buildings.sumocfg"
+    src.write_text(
+        "<configuration>\n\t<input>\n\t\t<net-file value=\"n.net.xml\"/>\n"
+        "\t\t<route-files value=\"routes/ped.rou.xml\"/>\n\t</input>\n"
+        "\t<routing>\n\t\t<device.rerouting.probability value=\"0.82\"/>\n"
+        "\t\t<device.rerouting.period value=\"300\"/>\n\t</routing>\n"
+        "</configuration>\n", encoding="utf-8")
+    before = src.read_text(encoding="utf-8")
+    rou = tmp_path / "cal.rou.xml"
+    rou.write_text("<routes/>", encoding="utf-8")
+
+    cd.main(["scenario", "--sumocfg", str(src), "--routes", str(rou),
+             "--keep-routes", "routes/ped.rou.xml", "--name", "cal.sumocfg",
+             "--execute-assigned-routes"])
+    out = (tmp_path / "cal.sumocfg").read_text(encoding="utf-8")
+    assert '<device.rerouting.period value="0"/>' in out
+    assert '<device.rerouting.pre-period value="0"/>' in out
+    # the shipped probability is left alone: the device stays attached, it just never reroutes
+    assert '<device.rerouting.probability value="0.82"/>' in out
+    assert src.read_text(encoding="utf-8") == before      # InTAS's own cfg untouched
+
+    cd.main(["scenario", "--sumocfg", str(src), "--routes", str(rou),
+             "--keep-routes", "routes/ped.rou.xml", "--name", "plain.sumocfg"])
+    plain = (tmp_path / "plain.sumocfg").read_text(encoding="utf-8")
+    assert '<device.rerouting.period value="300"/>' in plain      # opt-in, not the default
+    assert "pre-period" not in plain

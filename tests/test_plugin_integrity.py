@@ -504,9 +504,14 @@ def test_an_import_time_attack_is_caught_too(tp, tmp_path):
     sys.modules.pop("ti_importtime", None)           # module-level code runs ONCE per process
     with pytest.raises(ConfigError) as e:
         _run(tmp_path, "a7", plugins={"channel_model": {"ref": "ti_importtime:ImportTimeRebind"}})
-    # `validate_config` is what resolves (and therefore imports) the ref, so the checkpoint that
-    # catches this is the one taken before validation -- the FIRST statement of `run_pipeline`.
-    assert "INTEGRITY FAILURE while RESOLVING the declared plugins" in str(e.value)
+    # The checkpoint that catches it is now `registry.resolve`'s OWN bracket, taken immediately
+    # around `importlib.import_module` rather than around the whole of `validate_config`. Tighter,
+    # and the difference is not cosmetic: `resolve` is reached by callers that take no baseline of
+    # their own (`verify_lock` on a manifest replay, `--check-config`, `--verify-plugins`, the GUI's
+    # validation pass), and on a replay `config_from_dict` resolves BEFORE `run_pipeline` snapshots,
+    # so a tamper caught only by the outer checkpoint had already poisoned that snapshot.
+    assert "INTEGRITY FAILURE while IMPORTING the channel_model plugin" in str(e.value)
+    assert "ti_importtime:ImportTimeRebind" in str(e.value)
     assert "random.Random" in str(e.value)
     assert not _manifest_exists(tmp_path, "a7")
 

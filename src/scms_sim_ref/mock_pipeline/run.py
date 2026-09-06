@@ -54,6 +54,7 @@ from ..api import codec as _api_codec
 from ..api import detect as _api_detect
 from ..api import profile as _api_profile
 from ..api import report as _api_report
+from ..api import guard as _pguard
 from ..api import integrity as _integrity
 from ..api import isolate as _isolate
 from ..api import srcgate as _srcgate
@@ -331,7 +332,20 @@ PHY_FRAME_AIRTIME_S = (712.0 + 207.5) * 1e-6
 
 # Implementation tunables of the geometry (not standards constants).
 GEO_BUILDING_CELL_M = 3.0            # occupancy-raster resolution for the NLOSb blockage test
-GEO_BUILDING_MAX_CELLS = 6_000_000   # auto-coarsen the raster rather than blow up memory
+GEO_BUILDING_MAX_CELLS = 32_000_000  # auto-coarsen the raster rather than blow up memory. One cell
+                                     # is ONE BYTE, so this ceiling is 32 MB; it was 6 000 000,
+                                     # which the 2 km^2 OSM extract (0.22 M cells) never came near
+                                     # but the whole 66 km^2 city does -- InTAS needs 7.41 M cells at
+                                     # 3 m and would have been silently coarsened to 6 m, i.e. the
+                                     # full-city scene would have been classified at HALF the
+                                     # extract's resolution and the comparison between them would
+                                     # not have been like-for-like. MEASURED on InTAS: 6 m instead
+                                     # of 3 m moves NLOSb at 200 m from 0.2471 to 0.3170 and the
+                                     # 0.90-awareness-equivalent range from 338.5 m to 304.7 m --
+                                     # and 304.7 m is, to 0.7%, the 306.8 m that
+                                     # CROSS-ENGINE-RADIO.md attributes to "the Python instrument on
+                                     # MOSAIC's scene", which is how we know that column was
+                                     # silently measured at 6 m (docs/realism/FULL-CITY-SCENE.md).
 GEO_VEHICLE_CELL_M = 25.0            # uniform grid over vehicle blockers for the NLOSv test
 GEO_BLOCKER_HALF_WIDTH_M = 1.0       # a vehicle body blocks the LOS line within this lateral offset
 GEO_ENDPOINT_CLEAR_M = 6.0           # ignore raster hits this close to either antenna: the road
@@ -1094,7 +1108,44 @@ def _channel_env(cfg, buildings, dt):
 
 
 #: Keys a `plugins.channel_model` section may carry. Closed so a typo is an error, not a no-op.
-_CHANNEL_SECTION_KEYS = frozenset({"ref", "params", "conformance"})
+_CHANNEL_SECTION_KEYS = frozenset({"ref", "params", "conformance", "source_gate"})
+
+
+def _slot_source_gate(cfg, slot: str) -> str:
+    """`plugins.<slot>.source_gate` for the single-object slots, defaulting to "on".
+
+    Same key, same two values and the same meaning the `check` / `fusion` arrays already give it,
+    extended to the slots that take ONE plugin. "off" is the explicit, RECORDED opt-out for code the
+    user wrote or audited: it turns off the runtime plugin guard
+    (:mod:`~scms_sim_ref.api.guard`) for that slot, and because it lives in `cfg.plugins` it is
+    serialised verbatim into `manifest["config"]` and replays.
+    """
+    sel = (getattr(cfg, "plugins", None) or {}).get(slot)
+    if not isinstance(sel, dict):
+        return _srcgate.DEFAULT_MODE
+    return _srcgate.check_mode(sel.get("source_gate", _srcgate.DEFAULT_MODE),
+                               f"plugins.{slot}.source_gate")
+
+
+def _guard_label(cfg, slot: str, ref: str, builtin: bool):
+    """The label a plugin call is guarded under, or None for "do not guard".
+
+    None for a BUILT-IN (it is the engine; guarding it would refuse the engine's own `legacy_rng`
+    capability and buy nothing) and for a slot whose `source_gate` the config turned off.
+    `guard.guarded(fn, None)` returns `fn` itself, so both cases pay not even a wrapper frame.
+    """
+    if builtin or _slot_source_gate(cfg, slot) == "off":
+        return None
+    return f"plugins.{slot} {ref!r}"
+
+
+def _obj_guard_label(cfg, slot: str, obj):
+    """:func:`_guard_label` for an already-constructed single-object plugin (codec / profile /
+    report format), which the engine holds as an INSTANCE rather than as a ref."""
+    if obj is None:
+        return None
+    cls = obj if isinstance(obj, type) else type(obj)
+    return _guard_label(cfg, slot, cls.__name__, _api_registry.is_builtin(slot, cls))
 
 #: `plugins.<slot>.conformance`: "off" (default, and the only zero-cost setting) or "required".
 CONFORMANCE_MODES = ("off", "required")
@@ -1283,8 +1334,15 @@ def build_channel(cfg, buildings=None, dt: float = 1.0):
     # flowed straight into the MA-visible dataset as evidence. Built-ins are exempt: the pinned
     # goldens grade them, and this is a call per delivered link on a ~10^7-link loop.
     _validate = (how != "builtin")
-    chan = (_api_channel.BatchAdapter(model, rng_ns, _validate) if shape == "batch"
-            else PerLinkAdapter(model, rng_ns, _validate))
+    # THE RUNTIME PLUGIN GUARD, on the same third-party/built-in line `validate` draws. The adapters
+    # route every model-facing call through `guard.guarded`, which refuses `sys._getframe` and the
+    # other reflective routes into THIS loop's frame from inside CPython -- the half a static source
+    # scan cannot do, because `getattr(sys, "_get"+"frame")` defeats a name match and reaches the
+    # same C function. See api/guard.py for what it is and, more importantly, what it is not.
+    _glabel = _guard_label(cfg, "channel_model", ref, how == "builtin")
+    chan = (_api_channel.BatchAdapter(model, rng_ns, _validate, guard_label=_glabel)
+            if shape == "batch"
+            else PerLinkAdapter(model, rng_ns, _validate, guard_label=_glabel))
 
     def _provenance():
         # Built AT THE END of the run, not here: `declared_streams` is the set of stream labels the
@@ -1314,7 +1372,7 @@ def build_channel(cfg, buildings=None, dt: float = 1.0):
 # ran by default would encode every frame of every run -- and the whole point of the empty default
 # is that the pinned digests are reachable at ZERO cost, not merely at equal output.
 # --------------------------------------------------------------------------- #
-_CODEC_SECTION_KEYS = frozenset({"ref", "params", "conformance"})
+_CODEC_SECTION_KEYS = frozenset({"ref", "params", "conformance", "source_gate"})
 
 
 def _codec_selection(cfg):
@@ -1412,7 +1470,7 @@ def build_codec(cfg):
 # through a profile method. That is the test of whether the seam is real -- delete the built-in and
 # the engine still runs whatever profile the config names.
 # --------------------------------------------------------------------------- #
-_PROFILE_SECTION_KEYS = frozenset({"ref", "params", "conformance"})
+_PROFILE_SECTION_KEYS = frozenset({"ref", "params", "conformance", "source_gate"})
 
 #: The BUILT-IN profile synthesised from the layer flags when no profile is declared.
 DEFAULT_PROTOCOL_PROFILE = "etsi_its_g5"
@@ -1530,7 +1588,7 @@ def build_profile(cfg, codec):
 # --------------------------------------------------------------------------- #
 # The REPORT-FORMAT seam (api/report.py) -- the slot that was registered and EMPTY
 # --------------------------------------------------------------------------- #
-_REPORT_SECTION_KEYS = frozenset({"ref", "params", "conformance"})
+_REPORT_SECTION_KEYS = frozenset({"ref", "params", "conformance", "source_gate"})
 
 
 def _report_format_selection(cfg):
@@ -1591,16 +1649,41 @@ class WireEncoder:
     TS 103 759 `v2xPduEvidence` entry would carry into a report.
     """
 
-    __slots__ = ("codec", "signer", "_views", "_frame", "bytes_by_type", "count_by_type", "_sizer")
+    __slots__ = ("codec", "signer", "_views", "_frame", "bytes_by_type", "count_by_type", "_sizer",
+                 "_encode", "_envelope", "_decoders", "_probed", "_wire_size_capability")
 
-    def __init__(self, codec, signer: str = "digest", frame=None, epoch_unix=None, sizer=None):
+    def __init__(self, codec, signer: str = "digest", frame=None, epoch_unix=None, sizer=None,
+                 guard_label=None):
         self.codec = codec
         self.signer = signer
         #: WHO OWNS THE FRAME LENGTH. The profile does, when there is one: `wire_size_bytes` is
         #: where the security envelope is accounted for, and accounting for it in two places is how
         #: a CBR estimate silently ends up counting the certificate twice or not at all. With no
         #: profile the codec answers directly, which is what every run before the seam did.
-        self._sizer = sizer if sizer is not None else codec.wire_size_bytes
+        # A `sizer` handed in has already been guarded under the PROFILE's gate by the caller;
+        # wrapping it again here would only add a frame.
+        self._sizer = (sizer if sizer is not None
+                       else _pguard.guarded(codec.wire_size_bytes, guard_label))
+        self._encode = _pguard.guarded(codec.evidence_pdu, guard_label)
+        #: WIRE-SIZE HONESTY (see `_check_wire`). `(msg_type, signer) -> size - len(pdu)`, filled on
+        #: the first frame of each kind and asserted on every later one, but ONLY for a codec that
+        #: DECLARES `wire_size` -- the capability whose published meaning is "wire_size_bytes() is
+        #: derived from a real encode, not a constant". A codec that does not declare it is saying
+        #: its length is a MODELLED number (the `native_v1` profile deliberately charges the
+        #: engine's legacy 300 B), and holding a declared constant to the length of its own payload
+        #: would be refusing the thing it declared.
+        self._envelope: dict = {}
+        try:
+            caps = frozenset(codec.capabilities())
+        except Exception:                                       # pragma: no cover - hostile codec
+            caps = frozenset()
+        self._wire_size_capability = _api_codec.CAP_WIRE_SIZE in caps
+        #: `msg_type -> decode_<msg_type>`, for the round-trip probe. Absent decoders simply mean
+        #: that PDU type is not probed; `decode_cam` is the only one `CODEC_SPEC` requires.
+        self._decoders = {mt: _pguard.guarded(getattr(codec, f"decode_{mt}"), guard_label)
+                          for mt in ("cam", "denm", "vam")
+                          if getattr(codec, f"decode_{mt}", None) is not None}
+        self._probed: dict = {}
         f = frame if frame is not None else getattr(codec, "frame", _api_codec.DEFAULT_FRAME)
         e = epoch_unix if epoch_unix is not None else getattr(
             codec, "epoch_unix", _api_codec.DEFAULT_EPOCH_UNIX)
@@ -1653,11 +1736,115 @@ class WireEncoder:
         mt = self.wire_msg_type(b)
         claim = self.claim_for(b, mt)
         view = self._views["rsu" if b["veh"].is_rsu else "vehicle"]
-        pdu = self.codec.evidence_pdu(claim, view)
+        pdu = self._encode(claim, view)
         size = int(self._sizer(claim, self.signer))
-        self.bytes_by_type[mt] = self.bytes_by_type.get(mt, 0) + len(pdu)
+        n = self._check_wire(mt, pdu, size, claim, view)
+        self.bytes_by_type[mt] = self.bytes_by_type.get(mt, 0) + n
         self.count_by_type[mt] = self.count_by_type.get(mt, 0) + 1
         return pdu, size, claim
+
+    #: Frame lengths outside this band are refused rather than charged. A 802.11p MPDU cannot
+    #: exceed 4095 octets and an ITS-G5 CAM is a few hundred; the conformance suite (C.protocol)
+    #: already asserts the same `(0, 8192]` band against `wire_size_bytes` at LOAD time, and this is
+    #: the same statement made on every message of the run instead of once on a sample.
+    MAX_WIRE_BYTES = 8192
+
+    #: How often the emitted PDU is decoded back. The first frame of each PDU TYPE plus every
+    #: `DECODE_PROBE_EVERY`-th frame of it, so the probe is a deterministic function of the message
+    #: index and cannot depend on a clock, a thread or a codec's own state.
+    DECODE_PROBE_EVERY = 4096
+
+    #: How far a decoded position may sit from the encoded claim. ETSI's 1/10-microdegree grid is
+    #: ~1 cm; this is loose enough that a lossy but honest profile passes and tight enough that a
+    #: PDU which does not carry the claim at all cannot.
+    DECODE_TOLERANCE_M = 5.0
+
+    def _check_wire(self, mt: str, pdu, size: int, claim, view) -> int:
+        """Refuse a codec whose declared frame length or emitted PDU is not what it says it is.
+
+        THE DEFECT. `wire_size_bytes` was taken verbatim and fed straight into airtime -> CBR ->
+        collision -> latency -> `detection_time` -> `data_digest`, with nothing checking it against
+        the octets the same codec had just produced; and `evidence_pdu` was written into the dataset
+        (and into a TS 103 759 `v2xPduEvidence` entry) without ever being decoded. A codec reporting
+        fabricated sizes therefore produced three different datasets from one config, and a 4-byte
+        blob that decodes to nothing was recorded as evidence. Both are ARITHMETIC the engine can do
+        itself, so both are done here rather than trusted:
+
+        1. **shape** -- the PDU is real octets and the size is an int in `(0, MAX_WIRE_BYTES]`.
+        2. **envelope consistency** -- for a codec DECLARING `wire_size` ("derived from a real
+           encode"), `size - len(pdu)` is the security envelope and must be non-negative and the
+           same for every frame of one `(msg_type, signer)`. Fabricating a length then means
+           fabricating the payload to match it, which is what check 3 is for.
+        3. **the PDU decodes back to the claim it was made from**, on a deterministic sample.
+
+        Returns the PDU length, which the caller was going to compute anyway.
+        """
+        if not isinstance(pdu, (bytes, bytearray)):
+            raise ConfigError(
+                f"message codec {type(self.codec).__name__}: evidence_pdu() returned "
+                f"{type(pdu).__name__}, not octets. These bytes are what a TS 103 759 "
+                f"v2xPduEvidence entry carries and what the dataset records as evidence.")
+        n = len(pdu)
+        if not 0 < n <= self.MAX_WIRE_BYTES:
+            raise ConfigError(
+                f"message codec {type(self.codec).__name__}: evidence_pdu() returned {n} octets for "
+                f"a {mt}, outside (0, {self.MAX_WIRE_BYTES}]")
+        if not 0 < size <= self.MAX_WIRE_BYTES:
+            raise ConfigError(
+                f"message codec {type(self.codec).__name__}: wire_size_bytes(..., "
+                f"{self.signer!r}) = {size} for a {mt}, outside (0, {self.MAX_WIRE_BYTES}]. This "
+                f"number is charged to airtime -> CBR -> collision loss -> latency -> "
+                f"detection_time and reaches data_digest.")
+        if self._wire_size_capability:
+            delta = size - n
+            key = (mt, self.signer)
+            known = self._envelope.get(key)
+            if known is None:
+                if delta < 0:
+                    raise ConfigError(
+                        f"message codec {type(self.codec).__name__} declares the {_api_codec.CAP_WIRE_SIZE!r} "
+                        f"capability -- 'wire_size_bytes() is derived from a real encode' -- but "
+                        f"charges {size} B for a {mt} whose own encoded PDU is {n} B. A frame "
+                        f"cannot be shorter than the payload it carries.")
+                self._envelope[key] = delta
+            elif delta != known:
+                raise ConfigError(
+                    f"message codec {type(self.codec).__name__} declares "
+                    f"{_api_codec.CAP_WIRE_SIZE!r}, so wire_size_bytes() minus the encoded payload "
+                    f"is the security envelope for signer {self.signer!r} and is a CONSTANT. It was "
+                    f"{known} B and is now {delta} B for a {mt} ({size} B charged, {n} B encoded). "
+                    f"A declared-from-the-encoder length that does not track the encoder is a "
+                    f"fabricated CBR.")
+        seen = self._probed.get(mt, 0)
+        self._probed[mt] = seen + 1
+        if seen == 0 or seen % self.DECODE_PROBE_EVERY == 0:
+            self._probe_decode(mt, pdu, claim, seen)
+        return n
+
+    def _probe_decode(self, mt: str, pdu, claim, index: int) -> None:
+        """Decode one emitted PDU and check it still carries the claim it was built from."""
+        decode = self._decoders.get(mt)
+        if decode is None:
+            return                                     # no decoder for this PDU type: nothing to say
+        try:
+            back = decode(bytes(pdu))
+        except NotImplementedError:
+            return                                     # a codec that declares no decoder for it
+        except Exception as e:
+            raise ConfigError(
+                f"message codec {type(self.codec).__name__}: the {mt.upper()} it emitted does not "
+                f"decode -- decode_{mt}() raised {type(e).__name__}: {e}. These octets are written "
+                f"into the dataset as evidence and would go into a TS 103 759 v2xPduEvidence entry; "
+                f"a PDU nobody can decode is not evidence, and the length charged for it is not a "
+                f"frame length. (probe at {mt} #{index})") from None
+        dx = float(getattr(back, "x", float("nan"))) - float(claim.x)
+        dy = float(getattr(back, "y", float("nan"))) - float(claim.y)
+        if not (abs(dx) <= self.DECODE_TOLERANCE_M and abs(dy) <= self.DECODE_TOLERANCE_M):
+            raise ConfigError(
+                f"message codec {type(self.codec).__name__}: the {mt.upper()} it emitted decodes to "
+                f"a position {dx:+.1f}, {dy:+.1f} m from the claim it was encoded from (tolerance "
+                f"{self.DECODE_TOLERANCE_M} m). The emitted octets are what the dataset records as "
+                f"evidence, so they have to be the message. (probe at {mt} #{index})")
 
     def size_for(self, claim, signer: str) -> int:
         """Frame length for a claim under a GIVEN signer arm.
@@ -1896,11 +2083,16 @@ class LoadedCheck:
     """One resolved, constructed check plus everything the engine needs to run and record it."""
 
     __slots__ = ("ref", "instance", "column", "plugin_id", "builtin", "soft", "precision",
-                 "msg_types", "vru_suppressed", "params", "rng", "provenance", "isolated")
+                 "msg_types", "vru_suppressed", "params", "rng", "provenance", "isolated",
+                 "guard_label")
 
     def __init__(self, ref, instance, column, plugin_id, builtin, params, rng, provenance,
-                 isolated=False):
+                 isolated=False, guard_label=None):
         self.ref, self.instance, self.column = ref, instance, column
+        #: The label this check's `evaluate` is guarded under, or None for "not guarded" -- a
+        #: built-in, an isolated worker (it has no code in this process to guard) or a plugin whose
+        #: `source_gate` the config explicitly turned off. See `_guard_label`.
+        self.guard_label = guard_label
         self.plugin_id, self.builtin = plugin_id, builtin
         #: True when `instance` is an `api.isolate.IsolatedCheck` -- a proxy for a plugin running in
         #: its own interpreter. It answers `evaluate(obs, state, params, rng)` exactly as an
@@ -1931,11 +2123,15 @@ class CheckSuite:
     __slots__ = ("checks", "fusion", "fusion_params", "fusion_rng", "fusion_ref", "keys",
                  "soft_keys", "columns", "zero", "cam_plan", "denm_plan", "vru_suppressed",
                  "sig_column", "sig_suppressed", "third_party", "fusion_wrap", "_prov",
-                 "workers", "isolated")
+                 "workers", "isolated", "fusion_guard")
 
     def __init__(self, checks, fusion, fusion_params, fusion_rng, fusion_ref, prov,
-                 *, fusion_builtin=True, fusion_pid=None, workers=()):
+                 *, fusion_builtin=True, fusion_pid=None, workers=(), fusion_guard=None):
         self.checks = tuple(checks)
+        #: The label a THIRD-PARTY fusion's `decide` is guarded under, or None. The fusion sees the
+        #: same caller frame the checks do, one call later, so gating only the check slot would
+        #: leave the identical vector open.
+        self.fusion_guard = fusion_guard
         #: Live `api.isolate.IsolatedCheck` workers, in load order. `close()` reaps them; the child
         #: also exits on EOF of its stdin, so a parent that dies without reaching `close()` still
         #: leaves nothing behind.
@@ -1986,7 +2182,11 @@ class CheckSuite:
             # extract `state["plugin:<id>"]`, ship it and put it back regardless, so wrapping the
             # dict here would only build a `NamespacedState` for the proxy to immediately unwrap.
             wrap = None if (c.builtin or getattr(c, "isolated", False)) else c.plugin_id
-            plan.append((c.column, c.instance.evaluate, c.params, c.rng, wrap, c.precision))
+            # THE RUNTIME GUARD IS BOUND INTO THE CALL PLAN, once per run, so the hot loop calls the
+            # guarded bound method directly and a built-in's entry is the raw bound method it always
+            # was (`guarded(fn, None) is fn`). Measured cost on the guarded path: ~100 ns per call.
+            plan.append((c.column, _pguard.guarded(c.instance.evaluate, c.guard_label),
+                         c.params, c.rng, wrap, c.precision))
         return tuple(plan)
 
     def begin_step(self, step: int) -> None:
@@ -2071,7 +2271,9 @@ def _build_checks(cfg, loaded, prov, columns, workers, *, station_types: bool,
         # with a built-in's or with a future standardised name. The namespaced string is ALSO the
         # reason code that lands in `reason_codes`, so the collision-freedom is end-to-end.
         column = _claim_column(columns, ref, order, pid, code, builtin)
-        loaded.append(LoadedCheck(ref, inst, column, pid, builtin, params, rng_ns, None))
+        loaded.append(LoadedCheck(ref, inst, column, pid, builtin, params, rng_ns, None,
+                                  guard_label=(None if (builtin or sgate == "off")
+                                               else f"plugins.check {ref!r}")))
         prov.append(_check_provenance("check", order, ref, cls, how, iv, caps, rng_ns, params,
                                       conformance=attested))
     fref, fdeclared, fsgate = _fusion_selection(cfg)
@@ -2102,7 +2304,9 @@ def _build_checks(cfg, loaded, prov, columns, workers, *, station_types: bool,
     fcaps = _api_registry.check_capabilities("fusion", fref, fcls, fhow, fusion.capabilities())
     fprov = _check_provenance("fusion", 0, fref, fcls, fhow, fiv, fcaps, frng, fparams)
     return CheckSuite(loaded, fusion, fparams, frng, fref, prov + [fprov],
-                      fusion_builtin=fbuiltin, fusion_pid=fpid, workers=workers)
+                      fusion_builtin=fbuiltin, fusion_pid=fpid, workers=workers,
+                      fusion_guard=(None if (fbuiltin or fsgate == "off")
+                                    else f"plugins.fusion {fref!r}"))
 
 
 def _load_isolated_check(cfg, order, ref, declared, mode, sgate, columns, prov, workers):
@@ -2703,6 +2907,17 @@ class PipelineConfig:
                                          # for THIS city, i.e. the exact (lat0, lon0, kx, ky) tuple
                                          # derived from that extract's ROAD ways. Empty = keep the
                                          # net's own metric coordinates (procedural nets).
+    sumo_buildings: str = ""             # road_network="sumo": a SUMO polygon additional-file
+                                         # (e.g. InTAS's buildings.poly.xml) whose type="building"
+                                         # footprints become the geometric channel's NLOSb geometry.
+                                         # THE SCENE IS THE MAP PLUS ITS BUILDINGS: without this the
+                                         # whole-city path has roads and no footprints and falls back
+                                         # to the synthetic canyon density, which is exactly the
+                                         # comparison CROSS-ENGINE-RADIO.md says not to make. The
+                                         # polygons go through the SAME netimport transform the
+                                         # junctions did and are GATED on landing on them
+                                         # (netimport._assert_buildings_aligned). Empty = no
+                                         # footprints, byte-identical to before.
     sumo_trace: str = ""                 # mobility_source="sumo_replay": the frozen artifact
     sumo_trace_sha256: str = ""          # its sha256. FILLED IN by validate_config and therefore
                                          # recorded in manifest["config"], so a re-frozen trajectory
@@ -3698,6 +3913,14 @@ def _validate_mobility(cfg) -> None:
     if cfg.sumo_frame_city and cfg.road_network != "sumo":
         raise ValueError("sumo_frame_city needs road_network='sumo': it selects the projection "
                          "frame the .net.xml is re-projected into")
+    if cfg.sumo_buildings:
+        if cfg.road_network != "sumo":
+            raise ValueError(f"sumo_buildings needs road_network='sumo' (got "
+                             f"{cfg.road_network!r}): the footprints are projected with THAT net's "
+                             f"transform and gated against ITS junctions. A custom-network map "
+                             f"carries its own polygons in the document's 'buildings' layer.")
+        if not os.path.exists(cfg.sumo_buildings):
+            raise ValueError(f"sumo_buildings not found: {cfg.sumo_buildings!r}")
     if cfg.sumo_cert_slack_s < 0:
         raise ValueError(f"sumo_cert_slack_s must be >= 0 (got {cfg.sumo_cert_slack_s})")
     if cfg.sumo_offroad_p95_max_m <= 0:
@@ -3777,6 +4000,7 @@ def _validate_plugins(cfg) -> None:
     _validate_codec_plugin(cfg)
     ref, params = _channel_selection(cfg)
     _channel_conformance(cfg)          # reject a bad `conformance` mode HERE, not at step 0
+    _slot_source_gate(cfg, "channel_model")        # ...and a bad `source_gate` for the same reason
     cls, how, _iv, _shape = _api_registry.resolve("channel_model", ref)
     spec = _plugin_config_fields(cls)
     for k, v in sorted(params.items()):
@@ -3813,6 +4037,7 @@ def _validate_codec_plugin(cfg) -> None:
     if not ref:
         return
     _codec_conformance(cfg)
+    _slot_source_gate(cfg, "message_codec")
     cls, _how, _iv, _shape = _api_registry.resolve("message_codec", ref)
     spec = _plugin_config_fields(cls)
     for k, v in sorted(params.items()):
@@ -3840,6 +4065,10 @@ def _validate_slot_plugin(cfg, slot: str, keys: frozenset, enum_field: str) -> N
     if not ref:
         return
     _slot_conformance(cfg, slot)
+    # `source_gate` is validated at CONFIG time for the same reason `conformance` is: a typo in a
+    # key that decides whether the runtime plugin guard is armed must be an error the GUI and
+    # `--check-config` refuse, not a silent default.
+    _slot_source_gate(cfg, slot)
     cls, _how, _iv, _shape = _api_registry.resolve(slot, ref)
     spec = _plugin_config_fields(cls)
     for k, v in sorted(params.items()):
@@ -3927,7 +4156,7 @@ def _field_group(name: str) -> str:
         ("Network", ("road_network", "grid", "custom_network", "traffic_lights", "light_cycle",
                      "real_signals", "sidewalks", "sidewalk_width", "kerb_clearance",
                      "arterial", "local_speed", "directed_lanes", "drive_side",
-                     "sumo_net", "sumo_frame_city")),
+                     "sumo_net", "sumo_frame_city", "sumo_buildings")),
         ("Scenario events", ("events",)),
         ("Plugins", ("plugins",)),
         ("Protocol", ("message_codec", "message_signer", "cam_generation_rules", "dcc",
@@ -4078,6 +4307,12 @@ _FIELD_META = {
                               "this city (the exact lat0/lon0/kx/ky derived from that extract's "
                               "road ways), so the net registers with osm.py roads and building "
                               "footprints. Empty = keep the net's own metric coordinates"),
+    "sumo_buildings": dict(h="road_network=sumo: a SUMO polygon additional-file (InTAS ships "
+                             "buildings.poly.xml) whose type=\"building\" footprints become the "
+                             "geometric channel's NLOSb geometry. Projected with the SAME transform "
+                             "as the net and gated on landing on its junctions. Empty = the "
+                             "whole-city map runs with no footprints and falls back to the "
+                             "synthetic canyon density"),
     "sumo_trace": dict(h="mobility_source=sumo_replay: the frozen trajectory artifact "
                          "(python -m scms_sim_ref.mock_pipeline.sumo_trace --net ... --routes ... "
                          "--steps N --run-seed S --out map.trace)"),
@@ -4580,6 +4815,26 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     # (written by `osm.py --buildings`, projected with the ROAD graph's own projection tuple so the
     # two layers are registered); a synthetic map has none and falls back to the canyon density.
     _geo_buildings = _parse_buildings(cfg.custom_network) if cfg.road_network == "custom" else []
+    # THE WHOLE-CITY PATH's footprints. `road_network="sumo"` imports a real SUMO net, and a SUMO
+    # scenario ships its buildings as a separate polygon additional-file rather than inside the
+    # network document -- so without this the largest scene in the project would run with roads and
+    # no buildings and silently fall back to the canyon density. `scene_from_net` reads the net
+    # itself and builds the transform with the SAME `netimport._transformer` call the road import
+    # makes, so there is no way for the two layers to end up in different frames; it then GATES on
+    # the footprints landing on the junctions (measured: the gate fires on an 11 m displacement).
+    _geo_building_stats: dict = {}
+    if cfg.road_network == "sumo" and cfg.sumo_buildings:
+        from .netimport import scene_from_net as _scene_from_net
+        from .sumo_trace import frame_for_city as _frame_for_city
+        _geo_buildings, _geo_building_stats = _scene_from_net(
+            cfg.sumo_net, cfg.sumo_buildings, projection=_frame_for_city(cfg.sumo_frame_city))
+        if cfg.verbose:
+            print(f"[sumo scene] {os.path.basename(cfg.sumo_buildings)} -> "
+                  f"{_geo_building_stats['polygons']} footprints "
+                  f"({_geo_building_stats['vertices']} vertices), median centroid offset "
+                  f"{_geo_building_stats.get('median_offset_m')} m from the median junction, "
+                  f"{_geo_building_stats.get('junctions_in_footprint_frac')} of junctions inside "
+                  f"a footprint", flush=True)
     chan, chan_provenance = build_channel(cfg, buildings=_geo_buildings, dt=cfg.dt)
     # A construction-time write to `env["config"]` is fatal HERE, before step 0 -- which is where
     # every plugin failure belongs (PLUGIN-ARCH 3.2), and is early enough that no output directory
@@ -4661,8 +4916,15 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     #: The encoder, or None. Built once; holds the frozen StationViews so the reception loop does
     #: not allocate one per message. The frame LENGTH comes from the profile, which is where the
     #: security envelope is accounted for.
-    _wire = (WireEncoder(_codec, cfg.message_signer, sizer=_profile.wire_size_bytes)
-             if _codec is not None else None)
+    _wire = (WireEncoder(
+        _codec, cfg.message_signer,
+        # The two calls the encoder makes per message come from two DIFFERENT plugins, so each is
+        # guarded under its own slot's `source_gate`: the frame length from the profile, the octets
+        # from the codec.
+        sizer=_pguard.guarded(_profile.wire_size_bytes,
+                              _obj_guard_label(cfg, "protocol_profile", _profile)),
+        guard_label=_obj_guard_label(cfg, "message_codec", _codec))
+        if _codec is not None else None)
     _codec_claim = dict(_codec.standards_claim()) if _codec is not None else None
     _profile_claim = dict(_profile.standards_claim()) if _profile is not None else None
     if cfg.verbose and _profile is not None:
@@ -5665,7 +5927,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     _CAM_PLAN, _DENM_PLAN = suite.cam_plan, suite.denm_plan
     _VRU_SUPPRESSED, _SIG_SUPPRESSED = suite.vru_suppressed, suite.sig_suppressed
     _fusion, _fusion_params, _fusion_rng = suite.fusion, suite.fusion_params, suite.fusion_rng
-    _fusion_decide = _fusion.decide
+    _fusion_decide = _pguard.guarded(_fusion.decide, suite.fusion_guard)
     _wrap_state = _api_detect.NamespacedState
     #: None for the BUILT-IN fusion, which reads and writes `streak` on the raw per-link dict and
     #: whose access to it is what every pinned golden was recorded on. A THIRD-PARTY fusion gets the
@@ -7470,6 +7732,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                                 **({"signal_service": dict(_sig_served, plan=_sig_stats)}
                                    if cfg.real_signals else {}),
                                 **({"sidewalks": _sidewalk_stats} if _sidewalk_stats else {}),
+                                # The SCENE's other half on the whole-city path: which footprint
+                                # file was rasterised, how many polygons survived, and every
+                                # alignment statistic the registration gate measured. Emitted only
+                                # when `sumo_buildings` is set.
+                                **({"scene_buildings": _geo_building_stats}
+                                   if _geo_building_stats else {}),
                                 # THE PROTOCOL STACK'S OWN MEASUREMENTS. Emitted only when at least
                                 # one of the five opt-ins is on, so a default manifest is
                                 # byte-identical; and `counts` is outside `_data_digest` by
@@ -8239,6 +8507,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--sumo-frame-city", default="", metavar="CITY",
                    help="geo-referenced .net.xml: re-project it into osm.py's local frame for this "
                         "city, so it registers with osm.py roads and building footprints")
+    p.add_argument("--sumo-buildings", default="", metavar="POLY_XML",
+                   help="--road sumo: a SUMO polygon additional-file (InTAS ships "
+                        "buildings.poly.xml) whose type=\"building\" footprints become the "
+                        "geometric channel's NLOSb geometry. Projected with the SAME transform as "
+                        "the net and gated on landing on its junctions; without it the whole-city "
+                        "map has no buildings at all")
     p.add_argument("--sumo-trace", default="", metavar="TRACE",
                    help="--mobility-source sumo_replay: the frozen trajectory artifact "
                         "(python -m scms_sim_ref.mock_pipeline.sumo_trace ...)")
@@ -8458,6 +8732,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                          directed_lanes=args.directed_lanes, drive_side=args.drive_side,
                          mobility_source=args.mobility_source, sumo_net=args.sumo_net,
                          sumo_frame_city=args.sumo_frame_city, sumo_trace=args.sumo_trace,
+                         sumo_buildings=args.sumo_buildings,
                          sumo_trace_sha256=args.sumo_trace_sha256,
                          sumo_cert_slack_s=args.sumo_cert_slack,
                          sumo_offroad_p95_max_m=args.sumo_offroad_p95_max,

@@ -180,12 +180,13 @@ class ProvenanceRecord:
     __slots__ = ("slot", "order", "ref", "resolved_via", "distribution", "version",
                  "dist_sha256", "module_sha256", "package_sha256", "interface_version",
                  "capabilities", "declared_streams", "params", "params_sha256",
-                 "provenance_incomplete", "conformance", "isolated")
+                 "provenance_incomplete", "conformance", "isolated", "import_closure_sha256",
+                 "import_closure_modules")
 
     def __init__(self, slot, order, ref, resolved_via, distribution, version, dist_sha256,
                  module_sha256, interface_version, capabilities, declared_streams, params,
                  params_sha256, provenance_incomplete, conformance=None, package_sha256=None,
-                 isolated=False):
+                 isolated=False, import_closure=None):
         self.slot, self.order, self.ref = slot, order, ref
         self.resolved_via, self.distribution, self.version = resolved_via, distribution, version
         self.dist_sha256, self.module_sha256 = dist_sha256, module_sha256
@@ -196,6 +197,15 @@ class ProvenanceRecord:
         #: one that closes that gap. `None` for a built-in and for a plugin that is a bare module
         #: rather than a package (there `module_sha256` already covers everything).
         self.package_sha256 = package_sha256
+        #: sha256 over the plugin's whole static IMPORT CLOSURE outside the stdlib and this engine.
+        #: `package_sha256` stops at the plugin's own top-level package, so logic imported from
+        #: ANOTHER distribution is unhashed by every other field here -- measured: editing such a
+        #: sibling moved the dataset digest while `verify-plugins` reported no drift and exited 0.
+        #: `None` for a built-in and for a module this process cannot locate without importing it.
+        self.import_closure_sha256 = (import_closure or {}).get("sha256")
+        #: The module NAMES the closure covered, so a drift is diffable rather than a bare hash
+        #: mismatch, plus whether the walk hit its deterministic ceiling.
+        self.import_closure_modules = sorted((import_closure or {}).get("modules") or {})
         self.interface_version, self.capabilities = interface_version, capabilities
         self.declared_streams, self.params = declared_streams, params
         self.params_sha256 = params_sha256
@@ -223,6 +233,11 @@ class ProvenanceRecord:
         # before this field -- is byte-identical to what it was.
         if self.package_sha256 is not None:
             d["package_sha256"] = self.package_sha256
+        # Emitted only when established, so a built-in's entry -- and every manifest written before
+        # this field -- is byte-identical to what it was.
+        if self.import_closure_sha256 is not None:
+            d["import_closure_sha256"] = self.import_closure_sha256
+            d["import_closure_modules"] = list(self.import_closure_modules)
         if self.provenance_incomplete:
             d["provenance_incomplete"] = True
         if self.conformance:
@@ -332,6 +347,26 @@ def package_sha256(root: str):
     return h.hexdigest()
 
 
+def package_root_of_path(path):
+    """The top-level package directory a module FILE belongs to, or None for a bare module.
+
+    Walks up while each parent still has an `__init__.py`, so it is the same tree
+    :func:`package_root` returns -- derived from the FILESYSTEM instead of from an imported
+    module object, which is what lets the parent of an isolated worker compute it without
+    importing anything.
+    """
+    if not path:
+        return None
+    d = os.path.dirname(os.path.abspath(path))
+    if not os.path.isfile(os.path.join(d, "__init__.py")):
+        return None
+    while True:
+        parent = os.path.dirname(d)
+        if parent == d or not os.path.isfile(os.path.join(parent, "__init__.py")):
+            return d
+        d = parent
+
+
 def package_root(obj):
     """Directory of the top-level PACKAGE the object's module lives in, or None.
 
@@ -349,6 +384,188 @@ def package_root(obj):
     if len(paths) != 1:
         return None
     return paths[0] if os.path.isdir(paths[0]) else None
+
+
+# --------------------------------------------------------------------------- #
+# The IMPORT CLOSURE -- the hash that covers a sibling in ANOTHER distribution
+# --------------------------------------------------------------------------- #
+#: Deterministic ceilings. A plugin that imports `numpy` reaches hundreds of modules and tens of
+#: megabytes; hashing all of it would put seconds on every run for no extra assurance, and hashing
+#: an ARBITRARY prefix of it would make the digest depend on dict order. The walk is breadth-first
+#: over SORTED module names, so a truncation is a deterministic function of the import graph, and
+#: it is RECORDED (`import_closure_truncated`) rather than hidden.
+CLOSURE_MAX_MODULES = 400
+CLOSURE_MAX_BYTES = 64 << 20
+
+#: Modules that are never part of a plugin's identity: the standard library (it is pinned by
+#: `runtime_block()["python"]`) and this engine (pinned by `dataset_version` and the goldens; keying
+#: on it would make every manifest unreplayable after any edit to any engine file).
+_CLOSURE_SKIP_ROOTS = frozenset({"scms_sim_ref"})
+
+
+def static_locate(module_name: str):
+    """The FILE a dotted module name resolves to on this `sys.path`, **without importing anything**.
+
+    `importlib.util.find_spec` cannot be used for this: finding `a.b` imports `a`, and running a
+    package's `__init__.py` is exactly the untrusted code the isolated mode exists to keep out of
+    this process. This walks `sys.path` the way `FileFinder` does -- package directory with an
+    `__init__.py` first, then a same-named module file, then an extension module -- and executes
+    nothing.
+
+    Returns the absolute path, or None when this process cannot resolve the name that way (a
+    zipimport, a namespace package spread over several directories, an editable install behind a
+    custom finder). None means "say so", never "assume it is fine".
+    """
+    parts = [p for p in str(module_name).split(".") if p]
+    if not parts:
+        return None
+    search = list(sys.path)
+    found = None
+    for i, part in enumerate(parts):
+        found = None
+        for entry in search:
+            if not isinstance(entry, str):
+                continue
+            base = entry or os.getcwd()
+            init = os.path.join(base, part, "__init__.py")
+            if os.path.isfile(init):
+                found = (init, [os.path.join(base, part)])
+                break
+            for ext in (".py", ".pyd", ".so"):
+                cand = os.path.join(base, part + ext)
+                if os.path.isfile(cand):
+                    found = (cand, None)
+                    break
+            if found is not None:
+                break
+        if found is None:
+            return None
+        search = found[1]
+        if search is None and i < len(parts) - 1:
+            return None                                # a module cannot contain a submodule
+    return os.path.abspath(found[0]) if found else None
+
+
+def _closure_targets(path: str, package: str):
+    """Absolute module names this file imports, resolved through the AST. Never executes it."""
+    import ast
+    try:
+        with open(path, "rb") as fh:
+            src = fh.read()
+        tree = ast.parse(src, filename=path)
+    except (OSError, SyntaxError, ValueError):
+        return ()
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                out.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                # `from . import x` / `from ..y import z`: resolve against the containing package,
+                # so a plugin's own tree is walked in full rather than stopping at its first
+                # relative import.
+                base = package.split(".")
+                base = base[:len(base) - node.level + 1] if node.level <= len(base) else []
+                mod = ".".join([p for p in base if p] + ([node.module] if node.module else []))
+            else:
+                mod = node.module or ""
+            if not mod:
+                continue
+            out.add(mod)
+            for alias in node.names:
+                out.add(f"{mod}.{alias.name}")         # `from pkg import mod` names a MODULE too
+    return tuple(sorted(out))
+
+
+def _with_ancestors(name: str) -> tuple:
+    """`("a", "a.b", "a.b.c")` for `"a.b.c"` -- every package whose `__init__.py` runs on the way."""
+    parts = str(name).split(".")
+    return tuple(".".join(parts[:i + 1]) for i in range(len(parts)))
+
+
+def _closure_skip(name: str) -> bool:
+    head = name.split(".", 1)[0]
+    if head in _CLOSURE_SKIP_ROOTS:
+        return True
+    if head in getattr(sys, "stdlib_module_names", frozenset()):
+        return True
+    return head in sys.builtin_module_names
+
+
+def import_closure(module_name: str) -> dict:
+    """Every non-stdlib module reachable by following imports from `module_name`, with its hash.
+
+    **THE HOLE THIS CLOSES.** `package_sha256` hashes the plugin's OWN top-level package and nothing
+    else, so logic imported from a DIFFERENT distribution is unhashed. Measured on this engine: a
+    channel model whose physics lives in a sibling top-level package changed behaviour -- the digest
+    moved `9ea985e0` -> `ec9e476d` -- while `verify-plugins` printed "no drift" and exited 0, which
+    is D4's stated failure mode with the lock in place. Following the imports is what makes that
+    edit visible.
+
+    Static, and deliberately so: it is computed from the SOURCE, so it does not depend on what this
+    process happened to have imported already, and two machines with the same files agree.
+
+    Returns ``{"modules": {name: sha256}, "sha256": <digest over it>, "unresolved": [names],
+    "truncated": bool}``. A name this process cannot locate without importing it is REPORTED in
+    `unresolved` rather than silently dropped.
+    """
+    start = str(module_name)
+    seen: dict = {}
+    unresolved: list = []
+    frontier = list(_with_ancestors(start))
+    total = 0
+    truncated = False
+    while frontier:
+        name = frontier.pop(0)
+        if name in seen or _closure_skip(name):
+            continue
+        path = static_locate(name)
+        if path is None:
+            if name != start and name.rpartition(".")[0] in seen:
+                continue                               # `from pkg import Class`, not a submodule
+            unresolved.append(name)
+            continue
+        if len(seen) >= CLOSURE_MAX_MODULES or total >= CLOSURE_MAX_BYTES:
+            truncated = True
+            continue
+        digest = _file_sha256_cached(path)
+        if digest is None:                             # pragma: no cover - vanished mid-walk
+            unresolved.append(name)
+            continue
+        seen[name] = digest
+        try:
+            total += os.path.getsize(path)
+        except OSError:                                # pragma: no cover
+            pass
+        if path.endswith(".py"):
+            package = name if path.endswith("__init__.py") else name.rpartition(".")[0]
+            for target in _closure_targets(path, package):
+                # ANCESTORS TOO. `from prov_phys.core import reach` runs `prov_phys/__init__.py`
+                # before `core.py`, so a closure that hashed only `prov_phys.core` would leave the
+                # package's own module-level code -- the earliest hook there is -- unhashed.
+                frontier.extend(a for a in _with_ancestors(target) if a not in seen)
+        frontier.sort()
+    h = hashlib.sha256()
+    for name in sorted(seen):
+        h.update(name.encode("utf-8"))
+        h.update(seen[name].encode())
+    return {"modules": seen, "sha256": h.hexdigest(), "unresolved": sorted(set(unresolved)),
+            "truncated": truncated}
+
+
+def import_closure_sha256(obj_or_name):
+    """`import_closure(...)["sha256"]` for a class/instance or a module name, or None.
+
+    None for a built-in and for anything whose defining module this process cannot locate on
+    `sys.path` without importing it -- an absent field means "not established", never "clean".
+    """
+    name = obj_or_name if isinstance(obj_or_name, str) else getattr(obj_or_name, "__module__", None)
+    if not name or _closure_skip(str(name)):
+        return None
+    if static_locate(str(name)) is None:
+        return None
+    return import_closure(str(name))["sha256"]
 
 
 #: top-level module name -> (distribution, version, dist_sha256). `packages_distributions()` walks
@@ -593,7 +810,25 @@ INTERFACE_LABEL = "declared interface"
 
 
 def resolve(slot: str, ref: str):
-    """Three tiers, in this order, with every failure fatal here rather than at step k > 0."""
+    """Three tiers, in this order, with every failure fatal here rather than at step k > 0.
+
+    **THE IMPORT IS BRACKETED BY AN INTEGRITY SENTINEL, HERE, unconditionally.** Importing a plugin
+    runs its MODULE-LEVEL code, which is an earlier hook than `__init__` and is where a one-line
+    ``random.Random = Impostor`` lives. `run_pipeline` already snapshots before it resolves anything
+    -- but `run_pipeline` is not the only caller. `verify_lock` (a manifest REPLAY),
+    `--check-config`, `--verify-plugins`, the GUI's validation pass and the copilot all resolve, and
+    all of them used to import untrusted module-level code with no sentinel at all. On a replay that
+    is decisive: `config_from_dict` verifies the lock -- importing every declared plugin -- BEFORE
+    `run_pipeline` takes its own baseline, so a module-level tamper was already installed when the
+    baseline was captured, the baseline recorded the TAMPERED state as normal, and the end-of-run
+    comparison saw no drift. Measured: the digest moved and the run reported clean.
+
+    Snapshotting inside `resolve`, immediately around the import, closes that for every caller at
+    once: the tamper is fatal at the import that performed it, so it can never survive to poison a
+    later baseline. It costs one snapshot per THIRD-PARTY resolution (built-ins are already
+    imported; there is no import to bracket and no third-party code to run), which is a handful per
+    run against ~600 attribute reads each.
+    """
     if slot not in _BUILTINS:
         raise ConfigError(f"unknown plugin slot {slot!r}; known: {SLOTS}")
     _ensure_builtins(slot)
@@ -601,16 +836,23 @@ def resolve(slot: str, ref: str):
     if ref in _BUILTINS[slot]:
         obj, how = _BUILTINS[slot][ref], "builtin"
     else:
-        ep = _entry_point(slot, ref)
-        if ep is not None:
-            obj, how = ep.load(), "entry_point"
-        elif ":" in ref:
-            obj, how = _import_ref(ref), "dotted_path"
-        else:
-            known = list(builtin_names_sorted(slot)) + list(list_entry_points(slot))
-            raise ConfigError(
-                f"unknown {slot}: {ref!r}; known: {sorted(set(known))} "
-                f"(or give a dotted path 'package.module:Class')")
+        from .integrity import Sentinel
+        sentinel = Sentinel(armed=True)
+        try:
+            ep = _entry_point(slot, ref)
+            if ep is not None:
+                obj, how = ep.load(), "entry_point"
+            elif ":" in ref:
+                obj, how = _import_ref(ref), "dotted_path"
+            else:
+                known = list(builtin_names_sorted(slot)) + list(list_entry_points(slot))
+                raise ConfigError(
+                    f"unknown {slot}: {ref!r}; known: {sorted(set(known))} "
+                    f"(or give a dotted path 'package.module:Class')")
+        finally:
+            # In the `finally`, so a module whose import RAISES after tampering is still graded --
+            # "the import failed" must never be a way to leave a rebind installed and unreported.
+            sentinel.verify(f"while IMPORTING the {slot} plugin (module-level code)", subject=ref)
     iv = _check_interface_version(obj, slot)
     shape = _check_signature(obj, slot)
     return obj, how, iv, shape
@@ -628,7 +870,7 @@ def make_provenance(slot, order, ref, obj, how, iv, capabilities, declared_strea
     still get the full probe.
     """
     if how == "builtin":
-        dist, version, dsha, psha = None, None, None, None
+        dist, version, dsha, psha, closure = None, None, None, None, None
     else:
         dist, version, dsha = _distribution_for(obj)
         # The one hash that covers a SIBLING module. Third parties only: a built-in's package is
@@ -636,6 +878,12 @@ def make_provenance(slot, order, ref, obj, how, iv, capabilities, declared_strea
         # any edit to any engine file -- the same reason built-ins are exempt from `verify_lock`.
         root = package_root(obj)
         psha = package_sha256(root) if root else None
+        # ...and the one that covers a sibling in ANOTHER top-level package, which `package_sha256`
+        # by construction cannot. See `import_closure`.
+        mod_name = getattr(obj, "__module__", None)
+        closure = (import_closure(mod_name)
+                   if mod_name and not _closure_skip(mod_name) and static_locate(mod_name)
+                   else None)
     msha = module_sha256(obj)
     incomplete = dsha is None and msha is None and psha is None
     return ProvenanceRecord(
@@ -643,7 +891,8 @@ def make_provenance(slot, order, ref, obj, how, iv, capabilities, declared_strea
         dist_sha256=dsha, module_sha256=msha, interface_version=iv,
         capabilities=frozenset(capabilities), declared_streams=tuple(declared_streams),
         params=dict(params or {}), params_sha256=params_sha256(params),
-        provenance_incomplete=incomplete, conformance=conformance, package_sha256=psha)
+        provenance_incomplete=incomplete, conformance=conformance, package_sha256=psha,
+        import_closure=closure)
 
 
 def check_capabilities(slot, ref, obj, how, caps) -> frozenset:
@@ -724,7 +973,8 @@ def verify_lock(lock: dict, *, allow_drift: bool = False) -> list:
                     raise drift
                 drifts.append(drift.args[0])
                 continue
-            for fname in ("module_sha256", "package_sha256", "dist_sha256", "interface_version"):
+            for fname in ("module_sha256", "package_sha256", "dist_sha256", "interface_version",
+                          "import_closure_sha256"):
                 expected, actual = entry.get(fname), probed.get(fname)
                 if expected is None or actual is None or expected == actual:
                     continue
@@ -736,6 +986,14 @@ def verify_lock(lock: dict, *, allow_drift: bool = False) -> list:
         try:
             obj, how, iv, _shape = resolve(slot, ref)
         except ConfigError as e:
+            # AN INTEGRITY FAILURE IS NEVER "DRIFT". `resolve` imports, and its own sentinel raises
+            # `IntegrityError` (a `ConfigError`) when the plugin's MODULE-LEVEL code rebound an
+            # engine object. Recording that as a drift row would make `--allow-plugin-drift`
+            # -- whose whole meaning is "the files changed, proceed and record it" -- silently
+            # proceed with a rebound `random.Random`, which is the one thing it must never do.
+            from .integrity import IntegrityError
+            if isinstance(e, IntegrityError):
+                raise
             drift = PluginDriftError(slot, ref, "resolution", entry.get("module_sha256"), str(e))
             if not allow_drift:
                 raise drift
@@ -751,6 +1009,12 @@ def verify_lock(lock: dict, *, allow_drift: bool = False) -> list:
                               # `verify-plugins` printed "no drift" and exited 0 while the replay
                               # produced a DIFFERENT dataset. That is D4's stated failure mode.
                               ("package_sha256", package_sha256(root) if root else None),
+                              # ...and WITHOUT this row it is blind to an edit of a module in a
+                              # DIFFERENT top-level package, which `package_sha256` cannot reach by
+                              # construction. Measured: a channel model importing its physics from a
+                              # sibling distribution moved the dataset digest 9ea985e0 -> ec9e476d
+                              # while `verify-plugins` reported "no drift" and exited 0.
+                              ("import_closure_sha256", import_closure_sha256(obj)),
                               ("dist_sha256", _distribution_for(obj)[2]),
                               ("interface_version", iv)):
             expected = entry.get(fname)
@@ -778,4 +1042,6 @@ def _probe_isolated(slot, ref):
     return {"module_sha256": meta.get("module_sha256"),
             "package_sha256": meta.get("package_sha256"),
             "dist_sha256": meta.get("dist_sha256"),
+            # Computed by THIS process from the path IT resolves, never from the worker's report.
+            "import_closure_sha256": meta.get("import_closure_sha256"),
             "interface_version": meta.get("interface_version")}, None

@@ -421,6 +421,24 @@ def load_scenario(dataset_dir: str) -> dict:
                 src = "custom_network.buildings"
         except (TypeError, ValueError, KeyError):
             buildings, src = [], "custom_network unparseable"
+    elif cfg.get("road_network") == "sumo" and cfg.get("sumo_buildings"):
+        # THE WHOLE-CITY PATH. A `road_network="sumo"` run does not carry its map in the manifest --
+        # the .net.xml is 16.9 MB and the footprint file 5.7 MB, so `config` names them by path
+        # instead. Re-deriving the polygons through `netimport.scene_from_net` is not a second
+        # opinion about the scene: it is the SAME call the run made, with the same transform and the
+        # same registration gate, so this reads exactly the footprints the channel rasterised. A
+        # missing or moved input is reported in `buildings_source` rather than raised, because this
+        # module is a read-only instrument over a finished dataset.
+        try:
+            from ..mock_pipeline.netimport import scene_from_net
+            from ..mock_pipeline.sumo_trace import frame_for_city
+            polys, _binfo = scene_from_net(
+                str(cfg["sumo_net"]), str(cfg["sumo_buildings"]),
+                projection=frame_for_city(str(cfg.get("sumo_frame_city") or "")))
+            buildings = [[(float(p[0]), float(p[1])) for p in ring] for ring in polys]
+            src = "sumo_buildings (re-imported through netimport.scene_from_net)"
+        except (OSError, ValueError, RuntimeError, KeyError) as exc:
+            buildings, src = [], f"sumo_buildings unreadable: {type(exc).__name__}: {exc}"
 
     from ..mock_pipeline.run import TR37885_BLOCKER_HEIGHT_M
     heights: dict[str, float] = {}

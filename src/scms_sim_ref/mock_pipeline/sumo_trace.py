@@ -780,6 +780,22 @@ class SumoReplayMobility:
 # --------------------------------------------------------------------------- #
 # network coherence: ONE transform, two consumers
 # --------------------------------------------------------------------------- #
+def frame_for_city(frame_city: str, cache_dir: str = "datasets/_osmcache") -> dict | None:
+    """`sumo_frame_city` -> the projection tuple every layer of that map must share, or None.
+
+    ONE definition, used by `engine_network` for the roads and by the caller for anything else that
+    has to land in the same frame (building footprints, above all). A second derivation of the same
+    tuple is the projection trap with extra steps."""
+    if not frame_city:
+        return None
+    from .osm import CITY_BBOXES, fetch_osm, road_projection   # noqa: PLC0415
+
+    if frame_city not in CITY_BBOXES:
+        raise ValueError(f"sumo_frame_city must be one of {sorted(CITY_BBOXES)} "
+                         f"(got {frame_city!r})")
+    return road_projection(fetch_osm(CITY_BBOXES[frame_city], cache_dir))
+
+
 def engine_network(net_path: str, *, frame_city: str = "", cache_dir: str = "datasets/_osmcache",
                    directed: bool = False, strong: bool | None = None, max_nodes: int = 0,
                    shapes: bool = True, surface: bool = True, signals: bool = False):
@@ -835,13 +851,7 @@ def engine_network(net_path: str, *, frame_city: str = "", cache_dir: str = "dat
     `PipelineConfig.real_signals` is set."""
     from . import netimport                            # noqa: PLC0415  (needs sumolib)
 
-    frame = None
-    if frame_city:
-        from .osm import CITY_BBOXES, fetch_osm, road_projection   # noqa: PLC0415
-        if frame_city not in CITY_BBOXES:
-            raise ValueError(f"sumo_frame_city must be one of {sorted(CITY_BBOXES)} "
-                             f"(got {frame_city!r})")
-        frame = road_projection(fetch_osm(CITY_BBOXES[frame_city], cache_dir))
+    frame = frame_for_city(frame_city, cache_dir)
     net = netimport.read_net(net_path, programs=bool(signals))
     if strong is None:
         strong = True
@@ -890,6 +900,14 @@ def main(argv=None) -> int:
     p.add_argument("--substeps", type=int, default=1, metavar="N",
                    help="step SUMO at --dt/N and record every Nth state: keeps the scenario's own "
                         "calibrated integration step while the artifact stays at --dt (default 1)")
+    p.add_argument("--sumo-arg", action="append", default=[], metavar="ARG",
+                   help="extra argument passed straight to SUMO, repeatable. USE THE = FORM for a "
+                        "value that starts with a dash, or argparse eats it: "
+                        "`--sumo-arg=--output-prefix --sumo-arg=mine_`. That is the one you will "
+                        "actually need -- a scenario's own .sumocfg names its summary/tripinfo/log "
+                        "outputs, and freezing it OVERWRITES those committed files in place unless "
+                        "they are prefixed. Recorded in meta['invocation'], i.e. inside the "
+                        "artifact's hash")
     p.add_argument("--allow-version-drift", action="store_true",
                    help=f"do not require SUMO {SUMO_VERSION_PINNED} (the trajectories are then not "
                         f"comparable with ones frozen on the pinned build)")
@@ -901,7 +919,7 @@ def main(argv=None) -> int:
         return 0
     trace = freeze(net=a.net, routes=a.routes or "", sumocfg=a.sumocfg or "", out=a.out,
                    seed=a.seed, run_seed=a.run_seed, steps=a.steps, dt=a.dt, begin=a.begin,
-                   warmup_steps=a.warmup, substeps=a.substeps,
+                   warmup_steps=a.warmup, substeps=a.substeps, extra_args=tuple(a.sumo_arg),
                    time_to_teleport=a.time_to_teleport, split_on_gap=a.split_on_gap,
                    strict_version=not a.allow_version_drift)
     print(json.dumps({**trace.summary(), "out": a.out,

@@ -114,6 +114,26 @@ not a word more:
     reach is an operational matter (a separate user, ACLs, or an OS-level sandbox around the worker,
     which this mode makes possible -- one process, one pipe -- and does not itself provide).
 
+Measured, and still true: a child that walks the temp tree finds COMPLETED earlier runs and reads
+their ``ground_truth/*.jsonl`` -- ``reporter_true_id``, ``subject_true_id``,
+``report_correctness`` -- in full. That is a different dataset's answer key, not this one's, and a
+detector trained on it is a detector that has seen labels it was never given; for a benchmark, one
+is as disqualifying as the other.
+
+**Why there is no filesystem allow-list here.** A PEP 578 audit hook in the child could deny
+``open`` / ``os.listdir`` / ``os.scandir`` outside a set of roots, and it would stop the walk
+described above -- :mod:`~scms_sim_ref.api.guard` is the same machinery, used for the reflective
+events. It is deliberately not offered, because the child is the plugin's OWN process: whatever
+policy state that hook consulted would be an object the plugin can reach and edit, exactly as
+`guard.py`'s own docstring concedes for the in-process case, and it is the same interpreter
+throughout. In the in-process case that residue is worth accepting because the alternative is
+nothing at all; here it is not, because it would put a "the worker cannot read your disk" sentence
+next to a mechanism that a determined worker turns off, and this project has already withdrawn two
+containment claims. **What actually keeps another dataset away from the worker is an OS boundary --
+a separate user account, a directory ACL, a container -- and this mode is the shape that makes one
+possible: one process, one pipe, no shared state.** That is the whole claim, and it is the
+operator's to complete.
+
 `docs/realism/DETECTOR-PLUGIN.md` section 2.8 has the full measurement.
 """
 from __future__ import annotations
@@ -768,24 +788,44 @@ def child_env(deny=()) -> dict:
 # --------------------------------------------------------------------------- #
 # Parent side: identity, without importing the plugin
 # --------------------------------------------------------------------------- #
-def hash_reported_source(meta: dict) -> dict:
+def hash_reported_source(meta: dict, ref=None) -> dict:
     """Content hashes for a plugin the parent deliberately did NOT import.
 
-    The child reports WHERE it loaded the plugin from; the parent hashes those paths ITSELF. Reading
-    a file is not executing it, so this keeps the lock's content hashes out of the plugin's hands
-    while the plugin stays out of the engine's process.
+    **THE PARENT RESOLVES THE PATH ITSELF.** It used to hash whatever path the child NAMED, and the
+    child is the plugin's own process: a plugin that sets its module's ``__file__`` to a decoy made
+    the lock record the decoy's hash (measured: ``6d85ce01`` recorded for real code hashing
+    ``90272b8b``), and a replay re-probed the same decoy, so "no drift" was true of a file that was
+    never executed while the real code was free to change. So for a dotted ``pkg.mod:Class`` ref --
+    which the PARENT owns, because it comes out of the config -- the parent walks `sys.path` itself
+    (:func:`~scms_sim_ref.api.registry.static_locate`, which executes nothing, unlike `find_spec`,
+    which imports parent packages) and **refuses a worker whose reported path is not the one this
+    process resolves.** The package root and the import closure are derived from the parent's path
+    too, never from the child's report.
 
-    **The residue, stated rather than discovered.** The parent can verify that the paths it was given
-    hash to what it records; it cannot verify that they are the paths the child actually imported. A
-    worker that loads module A and names module B produces a self-consistent lock over the wrong
-    files. What that still buys is the property the lock exists for -- a replay re-runs the same
-    probe and refuses when those files change -- and what it costs is stated here and in
-    `docs/realism/DETECTOR-PLUGIN.md`. The in-process mode has the strictly larger hole (the plugin
-    can rewrite `registry.package_sha256` itself), which is why the integrity monitor watches it.
+    **The residue, stated rather than discovered.** When the parent cannot resolve the name that way
+    -- a zipimport, a namespace package, an entry-point ref, an editable install behind a custom
+    finder -- it falls back to the child's path AND SAYS SO in `path_source: "worker"`, and in that
+    case the old caveat still applies: a worker that loads module A and names module B produces a
+    self-consistent lock over the wrong files. `path_source` is in the lock so a reader can tell the
+    two cases apart instead of having to assume.
     """
     from . import registry
-    module_path = meta.get("module_path")
-    package_root = meta.get("package_root")
+    reported = meta.get("module_path")
+    module_name = str(ref).partition(":")[0] if ref and ":" in str(ref) else None
+    own = registry.static_locate(module_name) if module_name else None
+    if own is not None and reported and _norm(reported) != _norm(own):
+        raise IsolationError(
+            f"plugins.check {ref!r}: the isolated worker reported that it loaded the plugin from\n"
+            f"    {reported}\n"
+            f"but this process resolves {module_name!r} on the SAME sys.path to\n"
+            f"    {own}\n"
+            f"The lock's content hashes are computed from the file the ENGINE resolves, because a "
+            f"module can set its own __file__ and a worker that names a decoy would produce a "
+            f"self-consistent lock over code that never ran. A path this process cannot confirm is "
+            f"refused rather than recorded.")
+    module_path = own or reported
+    package_root = (registry.package_root_of_path(own) if own is not None
+                    else meta.get("package_root"))
     msha = None
     if module_path and os.path.isfile(module_path):
         try:
@@ -793,9 +833,14 @@ def hash_reported_source(meta: dict) -> dict:
         except OSError:                                  # pragma: no cover
             msha = None
     psha = registry.package_sha256(package_root) if package_root else None
-    return {"module_sha256": msha, "package_sha256": psha,
-            "dist_sha256": meta.get("dist_sha256"),
-            "distribution": meta.get("distribution"), "version": meta.get("version")}
+    closure = registry.import_closure_sha256(module_name) if own is not None else None
+    out = {"module_sha256": msha, "package_sha256": psha,
+           "dist_sha256": meta.get("dist_sha256"),
+           "distribution": meta.get("distribution"), "version": meta.get("version"),
+           "path_source": "parent" if own is not None else "worker"}
+    if closure is not None:
+        out["import_closure_sha256"] = closure
+    return out
 
 
 def provenance_record(slot, order, worker, params, conformance=None):
@@ -806,9 +851,11 @@ def provenance_record(slot, order, worker, params, conformance=None):
     knows to re-probe rather than re-import.
     """
     from . import registry
-    h = hash_reported_source(worker.meta)
+    h = hash_reported_source(worker.meta, worker.ref)
     incomplete = (h["dist_sha256"] is None and h["module_sha256"] is None
                   and h["package_sha256"] is None)
+    closure = ({"sha256": h["import_closure_sha256"], "modules": {}}
+               if h.get("import_closure_sha256") else None)
     return registry.ProvenanceRecord(
         slot=slot, order=order, ref=worker.ref, resolved_via=worker.resolved_via,
         distribution=h["distribution"], version=h["version"], dist_sha256=h["dist_sha256"],
@@ -816,7 +863,8 @@ def provenance_record(slot, order, worker, params, conformance=None):
         interface_version=worker.interface_version, capabilities=frozenset(worker.capabilities),
         declared_streams=tuple(worker.rng.declared_streams() if worker.rng else ()),
         params=dict(params or {}), params_sha256=registry.params_sha256(params),
-        provenance_incomplete=incomplete, conformance=conformance, isolated=True)
+        provenance_incomplete=incomplete, conformance=conformance, isolated=True,
+        import_closure=closure)
 
 
 def probe(slot: str, ref: str, *, timeout: float = DEFAULT_START_TIMEOUT_S) -> dict:
@@ -830,7 +878,7 @@ def probe(slot: str, ref: str, *, timeout: float = DEFAULT_START_TIMEOUT_S) -> d
     worker = IsolatedCheck(ref, {}, seed=0, env={}, start_timeout=timeout, slot=slot)
     try:
         meta = worker.spawn()
-        return dict(meta, **hash_reported_source(meta))
+        return dict(meta, **hash_reported_source(meta, ref))
     finally:
         worker.close()
 

@@ -176,6 +176,18 @@ Measured on a congested trace (6×6 grid, `randomTrips -p 0.18`, 1,541 vehicles,
 | `sumo_offroad_p95_max_m` | `8.0` | Mobility | `--sumo-offroad-p95-max` |
 | `sumo_net` | `""` | Network | `--sumo-net` |
 | `sumo_frame_city` | `""` | Network | `--sumo-frame-city` |
+| `sumo_buildings` | `""` | Network | `--sumo-buildings` |
+
+**`sumo_buildings` is the whole-city scene's other half** and it is not decoration. A `.net.xml`
+carries roads and no footprints; a SUMO scenario ships its buildings in a separate polygon
+additional-file. Without it, the biggest map in this project runs with no buildings at all and the
+geometric channel falls back to the synthetic urban-canyon density — worth **1.60× in PDR at 200 m**
+on InTAS, in the wrong direction. The polygons go through the SAME `netimport._transformer` closure
+the junctions did (`netimport.scene_from_net` reads the net itself rather than accepting a transform,
+so the two layers cannot end up in different frames) and are GATED on landing on those junctions: the
+gate fires on an 11 m displacement of the footprint layer, and every alignment statistic it measured
+is recorded in `manifest.counts.scene_buildings`. Measurements, thresholds and the displacement
+bisection: `docs/realism/FULL-CITY-SCENE.md`.
 
 `freeze()` itself gained two options, both default-inert and both keyed out of `meta` unless
 engaged, so no existing artifact's sha256 moves:
@@ -222,6 +234,27 @@ python -m scms_sim_ref.mock_pipeline.run --flow --duration 300 --seed 42 \
     --mobility-source sumo_replay --sumo-trace map.trace --sumo-trace-sha256 <hex> \
     --attacker-pct 0.15 --out datasets/sumo_run
 ```
+
+**The whole city, with its buildings** — the first-class full-scene path
+(`docs/realism/FULL-CITY-SCENE.md`). 66 km², 3289 junctions, 21,717 footprints, InTAS's own demand:
+
+```
+$S = "scms-sim/scenarios/gen_intas_urban_low/sumo"
+python -m scms_sim_ref.mock_pipeline.run --flow --duration 300 --seed 42 \
+    --road sumo --sumo-net $S/ingolstadt.net.xml --sumo-buildings $S/buildings.poly.xml \
+    --custom-network-directed \
+    --mobility-source sumo_replay --sumo-trace intas_full_300s_dt1.trace \
+    --radio-model geometric --radio-env urban --radio-range 500 --radio-cap-max-mult 1.4 \
+    --radio-tx-power-dbm 23 --radio-rx-sensitivity-dbm -81 \
+    --attacker-pct 0.15 --out datasets/full_city
+
+[sumo scene] buildings.poly.xml -> 21717 footprints (110431 vertices), median centroid offset
+             [237.58, -199.04] m from the median junction, 0.0027 of junctions inside a footprint
+[geometric radio] env=urban tx=23.0 dBm sens=-81.0 dBm cap=700 m sense=700 m buildings=21717
+```
+
+31 s, 104 ms/step, 261 MB peak — cheaper than the 2 km² OSM extract, which costs 426 ms/step and
+704 MB because it packs a bigger fleet into 1/33 of the area.
 
 The real-city run, verbatim (InTAS AM peak, 25200–25500 s, `InTAS_buildings.sumocfg`):
 

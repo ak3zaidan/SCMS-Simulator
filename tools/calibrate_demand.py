@@ -668,7 +668,8 @@ def cmd_sample(a):
     if r.returncode != 0:
         raise SystemExit(f"routeSampler failed ({r.returncode})")
 
-    n_veh = _inject_vtype(out, a.vtype_id, a.vtype_attrs)
+    vparams = dict(p.split("=", 1) for p in (a.vtype_param or []))
+    n_veh = _inject_vtype(out, a.vtype_id, a.vtype_attrs, vparams)
     meta = {
         "out": str(out), "sha256": sha256_file(out), "n_vehicles": n_veh,
         "mismatch_output": str(mism), "mismatch_sha256": sha256_file(mism),
@@ -678,7 +679,7 @@ def cmd_sample(a):
         "command": " ".join(argv[1:]),
         "inputs": {"candidates": {"path": str(a.candidates), "sha256": sha256_file(a.candidates)},
                    "targets": {"path": str(a.targets), "sha256": sha256_file(a.targets)}},
-        "vtype": {"id": a.vtype_id, "attrs": a.vtype_attrs},
+        "vtype": {"id": a.vtype_id, "attrs": a.vtype_attrs, "params": vparams},
         "stdout_tail": r.stdout[-4000:],
         "licence": LICENCE_NOTE,
     }
@@ -687,16 +688,27 @@ def cmd_sample(a):
     return 0
 
 
-def _inject_vtype(route_file: Path, vtype_id: str, attrs: str) -> int:
+def _inject_vtype(route_file: Path, vtype_id: str, attrs: str, params=None) -> int:
     """routeSampler emits bare <vehicle> elements; give them a vType the sumocfg can bind.
 
     The vType is deliberately minimal: the InTAS sumocfg sets default.carfollowmodel=EIDM
     and default.speeddev=0.1, so an attribute-free vType inherits exactly the car-following
     model and driver heterogeneity the baseline run used.
+
+    `params` become <param> children.  The one that matters is
+    `has.rerouting.device=false`: InTAS ships `device.rerouting.probability 0.82`, which
+    hands 82 % of vehicles a router that REPLACES the route routeSampler assigned -- once
+    at insertion and then every 300 s.  A count calibration whose product is a fixed route
+    set cannot survive that; see docs/realism/DEMAND-CALIBRATION.md sect. 6.
     """
     txt = route_file.read_text(encoding="utf-8")
     n = txt.count("<vehicle ")
-    decl = f'    <vType id="{vtype_id}" vClass="passenger"{(" " + attrs) if attrs else ""}/>\n'
+    head = f'    <vType id="{vtype_id}" vClass="passenger"{(" " + attrs) if attrs else ""}'
+    if params:
+        body = "".join(f'\n        <param key="{k}" value="{v}"/>' for k, v in params.items())
+        decl = f"{head}>{body}\n    </vType>\n"
+    else:
+        decl = head + "/>\n"
     if "<routes" in txt and f'id="{vtype_id}"' not in txt:
         i = txt.index(">", txt.index("<routes")) + 1
         txt = txt[:i] + "\n" + decl + txt[i:]
@@ -1076,6 +1088,16 @@ def cmd_scenario(a):
             except ValueError:
                 adds.append(str(pp.resolve()).replace("\\", "/"))
         txt = _cfg_set(txt, "additional-files", ",".join(adds), "input")
+    if a.execute_assigned_routes:
+        # InTAS ships device.rerouting.probability 0.82 with a 300 s period and SUMO's default
+        # 60 s pre-insertion period, so 82 % of vehicles have their route REPLACED by a
+        # travel-time shortest path -- once before they move and then every 300 s.  A
+        # routeSampler calibration IS a fixed route set; executed under that device it is a
+        # different, uncalibrated assignment.  Setting both periods to 0 leaves the device
+        # attached (removing it via has.rerouting.device=false segfaults sumo 1.25.0) but
+        # stops it ever replacing a route.  See docs/realism/DEMAND-CALIBRATION.md sect. 6.
+        txt = _cfg_set(txt, "device.rerouting.period", "0", "routing")
+        txt = _cfg_set(txt, "device.rerouting.pre-period", "0", "routing")
     out = src.parent / (a.name or CALIB_CFG_NAME)
     stem = out.stem
     for tag, val, sec in ((("summary-output", f"{stem}.summary.xml", "output"),
@@ -1154,6 +1176,12 @@ def build_parser():
     s.add_argument("--minimize-vehicles", type=float, default=None)
     s.add_argument("--vtype-id", default="calib_car")
     s.add_argument("--vtype-attrs", default="")
+    s.add_argument("--vtype-param", action="append", metavar="KEY=VALUE",
+                   help="<param> child of the emitted vType (repeatable). NOTE: the obvious "
+                        "candidate has.rerouting.device=false SEGFAULTS sumo 1.25.0 on the "
+                        "InTAS AM band (deterministically, at t=23547); use "
+                        "`scenario --execute-assigned-routes` instead, which keeps the device "
+                        "attached and only stops it replacing routes")
     s.add_argument("--attributes", default='type="calib_car" departLane="best" departSpeed="max"')
     s.set_defaults(fn=cmd_sample)
 
@@ -1194,6 +1222,10 @@ def build_parser():
     s.add_argument("--keep-routes", default="routes/ped.rou.xml,routes/BusRoutes.flow.xml")
     s.add_argument("--additional", nargs="*", default=None)
     s.add_argument("--name", default=CALIB_CFG_NAME)
+    s.add_argument("--execute-assigned-routes", action="store_true",
+                   help="write device.rerouting.period=0 and .pre-period=0 so SUMO runs the "
+                        "route set routeSampler solved for instead of replacing 82 %% of it "
+                        "with its own shortest paths")
     s.set_defaults(fn=cmd_scenario)
     return p
 

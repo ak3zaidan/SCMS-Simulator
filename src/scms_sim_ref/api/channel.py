@@ -54,6 +54,32 @@ from dataclasses import dataclass, field
 from types import MappingProxyType as _MappingProxyType
 from typing import Iterable, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
+from . import guard
+
+
+def _zero2(_a, _b) -> float:
+    """The `0.0` a batch model that models neither congestion nor collisions has always returned."""
+    return 0.0
+
+
+def _bind_guarded(model, name: str, guard_label, default=None):
+    """`model.<name>`, guarded, bound ONCE at adapter construction.
+
+    A model that does not define `name` keeps the behaviour it had when the adapter forwarded
+    through `self.model.<name>` on every call: `default` if one is given, otherwise a shim that
+    raises the same `AttributeError` at CALL time. Binding must not turn "this optional method was
+    never called" into "this adapter cannot be built".
+    """
+    fn = getattr(model, name, None)
+    if fn is None:
+        if default is not None:
+            return guard.guarded(default, guard_label)
+
+        def missing(*args, **kwargs):
+            return getattr(model, name)(*args, **kwargs)      # raises AttributeError, as before
+        return missing
+    return guard.guarded(fn, guard_label)
+
 INTERFACE_NAME = "ChannelModel"
 INTERFACE_VERSION = "ChannelModel/1.0"
 #: highest MINOR of ChannelModel/1.x this engine can speak (major must match exactly)
@@ -323,15 +349,27 @@ class PerLinkAdapter:
     #: `evaluate_link` is BOUND AT CONSTRUCTION rather than defined as a forwarding method: the
     #: engine calls it once per candidate link (~10^7 times on a mid-size run), and one fewer
     #: Python frame per link is the difference between a refactor that is free and one that is not.
-    __slots__ = ("model", "evaluate_link", "rng_ns", "validate")
+    __slots__ = ("model", "evaluate_link", "rng_ns", "validate", "_evaluate", "_begin_step",
+                 "_busy", "_collision", "_coin")
 
-    def __init__(self, model, rng_ns=None, validate: bool = False):
+    def __init__(self, model, rng_ns=None, validate: bool = False, guard_label=None):
         self.model = model
         #: `validate` is what turns `check_outcome` from a function nobody calls into the engine's
         #: outcome gate. On for third-party models, off for built-ins (the goldens grade those, and
         #: this is a per-delivered-link call on a ~10^7-link loop).
         self.validate = bool(validate)
-        self.evaluate_link = (_checked_evaluate(model.evaluate) if validate else model.evaluate)
+        #: EVERY model-facing entry point the engine calls goes through
+        #: :func:`~scms_sim_ref.api.guard.guarded` when `guard_label` is set, and `guarded(fn, None)`
+        #: returns `fn` itself -- so a built-in pays not even a wrapper frame, and a third party pays
+        #: ~100 ns per call for a runtime refusal of `sys._getframe` and the other reflective routes
+        #: into this loop's frame. A gap in this bracket IS a hole: a model whose `delivery_coin`
+        #: could walk the stack while its `evaluate` could not would be no protection at all.
+        self._evaluate = _bind_guarded(model, "evaluate", guard_label)
+        self._begin_step = _bind_guarded(model, "begin_step", guard_label)
+        self._busy = _bind_guarded(model, "channel_busy_ratio", guard_label)
+        self._collision = _bind_guarded(model, "collision_loss", guard_label)
+        self._coin = _bind_guarded(model, "delivery_coin", guard_label)
+        self.evaluate_link = (_checked_evaluate(self._evaluate) if validate else self._evaluate)
         #: The model's `RngNamespace`, so :meth:`begin_step` can advance it. See
         #: :meth:`BatchAdapter.begin_step` for why the ADAPTER owns that responsibility.
         self.rng_ns = rng_ns
@@ -355,16 +393,16 @@ class PerLinkAdapter:
     def begin_step(self, frame: StepFrame) -> None:
         if self.rng_ns is not None:
             self.rng_ns.begin_step(frame.step)
-        self.model.begin_step(frame)
+        self._begin_step(frame)
 
     def channel_busy_ratio(self, rx_vid: int, offered: float) -> float:
-        return self.model.channel_busy_ratio(rx_vid, offered)
+        return self._busy(rx_vid, offered)
 
     def collision_loss(self, dist_m: float, cbr: float) -> float:
-        return self.model.collision_loss(dist_m, cbr)
+        return self._collision(dist_m, cbr)
 
     def delivery_coin(self, tx_vid: int, rx_vid: int) -> float:
-        return self.model.delivery_coin(tx_vid, rx_vid)
+        return self._coin(tx_vid, rx_vid)
 
     def close(self) -> None:
         close = getattr(self.model, "close", None)
@@ -381,7 +419,7 @@ class PerLinkAdapter:
             rx = stations[rx_vid]
             if d_m > window_of(self.model, rx):
                 continue
-            res = self.model.evaluate(tx, rx, d_m, txn)
+            res = self._evaluate(tx, rx, d_m, txn)
             if res is not None:
                 # VALIDATE FIRST, THEN BIND. `check_outcome` returns a fresh `LinkOutcome` built from
                 # values read exactly once, so `bind` below is OUR method on OUR object -- a model
@@ -414,12 +452,22 @@ class BatchAdapter:
     that absence is how the engine knows to drive `deliver`.
     """
 
-    __slots__ = ("model", "rng_ns", "validate")
+    __slots__ = ("model", "rng_ns", "validate", "_deliver", "_begin_step", "_busy", "_collision",
+                 "_coin")
 
-    def __init__(self, model, rng_ns=None, validate: bool = False):
+    def __init__(self, model, rng_ns=None, validate: bool = False, guard_label=None):
         self.model = model
         self.rng_ns = rng_ns
         self.validate = bool(validate)
+        # See `PerLinkAdapter.__init__`: every model-facing entry point, or none of them.
+        self._deliver = _bind_guarded(model, "deliver", guard_label)
+        self._begin_step = _bind_guarded(model, "begin_step", guard_label)
+        # `channel_busy_ratio` and `collision_loss` are OPTIONAL on the batch ABI (a model that
+        # models neither simply has none), so the zero default is kept here rather than in the
+        # caller -- same values as before, one fewer `getattr` per link.
+        self._busy = _bind_guarded(model, "channel_busy_ratio", guard_label, _zero2)
+        self._collision = _bind_guarded(model, "collision_loss", guard_label, _zero2)
+        self._coin = _bind_guarded(model, "delivery_coin", guard_label)
 
     @property
     def interface_version(self) -> str:
@@ -448,10 +496,10 @@ class BatchAdapter:
         # space mid-step), which is why it is not on the model-facing surface.
         if self.rng_ns is not None:
             self.rng_ns.begin_step(frame.step)
-        self.model.begin_step(frame)
+        self._begin_step(frame)
 
     def deliver(self, frame: StepFrame, candidates: Sequence[tuple]) -> Iterable[LinkOutcome]:
-        outs = self.model.deliver(frame, candidates)
+        outs = self._deliver(frame, candidates)
         return [check_outcome(o) for o in outs] if self.validate else outs
 
     def reach_m_for(self, rx: StationSnapshot) -> float:
@@ -461,15 +509,13 @@ class BatchAdapter:
         return window_of(self.model, rx)
 
     def channel_busy_ratio(self, rx_vid: int, offered: float) -> float:
-        fn = getattr(self.model, "channel_busy_ratio", None)
-        return float(fn(rx_vid, offered)) if fn is not None else 0.0
+        return float(self._busy(rx_vid, offered))
 
     def collision_loss(self, dist_m: float, cbr: float) -> float:
-        fn = getattr(self.model, "collision_loss", None)
-        return float(fn(dist_m, cbr)) if fn is not None else 0.0
+        return float(self._collision(dist_m, cbr))
 
     def delivery_coin(self, tx_vid: int, rx_vid: int) -> float:
-        return self.model.delivery_coin(tx_vid, rx_vid)
+        return self._coin(tx_vid, rx_vid)
 
     def prune(self, live_vids) -> None:
         fn = getattr(self.model, "prune", None)

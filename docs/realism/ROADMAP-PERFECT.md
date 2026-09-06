@@ -17,19 +17,36 @@ profiles. 1531 tests, both pinned digests stable.
 Validated against reality: traffic, twice, against measured Ingolstadt loop counts. **The radio has
 never been validated against measured radio data** — only against published curves.
 
-## P1 — The scene is 2 km² and the city is 66 km²
+## P1 — The scene is 2 km² and the city is 66 km² — **LANDED**, see `FULL-CITY-SCENE.md`
 
-**The single largest realism term measured anywhere in this project.** The cross-engine benchmark
-attributes 84.8% of the 10.3× radio divergence to the SCENE, against 12.4% for the link-state
-classifier and 2.8% for propagation physics. The Python engine runs an RDP-simplified OSM core
-extract; the MOSAIC path runs the real 66 km² SUMO city whose traffic is on arterials.
+**Was the single largest realism term measured anywhere in this project.** The cross-engine
+benchmark attributed 84.8% of the 10.3× radio divergence to the SCENE, against 12.4% for the
+link-state classifier and 2.8% for propagation physics. The Python engine ran an RDP-simplified OSM
+core extract; the MOSAIC path runs the real 66 km² SUMO city whose traffic is on arterials.
 
-Everything downstream inherits it: link-state composition, awareness, density, and the fundamental
-diagram. Fixing the radio physics — which was worth doing — moved 2.8% of the problem.
+**Closed.** `road_network="sumo"` now carries the whole InTAS net *and* its 21,717 building
+footprints (`sumo_buildings`, projected through the road import's own transform and gated on landing
+on its junctions — the gate fires on an 11 m displacement). On the full city with InTAS's own
+traffic the engine delivers **0.6026** of packets at 200 m against **0.0754** on the 2 km² extract
+and MOSAIC's 0.7798: **the whole scene term (100.7% of it, corrected for §6 below), 89.0% of the
+whole divergence, residual factor 10.3× → 1.29×**. The 0.90-awareness-equivalent range goes
+103.5 m → **338.5 m** against MOSAIC's 504.6 m. Independent cross-check: the unmodified
+`awareness.py` pointed at MOSAIC's OWN scene and emissions reads 0.5944 / 335.1 m, so the native
+whole-city run agrees with it to **1.4% / 1.0%**. Link-state composition at 200–250 m is
+LOS+NLOSv 0.703 / NLOSb 0.298 against the Java side's 0.741 / 0.259 — 3.9 pp apart where the extract
+was 67 pp. Road length inside a building falls 10.35% → 2.00% and vehicles standing in walls 9.62% →
+0.09%, which retires the registration defect of `CROSS-ENGINE-RADIO.md` §5 as well. And it is
+**cheaper**: 104 ms/step and 261 MB against the extract's 426 ms/step and 704 MB, because cost
+follows vehicle density, not map area.
 
-Work: make the Python engine run the full city. The caps are already 4000 nodes / 12000 edges and
-InTAS is 3332/7942, so the graph fits; what does not fit is the OSM import path's simplification and
-node budget. The netconvert importer is the right route and already exists.
+Two things fell out of it. The map is 71.3% of the scene term and *where the traffic is* is the
+other 33.6% (measured by swapping the mobility alone). And `_BuildingRaster` was silently coarsening
+any scene above 6 M cells: the 66 km² city needs 7.41 M at 3 m, so every full-city classification —
+including `CROSS-ENGINE-RADIO.md` §6's own "Python instrument on MOSAIC's scene" column — had been
+done at 6 m, half the extract's resolution. The ceiling is now 32 M (32 MB).
+
+Still open under this heading: the classifier (12.4%) and physics (2.8%) terms, neither of them
+re-measured at 3 m.
 
 ## P2 — Calibrated demand cannot be delivered
 

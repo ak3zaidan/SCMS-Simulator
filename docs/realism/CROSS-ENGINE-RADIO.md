@@ -261,6 +261,19 @@ The fourth column is the unmodified `awareness.py` CLI run over a shim view of t
 pointed at MOSAIC's scene and emissions. It sits between the two engines exactly as the headline
 decomposition predicts.
 
+> **CORRECTION (P1, `FULL-CITY-SCENE.md` §6). That fourth column was measured at a 6 m raster, not
+> the 3 m every other column here uses.** `_BuildingRaster` doubles its cell size until the grid
+> fits `GEO_BUILDING_MAX_CELLS`, silently, and that ceiling was 6 M cells. The 2.01 km² extract
+> needs 0.22 M cells at 3 m; InTAS's 8.31 × 8.01 km footprint extent needs **7.41 M**, so the shim
+> was coarsened and this column is a half-resolution classifier compared against full-resolution
+> ones. Re-running **this same shim dataset** (`datasets/xengine/_shim_geo_p23`) with the ceiling
+> raised to 32 M gives **PDR 0.5944 at 200 m (not 0.5464)** and a **335.1 m NAR-0.90-equivalent
+> range (not 306.8 m)**, ratio 3.85× (not 3.52×), LOS 0.4557 / NLOSv 0.2800 / NLOSb 0.2643 at 200 m.
+> The §1 headline split is computed from the 0.5464 figure and therefore attributes slightly **too
+> little** to the scene: at matched 3 m resolution the split is **scene 88.4% / classifier 8.8% /
+> physics 2.8%**. Everything else in this document is unaffected — no other column uses a raster
+> larger than 6 M cells.
+
 *Truncated*: the MOSAIC curve cannot be read past 709.4 m because SNS's `singlehopRadius` is a hard
 disc that stops handing frames to the app there; the PDR at the last full band (700–750 m) is still
 0.208 > 0.20. The closed-form column supplies d20 and the gray-zone ratio for that arm.

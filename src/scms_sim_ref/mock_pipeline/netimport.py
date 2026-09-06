@@ -45,12 +45,31 @@ one physical road must carry mirror-image shapes -- netconvert does NOT (each ca
 own offset polyline), so `_canonicalise_shapes` picks one. Pass `strong=True` for a directed
 consumer: a bbox-clipped extract otherwise leaves junctions a vehicle can enter and never leave.
 
+THE WHOLE CITY, AND ITS BUILDINGS. The raw-OSM path cannot carry a city: it RDP-simplifies at 10 m
+(measured: 10.35% of its road length ends up inside its own building footprints) and drops minor
+road classes to fit a ~380 node budget. This path has neither problem -- InTAS imports 3332
+junctions / 7941 edges against `CustomNetwork`'s 4000 / 12000 caps -- so the FULL 66 km^2 city is a
+first-class route rather than a 2 km^2 extract. `buildings_from_poly` / `scene_from_net` bring the
+footprints across in the SAME frame (see THE PROJECTION TRAP above): a SUMO `.poly.xml` is written
+in the net's own metric coordinates, so it is transformed by the very `_transformer` closure the
+junctions went through, and then GATED three ways -- median centroid against the median JUNCTION,
+the fraction of centroids inside the road bbox, and the fraction of ROAD JUNCTIONS that land inside
+a footprint. That last arm is the sharp one: a translated footprint layer pushes junctions into
+walls. MEASURED on InTAS by displacing the real 21,717-footprint layer and bisecting: the gate fires
+from 10.6-12.6 m in every direction, and nothing in 0-20 km passes (docs/realism/FULL-CITY-SCENE.md
+carries the table). MEASURED end to end: the whole city with its buildings reads LOS 0.450 /
+NLOSv 0.303 / NLOSb 0.247 at 200 m against the 2 km^2 extract's 0.060 / 0.031 / 0.909, closes the
+whole 84.8% SCENE term of CROSS-ENGINE-RADIO.md, and runs 4.1x FASTER than the extract because cost
+follows vehicle density rather than map area.
+
 CLI:
     python -m scms_sim_ref.mock_pipeline.netimport --city ingolstadt --out ing_net.json
     python -m scms_sim_ref.mock_pipeline.netimport --city ingolstadt --strong --turns --out d.json
     python -m scms_sim_ref.mock_pipeline.netimport --net some.net.xml --out net.json --no-geo
     python -m scms_sim_ref.mock_pipeline.netimport --net ingolstadt.net.xml --signals --strong \
         --no-geo --out intas.json
+    python -m scms_sim_ref.mock_pipeline.netimport --net ingolstadt.net.xml --strong --no-geo \
+        --buildings buildings.poly.xml --out intas_scene.json      # the whole city + footprints
 """
 from __future__ import annotations
 
@@ -62,9 +81,10 @@ import os
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 
-from .osm import (CITY_BBOXES, _DROP_ORDER, NETWORK_SCHEMA_VERSION, fetch_osm, network_document,
-                  osm_cache_path, road_projection)
+from .osm import (CITY_BBOXES, _DROP_ORDER, NETWORK_SCHEMA_VERSION, FootprintIndex, _ring_area,
+                  fetch_osm, network_document, osm_cache_path, road_projection)
 
 # netconvert flag set for OSM input. NOTE these are netconvert-ONLY options: netgenerate rejects
 # --tls.guess-signals / --ramps.guess / --junctions.join (it takes --tls.guess/--tls.join instead),
@@ -475,6 +495,291 @@ def road_surface(net, tf, *, vclass: str | None = "passenger", round_m: int = 2)
         r = max((math.dist(c, tf(px, py)) for px, py in n.getShape()), default=0.0)
         junctions.append([round(c[0], round_m), round(c[1], round_m), round(r, round_m)])
     return {"polylines": polylines, "junctions": junctions}
+
+
+# --------------------------------------------------------------------------- #
+# the OTHER half of the scene: building footprints, in the road graph's frame
+# --------------------------------------------------------------------------- #
+#: SUMO `<poly type="...">` values treated as buildings. `type="building"` is what polyconvert
+#: writes for an OSM `building=*` way and is exactly the selection
+#: `org.scms.radio.BuildingIndex.parse` makes on the Java side, so both engines rasterise the SAME
+#: footprint set rather than two subsets of one file.
+POLY_BUILDING_TYPES = ("building",)
+
+#: Footprints further than this from the road extent cannot block a link between two vehicles.
+BUILDING_MARGIN_M = 250.0
+
+#: `_assert_buildings_aligned` tolerances, every one MEASURED on InTAS by translating the real
+#: footprint layer and bisecting (`docs/realism/FULL-CITY-SCENE.md` §3 carries the table). They are
+#: chosen as a PAIR that covers the whole translation range with no hole: arm 1 catches a shift from
+#: ~0.9 km up, arm 3 from ~11 m up, so between them nothing survives.
+#:
+#: ARM 1 -- median building centroid against the median JUNCTION, per axis, as a fraction of that
+#: axis's road extent. Deliberately NOT `osm.extract_buildings`' "inside the road bbox widened by
+#: half the diagonal": netconvert keeps motorway stubs far outside the built-up area, so InTAS's
+#: road bbox is 13.58 x 11.09 km around an 8.31 x 8.01 km city and that rule tolerates an 8.8 km
+#: shift -- larger than the city. Measured offset on InTAS: 237.6 m / 199.0 m against tolerances of
+#: 1358.4 m / 1109.2 m, i.e. 5.7x / 5.6x headroom; this arm alone fires from 0.91-1.60 km depending
+#: on the direction, which is why arm 3 exists.
+ALIGN_BUILDING_CENTRE_FRAC = 0.10
+#: ARM 2 -- the FRACTION of centroids inside the road bbox. InTAS measures 1.0000. Moves under a
+#: wrong SCALE or a rotation, which spread the cloud without necessarily moving its centre.
+ALIGN_MIN_CENTROID_INSIDE_FRAC = 0.60
+#: ARM 3, the sharp one. A correctly registered city puts its junctions on tarmac: InTAS measures
+#: 0.0027 of junctions inside a footprint, and displacing the layer drives that toward the
+#: built-area fraction (0.0441 at 10 m, 0.1327 at 25 m, 0.16 at 100-400 m). 0.05 is 18x the real
+#: value and fires at a shift of about 11 m -- roughly one lane width.
+ALIGN_MAX_JUNCTIONS_IN_FOOTPRINT_FRAC = 0.05
+
+
+def _poly_rings(poly_path: str, types=POLY_BUILDING_TYPES) -> tuple[list, dict]:
+    """`<poly type="building" shape="x,y x,y ...">` -> OPEN vertex rings, in the file's own frame.
+
+    A SUMO polygon additional-file is written in the NET's metric coordinates (the same frame the
+    `.net.xml` junctions are in, `netOffset` already applied), so nothing is projected here -- the
+    caller's transform does that, and it must be the road graph's own."""
+    want = frozenset(types) if types else None
+    rings: list = []
+    raw = 0
+    skipped_type = 0
+    degenerate = 0
+    for _ev, el in ET.iterparse(poly_path, events=("end",)):
+        if el.tag != "poly":
+            continue
+        raw += 1
+        if want is not None and (el.get("type") or "") not in want:
+            skipped_type += 1
+            el.clear()
+            continue
+        pts = []
+        bad = False
+        for part in (el.get("shape") or "").split():
+            bits = part.split(",")
+            if len(bits) < 2:
+                continue
+            try:
+                pts.append((float(bits[0]), float(bits[1])))
+            except ValueError:
+                bad = True
+                break
+        el.clear()
+        if bad:
+            degenerate += 1
+            continue
+        if len(pts) >= 2 and pts[0] == pts[-1]:
+            pts = pts[:-1]                       # the closing vertex is implied, as everywhere else
+        if len(pts) < 3:
+            degenerate += 1
+            continue
+        rings.append(pts)
+    return rings, {"poly_elements": raw, "skipped_wrong_type": skipped_type,
+                   "degenerate": degenerate, "rings": len(rings)}
+
+
+def _assert_buildings_aligned(rings: list, road_bbox, junctions=None, *,
+                              margin_m: float = ALIGN_MARGIN_M,
+                              centre_frac: float = ALIGN_BUILDING_CENTRE_FRAC,
+                              min_centroid_inside: float = ALIGN_MIN_CENTROID_INSIDE_FRAC,
+                              max_junction_hit: float = ALIGN_MAX_JUNCTIONS_IN_FOOTPRINT_FRAC,
+                              index_cell_m: float = 40.0) -> dict:
+    """GATE: the footprints must sit ON the road network, in three independent ways.
+
+    THE FAILURE THIS EXISTS FOR is silent. `osm.py` derives its frame origin from the ROAD ways
+    only; a layer projected with a different origin (or with a SUMO net's own UTM offset left in)
+    lands hundreds of metres away while every individual polygon still looks like a building and
+    every street still looks like a street. The geometric channel then computes NLOSb against a city
+    translated off itself, and the resulting dataset is plausible and wrong.
+
+    ARM 1 -- the median building centroid against the median JUNCTION, per axis, tolerating
+    `max(margin_m, centre_frac * that axis's road extent)`. Catches a large translation.
+
+    ARM 2 -- the FRACTION of centroids inside the road bbox. Moves under a wrong SCALE or a rotation,
+    which shift the cloud's spread without necessarily moving its centre.
+
+    ARM 3 -- the fraction of ROAD JUNCTIONS that land inside a footprint. This is the sharp one and
+    the only one that is a statement about REGISTRATION rather than about extent: a city's junctions
+    are on tarmac, so a correct overlay puts almost none of them inside a wall, and even a one-lane
+    displacement pushes that fraction toward the built-area fraction. Skipped (and reported as None)
+    when the caller passes no junctions -- and then arms 1-2 alone tolerate a shift of hundreds of
+    metres, so a caller that can supply junctions should.
+
+    The two thresholds are chosen as a pair with no hole between them: see the constants above.
+    """
+    if not rings:
+        raise ValueError("no building footprints were read: nothing to register against the roads")
+    cents = [(sum(p[0] for p in r) / len(r), sum(p[1] for p in r) / len(r)) for r in rings]
+    bxs = [p[0] for r in rings for p in r]
+    bys = [p[1] for r in rings for p in r]
+    cxs = sorted(c[0] for c in cents)
+    cys = sorted(c[1] for c in cents)
+    med = (cxs[len(cxs) // 2], cys[len(cys) // 2])
+    info: dict = {"polygons": len(rings), "vertices": len(bxs),
+                  "building_bbox": [round(min(bxs), 2), round(min(bys), 2),
+                                    round(max(bxs), 2), round(max(bys), 2)],
+                  "median_building_centroid": [round(med[0], 2), round(med[1], 2)]}
+    if road_bbox is None:
+        info.update(centroid_inside_road_bbox_frac=None, junctions_in_footprint_frac=None)
+        return info
+    rx0, ry0, rx1, ry1 = (float(v) for v in road_bbox)
+    info["road_bbox"] = [round(rx0, 2), round(ry0, 2), round(rx1, 2), round(ry1, 2)]
+    trap = ("THIS IS THE PROJECTION TRAP -- footprints must go through the SAME transform the "
+            "junctions did (netimport._transformer on this net), never through a re-derived "
+            "origin, and a SUMO .poly.xml is already in the net's own metric frame.")
+    if junctions:
+        # The median JUNCTION, not the bbox centre. netconvert keeps motorway stubs far outside the
+        # built-up area, so InTAS's road bbox centre sits 1.9 km east of the city its buildings are
+        # in and a bbox-centre test would fail a CORRECT import. The junction cloud's median is the
+        # city; measured offset from it, 238 m / 199 m.
+        jxs = sorted(p[0] for p in junctions)
+        jys = sorted(p[1] for p in junctions)
+        anchor = (jxs[len(jxs) // 2], jys[len(jys) // 2])
+        tol_x = max(margin_m, centre_frac * abs(rx1 - rx0))
+        tol_y = max(margin_m, centre_frac * abs(ry1 - ry0))
+        info["alignment_anchor"] = [round(anchor[0], 2), round(anchor[1], 2)]
+        info["alignment_anchor_is"] = "median junction"
+        info["alignment_tolerance_m"] = [round(tol_x, 1), round(tol_y, 1)]
+        info["median_offset_m"] = [round(med[0] - anchor[0], 2), round(med[1] - anchor[1], 2)]
+        if abs(med[0] - anchor[0]) > tol_x or abs(med[1] - anchor[1]) > tol_y:
+            raise ValueError(
+                f"projected building footprints do not sit on the road network: their median "
+                f"centroid {info['median_building_centroid']} is offset {info['median_offset_m']} m "
+                f"from the median junction {info['alignment_anchor']}, beyond the tolerance "
+                f"{info['alignment_tolerance_m']} m (= {centre_frac:g} of each axis's road extent, "
+                f"floor {margin_m:g} m). " + trap)
+    else:
+        # No junction cloud: fall back to `osm.extract_buildings`' containment rule, which is all a
+        # bbox alone can support. It is MUCH weaker -- on InTAS it tolerates an 8.8 km shift -- so
+        # a caller that can supply junctions must.
+        tol = max(margin_m, 0.5 * math.hypot(rx1 - rx0, ry1 - ry0))
+        info["alignment_anchor_is"] = "road bbox containment (no junctions supplied -- weak)"
+        info["alignment_tolerance_m"] = round(tol, 1)
+        if not (rx0 - tol <= med[0] <= rx1 + tol and ry0 - tol <= med[1] <= ry1 + tol):
+            raise ValueError(
+                f"projected building footprints do not sit on the road network: median centroid "
+                f"{info['median_building_centroid']} is outside the road bbox {info['road_bbox']} "
+                f"widened by {tol:.0f} m. " + trap)
+    inside = sum(1 for c in cents if rx0 <= c[0] <= rx1 and ry0 <= c[1] <= ry1)
+    frac = inside / len(cents)
+    info["centroid_inside_road_bbox_frac"] = round(frac, 4)
+    if frac < min_centroid_inside:
+        raise ValueError(
+            f"only {frac:.2%} of building centroids land inside the road extent "
+            f"{info['road_bbox']} (floor {min_centroid_inside:.0%}). A correct overlay measures "
+            f"87-100%; this is the signature of a wrong SCALE or a rotated frame, which spreads the "
+            f"footprint cloud without necessarily moving its centre.")
+    info["junctions_in_footprint_frac"] = None
+    if junctions:
+        idx = FootprintIndex(rings, cell_m=index_cell_m)
+        hit = sum(1 for jx, jy in junctions if idx.entered(jx, jy, jx, jy))
+        jf = hit / len(junctions)
+        info["junctions"] = len(junctions)
+        info["junctions_in_footprint"] = hit
+        info["junctions_in_footprint_frac"] = round(jf, 4)
+        if jf > max_junction_hit:
+            raise ValueError(
+                f"{jf:.2%} of the road graph's junctions land INSIDE a building footprint (ceiling "
+                f"{max_junction_hit:.0%}). Junctions are on tarmac in every real city -- InTAS "
+                f"measures 0.27%, 9 of 3332 -- so this says the two layers are not registered with "
+                f"each other. Check that the footprints went through this net's own transform: a "
+                f"10 m displacement already reads 4.4% and a 25 m one 13.3%.")
+    return info
+
+
+def buildings_from_poly(poly_path: str, tf=None, *, types=POLY_BUILDING_TYPES,
+                        road_bbox=None, junctions=None, margin_m: float = BUILDING_MARGIN_M,
+                        min_area_m2: float = 0.0, simplify_tol_m: float = 0.0,
+                        max_polygons: int = 0, round_m: int = 2,
+                        gate: bool = True) -> tuple[list, dict]:
+    """A SUMO `.poly.xml` -> building rings in the ROAD GRAPH's frame, gated on landing there.
+
+    `tf` MUST be the transform this import applied to the junction coordinates
+    (`netimport._transformer(net, projection)[0]`, which `scene_from_net` and
+    `sumo_trace.engine_network` both hand out) -- see `_assert_buildings_aligned`.
+
+    The defaults are deliberately LOSSLESS -- no minimum area, no RDP simplification, no polygon
+    cap -- because the Java side (`org.scms.radio.BuildingIndex`) rasterises the file as it stands,
+    and a cross-engine comparison of link-state composition is only a comparison if both engines
+    hold the same footprints. `osm.extract_buildings` simplifies at 1 m and caps at 6000 because it
+    is reconstructing rings from raw OSM node refs; here the polygons arrive already resolved.
+
+    Returns `(polygons, info)`; each polygon is an OPEN vertex list `[[x, y], ...]`, sorted
+    canonically so the layer is byte-stable for a given input.
+    """
+    rings, stats = _poly_rings(poly_path, types)
+    if not rings:
+        raise ValueError(f"{poly_path}: no <poly> of type {list(types)} carried a usable shape "
+                         f"({stats['poly_elements']} poly elements seen)")
+    if tf is not None:
+        rings = [[tf(x, y) for x, y in r] for r in rings]
+    if min_area_m2 > 0.0:
+        n0 = len(rings)
+        rings = [r for r in rings if _ring_area(r) >= min_area_m2]
+        stats["dropped_below_min_area"] = n0 - len(rings)
+    if simplify_tol_m > 0.0:
+        from .osm import _rdp                     # noqa: PLC0415  (only on the opt-in path)
+        simp = []
+        for r in rings:
+            if len(r) > 4:
+                s = _rdp(list(r) + [r[0]], simplify_tol_m)
+                if len(s) >= 4:
+                    r = [tuple(p) for p in s[:-1]]
+            simp.append(r)
+        rings = simp
+    stats["kept_before_bbox"] = len(rings)
+    if road_bbox is not None:
+        rx0, ry0, rx1, ry1 = (float(v) for v in road_bbox)
+        lo_x, lo_y = rx0 - margin_m, ry0 - margin_m
+        hi_x, hi_y = rx1 + margin_m, ry1 + margin_m
+        near = []
+        for r in rings:
+            cx = sum(p[0] for p in r) / len(r)
+            cy = sum(p[1] for p in r) / len(r)
+            if lo_x <= cx <= hi_x and lo_y <= cy <= hi_y:
+                near.append(r)
+        stats["dropped_beyond_margin"] = len(rings) - len(near)
+        rings = near
+    if not rings:
+        raise ValueError(f"{poly_path}: every footprint fell outside the road extent "
+                         f"{road_bbox} widened by {margin_m:g} m")
+    align = _assert_buildings_aligned(rings, road_bbox, junctions) if gate else {}
+    rings.sort(key=lambda r: (round(min(p[0] for p in r), 3), round(min(p[1] for p in r), 3)))
+    if max_polygons and len(rings) > max_polygons:
+        stats["truncated_from"] = len(rings)
+        rings = rings[:max_polygons]
+    out = [[[round(x, round_m), round(y, round_m)] for x, y in r] for r in rings]
+    info = {**stats, **align, "polygons": len(out),
+            "vertices": sum(len(r) for r in out),
+            "source": os.path.abspath(poly_path).replace("\\", "/"),
+            "poly_types": list(types), "min_area_m2": float(min_area_m2),
+            "simplify_tol_m": float(simplify_tol_m), "gated": bool(gate)}
+    return out, info
+
+
+def scene_from_net(net_path: str, poly_path: str, *, projection: dict | None = None,
+                   **kw) -> tuple[list, dict]:
+    """`(.net.xml, .poly.xml)` -> footprints in that net's frame, registered against its junctions.
+
+    THE POINT OF THIS FUNCTION is that it does not accept a transform from the caller: it reads the
+    net, builds the transform with `_transformer` -- the same call `net_to_network` makes -- and
+    derives the road bbox and the junction cloud from that same net. There is therefore no way for
+    the footprints to end up in a frame the roads are not in, which is the entire failure mode.
+
+    Costs one extra `sumolib` read of the net (0.5 s on InTAS's 16.9 MB). That is deliberate: the
+    alternative -- re-deriving the transform from the `<location>` element alone -- would be a
+    second implementation of the one thing that must not diverge.
+    """
+    net = read_net(net_path)
+    tf, _param = _transformer(net, projection)
+    junctions = [tf(*n.getCoord()[:2]) for n in net.getNodes() if n.getType() != "internal"]
+    if not junctions:
+        raise ValueError(f"{net_path}: no non-internal junctions to register footprints against")
+    xs = [p[0] for p in junctions]
+    ys = [p[1] for p in junctions]
+    polys, info = buildings_from_poly(poly_path, tf, road_bbox=[min(xs), min(ys), max(xs), max(ys)],
+                                      junctions=junctions, **kw)
+    info["net"] = os.path.abspath(net_path).replace("\\", "/")
+    info["net_junctions"] = len(junctions)
+    return polys, info
 
 
 def _canonicalise_shapes(directed: list, coords: list) -> int:
@@ -969,8 +1274,13 @@ def main(argv=None) -> int:
     p.add_argument("--frame-city", choices=sorted(CITY_BBOXES),
                    help="with --net: re-project into THIS city's osm.py frame (use it whenever the "
                         "net will share a map with osm.py roads or building footprints)")
+    p.add_argument("--buildings", metavar="POLY_XML",
+                   help="with --net: a SUMO polygon additional-file whose type=\"building\" "
+                        "footprints are projected with THIS net's transform and emitted as the "
+                        "document's `buildings` layer. Gated on landing on the junctions")
     p.add_argument("--stats", action="store_true", help="print topology fidelity stats")
     a = p.parse_args(argv)
+    buildings = None
     if a.net:
         frame = None
         if a.frame_city:
@@ -978,12 +1288,19 @@ def main(argv=None) -> int:
         nodes, edges, info = import_net(a.net, max_nodes=a.max_nodes, shapes=not a.no_shapes,
                                         turns=a.turns, strong=a.strong, projection=frame,
                                         signals=a.signals)
+        if a.buildings:
+            buildings, binfo = scene_from_net(a.net, a.buildings, projection=frame)
+            info["buildings_stats"] = binfo
     else:
+        if a.buildings:
+            p.error("--buildings goes with --net (a SUMO .poly.xml belongs to a SUMO net); the "
+                    "raw-OSM path takes its footprints from the same Overpass extract via "
+                    "`python -m scms_sim_ref.mock_pipeline.osm --buildings`")
         target = a.city if a.city else [float(v) for v in a.bbox.split(",")]
         nodes, edges, info = import_city(target, a.cache, max_nodes=a.max_nodes,
                                          shapes=not a.no_shapes, turns=a.turns, strong=a.strong,
                                          geo=not a.no_geo, signals=a.signals)
-    doc = signal_document(nodes, edges, info)
+    doc = signal_document(nodes, edges, info, buildings=buildings)
     with open(a.out, "w", encoding="utf-8") as fh:
         json.dump(doc, fh)
     keys = ("n_nodes", "n_edges", "n_directed_edges", "oneway_share", "intersections_deg_ge3",

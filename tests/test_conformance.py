@@ -889,8 +889,16 @@ def test_the_lock_sees_an_edit_to_a_SIBLING_module_not_just_the_defining_file(tm
         with pytest.raises(api.PluginDriftError) as e:
             RM._api_registry.verify_lock(lock)
         assert e.value.field == "package_sha256"
-        # --allow-plugin-drift still downgrades a hard stop to a loud one, never to silence
-        assert len(RM._api_registry.verify_lock(lock, allow_drift=True)) == 1
+        # --allow-plugin-drift still downgrades a hard stop to a loud one, never to silence.
+        # TWO rows, because two independent hashes see this edit now: `package_sha256` (the
+        # plugin's own package tree) and `import_closure_sha256` (every non-stdlib module the
+        # plugin's imports reach, which is the one that also covers a sibling in a DIFFERENT
+        # top-level package -- the case `package_sha256` cannot see by construction).
+        allowed = RM._api_registry.verify_lock(lock, allow_drift=True)
+        assert len(allowed) == 2
+        assert sorted(f for f in ("package_sha256", "import_closure_sha256")
+                      if any(f in msg for msg in allowed)) == ["import_closure_sha256",
+                                                               "package_sha256"]
     finally:
         sys.path.remove(str(tmp_path))
         for name in [m for m in list(sys.modules) if m == "sibpkg" or m.startswith("sibpkg.")]:

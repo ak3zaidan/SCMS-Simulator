@@ -54,6 +54,11 @@ And what is NOT claimed, stated as plainly as the rest:
 * This is **detection after the fact**, at named checkpoints. A plugin that tampers, reads what it
   wants and restores the binding before the checkpoint is not seen. Closing that needs a boundary
   this process does not have.
+* Detection is not the only instrument any more, and the division of labour matters:
+  :mod:`~scms_sim_ref.api.guard` REFUSES the reflective routes (`sys._getframe`, the `gc` walkers,
+  `ctypes`) while a gated plugin call is on the stack, from inside CPython, so the frame walk that
+  moves nothing on this list is now refused rather than merely invisible. This module still answers
+  the question that one cannot: *did anything the engine is made of change during the run?*
 * The sentinel is itself an object in the same address space. It watches its own module entry, which
   raises the bar and does not remove it.
 * A **passing** verification means "nothing on the watch list moved", never "this plugin is honest".
@@ -71,6 +76,10 @@ import random
 import sys
 
 from .errors import ConfigError
+#: The runtime plugin guard's nesting depth, bound ONCE here because `WitnessedRandom.random` reads
+#: it on every draw of the run and an attribute lookup through two modules per draw is not free.
+#: The list object's identity never changes, so this binding cannot go stale.
+from .guard import _DEPTH as _GUARD_DEPTH
 
 
 class IntegrityError(ConfigError):
@@ -142,8 +151,49 @@ MODULE_WATCH = (
                                         "_observed_detectors")),
     ("builtins", ("getattr", "setattr", "delattr", "open", "round", "float", "int", "sorted",
                   "isinstance", "__import__")),
+    ("scms_sim_ref.api.guard", ("guarded", "install", "enter", "leave", "arm", "violations",
+                                "violation_count", "_hook", "_refuse", "_check_import",
+                                "REFUSED_EVENTS", "REFUSED_PREFIXES", "GuardError")),
     ("hashlib", ("sha256",)),
     ("json", ("dumps",)),
+)
+
+#: `module -> class name`. THE WATCH LIST'S SECOND HALF, and it exists because the first half could
+#: not see the hole it closes.
+#:
+#: :data:`MODULE_WATCH` compares the identity of a module ATTRIBUTE. For a class attribute that is
+#: the identity of the class OBJECT -- which does not move when a METHOD ON IT is rewritten.
+#: Measured against this engine: setting ``WitnessedRandom.verify_stream`` to a no-op (and
+#: ``WitnessedRandom.random`` to one that does not count) defeated the stream self-check and moved
+#: the digest while every entry above compared equal, because `integrity.WitnessedRandom` was still
+#: the same class object. The `random.Random` methods were watched, one class's worth; every OTHER
+#: watched class's methods were not.
+#:
+#: The comparison is over the WHOLE ``vars(cls)`` -- names added, names removed, values rebound --
+#: rather than a hand-listed method set, so a class that grows a method is covered on the day it
+#: grows it and there is no second list to keep in step.
+CLASS_WATCH = (
+    ("scms_sim_ref.api.integrity", "WitnessedRandom"),
+    ("scms_sim_ref.api.integrity", "Sentinel"),
+    ("scms_sim_ref.api.detect", "Observation"),
+    ("scms_sim_ref.api.detect", "NamespacedState"),
+    ("scms_sim_ref.api.detect", "CheckBase"),
+    ("scms_sim_ref.api.detect", "FusionBase"),
+    ("scms_sim_ref.api.channel", "LinkOutcome"),
+    ("scms_sim_ref.api.channel", "StepFrame"),
+    ("scms_sim_ref.api.channel", "StationSnapshot"),
+    ("scms_sim_ref.api.channel", "PerLinkAdapter"),
+    ("scms_sim_ref.api.channel", "BatchAdapter"),
+    ("scms_sim_ref.api.codec", "Claim"),
+    ("scms_sim_ref.api.codec", "StationView"),
+    ("scms_sim_ref.api.rng", "RngNamespace"),
+    ("scms_sim_ref.api.registry", "ProvenanceRecord"),
+    ("scms_sim_ref.api.isolate", "IsolatedCheck"),
+    ("scms_sim_ref.conformance.runner", "ConformanceReport"),
+    ("scms_sim_ref.mock_pipeline.run", "ReadOnlyConfig"),
+    ("scms_sim_ref.mock_pipeline.run", "CheckSuite"),
+    ("scms_sim_ref.mock_pipeline.run", "LoadedCheck"),
+    ("scms_sim_ref.mock_pipeline.run", "WireEncoder"),
 )
 
 
@@ -172,6 +222,24 @@ def _module_surface() -> dict:
     return out
 
 
+def _class_surface() -> dict:
+    """`(module, class) -> {attribute: value}` over :data:`CLASS_WATCH`.
+
+    `dict(vars(cls))` and not a listed method set: the point of this half of the watch list is
+    everything the class HAS, so a method added tomorrow is covered without a second edit.
+    """
+    out = {}
+    for mod_name, cls_name in CLASS_WATCH:
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        cls = getattr(mod, cls_name, None)
+        if not isinstance(cls, type):
+            continue
+        out[(mod_name, cls_name)] = (cls, dict(vars(cls)))
+    return out
+
+
 class Sentinel:
     """A snapshot of the engine's identity-critical objects, and the comparison against it.
 
@@ -180,17 +248,18 @@ class Sentinel:
     point: a bounded conformance window cannot see a step-30 attack, and this can.
     """
 
-    __slots__ = ("_rand", "_mods", "_trace", "_profile", "_meta", "armed")
+    __slots__ = ("_rand", "_mods", "_classes", "_trace", "_profile", "_meta", "armed")
 
     def __init__(self, *, armed: bool = True):
         self.armed = bool(armed)
         if not self.armed:
-            self._rand = self._mods = {}
+            self._rand = self._mods = self._classes = {}
             self._trace = self._profile = None
             self._meta = ()
             return
         self._rand = _random_surface()
         self._mods = _module_surface()
+        self._classes = _class_surface()
         self._trace = sys.gettrace()
         self._profile = sys.getprofile()
         self._meta = tuple(sys.meta_path)
@@ -199,7 +268,10 @@ class Sentinel:
     def watched(self) -> int:
         """How many named objects this snapshot covers -- the manifest records it, so a reader can
         tell a monitored run from an unmonitored one without trusting a boolean."""
-        return (len(self._rand) + len(self._mods) + 3) if self.armed else 0
+        if not self.armed:
+            return 0
+        return (len(self._rand) + len(self._mods) + 3
+                + sum(len(d) for _cls, d in self._classes.values()))
 
     # -- comparison --------------------------------------------------------------------------- #
     def drift(self) -> list:
@@ -239,6 +311,7 @@ class Sentinel:
             if now is not was:
                 out.append((f"{mod_name}.{attr}",
                             f"{_describe(was)} -> {_describe(now)}{_why(mod_name, attr)}"))
+        out.extend(self._class_drift())
         if self._trace is None and sys.gettrace() is not None:
             out.append(("sys.settrace",
                         "a trace hook was INSTALLED during the run; a trace function sees every "
@@ -252,6 +325,38 @@ class Sentinel:
                         f"{[type(m).__name__ for m in added]}; a meta_path finder can substitute "
                         f"any module the engine imports after it"))
         out.sort()
+        return out
+
+    def _class_drift(self) -> list:
+        """Methods (and any other class attribute) rebound, added or deleted on a WATCHED CLASS.
+
+        Reported per attribute, with the class named, because "WitnessedRandom.verify_stream was
+        replaced" is the sentence that identifies the attack and "integrity.WitnessedRandom moved"
+        is not -- the class object does not move at all when a method on it is rewritten.
+        """
+        out = []
+        for (mod_name, cls_name), (cls, was) in sorted(self._classes.items()):
+            mod = sys.modules.get(mod_name)
+            now_cls = getattr(mod, cls_name, None) if mod is not None else None
+            if now_cls is not cls:
+                # The class OBJECT itself was replaced. `MODULE_WATCH` reports that where it is
+                # watched; comparing this snapshot's methods against a different class would print
+                # one consequence per method of a single cause.
+                out.append((f"{mod_name}.{cls_name}",
+                            f"the class object itself was replaced; every method comparison below "
+                            f"it is against a different class and is not reported"))
+                continue
+            now = dict(vars(cls))
+            for name in sorted(set(was) | set(now)):
+                old, new = was.get(name, _MISSING), now.get(name, _MISSING)
+                if old is new:
+                    continue
+                out.append((f"{mod_name}.{cls_name}.{name}",
+                            f"{_describe(old)} -> {_describe(new)}; a method rebound ON A WATCHED "
+                            f"CLASS leaves the class OBJECT'S identity -- the thing the module "
+                            f"watch compares -- perfectly intact, which is exactly how a no-op "
+                            f"WitnessedRandom.verify_stream defeated the stream self-check while "
+                            f"every other entry on this list compared equal"))
         return out
 
     # -- restoration -------------------------------------------------------------------------- #
@@ -284,6 +389,22 @@ class Sentinel:
                 try:
                     setattr(mod, attr, was)
                 except Exception:                                 # pragma: no cover
+                    pass
+        for (mod_name, cls_name), (cls, was) in self._classes.items():
+            mod = sys.modules.get(mod_name)
+            if mod is None or getattr(mod, cls_name, None) is not cls:
+                continue                                          # a replaced class: put back above
+            now = dict(vars(cls))
+            for name in set(was) | set(now):
+                old, new = was.get(name, _MISSING), now.get(name, _MISSING)
+                if old is new:
+                    continue
+                try:
+                    if old is _MISSING:
+                        delattr(cls, name)
+                    else:
+                        setattr(cls, name, old)
+                except Exception:                                 # pragma: no cover - exotic types
                     pass
         if self._trace is None and sys.gettrace() is not None:
             sys.settrace(None)
@@ -377,11 +498,27 @@ class WitnessedRandom(random.Random):
     identity snapshot above: the identity check catches a rebind that has not been *used* yet, and
     this catches one that was used and then removed before the checkpoint.
 
-    Honest about the residue: a plugin that draws from this object *through* the counted methods is
-    counted, so the states still agree -- what gives that away is the draw count itself moving away
-    from what the engine's own arithmetic explains, which nothing here can compute. The declared
-    property is "the stream advanced exactly as many words as it was ASKED for", not "only the engine
-    asked".
+    **The residue that used to be here is now closed, and this is what closed it.** A plugin that
+    reached this object -- by walking to `run_pipeline`'s `rng` local -- and drew from it *through*
+    the counted methods was COUNTED, so :meth:`verify_stream` still agreed while every downstream
+    draw in the run (`report_prob`, collusion, `net_delay`, the emit sampling) had shifted and the
+    digest had moved. The declared property was "the stream advanced exactly as many words as it was
+    ASKED for", never "only the engine asked", and that gap was measured (digest ``75176bd8`` against
+    a control ``d0cb992c``, undetected).
+
+    Both halves of it are shut now:
+
+    * the frame walk that reaches this object is refused at run time by
+      :mod:`~scms_sim_ref.api.guard`, from inside CPython, however it is spelled; and
+    * **this stream is CLOSED for the duration of every guarded plugin call.** The engine never
+      draws from its global stream while a plugin is on the stack -- the reception loop's draws
+      happen between calls, not inside one -- so a draw made while the guard is armed cannot be the
+      engine's, and it is refused rather than counted. That turns "we can prove the count" into "the
+      count cannot be moved by a plugin", which is the statement that was actually needed.
+
+    What remains, stated: a plugin that obtained this object and draws from it OUTSIDE a guarded
+    call -- from a background thread, or from a slot the config exempted with `source_gate: "off"`
+    -- is counted and not refused. Reaching it still requires the frame walk the guard refuses.
     """
 
     __slots__ = ("_words", "_state0")
@@ -396,10 +533,14 @@ class WitnessedRandom(random.Random):
         return self._words
 
     def random(self):
+        if _GUARD_DEPTH[0]:
+            raise _plugin_drew("random()")
         self._words += 2
         return super().random()
 
     def getrandbits(self, k):
+        if _GUARD_DEPTH[0]:
+            raise _plugin_drew("getrandbits()")
         self._words += (int(k) + 31) >> 5
         return super().getrandbits(k)
 
@@ -425,6 +566,22 @@ class WitnessedRandom(random.Random):
                 f"leaves the generator state a snapshot would compare perfectly intact).\n"
                 f"  Only plugin code can do this. No manifest is written.")
         return {"words": self._words}
+
+
+def _plugin_drew(what: str) -> IntegrityError:
+    return IntegrityError(
+        f"INTEGRITY FAILURE: {what} was called on the ENGINE'S GLOBAL random stream while a guarded "
+        f"plugin call was on the stack.\n"
+        f"  The engine never does this. Its own draws -- packet loss, report_prob, collusion, "
+        f"net_delay, the emit sampling -- all happen between plugin calls, never inside one, so a "
+        f"draw made here is a plugin's.\n"
+        f"  That single stream's draw COUNT AND ORDER are load-bearing: one extra draw shifts every "
+        f"subsequent value in the run and moves the digest, while the word counter -- which counts "
+        f"what it was ASKED for, not who asked -- stays perfectly consistent. Measured: one extra "
+        f"counted draw moved the digest and nothing saw it.\n"
+        f"  A plugin's randomness is its RngNamespace (api/rng.py), which is a pure function of "
+        f"(seed, plugin, label, ids, step) and is immune to call order and call count. No manifest "
+        f"is written.")
 
 
 def engine_random(seed, *, armed: bool):

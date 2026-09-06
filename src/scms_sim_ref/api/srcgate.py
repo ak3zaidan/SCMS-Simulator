@@ -41,6 +41,17 @@ must actually be prevented needs the out-of-process detector mode (a separate pr
 message boundary, the oracle simply not present in the address space) -- phase 4, and the only
 honest answer for genuinely untrusted code.
 
+**The SPELLING half of that gap is now closed at run time, elsewhere.**
+:mod:`~scms_sim_ref.api.guard` refuses `sys._getframe`, `sys._current_frames`, the `gc` object
+walkers, trace/profile installation and `ctypes` from inside CPython -- a PEP 578 audit hook fires
+in the C function itself, so `getattr(sys, "_get" + "frame")` reaches the same refusal as
+`sys._getframe`, and so does a helper module this gate never parsed. That does not make this module
+redundant and it does not make either of them a sandbox: this one turns the accident into a NAMED
+error at load time with a line number, the guard turns the deliberate act into a refusal at call
+time, and `guard.py`'s own docstring lists the three things it still cannot do. The two share one
+switch: `source_gate: "off"` turns off this gate AND the runtime guard for that plugin, which is
+what makes "code I wrote or audited" a single, recorded decision instead of two.
+
 Scope, stated so nobody over-reads a PASS: **the gate parses the single module the plugin class is
 DEFINED IN.** A helper module that class imports is not parsed, and neither is anything reached at
 run time. Widening it to the whole distribution is possible (`registry.package_root` already finds
