@@ -624,9 +624,11 @@ def _opposing_overlaps(dataset_dir):
         inst.setdefault(round(float(e["t"]), 3), {})[str(e["true_vehicle_id"])] = (
             float(e["true_x"]), float(e["true_y"]), float(e.get("true_heading") or 0.0))
     keys = [t for t in sorted(inst) if len(inst[t]) >= 2]
-    if len(keys) > rb.MAX_TIME_BUCKETS:
-        step = len(keys) / float(rb.MAX_TIME_BUCKETS)
-        keys = [keys[int(i * step)] for i in range(rb.MAX_TIME_BUCKETS)]
+    # The harness's OWN sampler, called rather than copied. This used to be a two-line copy of the
+    # fixed-stride rule; that rule was withdrawn for phase-locking onto the signal cycle, and a copy
+    # of a seeded rule diverges the moment either side changes. `stream="overlap"` is the same
+    # stream `_overlap_events` uses, so this selects the same instants it does.
+    keys = rb._subsample(keys, rb.MAX_TIME_BUCKETS, stream="overlap")
     opposing = same = 0
     for t in keys:
         pts = [inst[t][v] for v in sorted(inst[t])]

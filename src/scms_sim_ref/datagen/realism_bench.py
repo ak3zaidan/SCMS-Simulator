@@ -183,15 +183,48 @@ HEADWAY_LATERAL_TOL_M = LANE_WIDTH_M / 2.0    # a leader shares the follower's L
 HEADWAY_HEADING_TOL_DEG = 22.5                # ... and drives the same way (half of the old octant)
 HEADWAY_MAX_S = 60.0       # headways longer than this are "no leader", not a following headway
 HEADWAY_MIN_SPEED_MPS = 1.0
-HEADWAY_MAX_INSTANTS = 240    # cap on instants scanned for leaders (deterministic even spacing)
+HEADWAY_MAX_INSTANTS = 240    # cap on instants scanned for leaders (jittered systematic sampling)
 FD_CELL_M = 100.0          # fundamental-diagram space cell
 FD_WINDOW_S = 60.0         # fundamental-diagram time window
 FD_MIN_CELL_SAMPLES = 5    # per-cell segment count below which the cell is dropped
 OVERLAP_DIST_M = 1.0       # two distinct vehicles closer than this at one instant physically overlap
 LIVENESS_MIN_SPEED_MPS = 0.5  # a track whose whole span averages below this never actually moved
 LIVENESS_MIN_VEHICLES = 5     # ... and the moving fraction needs this many tracks to mean anything
-MAX_TIME_BUCKETS = 240     # cap on co-presence snapshots examined (deterministic even spacing)
+MAX_TIME_BUCKETS = 240     # cap on co-presence snapshots examined (jittered systematic sampling)
 MAX_VEH_PER_BUCKET = 400   # cap on vehicles per snapshot (deterministic: lowest vehicle ids first)
+#: WHAT THE CAP COSTS, AND WHAT TO SET IT TO. Measured, not assumed -- reference grid arm
+#: (``--flow --road grid --grid 6 --arrival-rate 2 --attacker-pct 0.15 --traffic-lights --seed 42``,
+#: mobility-oracle stream, 164 vehicles per instant) and, as the DENSE counter-case, this
+#: repository's ``datasets/py_intas_hour`` (1,669 vehicles per instant, 5.01e9 pair-instants):
+#:
+#:   duration    scans @240   scans uncapped   scorecard @240   scorecard uncapped
+#:      300 s       0.11 s        0.13 s           0.77 s            0.74 s   (-3%)
+#:     1800 s       0.34 s        0.89 s           3.02 s            3.58 s  (+19%)
+#:     3600 s       0.62 s        1.81 s           5.90 s            7.08 s  (+20%)
+#:     7200 s       1.17 s        3.82 s          11.71 s           14.42 s  (+23%)
+#:    14400 s       2.39 s        7.98 s          24.36 s           30.11 s  (+24%)
+#:   py_intas_hour 14.11 s      113.26 s
+#:
+#: So on the REFERENCE LADDER uncapped is affordable and ``--max-instants 0`` is the right setting
+#: whenever a graded verdict is being published: +5.75 s at 8 h, against the 684 s that generating
+#: that dataset took. It does NOT generalise, and that is why the default stays 240: these scans are
+#: O(instants x vehicles^2), ``_overlap_events`` applies no per-vehicle cap at all, and on the
+#: densest dataset in the repository uncapping is 8x the scan (14 s -> 113 s). A cap counted in
+#: INSTANTS cannot bound a cost that is quadratic in DENSITY; the knob that would is a PAIR-INSTANT
+#: budget, and that is the shape any future raise should take.
+#:
+#: Raising it is nonetheless cheap and worthwhile IF published magnitudes are to be compared
+#: run-to-run, because after the sampler fix the cap buys only PRECISION, never correctness. On the
+#: 8 h arm, over 40 seeds: cap 240 -> ``overlap_rate`` CV 4.55%, ``headway_ks`` CV 1.15%;
+#: 480 -> 3.08% / 0.70%; 960 -> 1.87% / 0.53%; 1920 -> 1.57% / 0.34%; 3840 -> 1.00% / 0.15%, and the
+#: MEAN is within +/-1.3% of the uncapped truth at every one of them. RECOMMENDED: 960 for anyone
+#: publishing cross-run magnitudes (halves the noise for +0.30 s of scan at 8 h, +20 s on the InTAS
+#: peak hour), 0 whenever the dataset is small enough to afford it. The default is left at 240
+#: deliberately: the cap is now a precision knob, the two GRADED capped rows are unaffected by it
+#: (``overlap_rate_max_per_1k_pair_instants`` is a zero-tolerance gate that no noise level can flip,
+#: and ``headway_ks`` sits 19 sd from its 0.15 threshold at cap 240), and bundling a precision change
+#: into the same commit as a BIAS FIX would make the two indistinguishable in the diff of every
+#: published number -- which is the reporting failure this whole finding is about.
 #: THE INSTANT CAPS ARE A COST CEILING, NOT A STATISTICAL ONE, and they are what makes a COUNT read
 #: off them incomparable across durations. With ``dt = 1.0 s`` a 240 s run is examined in full, a
 #: 3600 s run at 6.7% of its instants and a 28800 s run at 0.83% -- measured on the reference grid
@@ -1416,6 +1449,35 @@ def _subsample(items: list, max_items: int | None, *, stream: str,
     per stratum -- the design systematic sampling is the (fragile) shortcut for, with the same
     variance advantage over simple random sampling on a smoothly varying population and without the
     periodicity failure mode (Cochran, *Sampling Techniques*, 3rd ed., ch. 5 and 8.6).
+
+    WHAT THE REPLACEMENT ACHIEVES, on the thing that was broken. Published vs uncapped truth on the
+    reference arm, fixed-stride -> jittered, at the default cap of 240 in both cases::
+
+          duration   overlap_rate      headway_p50_s     headway_ks (GRADED vs 0.15)
+             300 s   -0.4% -> -0.6%    -0.2% -> -0.1%     +0.4% -> +0.1%
+            1800 s   -3.0% -> +2.7%    +0.6% -> +0.0%     -0.9% -> +0.8%
+            3600 s  -14.3% -> -0.9%    +0.6% -> -0.1%     -1.4% -> -1.0%
+            7200 s  -18.5% -> +7.0%    +2.3% -> +0.5%     -4.0% -> -1.0%
+           14400 s  -38.6% -> +5.1%    +7.2% -> -0.9%    -15.7% -> +1.1%
+
+    The remaining single-seed error is NOISE, not bias: over 50 seeds at 14,400 s the rate reads
+    0.15217 +/- 0.00695 against a truth of 0.15399 (mean -1.2%, CV 4.6%) and the KS reads
+    0.19179 +/- 0.00215 against 0.19262 (mean -0.4%, CV 1.1%).
+
+    AND IT IS NOT A LOCK MOVED TO A DIFFERENT PHASE. Sweeping the sampling grid across a full 24 s
+    signal cycle on the 14,400 s dataset -- the control that a merely re-aimed sampler would fail::
+
+                              min        max     spread    sd       mean vs truth
+        overlap_rate   old  0.09153    0.26718    2.92x   0.04694      -1.2%
+                       new  0.13908    0.16979    1.22x   0.00699      +1.6%
+        headway_ks     old  0.16079    0.22046    1.37x   0.02103      +1.3%
+                       new  0.18670    0.19475    1.04x   0.00212      -0.6%
+
+    The old rule's sd falls by 6.7x on the rate and 9.9x on the KS, and note what the OLD row means
+    for a graded verdict: the same 8-hour dataset published a KS anywhere from 0.1608 to 0.2205
+    against a 0.15 threshold depending only on which second the run happened to start. Under the new
+    rule the whole sweep lies in 0.1867-0.1948. That the old rule's MEAN over a full cycle is within
+    1.3% of the truth is the signature of a phase lock, not a defence of it.
 
     DETERMINISM. The draws come from ``random.Random(f"{seed}:{SAMPLER_KEY}:{stream}:{n}:{k}")`` --
     this repository's own string-keyed stream convention (``scms_sim_ref.api.rng``), which is

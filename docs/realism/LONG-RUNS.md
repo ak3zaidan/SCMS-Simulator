@@ -503,10 +503,16 @@ MAX_VEH_PER_BUCKET = 400      # cap on vehicles per snapshot
 ```
 
 With `dt = 1.0 s` a 240 s run is examined in full; a 3600 s run is examined at **6.7%** of its
-instants and the 28800 s run at **0.83%**. For a *distributional* metric that is harmless — the
-instants are evenly spaced across the run, so the sample stays representative in time, which is why
-`headway_ks` and the speed quantiles behave. For a *count* it is fatal, and the ladder shows it
+instants and the 28800 s run at **0.83%**. For a *count* that is fatal, and the ladder shows it
 end to end:
+
+> **The sentence that used to be here is withdrawn.** It read: *"For a distributional metric that is
+> harmless — the instants are evenly spaced across the run, so the sample stays representative in
+> time, which is why `headway_ks` and the speed quantiles behave."* That is false on signalised
+> traffic, and `headway_ks` is one of the rows it is false about. Even spacing is a fixed stride,
+> and a fixed stride phase-locks onto the signal cycle. **§3.5** is the measurement and the fix; the
+> speed quantiles are unaffected only because they are computed off an uncapped scan, which §3.5
+> uses as the control.
 
 | | 300 s | 900 s | 1800 s | 3600 s | 7200 s | 14400 s | 28800 s |
 |---|---|---|---|---|---|---|---|
@@ -522,6 +528,177 @@ durations**, because 434 → 319 over a 96× longer run is a **131× fall in the
 nothing in the row says out loud. `traffic.teleport_events` reads the same capped instant list and
 inherits the same property (it is 0 throughout on this arm, so nothing is visible, which is exactly
 the problem).
+
+### 3.5 The sampler itself phase-locked onto the signal cycle
+
+§3.3 paired every capped count with a **rate per unit examined**, on the argument that the rate is
+duration-invariant by construction because the cap moves numerator and denominator together. The
+construction is right and the row was still wrong, because the 240 instants behind it were **not a
+uniform-probability sample of the run**.
+
+`_even_subsample` took a **fixed stride**. A fixed stride is a Dirac comb, and a comb aliases against
+any periodic structure whose period divides it. On this arm `light_cycle_s = 24.0 s` (`run.py`), so
+the true overlap rate is periodic with **period 12 s**, while the stride `(D-1)/240` is
+7.5 / 15 / 30 / 60 s at 1800 / 3600 / 7200 / 14400 s. The number of **distinct signal phases** the
+scan can see is `12 / gcd(stride, 12)` = **8 / 4 / 2 / 1**. At 14400 s all 240 sampled instants sit at
+one phase of the cycle.
+
+Measured, published against the uncapped truth (`--max-instants 0`) on the mobility-oracle stream:
+
+| | 300 s | 1800 s | 3600 s | 7200 s | 14400 s |
+|---|---|---|---|---|---|
+| `overlap_rate_per_1k_pair_instants` **published** | 0.16040 | 0.15242 | 0.13428 | 0.12661 | **0.09460** |
+| … **uncapped truth** | 0.16108 | 0.15714 | 0.15675 | 0.15538 | **0.15399** |
+| … error | −0.4% | −3.0% | **−14.3%** | **−18.5%** | **−38.6%** |
+| `overlap` `estimated_run_total` published / true | 542 / 544 | 3,494 / 3,602 | 6,158 / 7,189 | 11,825 / 14,511 | **18,270 / 29,740** |
+| `headway_p50_s` published / true | 4.6589 / 4.6695 | 4.7617 / 4.7338 | 4.7732 / 4.7467 | 4.8638 / 4.7540 | **5.0808 / 4.7384** |
+| `headway_ks_shifted_exponential` published / true | 0.1975 / 0.1967 | 0.1919 / 0.1938 | 0.1898 / 0.1925 | 0.1843 / 0.1919 | **0.1624 / 0.1926** |
+
+The truth is **flat to ±2.4% over a 48× duration range**. The published rate falls by 41%. And the
+last row is the one that matters most: `headway_ks_shifted_exponential` is **graded** against
+`urban.time_headway_ks_max = 0.15`. At 14400 s it published 0.1624 — 8% above the threshold and
+trending down at −17.8% over the ladder — where the dataset's actual value is 0.1926, 28% above it.
+**A duration whose stride lands on a low-density phase can turn a real failure into a pass on
+sampler phase alone.**
+
+Three controls separate bias from noise:
+
+1. **Shift the grid by one second at 14400 s** and the rate moves 0.094603 → 0.258373 (309 → 860
+   overlap events). Sweeping all 12 phase offsets spans **2.73×** and *averages* 0.152640 — within
+   −0.9% of the truth. Averaging over the cycle recovers the answer, which is the signature of a
+   phase lock.
+2. **Thirty random 240-instant sub-samples** of the same dataset give 0.156438 ± 0.007537. The
+   published 0.094603 is **8.2 sd below** that mean. 240 instants is enough; the *choice* of 240 was
+   not.
+3. **The same scenario without `--traffic-lights`** shows only −2.0%, 7× smaller — which is what
+   identifies the signal cycle, and not the duration, as the driver.
+
+`speed_p50` / `speed_p95` and `fd_capacity` are **bit-identical** capped and uncapped, because they
+are read off scans that were never capped. That scopes the defect exactly: it is the instant-capped
+scans, and nothing else.
+
+#### The fix, and why this one
+
+`realism_bench._subsample` replaces the fixed stride with **jittered systematic sampling**: partition
+`range(n)` into `k` contiguous windows of width `s = n/k` and take one seeded uniform draw inside
+each. Item *m* is selected iff some window's draw lands in `[m, m+1)`; the windows tile `[0, n)` and
+each draw is uniform over its own window, so **every item's inclusion probability is exactly `k/n`**,
+at every `n` and `k`, against any spectrum. The `k` phase offsets are i.i.d. uniform on `[0, s)`, so
+the sampled phase modulo any period `p ≤ s` is uniform and the estimate's expectation is the
+full-cycle average — the standard anti-aliasing result for stochastic sampling (Dippé & Wold 1985;
+Cook, *ACM ToG* 5(1), 1986): jitter converts aliasing into noise. Exactly one index per window means
+the maximum gap stays under `2s`, so it keeps the even coverage that systematic sampling was chosen
+for — it *is* stratified sampling with one unit per stratum, the design systematic sampling is the
+fragile shortcut for (Cochran, *Sampling Techniques*, 3rd ed., §5, §8.6).
+
+The two alternatives were rejected on evidence, not taste. **A stride forced coprime with the
+structure** needs the period to be known, and this harness scores arbitrary datasets whose periods
+include the signal cycle, `demand_period_s`, the CAM interval, pseudonym rotation and any imported
+network's own signal programs; a stride coprime with 12 still aliases against 5 or 7, so this only
+moves the failure to the next dataset. **Full-period aggregation** also needs the period and changes
+what the metric means — a per-cycle average is not the per-instant distribution the KS row is
+computed on; where it is affordable it is already available, and it is called `--max-instants 0`.
+
+Determinism is preserved exactly: the draws come from
+`random.Random(f"{seed}:{SAMPLER_KEY}:{stream}:{n}:{k}")`, this repository's own string-keyed stream
+convention (`scms_sim_ref.api.rng`), which is `PYTHONHASHSEED`-independent and platform-stable. The
+key carries the seed, the stream name, the population size and the cap and nothing else — no call
+order, no call count, no global RNG — so the same dataset and seed give byte-identical output, and
+adding a new capped scan cannot move an existing one's numbers. `scorecard(sampler_seed=N)` /
+`--sampler-seed N` exposes it so a capped row's sampling noise can be **measured** rather than
+assumed. Both pinned pipeline digests are untouched: this module is read-only.
+
+#### After
+
+| | 300 s | 1800 s | 3600 s | 7200 s | 14400 s |
+|---|---|---|---|---|---|
+| `overlap_rate` error, **old → new** | −0.4% → −0.6% | −3.0% → +2.7% | −14.3% → **−0.9%** | −18.5% → **+7.0%** | −38.6% → **+5.1%** |
+| `headway_p50_s` error, old → new | −0.2% → −0.1% | +0.6% → +0.0% | +0.6% → −0.1% | +2.3% → **+0.5%** | +7.2% → **−0.9%** |
+| `headway_ks` error, old → new | +0.4% → +0.1% | −0.9% → +0.8% | −1.4% → −1.0% | −4.0% → **−1.0%** | −15.7% → **+1.1%** |
+
+The residual is **noise, not bias**. Over 50 seeds:
+
+| duration | `overlap_rate` mean err / CV | `headway_p50_s` mean err / CV | `headway_ks` mean err / CV |
+|---|---|---|---|
+| 300 s | +0.23% / 2.09% | +0.03% / 0.26% | −0.07% / 0.35% |
+| 1800 s | −0.47% / 4.38% | −0.02% / 0.69% | −0.43% / 1.13% |
+| 3600 s | +0.62% / 4.57% | +0.18% / 0.72% | −0.18% / 0.95% |
+| 7200 s | +0.62% / 5.05% | −0.11% / 0.76% | −0.31% / 1.06% |
+| 14400 s | −1.18% / 4.57% | +0.08% / 0.97% | −0.43% / 1.12% |
+
+#### The phase sweep — the control a re-aimed lock would fail
+
+Sweeping the sampling grid across a full 24 s cycle on the 14400 s dataset, 24 offsets:
+
+| | min | max | spread | sd | mean vs truth |
+|---|---|---|---|---|---|
+| `overlap_rate` **old** | 0.09153 | 0.26718 | **2.92×** | 0.04694 | −1.2% |
+| `overlap_rate` **new** | 0.13908 | 0.16979 | **1.22×** | **0.00699** | +1.6% |
+| `headway_ks` **old** | 0.16079 | 0.22046 | 1.37× | 0.02103 | +1.3% |
+| `headway_ks` **new** | 0.18670 | 0.19475 | **1.04×** | **0.00212** | −0.6% |
+
+The sd falls **6.7×** on the rate and **9.9×** on the KS. Read the KS row for what it means to a
+verdict: the same 8-hour dataset published anywhere from 0.1608 to 0.2205 against a 0.15 threshold
+depending only on which second the run started. Under the new sampler the entire sweep lies inside
+0.1867–0.1948.
+
+#### What the cap costs, and what to set it to
+
+Wall clock, measured (reference arm, mobility-oracle stream, 164 vehicles/instant; and
+`datasets/py_intas_hour` at 1,669 vehicles/instant as the dense counter-case):
+
+| duration | scans @240 | scans uncapped | `scorecard()` @240 | `scorecard()` uncapped |
+|---|---|---|---|---|
+| 300 s | 0.11 s | 0.13 s | 0.77 s | 0.74 s (−3%) |
+| 1800 s | 0.34 s | 0.89 s | 3.02 s | 3.58 s (+19%) |
+| 3600 s | 0.62 s | 1.81 s | 5.90 s | 7.08 s (+20%) |
+| 7200 s | 1.17 s | 3.82 s | 11.71 s | 14.42 s (+23%) |
+| 14400 s | 2.39 s | 7.98 s | 24.36 s | **30.11 s (+24%)** |
+| `py_intas_hour` | 14.11 s | **113.26 s** | | |
+
+**On the reference ladder, uncapped is affordable and is the right setting whenever a graded verdict
+is being published**: +5.75 s at 8 h, against the 684 s that generating that dataset took. It does
+not generalise — these scans are O(instants × vehicles²), `_overlap_events` applies no per-vehicle
+cap, and on the densest dataset here uncapping is 8× the scan. A cap counted in *instants* cannot
+bound a cost that is quadratic in *density*; a **pair-instant budget** is the shape a future raise
+should take.
+
+Since the sampler fix the cap buys only precision, never correctness. On the 8 h arm, 40 seeds:
+
+| cap | coverage | `overlap_rate` CV | `headway_ks` CV | scan |
+|---|---|---|---|---|
+| 240 | 1.7% | 4.55% | 1.15% | 2.49 s |
+| 480 | 3.3% | 3.08% | 0.70% | 2.58 s |
+| **960** | 6.7% | **1.87%** | **0.53%** | **2.79 s** |
+| 1920 | 13.3% | 1.57% | 0.34% | 3.11 s |
+| 3840 | 26.7% | 1.00% | 0.15% | 3.80 s |
+| 0 | 100% | — | — | 7.63 s |
+
+…and the mean is within ±1.3% of the uncapped truth at every one of them. **Recommended: 960** for
+anyone publishing cross-run magnitudes (halves the noise for +0.30 s of scan at 8 h, +20 s on the
+InTAS peak hour), **0** whenever the dataset is small enough to afford it. The shipped default stays
+**240**, deliberately: the two graded capped rows are unaffected by the choice
+(`overlap_rate_max_per_1k_pair_instants` is a zero-tolerance gate no noise level can flip, and
+`headway_ks` sits 19 sd from its threshold at cap 240), and bundling a precision change into the
+same change as a bias fix would make the two indistinguishable in the diff of every published number.
+
+#### The test that dodged it
+
+`tests/test_long_runs.py` built its overlap fixture with `overlap_every=7`, documented as
+*"deliberately COPRIME with the sub-sampling strides the tests use, so no result below is an
+aliasing artefact"*. Choosing a period coprime with the stride is choosing not to test the sampler,
+and the failure mode the real signalised arm exhibits — a period that **divides** the stride — was
+therefore never exercised. Section *DEFECT 1b* now builds exactly that case (1,200 instants, cap
+240, stride 5, overlaps every 5), and against the fixed-stride rule it is red in both directions:
+
+| fixture | uncapped truth | fixed-stride published | jittered published |
+|---|---|---|---|
+| overlaps at phase 1 | 33.333 | **0.000 (−100%)** | 38.889 (+16.7%) |
+| overlaps at phase 0 | 33.333 | **166.667 (+400%)** | 33.333 (0.0%) |
+| phase sweep, 5 phases | 33.333 | 166.667, 0, 0, 0, 0 | 33.33, 38.89, 35.42, 29.17, 29.86 |
+
+At phase 1 the old rule reports **zero overlaps, on a HARD existence gate, about a dataset in which
+one happens every five seconds**.
 
 ### 3.4 Not measurable at all below a duration — and not converged above it
 

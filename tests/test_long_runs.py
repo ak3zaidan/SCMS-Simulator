@@ -139,13 +139,28 @@ def test_overlap_count_saturates_at_the_cap_while_the_rate_does_not(tmp_path):
     assert c_s["details"]["coverage_frac"] == 1.0
     assert c_l["details"]["coverage_frac"] == pytest.approx(0.2)
 
-    # THE DEFECT: 5x the traffic, and the count does not move at all
-    assert c_l["value"] == c_s["value"]
-    # THE FIX: the rate is the same number both times -- which is the truth about this scenario
-    assert r_l["value"] == pytest.approx(r_s["value"], rel=0.02)
+    # THE DEFECT: 5x the traffic, and the count does not move with it. The long run really contains
+    # 172 overlaps (1,200 instants, one every 7); 240 instants is 240 instants, so the count reports
+    # a fifth of them and a reader comparing it with the short run's 35 learns nothing.
+    true_long = _row(rb.scorecard(_dataset(str(tmp_path / "l0"),
+                                           _overlapping_platoon(rb.MAX_TIME_BUCKETS * 5)),
+                                  max_instants=0), "traffic.overlap_events")
+    assert true_long["details"]["instants_examined"] == 1200 and true_long["value"] == 172
+    assert c_l["value"] == pytest.approx(c_s["value"], rel=0.35)
+    assert c_l["value"] < 0.4 * true_long["value"]
+    # THE FIX: the rate is the same number both times -- which is the truth about this scenario.
+    # The short run is scanned in full, so r_s is exact; r_l is a 240-of-1,200 sample and carries
+    # the sampling noise the jittered sampler trades the old rule's phase bias for. Averaged over
+    # seeds that noise cancels, which is the actual claim: the estimator is UNBIASED, not exact.
+    assert r_l["value"] == pytest.approx(r_s["value"], rel=0.35)
+    reps = [_row(rb.scorecard(_dataset(str(tmp_path / f"r{s}"),
+                                       _overlapping_platoon(rb.MAX_TIME_BUCKETS * 5)),
+                              sampler_seed=s), "traffic.overlap_rate_per_1k_pair_instants")["value"]
+            for s in range(12)]
+    assert (sum(reps) / len(reps)) == pytest.approx(r_s["value"], rel=0.05)
     # ... and the extrapolated whole-run magnitude DOES grow with the run, as a reader expects
     assert (r_l["details"]["estimated_run_total"]
-            == pytest.approx(5 * r_s["details"]["estimated_run_total"], rel=0.05))
+            == pytest.approx(5 * r_s["details"]["estimated_run_total"], rel=0.35))
 
 
 def test_a_capped_count_says_out_loud_that_it_cannot_be_compared(tmp_path):
@@ -184,9 +199,16 @@ def test_max_instants_zero_removes_the_cap_and_the_count_becomes_the_run_s(tmp_p
     assert capped["details"]["instants_examined"] == 240
     assert full["details"]["instants_examined"] == full["details"]["instants_available"] == 960
     assert full["value"] > capped["value"]
-    # and the capped RATE was an unbiased estimate of the uncapped truth all along
+    # and the capped RATE was an unbiased estimate of the uncapped truth all along -- UNBIASED, not
+    # exact: a 240-of-960 sample carries binomial noise, so the single-seed value is within a third
+    # and the mean over seeds is within a twentieth. Asserting the tight bound on ONE seed would be
+    # asserting the sampler's luck, which is the mistake this whole section exists to stop making.
     est = _row(rb.scorecard(root), "traffic.overlap_rate_per_1k_pair_instants")
-    assert est["details"]["estimated_run_total"] == pytest.approx(full["value"], rel=0.10)
+    assert est["details"]["estimated_run_total"] == pytest.approx(full["value"], rel=0.30)
+    reps = [_row(rb.scorecard(root, sampler_seed=s),
+                 "traffic.overlap_rate_per_1k_pair_instants")["details"]["estimated_run_total"]
+            for s in range(16)]
+    assert (sum(reps) / len(reps)) == pytest.approx(full["value"], rel=0.05)
 
 
 def test_the_default_cap_is_unchanged_so_no_historical_count_moves(tmp_path):
@@ -318,7 +340,7 @@ def test_a_period_that_divides_the_stride_makes_the_old_sampler_publish_zero(tmp
                     _overlapping_platoon(1200, overlap_every=5, overlap_phase=1))
     truth = _row(rb.scorecard(root, max_instants=0), "traffic.overlap_rate_per_1k_pair_instants")
     assert truth["details"]["instants_examined"] == 1200
-    assert truth["value"] == pytest.approx(1000.0 * 240 / (1200 * 6), rel=1e-9)   # 33.333
+    assert truth["value"] == pytest.approx(1000.0 * 240 / (1200 * 6), rel=1e-6)   # 33.333
 
     with monkeypatch.context() as mp:                       # <- the module as it used to behave
         mp.setattr(rb, "_subsample", _legacy_sampler)
@@ -348,36 +370,41 @@ def test_the_same_alias_can_also_inflate_the_published_rate_fivefold(tmp_path, m
     with monkeypatch.context() as mp:
         mp.setattr(rb, "_subsample", _legacy_sampler)
         old = _row(rb.scorecard(root), "traffic.overlap_rate_per_1k_pair_instants")["value"]
-    assert old == pytest.approx(5.0 * truth, rel=1e-9)      # every sampled instant overlaps
+    assert old == pytest.approx(5.0 * truth, rel=1e-6)      # every sampled instant overlaps
     new = _row(rb.scorecard(root), "traffic.overlap_rate_per_1k_pair_instants")["value"]
     assert new == pytest.approx(truth, rel=0.35)
 
 
-def test_shifting_the_run_by_one_instant_no_longer_moves_the_published_rate(tmp_path, monkeypatch):
-    """The sharp control, in miniature: sweep the phase offset across a FULL PERIOD.
+def test_shifting_the_structure_by_one_instant_no_longer_moves_the_published_rate(tmp_path,
+                                                                                  monkeypatch):
+    """THE SHARP CONTROL, in miniature: sweep the phase across a FULL PERIOD of the structure.
 
     A fix that merely moved the lock to a different phase would pass both tests above and fail this
-    one. Dropping the first `off` instants of the run re-phases the sampling grid; under the old
-    rule the published rate then swings over the whole period (here 0x to 5x the truth), and under
-    the new rule it does not move outside its sampling noise.
+    one, so this is the test that decides whether the sampler is fixed or merely re-aimed. Shifting
+    the overlaps by one instant relative to a grid of exactly 1,200 instants (stride exactly 5) is
+    the miniature of "shift the reference arm's 14,400 s run by 1 s", which moved the published rate
+    0.094603 -> 0.258373. Here the old rule swings from 0x to 5x the truth across the five phases;
+    the new one does not leave its sampling noise.
     """
-    rows = _overlapping_platoon(1205, overlap_every=5, overlap_phase=0)
+    truth = 1000.0 * (1200 / 5) / (1200 * 6)                # one overlap in five, six pairs, 33.333
     old_vals, new_vals = [], []
-    for off in range(5):                                    # a full period of the structure
-        root = _dataset(str(tmp_path / f"off{off}"), [r for r in rows if r["t"] >= off])
+    for ph in range(5):                                     # a full period of the structure
+        root = _dataset(str(tmp_path / f"ph{ph}"),
+                        _overlapping_platoon(1200, overlap_every=5, overlap_phase=ph))
+        assert _row(rb.scorecard(root, max_instants=0),
+                    "traffic.overlap_rate_per_1k_pair_instants")["value"] == pytest.approx(
+                        truth, rel=1e-6)                    # the SCENARIO is the same at every phase
         with monkeypatch.context() as mp:
             mp.setattr(rb, "_subsample", _legacy_sampler)
             old_vals.append(_row(rb.scorecard(root),
                                  "traffic.overlap_rate_per_1k_pair_instants")["value"])
         new_vals.append(_row(rb.scorecard(root),
                              "traffic.overlap_rate_per_1k_pair_instants")["value"])
-    truth = _row(rb.scorecard(_dataset(str(tmp_path / "t"), rows), max_instants=0),
-                 "traffic.overlap_rate_per_1k_pair_instants")["value"]
     assert min(old_vals) == 0.0                             # the lock lands off the structure ...
-    assert max(old_vals) >= 4.5 * truth                     # ... and dead on it
-    assert max(new_vals) / max(min(new_vals), 1e-9) < 2.0   # the spread collapses
-    assert all(v == pytest.approx(truth, rel=0.4) for v in new_vals), new_vals
-    assert (sum(new_vals) / len(new_vals)) == pytest.approx(truth, rel=0.15)
+    assert max(old_vals) == pytest.approx(5.0 * truth, rel=1e-6)          # ... and dead on it
+    assert max(new_vals) / min(new_vals) < 1.6              # the spread collapses
+    assert all(v == pytest.approx(truth, rel=0.35) for v in new_vals), new_vals
+    assert (sum(new_vals) / len(new_vals)) == pytest.approx(truth, rel=0.10)
 
 
 def test_the_sampler_is_deterministic_seeded_and_stream_isolated(tmp_path):
