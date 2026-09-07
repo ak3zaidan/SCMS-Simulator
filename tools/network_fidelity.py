@@ -67,8 +67,8 @@ GATES = {
     "signal_rel_err":       {"limit": 0.10, "severity": "informational"},
 }
 
-OVERLAP_DIST_M = 1.0        # realism_bench.OVERLAP_DIST_M -- kept in sync deliberately, see _load
-MAX_TIME_BUCKETS = 240      # realism_bench.MAX_TIME_BUCKETS
+OVERLAP_DIST_M = 1.0        # realism_bench.OVERLAP_DIST_M -- kept in sync deliberately
+MAX_TIME_BUCKETS = 240      # realism_bench.MAX_TIME_BUCKETS (the SAMPLER is imported, not copied)
 OPPOSING_DEG = 135.0        # heading difference above which two vehicles are head-on
 SAMEDIR_DEG = 45.0          # ... and below which they are travelling together (run.py's own filter)
 
@@ -608,9 +608,11 @@ def attribute_overlaps(dataset_dir: str, *, overlap_m: float = OVERLAP_DIST_M,
     overlapping vehicle pairs by network cause.
 
     The instant selection reproduces ``realism_bench._overlap_events`` exactly (timestamps rounded
-    to 3 dp, instants with >= 2 vehicles, deterministic even-spaced sub-sampling to
-    `max_instants`), so the total here is the harness's ``traffic.overlap_events`` number and not a
-    near-miss of it. `all_instants=True` additionally reports the un-sub-sampled total.
+    to 3 dp, instants with >= 2 vehicles, then ``realism_bench._subsample`` -- the harness's own
+    jittered-systematic sampler, CALLED rather than copied -- down to `max_instants`), so the total
+    here is the harness's ``traffic.overlap_events`` number and not a near-miss of it.
+    `all_instants=True` additionally reports the un-sub-sampled total, which is the number to prefer
+    whenever the dataset is small enough to afford it.
 
     With `project=True` the same trace is re-projected into directed lane frames -- each vehicle
     moved to its side of its edge's centreline by ``0.5 * lanes_per_dir * lane_width_m`` in its own
@@ -649,10 +651,14 @@ def attribute_overlaps(dataset_dir: str, *, overlap_m: float = OVERLAP_DIST_M,
                 heading_field += 1
 
     keys_all = [t for t in sorted(inst) if len(inst[t]) >= 2]
-    keys = list(keys_all)
-    if len(keys) > max_instants:
-        step = len(keys) / float(max_instants)
-        keys = [keys[int(i * step)] for i in range(max_instants)]
+    # THE HARNESS'S OWN SAMPLER, IMPORTED, NOT REIMPLEMENTED. This used to be a two-line copy of the
+    # fixed-stride rule; the rule is now jittered systematic sampling driven by a SEEDED, NAMED
+    # stream (realism_bench._subsample), and a re-implementation of that would be a silent
+    # divergence waiting to happen -- the very failure this function exists to avoid, since its
+    # whole contract is "this total IS the scorecard's traffic.overlap_events". The import is lazy
+    # because it pulls numpy in, and every other path through this stdlib-only tool stays numpy-free.
+    from scms_sim_ref.datagen import realism_bench as _rb   # noqa: PLC0415 - see above
+    keys = _rb._subsample(list(keys_all), max_instants, stream="overlap")
 
     hdg = _headings(tracks)
     # heading source: displacement always (true_heading is absent in datasets written before ADR

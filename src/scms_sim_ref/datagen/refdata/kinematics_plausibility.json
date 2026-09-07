@@ -79,6 +79,24 @@
       "source": "docs/realism/ROADMAP.md section 5 traffic panel (overlap events = 0). Two distinct vehicles occupying the same point at the same instant is a modelling failure, not a rare event.",
       "note": "Measured as distinct-vehicle pairs closer than the overlap distance at an identical timestamp."
     },
+    "teleport_rate_max_per_1k_pairs": {
+      "max": 0,
+      "unit": "events per 1,000 consecutive sample pairs",
+      "confidence": "anchored",
+      "cite": "ROADMAP section 5 'Sim health' row, restated as a rate",
+      "source": "The same zero-tolerance gate as teleport_events_max (docs/realism/ROADMAP.md section 5: 'teleports=0'), expressed per unit of what was examined rather than as a bare count. The threshold is unchanged and cannot be: zero events is zero rate.",
+      "derivation": "NOT a new measurement. teleport_events is a COUNT whose denominator is the number of consecutive sample pairs the run produced, which grows linearly with duration and with vehicle count, so two runs' counts are not comparable. Dividing by the measured denominator makes them comparable without changing any verdict (docs/realism/LONG-RUNS.md section 3.3).",
+      "note": "Companion RATE row to traffic.teleport_events. Scored SOFT: the count remains the HARD gate, and grading both HARD would report one defect as two CI failures."
+    },
+    "overlap_rate_max_per_1k_pair_instants": {
+      "max": 0,
+      "unit": "events per 1,000 co-present pairs examined",
+      "confidence": "anchored",
+      "cite": "ROADMAP section 5 'Sim health' row, restated as a rate",
+      "source": "The same zero-tolerance gate as overlap_events_max (docs/realism/ROADMAP.md section 5: 'overlap events = 0'), expressed per co-present pair actually tested.",
+      "derivation": "NOT a new measurement. traffic.overlap_events is computed over at most MAX_TIME_BUCKETS instants, so its denominator is a FIXED-SIZE SAMPLE whose coverage falls as 1/duration: measured on the reference grid arm the count reads 434 at 300 s and 319 at 28800 s while the trajectory sample behind it grows 109x, i.e. the published number falls while the traffic rises (docs/realism/LONG-RUNS.md section 3.3). Dividing by the pairs examined removes the cap from the number.",
+      "note": "Companion RATE row to traffic.overlap_events, which stays the HARD gate because it is a valid one-sided existence test at any coverage. The rate row is what may be compared across durations, and it carries the run's full pair census so the extrapolated whole-run magnitude is visible too."
+    },
     "moving_vehicle_min_fraction": {
       "min": 0.5,
       "unit": "fraction",

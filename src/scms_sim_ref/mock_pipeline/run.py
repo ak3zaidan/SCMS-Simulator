@@ -156,6 +156,21 @@ DENM_BRAKE_IMPLAUSIBLE_SPEED_MPS = DENM_BENIGN_MAX_SPEED_MPS + 0.5
 # vehicle impersonating a VRU. Used by the vruImpersonation detector; genuine VRUs (~vru_speed_mps,
 # a few m/s) stay far below it.
 VRU_MAX_PLAUSIBLE_SPEED_MPS = 10.0
+# Spare certificate windows issued past the estimated trip life when `cert_validity_s` is set, and
+# only where the despawn time is DYNAMIC (car-following: congestion decides it). The trip-life budget
+# is already 3x free-flow plus half a signal cycle per intersection plus 30 s, so ONE extra validity
+# period on top is what stops a congestion overrun from leaving a benign vehicle holding an EXPIRED
+# certificate -- the failure mode the old `valid_to = total_time + dt` forward cap existed to
+# prevent, and which is why certificate expiry could not be exercised at any run length
+# (docs/realism/LONG-RUNS.md 4.3). One spare is also what a real OBU holds: the current pseudonym
+# and the next. Each spare costs one row of `gt_identity_map` per vehicle, so it is not free.
+CERT_POOL_SLACK_WINDOWS = 1
+# A persistent adversary re-enters at a NEW origin after a dwell. The record therefore carries a gap
+# whose two ends are far apart, and `realism_bench.teleport_events` tests the MEAN SPEED across it --
+# correctly, because a gap is exactly where a vehicle could have been teleported. The dwell is
+# therefore floored at the time an ordinary vehicle would take to cover that distance at this speed,
+# so the implied mean speed over the un-recorded leg is always a driving speed.
+PERSISTENT_REDEPLOY_SPEED_MPS = 5.0
 WEATHER_MULT = {"clear": 1.0, "rain": 1.5, "fog": 2.0, "snow": 2.5}        # GNSS error multiplier
 WEATHER_RADIO_LOSS = {"clear": 0.0, "rain": 0.03, "fog": 0.02, "snow": 0.06}
 WEATHER_SPEED_MULT = {"clear": 1.0, "rain": 0.85, "fog": 0.75, "snow": 0.6}  # drivers slow in bad weather
@@ -2674,6 +2689,49 @@ class PipelineConfig:
     stale_max_s: float = 5.0             # staleness threshold for staleOrReplay
     # --- pseudonym rotation ---
     rotate_period_s: float = 0.0         # 0 = one pseudonym per vehicle (no rotation)
+    # --- CERTIFICATE VALIDITY (opt-in; 0 = the historic "a certificate expires when the run does") --
+    # THE DEFECT this exists to fix, measured across seven durations from 300 s to 8 h
+    # (docs/realism/LONG-RUNS.md section 4.3): `ma_cert_status.jsonl` was written with
+    # `valid_from = 0.0, valid_to = total_time` for 100.0% of certificates at EVERY rung, so a
+    # consumer reading `valid_to` as a certificate lifetime was reading the `--duration` flag; and
+    # the engine's own issued window (`gt_identity_map.valid_to`) is capped forward to
+    # `total_time + dt` for each vehicle's FINAL certificate, which with rotation off (the default)
+    # is ALL of them -- median issued span 0.477-0.481 x the run length at every rung, maximum
+    # exactly `duration + dt`. No run of any length exercised certificate expiry, which is the one
+    # SCMS timescale a long run exists to exercise.
+    #
+    # WHAT `cert_validity_s > 0` DOES. Every pseudonym certificate gets a FIXED validity window of
+    # this many seconds, independent of the run length and of the vehicle's trip:
+    #   * it becomes the rotation cadence when `rotate_period_s` is 0, so a vehicle present for
+    #     longer than one window rotates through real, individually-expiring certificates;
+    #   * the forward cap to `total_time + dt` is NOT applied -- certificates expire on their own
+    #     clock -- and the pool is instead sized to cover the trip plus `CERT_POOL_SLACK_WINDOWS`
+    #     spare windows, so a benign vehicle delayed by congestion still always holds a VALID cert
+    #     and cannot manufacture false `certValidity` positives (the precision collapse the forward
+    #     cap was protecting against);
+    #   * `ma_cert_status.jsonl` carries each certificate's REAL window instead of [0, total_time].
+    # Digest-moving (two data files change), hence opt-in and 0 by default.
+    cert_validity_s: float = 0.0
+    # --- PERSISTENT ADVERSARIES (opt-in; 0 = the historic "an attacker cannot outlive one trip") ---
+    # THE DEFECT (docs/realism/LONG-RUNS.md section 4.5): `attack_to = spawn_time + life`, so the
+    # attack-span distribution is STATIONARY from 1800 s on -- p50 256 s, p95 484 s, max 598 s,
+    # unchanged at 8 h. An 8 h run contains ~57,000 attackers each hostile for at most ten minutes
+    # and never one adversary that persists, so long-horizon misbehaviour detection (reputation
+    # accumulation, duty cycles whose period exceeds a trip, campaign-level linkage) is untestable
+    # at any run length.
+    #
+    # WHAT THIS MODELS: a compromised on-board unit whose CAMPAIGN spans hours across SEVERAL TRIPS.
+    # The chosen fraction of attackers keeps its identity, its credentials, its linkage context and
+    # its attacker role, and RE-ENTERS the network after each trip completes -- parked, then driven
+    # again -- until its campaign expires. Each individual trip is ordinary traffic; the adversary
+    # is what persists. The dwell between trips is never shorter than the time an ordinary vehicle
+    # would need to cover the distance to its next origin, so the un-recorded gap in its trajectory
+    # is physically consistent and cannot read as a teleport.
+    persistent_attacker_pct: float = 0.0   # fraction of ATTACKERS whose campaign outlives one trip
+    persistent_campaign_s: float = 3600.0  # mean campaign length (s); actual is drawn +/- jitter
+    persistent_campaign_jitter: float = 0.5  # campaign ~ U[(1-j), (1+j)] x persistent_campaign_s
+    persistent_dwell_min_s: float = 60.0   # shortest gap between two trips of the same adversary
+    persistent_dwell_max_s: float = 600.0  # ... and the longest (before the travel-time floor)
     # --- collusion / false accusation ---
     collude_pct: float = 0.0             # fraction of ATTACKERS that also file false reports
     victim_pct: float = 0.10             # fraction of benign vehicles targeted by colluders
@@ -2837,6 +2895,27 @@ class PipelineConfig:
     gap_acceptance: bool = False
     # time-varying demand (rush hour / night) + origin-destination bias
     demand_profile: str = "uniform"      # "uniform" | "rush" | "night"
+    # --- THE DEMAND PROFILE'S CLOCK (opt-in; 0 = the historic "shape stretched to the run") --------
+    # THE DEFECT (docs/realism/LONG-RUNS.md section 0): the arrival thinning evaluates the profile at
+    # `frac = tt / total_time`, so `--demand rush` is a SHAPE STRETCHED TO THE RUN rather than a
+    # time of day. Measured on the same seed: the "morning" peak sits at t ~= 75 s in a 300 s run and
+    # at t ~= 225 s in a 900 s run, only 11 of 278 vehicles survive the duration change byte-
+    # identically, and detection precision moves 0.780 -> 0.477 -- so two durations under `rush` are
+    # two DIFFERENT SCENARIOS and no quantity may be compared across them.
+    #
+    # `demand_period_s > 0` gives the profile a real clock: the multiplier becomes a function of
+    # ABSOLUTE simulated time modulo the period, with the peaks placed at wall-clock times and their
+    # width set in SECONDS -- so a rush hour is an hour, at 08:00, whatever `--duration` says, and a
+    # 300 s run is a 300 s WINDOW of the day rather than a compressed day. `demand_start_s` is the
+    # time of day at t = 0. Digest-moving under rush/night (it changes which vehicles arrive), so it
+    # is off by default; the uniform arm is unaffected either way (its multiplier is 1.0).
+    demand_period_s: float = 0.0         # 0 = legacy run-fraction shape; 86400 = a real day
+    demand_start_s: float = 0.0          # time of day (s past midnight) at simulated t = 0
+    demand_am_peak_s: float = 28800.0    # AM peak centre within the period (08:00)
+    demand_pm_peak_s: float = 61200.0    # PM peak centre within the period (17:00)
+    demand_peak_sigma_s: float = 3600.0  # Gaussian half-width of each peak -- a rush hour is an hour
+    demand_off_peak_frac: float = 0.2    # floor multiplier away from the peaks (matches the legacy
+                                         # `0.2 + 0.8 * peak` shape)
     od_model: str = "uniform"            # trip destination law: "uniform" | "gravity" (distance-decay)
     od_gravity_scale: float = 2.0        # gravity: hop decay scale (smaller -> shorter trips)
     boundary_origins: bool = False       # trips ORIGINATE at the grid perimeter (realistic sources/sinks)
@@ -3100,6 +3179,15 @@ class Vehicle:
     trip: object = None                    # roads.Trip when road_network="grid"
     attack_from: float = 0.0
     attack_to: float = 0.0
+    # --- persistent adversary (opt-in, `persistent_attacker_pct`) -----------------------------
+    # A compromised OBU whose CAMPAIGN spans several trips. `campaign_until > 0` marks it; the
+    # vehicle then RE-ENTERS the network with a fresh route after each trip completes, until the
+    # campaign expires. `spawn_time` deliberately stays the FIRST spawn (it keys the pseudonym
+    # rotation clock, the ground-truth row and the attack window), and `redeploy_at` carries the
+    # instant of the next re-entry.
+    campaign_until: float = 0.0            # 0 = ordinary adversary, bounded by its one trip
+    redeploy_at: float = 0.0               # next re-entry instant while dwelling between trips
+    deployments: int = 1                   # trips this identity has driven (1 = never re-entered)
     pulse_phase: float = 0.0               # per-vehicle offset [0,1) for intermittent (pulsed) attacks
     crl_aware: bool = False                 # watches the public CRL and goes dormant after a bust
     dormant_until: float = 0.0             # CRL-aware: broadcast honestly (no falsification) while t < this
@@ -3163,6 +3251,36 @@ class Vehicle:
         speed = math.hypot(vx, vy)
         heading = math.degrees(math.atan2(vy, vx)) % 360.0
         return x, y, speed, heading
+
+
+class _RetiredDevice:
+    """What is left of a station once it has permanently left the network.
+
+    **Why it exists.** A flow-mode `Vehicle` costs a measured 3.6 KiB once its history is cleared --
+    1,632 B of object + instance dict, 1,137 B of routed `Trip` polyline, 466 B of pseudonym records
+    and 250 B of `DeviceLinkageContext` -- and the engine used to hold every one of them for the
+    whole run. Over 8 hours that is 57,758 vehicles that never drive again (`docs/realism/LONG-RUNS.md`
+    section 1.3). Releasing them makes the vehicle term a function of the CONCURRENT population
+    (~170 on the reference arm) instead of the cumulative one.
+
+    **Why it is not simply deleted.** `digest_to_vehicle` cannot just drop the entry, because the MA's
+    `trusted()` gate is consulted for reporters inside a `revoke_window_s` sliding window and a
+    reporter may have despawned inside that window -- resolving it to `None` would change the gate's
+    verdict and therefore the dataset. So the mapping survives, pointing at these five fields, which
+    are every field any post-despawn reader touches: `vid` and `is_rsu` (`trusted`), `vid`
+    (`file_report`'s `reporter_true_id`), and `is_attacker` / `revoked` / `revocation_time` for the
+    revocation path that a despawned station can no longer reach. Anything else raises
+    `AttributeError` rather than silently reading a stale value.
+    """
+
+    __slots__ = ("vid", "is_rsu", "is_attacker", "revoked", "revocation_time")
+
+    def __init__(self, v: "Vehicle"):
+        self.vid = v.vid
+        self.is_rsu = v.is_rsu
+        self.is_attacker = v.is_attacker
+        self.revoked = v.revoked
+        self.revocation_time = v.revocation_time
 
 
 @dataclass
@@ -3651,6 +3769,55 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
         raise ValueError(f"weather must be one of {sorted(WEATHER_MULT)} (got {cfg.weather!r})")
     if cfg.demand_profile not in ("uniform", "rush", "night"):
         raise ValueError(f"demand_profile must be uniform|rush|night (got {cfg.demand_profile!r})")
+    if cfg.demand_period_s < 0:
+        raise ValueError(f"demand_period_s must be >= 0 (0 = no clock) (got {cfg.demand_period_s})")
+    if cfg.demand_period_s > 0:
+        if cfg.demand_peak_sigma_s <= 0:
+            raise ValueError(f"demand_peak_sigma_s must be > 0 when demand_period_s > 0 "
+                             f"(got {cfg.demand_peak_sigma_s})")
+        if not (0.0 <= cfg.demand_off_peak_frac <= 1.0):
+            raise ValueError(f"demand_off_peak_frac must be in [0, 1] "
+                             f"(got {cfg.demand_off_peak_frac})")
+        for _f in ("demand_start_s", "demand_am_peak_s", "demand_pm_peak_s"):
+            if getattr(cfg, _f) < 0:
+                raise ValueError(f"{_f} must be >= 0 (got {getattr(cfg, _f)})")
+    if cfg.cert_validity_s < 0:
+        raise ValueError(f"cert_validity_s must be >= 0 (0 = no expiry) (got {cfg.cert_validity_s})")
+    if 0 < cfg.cert_validity_s < cfg.rotate_period_s:
+        # A validity shorter than the rotation cadence leaves a gap between one certificate expiring
+        # and the next becoming current, in which the station has no valid credential at all. That
+        # is a misconfiguration, not a scenario: real provisioning issues certificates whose windows
+        # cover (and usually overlap) the rotation schedule.
+        raise ValueError(
+            f"cert_validity_s ({cfg.cert_validity_s}) must be >= rotate_period_s "
+            f"({cfg.rotate_period_s}) or the station is uncredentialed between rotations")
+    if not (0.0 <= cfg.persistent_attacker_pct <= 1.0):
+        raise ValueError(f"persistent_attacker_pct must be in [0, 1] "
+                         f"(got {cfg.persistent_attacker_pct})")
+    if cfg.persistent_attacker_pct > 0:
+        if not cfg.traffic_flow:
+            raise ValueError("persistent_attacker_pct needs traffic_flow=true: a campaign that "
+                             "outlives one trip has no meaning in the fixed-fleet model, where "
+                             "every vehicle is present for the whole run already")
+        if cfg.persistent_campaign_s <= 0:
+            raise ValueError(f"persistent_campaign_s must be > 0 "
+                             f"(got {cfg.persistent_campaign_s})")
+        if not (0.0 <= cfg.persistent_campaign_jitter <= 1.0):
+            raise ValueError(f"persistent_campaign_jitter must be in [0, 1] "
+                             f"(got {cfg.persistent_campaign_jitter})")
+        if cfg.persistent_dwell_min_s < 0 or cfg.persistent_dwell_max_s < cfg.persistent_dwell_min_s:
+            raise ValueError(f"need 0 <= persistent_dwell_min_s <= persistent_dwell_max_s "
+                             f"(got {cfg.persistent_dwell_min_s}, {cfg.persistent_dwell_max_s})")
+        if cfg.road_network == "linear":
+            # Re-entry needs a graph to route the next trip on. Refusing beats a flag that silently
+            # does nothing -- the same rule `directed_lanes` follows below.
+            raise ValueError("persistent_attacker_pct needs a routed road network (grid, ring, "
+                             "spider or custom): road_network='linear' has no graph to re-route on")
+        if cfg.mobility_source == "sumo_replay":
+            raise ValueError("persistent_attacker_pct is incompatible with "
+                             "mobility_source='sumo_replay': SUMO decided every departure and "
+                             "despawn before this run started, so the engine cannot re-enter a "
+                             "vehicle the trace does not contain")
     if cfg.od_model not in ("uniform", "gravity"):
         raise ValueError(f"od_model must be uniform|gravity (got {cfg.od_model!r})")
     if cfg.turn_speed_mps < 0:
@@ -4285,6 +4452,16 @@ _FIELD_META = {
                              "network; governs unsignalized nodes only; realistic slowing without "
                              "false revocations)"),
     "demand_profile": dict(h="Arrival-demand shape over the run"),
+    "demand_period_s": dict(h="Give the demand profile a REAL CLOCK: the length of one cycle "
+                             "(86400 = a day). 0 keeps the legacy behaviour, where the shape is "
+                             "stretched to the run and an 'AM peak' lands at 25% of whatever "
+                             "--duration says", lo=0, u="s"),
+    "demand_start_s": dict(h="Time of day (s past midnight) at simulated t=0", lo=0, u="s"),
+    "demand_am_peak_s": dict(h="AM peak centre within the demand period (28800 = 08:00)", lo=0, u="s"),
+    "demand_pm_peak_s": dict(h="PM peak centre within the demand period (61200 = 17:00)", lo=0, u="s"),
+    "demand_peak_sigma_s": dict(h="Gaussian half-width of each demand peak — 3600 makes a rush "
+                                  "hour an hour", lo=0, u="s"),
+    "demand_off_peak_frac": dict(h="Arrival-rate multiplier away from the peaks", lo=0, hi=1, st=0.05),
     "od_model": dict(h="Trip destination law: uniform or distance-decay gravity"),
     "od_gravity_scale": dict(h="Gravity hop-decay scale (smaller = shorter trips)", lo=0.1, hi=10, st=0.5),
     "boundary_origins": dict(h="Trips originate at the network perimeter (realistic sources/sinks)"),
@@ -4423,6 +4600,23 @@ _FIELD_META = {
     "offroad_tol_m": dict(h="Map off-road tolerance (HD-map check)", lo=0, u="m"),
     "max_accel_mps2": dict(h="Implausible-acceleration threshold", lo=1, u="m/s²"),
     "rotate_period_s": dict(h="Pseudonym rotation period (0 = no rotation)", lo=0, u="s"),
+    "cert_validity_s": dict(h="Validity period of ONE pseudonym certificate. 0 keeps the legacy "
+                             "behaviour, where a certificate expires when the simulation does "
+                             "(ma_cert_status wrote valid_to = total_time for 100% of rows at "
+                             "every duration). Set it and certificates expire on their own clock, "
+                             "the station rotates onto the next one, and the MA publishes the real "
+                             "window", lo=0, u="s"),
+    "persistent_attacker_pct": dict(h="Fraction of ATTACKERS whose campaign outlives one trip: the "
+                                      "identity re-enters the network after each journey until its "
+                                      "campaign expires (0 = every attacker dies with its trip)",
+                                    lo=0, hi=1, st=0.05),
+    "persistent_campaign_s": dict(h="Mean campaign length of a persistent adversary", lo=0, u="s"),
+    "persistent_campaign_jitter": dict(h="Campaign length spread: U[(1-j),(1+j)] x the mean",
+                                       lo=0, hi=1, st=0.05),
+    "persistent_dwell_min_s": dict(h="Shortest parked gap between two trips of one adversary",
+                                   lo=0, u="s"),
+    "persistent_dwell_max_s": dict(h="Longest parked gap between two trips of one adversary",
+                                   lo=0, u="s"),
     "ma_defense": dict(h="Trusted-reporter gating (reputation + rate limit)"),
     "reputation_max": dict(h="A reporter itself reported more than this is distrusted", lo=1),
     "report_budget": dict(h="A reporter filing more than this is rate-limited", lo=1),
@@ -4704,6 +4898,14 @@ def config_from_dict(d: dict, *, strict_plugins: bool = True,
 # once per step (default None -> zero effect); tests use it to simulate an interrupt deterministically.
 _ABORT = {"flag": False}
 PER_STEP_HOOK = None
+#: Audit seam for the end-of-run CRL linkage self-check (see `run_pipeline`, "Real-linkage sanity").
+#: The default check is INDEXED -- it verifies each observed pseudonym against the CRL entry the MA
+#: appended for that very device -- which is strictly stronger than the O(R^2) `any(...)` scan it
+#: replaced, and linear instead of quadratic. Setting this True (or `SCMS_CRL_AUDIT=exhaustive` in
+#: the environment) ALSO runs the original whole-CRL scan and asserts the two verdicts agree, which
+#: is what `tests/test_crl_sanity_index.py` uses to prove the equivalence on a real run. It costs
+#: R(R+1)/2 `matches` calls, so it is off by default and must stay off on a long run.
+CRL_AUDIT_EXHAUSTIVE = False
 # Telemetry seam (default None -> zero effect, byte-identical): when set to a callable it is invoked
 # with a small dict on each INITIATED discretionary lane change (vid, t, from_off, to_off, is_attacker,
 # is_faulty, peak_heading_dev_deg). Tests use it to assert lane transitions + heading transients occur.
@@ -4753,6 +4955,13 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     # manifest is written. See `ReadOnlyConfig` for why the snapshot, not the view, is the half that
     # actually holds.
     _cfg0 = copy.deepcopy(_config_dict(cfg))
+    # THE CADENCE A STATION CHANGES PSEUDONYM AT. `rotate_period_s` when it is set; otherwise
+    # `cert_validity_s`, because a certificate that expires is a certificate the station must rotate
+    # off -- that is what makes rotation MEANINGFUL over hours rather than a per-trip accident
+    # (measured: 1.043-1.051 certificates per vehicle at every duration from 300 s to 8 h with
+    # rotation off, docs/realism/LONG-RUNS.md 4.4). Both default to 0, so this is 0 by default and
+    # `active_pseudonym` returns pseudonyms[0] exactly as before.
+    _rot_period_s = cfg.rotate_period_s if cfg.rotate_period_s > 0 else cfg.cert_validity_s
     _ABORT["flag"] = False                            # fresh per run (module state is not reentrant)
     # CLAIMED BY IDENTITY, not merely consumed: a drift accepted by one replay is recorded in THAT
     # run's manifest and in no other, even when the drifted config is built and never run.
@@ -5296,7 +5505,40 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     pseudonym_info: dict[str, dict] = {}   # digest -> {i,j,lv,ghost,veh_vid}
     vehicles: list[Vehicle] = []
     gt_vehicle, gt_idmap = [], []
+    #: ORACLE attack windows. Filled by `_retire` as attackers leave the network for good and topped
+    #: up at finalisation with whoever is still live, so nothing has to hold an attacker's `Vehicle`
+    #: for the whole run just to read `attack_from` / `attack_to` / `onset` off it at the end.
+    gt_attacks: list = []
+    #: Constructed-but-not-yet-activated stations, in spawn order. `spawn_order` used to be
+    #: `sorted(vehicles, ...)` taken once the whole population existed; in flow mode there is no such
+    #: moment any more, so stations queue here as `_pump` builds them and the step loop drains the
+    #: queue by spawn time. Sorted once before the loop, which is a no-op on the lazy path (empty)
+    #: and reproduces the old order exactly on the eager ones (fixed fleet, and VRUs interleaved
+    #: with vehicles).
+    spawn_q: list = []
     atk_counter = {"n": 0}                  # running index for round-robin attack-type assignment
+    # ---- WHY THESE THREE ARE FILLED HERE AND NOT BUILT AFTERWARDS ------------------------------- #
+    # They used to be comprehensions over the whole `vehicles` list, taken once the entire population
+    # existed. Flow mode no longer HAS an entire population before step 0 (see `_pump` below), so
+    # each is filled one station at a time as that station is constructed. Content and keys are
+    # unchanged; only `digest_to_vehicle` is ever iterated (it is not), so insertion order is not
+    # observable and nothing here can move a digest.
+    digest_to_vehicle: dict[str, object] = {}
+    vrng: dict[int, random.Random] = {}
+    #: Dedicated per-vehicle DENM RNG stream (string-keyed), created + drawn ONLY when the DENM layer
+    #: is enabled, so every other RNG-driven output is untouched and the DEFAULT path is byte-identical.
+    vdenm_rng: dict[int, random.Random] = {}
+
+    def _register_station(v) -> None:
+        """Index one freshly constructed station: its pseudonyms, its streams, its spawn slot."""
+        vrng[v.vid] = random.Random(f"{cfg.seed}:sensor:{v.vid}")
+        if _denm_enabled:
+            vdenm_rng[v.vid] = random.Random(f"{cfg.seed}:denm:{v.vid}")
+        for _ps in v.pseudonyms:
+            digest_to_vehicle[_ps["digest"]] = v
+        for _g in v.ghosts:
+            digest_to_vehicle[_g] = v
+        spawn_q.append(v)
 
     def make_vehicle(vid, spawn_time, is_att, is_flt, is_coll, trip, life_hint, replay_span=None):
         vr = random.Random(f"{cfg.seed}:veh:{vid}")
@@ -5355,7 +5597,41 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             finish_time = (trip.t1 if trip is not None
                            else (spawn_time + life_hint if cfg.traffic_flow else None))
             life = life_hint if finish_time is None else max(cfg.dt, finish_time - spawn_time)
-        n_rot = 1 if cfg.rotate_period_s <= 0 else max(1, math.ceil(life / cfg.rotate_period_s))
+        # ---- PERSISTENT ADVERSARY: a campaign that outlives one trip ------------------------------
+        # Drawn from its OWN string-keyed stream (`{seed}:persist:{vid}`), which exists nowhere else,
+        # so `persistent_attacker_pct = 0` draws NOTHING here and every pinned digest holds. The
+        # campaign extends the CERTIFICATE budget below, because an adversary present for two hours
+        # needs certificates for two hours -- and with `cert_validity_s` set that is a pool of
+        # finite-validity certificates it rotates through, which is the combination that makes
+        # long-horizon linkage and reputation accumulation testable at all.
+        campaign_until = 0.0
+        if (is_att and cfg.persistent_attacker_pct > 0.0 and cfg.traffic_flow
+                and net is not None and _replay is None):
+            _prng = random.Random(f"{cfg.seed}:persist:{vid}")
+            if _prng.random() < cfg.persistent_attacker_pct:
+                _j = max(0.0, min(1.0, cfg.persistent_campaign_jitter))
+                _camp = cfg.persistent_campaign_s * (1.0 - _j + 2.0 * _j * _prng.random())
+                campaign_until = spawn_time + max(cfg.dt, _camp)
+                life = max(life, campaign_until - spawn_time + cfg.dt)
+        # ---- CERTIFICATE VALIDITY: cadence and window length, decided in one place ---------------
+        # `_rot_s` is how often the vehicle changes pseudonym; `_val_s` is how long ONE certificate
+        # is valid for. They were the same number (`rotate_period_s`) and both were 0 by default,
+        # which is why every certificate's window was the vehicle's whole life and, once the forward
+        # cap below fired, the whole RUN. With `cert_validity_s` set they separate: rotation may be
+        # faster than validity (real SCMS holds a batch of long-lived certificates and rotates
+        # through them), and validity never depends on `--duration` again.
+        _rot_s = cfg.rotate_period_s if cfg.rotate_period_s > 0 else cfg.cert_validity_s
+        _val_s = cfg.cert_validity_s if cfg.cert_validity_s > 0 else cfg.rotate_period_s
+        n_rot = 1 if _rot_s <= 0 else max(1, math.ceil(life / _rot_s))
+        if cfg.cert_validity_s > 0 and cf:
+            # Spare windows instead of the forward cap, and only where they are needed: `cf` is the
+            # branch whose despawn time is dynamic, so it is the only one whose `life` can be an
+            # under-estimate. A congested trip can outrun any life estimate, and the cap (below)
+            # answered that by making the LAST certificate valid to the end of the simulation --
+            # which is precisely the defect. A spare window answers it without the run length
+            # entering the certificate: the vehicle rotates onto a fresh, real, finite-validity
+            # certificate instead of holding an unexpiring one.
+            n_rot += CERT_POOL_SLACK_WINDOWS
         # THE WINDOWS, computed first and identically on both paths. Under `security_model="ecdsa"`
         # the whole device is provisioned in ONE butterfly batch -- which is the point: the RA
         # drains its request queue in a device-mixing order, so the PCA never sees a device's
@@ -5364,21 +5640,29 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         _windows = []
         for k in range(n_rot):
             i_k, j_k = k // cfg.jmax, (vid + k) % cfg.jmax
-            vf = spawn_time + (k * cfg.rotate_period_s if cfg.rotate_period_s > 0 else 0.0)
-            vt = spawn_time + ((k + 1) * cfg.rotate_period_s if cfg.rotate_period_s > 0 else life)
-            if cf and k == n_rot - 1:
-                # dynamic (congestion-dependent) despawn can outrun any life estimate; the vehicle's
-                # FINAL cert must stay valid for its whole presence, so cap it past the sim end -> a
-                # present benign vehicle can never show an "expired" cert (attacks override cvt/cvf).
+            vf = spawn_time + (k * _rot_s if _rot_s > 0 else 0.0)
+            vt = vf + (_val_s if _val_s > 0 else life)
+            if cf and k == n_rot - 1 and cfg.cert_validity_s <= 0:
+                # LEGACY PATH ONLY. Dynamic (congestion-dependent) despawn can outrun any life
+                # estimate; the vehicle's FINAL cert must stay valid for its whole presence, so cap
+                # it past the sim end -> a present benign vehicle can never show an "expired" cert
+                # (attacks override cvt/cvf). This is what makes `gt_identity_map.valid_to` a
+                # function of `--duration` -- median 0.48 x the run length, maximum exactly
+                # `duration + dt`, at every rung from 300 s to 8 h -- and `cert_validity_s` replaces
+                # it with spare windows rather than an unexpiring certificate.
                 vt = max(vt, total_time + cfg.dt)
             _windows.append((i_k, j_k, vf, vt))
+        _ghost_vt = spawn_time + (cfg.cert_validity_s if cfg.cert_validity_s > 0 else life)
         _ghost_windows = []
         if _sec is not None and is_att and atype == "Sybil":
             # A Sybil's ghosts are REAL CREDENTIALS it holds and uses simultaneously -- extra
             # j-indices in i-period 0. That is what the attack is under a working SCMS: not forged
             # certificates (those are `ForgedCertificate`, and a receiver rejects them on the
             # issuer), but more legitimate pseudonyms than a station is entitled to run at once.
-            _ghost_windows = [(0, (cfg.jmax - 1 - g) % cfg.jmax, spawn_time, spawn_time + life)
+            # A ghost is a certificate like any other, so under `cert_validity_s` it expires like
+            # any other (`rotate_period_s` alone does NOT touch it -- that would move a pinned
+            # digest, and a ghost is held simultaneously rather than rotated onto).
+            _ghost_windows = [(0, (cfg.jmax - 1 - g) % cfg.jmax, spawn_time, _ghost_vt)
                               for g in range(cfg.sybil_ghosts)]
         _creds = None
         if _sec is not None:
@@ -5429,6 +5713,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         if is_att and cfg.attack_delay_jitter_s > 0:  # varied attack onset across attackers (realism)
             v.attack_from += random.Random(f"{cfg.seed}:onset:{vid}").random() * cfg.attack_delay_jitter_s
         v.attack_to = (spawn_time + life) if cfg.traffic_flow else cfg.attack_end
+        if campaign_until > 0.0:
+            # THE FIX for "an attacker cannot outlive one trip". `attack_to` is now the end of the
+            # CAMPAIGN, not the end of the trip, and the step loop keeps the identity in play across
+            # the trips in between (see the re-entry block in the simulation loop).
+            v.campaign_until = campaign_until
+            v.attack_to = campaign_until
         if is_att and cfg.attack_duty_cycle < 1.0:   # desync pulses across attackers (own rng stream)
             v.pulse_phase = random.Random(f"{cfg.seed}:pulse:{vid}").random()
         if is_att and cfg.crl_aware_pct > 0:          # CRL-aware assignment (own rng; default draws none)
@@ -5447,7 +5737,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                                         "ghost": True, "veh_vid": vid}
                 gt_idmap.append(R.GtIdentityMap(true_vehicle_id=true_id, pseudonym_cert_digest=gdig,
                                                 i_period=0, valid_from=round(spawn_time, 3),
-                                                valid_to=round(spawn_time + life, 3)))
+                                                valid_to=round(_ghost_vt, 3)))
         vehicles.append(v)
         gt_kw = dict(true_vehicle_id=true_id, spawn_time=round(spawn_time, 3),
                      is_attacker=is_att, attacker_role=(atype if is_att else "none"),
@@ -5456,6 +5746,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         # ORACLE labels (is_crl_aware / is_vru) are emitted ONLY when their opt-in is on -> a run with
         # neither active is byte-identical (plain R.GtVehicle). Vehicles are never VRUs (is_vru=False).
         gt_vehicle.append(_make_gt_vehicle(cfg, v, False, gt_kw))
+        _register_station(v)
         return v
 
     def make_vru(vid, spawn_time, life, nodes):
@@ -5478,7 +5769,12 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         ra.bind(req_hash, true_id)
         j0 = vid % cfg.jmax
         vf = spawn_time
-        vt0 = max(spawn_time + life, total_time + cfg.dt)
+        # A VRU holds ONE certificate and never rotates, so its window has to cover its whole
+        # presence or a benign pedestrian shows an expired cert. Under `cert_validity_s` that cover
+        # is taken from the VRU's own life rather than from `total_time`, which is the part that
+        # made the window a function of the `--duration` flag.
+        vt0 = (spawn_time + max(cfg.cert_validity_s, life + cfg.dt) if cfg.cert_validity_s > 0
+               else max(spawn_time + life, total_time + cfg.dt))
         if _sec is not None:
             dig = _sec.provision(true_id, ctx, [(0, j0, vf, vt0)]).credentials[0].digest
         else:
@@ -5538,76 +5834,166 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                      is_attacker=False, attacker_role="none", is_faulty=False,
                      veh_type="vru", colluding_group_id=None)
         gt_vehicle.append(_make_gt_vehicle(cfg, v, True, gt_kw))
+        _register_station(v)
         return v
+
+    #: Draw the arrival process forward to `horizon`, constructing every station due by then. Bound
+    #: to the real pump in flow mode below; a fixed fleet has no arrival process (every vehicle is
+    #: present from t = 0), so it keeps this no-op and the step loop needs no branch.
+    def _pump(horizon: float) -> None:
+        return None
+
+    #: `_pump(_ARRIVALS_DRAIN)` finishes the arrival process (used before the VRU block, which needs
+    #: the final population size, and after the step loop, so an arrival landing in the run's last
+    #: `dt` is still created and still reaches `gt_vehicle` exactly as it did when the whole
+    #: population was drawn before step 0).
+    _ARRIVALS_DRAIN = float("inf")
 
     if cfg.traffic_flow:
         # ---- FLOW: vehicles arrive over time and despawn at trip end (steady-state population) ----
         n_steps = int(round((cfg.duration_s if cfg.duration_s > 0 else total_time) / cfg.dt))
         total_time = n_steps * cfg.dt
 
-        def demand_mult(frac):    # time-of-day arrival-rate multiplier in (0, 1]
-            if cfg.demand_profile == "rush":     # morning + evening peaks, quiet midday/edges
+        # THE DEMAND PROFILE, on a real clock when it is given one.
+        #
+        # Legacy (`demand_period_s == 0`, the default): the multiplier is a function of the RUN
+        # FRACTION `tt / total_time`. That is a shape stretched to the run, not a time of day, and
+        # it is why the rung ladder in docs/realism/LONG-RUNS.md stops being a controlled experiment
+        # the moment the profile is not uniform -- the "AM peak" lands at 75 s in a 300 s run and at
+        # 225 s in a 900 s one. Reproduced here EXACTLY, because it is what every pinned digest and
+        # every existing `--demand rush` dataset was generated against.
+        #
+        # Clocked (`demand_period_s > 0`): the multiplier is a function of ABSOLUTE simulated time,
+        # `(demand_start_s + tt) mod demand_period_s`, with the peaks at wall-clock seconds and a
+        # width in seconds. Two consequences, and they are the point: a rush hour is an hour rather
+        # than 9% of whatever the run happens to be, and a shorter run is a genuine PREFIX of a
+        # longer one under `rush`/`night` exactly as it already was under `uniform` -- the same
+        # traffic seen for less time, so quantities become comparable across durations.
+        def _tod_s(tt: float) -> float:
+            """Time of day (s within the period) at simulated second `tt`."""
+            return (cfg.demand_start_s + tt) % cfg.demand_period_s
+
+        def demand_mult_at(tt: float) -> float:   # arrival-rate multiplier in (0, 1]
+            if cfg.demand_profile == "uniform":
+                return 1.0
+            if cfg.demand_period_s > 0:
+                tod = _tod_s(tt)
+                if cfg.demand_profile == "rush":
+                    sig = max(1e-9, cfg.demand_peak_sigma_s)
+                    # circular offset: a peak near the period boundary must not be cut in half
+                    def _d(c):
+                        dd = abs(tod - c) % cfg.demand_period_s
+                        return min(dd, cfg.demand_period_s - dd)
+                    peak = (math.exp(-(_d(cfg.demand_am_peak_s) / sig) ** 2)
+                            + math.exp(-(_d(cfg.demand_pm_peak_s) / sig) ** 2))
+                    off = cfg.demand_off_peak_frac
+                    return off + (1.0 - off) * min(1.0, peak)
+                # night: sparse, gently ramping across the period (the legacy shape, clocked)
+                return 0.15 + 0.25 * (tod / cfg.demand_period_s)
+            frac = tt / total_time                # LEGACY: a shape stretched to the run
+            if cfg.demand_profile == "rush":      # morning + evening peaks, quiet midday/edges
                 peak = math.exp(-((frac - 0.25) / 0.09) ** 2) + math.exp(-((frac - 0.75) / 0.09) ** 2)
                 return 0.2 + 0.8 * min(1.0, peak)
-            if cfg.demand_profile == "night":    # sparse throughout, gently ramping
-                return 0.15 + 0.25 * frac
-            return 1.0                            # uniform
+            return 0.15 + 0.25 * frac             # night
 
+        _dest_floor = cfg.demand_off_peak_frac if cfg.demand_period_s > 0 else 0.2
         center = net.center if net is not None else None
         # demand surges above the base arrival rate need a faster candidate stream; the extra
         # candidates are thinned back out outside surge windows. No events -> cand_boost = 1.0 ->
         # identical draw sequence -> byte-identical output.
         cand_boost = max([1.0] + [ev_demand_mult(b) for b in sorted({e["t"] for e in _demand_evs})])
         cand_rate = cfg.arrival_rate * cand_boost
-        closure_sig: tuple = ()
         rrng = random.Random(f"{cfg.seed}:flow")
-        vid, tt = 0, 0.0
-        # `_replay is None` is the DEFAULT and is exactly `while True` there -- a constant load, no
-        # draw, no behaviour change. Under SUMO replay the engine's own arrival process is simply not
-        # run: SUMO decided who departs when, and the frozen trace records it (block below).
-        while _replay is None:                   # thinning: candidates at max rate, kept per demand
-            tt += rrng.expovariate(cand_rate) if cand_rate > 0 else total_time
-            if tt >= total_time:
-                break
-            if cfg.max_total_vehicles and vid >= cfg.max_total_vehicles:
-                break                            # cap total spawns (predictable memory bound)
-            frac = tt / total_time
-            if rrng.random() > demand_mult(frac) * ev_demand_mult(tt) / cand_boost:
-                continue                          # thinned out (off-peak / outside a surge)
-            if _closure_evs and net is not None:  # timed road closures divert NEW trips (navigation)
-                sig = tuple(e["t"] <= tt and (e["until"] is None or tt < e["until"])
-                            for e in _closure_evs)
-                if sig != closure_sig and hasattr(net, "set_closures"):
-                    closure_sig = sig
-                    net.set_closures([e["edge"] for e, on in zip(_closure_evs, sig) if on])
-            is_att = rrng.random() < cfg.attacker_pct
-            is_flt = (not is_att) and rrng.random() < cfg.faulty_pct
-            is_coll = is_att and rrng.random() < cfg.collude_pct
-            spd = cfg.trip_speed_min + rrng.random() * (cfg.trip_speed_max - cfg.trip_speed_min)
-            # OD bias: during a rush peak, most trips head to the centre (commute-to-core)
-            dest = center if (net is not None and cfg.demand_profile == "rush"
-                              and rrng.random() < demand_mult(frac) - 0.2) else None
-            trip = (net.random_trip(rrng, spd, tt, dest_hint=dest, od_model=cfg.od_model,
-                                    gravity_scale=cfg.od_gravity_scale,
-                                    boundary_origin=cfg.boundary_origins)
-                    if net is not None else None)
-            make_vehicle(vid, tt, is_att, is_flt, is_coll, trip, life_hint=90.0)
-            vid += 1
-        if _replay is not None:
-            # ---- SUMO REPLAY: the arrival process IS the frozen trace ------------------------- #
-            # No thinning, no expovariate, no `random_trip` -- departures, routes and car-following
-            # are all SUMO's, decided before this run started. What is still drawn here is the ROLE
-            # assignment (attacker / faulty / colluder), which belongs to the SECURITY experiment
-            # rather than to the traffic model, and it comes from its OWN string-keyed stream
-            # (`{seed}:sumoflow`) so it cannot touch the global `rng` sequence the pinned goldens
-            # depend on. Vehicles are created in the trace's canonical `idx` order, which the
-            # artifact records, so `vid` is a deterministic function of the trace alone.
+
+        # ---- THE ARRIVAL PROCESS, DRAWN ON DEMAND ------------------------------------------------ #
+        # This used to be a pre-pass: `while _replay is None:` ran to `tt >= total_time` before step 0,
+        # so the ENTIRE population -- every trip geometry, every pseudonym set, every
+        # DeviceLinkageContext, every LA registration, RA binding and PCA issuance -- existed before
+        # the first vehicle moved, and none of it was ever released. That is the "setup" phase of
+        # `docs/realism/LONG-RUNS.md` section 1.1 (0.12 s -> 5.15 s over the ladder) and it is where
+        # the memory of section 1.3 was allocated: peak working set fitted
+        # `92.5 MiB + 54.3 KiB x (vehicles EVER created)`, 3,159 MiB at 8 h, with the concurrent
+        # population saturating at ~170 the whole time.
+        #
+        # It is now a GENERATOR, pumped by the step loop, and the draw order is IDENTICAL. The
+        # generator suspends at `yield` -- after drawing a candidate's arrival time and deciding it
+        # survives thinning, but BEFORE drawing its roles, its speed and its route -- so resuming it
+        # replays exactly the sequence the pre-pass produced, one arrival at a time. `rrng` is a
+        # single stream consumed in order and every per-vehicle stream is string-keyed
+        # (`f"{seed}:veh:{vid}"`), so a vehicle's draws never depended on when it was built. That is
+        # what makes this byte-identical rather than merely equivalent.
+        #
+        # `_pump(t)` constructs every arrival due at or before `t`; `_pump(_ARRIVALS_DRAIN)` (after
+        # the loop, and before the VRU block, which needs the final population size to number its
+        # vids) finishes the process. An arrival that lands in the last `dt` of the run is therefore
+        # still created and still appears in `gt_vehicle` / `gt_identity_map`, exactly as before.
+
+        def _flow_arrivals():
+            """Yield `(spawn_time, vid)` for the NEXT arrival, then build it when resumed."""
+            closure_sig: tuple = ()       # () == "no closure applied to the router right now"
+            vid, tt = 0, 0.0
+            while True:
+                tt += rrng.expovariate(cand_rate) if cand_rate > 0 else total_time
+                if tt >= total_time:
+                    return
+                if cfg.max_total_vehicles and vid >= cfg.max_total_vehicles:
+                    return                        # cap total spawns (predictable memory bound)
+                dmul = demand_mult_at(tt)
+                if rrng.random() > dmul * ev_demand_mult(tt) / cand_boost:
+                    continue                      # thinned out (off-peak / outside a surge)
+                yield tt, vid                     # <- suspended here until this arrival is DUE
+                if _closure_evs and net is not None:  # timed road closures divert NEW trips
+                    sig = tuple(e["t"] <= tt and (e["until"] is None or tt < e["until"])
+                                for e in _closure_evs)
+                    if not any(sig):
+                        sig = ()                  # nothing closed == the router's resting state
+                    if sig != closure_sig and hasattr(net, "set_closures"):
+                        closure_sig = sig
+                        net.set_closures([e["edge"] for e, on in zip(_closure_evs, sig) if on])
+                is_att = rrng.random() < cfg.attacker_pct
+                is_flt = (not is_att) and rrng.random() < cfg.faulty_pct
+                is_coll = is_att and rrng.random() < cfg.collude_pct
+                spd = cfg.trip_speed_min + rrng.random() * (cfg.trip_speed_max - cfg.trip_speed_min)
+                # OD bias: during a rush peak, most trips head to the centre (commute-to-core). The
+                # threshold is "how far above the off-peak floor the demand currently is", and the
+                # floor is 0.2 on the legacy shape and `demand_off_peak_frac` (default 0.2) on the
+                # clocked one -- so the default is the same number and the draw is unchanged.
+                dest = center if (net is not None and cfg.demand_profile == "rush"
+                                  and rrng.random() < dmul - _dest_floor) else None
+                trip = (net.random_trip(rrng, spd, tt, dest_hint=dest, od_model=cfg.od_model,
+                                        gravity_scale=cfg.od_gravity_scale,
+                                        boundary_origin=cfg.boundary_origins)
+                        if net is not None else None)
+                make_vehicle(vid, tt, is_att, is_flt, is_coll, trip, life_hint=90.0)
+                vid += 1
+                if closure_sig and hasattr(net, "set_closures"):
+                    # Routing closures only ever affected the spawn pre-pass, and now that the
+                    # pre-pass is interleaved with the step loop that has to be re-established
+                    # before suspending: `_redeploy` routes a persistent adversary's next trip from
+                    # inside the loop and must see the same open network it always did. The `sig`
+                    # test above re-applies the closure for the next arrival.
+                    net.set_closures([])
+                    closure_sig = ()
+
+        def _replay_arrivals():
+            """SUMO REPLAY: the arrival process IS the frozen trace, pulled the same way.
+
+            No thinning, no expovariate, no `random_trip` -- departures, routes and car-following are
+            all SUMO's, decided before this run started. What is still drawn here is the ROLE
+            assignment (attacker / faulty / colluder), which belongs to the SECURITY experiment
+            rather than to the traffic model, and it comes from its OWN string-keyed stream
+            (`{seed}:sumoflow`) so it cannot touch the global `rng` sequence the pinned goldens
+            depend on. Vehicles are created in the trace's canonical `idx` order, which the artifact
+            records, so `vid` is a deterministic function of the trace alone.
+            """
             _srng = random.Random(f"{cfg.seed}:sumoflow")
             from .roads import Trip as _Trip
+            vid = 0
             for _span in _replay.plan(total_time=total_time, max_vehicles=cfg.max_total_vehicles):
                 is_att = _srng.random() < cfg.attacker_pct
                 is_flt = (not is_att) and _srng.random() < cfg.faulty_pct
                 is_coll = is_att and _srng.random() < cfg.collude_pct
+                yield _span.spawn_time, vid       # <- suspended here until this arrival is DUE
                 # The engine's `Trip` still exists for this vehicle, built from the DRIVEN polyline
                 # rather than from a router: `trip.length` is the SUMO route length and `trip.speed`
                 # its mean speed, so everything that reads `Vehicle.trip` keeps working. The
@@ -5617,11 +6003,25 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                              life_hint=90.0, replay_span=_span)
                 _replay.bind(vid, _span.idx)
                 vid += 1
-            if cfg.verbose:
-                print(f"[sumo replay] {vid} vehicles scheduled from the frozen trace over a "
-                      f"{total_time:.0f} s horizon", flush=True)
-        if _closure_evs and net is not None and hasattr(net, "set_closures"):
-            net.set_closures([])                 # routing closures only affect the spawn pre-pass
+
+        _arrivals = _replay_arrivals() if _replay is not None else _flow_arrivals()
+        _next_arrival = next(_arrivals, None)
+
+        def _pump(horizon: float) -> None:
+            """Construct every arrival whose spawn time is at or before `horizon`."""
+            nonlocal _next_arrival
+            while _next_arrival is not None and _next_arrival[0] <= horizon:
+                _next_arrival = next(_arrivals, None)
+
+        if cfg.vru_pct > 0:
+            # VRU vids are assigned contiguously PAST the vehicles (`make_vru(len(vehicles), ...)`),
+            # so the final vehicle count has to be known before the first VRU is built. Draining here
+            # restores the old eager behaviour for exactly that case; `vru_pct = 0` is the default
+            # and the arm every pinned golden is recorded on.
+            _pump(_ARRIVALS_DRAIN)
+        if _replay is not None and cfg.verbose:
+            print(f"[sumo replay] arrivals scheduled from the frozen trace over a "
+                  f"{total_time:.0f} s horizon", flush=True)
     else:
         # ---- FIXED FLEET: N vehicles present for the whole run (the default model) ----
         n_steps = cfg.n_steps
@@ -5670,12 +6070,11 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             for _ in range(_n_vru):
                 make_vru(len(vehicles), 0.0, total_time, _vru_nodes)
 
-    digest_to_vehicle = {d: vehicles[info["veh_vid"]] for d, info in pseudonym_info.items()}
-    vrng = {v.vid: random.Random(f"{cfg.seed}:sensor:{v.vid}") for v in vehicles}
-    # Dedicated per-vehicle DENM RNG stream (string-keyed), created + drawn ONLY when the DENM layer is
-    # enabled, so every other RNG-driven output is untouched and the DEFAULT path is byte-identical.
-    vdenm_rng = ({v.vid: random.Random(f"{cfg.seed}:denm:{v.vid}") for v in vehicles}
-                 if _denm_enabled else {})
+    # `digest_to_vehicle`, `vrng` and `vdenm_rng` were three comprehensions over the whole
+    # population here. They are now filled station by station in `_register_station`, because in
+    # flow mode there IS no whole population at this point -- the arrival process is drawn on
+    # demand by `_pump` (above) and the stations that have finished are released by `_retire`
+    # (below). Identical keys, identical values, and nothing iterates them.
 
     # ---- Road-Side Units (opt-in): fixed, always-trusted receivers ----
     # RSUs never move and never transmit; they only OBSERVE in-range CAMs and file reports like any
@@ -5737,6 +6136,11 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     subj_events: dict[str, list] = {}    # subject digest -> [(time, reporter_digest)] in a sliding window
     reported_vids: set[int] = set()       # true vids ever reported (for the live map colouring only)
     revoked_vehicles: dict[int, float] = {}          # vid -> revocation time (vehicle-level)
+    #: vid -> index into `crl_entries` of the entry the MA appended when it revoked that vid. This
+    #: is what turns the end-of-run linkage self-check from O(R^2) into O(C): the check no longer
+    #: has to search the CRL for an entry that matches, because the engine knows which entry is
+    #: supposed to match and can assert THAT one does. See the "Real-linkage sanity" block below.
+    revoked_entry_ix: dict[int, int] = {}
     revoked_digests: list[str] = []                  # triggering digests (for the CRL sanity check)
     filed_by: dict[str, int] = {}                    # reports FILED per reporter cert (rate-limit)
     received_by: dict[str, int] = {}                 # reports RECEIVED per subject cert (reputation)
@@ -6214,6 +6618,11 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         veh.revoked = True
         veh.revocation_time = t
         revoked_vehicles[veh.vid] = t
+        # THE INDEX, recorded at the one instant it is knowable for free: the entry that revokes
+        # this device is the one appended two lines up. Nothing else in the run appends to
+        # `crl_entries`, so this stays exact even when the list is the security layer's own
+        # (`_sec.crl`, which may already hold entries from an earlier arm).
+        revoked_entry_ix[veh.vid] = len(crl_entries) - 1
         revoked_digests.append(trigger_digest)
         reporters = {r for (_tt, r) in subj_events.get(trigger_digest, []) if trusted(r)}
         ma_investigations.append(R.MaInvestigation(
@@ -6722,10 +7131,97 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             if lat_rate:                   # a lane change in progress -> lateral velocity swings heading
                 v.cur_h = (v.cur_h + math.degrees(math.atan2(lat_rate, max(0.5, v.cur_v)))) % 360.0
 
+    def _retire(v) -> None:
+        """Release a station that has left the network for good.
+
+        The counterpart of `_pump`: together they make the engine's live station set a function of
+        the CONCURRENT population instead of the cumulative one. Called only on the terminal despawn
+        -- a persistent adversary that is merely parked between trips returns before this point,
+        because it comes back with the same identity, the same certificates and the same RNG streams.
+
+        What is released is everything only a driving vehicle needs: the claim history, the three
+        per-vehicle RNG streams, and the `Vehicle` itself -- its routed `Trip` polyline, its pseudonym
+        records and its `DeviceLinkageContext` -- replaced by a `_RetiredDevice` tombstone (see that
+        class for why the reference cannot simply be dropped). What is KEPT is everything the dataset
+        still owes: this attacker's `gt_attacks` row is written here, and `gt_vehicle`, `gt_idmap`,
+        `pseudonym_info`, `cert_first_seen` / `cert_last_seen`, `surv_span`, the CRL entry index and
+        the PKI authorities' own records were never the vehicle object's to begin with.
+        """
+        v.hist.clear()
+        vrng.pop(v.vid, None)            # a despawned vehicle never transmits again -> free its RNG
+        vdenm_rng.pop(v.vid, None)       # (empty/no-op unless the DENM layer is on -> digest-safe)
+        lc_rng.pop(v.vid, None)          # (empty/no-op unless lane_changes is on -> digest-safe)
+        # The other two per-identity accumulators, on the same argument: a station that has left for
+        # good never transmits another CAM, so neither its previous-speed sample nor its redeploy
+        # stream can be consulted again. Both are empty unless their opt-in is on -> digest-safe.
+        _denm_prev_v.pop(v.vid, None)
+        redeploy_rng.pop(v.vid, None)
+        if v.is_attacker:
+            gt_attacks.append(R.GtAttack(
+                attack_id=f"atk_{v.vid}", true_vehicle_id=f"veh_{v.vid:03d}",
+                attack_type=v.attack_type, start_time=round(v.attack_from, 3),
+                end_time=round(v.attack_to, 3), attack_onset_time=v.onset, params={}))
+        dead = _RetiredDevice(v)
+        for _ps in v.pseudonyms:
+            digest_to_vehicle[_ps["digest"]] = dead
+        for _g in v.ghosts:
+            digest_to_vehicle[_g] = dead
+        if 0 <= v.vid < len(vehicles) and vehicles[v.vid] is v:
+            vehicles[v.vid] = dead       # `len(vehicles)` still counts every station ever created
+
     # ---- Simulation loop: activate -> car-follow -> pre-pass -> detect -> collude -> revoke ----
-    spawn_order = sorted(vehicles, key=lambda v: (v.spawn_time, v.vid))
+    # `spawn_q` is filled by `_register_station` in construction order, which IS spawn order on every
+    # path that appends to it lazily. The one sort here reproduces the old
+    # `sorted(vehicles, key=(spawn_time, vid))` for the eager paths -- a fixed fleet, and VRUs, whose
+    # vids are numbered past the vehicles but whose spawn times interleave with them.
+    spawn_q.sort(key=lambda v: (v.spawn_time, v.vid))
     spawn_ptr = 0
+    n_spawned = 0                     # cumulative activations (the queue head is periodically dropped)
     active: dict[int, Vehicle] = {}
+    # ---- PERSISTENT ADVERSARIES: identities dwelling between trips ---------------------------
+    # Empty and never touched unless `persistent_attacker_pct > 0`, so the default path is
+    # byte-identical. `redeploy_q` holds (re-entry instant, vid) for every campaign vehicle that has
+    # finished a trip and will drive another; `redeploy_rng` is its own keyed stream per identity, so
+    # the routes it picks cannot perturb `rrng`, `rng` or any per-vehicle sensor stream.
+    redeploy_q: list[tuple[float, int]] = []
+    redeploy_pending: dict[int, Vehicle] = {}
+    redeploy_rng: dict[int, random.Random] = {}
+
+    def _redeploy(v, now: float) -> bool:
+        """Give a persistent adversary its next trip, or retire it. True = it will come back.
+
+        The dwell is the time the OBU is parked between two journeys, and it is floored at the time
+        an ordinary vehicle needs to drive from where this one stopped to where the next trip
+        starts. That floor is not cosmetic: the un-recorded leg is a gap in the trajectory, and
+        `realism_bench.teleport_events` tests mean speed across exactly such gaps, so a dwell too
+        short for the distance would (correctly) read as a teleport.
+        """
+        if now >= v.campaign_until or net is None:
+            return False
+        r = redeploy_rng.get(v.vid)
+        if r is None:
+            r = redeploy_rng[v.vid] = random.Random(f"{cfg.seed}:redeploy:{v.vid}")
+        # The same physical vehicle with the same driver, so its desired speed, its class kinematics
+        # and its GNSS quality are carried over unchanged. Only the ROUTE is new.
+        trip = net.random_trip(r, max(1.0, v.desired_speed), now, od_model=cfg.od_model,
+                               gravity_scale=cfg.od_gravity_scale,
+                               boundary_origin=cfg.boundary_origins)
+        x0, y0, _h0 = trip.at_distance(0.0)
+        px, py, _s, _h = v.true_state(now)
+        gap = math.hypot(x0 - px, y0 - py)
+        dwell = cfg.persistent_dwell_min_s + r.random() * max(
+            0.0, cfg.persistent_dwell_max_s - cfg.persistent_dwell_min_s)
+        dwell = max(dwell, gap / PERSISTENT_REDEPLOY_SPEED_MPS)
+        at = now + dwell
+        if at >= v.campaign_until:
+            return False                              # the campaign ends during the dwell
+        v.trip = trip
+        v.redeploy_at = at
+        v.deployments += 1
+        redeploy_q.append((at, v.vid))
+        redeploy_pending[v.vid] = v
+        return True
+
     t = 0.0                                           # defined even if interrupted before step 0
     # Catch Ctrl-C for a graceful stop (finish the step, then finalize). Only in the main thread; a
     # second Ctrl-C restores the default handler so it hard-aborts. Restored after the loop.
@@ -6749,13 +7245,42 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             break
         t = step * cfg.dt
         touched_subjects.clear()
-        while spawn_ptr < len(spawn_order) and spawn_order[spawn_ptr].spawn_time <= t:
-            av = spawn_order[spawn_ptr]; active[av.vid] = av; spawn_ptr += 1
+        _pump(t)                          # draw + construct every arrival due by now (flow only)
+        while spawn_ptr < len(spawn_q) and spawn_q[spawn_ptr].spawn_time <= t:
+            av = spawn_q[spawn_ptr]; spawn_q[spawn_ptr] = None
+            active[av.vid] = av; spawn_ptr += 1; n_spawned += 1
+        if spawn_ptr >= 4096:             # drop the drained head so the queue stays O(pending)
+            del spawn_q[:spawn_ptr]; spawn_ptr = 0
+        if redeploy_q:                        # persistent adversaries whose dwell has elapsed
+            due = [e for e in redeploy_q if e[0] <= t]
+            if due:
+                redeploy_q[:] = [e for e in redeploy_q if e[0] > t]
+                for _at, _vid in sorted(due):
+                    rv = redeploy_pending.pop(_vid)
+                    rv.s_pos = 0.0
+                    rv.cur_x, rv.cur_y, rv.cur_h = rv.trip.at_distance(0.0)
+                    if rv.lane_off:
+                        _hr = math.radians(rv.cur_h)
+                        rv.cur_x += rv.lane_off * -math.sin(_hr)
+                        rv.cur_y += rv.lane_off * math.cos(_hr)
+                    rv.cur_v = rv.desired_speed
+                    # cf: the route's completion decides the despawn (car_follow sets it). Otherwise
+                    # the trip's own arrival time does, exactly as at construction -- leaving it None
+                    # there would give a non-car-following adversary a vehicle that never despawns.
+                    rv.finish_time = None if rv.cf else rv.trip.t1
+                    active[_vid] = rv          # SAME identity, SAME certificates, next journey
         for vid in [vid for vid, v in active.items() if v.finish_time is not None and t > v.finish_time]:
-            active.pop(vid).hist.clear()
-            vrng.pop(vid, None)              # a despawned vehicle never transmits again -> free its RNG
-            vdenm_rng.pop(vid, None)         # (empty/no-op unless the DENM layer is on -> digest-safe)
-            lc_rng.pop(vid, None)            # (empty/no-op unless lane_changes is on -> digest-safe)
+            # A persistent adversary mid-campaign PARKS instead of retiring: it leaves the network
+            # (it broadcasts nothing while parked) and comes back with a new route after its dwell.
+            # Its per-vehicle sensor / DENM / lane-change streams are NOT dropped, because the same
+            # device carries them into the next trip -- resetting them would restart its GNSS error
+            # sequence and make two trips of one identity statistically independent, which is
+            # exactly the correlation a long-horizon linkage study is looking for.
+            _v = active[vid]
+            if _v.campaign_until > 0.0 and _redeploy(_v, t):
+                active.pop(vid).hist.clear()
+                continue
+            _retire(active.pop(vid))
         active_list = [active[vid] for vid in sorted(active)]
         if cf_active:
             car_follow(active_list, t)
@@ -6811,7 +7336,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             if enforced(tx, t):
                 surv["enforced"] += 1
                 continue
-            ps = tx.active_pseudonym(t, cfg.rotate_period_s)
+            ps = tx.active_pseudonym(t, _rot_period_s)
             digest = ps["digest"]
             cert_first_seen.setdefault(digest, t)
             cert_last_seen[digest] = t
@@ -7267,7 +7792,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             _cbr_n += 1
             if geo_cbr > _cbr_max:
                 _cbr_max = geo_cbr
-            reporter_digest = rx.active_pseudonym(t, cfg.rotate_period_s)["digest"]
+            reporter_digest = rx.active_pseudonym(t, _rot_period_s)["digest"]
             for li, (b, dist) in enumerate(in_range):
                 rssi_dbm = None
                 if not _chan_additive:
@@ -7468,7 +7993,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         for tx in active_list:
             if not tx.colluder or enforced(tx, t) or not (tx.attack_from <= t <= tx.attack_to):
                 continue
-            reporter_digest = tx.active_pseudonym(t, cfg.rotate_period_s)["digest"]
+            reporter_digest = tx.active_pseudonym(t, _rot_period_s)["digest"]
             if cfg.traffic_flow:
                 txx, txy = rx_pos.get(tx.vid, tx.true_state(t)[:2])
                 cand = [v for v in active_list if not v.is_attacker and not enforced(v, t) and not v.is_vru
@@ -7485,7 +8010,7 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             else:
                 victim_vehicles = [vehicles[vv] for vv in tx.victims if vv in active and not enforced(active[vv], t)]
             for victim in victim_vehicles:
-                subject_digest = victim.active_pseudonym(t, cfg.rotate_period_s)["digest"]
+                subject_digest = victim.active_pseudonym(t, _rot_period_s)["digest"]
                 if rng.random() > cfg.report_prob:
                     continue
                 # Fabricate PLAUSIBLE evidence from the colluder's own keyed stream so the detector
@@ -7558,12 +8083,20 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         if live_every and step % live_every == 0:
             write_live(active_list, t)
         if cfg.verbose and cfg.traffic_flow and n_steps >= 40 and step % max(1, n_steps // 20) == 0:
-            print(f"[flow t={t:.0f}/{total_time:.0f}s] active={len(active)} spawned={spawn_ptr} "
+            print(f"[flow t={t:.0f}/{total_time:.0f}s] active={len(active)} spawned={n_spawned} "
                   f"reports={counters['report']} revoked={len(revoked_vehicles)}", flush=True)
         if stream:
             flush_streams()
             if (step + 1) % cfg.state_prune_every == 0:
                 prune_state(step, active)
+
+    # ---- FINISH THE ARRIVAL PROCESS --------------------------------------------------------------
+    # The last step is at `(n_steps - 1) * dt`, so arrivals landing in the run's final `dt` are drawn
+    # but never activated. The pre-pass this replaced drew them anyway, and they appear in
+    # `gt_vehicle` / `gt_identity_map` -- roughly `arrival_rate * dt` rows. Draining here keeps that
+    # true on every path, including a Ctrl-C: an interrupted run's ground truth still describes the
+    # whole arrival process its seed defines, exactly as it did before.
+    _pump(_ARRIVALS_DRAIN)
 
     # ---- WHOLE-RUN INTEGRITY: the half a bounded conformance window structurally cannot do ----
     # Checked the moment the step loop ends, BEFORE a single output file is written, so a run whose
@@ -7608,19 +8141,64 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
             _w.discard()
 
     # ---- attack ground truth (with onset) ----
-    gt_attacks = [R.GtAttack(
+    # Every attacker RELEASED during the run already wrote its row from `_retire` (its onset and its
+    # attack window are both final the moment it leaves the network for good); this adds the ones
+    # still holding a live `Vehicle` -- everything on a fixed fleet, and on the flow path whoever was
+    # still driving when the run ended plus the handful whose arrival lands in the final `dt`.
+    # `_write_side_files` / `_write_outputs` sort by `attack_id`, so the order rows are appended in
+    # is not observable.
+    gt_attacks.extend(R.GtAttack(
         attack_id=f"atk_{v.vid}", true_vehicle_id=f"veh_{v.vid:03d}", attack_type=v.attack_type,
         start_time=round(v.attack_from, 3), end_time=round(v.attack_to, 3), attack_onset_time=v.onset,
-        params={}) for v in vehicles if v.is_attacker]
+        params={}) for v in vehicles if isinstance(v, Vehicle) and v.is_attacker)
 
     # ---- Real-linkage sanity: the CRL entry must revoke EVERY observed cert of a revoked vehicle ----
-    for vid in revoked_vehicles:
-        for d in cert_first_seen:
-            info = pseudonym_info[d]
-            if info["veh_vid"] != vid:
-                continue
+    # THE INVARIANT IS UNCHANGED and it is a real SCMS property: for every pseudonym the MA actually
+    # SAW on the air belonging to a device it revoked, the published CRL must recompute that
+    # pseudonym's linkage value from the two published seeds. That is the whole reason the linkage
+    # implementation is trustworthy, so it is asserted on every run rather than tested once.
+    #
+    # WHAT CHANGED IS THE SEARCH, not the property. This used to be
+    #
+    #     for vid in revoked_vehicles:            # O(R)
+    #         for d in cert_first_seen:           # O(C) -- a FULL scan, once per revoked vehicle
+    #             if pseudonym_info[d]["veh_vid"] != vid: continue
+    #             assert any(e.matches(...) for e in crl_entries)      # O(R)
+    #
+    # -- O(R*C) dictionary work plus R(R+1)/2 `CrlLinkageEntry.matches` calls at a measured
+    # 8.7-10.3 us each. Both R (revocations) and C (certificates ever observed) are linear in run
+    # length, so the term is ~4.5 us * R^2: 1.4 s at 300 s and an extrapolated 1,203 s of the
+    # 1,715.2 s finalisation at 28,800 s, i.e. 70% of it, and the whole reason finalisation's
+    # scaling exponent was 1.598 instead of 1.0 (`docs/realism/LONG-RUNS.md` section 1.2).
+    #
+    # It is now ONE pass over the observed certificates, and the CRL is not searched at all: the
+    # engine RECORDED which entry revokes each device (`revoked_entry_ix`, written inside
+    # `resolve_and_revoke`), so the check asserts that THAT entry matches. **This is strictly
+    # stronger than the scan it replaces** -- `crl_entries[ix]` is a member of `crl_entries`, so
+    # `crl_entries[ix].matches(...)` being true implies `any(e.matches(...) for e in crl_entries)`
+    # is true, while the converse does not hold: the old form would have been satisfied by some
+    # OTHER device's entry matching. Nothing is checked less often and nothing is checked less
+    # deeply; `matches` still recomputes the full hash chain, the Davies-Meyer pre-linkage values
+    # and the XOR for every observed pseudonym of every revoked device.
+    #
+    # `CRL_AUDIT_EXHAUSTIVE` (or `SCMS_CRL_AUDIT=exhaustive`) additionally runs the old whole-CRL
+    # scan and asserts the two agree. That is the equivalence proof, it is quadratic, and it is off
+    # by default -- see `tests/test_crl_sanity_index.py`, which runs it on a real dataset.
+    assert len(revoked_entry_ix) == len(revoked_vehicles), \
+        "every revoked vehicle must carry the index of the CRL entry that revokes it"
+    _crl_exhaustive = bool(CRL_AUDIT_EXHAUSTIVE or os.environ.get("SCMS_CRL_AUDIT") == "exhaustive")
+    _crl_checked = 0
+    for d in cert_first_seen:                         # the certs the MA actually SAW, once each
+        info = pseudonym_info[d]
+        ix = revoked_entry_ix.get(info["veh_vid"])
+        if ix is None:                                # this device was never revoked
+            continue
+        _crl_checked += 1
+        assert crl_entries[ix].matches(info["i"], info["j"], info["lv"]), \
+            "CRL entry failed to revoke a pseudonym of its target device"
+        if _crl_exhaustive:
             assert any(e.matches(info["i"], info["j"], info["lv"]) for e in crl_entries), \
-                "CRL entry failed to revoke a pseudonym of its target device"
+                "exhaustive CRL audit disagrees with the indexed check"
 
     # ---- Certificate status (MA-visible): a cert is revoked iff its vehicle is ----
     # When station types are in play each row also carries the MA-VISIBLE self-declared station_type
@@ -7630,9 +8208,23 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     # vehicle, is_vru=False) that broadcast station_type="vru" therefore appears as a declared VRU here,
     # exactly as the MA saw it -- so the MA-visible field never leaks the attacker's true type. Neither
     # VRUs nor the impersonation attack present -> plain R.MaCertStatus -> byte-identical.
+    # THE VALIDITY WINDOW THE MA PUBLISHES. Historically this row was written
+    # `valid_from = 0.0, valid_to = total_time` for 100.0% of certificates at every duration from
+    # 300 s to 8 h -- so `ma_cert_status.valid_to` was not a certificate profile, it was the
+    # `--duration` flag, and anything that trained or gated on it was reading the harness
+    # (docs/realism/LONG-RUNS.md 4.3). Under `cert_validity_s` it carries the certificate's OWN
+    # window, taken from the issuance record the engine already built. That is not a leak: a
+    # validity period is a field INSIDE the certificate, which the MA holds -- only the true
+    # identity beside it in `gt_identity_map` is ORACLE, and that is not read here.
+    _cert_window: dict = {}
+    if cfg.cert_validity_s > 0:
+        for _row in gt_idmap:
+            _cert_window[_row.pseudonym_cert_digest] = (_row.valid_from, _row.valid_to)
+
     def _cert_status_row(d, f):
-        kw = dict(cert_digest=d, first_seen=f, last_seen=cert_last_seen[d], valid_from=0.0,
-                  valid_to=total_time, issuing_pca="PCA-1",
+        vfrom, vto = _cert_window.get(d, (0.0, total_time))
+        kw = dict(cert_digest=d, first_seen=f, last_seen=cert_last_seen[d], valid_from=vfrom,
+                  valid_to=vto, issuing_pca="PCA-1",
                   crl_status=("revoked" if pseudonym_info[d]["veh_vid"] in revoked_vehicles else "active"),
                   revocation_time=revoked_vehicles.get(pseudonym_info[d]["veh_vid"]))
         if _emit_station_type:
@@ -7676,7 +8268,9 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
         data_files["ground_truth/gt_denm_emissions.jsonl"] = _write_jsonl(
             os.path.join(cfg.out_dir, "ground_truth", "gt_denm_emissions.jsonl"),
             sorted(gt_denm, key=lambda r: r["denm_id"]))
-    data_digest = _data_digest(cfg.out_dir, data_files)
+    # One streamed SHA-256 pass over the outputs, shared with the manifest below (see `_file_sha256`).
+    _file_hashes: dict[str, str] = {}
+    data_digest = _data_digest(cfg.out_dir, data_files, _file_hashes)
     chan.close()                       # ALWAYS called, including on the SIGINT finalisation path
     # Isolated detector workers: FINISH (which collects their declared streams for the manifest and
     # asserts they scored every message they were sent) and reap the processes. Before
@@ -7778,14 +8372,20 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                                                      "ok": True}
                                                     if _armed else None)),
                     config_snapshot=_cfg0, mobility=_mob_block, codec_claim=_codec_claim,
-                    profile_claim=_profile_claim,
+                    file_hashes=_file_hashes, profile_claim=_profile_claim,
                     report_claim=(dict(_report_fmt.standards_claim())
                                   if _report_fmt is not None else None))
 
     return RunResult(out_dir=cfg.out_dir, n_vehicles=len(vehicles), n_reports=n_reports,
                      n_investigations=len(ma_investigations), n_revoked=len(revoked_vehicles),
                      revoked_cert_digests=sorted(revoked_digests), data_digest=data_digest,
-                     counts=dict(cert_status=len(ma_cert_status), gt_reports=n_gt_reports))
+                     counts=dict(cert_status=len(ma_cert_status), gt_reports=n_gt_reports,
+                                 # observed pseudonyms of revoked devices re-derived from the CRL by
+                                 # the end-of-run linkage self-check. RunResult only -- it is not a
+                                 # manifest field and moves no digest -- so a test can assert the
+                                 # invariant was exercised over a real body of certificates rather
+                                 # than passing vacuously.
+                                 crl_linkage_checks=_crl_checked))
 
 
 # --------------------------------------------------------------------------- #
@@ -8050,11 +8650,35 @@ def _write_side_files(cfg, ma_invest, ma_crl, ma_cert, gt_veh, gt_idmap,
     return {rel: _write_jsonl(os.path.join(cfg.out_dir, rel), rows) for rel, rows in files.items()}
 
 
-def _file_sha256(path: str) -> str:
+#: Read size for `_file_sha256`. One megabyte is comfortably past the point where the syscall count
+#: stops mattering and far below any output file this engine writes.
+_HASH_BLOCK = 1 << 20
+
+
+def _file_sha256(path: str, cache: dict | None = None) -> str:
+    """SHA-256 of a file, read in `_HASH_BLOCK` chunks.
+
+    This used to be `h.update(fh.read())` -- the ENTIRE file into one `bytes` object -- and it is
+    called once per data file by `_data_digest` and again per data file by `_write_manifest`, so
+    every output file was read whole, twice. On the 8-hour reference run
+    `ground_truth/gt_mobility_oracle.jsonl` is 997 MB, so that single allocation was the largest
+    term in the run's peak working set and it grew linearly with duration
+    (`docs/realism/LONG-RUNS.md` section 1.2). Chunked reads make the allocation constant, and
+    `cache` lets the two call sites share one pass. **Digest-neutral by construction**: the bytes
+    fed to `hashlib` are the same bytes in the same order.
+    """
+    if cache is not None:
+        hit = cache.get(path)
+        if hit is not None:
+            return hit
     h = hashlib.sha256()
     with open(path, "rb") as fh:
-        h.update(fh.read())
-    return h.hexdigest()
+        for blk in iter(lambda: fh.read(_HASH_BLOCK), b""):
+            h.update(blk)
+    out = h.hexdigest()
+    if cache is not None:
+        cache[path] = out
+    return out
 
 
 def _survivorship_block(cfg, surv: dict, surv_span: dict, revoked: dict, n_vehicles: int,
@@ -8121,12 +8745,16 @@ def _survivorship_block(cfg, surv: dict, surv_span: dict, revoked: dict, n_vehic
     return out
 
 
-def _data_digest(out_dir: str, data_files: dict[str, str]) -> str:
-    """Single digest over all DATA files (manifest excluded -> determinism-safe)."""
+def _data_digest(out_dir: str, data_files: dict[str, str], cache: dict | None = None) -> str:
+    """Single digest over all DATA files (manifest excluded -> determinism-safe).
+
+    `cache` (optional, path -> hex) is filled as it goes so `_write_manifest` can reuse this pass
+    instead of reading and hashing every output file a second time.
+    """
     h = hashlib.sha256()
     for rel in sorted(data_files):
         h.update(rel.encode())
-        h.update(_file_sha256(data_files[rel]).encode())
+        h.update(_file_sha256(data_files[rel], cache).encode())
     return h.hexdigest()
 
 
@@ -8203,7 +8831,7 @@ def standards_profile_for(cfg, codec_claim=None, profile_claim=None, report_clai
 
 def _write_manifest(cfg, data_files, data_digest, counts, plugins=None,
                     config_snapshot=None, mobility=None, codec_claim=None,
-                    profile_claim=None, report_claim=None) -> None:
+                    profile_claim=None, report_claim=None, file_hashes=None) -> None:
     manifest = {
         "dataset_version": __version__,
         "build_utc": datetime.now(timezone.utc).isoformat(),   # NOT part of data_digest
@@ -8231,7 +8859,11 @@ def _write_manifest(cfg, data_files, data_digest, counts, plugins=None,
         # gui.ps1, conftest.py) an auditable property of the artifact rather than a convention.
         "runtime": _api_registry.runtime_block(),
         "data_digest_sha256": data_digest,
-        "outputs": [{"path": rel, "sha256": _file_sha256(p)} for rel, p in sorted(data_files.items())],
+        # `file_hashes` is `_data_digest`'s own pass, handed over rather than repeated: without it
+        # every data file is read and hashed a second time here (measured 1.91-1.94x the work of one
+        # streamed pass on the 3600 s and 7200 s reference datasets).
+        "outputs": [{"path": rel, "sha256": _file_sha256(p, file_hashes)}
+                    for rel, p in sorted(data_files.items())],
         "counts": counts,
         # The plugin LOCK (dvc.lock to cfg.plugins' dvc.yaml): what was ACTUALLY loaded, content
         # addressed. Excluded from data_digest by construction; carries its own provenance_digest.
@@ -8439,6 +9071,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--faulty-pct", type=float, default=0.05)
     p.add_argument("--weather", default="clear", choices=list(WEATHER_MULT))
     p.add_argument("--rotate-period", type=float, default=0.0, help="pseudonym rotation period (s); 0=off")
+    p.add_argument("--cert-validity", type=float, default=0.0,
+                   help="validity period of ONE pseudonym certificate (s); 0 = the legacy behaviour "
+                        "where a certificate expires when the simulation does. Set it and "
+                        "certificates expire on their own clock, the station rotates onto the next, "
+                        "and ma_cert_status carries the real window instead of [0, duration]")
+    p.add_argument("--persistent-attacker-pct", type=float, default=0.0,
+                   help="fraction of ATTACKERS whose campaign outlives one trip: the identity parks "
+                        "and re-enters with a new route until the campaign expires (0 = off)")
+    p.add_argument("--persistent-campaign", type=float, default=3600.0,
+                   help="mean campaign length of a persistent adversary (s)")
+    p.add_argument("--persistent-campaign-jitter", type=float, default=0.5,
+                   help="campaign length spread: U[(1-j),(1+j)] x --persistent-campaign")
+    p.add_argument("--persistent-dwell-min", type=float, default=60.0,
+                   help="shortest parked gap between two trips of one adversary (s)")
+    p.add_argument("--persistent-dwell-max", type=float, default=600.0,
+                   help="longest parked gap between two trips of one adversary (s)")
     p.add_argument("--collude-pct", type=float, default=0.0, help="fraction of attackers that false-report")
     p.add_argument("--victim-pct", type=float, default=0.10, help="fraction of benign vehicles targeted")
     p.add_argument("--sybil-ghosts", type=int, default=6, help="ghost identities a Sybil attacker fakes")
@@ -8618,6 +9266,21 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="explicit RSU positions 'x1,y1;x2,y2;...' (overrides --rsu-placement)")
     p.add_argument("--demand", default="uniform", choices=["uniform", "rush", "night"],
                    help="time-varying arrival-demand profile")
+    p.add_argument("--demand-period-s", type=float, default=0.0,
+                   help="give --demand a REAL CLOCK: the length of one cycle in simulated seconds "
+                        "(86400 = a day). 0 (default) keeps the legacy shape, which is stretched to "
+                        "the run -- the 'AM peak' then sits at 25%% of --duration, so two durations "
+                        "are two different scenarios")
+    p.add_argument("--demand-start-s", type=float, default=0.0,
+                   help="time of day (s past midnight) at simulated t=0, with --demand-period-s")
+    p.add_argument("--demand-am-peak-s", type=float, default=28800.0,
+                   help="AM peak centre within the demand period (default 28800 = 08:00)")
+    p.add_argument("--demand-pm-peak-s", type=float, default=61200.0,
+                   help="PM peak centre within the demand period (default 61200 = 17:00)")
+    p.add_argument("--demand-peak-sigma-s", type=float, default=3600.0,
+                   help="Gaussian half-width of each demand peak (default 3600: a rush hour is an hour)")
+    p.add_argument("--demand-off-peak-frac", type=float, default=0.2,
+                   help="arrival-rate multiplier away from the peaks")
     p.add_argument("--fleet", default="mixed", help="'mixed' or a single vehicle class (car/truck/bus/motorcycle)")
     p.add_argument("--fleet-mix", default="", help="custom mixed composition, e.g. 'car:0.6,truck:0.3,bus:0.1'")
     p.add_argument("--trip-speed-min", type=float, default=8.0, help="min desired trip speed (m/s)")
@@ -8756,6 +9419,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                          attack_delay_jitter_s=args.attack_delay_jitter,
                          faulty_pct=args.faulty_pct,
                          weather=args.weather, rotate_period_s=args.rotate_period,
+                         cert_validity_s=args.cert_validity,
+                         persistent_attacker_pct=args.persistent_attacker_pct,
+                         persistent_campaign_s=args.persistent_campaign,
+                         persistent_campaign_jitter=args.persistent_campaign_jitter,
+                         persistent_dwell_min_s=args.persistent_dwell_min,
+                         persistent_dwell_max_s=args.persistent_dwell_max,
                          collude_pct=args.collude_pct, victim_pct=args.victim_pct,
                          sybil_ghosts=args.sybil_ghosts, ma_defense=not args.no_ma_defense,
                          crl_aware_pct=args.crl_aware_pct, crl_dormant_s=args.crl_dormant_s,
@@ -8782,7 +9451,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                          grid_dropout=args.grid_dropout,
                          arterial_every=args.arterial_every, arterial_speed_mps=args.arterial_speed,
                          local_speed_mps=args.local_speed,
-                         demand_profile=args.demand, od_model=args.od_model,
+                         demand_profile=args.demand, demand_period_s=args.demand_period_s,
+                         demand_start_s=args.demand_start_s,
+                         demand_am_peak_s=args.demand_am_peak_s,
+                         demand_pm_peak_s=args.demand_pm_peak_s,
+                         demand_peak_sigma_s=args.demand_peak_sigma_s,
+                         demand_off_peak_frac=args.demand_off_peak_frac,
+                         od_model=args.od_model,
                          od_gravity_scale=args.od_gravity_scale, boundary_origins=args.boundary_origins,
                          n_rsus=args.n_rsus, rsu_placement=args.rsu_placement, rsu_range_m=args.rsu_range,
                          rsu_coords=args.rsu_coords,

@@ -14,10 +14,32 @@ from .leakage_linter import find_forbidden_keys
 
 
 def _read(path: str) -> list[dict]:
+    """Whole file as a list. Use ONLY where the rows are indexed, joined or re-scanned."""
     if not os.path.exists(path):
         return []
     with open(path, encoding="utf-8") as fh:
         return [json.loads(line) for line in fh if line.strip()]
+
+
+def _iter_rows(path: str):
+    """Row at a time, for the two passes that only ever iterate.
+
+    **This is the whole of `validate()`'s memory footprint.** `ma/ma_reports.jsonl` is the largest
+    MA-visible file a run writes -- 41 MB on a 30-minute reference run, 641 MB on an 8-hour one --
+    and `_read` materialised all of it as a list of dicts, at a measured ~4.7 bytes of resident
+    memory per byte of file. `mock_pipeline.run._emit_result` calls `validate()` after EVERY CLI run,
+    so that list was the dominant term in the engine's published peak working set: the
+    `92.5 MiB + 54.3 KiB x (vehicles ever created)` law in `docs/realism/LONG-RUNS.md` section 1.3 is
+    this list, and 54.3 KiB per vehicle is 11.5 KB of `ma_reports` per vehicle times that blow-up
+    factor. Streaming makes the same two passes with one row live at a time and changes no result:
+    both call sites only ever iterate.
+    """
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                yield json.loads(line)
 
 
 def realism_summary(dataset_dir: str) -> dict:
@@ -55,7 +77,7 @@ def validate(dataset_dir: str, realism: bool = False) -> tuple[dict, list]:
     ma_rows = 0
     leaks: list = []
     for f in sorted(glob.glob(os.path.join(ma, "*.jsonl"))):
-        for row in _read(f):
+        for row in _iter_rows(f):
             ma_rows += 1
             hits = find_forbidden_keys(row)
             if hits:
@@ -128,7 +150,7 @@ def validate(dataset_dir: str, realism: bool = False) -> tuple[dict, list]:
     rsu_reporters: set = set()
     rsu_reports = 0
     rsu_true = 0
-    for r in _read(os.path.join(ma, "ma_reports.jsonl")):
+    for r in _iter_rows(os.path.join(ma, "ma_reports.jsonl")):
         subj_atk = d2v.get(r.get("subject_cert_digest")) in attackers
         for code in r.get("reason_codes", []):
             det_hits[code] = det_hits.get(code, 0) + 1

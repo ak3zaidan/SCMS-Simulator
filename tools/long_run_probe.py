@@ -93,6 +93,32 @@ SCENARIOS: dict[str, list[str]] = {
     "ref_grid_rush": ["--flow", "--road", "grid", "--grid", "6", "--arrival-rate", "2",
                       "--attacker-pct", "0.15", "--traffic-lights", "--seed", "42",
                       "--demand", "rush"],
+    # The same rush profile ON A REAL CLOCK. `--demand-period-s 86400` makes the multiplier a
+    # function of absolute simulated time instead of run fraction, with `--demand-start-s 25200`
+    # putting t = 0 at 07:00 and the AM peak an hour later. This arm exists to show the OPPOSITE of
+    # `ref_grid_rush`: the rung ladder is a controlled experiment again, because a shorter run is an
+    # exact prefix of a longer one under it (compare with `--curves` at 300 and 900 s).
+    "ref_grid_rush_clocked": ["--flow", "--road", "grid", "--grid", "6", "--arrival-rate", "2",
+                              "--attacker-pct", "0.15", "--traffic-lights", "--seed", "42",
+                              "--demand", "rush", "--demand-period-s", "86400",
+                              "--demand-start-s", "25200"],
+    # Certificates with a REAL validity window. Every certificate is valid for 300 s whatever
+    # `--duration` says, `ma_cert_status` publishes that window instead of [0, total_time], and a
+    # station rotates onto a fresh certificate when its current one expires -- so the issued-span
+    # distribution stops tracking the run length (measured p50 0.477-0.481 x duration at every rung).
+    "ref_grid_certs": ["--flow", "--road", "grid", "--grid", "6", "--arrival-rate", "2",
+                       "--attacker-pct", "0.15", "--traffic-lights", "--seed", "42",
+                       "--cert-validity", "300"],
+    # A persistent adversary: 10% of attackers keep their identity across trips for a ~90 min
+    # campaign. This is the arm on which `--curves`' attack-span distribution stops being stationary
+    # (p50 256 s / p95 484 s / max 598 s at every duration from 1800 s to 8 h without it).
+    "ref_grid_persistent": ["--flow", "--road", "grid", "--grid", "6", "--arrival-rate", "2",
+                            "--attacker-pct", "0.15", "--traffic-lights", "--seed", "42",
+                            "--persistent-attacker-pct", "0.10",
+                            "--persistent-campaign", "5400",
+                            "--persistent-campaign-jitter", "0.3",
+                            "--persistent-dwell-min", "120", "--persistent-dwell-max", "900",
+                            "--cert-validity", "600"],
 }
 
 PROGRESS_RE = re.compile(r"\[flow t=(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)s\]\s+active=(\d+)\s+"
@@ -422,7 +448,12 @@ _PICK = ("traffic.trace_segments",
          "traffic.moving_vehicle_frac", "traffic.headway_p50_s",
          "traffic.headway_ks_shifted_exponential", "traffic.headway_below_floor_frac",
          "traffic.fd_capacity_veh_h_lane", "traffic.fd_backward_wave_speed_kmh",
-         "traffic.overlap_events", "traffic.teleport_events",
+         # The two COUNTS whose denominator is a sampling cap, each followed by the RATE that is
+         # comparable across rungs. Reading them side by side down the ladder is the point:
+         # `overlap_events` falls 434 -> 319 over a 96x duration change while the traffic behind it
+         # grows 109x, and the rate row is what says what actually happened.
+         "traffic.overlap_events", "traffic.overlap_rate_per_1k_pair_instants",
+         "traffic.teleport_events", "traffic.teleport_rate_per_1k_pairs",
          "traffic.lateral_discontinuity_events", "traffic.accel_within_comfort_frac",
          "traffic.accel_within_hard_bound_frac",
          "traffic.survivorship_vehicle_steps_frac", "traffic.revoked_vehicle_frac",
@@ -433,16 +464,31 @@ _PICK = ("traffic.trace_segments",
          "comm.link_state_los_fraction")
 
 
-def bench(out_dir: str, regime: str = "urban", traffic_source: str = "auto") -> dict:
+def bench(out_dir: str, regime: str = "urban", traffic_source: str = "auto",
+          max_instants: int | None = None) -> dict:
     from scms_sim_ref.datagen import realism_bench as rb
-    card = rb.scorecard(out_dir, regime=regime, traffic_source=traffic_source)
+    card = rb.scorecard(out_dir, regime=regime, traffic_source=traffic_source,
+                        max_instants=max_instants)
     flat = {}
     for m in card["panels"]["traffic"] + card["panels"]["comm"]:
-        flat[m["id"]] = {"value": m.get("value"), "status": m.get("status"), "n": m.get("n"),
-                         "reason": m.get("reason")}
+        row = {"value": m.get("value"), "status": m.get("status"), "n": m.get("n"),
+               "reason": m.get("reason")}
+        # THE DENOMINATOR, carried into the ladder JSON. Without it a rung's `overlap_events` is a
+        # number with no scale: 240 instants of 300 is not 240 instants of 28,800.
+        d = m.get("details") or {}
+        for k in ("instants_examined", "instants_available", "buckets_examined",
+                  "buckets_available", "coverage_frac", "pair_instants_examined",
+                  "pair_instants_available", "estimated_run_total", "links_per_usable_bin",
+                  "curve_resolved", "duration_for_curve_metrics_s"):
+            if k in d:
+                row[k] = d[k]
+        flat[m["id"]] = row
     return {"metrics": flat,
             "traffic_source": card.get("traffic_source"),
             "survivorship": card.get("survivorship"),
+            "sampling": {k: card.get("settings", {}).get(k)
+                         for k in ("max_instants", "max_time_buckets", "headway_max_instants",
+                                   "curve_min_links_per_bin")},
             "summary": card.get("summary"),
             "hard_failures": rb.hard_failures(card)}
 
@@ -702,7 +748,7 @@ def crl_assert_cost(revoked: int, certs: int, jmax: int = 20,
 # Ladder driver
 # --------------------------------------------------------------------------- #
 def ladder(durations, scenario, out_root, *, repeat=False, do_bench=False, do_curves=False,
-           regime="urban", oracle=True, quiet=False) -> dict:
+           regime="urban", oracle=True, quiet=False, max_instants=None) -> dict:
     os.makedirs(out_root, exist_ok=True)
     rungs = []
     for d in durations:
@@ -740,7 +786,7 @@ def ladder(durations, scenario, out_root, *, repeat=False, do_bench=False, do_cu
         if do_bench:
             t0 = time.perf_counter()
             try:
-                r["bench"] = bench(od, regime=regime)
+                r["bench"] = bench(od, regime=regime, max_instants=max_instants)
             except Exception as exc:                      # a panel that cannot score is a result
                 r["bench"] = {"error": f"{type(exc).__name__}: {exc}"}
             r["bench_wall_s"] = time.perf_counter() - t0
@@ -873,6 +919,11 @@ def main(argv=None) -> int:
     p.add_argument("--repeat", action="store_true",
                    help="run each rung twice with the same seed and diff every file")
     p.add_argument("--bench", action="store_true", help="score each rung with realism_bench")
+    p.add_argument("--bench-max-instants", type=int, default=None,
+                   help="realism_bench instant cap for --bench (default: the module's 240; 0 = "
+                        "unlimited). The default cap is why a COUNT read off a long rung is not "
+                        "comparable with one read off a short one -- raise it, or read the paired "
+                        "rate rows, which are")
     p.add_argument("--curves", action="store_true",
                    help="extract the SCMS time-curves (CRL, precision, certs) from each rung")
     p.add_argument("--regime", default="urban", choices=("auto", "urban", "highway"))
@@ -995,7 +1046,8 @@ def main(argv=None) -> int:
 
     durations = [float(x) for x in a.durations.split(",") if x.strip()]
     res = ladder(durations, a.scenario, a.out_root, repeat=a.repeat, do_bench=a.bench,
-                 do_curves=a.curves, regime=a.regime, oracle=not a.no_oracle, quiet=a.quiet)
+                 do_curves=a.curves, regime=a.regime, oracle=not a.no_oracle, quiet=a.quiet,
+                 max_instants=a.bench_max_instants)
     if a.json_out:
         _write_json(a.json_out, res)
     if a.markdown or not a.json_out:

@@ -85,6 +85,60 @@ MOSAIC/SUMO layer -- by probing ``manifest.json``. Where a signal is absent (sam
 unknown regime, too few points) the metric degrades to ``status="na"`` with a machine-readable
 ``reason`` instead of guessing.
 
+A NUMBER FROM A LONG RUN HAS TO MEAN THE SAME THING AS ONE FROM A SHORT RUN, and two mechanisms
+here made that false. Both are measured end to end on a 300 s -> 28,800 s duration ladder in
+``docs/realism/LONG-RUNS.md``, and both are now stated on the row rather than left to the reader.
+
+  1. **A count whose denominator is a sampling cap is not a measurement.** Several scans are capped
+     at ``MAX_TIME_BUCKETS`` / ``HEADWAY_MAX_INSTANTS`` instants for cost, so their coverage falls as
+     1/duration -- 100% of a 240 s run, 6.7% of a 3600 s run, 0.83% of a 28,800 s one. A COUNT read
+     off such a scan measures the harness: ``traffic.overlap_events`` reads 434 at 300 s and 319 at
+     28,800 s while the trajectory sample behind it grows 109x. So every capped row now publishes
+     its own ``details`` sampling block -- instants examined, instants available, the coverage
+     fraction, the cap, AND THE SAMPLER AND ITS SEED -- and each capped count is PAIRED WITH A RATE
+     per unit of what was actually examined (``traffic.overlap_rate_per_1k_pair_instants``,
+     ``traffic.teleport_rate_per_1k_pairs``). The count keeps the HARD gate, because it is a valid
+     one-sided existence test at any coverage; the RATE is the row to compare across runs, and it
+     carries an ``estimated_run_total`` extrapolated over the run's exact (cheaply counted) pair
+     census. ``scorecard(..., max_instants=N)`` / ``--max-instants`` raises or removes the cap when
+     the run is long enough to afford the full scan; ``0`` means unlimited.
+
+     **The rate was not enough, because the SAMPLER was biased.** This module used to claim here
+     that a distributional metric was unharmed by the cap "because the instants are evenly spaced".
+     THAT CLAIM IS WITHDRAWN: it is false on signalised traffic, and it was false on this
+     repository's own reference arm. Even spacing is a FIXED STRIDE, a fixed stride is a Dirac comb,
+     and a comb aliases against any periodic structure whose period divides it. With
+     ``light_cycle_s = 24 s`` the true overlap rate is periodic with period 12 s while the stride is
+     7.5 / 15 / 30 / 60 s at 1800 / 3600 / 7200 / 14400 s, so the number of DISTINCT SIGNAL PHASES
+     sampled was 12/gcd(stride, 12) = 8 / 4 / 2 / **1**. At 14,400 s all 240 sampled instants sat at
+     one phase. Measured, published vs uncapped truth:
+     ``overlap_rate_per_1k_pair_instants`` -14.3% / -18.5% / -38.6% at 3600 / 7200 / 14400 s against
+     a truth flat to +/-2.4% over 48x; ``headway_p50_s`` drifting +9.1% where the truth moved +1.5%;
+     ``headway_ks_shifted_exponential`` -- a GRADED row -- drifting -17.8% where the truth moved
+     -2.1%, publishing 0.1624 against a 0.15 threshold where the truth was 0.1926. Controls: shifting
+     the sampling grid by ONE SECOND at 14,400 s moved the rate 0.094603 -> 0.258373, the 12 phase
+     offsets spanned 2.73x and AVERAGED to within -0.9% of the truth, and 30 random 240-instant
+     sub-samples gave 0.156438 +/- 0.007537 -- the published 0.094603 is 8.2 sd below that mean, so
+     the error was BIAS, not sample size. The same scenario WITHOUT ``--traffic-lights`` showed only
+     -2.0%, 7x smaller, which is what identifies the signal cycle as the driver.
+
+     :func:`_subsample` therefore replaces the fixed stride with JITTERED SYSTEMATIC SAMPLING -- one
+     seeded uniform draw inside each stride window -- whose inclusion probability is exactly
+     ``examined/available`` for EVERY instant, at every duration, against any spectrum. The claim
+     above is now made in the form that is true, and only in that form: a distribution stays
+     representative under the cap *because every instant is equally likely to be in the sample*, not
+     because the instants are evenly spaced.
+  2. **A metric that EXISTS is not a metric that has CONVERGED.** ``MIN_SAMPLES`` gates the existence
+     of the awareness rows. It does not gate their precision, and on the reference arm the rows
+     appear at ~930 s and are still moving by a factor of 3.8 (``awareness_ratio_100m``) and 7.6
+     (``effective_range_m``) at 8 h, while ``comm.pdr_gray_zone_width_m`` -- the one GRADED row --
+     reads FAIL at 14,400 s and pass at all six other durations, so the run length alone decided a
+     verdict. The reconstructed curve is built from LINKS PER DISTANCE BIN, so that is what the floor
+     (``CURVE_MIN_LINKS_PER_BIN``) is applied to: below it the value AND the verdict are withheld,
+     and the reason states the measured links/bin, the floor, and -- because the shortfall is a
+     shortfall of RUN LENGTH -- how many simulated seconds this dataset's own observed link rate
+     would need. ``comm.honest_links`` carries the whole adequacy block so a reader can see it.
+
 Every metric compares to a reference entry loaded from ``refdata/*.json``; each reference number
 carries a ``source`` citation string, and the scorecard copies that citation next to the measured
 value so a published datasheet is self-auditing.
@@ -100,6 +154,7 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 
 import numpy as np
@@ -137,6 +192,54 @@ LIVENESS_MIN_SPEED_MPS = 0.5  # a track whose whole span averages below this nev
 LIVENESS_MIN_VEHICLES = 5     # ... and the moving fraction needs this many tracks to mean anything
 MAX_TIME_BUCKETS = 240     # cap on co-presence snapshots examined (deterministic even spacing)
 MAX_VEH_PER_BUCKET = 400   # cap on vehicles per snapshot (deterministic: lowest vehicle ids first)
+#: THE INSTANT CAPS ARE A COST CEILING, NOT A STATISTICAL ONE, and they are what makes a COUNT read
+#: off them incomparable across durations. With ``dt = 1.0 s`` a 240 s run is examined in full, a
+#: 3600 s run at 6.7% of its instants and a 28800 s run at 0.83% -- measured on the reference grid
+#: arm, ``traffic.overlap_events`` reads 434 at 300 s and 319 at 28800 s while the trajectory sample
+#: behind it grows 109x (42,403 -> 4,622,931 segments), i.e. a 26% FALL in the published number over
+#: a 96x rise in the traffic (docs/realism/LONG-RUNS.md section 3.3). For a COUNT the denominator is
+#: the cap, so the number measures the harness rather than the road.
+#:
+#: Three things follow, and all three are implemented here rather than described:
+#:   1. every capped metric publishes its own ``details.sampling`` block -- instants examined,
+#:      instants available, the coverage fraction, the cap that produced it AND the sampler and seed
+#:      that chose which instants -- so no count can be read without its denominator;
+#:   2. each capped COUNT is paired with a RATE per unit of what was actually examined
+#:      (``traffic.overlap_rate_per_1k_pair_instants``, ``traffic.teleport_rate_per_1k_pairs``),
+#:      which is duration-invariant BY CONSTRUCTION OF THE DENOMINATOR and is the row to compare
+#:      across runs; and
+#:   3. the sub-sample itself is drawn so that the rate in (2) is also duration-invariant IN FACT.
+#:      A rate is only unbiased if the instants behind it are a uniform-probability sample of the
+#:      run's, and a FIXED STRIDE is not: it phase-locks onto the signal cycle and made this very
+#:      rate read -38.6% low at 14,400 s (see :func:`_subsample`, which holds the measurement, the
+#:      controls and the replacement rule). ``_subsample`` is now the one sampling rule in this
+#:      module, and every capped scan goes through it under its own named, seeded stream.
+#: ``scorecard(..., max_instants=N)`` (CLI ``--max-instants``, 0 = unlimited) raises or removes the
+#: cap when a run is long enough to afford the O(instants x vehicles^2) scan -- and the measured
+#: cost of doing so is small enough at every rung on the reference ladder that RAISING IT IS THE
+#: RECOMMENDATION, not the exception (see :data:`MAX_TIME_BUCKETS`).
+SAMPLING_CAP_DOC = "docs/realism/LONG-RUNS.md#33-broken-by-the-240-instant-caps"
+SAMPLER_DOC = "docs/realism/LONG-RUNS.md#35-the-sampler-itself-phase-locked-onto-the-signal-cycle"
+#: The sub-sampling rule's identity, and the namespace segment of its seeded stream. Bumping this
+#: string is the deliberate, announced way to re-pin every capped row; it is in the key, so it
+#: cannot be changed without changing every jitter draw.
+SAMPLER_KEY = "realism_bench.sampler.jittered.v1"
+#: Default seed for the sub-sampler's jitter. FIXED, so the default scorecard is byte-reproducible
+#: without the caller thinking about randomness at all; overridable (``scorecard(sampler_seed=N)``,
+#: CLI ``--sampler-seed``) so the sampling variance of a graded row can be MEASURED rather than
+#: asserted -- re-score the same dataset under several seeds and read the spread. It is a benchmark
+#: constant, not the dataset's seed: the harness must not become a function of what it is scoring.
+SAMPLER_SEED = 20260907
+#: A curve-derived comm metric needs this many observed links PER USABLE DISTANCE BIN before it is
+#: graded. ``MIN_SAMPLES`` gates the EXISTENCE of the awareness rows; it does not gate their
+#: precision, and the two are not the same question. Measured on the reference grid arm
+#: (docs/realism/LONG-RUNS.md section 3.4): ``comm.honest_links`` crosses ``MIN_SAMPLES`` at ~930 s,
+#: and between that point and 8 h ``awareness_ratio_100m`` moves 0.2619 -> 0.9905 (3.8x),
+#: ``effective_range_m`` 65.4 -> 497.7 (7.6x) and ``pdr_gray_zone_width_m`` -- the one GRADED row --
+#: flips FAIL at 14400 s / pass at all six other durations, so on that metric the run length alone
+#: decides the verdict. 30 links per populated bin is the same Poisson floor ``MIN_SAMPLES`` and
+#: ``MIN_BIN_OPPORTUNITIES`` already use, applied to the quantity the curve is actually built from.
+CURVE_MIN_LINKS_PER_BIN = 30
 MOSAIC_ART_MAX_M = 1000.0  # ScmsBeaconApp ART_MAX_M default (env SCMS_ART_MAX_M), MOSAIC layer
 FULL_TRACE_MIN_PROB = 0.999   # emit_sample_prob at/above this counts as a full trace
 # --- traffic-panel mobility source + survivorship (see the module docstring) ---------------------
@@ -160,6 +263,10 @@ SURVIVORSHIP_GATED_METRICS = (
     "traffic.headway_p50_s", "traffic.headway_below_floor_frac",
     "traffic.headway_ks_shifted_exponential", "traffic.fd_capacity_veh_h_lane",
     "traffic.fd_backward_wave_speed_kmh", "traffic.overlap_events",
+    # The RATE inherits the gate for the same reason the count has it -- a missing vehicle removes
+    # an overlap PARTNER, so it thins the numerator without thinning the denominator in proportion.
+    # Leaving it out would have published a confident "0.0 / pass" beside the withheld count.
+    "traffic.overlap_rate_per_1k_pair_instants",
 )
 #: ... of which these are ONE-SIDED: truncation can only REMOVE vehicles, so it can only DECREASE a
 #: co-presence count. The truncated value is therefore a valid LOWER BOUND, and a value that already
@@ -167,7 +274,8 @@ SURVIVORSHIP_GATED_METRICS = (
 #: it would disarm a HARD CI gate on exactly the datasets that most need it (measured: the peak hour
 #: reads 28 overlaps truncated against 169 unbiased -- the truncated number is wrong, but it is not
 #: wrong about the failure). A PASS from the same number is worthless and is still withheld.
-SURVIVORSHIP_LOWER_BOUND_METRICS = ("traffic.overlap_events",)
+SURVIVORSHIP_LOWER_BOUND_METRICS = ("traffic.overlap_events",
+                                    "traffic.overlap_rate_per_1k_pair_instants")
 #: SUMO trace artifact tag (``mock_pipeline.sumo_trace.TRACE_FORMAT``), duplicated rather than
 #: imported so this module keeps its "numpy only, read-only" dependency contract.
 TRACE_FORMAT = "scms-sumo-trace/1"
@@ -400,7 +508,13 @@ def probe_dataset(dataset_dir: str) -> dict:
                    "sumo_trace_sha256": cfg.get("sumo_trace_sha256"),
                    "mobility_source": cfg.get("mobility_source"),
                    "emit_mobility_oracle": bool(cfg.get("emit_mobility_oracle", False)),
-                   "duration_s": cfg.get("duration_s")},
+                   "duration_s": cfg.get("duration_s"),
+                   # The arrival-demand shape and whether it is on a CLOCK. Without one, `rush` and
+                   # `night` are functions of run FRACTION, which is what makes two durations of the
+                   # same configuration two different scenarios -- so the traffic panel stamps it on
+                   # every row rather than letting a reader line two such runs up.
+                   "demand_profile": cfg.get("demand_profile"),
+                   "demand_period_s": cfg.get("demand_period_s")},
         "has_emissions": os.path.exists(
             os.path.join(dataset_dir, "ground_truth", "gt_emissions_sample.jsonl")),
         "has_mobility_oracle": os.path.exists(
@@ -1222,31 +1336,185 @@ def moving_vehicle_fraction(tracks: dict[str, dict],
     return (n_moving / n if n else None), n
 
 
-def _instant_groups(segs: dict, max_instants: int = HEADWAY_MAX_INSTANTS,
-                    max_veh: int = MAX_VEH_PER_BUCKET) -> list[np.ndarray]:
+def _fixed_stride_subsample(items: list, max_items: int | None) -> list:
+    """THE WITHDRAWN RULE. Fixed-stride systematic sampling -- kept only as a named reference.
+
+    This is what every capped scan in this module used until the phase-lock defect (see
+    :data:`SAMPLER_DOC` and :func:`_subsample`). It is retained, unused by the module itself, for
+    exactly two purposes: so ``tests/test_long_runs.py`` can demonstrate the failure the current
+    sampler prevents -- a regression test that has never been seen red is not a regression test --
+    and so a historical published number can be re-derived on demand and shown to be the artefact it
+    was. DO NOT CALL IT FROM A METRIC.
+    """
+    if not max_items or max_items <= 0 or len(items) <= max_items:
+        return list(items)
+    step = len(items) / float(max_items)
+    return [items[int(i * step)] for i in range(int(max_items))]
+
+
+def _subsample(items: list, max_items: int | None, *, stream: str,
+               seed: int = SAMPLER_SEED) -> list:
+    """JITTERED SYSTEMATIC sub-sample: one seeded uniform draw inside each stride window.
+
+    ``max_items`` of None or <= 0 means "no cap": a caller that has decided the run is long enough
+    to afford the full scan gets every item, in order, and no random number is drawn at all.
+
+    THE RULE.  Partition ``range(n)`` into ``k = max_items`` contiguous windows of width
+    ``s = n / k`` and take ONE uniform draw inside each window::
+
+        j_i = floor(i * s + u_i * s),   u_i ~ U[0, 1) i.i.d.
+
+    (Ties between adjacent windows -- possible only when ``s`` is fractional, with probability
+    <= 1/(4 s^2) per adjacent pair -- are broken by advancing to the next index, so the returned
+    indices are strictly increasing and no instant is ever counted twice.)
+
+    WHY, AND WHY NOT THE OTHER TWO CANDIDATES.
+
+    *Fixed-stride systematic sampling* (:func:`_fixed_stride_subsample`) draws ONE random quantity,
+    the start; the other ``k - 1`` indices are then determined. Its inclusion indicator is a Dirac
+    comb of period ``s``, which has energy at every multiple of ``1/s``, so a population component
+    whose period ``p`` divides ``s`` is observed at a SINGLE PHASE and the estimator's error is that
+    component's full amplitude -- INDEPENDENT OF ``k``. That is not a small-sample problem and no
+    cap raise fixes it. Measured on this repository's reference signalised grid arm
+    (``light_cycle_s`` 24 s, so the true overlap rate is periodic with period 12 s; the stride at
+    14,400 s is 60 s, a multiple of 12): all 240 sampled instants sat at one phase,
+    ``traffic.overlap_rate_per_1k_pair_instants`` published 0.094603 against an uncapped truth of
+    0.153993 (-38.6%), and 30 RANDOM 240-instant sub-samples of the same dataset gave
+    0.156438 +/- 0.007537 -- the published value is 8.2 sd below that mean, i.e. BIAS, not variance.
+
+    *A stride forced coprime with the structure* needs the period to be known. This module scores
+    arbitrary datasets -- the python engine, a frozen SUMO trace, a MOSAIC layer, an OSM-derived
+    network -- and the periods present include the signal cycle (``light_cycle_s``, configurable),
+    the demand profile (``demand_period_s``), the CAM interval, pseudonym rotation and whatever
+    signal programs an imported network carries. A stride coprime with 12 still aliases against 5,
+    7 or 25. There is no stride that is safe against an unknown spectrum, so this only relocates
+    the failure to the next dataset. REJECTED.
+
+    *Full-period aggregation* also needs the period, and it changes what the metric MEANS: a
+    per-cycle average is not the per-instant distribution ``headway_ks_shifted_exponential`` is
+    computed on. Where it is affordable it is already available and strictly better -- it is
+    ``max_instants=0`` -- and this module now recommends exactly that (see :data:`MAX_TIME_BUCKETS`).
+    REJECTED as the capped-path rule.
+
+    *Jittered systematic sampling* needs to know NOTHING about the population and has the two
+    properties the claim on these rows requires:
+
+      1. **Uniform inclusion probability, exactly k/n, for every item, at every n and k.** Item
+         ``m`` is selected iff some window's draw lands in ``[m, m+1)``; the windows tile ``[0, n)``
+         and each draw is uniform over its own window of width ``s``, so ``P(m) = 1/s = k/n``
+         regardless of where ``m`` sits or what the population does. The pooled empirical
+         distribution over the kept instants is therefore an unbiased estimator of the population's,
+         which is the claim ``distributional_note`` makes and the old rule could not support.
+      2. **The alias comb becomes a broadband noise floor.** The ``k`` phase offsets are i.i.d.
+         uniform on ``[0, s)``, so the sampled phase modulo ANY period ``p <= s`` is uniform and the
+         expectation of the estimate is the full-period average whatever ``p`` is. This is the
+         standard anti-aliasing result for stochastic sampling (Dippe & Wold 1985; Cook, ACM ToG
+         5(1), 1986): jitter trades an O(1) phase-dependent bias for O(1/sqrt(k)) noise.
+
+    And it keeps what the old rule was chosen for: exactly one index per window means the maximum
+    gap is under ``2 s`` and the sample cannot clump, so this is stratified sampling with one unit
+    per stratum -- the design systematic sampling is the (fragile) shortcut for, with the same
+    variance advantage over simple random sampling on a smoothly varying population and without the
+    periodicity failure mode (Cochran, *Sampling Techniques*, 3rd ed., ch. 5 and 8.6).
+
+    DETERMINISM. The draws come from ``random.Random(f"{seed}:{SAMPLER_KEY}:{stream}:{n}:{k}")`` --
+    this repository's own string-keyed stream convention (``scms_sim_ref.api.rng``), which is
+    ``PYTHONHASHSEED``-independent and platform-stable because CPython seeds a ``str`` through
+    SHA-512. The key contains the seed, the stream NAME, the population size and the cap, and
+    nothing else: no call order, no call count, no global RNG. Two consequences worth stating --
+    the same dataset, seed and config give byte-identical output; and adding a new capped scan (a
+    new ``stream`` label) cannot move any existing scan's numbers, which is the property the fixed
+    global-``rng`` streams elsewhere in this repository do NOT have.
+    """
+    n = len(items)
+    if not max_items or max_items <= 0 or n <= max_items:
+        return list(items)
+    k = int(max_items)
+    rnd = random.Random(f"{int(seed)}:{SAMPLER_KEY}:{stream}:{n}:{k}")
+    step = n / float(k)
+    out, prev = [], -1
+    for i in range(k):
+        j = int(i * step + rnd.random() * step)
+        if j >= n:
+            j = n - 1
+        if j <= prev:               # adjacent windows can round onto the same index
+            j = prev + 1
+        if j >= n:                  # unreachable while k <= n; a guard, not a policy
+            break
+        prev = j
+        out.append(items[j])
+    return out
+
+
+def _sampling_block(examined: int, available: int, cap: int | None, unit: str,
+                    seed: int = SAMPLER_SEED) -> dict:
+    """The denominator, published beside every number read off a capped scan.
+
+    A count taken over ``examined`` of ``available`` instants is not comparable with one taken over a
+    different fraction, and nothing in a bare row says so. This block is what says it. It also names
+    the SAMPLER and its seed, because "240 of 14,400 instants" is not enough to reproduce a number
+    and, until the phase-lock defect was found, the rule that picked those 240 was the thing doing
+    the damage.
+    """
+    cov = (float(examined) / float(available)) if available else None
+    out = {f"{unit}_examined": int(examined), f"{unit}_available": int(available),
+           "coverage_frac": _r(cov, 6), "cap": (int(cap) if cap else None),
+           "sampling": ("jittered systematic: one seeded uniform draw inside each stride window "
+                        "(stratified, one unit per stratum). Inclusion probability is exactly "
+                        "examined/available for every instant, so the sample is unbiased against "
+                        "ANY periodic structure -- which fixed-stride even spacing, the rule used "
+                        f"before, was not. See {SAMPLER_DOC}"),
+           "sampler": SAMPLER_KEY, "sampler_seed": int(seed)}
+    if cov is not None and cov < 1.0:
+        out["comparability"] = (
+            f"NOT COMPARABLE ACROSS DURATIONS AS A COUNT: {examined} of {available} {unit} were "
+            f"examined ({cov:.2%}), and that fraction falls as 1/duration while the cap stays "
+            f"fixed. Compare the paired RATE row instead, or re-score with --max-instants 0. "
+            f"See {SAMPLING_CAP_DOC}")
+    return out
+
+
+def _instant_groups(segs: dict, max_instants: int | None = HEADWAY_MAX_INSTANTS,
+                    max_veh: int = MAX_VEH_PER_BUCKET,
+                    stats: dict | None = None,
+                    sampler_seed: int = SAMPLER_SEED) -> list[np.ndarray]:
     """Segment indices grouped by end-of-segment timestamp: one group = one instant.
 
-    Deterministic sub-sampling, matching ``_snapshots``: instants are taken evenly spaced across the
-    run and, inside an instant, in vehicle-id order (``vid_i`` indexes the sorted vehicle list).
+    Deterministic sub-sampling, matching ``_snapshots``: instants are taken by :func:`_subsample`
+    (jittered systematic, own seeded stream ``"headway"``) and, inside an instant, in vehicle-id
+    order (``vid_i`` indexes the sorted vehicle list). ``stats``, when supplied, receives the
+    examined/available instant counts so the caller can publish the coverage this sub-sample
+    achieved.
     """
     if not segs.get("n"):
+        if stats is not None:
+            stats.update(examined=0, available=0)
         return []
     t = np.round(segs["t_end"], 3)
     order = np.lexsort((segs["vid_i"], t))
     bounds = np.flatnonzero(np.diff(t[order])) + 1
     groups = [g for g in np.split(order, bounds) if g.size >= 2]
-    if len(groups) > max_instants:
-        step = len(groups) / float(max_instants)
-        groups = [groups[int(i * step)] for i in range(max_instants)]
-    return [g[:max_veh] for g in groups]
+    kept = _subsample(groups, max_instants, stream="headway", seed=sampler_seed)
+    if stats is not None:
+        stats.update(examined=len(kept), available=len(groups))
+    return [g[:max_veh] for g in kept]
 
 
-def _snapshots(emissions: list[dict], bucket_s: float, max_buckets: int = MAX_TIME_BUCKETS,
-               max_veh: int = MAX_VEH_PER_BUCKET) -> list[dict]:
+def _snapshots(emissions: list[dict], bucket_s: float, max_buckets: int | None = MAX_TIME_BUCKETS,
+               max_veh: int = MAX_VEH_PER_BUCKET, stats: dict | None = None,
+               sampler_seed: int = SAMPLER_SEED) -> list[dict]:
     """Co-presence snapshots: one position per vehicle per time bucket (its latest sample there).
 
-    Deterministic sub-sampling: buckets are taken evenly spaced across the run and, inside a bucket,
-    vehicles are kept in sorted-id order. Nothing here draws random numbers.
+    Deterministic sub-sampling: buckets are taken by :func:`_subsample` (jittered systematic, own
+    seeded stream ``"copresence"``) and, inside a bucket, vehicles are kept in sorted-id order.
+    ``stats`` receives the examined/available bucket counts, which is what lets the comm panel
+    publish the fraction of the run its normalisation denominator was actually built from.
+
+    This scan is sub-sampled for the SAME reason the traffic ones are and was phase-locked in the
+    same way. It matters here too: these buckets are the denominator of the PDR-vs-distance curve,
+    and on a signalised network the pairwise-distance distribution is itself a function of signal
+    phase (a red light packs vehicles into a queue and shortens every pair distance), so a
+    single-phase bucket sample skews the reception OPPORTUNITIES the whole comm panel normalises by.
     """
     buckets: dict[int, dict[str, tuple[float, float, float]]] = {}
     for e in emissions:
@@ -1261,10 +1529,10 @@ def _snapshots(emissions: list[dict], bucket_s: float, max_buckets: int = MAX_TI
         cur = buckets.setdefault(b, {}).get(str(vid))
         if cur is None or t >= cur[0]:
             buckets[b][str(vid)] = (t, x, y)
-    keys = sorted(buckets)
-    if len(keys) > max_buckets:
-        step = len(keys) / float(max_buckets)
-        keys = [keys[int(i * step)] for i in range(max_buckets)]
+    keys_all = sorted(buckets)
+    keys = _subsample(keys_all, max_buckets, stream="copresence", seed=sampler_seed)
+    if stats is not None:
+        stats.update(examined=len(keys), available=len(keys_all))
     out = []
     for b in keys:
         vids = sorted(buckets[b])[:max_veh]
@@ -1364,7 +1632,9 @@ def _metric(mid: str, panel: str, title: str, value, unit: str, n: int | None,
 # ================================================================================================
 # TRAFFIC panel
 # ================================================================================================
-def _time_headways(segs: dict) -> np.ndarray:
+def _time_headways(segs: dict, max_instants: int | None = None,
+                   stats: dict | None = None,
+                   sampler_seed: int = SAMPLER_SEED) -> np.ndarray:
     """Time headways (spacing / follower speed) to the leader IN THE FOLLOWER'S OWN LANE.
 
     The dataset schema carries no edge or lane id (see docs/realism/investigation/benchmark-infra
@@ -1386,7 +1656,8 @@ def _time_headways(segs: dict) -> np.ndarray:
     """
     out: list[float] = []
     cos_tol = math.cos(math.radians(HEADWAY_HEADING_TOL_DEG))
-    for g in _instant_groups(segs):
+    cap = HEADWAY_MAX_INSTANTS if max_instants is None else max_instants
+    for g in _instant_groups(segs, max_instants=cap, stats=stats, sampler_seed=sampler_seed):
         x, y = segs["x_end"][g], segs["y_end"][g]
         v, hdg = segs["speed"][g], segs["heading"][g]
         ux, uy = np.cos(hdg), np.sin(hdg)
@@ -1473,13 +1744,23 @@ def _fundamental_diagram(segs: dict, n_lanes: int, cell_m: float, window_s: floa
 
 
 def _overlap_events(emissions: list[dict],
-                    max_instants: int = MAX_TIME_BUCKETS) -> tuple[int, int]:
-    """Distinct vehicles occupying the same point at the SAME timestamp.
+                    max_instants: int | None = MAX_TIME_BUCKETS,
+                    sampler_seed: int = SAMPLER_SEED) -> dict:
+    """Distinct vehicles occupying the same point at the SAME timestamp, WITH its denominator.
 
     Only exact timestamp matches are used (a bucketed snapshot would place vehicles up to a bucket
     apart in time and manufacture false overlaps). One position per (vehicle, instant): a vehicle
     emits at most one real CAM per step, and Sybil ghosts are never written to the emission stream.
-    Instants are sub-sampled with deterministic even spacing when there are many.
+    Instants are sub-sampled by :func:`_subsample` (jittered systematic, seeded stream ``"overlap"``)
+    when there are many. That sampler is load-bearing HERE above all: the true overlap rate on a
+    signalised network is periodic in the signal cycle, and the fixed-stride rule this replaced
+    reported one phase of it (-38.6% at 14,400 s on the reference arm).
+
+    Returns the count AND everything needed to interpret it: how many instants were examined out of
+    how many exist, and -- the quantity that actually makes the number comparable -- how many
+    CO-PRESENT PAIRS were tested against how many the run contains. The pair count is the honest
+    denominator: an overlap is a property of a pair at an instant, and the pair census is cheap
+    (one pass over the instant table) even when scanning every instant's geometry is not.
     """
     inst: dict[float, dict[str, tuple[float, float]]] = {}
     for e in emissions:
@@ -1489,18 +1770,20 @@ def _overlap_events(emissions: list[dict],
                 float(e["true_x"]), float(e["true_y"]))
         except (KeyError, TypeError, ValueError):
             continue
-    keys = [t for t in sorted(inst) if len(inst[t]) >= 2]
-    if len(keys) > max_instants:
-        step = len(keys) / float(max_instants)
-        keys = [keys[int(i * step)] for i in range(max_instants)]
-    n_over = 0
+    keys_all = [t for t in sorted(inst) if len(inst[t]) >= 2]
+    pairs_all = sum(len(inst[t]) * (len(inst[t]) - 1) // 2 for t in keys_all)
+    keys = _subsample(keys_all, max_instants, stream="overlap", seed=sampler_seed)
+    n_over = pairs_seen = 0
     for t in keys:
         pts = [inst[t][v] for v in sorted(inst[t])]
         x = np.array([p[0] for p in pts]); y = np.array([p[1] for p in pts])
         d = np.hypot(x[:, None] - x[None, :], y[:, None] - y[None, :])
         iu = np.triu_indices(x.size, k=1)
+        pairs_seen += int(iu[0].size)
         n_over += int((d[iu] < OVERLAP_DIST_M).sum())
-    return n_over, len(keys)
+    return {"events": n_over, "instants_examined": len(keys),
+            "instants_available": len(keys_all),
+            "pair_instants_examined": pairs_seen, "pair_instants_available": pairs_all}
 
 
 def _wave_speed_kmh(fd: dict) -> tuple[float | None, int]:
@@ -1524,7 +1807,9 @@ def _wave_speed_kmh(fd: dict) -> tuple[float | None, int]:
 def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
                   fd_cell_m: float = FD_CELL_M, fd_window_s: float = FD_WINDOW_S,
                   regime: str | None = None, gt: dict | None = None,
-                  src: dict | None = None, surv: dict | None = None) -> list[dict]:
+                  src: dict | None = None, surv: dict | None = None,
+                  max_instants: int | None = None,
+                  sampler_seed: int = SAMPLER_SEED) -> list[dict]:
     P = "traffic"
     out: list[dict] = []
     # WHICH STREAM THESE NUMBERS CAME FROM. `emissions` is whatever `resolve_mobility_source`
@@ -1581,6 +1866,24 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
                   "mobility_source_truncated": bool(src.get("truncated")),
                   "vehicle_steps_survival_frac": surv_frac,
                   "survivorship_basis": surv.get("basis")}
+    # THE DEMAND PROFILE, STAMPED ON EVERY TRAFFIC ROW. Without a clock (`demand_period_s = 0`) the
+    # `rush`/`night` multiplier is a function of `t / total_time`, so the profile is a shape
+    # STRETCHED TO THE RUN and two durations are two different scenarios rather than one scenario
+    # seen for longer -- measured on the reference arm, only 11 of 278 vehicles survive a
+    # 300 s -> 900 s change byte-identically, and detection precision moves 0.780 -> 0.477
+    # (docs/realism/LONG-RUNS.md section 0). A reader cannot see that from a traffic number, so the
+    # number now carries it.
+    _pcfg = probe.get("config") or {}
+    _dprof = _pcfg.get("demand_profile")
+    if _dprof:
+        src_detail["demand_profile"] = _dprof
+        src_detail["demand_period_s"] = _pcfg.get("demand_period_s")
+        if _dprof != "uniform" and not (_pcfg.get("demand_period_s") or 0):
+            src_detail["cross_duration_comparison"] = (
+                f"REFUSED: demand_profile={_dprof!r} with no clock (demand_period_s = 0) is a shape "
+                f"stretched to the run, so no quantity on this panel may be compared with the same "
+                f"quantity from a run of a different length. Set demand_period_s (e.g. 86400) to put "
+                f"the profile on absolute simulated time")
     _src_name = src.get("path") or EMISSIONS_REL
 
     # ---- survivorship, as metrics rather than as a footnote --------------------------------------
@@ -1890,9 +2193,35 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
         _ref(refdata, "kinematics.teleport_events_max"), HARD, reason=tele_few,
         extra={"speed_bound_mps": tele_lim, "pairs_examined": n_tele_pairs,
                "method": "mean speed over EVERY consecutive sample pair, including gaps longer "
-                         f"than max_finite_difference_dt_s ({MAX_FD_DT_S:g} s)"}))
+                         f"than max_finite_difference_dt_s ({MAX_FD_DT_S:g} s)",
+               "count_note": "this scan is NOT capped -- every consecutive sample pair of every "
+                             "track is tested -- so the count grows with the run and only the "
+                             "paired RATE row is comparable across durations"}))
+    # THE COMPARABLE FORM of the same evidence. The count above is a valid one-sided existence test
+    # at any duration (a teleport seen is a teleport that happened) but its MAGNITUDE is a function
+    # of how much data there was; the rate per 1,000 examined sample pairs is not.
+    out.append(_metric(
+        "traffic.teleport_rate_per_1k_pairs", P,
+        "Teleport rate per 1,000 consecutive sample pairs examined",
+        ((1000.0 * n_tele / n_tele_pairs) if (tele_few is None and n_tele_pairs) else None),
+        "events/1k pairs", n_tele_pairs,
+        _ref(refdata, "kinematics.teleport_rate_max_per_1k_pairs"), SOFT, reason=tele_few,
+        extra={"events": n_tele, "pairs_examined": n_tele_pairs,
+               "why_a_rate": "traffic.teleport_events is a count over however many pairs the run "
+                             "produced; this row divides by that denominator so a long run and a "
+                             "short one are the same measurement",
+               "sampling": "uncapped: every consecutive sample pair is scanned"}, nd=6))
 
-    n_over, n_inst = _overlap_events(emissions)
+    # `max_instants=None` means "the module default cap"; `0` means "no cap at all". Conflating the
+    # two would silently change every historical overlap count, which is the one thing this row must
+    # not do -- it is a HARD gate with pinned expectations.
+    ov_cap = MAX_TIME_BUCKETS if max_instants is None else max_instants
+    ov = _overlap_events(emissions, max_instants=ov_cap, sampler_seed=sampler_seed)
+    n_over, n_inst = ov["events"], ov["instants_examined"]
+    ov_sampling = _sampling_block(n_inst, ov["instants_available"], ov_cap, "instants",
+                                  seed=sampler_seed)
+    ov_sampling.update(pair_instants_examined=ov["pair_instants_examined"],
+                       pair_instants_available=ov["pair_instants_available"])
     out.append(_metric(
         "traffic.overlap_events", P,
         f"Distinct vehicles overlapping (< {OVERLAP_DIST_M:g} m apart at one instant)",
@@ -1900,7 +2229,33 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
         _ref(refdata, "kinematics.overlap_events_max"), HARD,
         reason=(None if n_inst >= 10 else
                 f"only {n_inst} instants carry >=2 simultaneously-sampled vehicles (need 10)"),
-        extra={"overlap_distance_m": OVERLAP_DIST_M, "instants_examined": n_inst}))
+        extra={"overlap_distance_m": OVERLAP_DIST_M, "instants_examined": n_inst,
+               "count_note": "kept as a HARD gate because it is a one-sided EXISTENCE test -- an "
+                             "overlap seen is an overlap that happened, at any coverage -- but its "
+                             "MAGNITUDE is the sub-sample's, not the run's. Compare "
+                             "traffic.overlap_rate_per_1k_pair_instants instead",
+               **ov_sampling}))
+    # THE ROW TO COMPARE ACROSS DURATIONS. Overlaps per 1,000 co-present pairs actually tested: the
+    # cap moves the denominator and the numerator together, so this is duration-invariant where the
+    # count is not. `estimated_run_total` re-inflates it by the run's own (cheaply counted, exact)
+    # pair census, which is the magnitude a reader takes from the count row and never gets.
+    ov_pairs = ov["pair_instants_examined"]
+    ov_rate = (1000.0 * n_over / ov_pairs) if (n_inst >= 10 and ov_pairs) else None
+    out.append(_metric(
+        "traffic.overlap_rate_per_1k_pair_instants", P,
+        "Vehicle-overlap rate per 1,000 co-present pairs examined", ov_rate,
+        "events/1k pairs", ov_pairs,
+        _ref(refdata, "kinematics.overlap_rate_max_per_1k_pair_instants"), SOFT,
+        reason=(None if (n_inst >= 10 and ov_pairs) else
+                f"only {n_inst} instants carry >=2 simultaneously-sampled vehicles (need 10)"),
+        extra={"overlap_distance_m": OVERLAP_DIST_M, "events": n_over,
+               "estimated_run_total": (int(round(ov_rate / 1000.0 * ov["pair_instants_available"]))
+                                       if ov_rate is not None else None),
+               "estimated_run_total_note": "the rate extrapolated over the run's FULL pair census "
+                                           "(exact, counted without scanning the geometry). This "
+                                           "is the magnitude the count row is mistaken for",
+               # the count's `comparability` warning is dropped here: this row IS the comparable one
+               **{k: v for k, v in ov_sampling.items() if k != "comparability"}}, nd=6))
 
     # LIVENESS. Every other HARD gate is an impossibility check, and a fleet that never moves passes
     # all of them (no teleport, no overlap, no acceleration outside the band) while the headway
@@ -1921,7 +2276,14 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
                          "its trip still counts as moving"}))
 
     # ---- time headways (edge proxy) ------------------------------------------------------------
-    hw = _time_headways(segs) if (n_seg and probe["full_trace"]) else np.zeros(0)
+    hw_stats: dict = {"examined": 0, "available": 0}
+    hw = (_time_headways(segs, max_instants=max_instants, stats=hw_stats,
+                         sampler_seed=sampler_seed)
+          if (n_seg and probe["full_trace"]) else np.zeros(0))
+    hw_sampling = _sampling_block(
+        hw_stats["examined"], hw_stats["available"],
+        (max_instants if max_instants is not None else HEADWAY_MAX_INSTANTS), "instants",
+        seed=sampler_seed)
     hw_reason = thin or (None if hw.size >= MIN_SAMPLES else
                          f"only {hw.size} in-lane leader/follower pairs (need {MIN_SAMPLES})")
     out.append(_metric(
@@ -1934,7 +2296,8 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
                "leader_rule": "nearest vehicle ahead in the follower's own heading frame, within "
                               "half a lane width laterally (no spatial cell, so long headways are "
                               "not censored)",
-               "headway_p15_s": _r(_pct(hw, 15)), "headway_p85_s": _r(_pct(hw, 85))}))
+               "headway_p15_s": _r(_pct(hw, 15)), "headway_p85_s": _r(_pct(hw, 85)),
+               **hw_sampling}))
     floor_ref = _ref(refdata, "traffic_regimes.headway_implausible_below_s")
     floor_s = float((floor_ref or {}).get("value", 0.5))
     out.append(_metric(
@@ -1942,7 +2305,8 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
         f"Time headways below the physical floor ({floor_s:g} s)",
         (float(np.mean(hw < floor_s)) if hw.size else None), "fraction", int(hw.size),
         _ref(refdata, "traffic_regimes.headway_implausible_max_fraction"), SOFT, reason=hw_reason,
-        extra={"floor_s": floor_s, "floor_source_ref": "traffic_regimes.headway_implausible_below_s"}))
+        extra={"floor_s": floor_s, "floor_source_ref": "traffic_regimes.headway_implausible_below_s",
+               **hw_sampling}))
     ks_ref = _ref(refdata, f"traffic_regimes.{reg}.time_headway_ks_max") if reg else None
     ks_val = None
     if hw.size >= MIN_SAMPLES:
@@ -1957,7 +2321,25 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
         reason=hw_reason or reg_reason,
         extra={"model_ref": "traffic_regimes.time_headway_model",
                "fit": "h_min = sample minimum, scale = mean - h_min (shape test, like "
-                      "calibration.ks_vs_fitted_rayleigh)"}))
+                      "calibration.ks_vs_fitted_rayleigh)",
+               # WITHDRAWN, and replaced by the condition that actually makes it true. The old
+               # wording -- "a DISTRIBUTION over evenly-spaced instants stays representative under
+               # the cap; only a COUNT does not" -- was FALSE on signalised traffic, and this row is
+               # where it did damage: under the fixed-stride rule this KS statistic drifted
+               # 0.1975 -> 0.1624 over the 300 s -> 14,400 s ladder (-17.8%) against an uncapped
+               # truth that moved 0.1967 -> 0.1926 (-2.1%), and it is GRADED against 0.15, so the
+               # sampler alone could turn a real FAIL into a pass. Even spacing is not enough;
+               # UNIFORM INCLUSION PROBABILITY is, and that is what the sampler now provides.
+               "distributional_note": "a DISTRIBUTION stays representative under the cap only if "
+                                      "every instant has the same probability of being sampled. "
+                                      "EVEN SPACING ALONE DOES NOT GIVE THAT: a fixed stride "
+                                      "phase-locks onto any periodic structure whose period "
+                                      "divides it (a signal cycle), and the error is then a BIAS "
+                                      "that no cap raise removes. The instants here are drawn by "
+                                      "jittered systematic sampling, whose inclusion probability "
+                                      f"is exactly examined/available for every instant. See "
+                                      f"{SAMPLER_DOC}",
+               **hw_sampling}))
 
     # ---- fundamental diagram --------------------------------------------------------------------
     fd = _fundamental_diagram(segs, probe["n_lanes"], fd_cell_m, fd_window_s) if n_seg else {"cells": 0}
@@ -2184,11 +2566,29 @@ def _crossing(curve: dict, level: float) -> float | None:
     return None
 
 
+def _observed_span_s(emissions: list[dict], probe: dict) -> float | None:
+    """Simulated seconds the record covers: the manifest's own duration, else the emission span.
+
+    Needed to turn "this dataset has too few links" into "this dataset is too SHORT", which is the
+    statement a reader can act on. The manifest value wins because the emission span is truncated by
+    whoever stopped transmitting last.
+    """
+    try:
+        d = float((probe.get("config") or {}).get("duration_s") or 0.0)
+    except (TypeError, ValueError):
+        d = 0.0
+    if d > 0.0:
+        return d
+    ts = [e.get("t") for e in emissions if isinstance(e.get("t"), (int, float))]
+    return (float(max(ts)) - float(min(ts))) if len(ts) >= 2 else None
+
+
 def comm_panel(emissions: list[dict], reports: list[dict], report_labels: list[dict],
                tracks: dict[str, dict], probe: dict, refdata: dict, *,
                t_bucket_s: float = T_BUCKET_S, dist_bin_m: float = DIST_BIN_M,
                max_dist_m: float = MAX_LINK_DIST_M, regime: str | None = None,
-               dataset_dir: str | None = None) -> list[dict]:
+               dataset_dir: str | None = None, max_instants: int | None = None,
+               sampler_seed: int = SAMPLER_SEED) -> list[dict]:
     P = "comm"
     out: list[dict] = []
     no_reports = (not reports or not report_labels)
@@ -2202,18 +2602,14 @@ def comm_panel(emissions: list[dict], reports: list[dict], report_labels: list[d
         if art_d.size > gt_d.size:
             method, heard = "art_reconstruction", art_d
 
-    out.append(_metric(
-        "comm.honest_links", P, "Honest (false-positive) report links usable for the PDR curve",
-        int(heard.size), "count", int(heard.size), severity=SOFT,
-        reason="informational: sample size for every other comm metric",
-        extra={"reconstruction_method": method, "candidate_reports": len(links),
-               "total_reports": len(reports),
-               "gt_endpoint_lookup_failures": int(gt_miss),
-               "art_censored_links": int(censored),
-               "note": "distance-triggered reports (acceptanceRangeThreshold) are excluded so the "
-                       "report-trigger probability is distance-independent"}))
-
-    snaps = _snapshots(emissions, t_bucket_s)
+    snap_stats: dict = {"examined": 0, "available": 0}
+    snaps = _snapshots(emissions, t_bucket_s, max_buckets=(MAX_TIME_BUCKETS if max_instants is None
+                                                           else max_instants), stats=snap_stats,
+                       sampler_seed=sampler_seed)
+    snap_sampling = _sampling_block(
+        snap_stats["examined"], snap_stats["available"],
+        (max_instants if max_instants is not None else MAX_TIME_BUCKETS), "buckets",
+        seed=sampler_seed)
     n_opp = sum(len(s["vids"]) * (len(s["vids"]) - 1) // 2 for s in snaps)
     few = None
     if no_reports:
@@ -2225,6 +2621,64 @@ def comm_panel(emissions: list[dict], reports: list[dict], report_labels: list[d
         few = f"only {n_opp} co-presence pairs to normalise against (need {MIN_SAMPLES})"
 
     curve = _pdr_curve(heard, snaps, dist_bin_m, max_dist_m) if not few else None
+
+    # ---- IS THE CURVE RESOLVED, OR ONLY PRESENT? -------------------------------------------------
+    # MIN_SAMPLES gates the EXISTENCE of the awareness rows. It does not gate their PRECISION, and on
+    # the reference grid arm the difference is the whole story: the rows appear at ~930 s and are
+    # still moving by a factor of 3.8 (awareness_ratio_100m) and 7.6 (effective_range_m) at 8 h,
+    # while comm.pdr_gray_zone_width_m -- the one GRADED row -- reads FAIL at 14400 s and pass at all
+    # six other durations, so the run length alone decides that verdict
+    # (docs/realism/LONG-RUNS.md sections 3.4 and 6). The curve is built from LINKS PER DISTANCE BIN,
+    # so that is what the floor is applied to; and because the shortfall is a shortfall of RUN
+    # LENGTH, the row says how much more of it this dataset's own observed link rate would need.
+    span_s = _observed_span_s(emissions, probe)
+    usable_bins = int(curve["usable"].sum()) if curve is not None else 0
+    # The curve's OWN numerator, not `heard.size`: a link that landed in a bin too thin to be usable
+    # (or past `max_dist_m`) contributes nothing to the shape being measured, so counting it here
+    # would overstate how well resolved the curve is.
+    curve_links = int(curve["num"][curve["usable"]].sum()) if curve is not None else 0
+    links_needed = CURVE_MIN_LINKS_PER_BIN * usable_bins
+    links_per_bin = (float(curve_links) / usable_bins) if usable_bins else None
+    link_rate = (float(curve_links) / span_s) if (span_s and span_s > 0 and curve is not None) else None
+    duration_needed = (links_needed / link_rate) if (link_rate and link_rate > 0) else None
+    thin_curve = None
+    if curve is not None and usable_bins and curve_links < links_needed:
+        thin_curve = (
+            f"UNDER-RESOLVED CURVE: {curve_links} honest links over {usable_bins} populated distance "
+            f"bins is {links_per_bin:.1f} links/bin, below the {CURVE_MIN_LINKS_PER_BIN}/bin floor "
+            f"({links_needed} links needed). MIN_SAMPLES={MIN_SAMPLES} gates whether this row "
+            f"EXISTS, not whether it has converged"
+            + (f"; at this dataset's observed {link_rate:.4g} honest links/simulated-second that is "
+               f"~{duration_needed:.0f} s of run against the {span_s:.0f} s it has"
+               if (duration_needed and span_s) else "")
+            + f". See {SAMPLING_CAP_DOC.rsplit('#', 1)[0]}")
+
+    out.append(_metric(
+        "comm.honest_links", P, "Honest (false-positive) report links usable for the PDR curve",
+        int(heard.size), "count", int(heard.size), severity=SOFT,
+        reason="informational: sample size for every other comm metric",
+        extra={"reconstruction_method": method, "candidate_reports": len(links),
+               "total_reports": len(reports),
+               "gt_endpoint_lookup_failures": int(gt_miss),
+               "art_censored_links": int(censored),
+               "note": "distance-triggered reports (acceptanceRangeThreshold) are excluded so the "
+                       "report-trigger probability is distance-independent",
+               # THE ADEQUACY BLOCK: everything a reader needs to decide whether the curve-derived
+               # rows below are a measurement or a placeholder, on one row, in the dataset's own
+               # units. `simulated_span_s` is the run length; `duration_for_curve_metrics_s` is what
+               # this arm would need at the link rate it actually achieved.
+               "usable_distance_bins": usable_bins,
+               "links_in_usable_bins": (curve_links if curve is not None else None),
+               "links_per_usable_bin": _r(links_per_bin, 2),
+               "links_per_bin_floor": CURVE_MIN_LINKS_PER_BIN,
+               "links_required_for_curve_metrics": int(links_needed) or None,
+               "simulated_span_s": _r(span_s, 1),
+               "observed_link_rate_per_sim_s": _r(link_rate, 6),
+               "duration_for_curve_metrics_s": (int(round(duration_needed))
+                                                if duration_needed else None),
+               "curve_resolved": (None if curve is None else bool(thin_curve is None)),
+               **snap_sampling}))
+
     curve_pts = []
     if curve is not None:
         for i in range(curve["edges"].size - 1):
@@ -2248,11 +2702,17 @@ def comm_panel(emissions: list[dict], reports: list[dict], report_labels: list[d
     # IS comparable; this row stays, unchanged and ungated, as the raw observable it always was.
     for anchor in AWARENESS_ANCHORS_M:
         val, n_at = (_curve_at(curve, anchor) if curve is not None else (None, 0))
+        if thin_curve:
+            # A wrong value published under an `na` status is still a wrong value -- the same rule
+            # the traffic panel applies when survivorship withholds a row. These rows are UNGATED,
+            # so the number is all a consumer reads, and at 2.8 links/bin it is a factor of 3.8 away
+            # from where it settles. The number goes, the reason stays.
+            val = None
         out.append(_metric(
             f"comm.awareness_ratio_{int(anchor)}m", P,
             f"Neighbour awareness ratio at {int(anchor)} m (normalised, all pairs)",
             val, "fraction", n_at, None, SOFT,
-            reason=few or (
+            reason=few or thin_curve or (
                 "UNGATED SINCE 2026-09-01 and deliberately so. This is an ALL-PAIRS, SINGLE-SHOT "
                 "ratio normalised at the near band; the 0.90 anchor it used to be graded against "
                 "is a >=1-of-Z per-second NAR over a 3-9 vehicle test fleet at a ~110 dB link "
@@ -2265,16 +2725,23 @@ def comm_panel(emissions: list[dict], reports: list[dict], report_labels: list[d
                                     "divided by the same ratio in the nearest populated bin",
                    "retired_reference": "v2x_awareness.awareness_ratio_200m_urban_min",
                    "retired_because": "conditions mismatch on pair population, shot multiplicity "
-                                      "and link budget; see refdata/v2x_awareness_conditions.json"}))
+                                      "and link budget; see refdata/v2x_awareness_conditions.json",
+                   "links_per_usable_bin": _r(links_per_bin, 2),
+                   "curve_resolved": (None if curve is None else bool(thin_curve is None))}))
 
     d90 = _crossing(curve, 0.90) if curve is not None else None
     d20 = _crossing(curve, 0.20) if curve is not None else None
     gray = (d20 - d90) if (d90 is not None and d20 is not None) else None
+    # THE ONE GRADED CURVE ROW, and the one metric on the reference arm whose PASS/FAIL flips with
+    # duration alone (FAIL at 14400 s, pass at 300/900/1800/3600/7200/28800 s). Below the links/bin
+    # floor the verdict is withheld with the shortfall stated, which is what stops a run length from
+    # deciding it. Above the floor nothing changes.
     out.append(_metric(
         "comm.pdr_gray_zone_width_m", P, "PDR gray-zone width (awareness 90% -> 20%)",
-        gray, "m", int(heard.size), _ref(refdata, "v2x_awareness.pdr_gray_zone_width_min_m"),
+        (None if thin_curve else gray), "m", int(heard.size),
+        _ref(refdata, "v2x_awareness.pdr_gray_zone_width_min_m"),
         SOFT,
-        reason=few or (None if gray is not None else
+        reason=few or thin_curve or (None if gray is not None else
                        "the reconstructed curve never crosses both the 0.90 and 0.20 levels inside "
                        f"{max_dist_m:g} m (a hard-cutoff/unit-disc radio has no gray zone)"),
         extra={"d_at_0p90_m": _r(d90, 1), "d_at_0p20_m": _r(d20, 1),
@@ -2282,14 +2749,20 @@ def comm_panel(emissions: list[dict], reports: list[dict], report_labels: list[d
                                   "measured curve (running maximum from the far end), so a single "
                                   "Poisson-noise dip cannot manufacture a gray zone",
                "min_bin_opportunities": curve["min_opportunities"] if curve is not None else None,
+               "links_per_usable_bin": _r(links_per_bin, 2),
+               "links_per_bin_floor": CURVE_MIN_LINKS_PER_BIN,
+               "curve_resolved": (None if curve is None else bool(thin_curve is None)),
                "curve": curve_pts or None}))
     d50 = _crossing(curve, 0.50) if curve is not None else None
     out.append(_metric(
         "comm.effective_range_m", P, "Effective range (awareness ratio crosses 0.5)",
-        d50, "m", int(heard.size), None, SOFT,
-        reason=few or "informational: tracked, no pass/fail band (the curve is proportional-to-PDR, "
+        (None if thin_curve else d50), "m", int(heard.size), None, SOFT,
+        reason=few or thin_curve or
+                      "informational: tracked, no pass/fail band (the curve is proportional-to-PDR, "
                       "not absolute -- see v2x_awareness.los_high_pdr_range_m for the pinned anchor)",
-        extra={"nominal_radio_range_m": _r(probe["radio_range_m"], 1) or None}))
+        extra={"nominal_radio_range_m": _r(probe["radio_range_m"], 1) or None,
+               "links_per_usable_bin": _r(links_per_bin, 2),
+               "curve_resolved": (None if curve is None else bool(thin_curve is None))}))
 
     # ---- CAM inter-packet gap -------------------------------------------------------------------
     gaps: list[float] = []
@@ -2338,7 +2811,8 @@ def scorecard(dataset_dir: str, refdata: dict | str | None = None, *, regime: st
               t_bucket_s: float = T_BUCKET_S, dist_bin_m: float = DIST_BIN_M,
               max_dist_m: float = MAX_LINK_DIST_M, fd_cell_m: float = FD_CELL_M,
               fd_window_s: float = FD_WINDOW_S, traffic_source: str = "auto",
-              sumo_trace: str | None = None) -> dict:
+              sumo_trace: str | None = None, max_instants: int | None = None,
+              sampler_seed: int = SAMPLER_SEED) -> dict:
     """Score one dataset directory. Read-only, deterministic, never raises on a missing signal.
 
     Raises FileNotFoundError only when `dataset_dir` itself is not a directory, or when
@@ -2381,10 +2855,12 @@ def scorecard(dataset_dir: str, refdata: dict | str | None = None, *, regime: st
         traffic_gt = ground_truth_kinematics(build_tracks(traffic_rows))
 
     traffic = traffic_panel(traffic_rows, probe, rd, fd_cell_m=fd_cell_m, fd_window_s=fd_window_s,
-                            regime=reg, gt=traffic_gt, src=src, surv=surv)
+                            regime=reg, gt=traffic_gt, src=src, surv=surv,
+                            max_instants=max_instants, sampler_seed=sampler_seed)
     comm = comm_panel(emissions, reports, rlabels, tracks, probe, rd, t_bucket_s=t_bucket_s,
                       dist_bin_m=dist_bin_m, max_dist_m=max_dist_m, regime=reg,
-                      dataset_dir=dataset_dir)
+                      dataset_dir=dataset_dir, max_instants=max_instants,
+                      sampler_seed=sampler_seed)
     metrics = traffic + comm
     counts = {"pass": 0, "fail": 0, "na": 0}
     for m in metrics:
@@ -2408,11 +2884,45 @@ def scorecard(dataset_dir: str, refdata: dict | str | None = None, *, regime: st
                      "max_dist_m": max_dist_m, "fd_cell_m": fd_cell_m, "fd_window_s": fd_window_s,
                      "max_finite_difference_dt_s": MAX_FD_DT_S, "min_samples": MIN_SAMPLES,
                      "traffic_source": traffic_source,
-                     "survivorship_min_frac": SURVIVORSHIP_MIN_FRAC},
+                     "survivorship_min_frac": SURVIVORSHIP_MIN_FRAC,
+                     # THE SAMPLING CAPS, named at the top of the scorecard because they are the
+                     # denominator of every capped count below and were previously invisible.
+                     "max_instants": (max_instants if max_instants is not None else None),
+                     "max_time_buckets": MAX_TIME_BUCKETS,
+                     "headway_max_instants": HEADWAY_MAX_INSTANTS,
+                     "max_veh_per_bucket": MAX_VEH_PER_BUCKET,
+                     # WHICH RULE PICKED THE SAMPLED INSTANTS, and with which jitter seed. A cap
+                     # without its sampler is not a reproducible description of a capped scan --
+                     # the sampler is the half that carried the phase-lock bias.
+                     "sampler": SAMPLER_KEY, "sampler_seed": int(sampler_seed),
+                     "curve_min_links_per_bin": CURVE_MIN_LINKS_PER_BIN},
         "panels": {"traffic": traffic, "comm": comm},
         "summary": {**counts, "total": len(metrics),
                     "hard_failures": hard_fail, "soft_failures": soft_fail},
     }
+
+
+def _coverage_suffix(m: dict) -> str:
+    """" over X of Y instants (Z%)" for a row read off a capped scan, else "".
+
+    The CI line is where a count is most likely to be compared against another run's, so it is where
+    the denominator has to appear. Without it "overlap_events 319 FAIL" on an 8-hour run reads as
+    "fewer overlaps than the 434 of a 300 s run" when it means "319 in the 0.83% of the run we
+    looked at".
+    """
+    d = m.get("details") or {}
+    cov = d.get("coverage_frac")
+    # Only the INSTANT-capped traffic rows. The comm panel's bucket coverage moves a curve's
+    # NORMALISING denominator, not a published count, so the same warning would be wrong there; it
+    # stays in `details` where it belongs.
+    if cov is None or cov >= 1.0 or "instants_available" not in d:
+        return ""
+    span = (f" [over {d['instants_examined']} of {d['instants_available']} instants, "
+            f"{cov:.2%} of the run")
+    # The warning belongs to the COUNT. The paired rate divides by the same sub-sample it was
+    # measured over, so it is comparable and saying otherwise would be wrong.
+    return span + (" -- NOT comparable with another duration as a count]"
+                   if m.get("unit") == "count" else "]")
 
 
 def hard_failures(card: dict) -> list[str]:
@@ -2422,7 +2932,8 @@ def hard_failures(card: dict) -> list[str]:
         if m["status"] == "fail" and m["severity"] == HARD:
             ref = m.get("reference") or {}
             out.append(f"REALISM HARD FAIL [{m['id']}] {m['title']}: {m['value']} {m['unit']} "
-                       f"(reference {_ref_text(ref)}; {ref.get('cite', 'no citation')})")
+                       f"(reference {_ref_text(ref)}; {ref.get('cite', 'no citation')})"
+                       + _coverage_suffix(m))
     return out
 
 
@@ -2498,6 +3009,7 @@ def render_lines(card: dict, include_na: bool = False) -> list[str]:
             val = "n/a" if m["value"] is None else f"{m['value']}"
             tail = (f" (ref {_ref_text(ref)} {ref.get('unit', m['unit'])}; {ref['cite']})"
                     if ref.get("cite") else "")
+            tail += _coverage_suffix(m)
             if m["status"] == "na" and m.get("reason"):
                 tail += f" — {m['reason']}"
             lines.append(f"    - {_ICON[m['status']]} {m['title']}: **{val} {m['unit']}**{tail}")
@@ -2535,6 +3047,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--sumo-trace", default=None,
                    help="path to the frozen SUMO trace to score the traffic panel from (default: "
                         "the one manifest.config.sumo_trace pins, if it is still on disk)")
+    p.add_argument("--max-instants", type=int, default=None,
+                   help=f"cap on instants / co-presence snapshots any capped scan examines "
+                        f"(default {MAX_TIME_BUCKETS}; 0 = unlimited). The default is a COST "
+                        f"ceiling, not a statistical one: past {MAX_TIME_BUCKETS} instants a "
+                        f"count's coverage falls as 1/duration, so raise it (or drop it) when the "
+                        f"run is long and the O(instants x vehicles^2) scan is affordable")
+    p.add_argument("--sampler-seed", type=int, default=SAMPLER_SEED,
+                   help=f"seed for the sub-sampler's JITTER (default {SAMPLER_SEED}). Capped scans "
+                        f"take one uniform draw inside each stride window instead of a fixed "
+                        f"stride, so they cannot phase-lock onto a signal cycle; the seed makes "
+                        f"that byte-reproducible. Re-score under several seeds to MEASURE a capped "
+                        f"row's sampling noise instead of assuming it")
     p.add_argument("--markdown", action="store_true", help="print the compact scorecard lines instead of JSON")
     p.add_argument("--fail-on-hard", action="store_true",
                    help="exit 1 when a HARD metric fails (CI gate; default is measure-only exit 0)")
@@ -2545,7 +3069,8 @@ def main(argv: list[str] | None = None) -> int:
     card = scorecard(a.dataset_dir, a.refdata, regime=a.regime, art_max_m=a.art_max_m,
                      radio_range_m=a.radio_range_m, t_bucket_s=a.t_bucket_s, dist_bin_m=a.bin_m,
                      max_dist_m=a.max_dist_m, fd_cell_m=a.fd_cell_m, fd_window_s=a.fd_window_s,
-                     traffic_source=a.traffic_source, sumo_trace=a.sumo_trace)
+                     traffic_source=a.traffic_source, sumo_trace=a.sumo_trace,
+                     max_instants=a.max_instants, sampler_seed=a.sampler_seed)
     if a.markdown:
         text = "\n".join(render_lines(card, include_na=True))
         try:
