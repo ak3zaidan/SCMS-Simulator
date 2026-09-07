@@ -201,6 +201,34 @@ class ConstructionRebindCheck(CheckBase):
         return 0.0
 
 
+def _flat_random(self):
+    return 0.5
+
+
+class ConstructionMethodRebindCheck(CheckBase):
+    """The METHOD form of the constructor attack, pinned separately from the CLASS form above.
+
+    `random.Random = Impostor` (the class) and `random.Random.random = _flat` (a method on it) are
+    caught by two different rows of the watch list -- the module-attribute half and the
+    `RANDOM_METHODS` half -- and the method form is the one that reaches the engine's OWN private
+    stream, the one every pinned golden depends on, rather than only the keyed streams built after
+    the rebind. Both are in the catalogue this engine is measured against; asserting one is not
+    asserting the other.
+    """
+
+    interface_version = DET_IV
+    plugin_id = "timeth"
+    reason_code = "timeth"
+
+    def __init__(self, *, params=None, rng=None, env=None):
+        CONSTRUCTED.append("ConstructionMethodRebindCheck")
+        random.Random.random = _flat_random
+        super().__init__(params=params, rng=rng, env=env)
+
+    def evaluate(self, obs, state, params, rng):
+        return 0.0
+
+
 class ConstructionRebindFusion(FusionBase):
     """And the fusion slot's."""
 
@@ -229,6 +257,30 @@ class DelayedClassRebind(HardRange):
     def begin_step(self, frame):
         super().begin_step(frame)
         if frame.step >= 30 and random.Random is not Impostor:
+            FIRED.append(frame.step)
+            random.Random = Impostor
+
+
+class WallClockRebind(HardRange):
+    """The same attack on a WALL CLOCK instead of a step counter, and it is a different threat.
+
+    A step-gated attack can in principle be met by lengthening the conformance window; a clock-gated
+    one cannot be met at all, because the suite finishes in well under the delay whatever window it
+    drives. Only a monitor that holds for the WHOLE run sees it, which is why it is pinned here
+    beside the step-gated form rather than assumed to be the same test.
+    """
+
+    plugin_id = "tiwall"
+
+    def __init__(self, *, params, rng, env):
+        super().__init__(params=params, rng=rng, env=env)
+        import time
+        self._t0 = time.monotonic()
+
+    def begin_step(self, frame):
+        super().begin_step(frame)
+        import time
+        if time.monotonic() - self._t0 > 0.05 and random.Random is not Impostor:
             FIRED.append(frame.step)
             random.Random = Impostor
 
@@ -484,6 +536,30 @@ def test_a_hostile_constructor_is_refused_before_step_0_check_slot(tp, tmp_path)
     assert not _manifest_exists(tmp_path, "a4")
 
 
+def test_a_constructor_that_rebinds_random_Random_random_ITSELF_is_refused(tp, tmp_path):
+    """A, PINNED IN ITS SECOND FORM. `random.Random = Impostor` reaches the ~20 keyed streams the
+    engine builds AFTER the rebind; `random.Random.random = _flat` reaches the engine's own private
+    `random.Random(cfg.seed)` -- the one every pinned golden depends on -- immediately, and leaves
+    every generator STATE a snapshot could compare perfectly intact while doing it. They are caught
+    by two different rows of the watch list, so one test does not cover the other.
+    """
+    original = random.Random.__dict__.get("random")
+    try:
+        with pytest.raises(ConfigError) as e:
+            _run(tmp_path, "a4m",
+                 plugins={"check": ["@builtins",
+                                    {"ref": "ti_plugins:ConstructionMethodRebindCheck"}]})
+        msg = str(e.value)
+        assert "INTEGRITY FAILURE while LOADING a detector plugin" in msg
+        assert "random.Random.random" in msg
+        assert not _manifest_exists(tmp_path, "a4m")
+        # ...and `verify()` restored it, so the interpreter is usable for the next submission
+        assert random.Random.__dict__.get("random") is original
+    finally:
+        if original is not None and random.Random.__dict__.get("random") is not original:
+            random.Random.random = original
+
+
 def test_a_hostile_constructor_is_refused_before_step_0_fusion_slot(tp, tmp_path):
     """A, fusion slot."""
     with pytest.raises(ConfigError) as e:
@@ -555,6 +631,26 @@ def test_the_whole_run_monitor_catches_the_delayed_class_rebind(tp, tmp_path):
     assert tp.FIRED and min(tp.FIRED) >= 30, f"the attack never fired: {tp.FIRED}"
     assert random.Random is not tp.Impostor
     assert not _manifest_exists(tmp_path, "b1")
+
+
+def test_the_whole_run_monitor_catches_the_WALL_CLOCK_delayed_rebind(tp, tmp_path):
+    """B, PINNED IN ITS SECOND FORM because it is the one no window can be made long enough for.
+
+    The step-gated attack invites the wrong fix ("drive conformance for more steps"). This one closes
+    that argument off: the trigger is `time.monotonic()`, so the suite finishes before it fires no
+    matter how many steps it drives, and only an end-of-run comparison over the WHOLE run sees it.
+    Both forms are in the catalogue of attacks this engine is measured against, and both must stay
+    caught.
+    """
+    tp.FIRED.clear()
+    with pytest.raises(ConfigError) as e:
+        _run(tmp_path, "b1w", plugins={"channel_model": {"ref": "ti_plugins:WallClockRebind"}})
+    msg = str(e.value)
+    assert "INTEGRITY FAILURE at the END of the run" in msg
+    assert "random.Random" in msg
+    assert tp.FIRED, "the wall-clock attack never fired; the delay is longer than the run"
+    assert random.Random is not tp.Impostor          # ...and the interpreter was restored
+    assert not _manifest_exists(tmp_path, "b1w")
 
 
 def test_the_delayed_rebind_is_invisible_to_every_digest_layer(tp):

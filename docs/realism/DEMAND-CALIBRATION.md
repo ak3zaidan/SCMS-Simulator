@@ -404,6 +404,15 @@ vehicles/hour summed over these 55 counting edges, against a measured 31,046 (AM
 Beyond that ceiling, extra demand converts into queue length, not into counted vehicles. This is the
 residual −27 % / −24 %, and no demand calibration can touch it.
 
+> **§12 supersedes the mechanism this section infers, and corrects one premise of it.** The ceiling
+> is real and §12 measures it per vehicle, but the "decisive control" argument above rests on the
+> claim that the warm-up hour has the *same* route concentration as the graded hour. It does not:
+> the warm-up assignment peaks at 1,071 veh/h on a single car lane and puts **nothing** above 1,200,
+> where the graded assignment reaches **1,778 veh/h/lane** with 24 edges at or above 1,200. The two
+> hours differ in feasibility, not only in volume. §12 also shows that what SUMO does with the
+> infeasible hour is not queue at the loops but **replace 75 % of the routes**, and that the
+> reported 24,071 exists only because it does.
+
 ---
 
 ## 7. Corrections to the documented baseline
@@ -631,11 +640,311 @@ paragraph to revisit.
 2. **Fix the detector layout upstream.** §3 is a bug in the shipped `InTAS_E1.add.xml`, independent
    of demand, and it has been silently corrupting every loop-based measurement in this repository.
    It is worth reporting to InTAS.
-3. **The next question is capacity, not demand.** §6 shows the network cannot carry measured flow.
-   Investigate signal plans and junction capacity at the saturating corridors before spending more
-   effort on demand.
-4. **Get turn counts if the deficit matters.** Loop counts alone cannot constrain routing, and §8.2–3
+3. **The next question is the assignment, not the demand and not (yet) the network.** §12 replaces
+   what this item used to say. The binding constraint is that routeSampler's solution puts up to
+   1,778 veh/h on single give-way lanes that pass ~515, and that SUMO then replaces the routes of
+   75 % of the vehicles rather than driving into it. The next run is a **capacity-constrained
+   assignment** — `duaIterate.py`, or `marouter` with volume-delay functions, seeded by the same
+   counts and the same held-out split — not a signal-plan investigation and not a demand change.
+   Only after that does a residual deficit measure the network.
+4. **Anything that reads these runs must know the routes are not the fitted ones.** §12.2. A
+   downstream consumer that assumes the calibrated scenario drives routeSampler's assignment is
+   wrong about it: only **37.9 %** of the fitted counting-edge passages are driven as assigned.
+5. **Get turn counts if the deficit matters.** Loop counts alone cannot constrain routing, and §8.2–3
    will remain open without them.
+
+---
+
+## 12. P2 — where the demand goes between assignment and the loops
+
+**Verdict: the ceiling is genuine, and the mechanism is not the one §6 inferred.** §6 measured a
+throughput ceiling by elimination and attributed the shortfall to "the network cannot carry it". A
+per-vehicle ledger built from SUMO's own `vehroute-output` says something sharper and less
+comfortable: **SUMO does not drive the route set routeSampler solved for.** It replaces the route of
+**75.0 %** of the graded-hour cohort before or during the trip, and **44.0 %** of routeSampler's
+assigned counting-edge passages are lost to that replacement rather than to congestion. Forcing
+SUMO to execute the assignment does not recover them — it gridlocks the city and delivers a third
+less. So the ceiling stands, but the 24,071 figure is not "what the network could carry"; it is
+what the network carries *after its own rerouting device has escaped an infeasible assignment*.
+
+Everything below is measured on the same seed-42 runs as §5–§6 (`y0AM`/`y0PM` reproduce the §5
+detector output exactly: 24,071 AM and 24,250 PM counting-edge passages, identical to `cAM`/`cPM`),
+re-run only to add `vehroute-output`, `edgeData` and un-suppressed warnings, none of which perturb
+the simulation.
+
+### 12.1 It is not insertion — DISCARDED and DELAYED are different rows, and both are small
+
+The two candidates that would make this a configuration bug rather than a traffic result are
+insertion capacity at the boundary and `max-depart-delay` silently deleting vehicles. SUMO reports
+each separately. `statistic-output`, verbatim:
+
+| run | `<vehicles …>` | discarded = loaded − inserted − waiting | `departDelay` |
+|---|---|---|---|
+| **calibrated AM** | `loaded="28461" inserted="28146" running="7843" waiting="44"` | **271 (0.95 %)** | **4.25 s** |
+| **calibrated PM** | `loaded="30838" inserted="30412" running="9704" waiting="166"` | **260 (0.84 %)** | 6.66 s |
+| baseline AM | `loaded="28883" inserted="25271" running="3921" waiting="240"` | **3,372 (11.7 %)** | **24.26 s** |
+| baseline PM | `loaded="24280" inserted="21305" running="3298" waiting="212"` | **2,763 (11.4 %)** | 25.23 s |
+
+Per vehicle, over the 16,655 calibrated cars departing in the AM graded hour, the delay between the
+departure routeSampler wrote and the departure SUMO achieved is **median 0.05 s, mean 6.0 s, p95
+16.6 s, max 300.04 s — and exactly one vehicle of 16,655 reaches the 300 s `max-depart-delay` cap.**
+Set against the route file vehicle by vehicle, **315** of the 28,229 calibrated AM cars never appear
+in `vehroute-output` at all (exactly SUMO's `loaded − inserted`); 44 of those are the ones still
+listed as `waiting` at the horizon and the other 271 are the discards. **266** of the 315 belong to
+the graded-hour cohort, and they account for **718 of its 31,040 assigned counting passages
+(2.3 %)**.
+`--no-warnings false` produces 3,800 warning lines in the AM run and **not one is an aborted
+departure**; they are 2,686 emergency-braking, 526 end-of-teleport, 352 yield teleports, 144 jam
+teleports, 44 wrong-lane teleports, 24 "no connection to the next edge" emergency stops and 8
+red-light emergency stops.
+
+So the calibrated scenario does **not** refuse to insert its demand. The *baseline* partly does —
+11.7 % of InTAS's own AM vehicles are discarded and its mean departure delay is 5.7× the calibrated
+run's — which means a slice of the documented −53.9 %/−55.7 % baseline deficit is a configuration
+limit and not demand at all. That is a separate finding, and it makes the baseline worse as a
+reference point, not better.
+
+### 12.2 The ledger: what happened to every assigned counting-edge passage
+
+`vehroute-output` with `--vehroute-output.exit-times --vehroute-output.write-unfinished` records,
+per vehicle, the edge sequence actually driven and the time it left each edge. Matching that against
+the route routeSampler assigned classifies every one of the 31,040 assigned AM passages into exactly
+one bucket (`tools/demand_ceiling.py ledger`):
+
+| | AM warm-up | **AM graded** | PM warm-up | **PM graded** |
+|---|---|---|---|---|
+| assigned to the cohort by routeSampler | 22,706 | **31,040** | 32,989 | **34,364** |
+| driven as assigned, inside the window | 12,720 (56.0 %) | **11,774 (37.9 %)** | 10,895 (33.0 %) | **8,055 (23.4 %)** |
+| **lost — SUMO replaced the route** | 7,764 (34.2 %) | **13,668 (44.0 %)** | 18,185 (55.1 %) | **18,947 (55.1 %)** |
+| lost — vehicle had not reached it at the horizon | 5 (0.0 %) | 4,880 (15.7 %) | 353 (1.1 %) | 6,430 (18.7 %) |
+| lost — passage fell after the window | 2,047 (9.0 %) | 0 | 3,425 (10.4 %) | 0 |
+| lost — vehicle never inserted | 170 (0.7 %) | 718 (2.3 %) | 131 (0.4 %) | 932 (2.7 %) |
+| credit — driven onto a counting edge it was *not* assigned | +7,700 | +8,698 | +10,893 | +8,605 |
+| credit — spillover from the previous hour's departures | +0 | +3,472 | +0 | +7,547 |
+| **= counting passages inside the window** | **20,548** | **24,104** | **21,916** | **24,330** |
+| the loops' own count for the same window | 20,571 | 24,071 | 21,894 | 24,250 |
+
+The ledger closes against the detector output to **0.11 %, 0.14 %, 0.10 % and 0.33 %** — it is an
+accounting of the same vehicles, not a model of them.
+
+Read the graded AM column. **Only 37.9 % of routeSampler's solution is executed.** The single
+largest term is not queueing, not insertion and not the horizon: it is `device.rerouting` replacing
+the route. 12,488 of the 16,655 graded-hour vehicles (**75.0 %**) have at least one route
+replacement; SUMO records each one in the `vehroute` output as a `<routeDistribution>` whose first
+entry carries `reason="device.rerouting"`. A raw structural scan of that file, independent of the
+ledger's matching logic, finds a `<routeDistribution>` on **20,676 of the 28,146 vehicles inserted
+across both AM hours (73.5 %)** — the same answer from the other direction. The shipped InTAS config
+assigns the device with
+`device.rerouting.probability 0.82`, re-optimises before insertion, and repeats every
+`device.rerouting.period 300` seconds against live travel times.
+
+Note what the two credit rows mean. Rerouting is not deleting flow, it is *moving* it: 8,698
+passages arrive on counting edges the vehicle was never assigned to. In the warm-up hour the two
+deviation terms nearly cancel (−7,764 against +7,700, a net −64 on 22,706). In the graded hour they
+do not (−13,668 against +8,698, a net **−4,970**). Rerouting is neutral while the corridors are
+free and systematically *away* from them once they are not — which is exactly what a travel-time
+router is supposed to do, and exactly what destroys a count-fitted assignment.
+
+### 12.3 The counterfactual — make SUMO execute the assignment
+
+`calibrate_demand.py scenario --execute-assigned-routes` writes `device.rerouting.period 0` and
+`.pre-period 0`, which is the only way to make SUMO drive the routes it was calibrated on. The
+ledger confirms the switch bites: **route replacements 0, route-deviation loss 0**. The rest of the
+run is the answer to whether rerouting was hiding a deliverable flow:
+
+| AM graded hour | as shipped (`y0AM`) | assignment executed (`y1AM`) |
+|---|---|---|
+| passages lost to route replacement | 13,668 (44.0 %) | **0** |
+| passages not reached at the horizon | 4,880 (15.7 %) | **13,176 (42.4 %)** |
+| vehicles never inserted | 315 | **2,255** |
+| teleports (jam) | 541 (144) | **3,011 (1,322)** |
+| **delivered at the 55 counting edges** | **24,071 (−22.5 %)** | **17,395 (−44.0 %)** |
+| PM equivalent | 24,250 (−30.6 %) | **11,078 (−68.3 %)**, 8,614 teleports (3,366 jam) |
+
+**The rerouting device is the only reason the calibrated scenario delivers 24,071 rather than
+17,395.** It is a mitigation of an infeasible assignment, not the cause of the deficit. Both facts
+matter: the calibration's headline gain is real *and* it is achieved by a route set SUMO overwrites.
+
+### 12.4 The network is at its production ceiling, and `edgeData` shows the shape of it
+
+Network-wide `edgeData` at 900 s, summed as vehicle-kilometres (production) against vehicle-hours
+(accumulation) — the network fundamental diagram, measured:
+
+| bin | as shipped: veh-km | veh-h | mean m/s | | executed: veh-km | veh-h | mean m/s |
+|---|---|---|---|---|---|---|---|
+| warm-up 3 | 17,333 | 685.5 | 7.02 | | 17,351 | 691.6 | 6.97 |
+| warm-up 4 | 17,880 | 733.8 | 6.77 | | 16,603 | 781.8 | 5.90 |
+| graded 1 | 19,678 | 901.3 | 6.07 | | 17,432 | 1,034.4 | 4.68 |
+| graded 2 | 22,175 | 1,227.6 | 5.02 | | 17,415 | 1,466.7 | 3.30 |
+| graded 3 | 22,964 | 1,494.5 | 4.27 | | 15,306 | 1,834.0 | 2.32 |
+| graded 4 | **22,848** | **1,718.4** | **3.69** | | **13,061** | **2,174.0** | **1.67** |
+
+As shipped, production rises to 22,964 veh-km per 900 s and then stops rising while accumulation
+grows 2.3× and mean speed halves: the saturated branch. With the assignment executed, production
+*falls* 17,432 → 13,061 while accumulation keeps climbing and 1,073 edges sit below 20 % of their
+free-flow speed: the gridlock branch. The PM pair has the same shape and is worse (as shipped
+23,084 → 23,658 veh-km, flat, ending at 2.97 m/s; executed 19,962 → 10,647 veh-km at **0.855 m/s**
+with 1,599 jammed edges).
+
+### 12.5 Why: the graded-hour assignment is infeasible on 24 links, and the warm-up hour's is not
+
+§6's "decisive control" — same route set, same concentration, only the volume differs — is wrong on
+the middle term. Per-lane assigned flow, counted over the routes routeSampler wrote for each hour
+(`tools/demand_ceiling.py bottleneck`; car lanes only, sidewalk lanes excluded):
+
+| assigned veh/h per **car lane** | AM warm-up: edges | AM graded: edges | PM graded: edges |
+|---|---|---|---|
+| < 450 | 6,390 | 6,254 | 6,160 |
+| 450–700 | 161 | 351 | 454 |
+| 700–900 | 23 | 61 | 114 |
+| 900–1,200 | 14 | 63 | 41 |
+| **≥ 1,200** | **0** | **24** | **15** |
+| **maximum** | **1,071** | **1,778** | **1,738** |
+| cohort that must cross an edge ≥ 900 veh/h/lane | 29.4 % | **58.0 %** | **66.6 %** |
+| assigned counting passages on such a route | 36.6 % | **61.9 %** | **71.7 %** |
+
+The worst AM link is `653473569#3`: one car lane (its lane 0 is a sidewalk), 77.7 m of
+`highway.tertiary` at 13.89 m/s, ending at junction `274041341`, which is a **`priority`** — an
+unsignalised give-way — junction. What SUMO does with it:
+
+| | assigned | entered | speed | occupancy | waiting/bin at the end |
+|---|---|---|---|---|---|
+| AM warm-up hour | 1,071 | **516** | 9.59 → 2.15 m/s | 7.2 → 34.7 % | 3,082 s |
+| AM graded hour | 1,778 | **513** | 2.52 → 1.31 m/s | 37.0 → 54.6 % | 5,387 s |
+
+**Its throughput is invariant at ≈515 veh/h while the demand placed on it rises 66 %.** That is a
+directly measured link capacity, and routeSampler assigns it 3.45×. `653473569#2` behind it reads
+502 / 479 on 1,018 / 1,677 assigned. The PM twin `201963533#4` is worse: 805 vehicles at 9.61 m/s in
+the warm-up hour and **212 at 0.47 m/s** in the graded hour on essentially the same assigned load —
+a capacity *drop*, the link's discharge collapsing once it gridlocks.
+
+What the 87 overloaded AM edges have in common says where the ceiling physically sits:
+
+| of the 87 edges assigned ≥ 900 veh/h/car lane | |
+|---|---|
+| have **one** car lane | **84** |
+| end at an unsignalised **`priority`** (give-way) junction | **81** (4 at a traffic light, 1 `right_before_left`, 1 `zipper`) |
+| road class | 48 `highway.tertiary`, 35 `highway.secondary`, 4 other |
+| **are one of the 55 counting edges** | **0** |
+| assigned passages / actually entered in the hour | **100,660 / 53,644** — served fraction median **0.521**, min 0.215 |
+
+The counting edges themselves are not the constraint and never were (§6: max target 692 veh/h/lane
+AM, and the undershooting loops run at 22 % occupancy) — **not one of the 87 is a counting edge**.
+The constraint is on the **paths to them**: 62 % of the graded hour's assigned counting passages
+ride a route that must first cross a single-lane give-way link the assignment overloads by a median
+factor of two. The warm-up hour succeeds because its assignment is feasible — nothing above
+1,200 veh/h/lane — not because it is smaller.
+
+### 12.6 Re-graded, calibration and held-out reported separately
+
+Re-measured on the runs above, repaired layout, `--id-prefix fx_`, the same nine reference windows,
+the held-out windows still untouched by any fitting:
+
+| run | set | n | modelled | **rel. error** | **median GEH** | GEH<5 | in FHWA tol. |
+|---|---|---|---|---|---|---|---|
+| **calibrated AM, as shipped** | calibration | 2 | 32,885 | −27.0 % | 14.86 | 0.348 | 0.348 |
+| **calibrated AM, as shipped** | **held-out** | 2 | 32,885 | **−27.1 %** | **14.07** | 0.348 | 0.348 |
+| calibrated AM, assignment executed | calibration | 2 | 23,355 | −48.1 % | 22.07 | 0.000 | 0.000 |
+| calibrated AM, assignment executed | **held-out** | 2 | 23,355 | **−48.2 %** | **22.38** | 0.000 | 0.022 |
+| **calibrated PM, as shipped** | calibration | 2 | 33,094 | −31.9 % | 16.11 | 0.130 | 0.152 |
+| **calibrated PM, as shipped** | **held-out** | 3 | 33,094 | **−24.1 %** | **11.74** | 0.188 | 0.232 |
+| calibrated PM, assignment executed | calibration | 2 | 14,999 | −69.1 % | 38.79 | 0.000 | 0.000 |
+| calibrated PM, assignment executed | **held-out** | 3 | 14,999 | **−65.6 %** | **33.74** | 0.029 | 0.029 |
+
+The as-shipped rows reproduce §5 to the digit. The calibration-to-held-out gap stays inside the
+reference's own day-to-day spread in every variant (AM +0.2 pp and +0.1 pp against a 1.5 % noise
+floor; PM +7.8 pp and +3.5 pp against 8.6 %), so nothing here was fitted to the test set. **All four
+FHWA gates still fail in every window**, and the executed-assignment variant fails them by two to
+three times the margin. `--execute-assigned-routes` is therefore a **diagnostic switch, not a
+scenario**: it is the honest way to run the routes that were calibrated, and it is much less like
+Ingolstadt. The shipped default stays as it is, and `InTAS_buildings.sumocfg` remains untouched.
+
+### 12.7 What this does and does not establish about InTAS
+
+**Established.** Loading 31,046 veh/h through these 55 counting edges *along routeSampler's paths*
+drives the InTAS network past its production ceiling: production flattens at ~22,900 veh-km per
+900 s while accumulation doubles, and the individual links carrying the concentration meter at a
+measured ~515 veh/h against 1,778 assigned. No configuration change recovers the flow — the two
+knobs that could have (`max-depart-delay`, and the rerouting device) account for 2.3 % and are
+already load-bearing in the other direction.
+
+**Not established, and this is the part that must not be over-claimed.** This is *not* a measurement
+that InTAS cannot carry Ingolstadt's measured traffic. It is a measurement that InTAS cannot carry
+*this assignment*, and the assignment is demonstrably infeasible by construction: routeSampler is a
+static sampler with no capacity model and no travel-time feedback (§8.7), it samples uniformly from
+a pool of modal routes that share long sub-paths, and nothing in it prevents 1,778 veh/h being put
+on one give-way lane. The honest next step is not a longer warm-up or a looser `max-depart-delay`
+but a **capacity-constrained assignment** — an equilibrium method (`duaIterate.py`, or `marouter`
+with volume-delay functions) seeded by the same counts — after which a residual ceiling would mean
+what §6 claims this one means. Until that is run, "the network cannot carry the measured flow"
+remains one plausible reading of a number at least as well explained by "the route set cannot be
+driven".
+
+**Also not established: that the §5 improvement comes from where §5 says it does.** The gain is real
+and it transfers to unseen days, but only 37.9 % of the assigned counting-edge passages are actually
+driven; 44 % are replaced by SUMO's own shortest paths, and 8,698 passages arrive on counting edges
+the vehicle was never assigned to. §8.2's "routes are not validated" is stronger than it reads: the
+routes SUMO drives are not the routes that were fitted.
+
+### 12.8 Reproduce
+
+All of §12 runs off two SUMO runs per band and one new tool, `tools/demand_ceiling.py`. Nothing
+count-derived is committed; every artefact stays under the git-ignored `.cache/calib/`. The route
+sets and the network are the §9 ones unchanged — `calibrated_am.rou.xml` `3855d8beca100f28`,
+`calibrated_pm.rou.xml` `a8c87a2273bdb584`, `ingolstadt.net.xml` `9f16fd821d0d1772` — plus
+`tools/demand_ceiling.py` `47defef16a81e223` and the passive probe file
+`.cache/calib/probe/edgedata.add.xml` `188fdd92e99521d5` (sha256, first 16 hex).
+
+```powershell
+. C:\Users\Administrator\tools\env.ps1
+cd C:\Users\Administrator\Documents\SCMS-Simulator
+$S = "scms-sim/scenarios/gen_intas_urban_low/sumo"; $C = ".cache/calib"
+
+# 0. the passive probe additional-file: network-wide 900 s edgeData
+#    (.cache/calib/probe/edgedata.add.xml -- output only, no effect on dynamics)
+
+# 1. the two AM runs -- identical except for the rerouting device
+cd $S
+sumo -c InTAS_calibrated_am.sumocfg --begin 21600 --end 28800 --output-prefix y0AM_ --seed 42 `
+     --no-step-log true --no-warnings false `
+     --additional-files "BusStations.add.xml,../../../../.cache/calib/layout/calib_layout.add.xml,buildings.poly.xml,../../../../.cache/calib/probe/edgedata.add.xml" `
+     --vehroute-output ../../../../.cache/calib/probe/vehroute.xml `
+     --vehroute-output.exit-times true --vehroute-output.write-unfinished true `
+     --tripinfo-output.write-unfinished true 2> ../../../../.cache/calib/probe/y0AM_err.log
+#    y1AM_ is the same line plus:  --device.rerouting.period 0 --device.rerouting.pre-period 0
+#    (or generate the cfg with: calibrate_demand.py scenario --execute-assigned-routes)
+cd ../../../..
+
+# 2. the per-vehicle ledger, and its cross-check against the loops
+python tools/demand_ceiling.py ledger --targets-meta $C/targets_am.edg.meta.json `
+    --routes $C/calibrated_am.rou.xml --vehroute $C/probe/y0AM_vehroute.xml `
+    --begin 25200 --end 28800 --json $C/probe/ledger_am_graded.json
+python tools/calibrate_demand.py edges --cov-out $C/layout/y0AM_calib_cov_det.xml `
+    --fixed-out $C/layout/y0AM_calib_fixed_det.xml --layout-map $C/layout/layout_map.json `
+    --targets-meta $C/targets_am.edg.meta.json --begin 25200 --end 28800
+
+# 3. network production per 900 s bin, and the worst links
+python tools/demand_ceiling.py network --edgedata $C/probe/y0AM_edgedata900_all.xml `
+    --targets-meta $C/targets_am.edg.meta.json --top 12
+
+# 4. is the ASSIGNMENT itself feasible?  run it for BOTH hours and compare
+python tools/demand_ceiling.py bottleneck --net $S/ingolstadt.net.xml `
+    --routes $C/calibrated_am.rou.xml --edgedata $C/probe/y0AM_edgedata900_all.xml `
+    --targets-meta $C/targets_am.edg.meta.json --begin 21600 --end 25200
+python tools/demand_ceiling.py bottleneck --net $S/ingolstadt.net.xml `
+    --routes $C/calibrated_am.rou.xml --edgedata $C/probe/y0AM_edgedata900_all.xml `
+    --targets-meta $C/targets_am.edg.meta.json --begin 25200 --end 28800
+
+# 5. re-grade -- calibration and held-out in one invocation, then the gap
+python tools/calibrate_demand.py grade --det-out $C/layout/y0AM_calib_fixed_det.xml `
+    --layout-map $C/layout/layout_map.json --id-prefix fx_ --begin 25200 --end 28800 `
+    --label y0AM --ref "$C/ref_20231114_0600Z.json=calibration" `
+    --ref "$C/ref_20231116_0600Z.json=calibration" --ref "$C/ref_20231121_0600Z.json=held-out" `
+    --ref "$C/ref_20231123_0600Z.json=held-out" --json $C/probe/g_y0AM_fixed.json
+python tools/calibrate_demand.py report --grade $C/probe/g_y0AM_fixed.json `
+    $C/probe/g_y1AM_fixed.json $C/probe/g_y0PM_fixed.json $C/probe/g_y1PM_fixed.json `
+    --out $C/probe/summary_p2.json
+```
 
 ---
 

@@ -110,9 +110,91 @@ section do not reproduce from the diff the document itself prints, and one only 
 the acceptance script leaves a `.orig` backup **inside site-packages**, contaminating the package
 hash it is meant to verify.
 
+## Round 3 — the whole catalogue re-run against HEAD with fresh external code (2026-09-06)
+
+Ten attack families, re-implemented from scratch as a plugin distribution **outside this repository**
+(`C:\Temp\adv\ext`, on `sys.path`, never installed), each measured with a digest against an honest
+control on `seed=17, grid 5×5, 40 s, arrival 1.5, attacker 0.30`. Control digest
+`2d73c3fb2ab6b87e…`.
+
+### Eight of ten do not land. Each was independently confirmed by reverting its fix.
+
+| # | family | verdict at HEAD | measured |
+|---|---|---|---|
+| 4 | module-level tamper on the no-run import paths | **BLOCKED** | `verify-plugins`, `--check-config` and the run path all raise `INTEGRITY FAILURE while IMPORTING the check plugin (module-level code)`; `registry.resolve`'s own `Sentinel` fires at the import that performed it |
+| 5 | attestation verdict forgery (`atexit` rewriting the child's report + writing JSON on fd 1) | **BLOCKED** | the plugin genuinely failed `['D1_pure','D2_reads_only_ma_visible','D3_label_invariance','D4_firing_convention','D5_monotone_in_attack_magnitude','D7_state_namespacing']` and the run was refused; the forged `{"passed": 99, "ok": true}` reached the parent's stdout and was **not read** — no framing token |
+| 6 | cross-package sibling drift | **BLOCKED** | the edit moved the digest `86877363` → `49442da0` with `module_sha256` unmoved and `package_sha256` null, and `import_closure_sha256` moved `b117e35a` → `4c3ff7cf`; `verify-plugins` exit **2** |
+| 7 | mutating methods **of** a watched class (obfuscated `getattr(sys,"mod"+"ules")`) | **BLOCKED** | `INTEGRITY FAILURE at the END of the run: 3 watched object(s)`, naming `WitnessedRandom.verify_stream`; no manifest |
+| 9 | isolated-mode `__file__` decoy | **BLOCKED** | `IsolationError: the isolated worker reported that it loaded the plugin from <decoy>` — the parent resolves the path itself and refuses the mismatch |
+| 10 | lying codec (fabricated `wire_size_bytes`, non-decoding `evidence_pdu`), `net_latency_model` on | **BLOCKED** | `the CAM it emitted does not decode -- decode_cam() raised ValueError`; refused before any manifest |
+| — | `random.Random.random` rebind at `__init__` | **BLOCKED** (pinned) | `INTEGRITY FAILURE while LOADING a detector plugin` |
+| — | delayed rebind of a watched object, **step-gated and wall-clock-gated** | **BLOCKED** (pinned) | both: `INTEGRITY FAILURE at the END of the run`, no manifest. The wall-clock form is newly pinned — a step-gated attack invites "drive conformance longer", a clock-gated one closes that argument off |
+| — | isolated child hunting **this run's** streamed ground truth | **BLOCKED** (pinned) | child found `env_hits=[]`, `cwd_entries=[]`, no `ground_truth/` for this run |
+
+Every one of those has a regression test that **fails when the fix is reverted** — measured by
+reverting each in turn: F7 → 2 failed, F4 → 1 failed, F6 → 1 failed, F10 → 3 failed, F5 → 1 failed,
+F9 → 2 failed.
+
+### Two land, and one of them is not closable in this process
+
+**1. The frame walk, taken while the plugin is being LOADED.** `api/guard.py` refuses
+`sys._getframe` from inside CPython however it is spelled — but it is armed around the calls the
+engine makes **into** a plugin. A plugin's module body and its `__init__` are not calls, and
+`frame.f_back` / `frame.f_locals` raise no audit event at all. So:
+
+```
+capture in evaluate()  -> BLOCKED  (IntegrityError: PLUGIN GUARD REFUSAL, sys._getframe)
+capture in __init__    -> LANDS    {"broadcast_dict": "run_pipeline", "locals:vehicles": "run_pipeline"}
+capture at module body -> LANDS    {"is_attacker": true, "true_xy": [466.4527993807002, 120.0]}
+```
+
+Both landing forms ran to completion at the **default** `source_gate` and wrote a dataset. This is
+not closable: arming the hook over a plugin's module body would refuse `collections.namedtuple`,
+`typing.NamedTuple` and `logging` — what honest authors do there — and would still leave metaclasses,
+`__set_name__`, descriptors and properties open.
+
+**Action taken: documented, not claimed.** `api/guard.py` gains a fourth named limit and a measured
+section; `api/srcgate.py` and `api/integrity.py` had their "closed however it is spelled" sentences
+**withdrawn** as false; `DETECTOR-PLUGIN.md` §2.3 gains a runtime-guard row and §2.4.1;
+`PLUGIN-ARCHITECTURE.md` §10.1 states the posture. Pinned by
+`test_the_frame_walk_STILL_LANDS_when_it_is_taken_while_the_plugin_is_LOADED`, which **passes by the
+attack succeeding**.
+
+**2. Drawing from the frame-walked global RNG — CLOSED, in the half that is arithmetic.** The same
+walk reaches `run_pipeline`'s `rng`. Reading it is a read; drawing from it is an act. The engine
+makes no global-stream draw while it is handing control to a plugin's loader or constructor, so the
+stream is now closed for the whole plugin-loading phase as well as for every guarded call
+(`integrity.stream_closed`).
+
+| form | before | after |
+|---|---|---|
+| draw in `evaluate` | refused (guard armed) | refused |
+| draw in `__init__`, refusal swallowed | **complete clean run**, digest `319bb0bd` vs honest twin `192286db`, `verify_stream` agreeing, manifest written | `IntegrityError ... SWALLOWED the refusal`, no manifest |
+| draw in `evaluate`, refusal swallowed | run completed | `28835 draw(s) ... were REFUSED`, no manifest |
+| honest twin (walks, does not draw) | `192286db` | `192286db` — the closure costs an honest plugin nothing |
+
+### One CLI defect found on the way
+
+`verify-plugins` detected the family-4 module-level tamper correctly and then let the
+`IntegrityError` escape as an **unhandled traceback at exit 1** — which is that command's code for
+"the manifest file was unreadable". A CI gate keyed on the exit code therefore filed an actively
+hostile plugin under "bad JSON". It now reports `PLUGIN INTEGRITY REFUSAL` at exit **2**, and
+`--allow-drift` does not downgrade it.
+
+### Pinned digests
+
+`0bd93655a2d5bebb4172191fab0940a5ff90c6be685cfa033f5edcfd7c1fb740` (default golden) and
+`b25f2137cf14dd504d56bb88cd67cce273b6a6ac348f7c59ee6d3b4372257815` (reference run) both reproduce
+byte-identically after all of the above.
+
 ## Lesson
 
 Both of these landed because their verifier agents were lost to a session limit and the work was
 committed on implementer report alone. The two earlier failures in this project had the same shape:
 a GEH gate that graded a simulation against itself, and a seed-stability gate too loose to catch a
 2× regression. **Nothing here counts as done until an independent agent has re-run the attack.**
+
+Round 3 adds a second rule, learned from the two withdrawn containment claims and from the
+"however it is spelled" sentence withdrawn above: **a limitation must be pinned by a test that
+passes by the attack succeeding.** A limitation asserted only in prose becomes a claim the first time
+someone paraphrases it.

@@ -56,9 +56,15 @@ And what is NOT claimed, stated as plainly as the rest:
   this process does not have.
 * Detection is not the only instrument any more, and the division of labour matters:
   :mod:`~scms_sim_ref.api.guard` REFUSES the reflective routes (`sys._getframe`, the `gc` walkers,
-  `ctypes`) while a gated plugin call is on the stack, from inside CPython, so the frame walk that
-  moves nothing on this list is now refused rather than merely invisible. This module still answers
-  the question that one cannot: *did anything the engine is made of change during the run?*
+  `ctypes`) **while a gated plugin CALL is on the stack** -- and only then. A plugin's MODULE-LEVEL
+  code and its ``__init__`` are not calls the guard is armed for, and CPython audits no event for
+  ``frame.f_back`` or ``frame.f_locals``, so a frame captured at import or construction time is
+  readable for the whole run without one audited operation. Measured on this engine, at the default
+  ``source_gate``: a `check` that captured ``sys._getframe(1)`` in its module body reached
+  ``run_pipeline``'s frame and read ``b["veh"].is_attacker`` (True) and the sender's true position
+  (466.45, 120.0) from inside ``evaluate``. **In-process plugins are trusted code.** This module
+  still answers the question the guard cannot: *did anything the engine is made of change during
+  the run?*
 * The sentinel is itself an object in the same address space. It watches its own module entry, which
   raises the bar and does not remove it.
 * A **passing** verification means "nothing on the watch list moved", never "this plugin is honest".
@@ -139,7 +145,12 @@ MODULE_WATCH = (
       "station_type_to_etsi", "ENGINE_STATION_TYPE", "UNAVAILABLE")),
     ("scms_sim_ref.api.srcgate", ("gate", "scan_source", "check_mode", "module_source")),
     ("scms_sim_ref.api.rng", ("RngNamespace", "check_plugin_id")),
-    ("scms_sim_ref.api.integrity", ("Sentinel", "WitnessedRandom", "IntegrityError")),
+    # `stream_closed` and `engine_random` belong here for the same reason `guard.enter`/`leave` do:
+    # they are the mechanism that decides whether the engine's global stream may be drawn from, so a
+    # plugin that replaces one has disarmed the thing judging it.
+    ("scms_sim_ref.api.integrity",
+     ("Sentinel", "WitnessedRandom", "IntegrityError", "stream_closed", "stream_refusals",
+      "engine_random", "armed_for")),
     ("scms_sim_ref.conformance.runner", ("run_ref", "run_contract", "ConformanceReport")),
     ("scms_sim_ref.mock_pipeline.run",
      ("_attest", "_round_score", "_assert_config_unmoved", "_data_digest", "_write_manifest",
@@ -175,6 +186,11 @@ MODULE_WATCH = (
 CLASS_WATCH = (
     ("scms_sim_ref.api.integrity", "WitnessedRandom"),
     ("scms_sim_ref.api.integrity", "Sentinel"),
+    # The loading-phase stream closure. Watched as a CLASS and not only as a module attribute for
+    # exactly the reason this half of the list exists: replacing `stream_closed.__enter__` with a
+    # no-op reopens the stream while leaving the class object -- the thing `MODULE_WATCH` compares --
+    # untouched.
+    ("scms_sim_ref.api.integrity", "stream_closed"),
     ("scms_sim_ref.api.detect", "Observation"),
     ("scms_sim_ref.api.detect", "NamespacedState"),
     ("scms_sim_ref.api.detect", "CheckBase"),
@@ -478,6 +494,85 @@ def _message(when: str, subject: str, moved) -> str:
 # --------------------------------------------------------------------------- #
 # The engine's own stream, and the proof that it advanced exactly as much as it was asked to
 # --------------------------------------------------------------------------- #
+#: Nesting depth of a window in which the engine's global stream is CLOSED -- no draw is legitimate
+#: because the engine itself is not drawing. A LIST for the same reason `guard._DEPTH` is one:
+#: `WitnessedRandom.random` reads it on every draw of the run and a list index is the cheapest read
+#: Python has for mutable module state.
+#:
+#: **Deliberately separate from `guard._DEPTH`.** Raising the guard's depth would arm the PEP 578
+#: audit hook, and `api/guard.py` names the price of that: `logging` above the enabled level,
+#: `collections.namedtuple`, `typing.NamedTuple` and `traceback.print_stack()` all call
+#: `sys._getframe` and would be refused. Those are exactly the things an honest plugin author does at
+#: module scope and in `__init__`, and `guard.py` currently tells them to "log from `__init__`". This
+#: counter closes the STREAM without arming the hook, so the honest author pays nothing.
+_STREAM_CLOSED = [0]
+
+#: How many draws have been REFUSED on a closed stream, ever, in this process. Monotone and
+#: unbounded, for exactly the reason `guard._COUNT` is: :class:`IntegrityError` is a `ConfigError`
+#: and therefore an `Exception`, so a plugin's `try: ... except Exception:` swallows the refusal and
+#: carries on. Measured: a constructor that walked to the engine's stream, drew, caught the refusal
+#: and returned normally produced a complete run. The COUNT is what makes swallowing pointless --
+#: `stream_closed.__exit__` and `WitnessedRandom.verify_stream` both compare it across their window.
+_STREAM_REFUSALS = [0]
+
+
+def stream_refusals() -> int:
+    """Refused draws on the engine's global stream so far in this process."""
+    return _STREAM_REFUSALS[0]
+
+
+class stream_closed:                                       # noqa: N801 - context-manager naming
+    """``with stream_closed():`` -- the engine's global stream refuses every draw for this block.
+
+    **The window this exists for, measured.** `guard` refuses the frame walk only while a guarded
+    plugin CALL is on the stack, and neither a plugin's module-level code nor its ``__init__`` is
+    one. So a `check` that walked to ``run_pipeline``'s frame in its constructor, took the
+    ``WitnessedRandom`` out of the locals and drew one number from it produced a complete, clean run:
+    the digest moved ``2d73c3fb`` -> ``319bb0bd``, `verify_stream` still agreed (the counter counts
+    what it was ASKED for, not who asked), no watched identity moved, and the manifest was written.
+
+    The engine makes NO draw on its own global stream while it is handing control to a plugin's
+    loader or constructor -- every engine draw is in the reception loop, after `build_checks` has
+    returned -- so closing the stream across the whole plugin-LOADING phase is exact rather than
+    approximate. It covers module import, ``__init__``, ``capabilities()``, ``config_fields()`` and
+    any property the engine reads off the instance, which is every unguarded entry point a plugin has
+    before step 0.
+
+    What it does NOT do, and the distinction is the whole honesty of this module: it does not stop a
+    plugin READING the frame, the broadcast dict or the label. That reach is still open at import and
+    construction time and is not closable in this process. See the module docstring.
+    """
+
+    __slots__ = ("_n",)
+
+    def __enter__(self):
+        self._n = _STREAM_REFUSALS[0]
+        _STREAM_CLOSED[0] += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if _STREAM_CLOSED[0] > 0:
+            _STREAM_CLOSED[0] -= 1
+        if exc_type is None and _STREAM_REFUSALS[0] != self._n:
+            # The plugin CAUGHT the refusal (`except Exception:` is enough -- `IntegrityError` is a
+            # `ConfigError`) and returned normally. The count cannot be caught.
+            raise IntegrityError(
+                f"INTEGRITY FAILURE while LOADING a plugin: {_STREAM_REFUSALS[0] - self._n} "
+                f"draw(s) on the ENGINE'S GLOBAL random stream were refused, and the plugin "
+                f"SWALLOWED the refusal and returned normally.\n"
+                f"  Reaching that object takes a walk to `run_pipeline`'s frame, which the runtime "
+                f"guard does not refuse in a plugin's module body or its __init__. The stream is "
+                f"closed there instead, and the refusal is COUNTED so that catching it buys "
+                f"nothing.\n"
+                f"  A plugin's randomness is its RngNamespace (api/rng.py). No manifest is written.")
+        return False
+
+
+def stream_is_closed() -> bool:
+    """Whether the engine's global stream is currently refusing draws. Test/debug seam."""
+    return bool(_STREAM_CLOSED[0])
+
+
 class WitnessedRandom(random.Random):
     """The engine's global `random.Random(cfg.seed)`, counting Mersenne-Twister WORDS.
 
@@ -506,25 +601,41 @@ class WitnessedRandom(random.Random):
     ASKED for", never "only the engine asked", and that gap was measured (digest ``75176bd8`` against
     a control ``d0cb992c``, undetected).
 
-    Both halves of it are shut now:
+    **The stream is CLOSED in the two windows in which no draw can be the engine's**, which is what
+    turns "we can prove the count" into "a plugin cannot move the count":
 
-    * the frame walk that reaches this object is refused at run time by
-      :mod:`~scms_sim_ref.api.guard`, from inside CPython, however it is spelled; and
-    * **this stream is CLOSED for the duration of every guarded plugin call.** The engine never
-      draws from its global stream while a plugin is on the stack -- the reception loop's draws
-      happen between calls, not inside one -- so a draw made while the guard is armed cannot be the
-      engine's, and it is refused rather than counted. That turns "we can prove the count" into "the
-      count cannot be moved by a plugin", which is the statement that was actually needed.
+    * for the duration of every **guarded plugin call** (`guard._DEPTH`). The reception loop's draws
+      happen between calls, never inside one, so a draw made while the guard is armed is a plugin's;
+      and
+    * for the duration of the whole **plugin-LOADING phase** (:class:`stream_closed`) -- module
+      import, ``__init__``, ``capabilities()``, every attribute the engine reads off the instance.
+      The engine draws nothing on its global stream there either.
 
-    What remains, stated: a plugin that obtained this object and draws from it OUTSIDE a guarded
-    call -- from a background thread, or from a slot the config exempted with `source_gate: "off"`
-    -- is counted and not refused. Reaching it still requires the frame walk the guard refuses.
+    **THE READ IS NOT CLOSED, AND THIS DOCSTRING USED TO SAY OTHERWISE.** It claimed the frame walk
+    that reaches this object "is refused at run time by `guard`, however it is spelled". That is
+    false and was measured to be false: `guard` is armed around plugin CALLS, and a plugin's module
+    body and its ``__init__`` are not calls. CPython audits ``sys._getframe`` but audits nothing for
+    ``frame.f_back`` or ``frame.f_locals``, so a frame captured in a module body is a live handle on
+    ``run_pipeline``'s locals -- this object among them -- for the rest of the run, obtained with one
+    audited operation performed where nothing was listening. What the closure above does is make that
+    handle **useless for moving the digest**: the draw is refused in both windows, and outside them
+    the plugin is not running.
+
+    What remains, stated rather than left to be discovered: a plugin that stashed this object and
+    draws from it from a BACKGROUND THREAD (which runs while the engine's own loop is between guarded
+    calls), or from a slot the config exempted with `source_gate: "off"`, is counted and not refused.
+    And the READ -- of the oracle, of the labels, of anything else in those frames -- is not affected
+    by any of this. In-process plugins are TRUSTED CODE; the boundary that PREVENTS is
+    :mod:`~scms_sim_ref.api.isolate`.
     """
 
-    __slots__ = ("_words", "_state0")
+    __slots__ = ("_words", "_state0", "_refusals0")
 
     def __init__(self, seed=None):
         self._words = 0
+        #: Refusals already on the process counter when this stream was created, so `verify_stream`
+        #: measures THIS run's window in a process that runs many (foundry/campaign/massive/GUI).
+        self._refusals0 = _STREAM_REFUSALS[0]
         super().__init__(seed)
         self._state0 = super().getstate()
 
@@ -533,19 +644,33 @@ class WitnessedRandom(random.Random):
         return self._words
 
     def random(self):
-        if _GUARD_DEPTH[0]:
+        if _GUARD_DEPTH[0] or _STREAM_CLOSED[0]:
             raise _plugin_drew("random()")
         self._words += 2
         return super().random()
 
     def getrandbits(self, k):
-        if _GUARD_DEPTH[0]:
+        if _GUARD_DEPTH[0] or _STREAM_CLOSED[0]:
             raise _plugin_drew("getrandbits()")
         self._words += (int(k) + 31) >> 5
         return super().getrandbits(k)
 
     def verify_stream(self, when: str) -> dict:
-        """Raise :class:`IntegrityError` unless the stream is exactly `words` words along."""
+        """Raise :class:`IntegrityError` unless the stream is exactly `words` words along.
+
+        It also fails on a REFUSED draw that the plugin swallowed. `stream_closed` catches that for
+        the loading phase; this catches it for a draw made from inside a guarded CALL, where the
+        refusal is likewise an `Exception` a plugin can suppress.
+        """
+        refused = _STREAM_REFUSALS[0] - self._refusals0
+        if refused:
+            raise IntegrityError(
+                f"INTEGRITY FAILURE {when}: {refused} draw(s) on the engine's global random stream "
+                f"were REFUSED during this run and the plugin carried on.\n"
+                f"  The engine never draws on that stream while a plugin is on the stack or while a "
+                f"plugin is being loaded, so a refused draw is a plugin's -- reached by walking to "
+                f"`run_pipeline`'s frame. The refusal is an exception a plugin can catch; this count "
+                f"is not. No manifest is written.")
         probe = random.Random()
         probe.setstate(self._state0)
         if self._words:
@@ -569,12 +694,18 @@ class WitnessedRandom(random.Random):
 
 
 def _plugin_drew(what: str) -> IntegrityError:
+    _STREAM_REFUSALS[0] += 1
+    where = ("while a guarded plugin call was on the stack" if _GUARD_DEPTH[0]
+             else "while the engine was LOADING a plugin (module import / __init__ / capabilities)")
     return IntegrityError(
-        f"INTEGRITY FAILURE: {what} was called on the ENGINE'S GLOBAL random stream while a guarded "
-        f"plugin call was on the stack.\n"
+        f"INTEGRITY FAILURE: {what} was called on the ENGINE'S GLOBAL random stream {where}.\n"
         f"  The engine never does this. Its own draws -- packet loss, report_prob, collusion, "
-        f"net_delay, the emit sampling -- all happen between plugin calls, never inside one, so a "
-        f"draw made here is a plugin's.\n"
+        f"net_delay, the emit sampling -- all happen in the reception loop, between plugin calls and "
+        f"long after the last plugin was constructed, so a draw made here is a plugin's.\n"
+        f"  Reaching this object at all takes a walk to `run_pipeline`'s frame. That walk is refused "
+        f"inside a guarded call and is NOT refused in a plugin's module body or its __init__, which "
+        f"is why the STREAM is closed here rather than the reach: a captured handle is real, and "
+        f"this is what makes it useless.\n"
         f"  That single stream's draw COUNT AND ORDER are load-bearing: one extra draw shifts every "
         f"subsequent value in the run and moves the digest, while the word counter -- which counts "
         f"what it was ASKED for, not who asked -- stays perfectly consistent. Measured: one extra "

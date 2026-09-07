@@ -39,8 +39,23 @@ foreach ($band in 'am', 'pm') {
         --routes $rou `
         --additional "$S\BusStations.add.xml" "$C\layout\calib_layout.add.xml" "$S\buildings.poly.xml" `
         --name "InTAS_calibrated_$band.sumocfg"
+
+    # 4 + 5. the DIAGNOSTIC pair for docs/realism/DEMAND-CALIBRATION.md sect. 12: the same
+    #        demand with device.rerouting disabled, i.e. SUMO actually driving the route set
+    #        routeSampler solved for.  InTAS's shipped 0.82 rerouting probability replaces the
+    #        route of 75 % of the calibrated vehicles, so the as-shipped config grades a route
+    #        set it does not execute.  Executing it is MUCH WORSE against the loops (AM
+    #        -22.5 % -> -44.0 %, PM -30.6 % -> -68.3 %) because the assignment is infeasible
+    #        and the city gridlocks.  This config exists to MEASURE that, not to be run as a
+    #        scenario -- see sect. 12.3 and 12.6.
+    python "$repo\tools\calibrate_demand.py" scenario --sumocfg "$S\InTAS_buildings.sumocfg" `
+        --routes $rou --execute-assigned-routes `
+        --additional "$S\BusStations.add.xml" "$C\layout\calib_layout.add.xml" "$S\buildings.poly.xml" `
+        --name "InTAS_calibrated_${band}_execroutes.sumocfg"
 }
 Write-Host ""
 Write-Host "InTAS_buildings.sumocfg is UNCHANGED -- unmodified InTAS demand remains the default."
 Write-Host "AM band: --begin 21600 --end 28800 (graded hour 25200-28800 = local 07:00-08:00)"
 Write-Host "PM band: --begin 54000 --end 61200 (graded hour 57600-61200 = local 16:00-17:00)"
+Write-Host "*_execroutes.sumocfg are DIAGNOSTICS (sect. 12), not scenarios: they run the"
+Write-Host "calibrated routes without SUMO's rerouting device and score far worse."

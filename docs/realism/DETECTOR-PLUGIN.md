@@ -22,6 +22,18 @@ distribution installed and with no plugins declared. Reproduce the functional ev
 > been reaped, so the sentence is true of the code and not only of the intent. `ISOLATION-ORACLE-LEAK.md`
 > is the whole diagnosis, fix and measurement.
 
+> **Corrected 2026-09-06, after an independent re-run of the whole attack catalogue with plugin code
+> written outside this repository.** Eight of ten families no longer land (see
+> `PLUGIN-VERIFICATION-FINDINGS.md` round 3). The one that does is the **frame walk taken while the
+> plugin is being LOADED** — `api/guard.py` refuses `sys._getframe` from inside CPython, but it is
+> armed around the calls the engine makes *into* a plugin, and a module body and an `__init__` are
+> not calls. Measured at the default `source_gate`: `b["veh"].is_attacker → True`,
+> `b["x"], b["y"] → (466.4527993807002, 120.0)`, run completed, dataset written. It is **not closable
+> in this process** and is documented as a limitation rather than papered over —
+> [§2.4.1](#241-the-runtime-guard--and-the-window-it-does-not-cover). Two sentences elsewhere in this
+> project claiming the walk was "refused however it is spelled" have been withdrawn. **In-process
+> plugins are TRUSTED CODE.**
+
 > **The safety claim in this document was wrong until 2026-08-31 and is now stated correctly.**
 > An earlier revision of §1.2 called the `Observation` boundary "a boundary you cannot walk around".
 > It is not, it cannot be for any in-process plugin, and a detector reading the labels through
@@ -166,6 +178,16 @@ vector exists on the channel slot and was found there independently.
 `gc.get_referrers(obs)` reaches the same dict without touching a frame. `from
 scms_sim_ref.mock_pipeline import run` reaches it without any reflection at all.
 
+**Both of those spellings, and the one above, are now refused at run time — *if they are executed
+inside a call the engine made into the plugin*.** That is the whole of what
+[§2.4.1](#241-the-runtime-guard--and-the-window-it-does-not-cover) buys, and it is why the same walk
+moved one line up the file rather than disappearing. Taken in the plugin's **module body** — code
+`registry.resolve` executes when it imports the module, where no guard is armed and where
+`f_back`/`f_locals` raise no audit event at all — the identical capture is a live handle on
+`run_pipeline`'s locals for the whole run, and re-measured against HEAD it still returns
+`is_attacker = True` and `(466.4527993807002, 120.0)` from inside `evaluate`. Read §2.4.1 before you
+form a view about what the gate and the guard are worth.
+
 ### 2.3 Why this cannot be fixed in-process, and what was done instead
 
 Python gives every callable in a process the same reflective powers: `sys._getframe`,
@@ -179,11 +201,15 @@ the engine does four things that *are* true, and claims nothing more:
 | **`Observation`** | no ground truth reachable **by name**; nothing attachable; no declared field writable via `setattr` / `object.__setattr__` / `del` | `type(obs).claimed_x.fget.__self__.__set__(obs, v)` — the saved slot descriptor |
 | **`NamespacedState`** | the mapping interface lands in `plugin:<id>`; reserved keys raise on write; `h` comes back a tuple and `streak` a read-only proxy over a **copy** | `object.__getattribute__(ns, "_st")` — the wrapper holds the engine's dict |
 | **the source gate** | refuses frame walking, `gc` reflection, trace hooks, `ctypes`, `eval`/`exec`, and engine-internal imports, at load, by line number | `getattr(sys, "_get" + "frame")`; an `eval`; a helper module the gate does not parse |
+| **the runtime guard** ([§2.4.1](#241-the-runtime-guard--and-the-window-it-does-not-cover)) | while the engine is *calling into* the plugin, `sys._getframe`, `sys._current_frames`, the `gc` walkers, trace/profile installation and `ctypes` are refused **inside CPython**, so the spelling does not matter | **the guard is armed around plugin CALLS, not around plugin LOADING** — one `sys._getframe` in the module body or in `__init__` is not refused, and `f_back`/`f_locals` are audited by nothing, so the captured frame stays readable for the whole run |
 | **the integrity monitor** (§2.6) | the RNG primitives, the engine's own gates and the boundary classes are the **same objects** at the end of the run that they were at the start, and the engine's stream advanced exactly as many words as it drew | a plugin that tampers, uses the tamper, and puts the binding back **before the next checkpoint**; and everything that moves nothing at all — a frame walk moves nothing |
 
-All three residues are **pinned by tests** (`tests/test_detector_trust_boundary.py`,
-`tests/test_plugin_integrity.py`), so if a future change closes one, the test fails and this table
-has to be upgraded rather than left overstating.
+All four residues are **pinned by tests** (`tests/test_detector_trust_boundary.py`,
+`tests/test_plugin_runtime_guard.py`, `tests/test_plugin_integrity.py`), so if a future change closes
+one, the test fails and this table has to be upgraded rather than left overstating. The guard's
+residue is pinned by a test that **passes by the attack succeeding**
+(`test_the_frame_walk_STILL_LANDS_when_it_is_taken_while_the_plugin_is_LOADED`) — the only way to
+stop a limitation quietly turning into a claim.
 
 The honest boundary is a process boundary: a detector in its own process, with an explicit message
 interface, where the oracle is simply not in the address space — **and, since the address space was
@@ -267,6 +293,86 @@ It is a config key, not a flag, so it replays and it is written verbatim into
 `manifest["config"]["plugins"]`. A dataset built with the gate disabled says so in its own manifest.
 `"source_gate"` accepts `"on"` (default) and `"off"`; anything else is an error, never a silent
 default.
+
+### 2.4.1 The runtime guard — and the window it does not cover
+
+The gate above is a **static name match**, and its own error message says what that costs:
+`getattr(sys, "_get" + "frame")` is the same walk with the name assembled at run time and no gate
+that parses source can see it. `api/guard.py` answers the spelling half where spelling has already
+stopped existing — a **PEP 578 audit hook**, which CPython raises from inside `sys._getframe` itself,
+so `sys._getframe`, `getattr(sys, "_get"+"frame")`, `eval("sys._getframe")`, an alias captured at
+import and a helper module the gate never parsed all reach one refusal. It also refuses
+`sys._current_frames`, `gc.get_objects` / `get_referrers` / `get_referents`, `sys.settrace` /
+`setprofile` and `ctypes.*`. The refusal derives from `BaseException` (so `except Exception:` cannot
+swallow it) **and is counted** (so `except BaseException:` buys nothing either — the count is
+compared across the call and a move fails the run with no manifest).
+
+`"source_gate": "off"` turns off the static gate **and** this guard for that one plugin, so "code I
+wrote or audited" stays one recorded decision rather than two.
+
+#### The window, stated plainly, because it is the whole trust model
+
+**The guard is armed around the calls the engine makes INTO a plugin** — `evaluate`, `decide`,
+`encode_cam`, `wire_size_bytes`. It is **not** armed around:
+
+* the plugin's **module-level code**, which `registry.resolve` executes when it imports the module;
+* the plugin's **`__init__`**;
+* `capabilities()`, `config_fields()`, and any attribute or property the engine reads off the
+  instance while loading it.
+
+It cannot be. An honest module body calls `collections.namedtuple`, `typing.NamedTuple` or `logging`
+above the enabled level, and every one of those calls `sys._getframe` — arming the hook there would
+refuse honest code, and it still would not close anything, because a metaclass, a `__set_name__`, a
+descriptor or a property is another unguarded entry point and enumerating them all is exactly what
+this project has said twice now that it cannot do.
+
+And **`frame.f_back` and `frame.f_locals` raise no audit event at all**. So one `sys._getframe`,
+performed where nothing is listening, yields a live handle on the engine's own frames for the rest of
+the run. Measured against HEAD, at the **default** `source_gate`, with a plugin written outside this
+repository:
+
+```python
+# module scope of a third-party check -- runs inside registry.resolve()'s import
+_F = getattr(sys, "_get" + "frame")
+FRAMES = []
+_f = _F(1)
+while _f is not None:
+    FRAMES.append(_f)
+    _f = getattr(_f, "f_" + "back")
+
+# ...and later, from evaluate(), with no audited operation whatsoever:
+b = getattr(FRAMES[k], "f_" + "locals")["b"]
+b["veh"].is_attacker      # -> True                        the label being predicted
+b["x"], b["y"]            # -> (466.4527993807002, 120.0)  the sender's TRUE position
+```
+
+The run **completed and wrote a dataset.** This is pinned by a test that passes by the attack
+succeeding, so the paragraph cannot quietly become false in either direction.
+
+#### What *is* closed, because it is arithmetic rather than reachability
+
+The same walk reaches `run_pipeline`'s `rng` — the engine's single global stream, whose draw *count
+and order* are load-bearing for every digest in the project. Reading it is a read; **drawing from it
+is a measurable act**, and the engine can refuse that even though it cannot refuse the reach:
+
+* the stream refuses every draw for the duration of every guarded plugin call, and
+* it refuses every draw for the duration of the whole plugin-**loading** phase — module import,
+  `__init__`, `capabilities()`, every attribute read (`api/integrity.stream_closed`).
+
+The engine itself makes no global-stream draw in either window, so this is exact rather than
+heuristic. Measured: before the loading-phase closure, a plugin that walked to `rng` in its
+constructor and drew **one** number produced a complete, clean run whose digest was `319bb0bd`
+against an honest twin's `192286db` — `verify_stream` agreed (it counts what it was *asked* for, not
+who asked), nothing on the watch list moved, and the manifest was written. The refusal is an
+`Exception`, so it is also **counted**: a plugin that catches it and returns normally still fails the
+run, at load time, with no manifest.
+
+#### The one-line summary
+
+> The static gate turns an accident into a named error. The runtime guard turns a deliberate reach
+> **inside a plugin call** into a refusal. Neither closes the reach taken while the plugin is being
+> **loaded**, and nothing in this process can. **In-process plugins are TRUSTED CODE.** A detector you
+> cannot review runs with `"isolated": true`.
 
 ### 2.5 When the engine checks a plugin — and why "when" was a defect
 
@@ -599,13 +705,23 @@ None of those is implemented here, and none of them is claimed. Asserted in
 `tests/test_detector_isolation.py::test_the_child_still_reads_the_filesystem_and_the_docs_say_so`, so
 this paragraph cannot quietly become false.
 
-**2. The worker reports its own identity.** The child says where it loaded the plugin from; the
-parent hashes *those paths itself* (reading a file is not importing it), so `module_sha256`,
-`package_sha256` and the drift refusal on replay all still work — a replay re-probes in a child and
-compares. What the parent cannot check is that the paths are the ones the child actually imported: a
-worker that loads module A and names module B produces a self-consistent lock over the wrong files.
-The in-process mode has the strictly larger version of this hole (there the plugin can rewrite
-`registry.package_sha256` itself, which is why the integrity monitor watches it), but it is a hole.
+**2. The worker reports its own identity — and for a dotted ref the parent no longer believes it.**
+This used to be a live hole, and it was measured: a plugin that set its module's `__file__` to a
+decoy made the lock record the decoy's hash (`6d85ce01`) for code that hashed `90272b8b`, and a
+replay re-probed the same decoy, so "no drift" was true of a file that never ran.
+
+For a `pkg.mod:Class` ref — which the **parent** owns, because it comes out of the config — the
+parent now resolves the module on `sys.path` itself (`registry.static_locate`, which walks the path
+the way `FileFinder` does and executes nothing, unlike `find_spec`, which imports parent packages)
+and **refuses a worker whose reported path is not the one this process resolves**. `module_sha256`,
+`package_sha256` and `import_closure_sha256` are all computed from the parent's path.
+
+The residue is named in the lock rather than left to be assumed: when the parent *cannot* resolve the
+name that way — a zipimport, a namespace package, an entry-point ref, an editable install behind a
+custom finder — it falls back to the child's path and records `"path_source": "worker"`, and in that
+case the old caveat still applies. Read that field before you trust the hashes. The in-process mode
+has the strictly larger version of this hole (there the plugin can rewrite `registry.package_sha256`
+itself, which is why the integrity monitor watches it).
 
 **3. Config-time schema introspection is given up.** `--dump-config-schema`, the GUI's advanced panel
 and the copilot cheat-sheet cannot show an isolated plugin's knobs, because reading `config_fields()`
@@ -639,9 +755,15 @@ importing it.
 If you are collecting detectors from other people and comparing them:
 
 1. **Read the source.** The gate makes the obvious reaches loud; it does not make reading optional.
+   And read the **module body and the `__init__`**, not just `evaluate`: those are the two places the
+   runtime guard is not armed ([§2.4.1](#241-the-runtime-guard--and-the-window-it-does-not-cover)),
+   and a single `sys._getframe` there is a live handle on the oracle for the whole run.
 2. **Pin the content hashes.** `manifest["plugins"]["loaded"][*]` carries `module_sha256`,
-   `package_sha256` and `dist_sha256`; §7.1 shows the drift refusal. What you reviewed is then what
-   ran.
+   `package_sha256`, `dist_sha256` and `import_closure_sha256` — the last of which is what catches an
+   edit to a module in a *different* top-level package the plugin imports its logic from (measured:
+   such an edit moved the dataset digest while `module_sha256`, `package_sha256` and `dist_sha256`
+   were all unmoved and `verify-plugins` exited 0). §7.1 shows the drift refusal. What you reviewed
+   is then what ran.
 3. **Do not treat a reproduced digest as evidence of honesty.** It is not. A label-reading detector
    reproduces its digest exactly.
 4. **Use the conformance suite's D2 and D3** (§4.1) — and know their blind spot. D2 records every
@@ -1266,11 +1388,23 @@ A plugin declaring one is rejected at load with `CapabilityError`.
    design one.
 2. **The source gate parses one module.** It reads the module the plugin class is *defined in* — not
    the helper modules that module imports, and nothing resolved at run time. Widening it to the whole
-   distribution is mechanical (`registry.package_root` already finds the tree) and is not claimed
-   here. It is also defeated by `getattr(sys, "_get" + "frame")`, by an `eval`, and by anything else
-   a name-matching pass cannot see; that is asserted in
+   distribution is mechanical (`registry.package_root` already finds the tree, and
+   `registry.import_closure` already *hashes* that tree plus every non-stdlib module it imports) and
+   is not claimed here. It is also defeated by `getattr(sys, "_get" + "frame")`, by an `eval`, and by
+   anything else a name-matching pass cannot see; that is asserted in
    `tests/test_detector_trust_boundary.py::test_the_gate_is_a_guard_rail_and_the_repository_proves_it`
    so this paragraph cannot quietly become false.
+2b. **The runtime guard covers plugin CALLS, not plugin LOADING — and this is the largest open gap
+   in the in-process model.** `sys._getframe` taken in a module body or in `__init__` is not refused,
+   `f_back`/`f_locals` are audited by nothing, and the captured frame is a live handle on
+   `run_pipeline`'s locals — the broadcast dict, `veh.is_attacker`, the sender's true position — for
+   the whole run. Measured end to end at the default `source_gate`
+   ([§2.4.1](#241-the-runtime-guard--and-the-window-it-does-not-cover)) and pinned by a test that
+   passes *by the attack succeeding*. It is not closable in-process: arming the hook over a plugin's
+   module body would refuse `collections.namedtuple`, `typing.NamedTuple` and `logging`, and would
+   still leave metaclasses, `__set_name__`, descriptors and properties open. The *use* of the engine
+   RNG reached that way **is** closed (`integrity.stream_closed`); the *read* is not. **In-process
+   plugins are trusted code, and a detector you cannot review must run isolated.**
 3. **The gate's verdict is not in the manifest's plugin LOCK.** `source_gate: "off"` is recorded,
    because `cfg.plugins` is serialised verbatim into `manifest["config"]`, and it replays. But
    `manifest["plugins"]["loaded"][*]` carries no `source_gate` field of its own, so a consumer
@@ -1297,7 +1431,8 @@ A plugin declaring one is rejected at load with `CapabilityError`.
 |---|---|
 | the interfaces | `src/scms_sim_ref/api/detect.py` — `Observation` (and `_seal`, which makes it read-only), `Check`, `Fusion`, `CheckBase`, `NamespacedState`, `VIOLATION_THRESHOLD` |
 | **the source gate** | `src/scms_sim_ref/api/srcgate.py` — the refusal list, the message, and the module docstring stating what it is not |
-| **the integrity monitor** | `src/scms_sim_ref/api/integrity.py` — `Sentinel` (the identity snapshot, §2.6), `WitnessedRandom` (the word-counting engine stream), and the module docstring stating what it is not |
+| **the runtime guard** | `src/scms_sim_ref/api/guard.py` — the PEP 578 audit hook, the refused-event list, and the docstring's four named limits, of which the fourth (CALLS, not LOADING) is the one that decides the trust model |
+| **the integrity monitor** | `src/scms_sim_ref/api/integrity.py` — `Sentinel` (the identity snapshot, §2.6), `WitnessedRandom` (the word-counting engine stream), `stream_closed` (the loading-phase closure of that stream), and the module docstring stating what it is not |
 | **isolated (out-of-process) detectors** | `src/scms_sim_ref/api/isolate.py` — the wire protocol, `IsolatedCheck` (the engine-side proxy), `IsolatedRng`, and the child worker (`python -m scms_sim_ref.api.isolate --serve`). Its docstring states the transport decision and what the mode does not close |
 | **out-of-process attestation** | `src/scms_sim_ref/conformance/attest.py` — the child interpreter that grades a candidate before the engine ever constructs it |
 | the knobs | `src/scms_sim_ref/api/fields.py` — `FieldSpec` |
@@ -1307,6 +1442,7 @@ A plugin declaring one is rejected at load with `CapabilityError`.
 | the loader | `src/scms_sim_ref/mock_pipeline/run.py` — `default_check_refs`, `_assert_not_hijacked`, `_claim_column`, `build_checks` |
 | the contract | `src/scms_sim_ref/conformance/v1/detect.py` — `CheckContract`, D1–D8 |
 | **the trust-boundary tests** | `tests/test_detector_trust_boundary.py` — every claim in §2.1–§2.4, including the two escapes it admits to |
+| **the runtime-guard tests** | `tests/test_plugin_runtime_guard.py` — §2.4.1: the obfuscated walk refused inside a call, the swallowed refusal, the `gc` route, the import tripwire, the load-time walk that **still lands** (pinned as a limitation), the loading-phase RNG closure and its honest twin, and the watched-class mutation end to end |
 | **the integrity tests** | `tests/test_plugin_integrity.py` — §2.5–§2.7: the hostile constructor on all three slots, the import-time rebind, the attestation ORDER, the step-30 delayed rebind that conformance reports `ok` on, the rebind-then-restore only the stream witness catches, and the stateful `LinkOutcome` |
 | **the isolation tests** | `tests/test_detector_isolation.py` — §2.8: identical digests both ways, the payload asserted against `Observation`'s own field list and against the serialised bytes, the same hostile class run BOTH ways, the crash / hang / desync / non-JSON-state refusals, and the filesystem hole |
 | the functional tests | `tests/test_detector_plugins.py` — the zero-engine-edits claim and the digests |

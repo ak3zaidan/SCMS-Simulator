@@ -10,13 +10,16 @@ the engine's global RNG with the gate at its default ``"on"`` -- and reading the
 nothing, so the digests, the goldens, the lock and the integrity monitor are all structurally blind
 to it.
 
-This module closes the SPELLING half of that gap, and it closes it in C rather than in a parser.
+This module closes the SPELLING half of that gap **inside the calls the engine makes into a plugin**,
+and it closes it in C rather than in a parser. (It does NOT cover the plugin's module body or its
+``__init__``; that is the fourth named limit below, it is measured, and it is the sentence that
+decides the trust model. Read it before you form a view about what this module is worth.)
 CPython raises a PEP 578 audit event from inside ``sys._getframe`` itself, so the event fires
 whatever name the call was reached by -- ``sys._getframe``, ``getattr(sys, "_get"+"frame")``,
 ``eval("sys._getframe")``, an alias captured at import, a helper module the gate never parsed. A hook
 that RAISES makes the audited operation fail, so the frame object is never produced::
 
-    while a gated plugin's code is on the stack:
+    while a gated plugin's code is on the stack IN A CALL THE ENGINE GUARDED:
         sys._getframe / sys._current_frames        -> refused (no frame object is created)
         gc.get_objects / get_referrers / referents -> refused (the reflective route to the same dict)
         sys.settrace / sys.setprofile             -> refused (a hook that sees every engine frame)
@@ -46,9 +49,44 @@ and ``sys.modules`` is not audited at all. A plugin that reads
 stop it. What it gets there is module globals, not the run's per-message oracle -- but the honest
 statement is "the frames are closed", never "the engine is closed".
 
+THE LIMIT THAT MATTERS MOST, MEASURED
+-------------------------------------
+Read the claim above again and notice what it is scoped to: **while a guarded plugin CALL is on the
+stack.** The engine arms this guard around the calls it makes INTO a plugin -- `evaluate`, `decide`,
+`encode`, `wire_size_bytes`. It does not arm it around the plugin's **module-level code** (which
+`registry.resolve` runs when it imports the module) or around its **`__init__`**, and it cannot: an
+honest plugin's module body legitimately calls `collections.namedtuple`, `typing.NamedTuple` or
+`logging` above the enabled level, every one of which calls `sys._getframe`, so arming there would
+refuse honest code while still not closing anything (a metaclass, a `__set_name__`, a descriptor, a
+property the engine reads and `capabilities()` are all unguarded plugin entry points too, and
+enumerating them all is the thing this module says it cannot do).
+
+And ``f_back``/``f_locals`` are **not audited by CPython at all**. So one `sys._getframe(1)` in a
+module body -- performed where nothing is armed -- yields a frame object that stays a live handle on
+`run_pipeline`'s locals for the whole run, readable from inside `evaluate` with no audited operation
+whatever. Measured on this engine at the default `source_gate`::
+
+    # module scope of a third-party check -- runs during registry.resolve()'s import
+    _F = getattr(sys, "_get" + "frame"); _f = _F(1)
+    while _f: _FRAMES.append(_f); _f = getattr(_f, "f_" + "back")
+    # ... later, from evaluate():
+    b = _FRAMES[k].f_locals["b"]
+    b["veh"].is_attacker    -> True
+    b["x"], b["y"]          -> (466.4527993807002, 120.0)      the sender's TRUE position
+
+The run completed and wrote a dataset. **The frame walk to the oracle is NOT closed by this module,
+and no arrangement of this module can close it.** What IS closed, because it is arithmetic rather
+than reachability, is the *use* of the engine's global RNG obtained that way: see
+:class:`~scms_sim_ref.api.integrity.stream_closed`, which refuses every draw on that stream for the
+whole plugin-loading phase as well as for every guarded call.
+
+**In-process plugins are TRUSTED CODE, on the same footing as any installed dependency.** For a
+detector you have not reviewed, the answer is `plugins.check[].isolated: true`
+(:mod:`~scms_sim_ref.api.isolate`), where the oracle is not in the address space.
+
 WHAT THIS IS NOT
 ----------------
-**It is not a sandbox, and this module must never be described as one.** Three named limits:
+**It is not a sandbox, and this module must never be described as one.** Four named limits:
 
 1. **The guard's own state is an object in this interpreter.** A plugin that reaches
    ``sys.modules["scms_sim_ref.api.guard"]`` can set the depth cell to zero and walk freely. That
@@ -62,6 +100,10 @@ WHAT THIS IS NOT
    installed LAZILY -- the first time a run actually loads a gated in-process plugin -- and is inert
    (one list-index test) whenever nothing is armed. A run with no plugins never installs it and pays
    nothing, which is why the pinned no-plugin goldens are untouched by any of this.
+4. **It covers plugin CALLS, not plugin LOADING.** The section above measures what that costs: a
+   frame captured at import or construction time is a live handle for the whole run. This is the
+   limit that decides the trust model, and it is why "submissions cannot read the labels" is only
+   ever true of the isolated mode.
 
 WHAT IT COSTS A HONEST PLUGIN AUTHOR
 ------------------------------------
@@ -74,6 +116,13 @@ rather than a concession. The same goes for `collections.namedtuple`, `dataclass
 `logger.info()` under the default WARNING level never reach `findCaller` and are unaffected; log
 from `__init__`, or set `source_gate: "off"` for a plugin you wrote yourself. ~100 ns per guarded
 call is the other cost, measured, and it is paid only on the third-party path.
+
+`logging` in `__init__` keeps working, and keeping it working is why the loading-phase closure of the
+engine's RNG (:class:`~scms_sim_ref.api.integrity.stream_closed`) is a SEPARATE counter from
+`_DEPTH` rather than an extension of it: raising this module's depth over a plugin's constructor
+would arm the audit hook there and refuse `namedtuple`, `NamedTuple` and `findCaller` for every
+honest author. Closing the stream costs an honest author nothing at all -- a plugin's randomness is
+its `RngNamespace`, and it never sees the engine's global stream in the first place.
 
 The only boundary that PREVENTS rather than REFUSES is out-of-process isolation
 (:mod:`~scms_sim_ref.api.isolate`), where the oracle is not in the address space at all.

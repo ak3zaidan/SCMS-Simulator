@@ -4835,7 +4835,16 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                   f"{_geo_building_stats.get('median_offset_m')} m from the median junction, "
                   f"{_geo_building_stats.get('junctions_in_footprint_frac')} of junctions inside "
                   f"a footprint", flush=True)
-    chan, chan_provenance = build_channel(cfg, buildings=_geo_buildings, dt=cfg.dt)
+    # THE GLOBAL STREAM IS CLOSED FOR THE WHOLE PLUGIN-LOADING PHASE, and every `build_*` below is
+    # bracketed the same way. The engine draws nothing on `rng` between here and the reception loop,
+    # so a draw made inside one of these calls is a plugin's -- and a plugin CAN make one: `guard` is
+    # armed around plugin CALLS, not around a plugin's module body or its `__init__`, so a walk to
+    # this frame taken there is not refused and hands over `rng` itself. Measured: one such draw in a
+    # constructor moved the digest 2d73c3fb -> 319bb0bd with `verify_stream` still agreeing (it counts
+    # what it was ASKED for, not who asked) and nothing else seeing it. See
+    # `api/integrity.stream_closed`, which also states what this does NOT close: the READ.
+    with _integrity.stream_closed():
+        chan, chan_provenance = build_channel(cfg, buildings=_geo_buildings, dt=cfg.dt)
     # A construction-time write to `env["config"]` is fatal HERE, before step 0 -- which is where
     # every plugin failure belongs (PLUGIN-ARCH 3.2), and is early enough that no output directory
     # has been created.
@@ -4877,7 +4886,8 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     # the whole test of whether the seam is real. Each of profile, report format and security layer
     # is independently None by default, and the whole block costs one `if` per feature on the
     # default path.
-    _codec, codec_provenance = build_codec(cfg)
+    with _integrity.stream_closed():                  # see build_channel above
+        _codec, codec_provenance = build_codec(cfg)
     _assert_config_unmoved(_cfg0, cfg, "while constructing the message codec")
     if _codec is not None and _armed:
         _run_sentinel.verify("after LOADING the message codec")
@@ -4886,11 +4896,13 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     # which case not a single line below it executes and the default path is exactly what it was.
     # The codec built above is INJECTED; a third-party profile may return its own from `codec()`,
     # and everything downstream reads `_profile.codec()` rather than `_codec`.
-    _profile, profile_provenance = build_profile(cfg, _codec)
+    with _integrity.stream_closed():                  # see build_channel above
+        _profile, profile_provenance = build_profile(cfg, _codec)
     _assert_config_unmoved(_cfg0, cfg, "while constructing the protocol profile")
     if _profile is not None and _armed:
         _run_sentinel.verify("after LOADING the protocol profile")
-    _report_fmt, report_format_provenance = build_report_format(cfg)
+    with _integrity.stream_closed():                  # see build_channel above
+        _report_fmt, report_format_provenance = build_report_format(cfg)
     _assert_config_unmoved(_cfg0, cfg, "while constructing the report format")
     if _report_fmt is not None and _armed:
         _run_sentinel.verify("after LOADING the report format")
@@ -5912,7 +5924,13 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
     # HERE, before step 0, and must not take the SIGINT path that finalises a valid partial manifest.
     _LEGACY_RNG["rng"] = rng
     try:
-        suite = build_checks(cfg, station_types=_emit_station_type, denm=_denm_enabled)
+        # Closed for the same reason the four `build_*` calls above are, and it matters most here:
+        # `_LEGACY_RNG` is holding the global stream open for the BUILT-IN fusion at exactly the
+        # moment a third-party check's constructor is running. The built-in fusion only STORES the
+        # object in `__init__` and draws in `decide()` (in the loop, after this returns), so the
+        # closure costs it nothing. See `api/integrity.stream_closed`.
+        with _integrity.stream_closed():
+            suite = build_checks(cfg, station_types=_emit_station_type, denm=_denm_enabled)
     finally:
         _LEGACY_RNG["rng"] = None
     if _armed:
@@ -8252,7 +8270,17 @@ def _cli_verify_plugins(argv) -> int:
     whole value: identity drift with no digest drift is a harmless refactor; NO identity drift with
     digest drift means the plugin is nondeterministic or the interpreter changed.
 
-    Exit codes: 0 clean, 2 drift (or an unresolvable plugin), 1 for a bad/unreadable manifest.
+    Exit codes: 0 clean, 2 drift / an unresolvable plugin / an INTEGRITY REFUSAL, 1 for a
+    bad/unreadable manifest.
+
+    **The integrity row is a separate exit path and it has to be.** Re-resolving imports, and
+    importing runs the plugin's module-level code -- `registry.resolve` brackets that with a
+    `Sentinel` precisely because one line at module scope (`random.Random = Impostor`) is an earlier
+    hook than anything else in the seam. Until this handler existed the resulting `IntegrityError`
+    escaped as an unhandled traceback at exit 1, which is this command's code for "the manifest file
+    was unreadable" -- so a CI gate keyed on the exit code filed a refused, actively hostile plugin
+    under "bad JSON", and the operator got a stack trace instead of the sentinel's message. It is
+    reported here, by name, at the same exit code as drift.
     """
     import argparse
     import sys as _sys
@@ -8286,9 +8314,18 @@ def _cli_verify_plugins(argv) -> int:
               "provenance_digest": lock.get("provenance_digest"),
               "provenance_digest_recomputed": recomputed,
               "provenance_digest_ok": recomputed == lock.get("provenance_digest"),
-              "runtime": man.get("runtime", {}), "drifts": []}
+              "runtime": man.get("runtime", {}), "drifts": [], "integrity_failure": None}
     try:
         result["drifts"] = list(_api_registry.verify_lock(lock, allow_drift=a.allow_drift))
+    except _integrity.IntegrityError as e:
+        # NOT drift, and never downgraded by `--allow-drift`: drift means "the files changed,
+        # proceed and record it", and proceeding with a rebound `random.Random` is the one thing
+        # that must never happen. `verify_lock` re-raises it for the same reason.
+        result["integrity_failure"] = str(e)
+        _emit_verify(result, a.json)
+        print(f"PLUGIN INTEGRITY REFUSAL: verifying this lock IMPORTED a plugin whose module-level "
+              f"code rebound an engine object.\n{e}", file=_sys.stderr)
+        return 2
     except PluginDriftError as e:
         result["drifts"] = [str(e)]
         _emit_verify(result, a.json)
@@ -8317,9 +8354,12 @@ def _emit_verify(result, as_json: bool) -> None:
     if rt:
         print(f"  runtime              {rt.get('python_version')} {rt.get('platform')} "
               f"hash_randomization={rt.get('hash_randomization')}")
+    if result.get("integrity_failure"):
+        print("  INTEGRITY            REFUSED (see stderr) -- the lock could not be verified "
+              "because importing a plugin to verify it tampered with this interpreter")
     for d in result["drifts"]:
         print(f"  DRIFT                {d}")
-    if not result["drifts"]:
+    if not result["drifts"] and not result.get("integrity_failure"):
         print("  no drift")
 
 

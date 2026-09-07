@@ -22,6 +22,7 @@ demonstration that lives inside the repository proves nothing about forking.
 """
 from __future__ import annotations
 
+import importlib
 import json
 import random
 import sys
@@ -804,6 +805,77 @@ def test_verify_plugins_cli_round_trips_a_real_manifest(tmp_path, capsys):
     tampered.write_text(json.dumps(doc), encoding="utf-8")
     assert RM.main(["verify-plugins", str(tampered)]) == 2
     assert "provenance_digest does not match" in capsys.readouterr().err
+
+
+_CLI_MODULE_LEVEL_TAMPER = '''\
+"""One line at module scope. `verify-plugins` RE-RESOLVES every locked entry, and resolving imports
+-- so this runs inside the CI gate that is supposed to be judging it."""
+import random
+
+from scms_sim_ref.api.channel import DELIVERED, INTERFACE_VERSION
+
+
+class Impostor(random.Random):
+    pass
+
+
+random.Random = Impostor
+
+
+class Model:
+    interface_version = INTERFACE_VERSION
+    plugin_id = "clitamper"
+
+    def __init__(self, *, params, rng, env):
+        self.reach_m = float(env["radio_range_m"])
+
+    def capabilities(self):
+        return frozenset({"reach"})
+
+    def begin_step(self, frame):
+        pass
+
+    def evaluate(self, tx, rx, d_m, txn):
+        return DELIVERED if d_m <= self.reach_m else None
+'''
+
+
+def test_verify_plugins_reports_an_INTEGRITY_refusal_as_a_refusal_not_as_a_crash(
+        tmp_path, capsys, monkeypatch):
+    """The CI gate's exit codes have to MEAN something.
+
+    `registry.resolve` brackets its own import with a `Sentinel`, so a plugin whose module-level code
+    rebinds `random.Random` is caught while `verify-plugins` is re-resolving it -- correctly. But the
+    resulting `IntegrityError` escaped this command as an unhandled traceback at exit 1, and 1 is
+    this command's code for "the manifest file was unreadable". A gate keyed on the exit code
+    therefore filed an actively hostile plugin under "bad JSON", and the operator got a stack trace
+    instead of the sentinel's message. Measured against HEAD before this handler existed.
+    """
+    (tmp_path / "cli_tamper.py").write_text(_CLI_MODULE_LEVEL_TAMPER, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    sys.modules.pop("cli_tamper", None)
+    original = random.Random
+    lock = {"plugins": {"api_version": "1.0", "provenance_digest": "x", "loaded": [
+        {"slot": "channel_model", "order": 0, "ref": "cli_tamper:Model",
+         "resolved_via": "dotted_path", "module_sha256": "0" * 64,
+         "interface_version": "ChannelModel/1.0", "params": {}}]}}
+    man = tmp_path / "tamper_manifest.json"
+    man.write_text(json.dumps(lock), encoding="utf-8")
+    try:
+        assert RM.main(["verify-plugins", str(man)]) == 2      # not 1, and not a traceback
+        err = capsys.readouterr().err
+        assert "PLUGIN INTEGRITY REFUSAL" in err
+        assert "random.Random" in err
+        # ...and `--allow-drift` does NOT downgrade it: "the files changed, proceed" must never mean
+        # "proceed with a rebound random.Random".
+        sys.modules.pop("cli_tamper", None)
+        random.Random = original
+        assert RM.main(["verify-plugins", str(man), "--allow-drift"]) == 2
+        assert "PLUGIN INTEGRITY REFUSAL" in capsys.readouterr().err
+    finally:
+        random.Random = original
+        sys.modules.pop("cli_tamper", None)
 
 
 _SIBLING_PKG_PHYSICS = """\

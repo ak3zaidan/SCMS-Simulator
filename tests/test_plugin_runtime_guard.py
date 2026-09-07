@@ -41,6 +41,7 @@ never installs the hook and reproduces the pinned golden byte-for-byte.
 """
 
 import importlib
+import pathlib
 import random
 import sys
 
@@ -169,8 +170,147 @@ class Honest(CheckBase):
         return min(2.0, abs(obs.claimed_x - obs.ref_x) / 500.0)
 '''
 
+_LOAD_TIME_WALK = '''\
+"""THE SPELLING THAT STILL LANDS, and it is pinned here so nobody can claim otherwise.
+
+The capture happens in the MODULE BODY -- code `registry.resolve` executes when it imports the
+plugin, and which no guard is armed for. `f_back` and `f_locals` raise no audit event at all, so the
+captured frames stay live handles on the engine's own locals for the rest of the run.
+"""
+import sys
+
+from scms_sim_ref.api.detect import INTERFACE_VERSION, CheckBase
+
+_F = getattr(sys, "_get" + "frame")
+
+FRAMES = []
+_f = _F(1)
+while _f is not None:
+    FRAMES.append(_f)
+    _f = getattr(_f, "f_" + "back")
+
+SEEN = {}
+
+
+class LoadTimeWalker(CheckBase):
+    interface_version = INTERFACE_VERSION
+    plugin_id = "loadwalk"
+    reason_code = "loadwalk"
+
+    def evaluate(self, obs, state, params, rng):
+        if not SEEN:
+            for f in FRAMES:
+                b = getattr(f, "f_" + "locals").get("b")
+                if isinstance(b, dict) and "veh" in b:
+                    SEEN["frame"] = f.f_code.co_name
+                    SEEN["is_attacker"] = bool(b["veh"].is_attacker)
+                    SEEN["true_xy"] = (b.get("x"), b.get("y"))
+                    break
+        return 0.0
+'''
+
+_LOAD_TIME_DRAW = '''\
+"""The same unguarded capture, used for the half that CAN be closed: a draw on the engine's global
+stream made from `__init__`, with the refusal swallowed by `except Exception`."""
+import sys
+
+from scms_sim_ref.api.detect import INTERFACE_VERSION, CheckBase
+
+_F = getattr(sys, "_get" + "frame")
+
+
+class LoadTimeDrawer(CheckBase):
+    interface_version = INTERFACE_VERSION
+    plugin_id = "loaddraw"
+    reason_code = "loaddraw"
+
+    def __init__(self, *, params=None, rng=None, env=None):
+        super().__init__(params=params, rng=rng, env=env)
+        self.reached = False
+        f = _F(1)
+        while f is not None:
+            r = getattr(f, "f_" + "locals").get("rng")
+            if r is not None and type(r).__name__ == "WitnessedRandom":
+                self.reached = True
+                try:
+                    r.random()
+                except Exception:                    # IntegrityError is a ConfigError is an Exception
+                    pass
+                break
+            f = getattr(f, "f_" + "back")
+
+    def evaluate(self, obs, state, params, rng):
+        return 0.0
+'''
+
+_LOAD_TIME_TWIN = '''\
+"""The honest TWIN of `grd_loaddraw`: same plugin_id, same reason_code, same column, same
+`evaluate`. It reaches the engine's stream and does not draw from it, so its digest is the control
+the drawing form has to be compared against."""
+import sys
+
+from scms_sim_ref.api.detect import INTERFACE_VERSION, CheckBase
+
+_F = getattr(sys, "_get" + "frame")
+
+
+class LoadTimeTwin(CheckBase):
+    interface_version = INTERFACE_VERSION
+    plugin_id = "loaddraw"
+    reason_code = "loaddraw"
+
+    def __init__(self, *, params=None, rng=None, env=None):
+        super().__init__(params=params, rng=rng, env=env)
+        self.reached = False
+        f = _F(1)
+        while f is not None:
+            r = getattr(f, "f_" + "locals").get("rng")
+            if r is not None and type(r).__name__ == "WitnessedRandom":
+                self.reached = True
+                break
+            f = getattr(f, "f_" + "back")
+
+    def evaluate(self, obs, state, params, rng):
+        return 0.0
+'''
+
+_WATCHED_CLASS_MUTATOR = '''\
+"""Neutralise the stream self-check by rebinding the methods OF a watched class rather than replacing
+the class -- the class OBJECT never moves, which is what the module watch compares. `sys.modules` is
+assembled at run time so the static gate's name list cannot see it, and `sys.modules` raises no audit
+event, so the runtime guard cannot either."""
+import random
+import sys
+
+from scms_sim_ref.api.detect import INTERFACE_VERSION, CheckBase
+
+_MODS = getattr(sys, "mod" + "ules")
+
+
+class WatchedClassMutator(CheckBase):
+    interface_version = INTERFACE_VERSION
+    plugin_id = "clsmut"
+    reason_code = "clsmut"
+
+    def __init__(self, *, params=None, rng=None, env=None):
+        super().__init__(params=params, rng=rng, env=env)
+        self.armed = False
+
+    def evaluate(self, obs, state, params, rng):
+        if not self.armed and obs.t >= 20.0:
+            self.armed = True
+            integ = _MODS.get("scms_sim_ref.api.integrity")
+            if integ is not None:
+                integ.WitnessedRandom.verify_stream = lambda s, when: {"words": s._words}
+                integ.WitnessedRandom.random = random.Random.random
+                random.Random.random = lambda s: 0.5
+        return 0.0
+'''
+
 _MODULES = {"grd_obf": _OBFUSCATED_WALK, "grd_swallow": _SWALLOWING_WALK, "grd_gc": _GC_WALK,
-            "grd_rtimport": _RUNTIME_IMPORT, "grd_honest": _HONEST}
+            "grd_rtimport": _RUNTIME_IMPORT, "grd_honest": _HONEST,
+            "grd_loadwalk": _LOAD_TIME_WALK, "grd_loaddraw": _LOAD_TIME_DRAW,
+            "grd_loadtwin": _LOAD_TIME_TWIN, "grd_clsmut": _WATCHED_CLASS_MUTATOR}
 
 
 @pytest.fixture(scope="module")
@@ -323,6 +463,7 @@ def test_the_global_stream_refuses_to_be_drawn_from_inside_a_guarded_call():
     r = INTEG.WitnessedRandom(7)
     before = r.random()                              # the engine's own draws are unaffected
     assert 0.0 <= before < 1.0
+    state_before = r.getstate()
     with pytest.raises(INTEG.IntegrityError) as e:
         with GUARD.arm():
             r.random()
@@ -331,9 +472,18 @@ def test_the_global_stream_refuses_to_be_drawn_from_inside_a_guarded_call():
     with pytest.raises(INTEG.IntegrityError):
         with GUARD.arm():
             r.getrandbits(32)
-    # ...and the refusal did not advance the stream, so the engine's own accounting still holds
-    r.verify_stream("after the refused draws")
-    assert r.words == 2
+    # The refusal did not advance the stream, and it did not move the counter either -- so the
+    # engine's own accounting is untouched by an attempt.
+    assert r.getstate() == state_before and r.words == 2
+    # ...but the ATTEMPT is not forgotten. `IntegrityError` is a `ConfigError` and therefore an
+    # `Exception`, so a plugin's `except Exception:` swallows the refusal and returns a plausible
+    # score; the COUNT is what makes that pointless, exactly as `guard`'s violation counter does for
+    # a swallowed `GuardError`. Measured before this counter existed: a constructor that drew,
+    # caught the refusal and returned normally produced a complete run and a written manifest.
+    with pytest.raises(INTEG.IntegrityError) as e2:
+        r.verify_stream("after the refused draws")
+    assert "were REFUSED during this run" in str(e2.value)
+    assert "2 draw(s)" in str(e2.value)
 
 
 def test_the_word_counter_still_catches_the_classic_random_rebind():
@@ -610,3 +760,166 @@ def test_the_refusal_never_reads_as_a_score(tp, tmp_path):
         with pytest.raises(ConfigError):
             _run(tmp_path, name, ref)
         assert not (tmp_path / name / "manifest.json").exists()
+
+
+# ================================================== 6. the window the guard does NOT cover ======= #
+#
+# Everything above measures what the guard closes. This section measures what it does not, because a
+# limitation nobody exercises is a limitation nobody notices has been overclaimed -- and the
+# overclaim was in this repository: `integrity.WitnessedRandom`'s docstring said the frame walk that
+# reaches the engine's stream "is refused at run time by guard, however it is spelled". It is not.
+# The guard is armed around plugin CALLS; a plugin's module body and its `__init__` are not calls.
+def test_the_frame_walk_STILL_LANDS_when_it_is_taken_while_the_plugin_is_LOADED(tp, tmp_path):
+    """PINNED AS A LIMITATION, not as a fix. This test PASSES BY THE ATTACK SUCCEEDING.
+
+    `registry.resolve` imports the plugin's module, and the guard is not armed for that import (it
+    cannot be: an honest module body calls `collections.namedtuple` / `typing.NamedTuple` /
+    `logging`, all of which call `sys._getframe`). CPython audits `sys._getframe` and audits NOTHING
+    for `frame.f_back` or `frame.f_locals`, so one capture performed where nothing is listening is a
+    live handle on `run_pipeline`'s locals for the rest of the run.
+
+    Measured here end to end, at the DEFAULT `source_gate`: the plugin reads `b["veh"].is_attacker`
+    -- the label it is being asked to predict -- and the sender's TRUE position, and the run
+    completes and writes a dataset.
+
+    If this test ever starts FAILING, something closed the frame walk and the honest-limitation
+    paragraphs in `api/guard.py`, `api/srcgate.py`, `api/integrity.py` and
+    `docs/realism/DETECTOR-PLUGIN.md` are now understating the engine -- update them deliberately.
+    Until then, in-process plugins are TRUSTED CODE and the only boundary that PREVENTS is
+    `plugins.check[].isolated: true`.
+    """
+    res = _run(tmp_path, "loadwalk", "grd_loadwalk:LoadTimeWalker")
+    assert (tmp_path / "loadwalk" / "manifest.json").exists()
+    assert res.n_reports >= 0
+    seen = sys.modules["grd_loadwalk"].SEEN
+    assert seen, "the capture at module scope no longer reaches the engine's frames"
+    assert seen["frame"] == "run_pipeline"
+    assert isinstance(seen["is_attacker"], bool)          # the LABEL, read directly
+    assert all(isinstance(v, float) for v in seen["true_xy"])   # the sender's TRUE position
+
+
+def test_the_documentation_of_that_limit_travels_with_the_code():
+    """The three modules a reader reaches for must all say the same thing, in their own docstrings,
+    because a limitation recorded only in a markdown file is a limitation that gets lost."""
+    assert "It covers plugin CALLS, not plugin LOADING" in GUARD.__doc__
+    assert "In-process plugins are TRUSTED CODE" in GUARD.__doc__
+    assert "isolated" in GUARD.__doc__
+    assert "TRUSTED CODE" in SG.__doc__
+    assert "not around the plugin's module-level code or its" in SG.__doc__
+    assert "In-process plugins are trusted code." in INTEG.__doc__
+    assert "THE READ IS NOT CLOSED" in INTEG.WitnessedRandom.__doc__
+
+
+def test_the_two_guides_say_it_too_and_do_not_overclaim():
+    """PINNED SO THE PROSE CANNOT DRIFT AWAY FROM THE CODE.
+
+    A limitation that lives only in a docstring is a limitation a benchmark operator never reads. It
+    has to be in the guide they DO read, and the guide must not contain the sentence the code no
+    longer supports.
+    """
+    def flat(p):
+        # markdown is hard-wrapped and uses ** for emphasis; the CLAIM is what is being pinned, not
+        # the line breaks, so both are normalised away before matching.
+        return " ".join(p.read_text(encoding="utf-8").replace("*", "").split())
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "docs" / "realism"
+    docs = {"DETECTOR-PLUGIN.md": flat(root / "DETECTOR-PLUGIN.md"),
+            "PLUGIN-ARCHITECTURE.md": flat(root / "PLUGIN-ARCHITECTURE.md")}
+    for name, doc in docs.items():
+        assert "TRUSTED CODE" in doc or "TRUSTED code" in doc, name
+        assert "isolated" in doc, name
+        # the window, named in the guide a reader actually reaches for
+        assert "CALLS, not plugin LOADING" in doc, name
+        # ...and the measurement that makes it a fact rather than an opinion, so a future editor
+        # who deletes the evidence has to delete an assertion too
+        assert "466.4527993807002" in doc, name
+        # ...and it must point at the boundary that actually PREVENTS rather than leaving the reader
+        # to conclude the guard is one.
+        assert "isolated" in doc and "not closable" in doc, name
+
+
+def test_a_draw_on_the_global_stream_during_LOADING_is_refused_and_swallowing_it_is_fatal(
+        tp, tmp_path):
+    """ATTACK 2, closed at the third point -- the one the guard cannot reach.
+
+    The READ above cannot be closed. The USE of what it reaches can be, because it is arithmetic and
+    not reachability: the engine makes no draw on its own global stream while it is handing control
+    to a plugin's loader or constructor, so a draw made there is a plugin's by construction.
+
+    Measured before this closure: this exact plugin drew once from `run_pipeline`'s `rng` in its
+    `__init__`, caught the refusal it did not get, and produced a complete run whose digest was
+    `319bb0bd` against the honest twin's `192286db` -- with `verify_stream` agreeing, no watched
+    identity moved, and a manifest written.
+    """
+    with pytest.raises(INTEG.IntegrityError) as e:
+        _run(tmp_path, "loaddraw", "grd_loaddraw:LoadTimeDrawer")
+    msg = str(e.value)
+    assert "SWALLOWED the refusal" in msg                 # catching it buys nothing
+    assert "RngNamespace" in msg                          # and it says what to use instead
+    assert not (tmp_path / "loaddraw" / "manifest.json").exists()
+
+
+def test_the_honest_twin_of_that_plugin_is_unaffected(tp, tmp_path):
+    """THE OTHER HALF OF THE GATE. The closure must cost nothing to a plugin that does not draw --
+    same plugin_id, same reason_code, same column, same `evaluate`, and it still reaches the stream.
+    Without this, "the digest moved" above could be measuring the column rather than the draw."""
+    res = _run(tmp_path, "loadtwin", "grd_loadtwin:LoadTimeTwin")
+    assert (tmp_path / "loadtwin" / "manifest.json").exists()
+    assert res.data_digest and res.n_reports >= 0
+    assert INTEG.stream_refusals() >= 0                   # nothing was refused for the honest form
+
+
+def test_the_stream_closure_does_not_arm_the_audit_hook():
+    """WHY IT IS A SEPARATE COUNTER FROM `guard._DEPTH`, pinned.
+
+    Raising the guard's depth here would arm the PEP 578 hook and refuse `namedtuple`, `NamedTuple`
+    and `logging` -- exactly the things an honest author does at module scope and in `__init__`, and
+    exactly what `api/guard.py` tells them to do instead of logging inside `evaluate`. Closing the
+    STREAM costs them nothing.
+    """
+    import collections
+    with INTEG.stream_closed():
+        assert INTEG.stream_is_closed() and GUARD.depth() == 0
+        assert collections.namedtuple("_Probe", "a")(1).a == 1     # uses sys._getframe internally
+        assert sys._getframe(0) is not None
+    assert not INTEG.stream_is_closed()
+
+
+def test_the_closure_is_reentrant_and_releases_on_an_exception():
+    """The in-process multi-run drivers do thousands of runs in one interpreter; a leaked depth would
+    make every later run refuse the engine's own draws."""
+    before = INTEG.stream_is_closed()
+    with pytest.raises(ValueError):
+        with INTEG.stream_closed():
+            with INTEG.stream_closed():
+                raise ValueError("boom")
+    assert INTEG.stream_is_closed() == before
+
+
+def test_the_closure_mechanism_is_itself_watched():
+    """A plugin that reached `sys.modules["scms_sim_ref.api.integrity"]` and replaced
+    `stream_closed` with a no-op would reopen the stream. Replacing it is drift."""
+    watched = {(m, a) for m, attrs in INTEG.MODULE_WATCH for a in attrs}
+    for attr in ("stream_closed", "stream_refusals", "engine_random"):
+        assert ("scms_sim_ref.api.integrity", attr) in watched
+
+
+# ================================================== 7. the class watch, end to end =============== #
+def test_a_watched_class_method_mutation_is_fatal_END_TO_END(tp, tmp_path):
+    """ATTACK 7 as an attacker actually spells it, through a whole run.
+
+    `test_a_method_rebound_on_a_watched_class_is_drift` exercises the `Sentinel` directly. This one
+    goes through the engine: a `check` that reaches `sys.modules` -- assembled at run time, so the
+    static gate's name list cannot see it, and unaudited, so the runtime guard cannot either --
+    replaces `WitnessedRandom.verify_stream` with a no-op and `WitnessedRandom.random` with one that
+    does not count, then rebinds `random.Random.random`. Every module-attribute identity still
+    compares equal, because the class OBJECT never moved.
+    """
+    with pytest.raises(INTEG.IntegrityError) as e:
+        _run(tmp_path, "clsmut", "grd_clsmut:WatchedClassMutator")
+    msg = str(e.value)
+    assert "WitnessedRandom.verify_stream" in msg
+    assert "WATCHED CLASS" in msg
+    assert not (tmp_path / "clsmut" / "manifest.json").exists()
+    # ...and the interpreter is usable afterwards, which is what `verify()`'s restore is for
+    assert INTEG.Sentinel(armed=True).drift() == []

@@ -41,16 +41,25 @@ must actually be prevented needs the out-of-process detector mode (a separate pr
 message boundary, the oracle simply not present in the address space) -- phase 4, and the only
 honest answer for genuinely untrusted code.
 
-**The SPELLING half of that gap is now closed at run time, elsewhere.**
+**The SPELLING half of that gap is closed at run time INSIDE A GUARDED CALL, and nowhere else.**
 :mod:`~scms_sim_ref.api.guard` refuses `sys._getframe`, `sys._current_frames`, the `gc` object
 walkers, trace/profile installation and `ctypes` from inside CPython -- a PEP 578 audit hook fires
 in the C function itself, so `getattr(sys, "_get" + "frame")` reaches the same refusal as
-`sys._getframe`, and so does a helper module this gate never parsed. That does not make this module
-redundant and it does not make either of them a sandbox: this one turns the accident into a NAMED
-error at load time with a line number, the guard turns the deliberate act into a refusal at call
-time, and `guard.py`'s own docstring lists the three things it still cannot do. The two share one
-switch: `source_gate: "off"` turns off this gate AND the runtime guard for that plugin, which is
-what makes "code I wrote or audited" a single, recorded decision instead of two.
+`sys._getframe`, and so does a helper module this gate never parsed. **But the guard is armed around
+the calls the engine makes INTO a plugin, not around the plugin's module-level code or its
+`__init__`** -- and `frame.f_back` / `frame.f_locals` are audited by nothing, so a frame captured at
+import or construction time is a live handle on the reception loop's locals for the rest of the run.
+Measured, at this gate's default `"on"`: a module body that captured `sys._getframe(1)` read
+`b["veh"].is_attacker` and the sender's true position from inside `evaluate`, and the run completed.
+
+So: neither module is a sandbox and neither closes the reach. This one turns the accident into a
+NAMED error at load time with a line number; the guard turns the deliberate act into a refusal for
+the window it covers, and `guard.py`'s own docstring lists the four things it cannot do. The two
+share one switch: `source_gate: "off"` turns off this gate AND the runtime guard for that plugin,
+which is what makes "code I wrote or audited" a single, recorded decision instead of two.
+**In-process plugins are TRUSTED CODE.** For a detector you have not reviewed, the only boundary
+that PREVENTS rather than refuses is `plugins.check[].isolated: true`
+(:mod:`~scms_sim_ref.api.isolate`).
 
 Scope, stated so nobody over-reads a PASS: **the gate parses the single module the plugin class is
 DEFINED IN.** A helper module that class imports is not parsed, and neither is anything reached at

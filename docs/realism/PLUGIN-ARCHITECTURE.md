@@ -1583,3 +1583,58 @@ hooks fire only in the current interpreter, so a subprocess escapes entirely.
 **Real isolation requires leaving the process**, and on this host (Windows, WSL disabled) only
 subprocess isolation is viable — which is affordable **only** because §2.3 already batches the
 interface per step. That is tier 2, for genuinely untrusted code. Build tier 1 now.
+
+### 10.1 What tier 1 turned out to be, measured (2026-09-06)
+
+Tier 1 shipped as four layers — `Observation`'s field list, `api/srcgate.py` (a load-time AST name
+match), `api/guard.py` (a PEP 578 audit hook armed around plugin calls) and `api/integrity.py` (a
+whole-run identity snapshot plus a word-counting engine RNG). An independent adversary re-ran the
+whole catalogue of attacks against them with plugin code written outside this repository. The result
+is worth stating precisely, because the interesting part is the line between the two halves.
+
+**Closed, each re-measured with a digest move against an honest control, each with a regression test
+that fails when the fix is reverted:**
+
+| # | attack | what closes it |
+|---|---|---|
+| 4 | module-level tamper (`random.Random = Impostor`) run by `verify-plugins`, `--check-config` and the `config_from_dict` replay, *before* `run_pipeline` took its baseline | `registry.resolve` brackets its **own** import with a `Sentinel`, so the tamper is fatal at the import that performed it and can never poison a later snapshot. `verify-plugins` reports it as an integrity **refusal** at exit 2, not as a traceback at exit 1 |
+| 5 | attestation verdict forgery — a plugin that genuinely fails conformance (`ok=False`, 3 failed) rewriting the child's report from `atexit` to `passed: 99, ok: true` | there is no report file; the child writes to a pipe, behind a 128-bit token the parent generated, and `os._exit`s so `atexit` never runs |
+| 6 | cross-package sibling drift — editing a **different** top-level package the plugin imports, which moved the digest while `module_sha256` **and** `package_sha256` were unmoved and `verify-plugins` said "no drift", exit 0 | `registry.import_closure` hashes the plugin's whole static import closure outside the stdlib and this engine; the row is enforced by `verify_lock` |
+| 7 | mutating the methods **of** a watched class (`WitnessedRandom.verify_stream`, `.random`), which leaves the class *object*'s identity — the thing the module watch compares — intact | `Sentinel` compares `vars(cls)` whole for every watched class |
+| 9 | isolated-mode lock decoy — the plugin points `__file__` at a decoy and the lock records the decoy's hash (`6d85ce01`) instead of the real code (`90272b8b`) | the **parent** resolves the dotted ref on `sys.path` itself (executing nothing) and refuses a worker whose reported path is not the one it resolves; `path_source` records which case applies |
+| 10 | a lying codec — a wire size unrelated to the PDU it encoded, and a PDU that does not decode, feeding airtime → CBR → latency → `detection_time` → `data_digest` and writing fabricated stats to the manifest | `WireEncoder._check_wire`: shape, envelope consistency for a codec that declares `wire_size`, and a deterministic round-trip of the codec's own PDU |
+
+**NOT closed, and not closable in this process — the frame walk.** `api/guard.py` refuses
+`sys._getframe` from inside CPython however it is spelled, but **it covers plugin CALLS, not plugin
+LOADING**: it is armed around the calls the engine makes **into** a plugin, and a plugin's module
+body and its `__init__` are not calls. `frame.f_back` / `frame.f_locals` raise no audit event at all,
+so one capture taken during `registry.resolve`'s import is a live handle on `run_pipeline`'s locals
+for the whole run. Measured against HEAD at the **default** `source_gate`, with a third-party check:
+`b["veh"].is_attacker` → `True`, `b["x"], b["y"]` → `(466.4527993807002, 120.0)`, run completed,
+dataset written.
+
+Arming the hook over a plugin's module body would refuse `collections.namedtuple`,
+`typing.NamedTuple` and `logging` — the things honest authors do there — and would still leave
+metaclasses, `__set_name__`, descriptors and properties open. So:
+
+> **In-process plugins are TRUSTED CODE, on the same footing as any installed dependency.** The
+> source gate turns the accident into a named error; the runtime guard turns a deliberate reach
+> *inside a plugin call* into a refusal. Neither closes the reach, and no arrangement of them can.
+> **A detector you have not reviewed must run out of process** (`plugins.check[].isolated: true`,
+> `api/isolate.py`), where the oracle is neither in the address space nor on the disk while the
+> worker is alive.
+
+This is pinned by a test that **passes by the attack succeeding**
+(`tests/test_plugin_runtime_guard.py::test_the_frame_walk_STILL_LANDS_when_it_is_taken_while_the_plugin_is_LOADED`),
+so the limitation cannot quietly turn into a claim. Two containment claims have already been
+withdrawn in this project; a documented limitation is fine, a false claim is not.
+
+**The half of that gap that *is* arithmetic is closed.** The same walk reaches `run_pipeline`'s
+global `random.Random`, whose draw count and order are load-bearing for every pinned digest. Reading
+it is a read; drawing from it is an act, so the stream now refuses every draw both inside a guarded
+call and for the **whole plugin-loading phase** (`integrity.stream_closed`) — module import,
+`__init__`, `capabilities()`, every attribute read. The engine makes no global-stream draw in either
+window, so the closure is exact. Measured before it: one draw in a constructor produced a clean
+complete run at digest `319bb0bd` against an honest twin's `192286db`, with `verify_stream` agreeing
+and nothing on the watch list moved. The refusal is counted as well as raised, so catching it and
+returning normally still fails the run before any manifest exists.
