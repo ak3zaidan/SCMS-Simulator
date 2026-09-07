@@ -939,11 +939,14 @@ below is measured on this host with `tools/day_run.py`.*
    midnight than at 09:00, and its revocation precision is 0.667 after two minutes at midnight
    against 0.219 after two minutes at the peak. "The whole city is the cheap option" is true of the
    night and of nothing else.
-2. **A full 86,400 s day is not runnable as one process on this host, and the binding constraint is
-   not CPU.** The frozen trajectory costs a measured **185–220 heap bytes per vehicle-step**, and the
-   geometric channel's per-link state **grows for the whole run with no plateau observed** —
-   +6.68 MB per simulated second at 1,807 concurrent, +21.5 MB/s at 2,340. Chunking is the answer and
-   it costs something real: SCMS state does not cross a chunk boundary.
+2. **A full 86,400 s day is not runnable as one process on this host — and SUMO alone does not get
+   through it either.** A continuous `sumo` run of InTAS's own day, at its own 0.1 s step, with no
+   engine involved, **aborted at 07:22** (`Request lateral offset of vehicle ... for invalid lane`,
+   exit 1) after 99 minutes of wall clock. On the engine side the frozen trajectory costs a measured
+   **185–220 heap bytes per vehicle-step** (a day is 30–37 GB resident), and the geometric channel's
+   per-link state **grows for the whole run with no plateau observed** — +6.68 MB per simulated
+   second at 1,807 concurrent, +21.5 MB/s at 2,340. Chunking answers all three, and it costs
+   something real: SCMS state does not cross a chunk boundary.
 3. **The misbehaviour authority's trusted-reporter gate is a LIFETIME cap, not a rate limit, and it
    saturates.** `run.trusted()` requires `filed_by[cert] <= report_budget` (30) where `filed_by` is
    cumulative for the certificate's life and never decays. On the committed InTAS peak hour,
@@ -1015,19 +1018,21 @@ halting share are SUMO's own, over the recorded window only.
 
 The last column is a **separate single continuous run of the whole day** — one `sumo` process from
 t = 0 at the scenario's own 0.1 s step, summary every 10 s — and it is the reference the windowed
-freezes are checked against in §10.2. It had reached 07:08 when this was written, where it measures
-a peak of **4,061 concurrent vehicles**, and its own phase aggregates are:
+freezes are checked against in §10.2. **It did not finish. It aborted at 07:22** (§12.6), after
+5,931.7 s of wall clock, having reached a peak of **4,256 concurrent vehicles**. Its phase
+aggregates, over the part it did cover:
 
 | phase | clock | concurrent mean | max | network mean speed | halting share |
 |---|---|---:|---:|---:|---:|
 | night | 00:00–05:00 | 304 | 1,274 | 10.21 m/s | 0.198 |
 | AM ramp | 05:00–07:00 | 2,521 | 3,885 | 7.60 m/s | 0.330 |
-| AM peak | 07:00–07:08 | **3,984** | **4,061** | **5.59 m/s** | **0.426** |
+| AM peak | 07:00–07:22 | **4,089** | **4,256** | **5.45 m/s** | **0.438** |
 
-**Concurrency spans 20× across the measured part of the day (197.8 → 4,061), network mean speed
-falls 58% (13.28 → 5.59 m/s) and the halting share rises 3.6× (0.119 → 0.426).** There is no single
+**Concurrency spans 21.5× across the measured part of the day (197.8 → 4,256), network mean speed
+falls 59% (13.28 → 5.45 m/s) and the halting share rises 3.7× (0.119 → 0.438).** There is no single
 number for "how many vehicles the InTAS scenario has", and a 300 s sample of one phase is not the
-city — it is one of at least three qualitatively different traffic states.
+city — it is one of at least three qualitatively different traffic states. And the day is only 7 h 22
+old when SUMO gives up on it.
 
 ### 10.2 The 900 s warmup is enough at night and is NOT enough at the peak
 
@@ -1064,7 +1069,7 @@ by its clock time, and all of them are **lower bounds** on their clock time's tr
 
 **Consequence, and it is a constraint on this document.** Every high-concurrency arm below is
 labelled by its **measured** concurrency, never by its clock time, and the concurrencies reached
-(2,340 max) are **lower bounds on the true peak** (3,552). The cost at the true peak is therefore
+(2,340 max) are **lower bounds on the true peak** (3,919 at 07:00, 4,256 across the AM peak). The cost at the true peak is therefore
 read off the fitted curve in §11 and labelled as such.
 
 ### 10.3 The radio is a different radio at 09:00 than at 00:00
@@ -1140,8 +1145,8 @@ ray-cast against the footprint raster.
 The whole day's cost is **not measured here.** This is a projection and its basis is stated so it can
 be checked or replaced:
 
-1. **Concurrency, second by second**, taken from the continuous full-day SUMO probe wherever it has
-   reached (measured, 10 s samples, t ≤ 25,680 s) and beyond that from the §10.1 window probes
+1. **Concurrency, second by second**, taken from the continuous full-day SUMO probe for as far as it
+   got before aborting (measured, 10 s samples, t ≤ 25,680 s) and beyond that from the §10.1 window probes
    interpolated in time and multiplied by the measured continuous ÷ windowed ratio. That ratio is
    **1.285** at 06:00 and **1.675** at 07:00 (§10.2), and it is applied uniformly, so the two give
    a **low and a high bound** on the unmeasured part of the day rather than one answer.
@@ -1167,7 +1172,7 @@ window. Both bounds are consistent with that; the low one is the better match to
 and the high one to the peak.
 
 **Uncertainty, honestly.** The cost fit spans 207.5 → 2,339.7 concurrent and the day's measured peak
-is already **4,061** (§10.1), well outside it — at N^1.51 that is 2.3× the top measured disc rung and
+is already **4,256** (§10.1), well outside it — at N^1.51 that is 2.4× the top measured disc rung and
 at N^1.87 it is 2.9× the geometric one, and neither is measured. The fill correction is two data
 points, taken where the under-fill is worst, and applying either uniformly is wrong in a known
 direction for the phases where 900 s is nearly enough. Memory, not time, is what actually stops a
@@ -1434,6 +1439,7 @@ Freezing is not free and on a day it is comparable to running. Measured:
 | the first 1,800 s of the day, cold `sumo`, no recording | 1,800 | **58.4 s** | 31× realtime |
 | 120 s window at 00:00, no warmup (`day_run freeze`) | 120 | 4.5 s | — |
 | 1,800 s window at 07:00 + 900 s warmup, recorded | 2,700 | **1,595.9 s** | **1.69× realtime** |
+| the continuous day probe, until it died at 07:22 | 26,550 | **5,931.7 s** | 4.5× realtime |
 
 The last row is the one that matters: at AM-peak density, freezing costs **0.59 s of wall per
 simulated second**, so the 48 freezes of a chunked day are of the same order as the engine runs
@@ -1445,11 +1451,31 @@ Its concurrency also settles the §10.2 warmup question from the other side: the
 **2,236** and closes at **3,264** — still climbing after 1,800 s of recording, toward the 3,552 the
 3,600 s-warmup trace starts at. The AM peak takes more than an hour to fill.
 
-`sumo_trace.freeze`'s own docstring records the trap that matters most for a long freeze, and it is
-not ours to fix: on InTAS from 21,600 s, SUMO 1.25.0 dies with a Windows ACCESS_VIOLATION
-(0xC0000005) at sim time 23,544.1 under `--time-to-teleport -1` and at 23,904.7 under `300`, at the
-same seed — and the same window runs clean at a different SUMO seed. A day-long single freeze walks
-straight into that; 48 half-hour freezes lose one window and can re-seed it.
+**And then SUMO stops.** The continuous full-day probe — one `sumo` process, the scenario's own
+`.sumocfg`, `--begin 0 --end 86400 --seed 42`, no engine involved at all — **aborted at sim time
+26,550 s (07:22)** after 5,931.7 s of wall clock, with:
+
+```
+Error: Request lateral offset of vehicle 'carIn112933:1' for invalid lane ':474375812_1_0'
+Quitting (on error).                                    (exit code 1)
+```
+
+That is not a stepping artefact. `sumo_trace.freeze`'s docstring records the same message as what
+happens when the sublane model is asked to place a vehicle after a **1 s jump** onto an internal
+lane, and warns against re-integrating InTAS at 1 s for exactly that reason — but this run was at the
+scenario's own calibrated **0.1 s** step, and it died anyway, in the AM peak, on the scenario's own
+demand. **On this toolchain, at this seed, InTAS cannot run its own day.**
+
+The same docstring records the other half: on InTAS from 21,600 s, SUMO 1.25.0 also dies with a
+Windows ACCESS_VIOLATION (0xC0000005) at 23,544.1 under `--time-to-teleport -1` and at 23,904.7 under
+`300`, **at the same seed — and the same window runs clean at a different SUMO seed.** That is what
+happened here too: all eight windowed freezes in this document, including five whose windows lie past
+07:22, ran to completion at the *derived* SUMO seed 257,318,856 (`--run-seed 42`), while the direct
+`--seed 42` continuous run died at 07:22.
+
+**So chunking is not only a memory strategy — on this toolchain it is what makes the day runnable at
+all.** A monolithic day freeze walks into a seed-dependent abort with 7 h of work behind it and no
+artifact; 48 half-hour freezes lose one window, re-seed it, and continue.
 
 ## 13. Interruption: what survives, and what does not
 
@@ -1526,7 +1552,7 @@ For someone who wants a realistic long run of the real city on a host like this 
 
 | knob | recommendation | why, in one measured number |
 |---|---|---|
-| **duration** | the whole 86,400 s day, **chunked into 1,800 s windows** | a monolithic day trace is 18–22 GB resident before the engine starts (§12.1) |
+| **duration** | the whole 86,400 s day, **chunked into 1,800 s windows** | a monolithic day trace is 30–37 GB resident before the engine starts (§12.1) — and SUMO itself aborts the continuous day at 07:22 (§12.6) |
 | **window overlap** | 900 s warmup per window, and **verify the fill** against a continuous `profile` run | 900 s is within 4% at night and 1.52× short at the peak (§10.2) |
 | **step size** | `dt = 1.0` with `--substeps 10` | InTAS is calibrated at 0.1 s; re-integrating at 1 s is a different model, and `dt = 0.1` in the engine exhausts `report_budget` in ~3 simulated seconds (§12.3) |
 | **radio** | **disc for the day, geometric for chosen windows** | geometric memory grows +21.5 MB per simulated second at 2,340 concurrent with no plateau; disc is flat by step 50 (§12.2). Geometric costs 4.48× disc at that density |
@@ -1561,6 +1587,7 @@ $N = "$S/ingolstadt.net.xml"; $C = "$S/InTAS_buildings.sumocfg"; $B = "$S/buildi
 # the demand profile. NOTE the four explicit output overrides: the sumocfg names its outputs
 # RELATIVE TO ITSELF, so without them this overwrites the scenario's committed measurement files
 # in place. `--output-prefix` is SUMO's usual answer and does not work with an absolute path.
+# This run ABORTS at 07:22 at --seed 42 (section 12.6); re-seed if you need it to go further.
 sumo -c $C --begin 0 --end 86400 --seed 42 --threads 1 --no-step-log true --no-warnings true `
      --summary-output day.summary.xml --summary-output.period 10 `
      --tripinfo-output day.tripinfo.xml --statistic-output day.stat.xml --log day.log `
@@ -1611,11 +1638,13 @@ python tools/day_run.py dynamics datasets/py_intas_300s --bucket-s 60
   labelled as such at every use. A 1,800 s peak-density run was started and lost to a harness kill at
   20 minutes (§13) — its trace is frozen and the run is one command away from being redone.
 * **The true AM peak was never run through the engine.** Every high arm is a 900 s-warmup window
-  topping out at 2,340 concurrent, against a continuous-day peak of **4,061** measured by SUMO
+  topping out at 2,340 concurrent, against a continuous-day peak of **4,256** measured by SUMO
   (§10.1). Costs at the true peak are read off a fit extrapolated 1.7× past its top rung.
-* **The full-day SUMO probe did not finish** inside this session — it reached 07:08 of 24:00 — so
-  §10.2's continuous-day column exists for 00:00, 04:00, 06:00 and 07:00 and the PM peak's true
-  concurrency is unmeasured. The §11.1 projection covers that gap with two bounds, not one answer.
+* **The full-day SUMO probe never finished — it aborted at 07:22** (§12.6). §10.2's continuous-day
+  column therefore exists for 00:00, 04:00, 06:00 and 07:00 only, and the PM peak's true concurrency
+  is unmeasured. The §11.1 projection covers that gap with two bounds rather than one answer. It has
+  **not** been shown that a different SUMO seed gets through the whole day — only that the eight
+  windowed freezes at the derived seed did not hit it.
 * **The geometric memory curve was never seen to saturate**, which means the extrapolations in §12.2
   are upper bounds on a slope, not predictions of a ceiling. What that ceiling is has not been
   measured.
