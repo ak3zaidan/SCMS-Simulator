@@ -609,8 +609,8 @@ def attribute_overlaps(dataset_dir: str, *, overlap_m: float = OVERLAP_DIST_M,
 
     The instant selection reproduces ``realism_bench._overlap_events`` exactly (timestamps rounded
     to 3 dp, instants with >= 2 vehicles, then ``realism_bench._subsample`` -- the harness's own
-    jittered-systematic sampler, CALLED rather than copied -- down to `max_instants`), so the total
-    here is the harness's ``traffic.overlap_events`` number and not a near-miss of it.
+    circular jittered systematic sampler, CALLED rather than copied -- down to `max_instants`), so
+    the total here is the harness's ``traffic.overlap_events`` number and not a near-miss of it.
     `all_instants=True` additionally reports the un-sub-sampled total, which is the number to prefer
     whenever the dataset is small enough to afford it.
 
@@ -652,7 +652,7 @@ def attribute_overlaps(dataset_dir: str, *, overlap_m: float = OVERLAP_DIST_M,
 
     keys_all = [t for t in sorted(inst) if len(inst[t]) >= 2]
     # THE HARNESS'S OWN SAMPLER, IMPORTED, NOT REIMPLEMENTED. This used to be a two-line copy of the
-    # fixed-stride rule; the rule is now jittered systematic sampling driven by a SEEDED, NAMED
+    # fixed-stride rule; the rule is now circular jittered systematic sampling driven by a NAMED
     # stream (realism_bench._subsample), and a re-implementation of that would be a silent
     # divergence waiting to happen -- the very failure this function exists to avoid, since its
     # whole contract is "this total IS the scorecard's traffic.overlap_events". The import is lazy

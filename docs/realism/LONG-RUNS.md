@@ -503,7 +503,10 @@ MAX_VEH_PER_BUCKET = 400      # cap on vehicles per snapshot
 ```
 
 With `dt = 1.0 s` a 240 s run is examined in full; a 3600 s run is examined at **6.7%** of its
-instants and the 28800 s run at **0.83%**. For a *count* that is fatal, and the ladder shows it
+instants and the 28800 s run at **0.83%**. (Four places, in fact: `datagen/awareness.py` caps the
+same quantity again at `MAX_SNAPSHOTS = 240` for the `comm.*` rows it contributes — see §3.5, which
+is also where the third of these, the per-instant **vehicle** cap, turns out to have been a
+lexicographic prefix rather than a sample.) For a *count* that is fatal, and the ladder shows it
 end to end:
 
 > **The sentence that used to be here is withdrawn.** It read: *"For a distributional metric that is
@@ -566,12 +569,46 @@ Three controls separate bias from noise:
 1. **Shift the grid by one second at 14400 s** and the rate moves 0.094603 → 0.258373 (309 → 860
    overlap events). Sweeping all 12 phase offsets spans **2.73×** and *averages* 0.152640 — within
    −0.9% of the truth. Averaging over the cycle recovers the answer, which is the signature of a
-   phase lock.
+   phase lock. *(That last part is a property of THIS construction and not a general defence: sweep
+   the same cycle by truncating the data instead of by moving the grid and the fixed stride's mean
+   is +6.1% off, not −0.9% — see the phase-sweep table below, which is why it now states which
+   construction it used.)*
 2. **Thirty random 240-instant sub-samples** of the same dataset give 0.156438 ± 0.007537. The
    published 0.094603 is **8.2 sd below** that mean. 240 instants is enough; the *choice* of 240 was
    not.
-3. **The same scenario without `--traffic-lights`** shows only −2.0%, 7× smaller — which is what
-   identifies the signal cycle, and not the duration, as the driver.
+3. **The same scenario without `--traffic-lights`** — a fresh 8 h run, same config minus the
+   lights — is where the fixed stride is *almost right*, which is what identifies the signal cycle
+   and not the duration as the driver:
+
+   | 8 h arm | `overlap_rate` truth | fixed-stride published | error | `headway_ks` error |
+   |---|---|---|---|---|
+   | **with** lights | 0.153993 | 0.094603 | **−38.6%** | **−15.7%** |
+   | **without** lights | 0.166003 | 0.165355 | **−0.4%** | −1.8% |
+
+   so the error is **98× smaller** on the rate and 8.9× smaller on the KS. *(An earlier version of
+   this section said "−2.0%, 7× smaller". Neither number reproduced: −0.4% is the measured rate
+   error, and the ≈8.9× belongs to the `headway_ks` row, not to the rate.)*
+
+   **And the trade the fix makes, stated in the direction that is unflattering to it.** On this
+   non-periodic arm the fixed stride's single number is the *closer* of the two: −0.4%, where the
+   shipped sampler's default seed reads **−3.0%** and the withdrawn window-jitter rule read −4.8%.
+   That −3.0% is noise and is measured as such — over 20 seeds this arm's `overlap_rate` has
+   CV **6.2%** and a mean of **−0.20%** (the default seed sits −0.49 sd from the truth), i.e. the
+   estimator is unbiased here and simply has a per-draw spread that a deterministic rule does not.
+   That is the whole bargain — a random sampler pays O(1/√k) noise on **every** dataset to remove an
+   O(1) bias on the ones with structure — and it is the right bargain only because the noise is
+   bounded, measurable, averageable and re-rollable with `--sampler-seed`, while the bias was none
+   of those things: on the *lights* arm the same deterministic rule is −38.6% and looks exactly as
+   confident.
+
+   *(One more thing this arm shows, and it is not the sampler's: `headway_ks` reads about 2% low
+   under **both** rules here — fixed stride −1.8%, shipped 20-seed mean −2.0% ± 0.3% — because the
+   KS row is not a mean. It is fitted on the sub-sample it is measured against, `h_min` = the
+   sample minimum, so a smaller sample fits itself slightly better. Uniform inclusion probability
+   makes a MEAN over instants unbiased; a pooled, self-fitted statistic is a ratio estimator and is
+   unbiased only to O(1/instants_examined), which is what `distributional_note` on that row now
+   says. On the lights ladder the same 20-seed means are +0.08 / −0.14 / −0.24 / −0.35% at
+   300 / 1800 / 3600 / 7200 s, so it is a per-dataset finite-sample effect, not a constant.)*
 
 `speed_p50` / `speed_p95` and `fd_capacity` are **bit-identical** capped and uncapped, because they
 are read off scans that were never capped. That scopes the defect exactly: it is the instant-capped
@@ -579,17 +616,103 @@ scans, and nothing else.
 
 #### The fix, and why this one
 
-`realism_bench._subsample` replaces the fixed stride with **jittered systematic sampling**: partition
-`range(n)` into `k` contiguous windows of width `s = n/k` and take one seeded uniform draw inside
-each. Item *m* is selected iff some window's draw lands in `[m, m+1)`; the windows tile `[0, n)` and
-each draw is uniform over its own window, so **every item's inclusion probability is exactly `k/n`**,
-at every `n` and `k`, against any spectrum. The `k` phase offsets are i.i.d. uniform on `[0, s)`, so
-the sampled phase modulo any period `p ≤ s` is uniform and the estimate's expectation is the
-full-cycle average — the standard anti-aliasing result for stochastic sampling (Dippé & Wold 1985;
-Cook, *ACM ToG* 5(1), 1986): jitter converts aliasing into noise. Exactly one index per window means
-the maximum gap stays under `2s`, so it keeps the even coverage that systematic sampling was chosen
-for — it *is* stratified sampling with one unit per stratum, the design systematic sampling is the
+> **The first fix published here was itself wrong, and its claim is withdrawn.** It jittered inside
+> **real-valued** windows and resolved the resulting index collisions by advancing to the next
+> index (`if j <= prev: j = prev + 1`). With a fractional `s = n/k` an item's unit interval can be
+> covered by *two* adjacent windows, so the probability that *either* hits it is strictly below the
+> expected hit count `1/s`; and the tie-break then displaces the collision **upward**, over-sampling
+> the later item. Its published property — "inclusion probability is exactly `k/n` at every `n` and
+> `k`" — was therefore true **only when `k` divides `n`**. Exactly, by DP over the rule itself, and
+> confirmed by a 20,000–200,000-seed Monte Carlo of it to 4 dp:
+>
+> | (n, k) | s | inclusion probability, min … max | against `k/n` | worst deviation |
+> |---|---|---|---|---|
+> | 3, 2 | 1.500 | 0.5556 … 0.7778 | 0.6667 | 16.7% |
+> | 7, 5 | 1.400 | 0.5918 … 0.8601 | 0.7143 | 20.4% |
+> | 300, 240 | 1.250 | 0.6800 … 0.9616 | 0.8000 | 20.2% |
+> | 481, 240 | 2.004 | 0.4367 … 0.5612 | 0.4990 | 12.5% |
+> | 1201, 240 | 5.004 | 0.1899 … 0.2098 | 0.1998 | 5.0% |
+> | 1200 / 1440 / 2400 / 14400, 240 | 5 / 6 / 10 / 60 | exact | — | **0.0%** |
+>
+> On a population of period 2 that is a real bias in a published rate. Through `scorecard()` on the
+> `_overlapping_platoon` fixture, EXACT (computed from the probabilities above) beside MEASURED
+> (mean over seeds, z of that mean), with the shipped rule on the same fixtures and seeds as the
+> control:
+>
+> | n | s | exact | measured | seeds | **shipped rule** |
+> |---|---|---|---|---|---|
+> | 481 | 2.004 | **−8.28%** | **−8.41%** (z = −24.6) | 300 | +0.27% (z = +0.7) |
+> | 961 | 4.004 | −2.08% | −2.21% (z = −4.7) | 200 | −0.55% (z = −1.2) |
+> | 1441 | 6.004 | −0.92% | −0.90% (z = −1.4) | 120 | +0.49% (z = +0.8) |
+> | 14401 | 60.004 | −0.01% | +0.31% (z = +0.2) | 24 | +1.07% (z = +0.7) |
+>
+> The damage is largest where the stride is **small**, i.e. on **short** runs: the reference arm's
+> own 300 s rung sits at s = 1.23, where the tie-break fires ~30 times per 240 draws (it fires
+> ~102, 29.6, 10.2, 1.5 and 0.02 times per 240 draws at n = 241, 300, 481, 1201 and 14401). That is
+> the opposite end of the ladder from the fixed-stride defect above, so the two withdrawn rules were
+> wrong about different runs — which is why every bound in `tests/test_long_runs.py` is now checked
+> against both.
+
+`realism_bench._subsample` now uses **circular jittered systematic sampling**. Cut `range(n)` into
+`k` contiguous **integer** blocks at `c_i = ⌊i·n/k⌋` — so every block holds `⌊n/k⌋` or `⌈n/k⌉` items
+and the long ones are spread evenly — **rotate the whole partition** by one uniform draw
+`d ~ U{0…n−1}`, and take one uniform draw inside each block:
+
+```
+d ~ U{0, …, n−1};  o_i ~ U{0, …, L_i − 1} i.i.d.,  L_i = c_(i+1) − c_i
+j_i = (d + c_i + o_i) mod n,   returned sorted
+```
+
+The blocks are disjoint and tile `range(n)`, so the result is exactly `k` **distinct** indices in
+increasing order and **there is no tie-break at all** — nothing can collide, because nothing is
+rounded onto a shared integer in the first place. The rotation is what buys exactness: it makes the
+*law* of the partition invariant under cyclic shift, so every item sees the population's own
+distribution of block sizes, and with `n = qk + r`,
+
+```
+P(item m selected) = E[1 / L(m)] = [r(q+1)/n]·1/(q+1) + [q(k−r)/n]·1/q = r/n + (k−r)/n = k/n
+```
+
+for **every** `m`, at every `n` and `k`, with **no divisibility condition**. Verified two ways over
+the awkward pairs above: exact enumeration gives `max |P − k/n| = 0` in every case, and a
+4,000–200,000-seed Monte Carlo *of the shipped code* puts every item inside the binomial band around
+`k/n` — over the eleven cases that is **19,062 item-level frequencies, largest deviation 4.5 σ**,
+against an expected maximum of ≈4.1 for that many draws. The band is stated **per item** and not as
+a χ² over items on purpose: one draw of this design selects exactly `k` items, so the item counts
+are dependent *within* a draw and a χ² over them is not null-calibrated (measured across seed
+blocks its z wanders from −5 to +18 with no defect present). *Across* seeds each item's count is
+exactly `Binomial(seeds, P(item))`, so the per-item band is exact rather than approximate, which is
+why `tests/test_long_runs.py` uses it. The cyclic-rotation device is Lahiri's **circular systematic
+sampling** (1952), used there against this same divisibility defect.
+
+What uniform inclusion probability buys, precisely: for any per-instant quantity the sample mean is
+unbiased for the run's mean, whatever the population does — that is the whole of it, and it is why
+no assumption about the spectrum appears anywhere in the module. Read as phases of a cycle it gives
+the anti-aliasing result for stochastic sampling (Dippé & Wold 1985; Cook, *ACM ToG* 5(1), 1986):
+jitter converts aliasing into noise. A **pooled** distribution over instants contributing unequal
+numbers of observations (the headway rows) is a *ratio* estimator, so it is unbiased to
+O(1/instants_examined) rather than exactly — the rows now say it in that form and no stronger. One
+index per block keeps consecutive kept indices within `L_i + L_(i+1) ≤ 2⌈s⌉`, so the sample cannot
+clump: it is stratified sampling with one unit per stratum, the design systematic sampling is the
 fragile shortcut for (Cochran, *Sampling Techniques*, 3rd ed., §5, §8.6).
+
+**Every capped row moves once, here.** `SAMPLER_KEY` goes from `realism_bench.sampler.jittered.v1`
+to `realism_bench.sampler.circular_jittered.v2`, and the key is part of the RNG stream, so no capped
+number drawn by either withdrawn rule reproduces under this one — including the capped numbers
+published elsewhere in these documents before this change. Every scorecard carries the rule that
+drew it (`settings.sampler`, and `sampler` on each capped row), which is what makes that
+checkable rather than something a reader has to know. **Neither pinned pipeline digest is affected:
+this module is read-only and `run.py` is untouched — reference
+`b25f2137cf14dd504d56bb88cd67cce273b6a6ac348f7c59ee6d3b4372257815` and default golden
+`0bd93655a2d5bebb4172191fab0940a5ff90c6be685cfa033f5edcfd7c1fb740` both reproduce byte-identically.**
+
+**And what it costs**, stated: one block spans the seam between the end of the run and its start, so
+one of the `k` strata is not an interval of time — a little variance on a non-stationary population,
+in exchange for the exact inclusion probability. There is no arrangement that gives both: with fixed
+integer blocks and one draw per block, `P = 1/L` is forced, and uniformity then *requires* `n/k` to
+be an integer. Simple random sampling without replacement is also exactly `k/n` and was rejected for
+the opposite reason: it gives up the stratification and can leave whole minutes of a run
+unrepresented.
 
 The two alternatives were rejected on evidence, not taste. **A stride forced coprime with the
 structure** needs the period to be known, and this harness scores arbitrary datasets whose periods
@@ -610,37 +733,137 @@ assumed. Both pinned pipeline digests are untouched: this module is read-only.
 
 #### After
 
+Published against the uncapped truth at the default cap of 240 in both cases — **fixed stride →
+the shipped rule**, one draw each (the whole ladder re-measured under the rule that actually ships,
+not under the withdrawn one):
+
 | | 300 s | 1800 s | 3600 s | 7200 s | 14400 s |
 |---|---|---|---|---|---|
-| `overlap_rate` error, **old → new** | −0.4% → −0.6% | −3.0% → +2.7% | −14.3% → **−0.9%** | −18.5% → **+7.0%** | −38.6% → **+5.1%** |
-| `headway_p50_s` error, old → new | −0.2% → −0.1% | +0.6% → +0.0% | +0.6% → −0.1% | +2.3% → **+0.5%** | +7.2% → **−0.9%** |
-| `headway_ks` error, old → new | +0.4% → +0.1% | −0.9% → +0.8% | −1.4% → −1.0% | −4.0% → **−1.0%** | −15.7% → **+1.1%** |
+| `overlap_rate` error | −0.4% → +2.3% | −3.0% → **+0.3%** | −14.3% → **+0.0%** | −18.5% → **+2.0%** | −38.6% → **−0.7%** |
+| `headway_p50_s` error | −0.2% → +0.3% | +0.6% → −0.0% | +0.6% → −0.1% | +2.3% → **−1.2%** | +7.2% → **−1.5%** |
+| `headway_ks` error | +0.4% → +0.2% | −1.0% → +0.3% | −1.4% → −0.1% | −4.0% → **−1.1%** | −15.7% → **+1.9%** |
 
-The residual is **noise, not bias**. Over 50 seeds:
+Those are **single draws**, and the claim is about the estimator, not the draw — so here is the
+estimator, over **20 seeds** per rung:
 
 | duration | `overlap_rate` mean err / CV | `headway_p50_s` mean err / CV | `headway_ks` mean err / CV |
 |---|---|---|---|
-| 300 s | +0.23% / 2.09% | +0.03% / 0.26% | −0.07% / 0.35% |
-| 1800 s | −0.47% / 4.38% | −0.02% / 0.69% | −0.43% / 1.13% |
-| 3600 s | +0.62% / 4.57% | +0.18% / 0.72% | −0.18% / 0.95% |
-| 7200 s | +0.62% / 5.05% | −0.11% / 0.76% | −0.31% / 1.06% |
-| 14400 s | −1.18% / 4.57% | +0.08% / 0.97% | −0.43% / 1.12% |
+| 300 s | +0.25% / 1.80% | −0.02% / 0.27% | +0.08% / 0.33% |
+| 1800 s | −1.14% / 3.53% | −0.26% / 0.54% | −0.14% / 0.96% |
+| 3600 s | +1.61% / 4.87% | +0.10% / 0.98% | −0.24% / 1.01% |
+| 7200 s | +0.80% / 3.95% | +0.22% / 0.85% | −0.35% / 0.94% |
+| 14400 s | −0.40% / 5.06% | +0.04% / 0.82% | −0.20% / 1.21% |
+
+Every one of those fifteen means is within **2.2 standard errors** (CV/√20) of the truth — the
+largest is `headway_p50_s` at 1800 s, −0.26% against an se of 0.12%, and across fifteen numbers an
+extreme of ≈2.2 is what "no bias" looks like — where the fixed stride's error **grew with duration**
+to −38.6%. Read the 300 s column of the first table for the
+price: +2.3% where the fixed stride read −0.4%. On a short, weakly-structured rung a deterministic
+rule can land closer — it is simply never **knowable** that it did, and that is the property being
+bought.
 
 #### The phase sweep — the control a re-aimed lock would fail
 
-Sweeping the sampling grid across a full 24 s cycle on the 14400 s dataset, 24 offsets:
+> **This table used to compare two different experiments.** Its *old* row reproduced only under
+> "shift the sampling grid on a fixed dataset" and its *new* row only under "drop the first `off`
+> instants", and a spread measured under one construction is not comparable with a spread measured
+> under the other. Both rows below now come from **one** construction, stated: **drop the first
+> `off` instants, `off = 0 … 23`**, i.e. a full 24 s signal cycle of data truncation, with every
+> rule re-run on each truncated population. It is the only construction defined for both rules —
+> "shift the grid" is not a thing a random sampler has — and it is a clean sampler-only control
+> here because dropping ≤ 23 s out of 14,400 s leaves the uncapped truth **constant to five decimal
+> places** (`overlap_rate` 0.15399 at every offset, sd 0.00000), so the entire spread below is the
+> sampler's own.
+>
+> *How it was produced, so it can be re-run:* load the arm's mobility-oracle rows once
+> (`rb.resolve_mobility_source`), and for each `off` score the rows with `t >= t0 + off` through the
+> harness's own scans — `rb._overlap_events(sub, max_instants=240)` and
+> `rb._time_headways(rb.segment_table(...), max_instants=240)`, with `rb._subsample` monkey-patched
+> to `rb._fixed_stride_subsample` for the "fixed stride" rows and left alone for the shipped ones.
+> Calling the module's scans rather than re-implementing them is the point: the numbers are the
+> published rows' own arithmetic.
 
 | | min | max | spread | sd | mean vs truth |
 |---|---|---|---|---|---|
-| `overlap_rate` **old** | 0.09153 | 0.26718 | **2.92×** | 0.04694 | −1.2% |
-| `overlap_rate` **new** | 0.13908 | 0.16979 | **1.22×** | **0.00699** | +1.6% |
-| `headway_ks` **old** | 0.16079 | 0.22046 | 1.37× | 0.02103 | +1.3% |
-| `headway_ks` **new** | 0.18670 | 0.19475 | **1.04×** | **0.00212** | −0.6% |
+| `overlap_rate` **fixed stride** | 0.09460 | 0.19671 | **2.08×** | 0.01950 | **+6.1%** |
+| `overlap_rate` **shipped** | 0.13358 | 0.17108 | 1.28× | **0.00816** | **+0.1%** |
+| `headway_ks` **fixed stride** | 0.16138 | 0.19249 | 1.19× | 0.00971 | **−4.8%** |
+| `headway_ks` **shipped** | 0.17894 | 0.19628 | 1.10× | **0.00320** | **−0.6%** |
 
-The sd falls **6.7×** on the rate and **9.9×** on the KS. Read the KS row for what it means to a
-verdict: the same 8-hour dataset published anywhere from 0.1608 to 0.2205 against a 0.15 threshold
-depending only on which second the run started. Under the new sampler the entire sweep lies inside
-0.1867–0.1948.
+The sd falls **2.4×** on the rate and **3.0×** on the KS. *(The "6.7× / 9.9×" this section used to
+claim was the artefact of the mixed construction — it divided a grid-shift sd by a truncation sd.
+Like for like it is 2.4×, and the honest headline of this table is not the sd at all: it is the
+**mean**. Under one construction the fixed stride is out by +6.1% on the rate and −4.8% on the KS
+*on average over a full cycle*, while the shipped sampler is out by +0.1% and −0.6% — a phase lock
+does not average away when the thing you sweep is the data rather than the grid.)*
+
+Read the KS row for what it means to a verdict: the same 8-hour dataset published anywhere from
+0.1614 to 0.1925 against a 0.15 threshold depending only on which second the run started, and the
+average of those was 4.8% below the truth. Under the shipped sampler the sweep's mean is 0.6% below
+it.
+
+#### The same rule was still live in a second module
+
+Replacing `realism_bench`'s sampler did not replace the **copy** of it in
+`datagen/awareness.py`, which caps its own co-presence scan at `MAX_SNAPSHOTS = 240` buckets and did
+it with the withdrawn rule, byte for byte:
+
+```python
+if len(keys) > max_snaps:                     # awareness.snapshots, before
+    step = len(keys) / float(max_snaps)
+    keys = [keys[int(i * step)] for i in range(max_snaps)]
+```
+
+with a docstring that still said *"buckets are subsampled evenly across the run … so nothing here is
+random"* — the very sentence the fix had withdrawn one file over. These buckets feed five published
+`comm.*` rows, and the function took **no cap argument and no sampler seed**, so `--max-instants 0`
+could not reach it and no flag could re-draw it.
+
+How exposed it was, exactly, because the honest answer is "less than the traffic scan, and unknowably
+so": this dataset has 14,135 non-empty buckets, a fractional stride of 58.90 that does reach all 12
+phases of the signal cycle, so the total lock the traffic scan suffered did **not** occur here. It
+occurs whenever the bucket count is a multiple of the cap — 1800 / 3600 / 7200 / 14400 buckets give
+8 / 4 / 2 / **1** distinct phases mod 12 — and nothing in the rule prevented that; whether a given
+run lands there is a property of how many buckets happened to be non-empty. That is the actual
+indictment of a deterministic sampler: its error has **no spread to look at**, so from the output
+alone −0.4% and −38.6% are indistinguishable.
+
+Measured on the 8 h arm — 240 of 14,135 buckets (1.7%), 1,955 of 117,151 classifiable pairs:
+
+| row | uncapped truth | fixed stride (shipped) | shipped rule now | its 8-seed mean |
+|---|---|---|---|---|
+| `comm.link_state_los_fraction` | 0.328000 | 0.326600 (−0.43%) | 0.334100 (+1.86%) | 0.327263 (**−0.22%**) |
+| `comm.link_state_los_fraction_200m` | 0.436800 | 0.425900 (**−2.50%**) | 0.438400 (+0.37%) | 0.436613 (**−0.04%**) |
+| `comm.pdr_absolute_200m` | 0.414200 | 0.408300 (−1.42%) | 0.415900 (+0.41%) | 0.414575 (**+0.09%**) |
+| `comm.nar90_equivalent_range_m` | 243.400 | 241.200 (−0.90%) | 243.300 (−0.04%) | 243.463 (**+0.03%**) |
+| `comm.pdr_gray_zone_ratio` | 7.50690 | 7.53720 (+0.40%) | 7.53230 (+0.34%) | 7.50935 (**+0.03%**) |
+
+The single-seed column is one draw and is not the claim; the 8-seed mean is, and it is inside 0.22%
+of the truth on every row where the fixed stride was out by up to 2.5%. `awareness_report` and
+`link_state_composition` now take `max_snaps` and `sampler_seed`, `scorecard` passes its own
+`--max-instants` / `--sampler-seed` through, and every row the module contributes carries the same
+`_sampling_block` the traffic panel publishes — `buckets_examined` / `buckets_available`,
+`coverage_frac`, `sampler`, `sampler_seed` and the `NOT COMPARABLE ACROSS DURATIONS` warning, which
+those rows previously did not carry at all.
+
+**Two more non-uniform truncations of the same class were found and fixed** while looking:
+
+* `MAX_VEH_PER_BUCKET = 400` was applied as `sorted(vids)[:400]`. Vehicle ids are `veh_NNN` of
+  **variable digit width**, so that sort is lexicographic (`veh_1000 < veh_999`): the retained set
+  was neither the earliest nor the lowest-numbered but an arbitrary subset, with no stated inclusion
+  probability and no coverage row. Measured on the dense counter-case (`datasets/py_intas_hour`:
+  14,896 vehicles, 1,669 co-present per instant, so the cap keeps **24.2%** and **bound in 240 of
+  240** examined instants) the numeric id is essentially spawn order — Pearson **+0.983** against
+  `spawn_time` — while the **lexicographic rank the cap actually sorted on correlates −0.362** with
+  it. It now goes through the same sampler on a per-instant stream and publishes
+  `instants_hitting_vehicle_cap`, `vehicle_coverage_frac` and the warning that a neighbour-defined
+  quantity (headway, co-presence distance) is biased **long** under it. It does not bind on the
+  reference arm (164 veh/instant, cap never reached).
+* `awareness.link_state_composition`'s 400,000-pair ray-march budget stopped at the first pair that
+  exceeded it, i.e. it kept the run's **earliest** buckets and left the bucket it stopped inside
+  half-counted. Buckets are now visited in a seeded random order and committed whole, so a budget
+  stop drops a random subset of the sampled buckets, and the row says how many it classified. It
+  does not bind on the reference arm (117,151 pairs).
 
 #### What the cap costs, and what to set it to
 
@@ -663,7 +886,10 @@ cap, and on the densest dataset here uncapping is 8× the scan. A cap counted in
 bound a cost that is quadratic in *density*; a **pair-instant budget** is the shape a future raise
 should take.
 
-Since the sampler fix the cap buys only precision, never correctness. On the 8 h arm, 40 seeds:
+Since the sampler fix the cap buys only precision, never correctness. On the 8 h arm, 40 seeds
+*(measured under the withdrawn `jittered.v1` rule; the cap-240 row re-measures to CV **5.06%** on
+the rate and **1.21%** on the KS over 20 seeds under the shipped rule, i.e. the same precision — the
+two rules differ in bias, not in variance, and the recommendation below is unchanged)*:
 
 | cap | coverage | `overlap_rate` CV | `headway_ks` CV | scan |
 |---|---|---|---|---|
@@ -682,6 +908,22 @@ InTAS peak hour), **0** whenever the dataset is small enough to afford it. The s
 `headway_ks` sits 19 sd from its threshold at cap 240), and bundling a precision change into the
 same change as a bias fix would make the two indistinguishable in the diff of every published number.
 
+#### Two things a capped number is, which this document did not say
+
+1. **The sample is not NESTED across durations.** The sampler's stream key carries the population
+   size (`f"{seed}:{SAMPLER_KEY}:{stream}:{n}:{k}"`), so a 14,400 s run and a 7,200 s one draw
+   *different* instants — the longer run's 240 are not a superset of the shorter run's, and not one
+   of them need be shared. Two rungs of the ladder therefore differ by their **samples** as well as
+   by their data, and the paired-difference intuition that a longer run "contains" a shorter one —
+   true of the datasets themselves under `--demand uniform`, which is what §0 establishes — is false
+   of the capped rows read off them. The `comparability` note on every capped row now says so.
+2. **A published capped number's error is FROZEN.** The sampler is deterministic given
+   `(sampler_seed, stream, n, k)`, which is what makes a scorecard byte-reproducible — and it means
+   re-running the scorecard **cannot re-roll** the sampling error of a number already published.
+   Only `--sampler-seed` can. A row that came out 1.5 sd high stays 1.5 sd high on every re-run of
+   that dataset for ever, and the way to find out how big that error is, is to re-score under
+   several seeds and read the spread (which is how every "± " in this section was obtained).
+
 #### The test that dodged it
 
 `tests/test_long_runs.py` built its overlap fixture with `overlap_every=7`, documented as
@@ -691,14 +933,21 @@ and the failure mode the real signalised arm exhibits — a period that **divide
 therefore never exercised. Section *DEFECT 1b* now builds exactly that case (1,200 instants, cap
 240, stride 5, overlaps every 5), and against the fixed-stride rule it is red in both directions:
 
-| fixture | uncapped truth | fixed-stride published | jittered published |
-|---|---|---|---|
-| overlaps at phase 1 | 33.333 | **0.000 (−100%)** | 38.889 (+16.7%) |
-| overlaps at phase 0 | 33.333 | **166.667 (+400%)** | 33.333 (0.0%) |
-| phase sweep, 5 phases | 33.333 | 166.667, 0, 0, 0, 0 | 33.33, 38.89, 35.42, 29.17, 29.86 |
+| fixture | uncapped truth | fixed-stride published | shipped rule, one seed | shipped rule, 16-seed mean |
+|---|---|---|---|---|
+| overlaps at phase 1 | 33.333 | **0.000 (−100%)** | 27.778 | 34.94 ± 1.29 |
+| overlaps at phase 0 | 33.333 | **166.667 (+400%)** | 34.028 | 32.77 ± 1.39 |
+| phase sweep, 5 phases | 33.333 | 166.667, 0, 0, 0, 0 | 34.03, 27.78, 42.36, 31.25, 31.25 | — |
+| … spread over the sweep | — | **∞ (min is 0)** | **1.52×** | — |
 
 At phase 1 the old rule reports **zero overlaps, on a HARD existence gate, about a dataset in which
-one happens every five seconds**.
+one happens every five seconds**. Read the last two columns together: the shipped rule's single-seed
+value is *noise* around the truth (its 16-seed mean is inside one standard error of 33.333 at every
+phase) while the old rule's is a *lock* — which is why every bound in that section is now sized from
+the measured standard error of the seed replicates, and each is checked to be red against the
+withdrawn rule in the same test. Two of those bounds had been loosened until they were satisfied by
+the withdrawn rule *exactly* (deviation 0.0000), on a fixture whose period was coprime with the
+stride; both now use a period that divides it.
 
 ### 3.4 Not measurable at all below a duration — and not converged above it
 

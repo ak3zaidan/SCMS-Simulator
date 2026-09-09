@@ -122,12 +122,25 @@ here made that false. Both are measured end to end on a 300 s -> 28,800 s durati
      the error was BIAS, not sample size. The same scenario WITHOUT ``--traffic-lights`` showed only
      -2.0%, 7x smaller, which is what identifies the signal cycle as the driver.
 
-     :func:`_subsample` therefore replaces the fixed stride with JITTERED SYSTEMATIC SAMPLING -- one
-     seeded uniform draw inside each stride window -- whose inclusion probability is exactly
-     ``examined/available`` for EVERY instant, at every duration, against any spectrum. The claim
-     above is now made in the form that is true, and only in that form: a distribution stays
-     representative under the cap *because every instant is equally likely to be in the sample*, not
-     because the instants are evenly spaced.
+     :func:`_subsample` therefore replaces the fixed stride with CIRCULAR JITTERED SYSTEMATIC
+     SAMPLING -- one seeded uniform draw inside each integer block of a randomly rotated k-block
+     partition -- whose inclusion probability is exactly ``examined/available`` for EVERY instant,
+     at every duration, against any spectrum. The claim above is now made in the form that is true,
+     and only in that form: a distribution stays representative under the cap *because every instant
+     is equally likely to be in the sample*, not because the instants are evenly spaced.
+
+     THE FIRST ATTEMPT AT THAT FIX WAS ALSO WRONG, and its claim is withdrawn too. It jittered
+     inside REAL-VALUED windows and advanced an index that collided with its predecessor
+     (:func:`_window_jitter_subsample`); with a fractional window width an item can be covered by
+     two windows, so the union probability falls below ``k/n`` and the tie-break pushes the
+     displaced draw upward. Its published "exactly k/n at every n and k" held ONLY when the cap
+     divided the instant count: exactly, item-to-item, ``0.5556-0.7778`` against 0.6667 at
+     ``n=3, k=2``, ``0.4367-0.5612`` against 0.4990 at ``n=481, k=240``, and on a population of
+     period 2 that is a -8.3% bias in a published rate at ``n=481`` (s = 2.004), -2.1% at n=961,
+     -0.9% at n=1441, -0.01% at n=14401. The bias is largest where ``s`` is SMALL, i.e. on the
+     SHORT rungs -- the reference arm's own 300 s rung sits at s = 1.23 -- which is the opposite end
+     of the ladder from the fixed-stride defect above, and it is why the sampler is now keyed
+     ``circular_jittered.v2`` and every capped row was re-pinned once more.
   2. **A metric that EXISTS is not a metric that has CONVERGED.** ``MIN_SAMPLES`` gates the existence
      of the awareness rows. It does not gate their precision, and on the reference arm the rows
      appear at ~930 s and are still moving by a factor of 3.8 (``awareness_ratio_100m``) and 7.6
@@ -183,15 +196,26 @@ HEADWAY_LATERAL_TOL_M = LANE_WIDTH_M / 2.0    # a leader shares the follower's L
 HEADWAY_HEADING_TOL_DEG = 22.5                # ... and drives the same way (half of the old octant)
 HEADWAY_MAX_S = 60.0       # headways longer than this are "no leader", not a following headway
 HEADWAY_MIN_SPEED_MPS = 1.0
-HEADWAY_MAX_INSTANTS = 240    # cap on instants scanned for leaders (jittered systematic sampling)
+HEADWAY_MAX_INSTANTS = 240    # cap on instants scanned for leaders (circular jittered systematic)
 FD_CELL_M = 100.0          # fundamental-diagram space cell
 FD_WINDOW_S = 60.0         # fundamental-diagram time window
 FD_MIN_CELL_SAMPLES = 5    # per-cell segment count below which the cell is dropped
 OVERLAP_DIST_M = 1.0       # two distinct vehicles closer than this at one instant physically overlap
 LIVENESS_MIN_SPEED_MPS = 0.5  # a track whose whole span averages below this never actually moved
 LIVENESS_MIN_VEHICLES = 5     # ... and the moving fraction needs this many tracks to mean anything
-MAX_TIME_BUCKETS = 240     # cap on co-presence snapshots examined (jittered systematic sampling)
-MAX_VEH_PER_BUCKET = 400   # cap on vehicles per snapshot (deterministic: lowest vehicle ids first)
+MAX_TIME_BUCKETS = 240     # cap on co-presence snapshots examined (circular jittered systematic)
+#: Cap on vehicles kept inside ONE instant, because both capped scans are O(vehicles^2) per instant
+#: and an instant cap alone cannot bound a cost that is quadratic in DENSITY. Until the sampler
+#: audit this cap was ``sorted(vids)[:400]``, i.e. the lexicographically first 400 -- and vehicle
+#: ids are ``veh_NNN`` of VARIABLE DIGIT WIDTH, so ``veh_1000 < veh_999`` and the retained set was
+#: neither the earliest, nor the lowest-numbered, nor a stated sample. Measured on this repository's
+#: densest dataset (``datasets/py_intas_hour``, 14,896 vehicles, 1,669 co-present per instant, so
+#: the cap keeps 24% of them and BOUND in 240 of 240 examined instants): the NUMERIC id is
+#: essentially spawn order (Pearson +0.983 against ``spawn_time``), while the LEXICOGRAPHIC rank the
+#: cap actually sorted on correlates -0.362 with it. It now goes through :func:`_subsample` on its
+#: own per-instant stream, so the vehicles kept have inclusion probability exactly 400/present, and
+#: the rows say when it bound. It does NOT bind on the reference arm (164 vehicles per instant).
+MAX_VEH_PER_BUCKET = 400
 #: WHAT THE CAP COSTS, AND WHAT TO SET IT TO. Measured, not assumed -- reference grid arm
 #: (``--flow --road grid --grid 6 --arrival-rate 2 --attacker-pct 0.15 --traffic-lights --seed 42``,
 #: mobility-oracle stream, 164 vehicles per instant) and, as the DENSE counter-case, this
@@ -256,7 +280,18 @@ SAMPLER_DOC = "docs/realism/LONG-RUNS.md#35-the-sampler-itself-phase-locked-onto
 #: The sub-sampling rule's identity, and the namespace segment of its seeded stream. Bumping this
 #: string is the deliberate, announced way to re-pin every capped row; it is in the key, so it
 #: cannot be changed without changing every jitter draw.
-SAMPLER_KEY = "realism_bench.sampler.jittered.v1"
+#:
+#: ``...jittered.v1`` (:func:`_window_jitter_subsample`) is WITHDRAWN and this is its announced
+#: re-pin: v1 drew inside real-valued windows and broke the resulting index collisions by advancing
+#: to the next index, which made its published inclusion probability -- "exactly examined/available
+#: for every instant" -- false at every ``n`` that ``k`` does not divide (up to 20.4% deviation
+#: item-to-item, and a -8.3% bias in a published rate at ``s = 2.004``). v2 draws inside integer
+#: blocks of a randomly rotated partition, where the same claim is exactly true. Every capped row
+#: moves once, here, and no capped row's claim survives that did not.
+SAMPLER_KEY = "realism_bench.sampler.circular_jittered.v2"
+#: The withdrawn v1 key, pinned so :func:`_window_jitter_subsample` still reproduces the draws that
+#: rule actually shipped with rather than tracking the current one.
+SAMPLER_KEY_V1 = "realism_bench.sampler.jittered.v1"
 #: Default seed for the sub-sampler's jitter. FIXED, so the default scorecard is byte-reproducible
 #: without the caller thinking about randomness at all; overridable (``scorecard(sampler_seed=N)``,
 #: CLI ``--sampler-seed``) so the sampling variance of a graded row can be MEASURED rather than
@@ -1385,21 +1420,125 @@ def _fixed_stride_subsample(items: list, max_items: int | None) -> list:
     return [items[int(i * step)] for i in range(int(max_items))]
 
 
+def _window_jitter_subsample(items: list, max_items: int | None, *, stream: str = "x",
+                             seed: int = SAMPLER_SEED) -> list:
+    """THE OTHER WITHDRAWN RULE: real-valued jitter windows with a collision tie-break.
+
+    This was the first replacement for :func:`_fixed_stride_subsample`, and it fixed the phase lock
+    it was written to fix. It is withdrawn because the property it PUBLISHED -- inclusion
+    probability exactly ``k/n`` for every item -- is false whenever ``k`` does not divide ``n``:
+
+      * with fractional ``s = n/k`` an item's unit interval can be covered by TWO adjacent windows,
+        and ``P(hit by either)`` is strictly below the expected hit count ``1/s``; and
+      * the tie-break (``if j <= prev: j = prev + 1``) then displaces the collision UPWARD, so the
+        later index is over-sampled and the earlier one under-sampled.
+
+    Exact inclusion probabilities (DP over this rule, agreeing with 200k-seed Monte Carlo to 4 dp)::
+
+        n=3   k=2    0.5556 .. 0.7778  against k/n = 0.6667   (16.7% deviation)
+        n=7   k=5    0.5918 .. 0.8601  against 0.7143         (20.4%)
+        n=300 k=240  0.6800 .. 0.9616  against 0.8000         (20.2%)
+        n=481 k=240  0.4367 .. 0.5612  against 0.4990         (12.5%)
+        n=1201 k=240 0.1899 .. 0.2098  against 0.1998         ( 5.0%)
+        n=1440 k=240 exact (k | n: no window straddles an item, no tie-break can fire)
+
+    On a population whose period is 2 that is a REAL BIAS in a published rate. It is exactly
+    computable from those probabilities, and it was then confirmed through :func:`scorecard` on
+    ``tests/test_long_runs.py::_overlapping_platoon`` -- EXACT (from the probabilities) against
+    MEASURED (mean over seeds, z of the mean)::
+
+                              exact     measured           this rule replaced by _subsample
+        n=481   (s=2.004)    -8.28%    -8.41%  z=-24.6     +0.27%  z=+0.7   (300 seeds)
+        n=961   (s=4.004)    -2.08%    -2.21%  z= -4.7     -0.55%  z=-1.2   (200 seeds)
+        n=1441  (s=6.004)    -0.92%    -0.90%  z= -1.4     +0.49%  z=+0.8   (120 seeds)
+        n=14401 (s=60.004)   -0.01%    +0.31%  z= +0.2     +1.07%  z=+0.7   (24 seeds)
+
+    The replacement's bias is exactly ZERO by construction at every one of them (its inclusion
+    probability is exactly ``k/n``), which is what the right-hand column is consistent with.
+
+    It is kept, unused by the module, for the same reason :func:`_fixed_stride_subsample` is: so
+    ``tests/test_long_runs.py`` can show the current rule passing a test this one fails.
+    DO NOT CALL IT FROM A METRIC.
+    """
+    n = len(items)
+    if not max_items or max_items <= 0 or n <= max_items:
+        return list(items)
+    k = int(max_items)
+    rnd = random.Random(f"{int(seed)}:{SAMPLER_KEY_V1}:{stream}:{n}:{k}")
+    step = n / float(k)
+    out, prev = [], -1
+    for i in range(k):
+        j = int(i * step + rnd.random() * step)
+        if j >= n:
+            j = n - 1
+        if j <= prev:               # adjacent windows can round onto the same index
+            j = prev + 1
+        if j >= n:
+            break
+        prev = j
+        out.append(items[j])
+    return out
+
+
 def _subsample(items: list, max_items: int | None, *, stream: str,
                seed: int = SAMPLER_SEED) -> list:
-    """JITTERED SYSTEMATIC sub-sample: one seeded uniform draw inside each stride window.
+    """CIRCULAR JITTERED SYSTEMATIC sub-sample: one seeded uniform draw inside each integer block
+    of a randomly rotated partition of ``range(n)``.
 
     ``max_items`` of None or <= 0 means "no cap": a caller that has decided the run is long enough
     to afford the full scan gets every item, in order, and no random number is drawn at all.
 
-    THE RULE.  Partition ``range(n)`` into ``k = max_items`` contiguous windows of width
-    ``s = n / k`` and take ONE uniform draw inside each window::
+    THE RULE.  With ``n`` items and ``k = max_items``, cut ``range(n)`` into ``k`` contiguous
+    INTEGER blocks at ``c_i = floor(i * n / k)`` (so every block holds ``floor(n/k)`` or
+    ``ceil(n/k)`` items and the large ones are spread evenly), rotate the whole partition by one
+    uniform draw ``d ~ U{0..n-1}``, and take ONE uniform draw inside each block::
 
-        j_i = floor(i * s + u_i * s),   u_i ~ U[0, 1) i.i.d.
+        d ~ U{0, ..., n-1};   o_i ~ U{0, ..., L_i - 1} i.i.d.,  L_i = c_(i+1) - c_i
+        j_i = (d + c_i + o_i) mod n,  returned sorted
 
-    (Ties between adjacent windows -- possible only when ``s`` is fractional, with probability
-    <= 1/(4 s^2) per adjacent pair -- are broken by advancing to the next index, so the returned
-    indices are strictly increasing and no instant is ever counted twice.)
+    The blocks are disjoint and cover ``range(n)``, so the result is exactly ``k`` DISTINCT indices
+    in increasing order with no tie-break anywhere -- nothing can collide, because nothing is
+    rounded onto a shared integer in the first place.
+
+    WHY THE ROTATION, AND WHY THIS IS THE PROPERTY THAT MATTERS.  Cutting into integer blocks alone
+    does not give a uniform inclusion probability when ``k`` does not divide ``n``: an item in a
+    short block is drawn with probability ``1/floor(s)`` and one in a long block with
+    ``1/ceil(s)``. The rotation makes the LAW of the partition invariant under cyclic shift, so
+    every item sees the same distribution of block sizes -- the population's own -- and
+
+        P(item m selected) = E[1 / L(m)]
+                           = [r(q+1)/n] * 1/(q+1) + [q(k-r)/n] * 1/q
+                           = r/n + (k-r)/n = k/n        for EVERY m, with n = qk + r, 0 <= r < k.
+
+    EXACTLY ``k/n``, at every ``n`` and ``k``, with no divisibility condition -- which is the claim
+    ``_sampling_block`` and ``distributional_note`` make, and the claim the previous rule
+    (:func:`_window_jitter_subsample`) could not support off the ``k | n`` cases. Verified two ways
+    over the awkward pairs, including ``n=3,k=2``, ``n=7,k=5``, ``n=300/481/961/1201,k=240``:
+    exact enumeration gives ``max |P - k/n| = 0`` in every case, and a 4k-200k-seed Monte Carlo of
+    the SHIPPED code puts every item inside the binomial band around ``k/n`` -- 19,062 item-level
+    frequencies over eleven cases, largest deviation 4.5 sigma against an expected maximum of ~4.1.
+
+    That band is stated PER ITEM, and not as a chi-square over items, deliberately: one draw of this
+    design selects exactly ``k`` items, so the counts are dependent WITHIN a draw and a chi-square
+    over them is not null-calibrated (measured across seed blocks with no defect present, its z
+    wanders from -5 to +18). ACROSS seeds each item's count is exactly ``Binomial(seeds, P(item))``,
+    which is what makes the per-item band exact. The cyclic-rotation device is Lahiri's circular
+    systematic sampling (1952), used there for this same divisibility defect.
+
+    WHAT UNIFORM INCLUSION PROBABILITY BUYS, precisely. For any per-instant quantity ``y``, the
+    sample mean over the kept instants is unbiased for the population mean, whatever ``y`` does --
+    that is the whole of it, and it is why no assumption about the population's spectrum appears
+    anywhere in this module. A POOLED distribution over instants that contribute unequal numbers of
+    observations (headways) is a ratio estimator, so it is unbiased to O(1/k) rather than exactly:
+    exactly unbiased when every instant contributes the same count, consistent otherwise. The rows
+    say it in that form and no stronger.
+
+    AND THE COST, stated: one block spans the seam between the end of the run and its start, so one
+    of the ``k`` strata is not an interval of time. That costs a little variance on a
+    non-stationary population (a stratum is meant to be internally homogeneous) and buys the exact
+    inclusion probability. There is no arrangement that gives both: with fixed integer blocks and
+    exactly one draw per block, ``P = 1/L`` is forced, and uniformity then REQUIRES ``L = n/k`` to
+    be an integer.
 
     WHY, AND WHY NOT THE OTHER TWO CANDIDATES.
 
@@ -1429,55 +1568,77 @@ def _subsample(items: list, max_items: int | None, *, stream: str,
     ``max_instants=0`` -- and this module now recommends exactly that (see :data:`MAX_TIME_BUCKETS`).
     REJECTED as the capped-path rule.
 
-    *Jittered systematic sampling* needs to know NOTHING about the population and has the two
-    properties the claim on these rows requires:
+    *Circular jittered systematic sampling* needs to know NOTHING about the population and has the
+    two properties the claim on these rows requires:
 
-      1. **Uniform inclusion probability, exactly k/n, for every item, at every n and k.** Item
-         ``m`` is selected iff some window's draw lands in ``[m, m+1)``; the windows tile ``[0, n)``
-         and each draw is uniform over its own window of width ``s``, so ``P(m) = 1/s = k/n``
-         regardless of where ``m`` sits or what the population does. The pooled empirical
-         distribution over the kept instants is therefore an unbiased estimator of the population's,
-         which is the claim ``distributional_note`` makes and the old rule could not support.
-      2. **The alias comb becomes a broadband noise floor.** The ``k`` phase offsets are i.i.d.
-         uniform on ``[0, s)``, so the sampled phase modulo ANY period ``p <= s`` is uniform and the
-         expectation of the estimate is the full-period average whatever ``p`` is. This is the
-         standard anti-aliasing result for stochastic sampling (Dippe & Wold 1985; Cook, ACM ToG
-         5(1), 1986): jitter trades an O(1) phase-dependent bias for O(1/sqrt(k)) noise.
+      1. **Uniform inclusion probability, exactly k/n, for every item, at every n and k.** Proved
+         above from the rotation, and measured below. This is what makes the sample mean over the
+         kept instants an unbiased estimator of the run's mean for ANY per-instant quantity, which
+         is the claim ``distributional_note`` and ``_sampling_block`` make. The rule this replaced
+         made the same claim on real-valued windows, where it is true only when ``k`` divides ``n``
+         -- see :func:`_window_jitter_subsample` for the measured size of that error.
+      2. **The alias comb becomes a broadband noise floor.** Uniform inclusion probability applied
+         to the indicator of "this instant is at phase ``p`` of some cycle" says the sampled phase
+         distribution is the population's own, for EVERY period, so the expectation of the estimate
+         is the full-cycle average whatever the cycle is. This is the standard anti-aliasing result
+         for stochastic sampling (Dippe & Wold 1985; Cook, ACM ToG 5(1), 1986): jitter trades an
+         O(1) phase-dependent bias for O(1/sqrt(k)) noise.
 
-    And it keeps what the old rule was chosen for: exactly one index per window means the maximum
-    gap is under ``2 s`` and the sample cannot clump, so this is stratified sampling with one unit
-    per stratum -- the design systematic sampling is the (fragile) shortcut for, with the same
-    variance advantage over simple random sampling on a smoothly varying population and without the
-    periodicity failure mode (Cochran, *Sampling Techniques*, 3rd ed., ch. 5 and 8.6).
+    And it keeps what the old rule was chosen for: exactly one index per block means consecutive
+    kept indices are at most ``L_i + L_(i+1) <= 2*ceil(s)`` apart and the sample cannot clump, so
+    this is stratified sampling with one unit per stratum -- the design systematic sampling is the
+    (fragile) shortcut for, with the same variance advantage over simple random sampling on a
+    smoothly varying population and without the periodicity failure mode (Cochran, *Sampling
+    Techniques*, 3rd ed., ch. 5 and 8.6). Simple random sampling without replacement would also give
+    inclusion probability exactly ``k/n``; it is not used because it gives up that stratification
+    and can leave whole minutes of a run unrepresented.
 
     WHAT THE REPLACEMENT ACHIEVES, on the thing that was broken. Published vs uncapped truth on the
-    reference arm, fixed-stride -> jittered, at the default cap of 240 in both cases::
+    reference arm, fixed stride -> THIS rule, at the default cap of 240 in both cases::
 
           duration   overlap_rate      headway_p50_s     headway_ks (GRADED vs 0.15)
-             300 s   -0.4% -> -0.6%    -0.2% -> -0.1%     +0.4% -> +0.1%
-            1800 s   -3.0% -> +2.7%    +0.6% -> +0.0%     -0.9% -> +0.8%
-            3600 s  -14.3% -> -0.9%    +0.6% -> -0.1%     -1.4% -> -1.0%
-            7200 s  -18.5% -> +7.0%    +2.3% -> +0.5%     -4.0% -> -1.0%
-           14400 s  -38.6% -> +5.1%    +7.2% -> -0.9%    -15.7% -> +1.1%
+             300 s   -0.4% -> +2.3%    -0.2% -> +0.3%     +0.4% -> +0.2%
+            1800 s   -3.0% -> +0.3%    +0.6% -> -0.0%     -1.0% -> +0.3%
+            3600 s  -14.3% -> +0.0%    +0.6% -> -0.1%     -1.4% -> -0.1%
+            7200 s  -18.5% -> +2.0%    +2.3% -> -1.2%     -4.0% -> -1.1%
+           14400 s  -38.6% -> -0.7%    +7.2% -> -1.5%    -15.7% -> +1.9%
 
-    The remaining single-seed error is NOISE, not bias: over 50 seeds at 14,400 s the rate reads
-    0.15217 +/- 0.00695 against a truth of 0.15399 (mean -1.2%, CV 4.6%) and the KS reads
-    0.19179 +/- 0.00215 against 0.19262 (mean -0.4%, CV 1.1%).
+    Those are SINGLE DRAWS, and the claim is about the estimator, not the draw. Over 20 seeds per
+    rung, mean error and CV::
 
-    AND IT IS NOT A LOCK MOVED TO A DIFFERENT PHASE. Sweeping the sampling grid across a full 24 s
-    signal cycle on the 14,400 s dataset -- the control that a merely re-aimed sampler would fail::
+          duration   overlap_rate        headway_p50_s      headway_ks
+             300 s   +0.25% / CV 1.80%   -0.02% / 0.27%     +0.08% / 0.33%
+            1800 s   -1.14% / CV 3.53%   -0.26% / 0.54%     -0.14% / 0.96%
+            3600 s   +1.61% / CV 4.87%   +0.10% / 0.98%     -0.24% / 1.01%
+            7200 s   +0.80% / CV 3.95%   +0.22% / 0.85%     -0.35% / 0.94%
+           14400 s   -0.40% / CV 5.06%   +0.04% / 0.82%     -0.20% / 1.21%
 
-                              min        max     spread    sd       mean vs truth
-        overlap_rate   old  0.09153    0.26718    2.92x   0.04694      -1.2%
-                       new  0.13908    0.16979    1.22x   0.00699      +1.6%
-        headway_ks     old  0.16079    0.22046    1.37x   0.02103      +1.3%
-                       new  0.18670    0.19475    1.04x   0.00212      -0.6%
+    i.e. the residual is NOISE of a size the CV states, around a mean that sits within 2.2 standard
+    errors (CV/sqrt(20)) of the truth at every one of those fifteen cells -- an extreme of ~2.2 over
+    fifteen numbers is what NO BIAS looks like -- where the fixed stride's error GREW with duration
+    to -38.6%. Note also what the single-draw row costs at 300 s: +2.3% where the fixed stride read
+    -0.4%. On a short, weakly-structured rung a deterministic rule can be closer; it is simply not
+    KNOWABLE that it is, which is the property being bought here.
 
-    The old rule's sd falls by 6.7x on the rate and 9.9x on the KS, and note what the OLD row means
-    for a graded verdict: the same 8-hour dataset published a KS anywhere from 0.1608 to 0.2205
-    against a 0.15 threshold depending only on which second the run happened to start. Under the new
-    rule the whole sweep lies in 0.1867-0.1948. That the old rule's MEAN over a full cycle is within
-    1.3% of the truth is the signature of a phase lock, not a defence of it.
+    AND IT IS NOT A LOCK MOVED TO A DIFFERENT PHASE. The control that a merely re-aimed sampler
+    would fail, under ONE construction for both rules -- drop the first ``off`` instants,
+    ``off = 0..23``, a full 24 s signal cycle of data truncation, on the 14,400 s dataset. (Dropping
+    <= 23 s out of 14,400 leaves the uncapped truth CONSTANT to 5 dp, sd 0.00000, so the whole
+    spread below is the sampler's own; and it is the only construction defined for both rules, since
+    "shift the sampling grid" is not a thing a random sampler has.)::
+
+                                        min        max     spread    sd      mean vs truth
+        overlap_rate   fixed stride    0.09460    0.19671    2.08x   0.01950     +6.1%
+                       shipped         0.13358    0.17108    1.28x   0.00816     +0.1%
+        headway_ks     fixed stride    0.16138    0.19249    1.19x   0.00971     -4.8%
+                       shipped         0.17894    0.19628    1.10x   0.00320     -0.6%
+
+    The sd falls 2.4x on the rate and 3.0x on the KS -- but the headline of this table is the MEAN,
+    not the sd: swept over the DATA rather than over the grid, the fixed stride is out by +6.1% and
+    -4.8% ON AVERAGE OVER A FULL CYCLE, where the shipped rule is out by +0.1% and -0.6%. And note
+    what the fixed-stride KS row means for a graded verdict: the same 8-hour dataset published a KS
+    anywhere from 0.1614 to 0.1925 against a 0.15 threshold depending only on which second the run
+    happened to start.
 
     DETERMINISM. The draws come from ``random.Random(f"{seed}:{SAMPLER_KEY}:{stream}:{n}:{k}")`` --
     this repository's own string-keyed stream convention (``scms_sim_ref.api.rng``), which is
@@ -1493,23 +1654,59 @@ def _subsample(items: list, max_items: int | None, *, stream: str,
         return list(items)
     k = int(max_items)
     rnd = random.Random(f"{int(seed)}:{SAMPLER_KEY}:{stream}:{n}:{k}")
-    step = n / float(k)
-    out, prev = [], -1
-    for i in range(k):
-        j = int(i * step + rnd.random() * step)
-        if j >= n:
-            j = n - 1
-        if j <= prev:               # adjacent windows can round onto the same index
-            j = prev + 1
-        if j >= n:                  # unreachable while k <= n; a guard, not a policy
-            break
-        prev = j
-        out.append(items[j])
-    return out
+    # `randrange` is exactly uniform (rejection sampling over getrandbits), which the exactness of
+    # the inclusion probability above depends on; `int(rnd.random() * n)` is not.
+    d = rnd.randrange(n)                                   # the cyclic rotation of the partition
+    cut = [(i * n) // k for i in range(k + 1)]              # c_i; blocks [c_i, c_(i+1)), sizes q|q+1
+    return [items[j] for j in sorted((d + cut[i] + rnd.randrange(cut[i + 1] - cut[i])) % n
+                                     for i in range(k))]
+
+
+class _VehCap:
+    """Census of the WITHIN-INSTANT vehicle cap, so a scan can say whether it bound and how hard.
+
+    An instant cap and a vehicle cap are two different sub-samples, and only the first one was ever
+    published. On a dense dataset the second is the bigger truncation of the two: at 1,669 vehicles
+    per instant, ``MAX_VEH_PER_BUCKET = 400`` keeps 24% of them.
+    """
+
+    def __init__(self, cap: int) -> None:
+        self.cap = int(cap)
+        self.units = self.capped = self.max_present = self.kept = self.present = 0
+
+    def _seen(self, present: int, kept: int) -> None:
+        self.units += 1
+        self.present += present
+        self.kept += kept
+        self.max_present = max(self.max_present, present)
+
+    def hit(self, present: int) -> None:
+        """One instant in which the cap BOUND: `cap` of `present` vehicles were kept."""
+        self.capped += 1
+        self._seen(present, self.cap)
+
+    def miss(self, present: int) -> None:
+        """One instant in which it did not: every vehicle present was kept."""
+        self._seen(present, present)
+
+    def block(self) -> dict:
+        out = {"vehicle_cap": int(self.cap), "instants_hitting_vehicle_cap": int(self.capped),
+               "max_vehicles_in_an_examined_instant": int(self.max_present)}
+        if self.capped:
+            out["vehicle_coverage_frac"] = _r(self.kept / self.present if self.present else None, 6)
+            out["vehicle_sampling"] = (
+                f"the vehicle cap BOUND in {self.capped} of {self.units} examined instants: inside "
+                f"those, {self.cap} of the vehicles present were kept by the same sampler on that "
+                f"instant's own stream, so a vehicle's inclusion probability is exactly "
+                f"{self.cap}/present. It is a second sub-sample on top of the instant one, and a "
+                f"quantity defined by a NEIGHBOUR (headway, co-presence distance) is biased LONG "
+                f"under it, because the nearest neighbour may not be in the sample. Raise "
+                f"MAX_VEH_PER_BUCKET or score a less dense dataset to remove it.")
+        return out
 
 
 def _sampling_block(examined: int, available: int, cap: int | None, unit: str,
-                    seed: int = SAMPLER_SEED) -> dict:
+                    seed: int = SAMPLER_SEED, veh: dict | None = None) -> dict:
     """The denominator, published beside every number read off a capped scan.
 
     A count taken over ``examined`` of ``available`` instants is not comparable with one taken over a
@@ -1521,17 +1718,28 @@ def _sampling_block(examined: int, available: int, cap: int | None, unit: str,
     cov = (float(examined) / float(available)) if available else None
     out = {f"{unit}_examined": int(examined), f"{unit}_available": int(available),
            "coverage_frac": _r(cov, 6), "cap": (int(cap) if cap else None),
-           "sampling": ("jittered systematic: one seeded uniform draw inside each stride window "
-                        "(stratified, one unit per stratum). Inclusion probability is exactly "
-                        "examined/available for every instant, so the sample is unbiased against "
-                        "ANY periodic structure -- which fixed-stride even spacing, the rule used "
-                        f"before, was not. See {SAMPLER_DOC}"),
+           "sampling": ("circular jittered systematic: one seeded uniform draw inside each integer "
+                        "block of a randomly rotated k-block partition (stratified, one unit per "
+                        "stratum). Over the sampler seed the inclusion probability is exactly "
+                        "examined/available for every unit -- at every population size and cap, "
+                        "with no divisibility condition -- so the sample mean is unbiased for the "
+                        "run's mean against ANY periodic structure. Fixed-stride even spacing, the "
+                        "rule used before, was not; nor was real-valued window jitter, which is "
+                        "exact only when the cap divides the population. THIS NUMBER IS ONE DRAW "
+                        "FROM THAT DESIGN: its own error is frozen once published and re-running "
+                        "cannot re-roll it, only a different sampler_seed can. "
+                        f"See {SAMPLER_DOC}"),
            "sampler": SAMPLER_KEY, "sampler_seed": int(seed)}
+    if veh:
+        out.update(veh)
     if cov is not None and cov < 1.0:
         out["comparability"] = (
             f"NOT COMPARABLE ACROSS DURATIONS AS A COUNT: {examined} of {available} {unit} were "
             f"examined ({cov:.2%}), and that fraction falls as 1/duration while the cap stays "
             f"fixed. Compare the paired RATE row instead, or re-score with --max-instants 0. "
+            f"The samples are also NOT NESTED across durations -- the key is keyed on the "
+            f"population size, so a longer run's sample is not a superset of a shorter run's and "
+            f"two rungs differ by their samples as well as by their data. "
             f"See {SAMPLING_CAP_DOC}")
     return out
 
@@ -1543,10 +1751,11 @@ def _instant_groups(segs: dict, max_instants: int | None = HEADWAY_MAX_INSTANTS,
     """Segment indices grouped by end-of-segment timestamp: one group = one instant.
 
     Deterministic sub-sampling, matching ``_snapshots``: instants are taken by :func:`_subsample`
-    (jittered systematic, own seeded stream ``"headway"``) and, inside an instant, in vehicle-id
-    order (``vid_i`` indexes the sorted vehicle list). ``stats``, when supplied, receives the
-    examined/available instant counts so the caller can publish the coverage this sub-sample
-    achieved.
+    (circular jittered systematic, own seeded stream ``"headway"``) and, inside an instant, so are
+    the vehicles when there are more than ``max_veh`` of them -- on a per-instant stream, so two
+    equally-sized instants do not draw the same positions. ``stats``, when supplied, receives the
+    examined/available instant counts, and the vehicle-cap census, so the caller can publish the
+    coverage this sub-sample achieved.
     """
     if not segs.get("n"):
         if stats is not None:
@@ -1556,10 +1765,23 @@ def _instant_groups(segs: dict, max_instants: int | None = HEADWAY_MAX_INSTANTS,
     order = np.lexsort((segs["vid_i"], t))
     bounds = np.flatnonzero(np.diff(t[order])) + 1
     groups = [g for g in np.split(order, bounds) if g.size >= 2]
-    kept = _subsample(groups, max_instants, stream="headway", seed=sampler_seed)
+    # Sub-sample INDICES, not the groups themselves, so each kept instant has a stable identity to
+    # key its own vehicle draw on.
+    idx = _subsample(list(range(len(groups))), max_instants, stream="headway", seed=sampler_seed)
+    out, veh = [], _VehCap(max_veh)
+    for i in idx:
+        g = groups[i]
+        if g.size > max_veh:
+            sel = _subsample(list(range(g.size)), max_veh, stream=f"headway_vehicles:{i}",
+                             seed=sampler_seed)
+            veh.hit(int(g.size))
+            g = g[np.asarray(sel, dtype=int)]
+        else:
+            veh.miss(int(g.size))
+        out.append(g)
     if stats is not None:
-        stats.update(examined=len(kept), available=len(groups))
-    return [g[:max_veh] for g in kept]
+        stats.update(examined=len(idx), available=len(groups), veh=veh.block())
+    return out
 
 
 def _snapshots(emissions: list[dict], bucket_s: float, max_buckets: int | None = MAX_TIME_BUCKETS,
@@ -1567,9 +1789,10 @@ def _snapshots(emissions: list[dict], bucket_s: float, max_buckets: int | None =
                sampler_seed: int = SAMPLER_SEED) -> list[dict]:
     """Co-presence snapshots: one position per vehicle per time bucket (its latest sample there).
 
-    Deterministic sub-sampling: buckets are taken by :func:`_subsample` (jittered systematic, own
-    seeded stream ``"copresence"``) and, inside a bucket, vehicles are kept in sorted-id order.
-    ``stats`` receives the examined/available bucket counts, which is what lets the comm panel
+    Deterministic sub-sampling: buckets are taken by :func:`_subsample` (circular jittered
+    systematic, own seeded stream ``"copresence"``) and, inside a bucket, so are the vehicles when
+    there are more than ``max_veh`` of them -- on that bucket's own stream. ``stats`` receives the
+    examined/available bucket counts and the vehicle-cap census, which is what lets the comm panel
     publish the fraction of the run its normalisation denominator was actually built from.
 
     This scan is sub-sampled for the SAME reason the traffic ones are and was phase-locked in the
@@ -1593,11 +1816,17 @@ def _snapshots(emissions: list[dict], bucket_s: float, max_buckets: int | None =
             buckets[b][str(vid)] = (t, x, y)
     keys_all = sorted(buckets)
     keys = _subsample(keys_all, max_buckets, stream="copresence", seed=sampler_seed)
+    veh = _VehCap(max_veh)
     if stats is not None:
         stats.update(examined=len(keys), available=len(keys_all))
     out = []
     for b in keys:
-        vids = sorted(buckets[b])[:max_veh]
+        vids = sorted(buckets[b])
+        if len(vids) > max_veh:
+            veh.hit(len(vids))
+            vids = _subsample(vids, max_veh, stream=f"copresence_vehicles:{b}", seed=sampler_seed)
+        else:
+            veh.miss(len(vids))
         if len(vids) < 2:
             continue
         out.append({
@@ -1607,6 +1836,8 @@ def _snapshots(emissions: list[dict], bucket_s: float, max_buckets: int | None =
             "y": np.array([buckets[b][v][2] for v in vids], dtype=float),
             "t": np.array([buckets[b][v][0] for v in vids], dtype=float),
         })
+    if stats is not None:
+        stats.update(veh=veh.block())
     return out
 
 
@@ -1813,7 +2044,7 @@ def _overlap_events(emissions: list[dict],
     Only exact timestamp matches are used (a bucketed snapshot would place vehicles up to a bucket
     apart in time and manufacture false overlaps). One position per (vehicle, instant): a vehicle
     emits at most one real CAM per step, and Sybil ghosts are never written to the emission stream.
-    Instants are sub-sampled by :func:`_subsample` (jittered systematic, seeded stream ``"overlap"``)
+    Instants are sub-sampled by :func:`_subsample` (circular jittered systematic, stream ``"overlap"``)
     when there are many. That sampler is load-bearing HERE above all: the true overlap rate on a
     signalised network is periodic in the signal cycle, and the fixed-stride rule this replaced
     reported one phase of it (-38.6% at 14,400 s on the reference arm).
@@ -2345,7 +2576,7 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
     hw_sampling = _sampling_block(
         hw_stats["examined"], hw_stats["available"],
         (max_instants if max_instants is not None else HEADWAY_MAX_INSTANTS), "instants",
-        seed=sampler_seed)
+        seed=sampler_seed, veh=hw_stats.get("veh"))
     hw_reason = thin or (None if hw.size >= MIN_SAMPLES else
                          f"only {hw.size} in-lane leader/follower pairs (need {MIN_SAMPLES})")
     out.append(_metric(
@@ -2398,9 +2629,15 @@ def traffic_panel(emissions: list[dict], probe: dict, refdata: dict, *,
                                       "phase-locks onto any periodic structure whose period "
                                       "divides it (a signal cycle), and the error is then a BIAS "
                                       "that no cap raise removes. The instants here are drawn by "
-                                      "jittered systematic sampling, whose inclusion probability "
-                                      f"is exactly examined/available for every instant. See "
-                                      f"{SAMPLER_DOC}",
+                                      "circular jittered systematic sampling, whose inclusion "
+                                      "probability over the sampler seed is exactly "
+                                      "examined/available for every instant, at every population "
+                                      "size and cap. Note the exact form of what that buys: the "
+                                      "instants are a self-weighting sample of the run, so a mean "
+                                      "over them is unbiased; this KS statistic pools unequal "
+                                      "numbers of headways per instant, which makes it a ratio "
+                                      "estimator -- unbiased to O(1/instants_examined), not "
+                                      f"exactly. See {SAMPLER_DOC}",
                **hw_sampling}))
 
     # ---- fundamental diagram --------------------------------------------------------------------
@@ -2671,7 +2908,7 @@ def comm_panel(emissions: list[dict], reports: list[dict], report_labels: list[d
     snap_sampling = _sampling_block(
         snap_stats["examined"], snap_stats["available"],
         (max_instants if max_instants is not None else MAX_TIME_BUCKETS), "buckets",
-        seed=sampler_seed)
+        seed=sampler_seed, veh=snap_stats.get("veh"))
     n_opp = sum(len(s["vids"]) * (len(s["vids"]) - 1) // 2 for s in snaps)
     few = None
     if no_reports:
@@ -2853,8 +3090,14 @@ def comm_panel(emissions: list[dict], reports: list[dict], report_labels: list[d
     if dataset_dir:
         try:
             from . import awareness as _aw
+            # THE CAP AND THE SAMPLER SEED GO THROUGH. This scan is capped exactly like the ones
+            # above it (240 time buckets by default) and used to take its own, unreachable by
+            # --max-instants and drawn by the withdrawn fixed-stride rule.
             rep = _aw.awareness_report(dataset_dir, refdata_dir=refdata.get("dir"),
-                                       bin_m=dist_bin_m, max_dist_m=max_dist_m)
+                                       bin_m=dist_bin_m, max_dist_m=max_dist_m,
+                                       max_snaps=(_aw.MAX_SNAPSHOTS if max_instants is None
+                                                  else max_instants),
+                                       sampler_seed=sampler_seed)
             out.extend(_aw.panel_rows(rep, _metric, lambda k: _ref(refdata, k)))
         except Exception as exc:                       # noqa: BLE001 - reported, never raised
             out.append(_metric(

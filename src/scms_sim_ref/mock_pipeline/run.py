@@ -329,9 +329,21 @@ TR37885_SHADOW_DECORR_M = {"LOS": 10.0, "NLOSv": 13.0, "NLOSb": 13.0}
 # NLOSv additional loss: PL_LOS + max(0, N(mu, sigma)), mu = base + max(0, 15*log10(d) - 41).
 # The base selects on BLOCKER HEIGHT vs antenna height, not on distance; the distance term is
 # identically zero below 10^(41/15) = 541.17 m, i.e. constant across the whole urban regime.
+# The three keys are this module's historic names for TR 37.885 V15.3.0 clause 6.2.1's three CASES;
+# `tr37885_nlosv_case` below is the standard's own rule and the only place the branch is decided.
 TR37885_NLOSV = {"both_below": (9.0, 4.5), "one_below": (5.0, 4.0), "both_above": (0.0, 0.0)}
 TR37885_BLOCKER_HEIGHT_M = {"car": 1.6, "motorcycle": 1.6, "truck": 3.0, "bus": 3.0}
-V2X_ANTENNA_HEIGHT_M = 1.5           # roof-mounted OBU antenna
+# TR 37.885 V15.3.0 Table 6.1.4-1: "UE antenna height -- Vehicle UE: As defined in Subclause 6.1.2.
+# Pedestrian UE, cellular UE: 1.5 m", and clause 6.1.2 gives Type 1 = 0.75 m, TYPE 2 = 1.6 m,
+# Type 3 = 3 m.  This engine declares its fleet TR Type 2 (see `_station_antenna`), so 1.6 m is the
+# height that declaration commits it to.  IT WAS 1.5 m UNTIL 2026-09-07, which is the standard's
+# PEDESTRIAN row -- the same table's RSU row (5 m) had been taken correctly, so the fleet was the
+# one station class reading off the wrong line.  Consequences of the correction, both measured and
+# both in the direction of the standard: a car blocker (1.6 m body) now resolves to TR Case 3
+# (5 dB) instead of Case 2 (9 dB), i.e. 3.836 dB LESS attenuation per car-blocked link; and blocker
+# TYPE now changes the loss, which under 1.5 m antennas it structurally could not.  Neither pinned
+# dataset digest moves: both run `radio_model="disc"`, which never reads `StationSnapshot.ant_h_m`.
+V2X_ANTENNA_HEIGHT_M = 1.6           # roof-mounted OBU antenna == TR 37.885 Type 2 (clause 6.1.2)
 RSU_ANTENNA_HEIGHT_M = 5.0           # pole-mounted RSU: above a car blocker, below nothing useful
 # Small-scale fading (nakagami_fading.m_by_distance_adopted): m = 3 / 1.5 / 1.0 over 0-50 / 50-150 /
 # >150 m. Power is Gamma(shape=m, scale=1/m) -- unit MEAN, so fading redistributes power without
@@ -367,6 +379,10 @@ GEO_ENDPOINT_CLEAR_M = 6.0           # ignore raster hits this close to either a
                                      # graph is RDP-simplified (10 m) and the raster has a ~1-cell
                                      # halo, so an antenna can nominally land on a building cell
 GEO_FADING_HEADROOM_DB = 10.0        # candidate-window headroom for a favourable Nakagami fade
+GEO_HEADING_MIN_MOVE_M = 0.05        # below this per-step displacement, HOLD the previous heading
+                                     # rather than recompute it: at a red light the numerator is
+                                     # rounding and lane wander, and a car in a queue still points
+                                     # down its own street (opt-in antenna pattern only)
 
 
 def tr37885_pathloss_db(state: str, d_m: float, fc_ghz: float = TR37885_FC_GHZ) -> float:
@@ -387,12 +403,493 @@ def tr37885_nlosv_mu_db(base_db: float, d_m: float) -> float:
     return base_db + max(0.0, 15.0 * math.log10(max(float(d_m), 1.0)) - 41.0)
 
 
+def tr37885_nlosv_case(tx_h_m: float, rx_h_m: float, blocker_h_m: float) -> str:
+    """TR 37.885 V15.3.0 clause 6.2.1's three-case blockage rule, as WRITTEN. Key of TR37885_NLOSV.
+
+    Verbatim: "Case 1: Minimum antenna height value of TX and RX > Blocker height - No additional
+    blockage loss"; "Case 2: Maximum antenna height value of TX and RX < Blocker height - Mean:
+    9 + max(0, 15*log10(d)-41) dB, standard deviation: 4.5 dB"; "Case 3: Otherwise - Mean: 5 dB +
+    max(0, 15*log10(d)-41), standard deviation: 4 dB".
+
+    THE TRAP THIS FUNCTION EXISTS TO CLOSE.  Until 2026-09-07 the branch was computed as
+    `below = (tx_h < blocker_h) + (rx_h < blocker_h)`, which conflates Case 1 with Case 3 AT
+    EQUALITY: Case 1 needs min(h) STRICTLY greater than the blocker, so an antenna standing exactly
+    at the blocker's height belongs to Case 3 (5 dB) and the old test returned 0 dB.  That was
+    unreachable only by luck -- at the 1.5 m antenna height this engine used to carry, no station
+    stood at any blocker height.  Under the standard's own urban Option A fleet ("100% vehicle type
+    2", antenna 1.6 m, body 1.6 m) equality is the ONLY NLOSv geometry there is, so the correction
+    to `V2X_ANTENNA_HEIGHT_M` would have walked straight into it: it would have swapped a +3.836 dB
+    error for a -5.2023 dB one. Both are fixed together, and neither may be fixed alone.
+    """
+    if min(tx_h_m, rx_h_m) > blocker_h_m:
+        return "both_above"                 # Case 1
+    if max(tx_h_m, rx_h_m) < blocker_h_m:
+        return "both_below"                 # Case 2
+    return "one_below"                      # Case 3, "otherwise" -- INCLUDING equality
+
+
 def nakagami_m_for_distance(d_m: float) -> float:
     """Nakagami shape factor for a link of this length (3 / 1.5 / 1.0 over 0-50 / 50-150 / >150 m)."""
     for upper, m in NAKAGAMI_M_BANDS:
         if d_m <= upper:
             return m
     return NAKAGAMI_M_BANDS[-1][1]
+
+
+# =========================================================================== #
+# OPT-IN CHANNEL PHYSICS.  Everything from here to `hidden_terminal_fraction`
+# is inert unless a `radio_*` knob switches it on; with the shipped defaults
+# `GeometricChannel` evaluates exactly the arithmetic it evaluated before, and
+# the two pinned dataset digests (which run `radio_model="disc"` and never
+# construct this class at all) cannot move.
+#
+# Each block says whether it is CONFORMANT (it implements what a standard we
+# claim to follow specifies) or MEASUREMENT-BASED (it implements what a
+# measurement campaign observed, in preference to a specification), and every
+# measurement-based constant carries whose measurement it is, under what
+# conditions it was taken, and why it was preferred.  A future reader must be
+# able to re-litigate these choices; that is what the citations are for.
+# =========================================================================== #
+
+_C_M_PER_S = 299_792_458.0          # exact, SI definition of the metre
+
+
+# --------------------------------------------------------------------------- #
+# 1. ANTENNA PATTERN -- CONFORMANT.  3GPP TR 37.885 V15.3.0 Tables 6.1.4-8 and
+#    6.1.4-9, "For 6 GHz" column (our carrier is 5.9 GHz), Option 1.
+#
+#    Read first-hand on 2026-09-07 from the ATIS mirror
+#    (ATIS.3GPP.37.885.V1530.pdf, pp. 15-16), the same copy the constants in
+#    refdata/pathloss_3gpp_tr37885.json were transcribed from.  Table 6.1.4-8
+#    "For 6 GHz", verbatim:
+#
+#      Antenna element gain VERTICAL pattern (all vehicle types)
+#          A_E,V(theta) = -min[ 12*((theta - 90)/theta_3dB)^2 , SLA_V ],
+#          theta_3dB = 90 deg, SLA_V = 20 dB
+#      Antenna element gain HORIZONTAL pattern
+#          Vehicle Type 2:            A_E,H(phi) = 0
+#          Vehicle Type 1 and Type 3: A_E,H(phi) = -min[ 12*(phi/phi_3dB)^2 , A_m ],
+#                                     phi_3dB = 120 deg, A_m = 20 dB
+#      Pattern combining method for 3D
+#          A''(theta, phi) = -min[ -(A_E,V(theta) + A_E,H(phi)) , A_m ]
+#      Max direct. gain of the antenna element
+#          3 dBi
+#
+#    Table 6.1.4-9 "For 6 GHz" places them, verbatim: "Vehicle Type 1 and Type
+#    3: Front and rear antennas: Baseline: (1, 1, 2, 1, 1) for each location.
+#    Front antenna array bearing angle: Omega_Front = 0 deg. Rear antenna array
+#    bearing angle: Omega_Rear = 180 deg"; "Vehicle Type 2: Rooftop antenna:
+#    Baseline: (1, 2, 2, 1, 1)".  So Type 2 is a single rooftop panel that is
+#    OMNIDIRECTIONAL IN AZIMUTH (its A_E,H is identically zero) and Types 1 and
+#    3 carry two panels, boresighted forwards and backwards.
+#
+#    THE GAP THIS CLOSES.  `mean_rx = tx_dbm - pl + shadow_db` had no antenna
+#    term of any kind -- no gain, no pattern, no bearing.
+#
+#    WITHDRAWN 2026-09-07, and recorded rather than deleted.  An earlier version
+#    of this comment claimed the term "unlocks" Nilsson et al.'s 2-4 m
+#    de-correlation distance as "the APPLICABLE comparison" for
+#    TR37885_SHADOW_DECORR_M.  IT DOES NOT, on the source's own terms.  Nilsson
+#    et al. (Sensors 18(12):4433, 2018, CC BY 4.0) measure that figure on the
+#    ZERO-MEAN, offset-subtracted large-scale process, and they say where the
+#    offset goes: "The mean of Psi-sigma ... represents the differences in the
+#    particular traffic situation and THE GAIN OF THE INVOLVED ANTENNAS for the
+#    particular communication link."  What their conditional asks for is a model
+#    that accounts for the PER-LINK antenna gain.  This term supplies a
+#    STATISTICAL ELEMENT pattern from a specification, and for the Type 2 pair
+#    that is ~70% of these fleets it is a CONSTANT +3 dBi at every bearing --
+#    which removes no per-link variation whatever.  Turning it on therefore does
+#    not move this model out of the source's "otherwise" branch, and
+#    RADIO-VS-REALITY.md section 2, in this same tree, already says so.  The
+#    de-correlation pin stands unchanged and is not re-litigated here.
+#
+#    WHAT THE TERM DOES DO TO THE BUDGET, stated because it is a CONFORMANCE
+#    correction and was mis-recorded as a double count.  TR 37.885 Table 6.1.1-1
+#    lists "UE Tx power -- Vehicle/pedestrian UE or UE type RSU: 23dBm" in the
+#    same column as "BS Tx power -- Macro BS: 49dBm", and 49 dBm is a macro's
+#    CONDUCTED PA power; the element gain is given SEPARATELY in Table 6.1.4-8
+#    ("Max direct. gain of the antenna element -- 3 dBi").  The only "e.i.r.p."
+#    anywhere in the document is clause 5's 63-64 GHz regulatory survey, not the
+#    simulation assumptions.  So the TR-conformant V2V budget is
+#    23 + 3 - PL + 3 = 29 - PL, which is what this model computes WITH THE
+#    PATTERN ON -- and the shipped default (pattern off) sits 6 dB BELOW the
+#    standard's own link budget.  See `radio_tx_power_dbm` for the two
+#    conventions this repository genuinely holds at once.
+# --------------------------------------------------------------------------- #
+TR37885_ANT_SLA_V_DB = 20.0          # Table 6.1.4-8, 6 GHz: vertical side-lobe floor
+TR37885_ANT_THETA_3DB_DEG = 90.0     # Table 6.1.4-8, 6 GHz: vertical 3 dB beamwidth
+TR37885_ANT_A_MAX_DB = 20.0          # Table 6.1.4-8, 6 GHz: horizontal front-to-back floor
+TR37885_ANT_PHI_3DB_DEG = 120.0      # Table 6.1.4-8, 6 GHz: horizontal 3 dB beamwidth (Types 1/3)
+TR37885_ANT_MAX_GAIN_DBI = 3.0       # Table 6.1.4-8, 6 GHz: max directional gain of the element
+TR37885_ANT_PANEL_BEARINGS_DEG = (0.0, 180.0)    # Table 6.1.4-9: Omega_Front, Omega_Rear
+#: Table 6.1.4-6 (pedestrian UE and cellular UE, 6 GHz): omnidirectional, max element gain 0 dBi.
+TR37885_PEDESTRIAN_ANT_GAIN_DBI = 0.0
+
+
+def _wrap180(deg: float) -> float:
+    """Fold an angle in degrees into [-180, 180]."""
+    return (float(deg) + 180.0) % 360.0 - 180.0
+
+
+def tr37885_antenna_gain_dbi(rel_az_deg: float, zenith_deg: float, directional: bool,
+                             max_gain_dbi: float = TR37885_ANT_MAX_GAIN_DBI) -> float:
+    """TR 37.885 Table 6.1.4-8 (6 GHz, Option 1) element gain toward one peer, in dBi.
+
+    `rel_az_deg` is the peer's azimuth relative to the VEHICLE's heading (0 = dead ahead) and
+    `zenith_deg` is the peer's zenith angle (0 = straight up, 90 = the horizon), which is what the
+    standard's `theta` means.  `directional=False` is vehicle Type 2 (a rooftop panel whose A_E,H
+    is identically 0, i.e. azimuth-omnidirectional); `directional=True` is Types 1 and 3, whose two
+    panels sit at the bearings in TR37885_ANT_PANEL_BEARINGS_DEG.
+
+    A two-panel station is scored on the BETTER of its panels.  The standard specifies the element
+    pattern and the panel bearings but leaves TXRU mapping "up to proponents decision", so it does
+    not say how the two are combined; taking the maximum is panel SELECTION, the conventional and
+    the most conservative reading (it never credits a station with array gain it was not given).
+    """
+    av = -min(12.0 * ((float(zenith_deg) - 90.0) / TR37885_ANT_THETA_3DB_DEG) ** 2,
+              TR37885_ANT_SLA_V_DB)
+    if not directional:
+        # Table 6.1.4-8: "Vehicle Type 2: A_E,H(phi) = 0"
+        return max_gain_dbi - min(-av, TR37885_ANT_A_MAX_DB)
+    best = None
+    for bearing in TR37885_ANT_PANEL_BEARINGS_DEG:
+        phi = _wrap180(rel_az_deg - bearing)
+        ah = -min(12.0 * (phi / TR37885_ANT_PHI_3DB_DEG) ** 2, TR37885_ANT_A_MAX_DB)
+        g = -min(-(av + ah), TR37885_ANT_A_MAX_DB)
+        best = g if best is None else max(best, g)
+    return max_gain_dbi + best
+
+
+# --------------------------------------------------------------------------- #
+# 2. NLOSv BLOCKAGE, "MEASUREMENT-BASED" ARM -- RETRACTED 2026-09-07.
+#    THERE IS NO `radio_nlosv_model` KNOB.  THIS ENTRY IS THE NEGATIVE RESULT.
+#
+#    An opt-in arm `radio_nlosv_model="measured_boban"` shipped in this file
+#    earlier the same day.  It fitted a log-linear, blocker-class-dependent
+#    NLOSv mean -- a 100 m level per blocker class and a 13 dB/decade slope --
+#    and it was offered as a measurement-based alternative to TR 37.885's flat
+#    specified term.  It is withdrawn, its constants are deleted, and the reason
+#    is recorded here because a measurement-motivated model that was tested
+#    against an independent measurement and LOST to the specification is a
+#    result, not an embarrassment.  Four reasons, any one sufficient:
+#
+#    1. IT WAS NOT MEASUREMENT-BASED.  Its LEVEL anchor was the widely-quoted
+#       "5, 13 and 20 dB for car, van and truck at 100 m" triple, which is
+#       GEMV^2 SIMULATOR OUTPUT.  Fig. 12's own caption in the source says so:
+#       "Received power distribution AS GENERATED BY GEMV^2 ... For each link, a
+#       single vehicle of a given type is placed between transmitter and
+#       receiver".  The body text says only that the results are "IN LINE WITH
+#       previous measurements" -- consistent with, not drawn from.  Only the
+#       SLOPE was measured.  This tree had already recorded exactly that, in
+#       capitals, in refdata/pathloss_3gpp_tr37885.json
+#       (`nlosv_reference_5_13_20_is_model_output`) and in
+#       docs/realism/RADIO-VS-REALITY.md section 7.7 -- and the arm was built
+#       and shipped anyway, in the same tree, on the same day.  Two files
+#       asserting opposite things about one number is the failure mode that
+#       matters most here; it is why the retraction is written down.
+#
+#    2. IT WAS FALSIFIED BY A MEASUREMENT THIS REPOSITORY ALREADY QUOTES, AND
+#       THE SPECIFICATION IT REPLACED BEAT IT BY ROUGHLY 10 dB.  Segata et al.
+#       (IEEE VNC 2013 section IV; A12 freeway, 5.89 GHz 802.11p, rooftop
+#       omnis, truck blocker; body text, not a figure) measure a LOS-to-NLOS
+#       truck difference of about 10 dB at 80 m and about 5 dB at 120 m.  The
+#       withdrawn arm's truck curve is 21.3 dB at 80 m and 20.0 dB at 120 m;
+#       TR 37.885's specified term is 9.04 dB at both.  The arm's error against
+#       that campaign is ONE-SIDED, +11 to +15 dB, an order of magnitude worse
+#       than the specification's -0.96 / +4.04 dB.  The arm existed because the
+#       spec's error CHANGES SIGN across the band -- but a sign-changing error
+#       of a few dB is not improved on by a one-sided error of fifteen.  The
+#       numbers and their quotations are in docs/realism/RADIO-VS-REALITY.md
+#       section 5, which had already graded the SPECIFICATION against Segata;
+#       nobody graded the arm.
+#
+#    3. NO MEASUREMENT IN ITS CHAIN WAS A CAR BLOCKING A CAR LINK.  The "car":
+#       5.0 dB anchor is for a GEMV^2 blocker whose mean height (1.5 m) EQUALS
+#       the transmit and receive antenna height -- the marginal case -- and the
+#       code mapped it onto the both-antennas-below branch.  The "5-7 dB at
+#       100 m" pair it leaned on is worse still: the 7 dB is the 802.11p van and
+#       the 5 dB is the 802.11b/g van at 2412 MHz.  A 2.4 GHz figure was being
+#       used to bracket a 5.9 GHz model.
+#
+#    4. LICENCE.  The level anchor digitised an IEEE-copyright figure into a
+#       source constant, which this project's standing rule forbids outright:
+#       numbers from licence-unclear or IEEE-copyright sources are never
+#       committed as code constants or refdata, and quotation with citation in
+#       prose is the only permitted form.  docs/realism/RADIO-VS-REALITY.md
+#       section 8 asserts "Nothing under a licence-unclear or non-CC licence is
+#       committed anywhere in the tree"; that sentence was false while those
+#       constants existed and is true again now.
+#
+#    WHAT WOULD MAKE A SUCCESSOR ARM ADMISSIBLE, stated so the door is not
+#    silently shut on the idea.  The DECAY is real: two independent campaigns
+#    report NLOSv excess loss falling with link distance across 10-120 m, and
+#    TR 37.885 is flat there by construction.  A successor must (a) be named for
+#    what it is rather than for a measurement it only partly uses, (b) carry no
+#    constant digitised from a figure or taken from a licence-unclear source,
+#    and (c) be graded against Segata et al. BEFORE it ships, not after.  Until
+#    then the specified term is the only NLOSv mean in this module, and its own
+#    falsification stays pinned in tests/test_geometric_channel.py section 8 --
+#    which is the honest state of affairs: the model is wrong in a way we have
+#    measured, rather than wrong in a way we have replaced with something worse.
+# --------------------------------------------------------------------------- #
+
+# --------------------------------------------------------------------------- #
+# 3. TWO-RAY GROUND-REFLECTION BREAKPOINT -- opt-in, `radio_breakpoint="two_ray"`.
+#
+#    CONFIRMED: TR37885_PATHLOSS is single-slope, and no breakpoint term exists
+#    anywhere in this module.  The physical breakpoint at which the first
+#    Fresnel ellipsoid meets the ground, d_b = 4*h_TX*h_RX/lambda, is 201.5 m at
+#    our own 1.6 m antenna heights and 5.9 GHz -- INSIDE the operating range
+#    (the docs quote a 338 m 0.90-awareness-equivalent range), so the omission
+#    is not academic.  (It was 177.1 m until 2026-09-07: d_b is QUADRATIC in the
+#    antenna height, so correcting V2X_ANTENNA_HEIGHT_M from the standard's
+#    pedestrian 1.5 m to its Type 2 1.6 m pushed the onset out by 13.8%.)
+#
+#    NOT CONFIRMED, AND DELIBERATELY NOT ASSERTED: the MAGNITUDE.  TR 37.885's
+#    urban LOS fit (b = 16.7 dB/decade) is an empirical fit to an urban canyon
+#    and may already embed waveguiding that partly cancels the ground-reflection
+#    loss; a post-breakpoint slope measured in one city need not transfer to
+#    another.  This term therefore ships OFF, and its slope is a KNOB rather
+#    than a constant.  Its default is the classical two-ray asymptote of
+#    40 dB/decade (received power ~ d^-4 beyond the breakpoint) because that is
+#    the one value here that is a physics result rather than a fitted
+#    observation.  Published post-breakpoint V2V slopes nearer 28-30 dB/decade
+#    exist; none was verified first-hand for this repository, so none is
+#    hard-coded, and the honest bracket is [b_TR, 40] dB/decade.
+#
+#    WHAT WOULD SETTLE IT: a licence-clean measured RSSI-vs-distance curve taken
+#    at ~1.6 m antenna heights at 5.9 GHz, in the same environment class, that
+#    reaches past 300 m -- the same curve `RADIO-VS-REALITY.md` section 6 lists
+#    as the outstanding unvalidated quantity.  Until that exists, running with
+#    and without this term brackets the answer instead of picking one.
+# --------------------------------------------------------------------------- #
+TWO_RAY_SLOPE_DB_PER_DECADE = 40.0   # received power ~ d^-4: the classical two-ray asymptote
+
+
+def two_ray_breakpoint_m(h_tx_m: float, h_rx_m: float, fc_ghz: float = TR37885_FC_GHZ) -> float:
+    """First-Fresnel-zone ground-reflection breakpoint d_b = 4*h_TX*h_RX/lambda, in metres."""
+    lam = _C_M_PER_S / (float(fc_ghz) * 1e9)
+    return 4.0 * float(h_tx_m) * float(h_rx_m) / lam
+
+
+def two_ray_excess_db(d_m: float, d_break_m: float, base_slope_db_dec: float,
+                      slope_db_dec: float = TWO_RAY_SLOPE_DB_PER_DECADE) -> float:
+    """Excess loss over a single-slope model once past the breakpoint, in dB.
+
+    Zero at and below `d_break_m` (so the composite is CONTINUOUS there) and (slope - base) dB per
+    decade beyond it, which is exactly "replace the slope past the breakpoint".  Clamped at zero, so
+    a `slope_db_dec` below the model's own slope is a no-op rather than a gain."""
+    if d_m <= d_break_m or d_break_m <= 0.0:
+        return 0.0
+    return max(0.0, (float(slope_db_dec) - float(base_slope_db_dec))
+               * math.log10(float(d_m) / float(d_break_m)))
+
+
+# --------------------------------------------------------------------------- #
+# 4. BLOCKER FOOTPRINT BY VEHICLE TYPE -- CONFORMANT, opt-in
+#    (`radio_blocker_width="tr37885"`).
+#
+#    GEO_BLOCKER_HALF_WIDTH_M is one number for every vehicle, so an articulated
+#    truck occludes exactly the same 2 m-wide corridor as a motorcycle.
+#    TR 37.885 V15.3.0 clause 6.1.2 gives the widths, verbatim: "Type 1
+#    (passenger vehicle with lower antenna position): length 5 meters, width 2.0
+#    meters"; "Type 2 ...: length 5 meters, width 2.0 meters"; "Type 3
+#    (truck/bus): length 13 meters, width 2.6 meters".  Half-widths 1.0 and 1.3 m
+#    -- note the shipped uniform 1.0 m is already exactly the Type 1/2 value, so
+#    switching this on widens ONLY trucks and buses.  Keyed on blocker height
+#    because that is the type signal the channel actually receives.
+# --------------------------------------------------------------------------- #
+TR37885_BLOCKER_HALF_WIDTH_M = {1.6: 1.0, 3.0: 1.3}    # clause 6.1.2 widths / 2, by body height
+
+
+def tr37885_blocker_half_width_m(blocker_h_m: float) -> float:
+    """Half of the TR 37.885 clause 6.1.2 body width for the type with this body height."""
+    return TR37885_BLOCKER_HALF_WIDTH_M.get(float(blocker_h_m), GEO_BLOCKER_HALF_WIDTH_M)
+
+
+# --------------------------------------------------------------------------- #
+# 5. TEMPORALLY CORRELATED SMALL-SCALE FADE -- opt-in,
+#    `radio_fading_correlation="jakes"`.
+#
+#    THE DEFECT.  The Nakagami fade is drawn i.i.d. per packet.  That is
+#    DEFENSIBLE AT SPEED and should be said so: at 30 m/s relative speed the
+#    Doppler is 590 Hz and the coherence time 0.72 ms, three orders below the
+#    100 ms CAM period, so consecutive CAMs really are independent.  It is
+#    optimistic at NEAR-ZERO relative speed, where the coherence time diverges
+#    and a deep fade that should persist across several CAMs gets resampled
+#    away instead -- and near-zero relative speed is exactly a queue at a red
+#    light, i.e. the `--traffic-lights` reference arm.
+#
+#    THE MODEL.  Clarke's isotropic-scattering autocorrelation
+#    rho = J0(2*pi*f_D*dt), carried as an AR(1) on a standard normal, with the
+#    Nakagami marginal imposed EXACTLY by the probability-integral transform
+#    X = F^-1(Phi(z)) for F = Gamma(shape=m, scale=1/m).  So the fade
+#    distribution is bit-for-bit the one the uncorrelated path already draws --
+#    only its time structure changes, which is the whole point.
+#
+#    WHAT IS EXACT AND WHAT IS NOT, stated plainly.  The MARGINAL is exact.
+#    The LAG-1 correlation of the underlying Gaussian is exact by construction.
+#    Correlation at longer lags is NOT: a true Clarke process is not AR(1), and
+#    an AR(1) forced to J0 at lag 1 gives rho^2 at lag 2 where Clarke gives
+#    J0(2x).  This is a lag-1-matched surrogate, not a Jakes simulator, and
+#    since the model samples the channel once per CAM, lag 1 is the lag that
+#    carries the delivery correlation.
+#
+#    NOTE J0 GOES NEGATIVE.  That is the real function, not a bug; an AR(1)
+#    with rho < 0 is well defined and still matches lag 1.  It does mean the
+#    correlation is NOT monotone in speed, which is a property of isotropic
+#    scattering rather than of this implementation.
+#
+#    THE LIMITATION THAT MATTERS MOST.  `v_rel` here is the NODE-TO-NODE
+#    relative speed, the conventional surrogate.  It neglects scatterer motion,
+#    so two vehicles travelling in convoy at identical speed are modelled as
+#    perfectly correlated when in reality the roadside scatterers still sweep
+#    past both of them.  This arm is therefore an UPPER BOUND on correlation
+#    for a convoy, and its honest scope is the stopped-and-crawling case.
+#
+#    AND NOTE THE CADENCE.  At the engine's default dt = 1.0 s, rho is below
+#    0.13 for any relative speed above 0.1 m/s, so this term does almost
+#    nothing until dt is reduced to the standard's own 100 ms link-state
+#    cadence.  It is at dt <= 0.1 s that it bites.
+# --------------------------------------------------------------------------- #
+JAKES_COHERENCE_CONST = 0.423        # T_c ~ 0.423 / f_D, the standard 50%-correlation figure
+
+
+def bessel_j0(x: float) -> float:
+    """Bessel function of the first kind, order 0.
+
+    Abramowitz & Stegun 9.4.1 (|x| < 8) and 9.4.3 (|x| >= 8) rational approximations, whose stated
+    error bound is |eps| < 1.6e-8 -- far inside anything a fading correlation needs, and dependency
+    free (`math` has no Bessel)."""
+    ax = abs(float(x))
+    if ax < 8.0:
+        y = x * x
+        p = (57568490574.0 + y * (-13362590354.0 + y * (651619640.7 + y * (-11214424.18
+             + y * (77392.33017 + y * (-184.9052456))))))
+        q = (57568490411.0 + y * (1029532985.0 + y * (9494680.718 + y * (59272.64853
+             + y * (267.8532712 + y)))))
+        return p / q
+    z = 8.0 / ax
+    y = z * z
+    xx = ax - 0.785398164
+    p = (1.0 + y * (-0.1098628627e-2 + y * (0.2734510407e-4
+         + y * (-0.2073370639e-5 + y * 0.2093887211e-6))))
+    q = (-0.1562499995e-1 + y * (0.1430488765e-3 + y * (-0.6911147651e-5
+         + y * (0.7621095161e-6 + y * (-0.934935152e-7)))))
+    return math.sqrt(0.636619772 / ax) * (math.cos(xx) * p - z * math.sin(xx) * q)
+
+
+def _gamma_p(a: float, x: float) -> float:
+    """Regularized lower incomplete gamma P(a, x): series below a+1, continued fraction above."""
+    if x <= 0.0:
+        return 0.0
+    if x < a + 1.0:
+        ap, s, term = a, 1.0 / a, 1.0 / a
+        for _ in range(300):
+            ap += 1.0
+            term *= x / ap
+            s += term
+            if abs(term) < abs(s) * 1e-15:
+                break
+        return s * math.exp(-x + a * math.log(x) - math.lgamma(a))
+    tiny = 1e-300
+    b, c, d = x + 1.0 - a, 1.0 / tiny, 1.0 / (x + 1.0 - a)
+    h = d
+    for i in range(1, 300):
+        an = -i * (i - a)
+        b += 2.0
+        d = an * d + b
+        if abs(d) < tiny:
+            d = tiny
+        c = b + an / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        step = d * c
+        h *= step
+        if abs(step - 1.0) < 1e-15:
+            break
+    return 1.0 - math.exp(-x + a * math.log(x) - math.lgamma(a)) * h
+
+
+def _norm_ppf(p: float) -> float:
+    """Inverse standard-normal CDF (Acklam's rational approximation + one Halley refinement)."""
+    a = (-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00)
+    b = (-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01)
+    c = (-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00)
+    d = (7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00)
+    lim = 0.02425
+    if p < lim:
+        q = math.sqrt(-2.0 * math.log(p))
+        x = (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    elif p <= 1.0 - lim:
+        q = p - 0.5
+        r = q * q
+        x = (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / \
+            (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
+    else:
+        q = math.sqrt(-2.0 * math.log(1.0 - p))
+        x = -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    e = 0.5 * math.erfc(-x / math.sqrt(2.0)) - p
+    u = e * math.sqrt(2.0 * math.pi) * math.exp(x * x / 2.0)
+    return x - u / (1.0 + x * u / 2.0)
+
+
+def _gamma_p_inv(a: float, p: float) -> float:
+    """Inverse of P(a, .) -- bracketed Newton from a Wilson-Hilferty start, bisecting on escape.
+
+    `p` is SATURATED into the representable open interval (0, 1) rather than trusted. The caller
+    feeds it Phi(z), and Phi(z) rounds to exactly 1.0 for any z above about 8.3, at which point
+    `_norm_ppf` would evaluate log(1 - p) = log(0) and raise `math domain error` -- crashing a run
+    on a single freak draw. Vanishingly unlikely per draw and not at all unlikely to be the one
+    thing that kills an eight-hour run, so the extreme quantile saturates instead."""
+    if p <= 0.0:
+        return 0.0
+    p = min(float(p), math.nextafter(1.0, 0.0))
+    x = max(a * (1.0 - 1.0 / (9.0 * a) + _norm_ppf(p) / (3.0 * math.sqrt(a))) ** 3, 1e-12)
+    lo, hi = 0.0, max(x * 4.0, 1.0)
+    while _gamma_p(a, hi) < p:
+        hi *= 2.0
+    for _ in range(120):
+        f = _gamma_p(a, x) - p
+        if abs(f) < 1e-14:
+            break
+        if f > 0.0:
+            hi = x
+        else:
+            lo = x
+        deriv = math.exp((a - 1.0) * math.log(x) - x - math.lgamma(a))
+        nx = x - f / deriv if deriv > 0.0 else x
+        x = nx if lo < nx < hi else 0.5 * (lo + hi)
+    return x
+
+
+def nakagami_power_from_normal(m: float, z: float) -> float:
+    """Gamma(shape=m, scale=1/m) fading POWER at the same quantile as the N(0,1) sample `z`.
+
+    The probability-integral transform, so the marginal is EXACTLY the distribution
+    `prng.gammavariate(m, 1/m)` draws -- unit mean, variance 1/m -- and only the time correlation
+    of the driving normal distinguishes the two arms."""
+    return _gamma_p_inv(m, 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))) / m
+
+
+def jakes_rho(v_rel_mps: float, dt_s: float, fc_ghz: float = TR37885_FC_GHZ) -> float:
+    """Clarke/Jakes correlation of the fading process across `dt_s` at this relative speed.
+
+    CLAMPED TO [-1, 1], and that clamp is load-bearing rather than defensive. |J0| <= 1 exactly,
+    but the A&S rational approximation overshoots slightly near the origin -- it returns
+    1.0000000028 at x = 0 -- and feeding that to an AR(1) gives `sqrt(1 - rho^2)` = 0 and a state
+    that is MULTIPLIED by 1.0000000028 every step. Over a long run that is an exponentially growing
+    fade, and at a stop line (where rho is exactly this value) it is the very case the term exists
+    to model."""
+    f_d = abs(float(v_rel_mps)) * float(fc_ghz) * 1e9 / _C_M_PER_S
+    return max(-1.0, min(1.0, bessel_j0(2.0 * math.pi * f_d * float(dt_s))))
 
 
 def hidden_terminal_fraction(d_m: float, sense_r_m: float) -> float:
@@ -540,28 +1037,47 @@ class _VehicleBlockerIndex:
         self.buckets: dict = {}
 
     def rebuild(self, entries) -> None:
-        """`entries` = iterable of (vid, x, y, blocker_height_m)."""
+        """`entries` = iterable of (vid, x, y, blocker_height_m[, half_width_m]).
+
+        The optional fifth element is the blocker's OWN half-width (opt-in GAP 5,
+        `radio_blocker_width="tr37885"`); omitted, every blocker keeps the uniform
+        GEO_BLOCKER_HALF_WIDTH_M the scan has always used, so a 4-tuple caller is unchanged."""
         self.buckets = {}
         c = self.cell
-        for vid, x, y, h in entries:
-            self.buckets.setdefault((int(x // c), int(y // c)), []).append((vid, x, y, h))
+        for e in entries:
+            vid, x, y, h = e[0], e[1], e[2], e[3]
+            hw = e[4] if len(e) > 4 else GEO_BLOCKER_HALF_WIDTH_M
+            self.buckets.setdefault((int(x // c), int(y // c)), []).append((vid, x, y, h, hw))
 
     def tallest_blocker(self, x0, y0, x1, y1, skip_a: int, skip_b: int,
                         half_width_m: float = GEO_BLOCKER_HALF_WIDTH_M) -> float:
-        """Height of the tallest vehicle whose body intersects the segment (0.0 = clear).
+        """Height of the tallest vehicle whose body intersects the segment (0.0 = clear)."""
+        return self.tallest_blocker_entry(x0, y0, x1, y1, skip_a, skip_b, half_width_m)[1]
+
+    def tallest_blocker_entry(self, x0, y0, x1, y1, skip_a: int, skip_b: int,
+                              half_width_m: float = GEO_BLOCKER_HALF_WIDTH_M,
+                              per_blocker_width: bool = False):
+        """(vid, height) of the tallest vehicle whose body intersects the segment; (0, 0.0) if clear.
+
+        The vid is what makes a PER-LINK blockage draw possible (GAP 2): "the same blocked link"
+        means "the same body in the way", and that identity is not recoverable from the height.
 
         Only the cells the segment actually passes through are visited -- sampled every `cell` metres
         along the line with its 3x3 neighbourhood, which provably covers every cell within one cell
         (>> half_width_m) of the segment. Enumerating the segment's bounding box instead is
-        O(length^2/cell^2) and is what made a 700 m link cost 841 bucket probes instead of ~80."""
+        O(length^2/cell^2) and is what made a 700 m link cost 841 bucket probes instead of ~80.
+
+        `per_blocker_width` swaps the uniform corridor for each blocker's own stored half-width; the
+        default reproduces the historic scan comparison for comparison, hit for hit."""
         dx, dy = x1 - x0, y1 - y0
         ll = dx * dx + dy * dy
         if ll <= 1e-9:
-            return 0.0
+            return 0, 0.0
         c = self.cell
         length = math.sqrt(ll)
         steps = int(length / c) + 1
         best = 0.0
+        best_vid = 0
         get = self.buckets.get
         seen = set()
         for k in range(steps + 1):
@@ -574,16 +1090,17 @@ class _VehicleBlockerIndex:
                     if key in seen:
                         continue
                     seen.add(key)
-                    for vid, vx, vy, h in get(key, ()):
+                    for vid, vx, vy, h, hw in get(key, ()):
                         if vid == skip_a or vid == skip_b or h <= best:
                             continue
                         s = ((vx - x0) * dx + (vy - y0) * dy) / ll
                         if not (0.0 < s < 1.0):      # strictly BETWEEN the two antennas
                             continue
+                        w = hw if per_blocker_width else half_width_m
                         px, py = x0 + s * dx, y0 + s * dy
-                        if (vx - px) ** 2 + (vy - py) ** 2 <= half_width_m * half_width_m:
-                            best = h
-        return best
+                        if (vx - px) ** 2 + (vy - py) ** 2 <= w * w:
+                            best, best_vid = h, vid
+        return best_vid, best
 
 
 # =========================================================================== #
@@ -780,13 +1297,37 @@ class GeometricChannel(LinkChannelModelBase):
         self.blockers = _VehicleBlockerIndex()
         self.step = -1
         self.stats = Counter()
+        # --- OPT-IN PHYSICS EXTENSIONS.  Every one defaults to the historic behaviour, and every
+        # one is read through getattr so this class still constructs from the reduced config the
+        # plugin-conformance contract builds out of `_CHANNEL_ENV_KEYS`.
+        self.nlosv_hold = bool(getattr(cfg, "radio_nlosv_hold", False))
+        self.ant_pattern = str(getattr(cfg, "radio_antenna_pattern", "none"))
+        self.ant_gain_dbi = float(getattr(cfg, "radio_antenna_gain_dbi", TR37885_ANT_MAX_GAIN_DBI))
+        self.blocker_width = str(getattr(cfg, "radio_blocker_width", "uniform"))
+        self.breakpoint_model = str(getattr(cfg, "radio_breakpoint", "none"))
+        self.breakpoint_slope = float(getattr(cfg, "radio_breakpoint_slope_db_per_decade",
+                                              TWO_RAY_SLOPE_DB_PER_DECADE))
+        # per-link blockage draw (GAP 2) and its OWN named stream, so that switching the hold on
+        # does not shift the shadowing sequence and an A/B isolates exactly this one change
+        self._nlosv: dict = {}              # unordered pair -> (signature, z) held blockage draw
+        self.fade_correlation = str(getattr(cfg, "radio_fading_correlation", "none"))
+        # true heading/velocity, DERIVED per station from the positions this channel already has
+        self._kin: dict = {}                # vid -> (x, y, heading_rad, vx, vy)
+        self._stations: dict = {}           # vid -> this step's StationSnapshot (antenna typing)
+        self._fade: dict = {}               # ordered pair -> (step, z) the correlated fade state
+        self._needs_kin = self.ant_pattern != "none" or self.fade_correlation != "none"
         # candidate-window cap: the distance at which the MEDIAN LOS signal is cap_sigma shadow
         # sigmas plus a fading headroom below the decode floor. Bounded by radio_cap_max_mult *
         # radio_range_m exactly as the logdistance branch is, so the cell search stays O(local) --
         # at realistic power the TR 37.885 urban-LOS slope (b = 16.7) puts the unbounded cap in the
         # tens of kilometres, so the multiplier, not the physics, is the performance dial here.
         a, b, c = TR37885_PATHLOSS[self.los_state]
-        budget = (self.tx_dbm - self.decode_floor_dbm
+        # With a pattern on, BOTH ends can contribute up to the element's max directional gain, so
+        # the candidate window has to widen by 2x that or the model would cull links its own link
+        # budget closes.  The window is an upper bound; being generous costs search time, not
+        # correctness, whereas being tight silently truncates reception.
+        ant_headroom = 2.0 * max(0.0, self.ant_gain_dbi) if self.ant_pattern != "none" else 0.0
+        budget = (self.tx_dbm - self.decode_floor_dbm + ant_headroom
                   + cfg.radio_cap_sigma * TR37885_SHADOW_SIGMA_DB["LOS"] + GEO_FADING_HEADROOM_DB)
         reach = 10.0 ** ((budget - a - c * math.log10(TR37885_FC_GHZ)) / b)
         # `reach_m` is the interface name; `cap_m` remains a read-only alias for one minor version.
@@ -822,13 +1363,57 @@ class GeometricChannel(LinkChannelModelBase):
         entry identical to the list comprehension this replaced.
         """
         if isinstance(frame, StepFrame):
-            entries = [(s.vid, s.x, s.y, s.blocker_h_m)
-                       for s in frame.stations.values() if s.blocker_h_m > 0.0]
+            if self.blocker_width == "tr37885":
+                entries = [(s.vid, s.x, s.y, s.blocker_h_m,
+                            tr37885_blocker_half_width_m(s.blocker_h_m))
+                           for s in frame.stations.values() if s.blocker_h_m > 0.0]
+            else:
+                entries = [(s.vid, s.x, s.y, s.blocker_h_m)
+                           for s in frame.stations.values() if s.blocker_h_m > 0.0]
             step = frame.step
+            self._stations = frame.stations
+            if self._needs_kin:
+                self._track(frame.stations)
         else:
             step, entries = frame, (blocker_entries if blocker_entries is not None else ())
+            if self._needs_kin:
+                raise ValueError(
+                    "radio_antenna_pattern / radio_fading_correlation need the StepFrame form of "
+                    "begin_step(): they are functions of each station's TYPE, HEADING and VELOCITY, "
+                    "and the legacy begin_step(step, blocker_entries) form carries none of them. "
+                    "Pass a StepFrame. (Degrading silently here would report a pattern that was "
+                    "never applied and a fade correlation computed at zero relative speed.)")
         self.step = step
         self.blockers.rebuild(entries)
+
+    def _track(self, stations) -> None:
+        """Heading and speed per station, DERIVED from the true positions this channel already has.
+
+        The antenna pattern needs a bearing, so heading became a channel input -- but it did NOT
+        need to become a new ABI field.  `StationSnapshot` already carries each station's TRUE
+        position every step, and a vehicle's antennas are fixed to its body, which points where the
+        body has been going.  Differencing consecutive true positions therefore yields the heading
+        without widening the oracle surface by one byte, and without a second, independently-wrong
+        copy of the heading the mobility model already owns.
+
+        Below GEO_HEADING_MIN_MOVE_M the displacement is numerically dominated by rounding and by
+        lane wander, so the LAST heading is held rather than recomputed.  That is also the
+        physically right answer for the case that matters most here: a vehicle stopped at a red
+        light still points down its own street, and a heading that spun freely at zero speed would
+        make a queue's antenna pattern flicker.  A station's first step has no previous position and
+        so no heading; it is treated as pointing along +x until it moves.
+        """
+        kin = self._kin
+        dt = self.dt
+        for vid, s in stations.items():
+            prev = kin.get(vid)
+            if prev is None:
+                kin[vid] = (s.x, s.y, 0.0, 0.0, 0.0)
+                continue
+            dx, dy = s.x - prev[0], s.y - prev[1]
+            moved = math.hypot(dx, dy)
+            hdg = math.atan2(dy, dx) if moved > GEO_HEADING_MIN_MOVE_M else prev[2]
+            kin[vid] = (s.x, s.y, hdg, dx / dt, dy / dt)
 
     def channel_busy_ratio(self, rx_vid: int, offered: float) -> float:
         """Interface name for :meth:`cbr`. `rx_vid` is unused: this estimator is a function of the
@@ -849,6 +1434,12 @@ class GeometricChannel(LinkChannelModelBase):
             self._shadow.pop(k, None)
         for k in [k for k in self._packet if k[0] not in live_vids and k[1] not in live_vids]:
             self._packet.pop(k, None)
+        for k in [k for k in self._nlosv if k[0] not in live_vids and k[1] not in live_vids]:
+            self._nlosv.pop(k, None)
+        for k in [k for k in self._fade if k[0] not in live_vids and k[1] not in live_vids]:
+            self._fade.pop(k, None)
+        for v in [v for v in self._kin if v not in live_vids]:
+            self._kin.pop(v, None)
 
     def cbr(self, load_msgs_per_step: float) -> float:
         """Modelled channel busy ratio: offered frames per second x PPDU+MAC airtime, capped at 1.
@@ -866,6 +1457,72 @@ class GeometricChannel(LinkChannelModelBase):
         separation, which is the qualitative behaviour the flat ramp it replaces did not have."""
         g = cbr * hidden_terminal_fraction(dist_m, self.sense_m)
         return 1.0 - math.exp(-2.0 * g) if g > 0.0 else 0.0
+
+    # -- antenna ----------------------------------------------------------------------------- #
+    def _station_antenna(self, vid: int):
+        """(is_directional, max_gain_dbi) for this station under TR 37.885, or None if not modelled.
+
+        The standard's vehicle types are recovered from the one type signal the channel already
+        receives, the BODY HEIGHT that TR37885_BLOCKER_HEIGHT_M assigns:
+
+          * body 3.0 m  -> TR 37.885 Type 3 (truck/bus). Table 6.1.4-9: front AND rear panels at
+            bearings 0 deg / 180 deg, each with the Type 1/3 directional horizontal pattern.
+          * body 1.6 m  -> TR 37.885 Type 2 (passenger vehicle, higher antenna position). Table
+            6.1.4-9: ONE rooftop panel; Table 6.1.4-8 gives it A_E,H(phi) = 0, azimuth-omni.
+            Type 2 rather than Type 1 because this engine mounts every vehicle antenna at
+            `V2X_ANTENNA_HEIGHT_M`, which is Type 2's 1.6 m rooftop placement and not Type 1's
+            0.75 m bumper placement. That declaration and the constant now AGREE; until 2026-09-07
+            the constant said 1.5 m, which is Table 6.1.4-1's PEDESTRIAN UE height, and this
+            docstring was the justification for a type the fleet did not have.
+          * a VRU -> Table 6.1.4-6 (pedestrian UE, 6 GHz): omnidirectional, max element gain 0 dBi.
+          * an RSU -> NOT MODELLED, AND REFUSED. TR 37.885 gives RSUs BS-type and UE-type antenna
+            ARRAYS (Tables 6.1.4-1 to 6.1.4-5) with panel bearings, tilt and TXRU mapping; this
+            model has no array factor to put them through. Contributing 0 dB for an RSU endpoint
+            while both ends of every V2V link contribute the element gain is a PERMANENT relative
+            penalty on infrastructure links -- 3 dB at the shipped gain -- produced by a missing
+            model rather than by physics, so `validate_config` refuses the combination and this
+            raises if it is ever reached with validation bypassed.
+        """
+        st = self._stations.get(vid)
+        if st is None:
+            self.stats["ant_station_unknown"] += 1
+            return None
+        if st.is_rsu:
+            self.stats["ant_rsu_not_modelled"] += 1
+            raise ValueError(
+                f"radio_antenna_pattern={self.ant_pattern!r} met an RSU (vid {vid}) and TR 37.885 "
+                f"models an RSU with an antenna ARRAY (Tables 6.1.4-1..-5) this channel cannot "
+                f"evaluate. Returning 0 dB here would put every V2I link "
+                f"{self.ant_gain_dbi} dB below every V2V link for a modelling reason, silently. "
+                f"validate_config refuses this combination; something bypassed it.")
+        if st.is_vru:
+            return False, TR37885_PEDESTRIAN_ANT_GAIN_DBI
+        return st.blocker_h_m >= TR37885_BLOCKER_HEIGHT_M["truck"], self.ant_gain_dbi
+
+    def _antenna_gain_db(self, vid: int, own_x: float, own_y: float, peer_x: float, peer_y: float,
+                         own_h: float, peer_h: float, d: float) -> float:
+        """This station's element gain toward its peer, in dB (0.0 when no pattern is modelled).
+
+        The BEARING is taken from the coordinates this link was actually evaluated at, and only the
+        HEADING from the tracked kinematics.  That distinction matters for a Sybil ghost: the ghost
+        radiates from its attacker's true position (which is what `evaluate_raw` is handed) and it
+        inherits the attacker's heading (which is what `_kin` holds under the attacker's true vid),
+        so its pattern is the attacker's pattern -- exactly as the physics requires, and exactly the
+        property that keeps the channel un-steerable by a position-falsifying attacker.
+        """
+        spec = self._station_antenna(vid)
+        if spec is None:
+            return 0.0
+        directional, max_gain = spec
+        kin = self._kin.get(vid)
+        if kin is None:
+            self.stats["ant_heading_unknown"] += 1
+            return 0.0
+        bearing = math.atan2(peer_y - own_y, peer_x - own_x)
+        rel_az = math.degrees(bearing - kin[2])
+        # zenith: 0 = straight up, 90 = the horizon, which is TR 37.885's own theta convention
+        zenith = 90.0 - math.degrees(math.atan2(peer_h - own_h, max(d, 1e-9)))
+        return tr37885_antenna_gain_dbi(rel_az, zenith, directional, max_gain)
 
     # -- per-link ---------------------------------------------------------------------------- #
     def _link_state(self, tx_vid, rx_vid, txx, txy, rxx, rxy, d, tx_h, rx_h):
@@ -895,7 +1552,9 @@ class GeometricChannel(LinkChannelModelBase):
         st["pa"], st["pb"] = pa, pb
 
         # --- classification -------------------------------------------------------------------
-        blocker_h = self.blockers.tallest_blocker(txx, txy, rxx, rxy, tx_vid, rx_vid)
+        blocker_vid, blocker_h = self.blockers.tallest_blocker_entry(
+            txx, txy, rxx, rxy, tx_vid, rx_vid,
+            per_blocker_width=(self.blocker_width == "tr37885"))
         if self.buildings is not None:
             nlosb = self.buildings.blocked(txx, txy, rxx, rxy)
         elif self.canyon_per_m > 0.0:
@@ -912,13 +1571,78 @@ class GeometricChannel(LinkChannelModelBase):
             nlosb = False
         if nlosb:
             state, mu_base, sig_v = "NLOSb", 0.0, 0.0
+            case = "both_above"
         elif blocker_h > 0.0:
-            below = (tx_h < blocker_h) + (rx_h < blocker_h)
-            mu_base, sig_v = TR37885_NLOSV[("both_above", "one_below", "both_below")[below]]
-            state = "NLOSv" if below else "LOS"     # both antennas above the blocker -> no loss
+            # TR 37.885 clause 6.2.1's own three-case rule, in ONE place (`tr37885_nlosv_case`).
+            # It replaced `below = (tx_h < blocker_h) + (rx_h < blocker_h)`, which could not express
+            # the standard's Case 1 / Case 3 boundary: `below == 0` means min(h) >= blocker, and the
+            # standard's Case 1 needs min(h) STRICTLY greater. See that function for the whole trap.
+            case = tr37885_nlosv_case(tx_h, rx_h, blocker_h)
+            mu_base, sig_v = TR37885_NLOSV[case]
+            state = "LOS" if case == "both_above" else "NLOSv"   # Case 1 -> no blockage loss at all
         else:
             state, mu_base, sig_v = "LOS", 0.0, 0.0
+            case = "both_above"
         self.stats[state] += 1
+        st["blocker_h"] = blocker_h
+
+        # --- GAP 2: hold the NLOSv blockage draw for the BLOCKAGE EPISODE, not per packet -------
+        # PHYSICS-MOTIVATED, NOT SPECIFIED BY THE STANDARD.  Read the label carefully: an earlier
+        # version of this comment called the hold "CONFORMANT (TR 37.885 6.2.1)" on the strength of
+        # "The additional blockage loss is max {0 dB, a log-normal random variable}", and asserted
+        # that the standard says ONE DRAW PER BLOCKED LINK.  IT DOES NOT.  Clause 6.2.1 read in full
+        # states no temporal scope for the draw at all -- not "per link", not "per packet" -- and
+        # that claim entered this file from the task brief that commissioned the term, not from the
+        # document.  Two further reasons the CONFORMANT label was wrong rather than merely
+        # unsupported:
+        #   * the standard's blocker is STATISTICAL, not geometric: "The blocker height is the
+        #     vehicle height which is randomly selected out of the three vehicle types according to
+        #     the portion of the vehicle types in the simulated scenario."  The signature below keys
+        #     the held deviate to a GEOMETRICALLY IDENTIFIED vehicle the standard does not have.
+        #   * the standard's own baseline is a STATIC STATE: "Baseline is the state is not updated
+        #     between LOS and NLOSv", i.e. drawn once per link-LIFETIME -- a STRONGER hold than the
+        #     signature refresh implemented here, and one this code's own "a different vehicle means
+        #     a new episode" rule deliberately breaks.
+        # THE TERM STAYS, ON ITS PHYSICS MERITS, and they are measured: a blockage is a large-scale
+        # effect of the same class as shadow fading, redrawing it per packet demotes it to fast
+        # fading and double-counts against the Nakagami fade on the next line, and holding it
+        # lengthens the consecutive-loss runs misbehaviour detection reads (2.17 -> 2.87 steps,
+        # +32%; P(loss|loss) 0.543 -> 0.657).  What is withdrawn is the claim that a standard
+        # requires it.
+        #
+        # THE RULE, and what "the episode" means when both endpoints move and the blocker set
+        # changes: what is held is the STANDARDISED deviate z ~ N(0,1), and it is held for exactly
+        # as long as the blocking geometry that produced it persists.  The draw is refreshed when,
+        # and only when, the SIGNATURE (blocker vid, TR 37.885 case) changes -- i.e.
+        #   * the link enters NLOSv (no previous obstruction),
+        #   * a DIFFERENT vehicle becomes the tallest obstruction (the body the variable describes
+        #     has been replaced by another body, so it is a new obstruction event, not the same one
+        #     seen later), or
+        #   * the case changes between TR Case 2 ("both_below") and TR Case 3 ("one_below") -- a
+        #     qualitative change in the geometry, and the one that also selects sigma.
+        # The draw is dropped when the link leaves NLOSv, so re-entering blockage is a fresh
+        # episode rather than a resumed one.  Holding z rather than the realised dB value keeps the
+        # standard's DISTANCE dependence live: `max(0, mu(d) + sigma*z)` still tracks the link's own
+        # length, which below 541.17 m is a constant and above it is not.
+        # The stream is the link's OWN, separate from the shadowing stream, so that enabling the
+        # hold does not shift the shadowing sequence and an A/B isolates this change alone.
+        if self.nlosv_hold:
+            if state == "NLOSv":
+                sig = (blocker_vid, case)
+                held = self._nlosv.get(key)
+                if held is None or held[0] != sig:
+                    rng_b = st.get("nlosv_rng")
+                    if rng_b is None:
+                        rng_b = random.Random(f"{self.seed}:nlosv:{key[0]}:{key[1]}")
+                        st["nlosv_rng"] = rng_b
+                    self._nlosv[key] = (sig, rng_b.gauss(0.0, 1.0))
+                    self.stats["nlosv_draw"] += 1
+                st["z"] = self._nlosv[key][1]
+            else:
+                self._nlosv.pop(key, None)
+                st["z"] = None
+        else:
+            st["z"] = None
 
         # --- AR(1) / Gudmundson shadowing -------------------------------------------------------
         sigma = TR37885_SHADOW_SIGMA_DB[state]
@@ -943,6 +1667,196 @@ class GeometricChannel(LinkChannelModelBase):
         measures)."""
         return 0.0 if rx_dbm >= self.decode_floor_dbm else 1.0
 
+    # -- THE LINK BUDGET.  ONE SITE, AND IT HAS TO STAY ONE SITE. ---------------------------- #
+    def mean_rx_dbm(self, tx_vid, rx_vid, txx, txy, rxx, rxy, d, tx_h, rx_h,
+                    state, shadow_db, nlosv_loss_db) -> float:
+        """Mean received power on this link before the per-packet fade, in dBm.
+
+        EVERY term in the budget is assembled here and NOWHERE ELSE, and that is a SECURITY
+        property, not a tidiness one.  Two callers need this number: `evaluate_raw`, for a frame a
+        receiver genuinely decoded, and `synthesize_rx_dbm`, for the `rssi_dbm` column of a
+        FABRICATED misbehaviour report.  If those two ever compute the budget separately, the
+        difference between them becomes a classifier: an ML model trained on `ma_reports` learns
+        "this report's RSSI is 6 dB high, therefore it is a fabrication", which is an oracle the
+        attacker did not earn and the dataset should not contain.
+
+        THAT IS NOT HYPOTHETICAL.  The collusion path used to hand-roll `tx_dbm - pathloss(state,
+        d)` of its own.  While the shipped defaults were the only configuration, the two agreed to
+        +0.036 dB and the design was sound.  Enabling `radio_antenna_pattern="tr37885_opt1"` -- one
+        knob, no change to the collusion code -- opened a +5.824 dB gap (1.15 sigma; a single
+        threshold separated fabricated from genuine at AUC ~= 0.79) because the antenna term existed
+        on one side of the model only.  Any future term added to this method is added to both paths
+        by construction; a term added anywhere else re-opens the hole.
+        `tests/test_geometric_channel_physics.py` enumerates every `radio_*` knob this class reads
+        and fails if any of them re-opens it.
+        """
+        if state == "NLOSb":
+            pl = tr37885_pathloss_db(self.nlos_state, d)
+        else:
+            pl = tr37885_pathloss_db(self.los_state, d)
+            pl += nlosv_loss_db
+            # GAP 3: the ground-reflection breakpoint, opt-in.  Applied only to the LOS path-loss
+            # family: a two-ray ground reflection is a LINE-OF-SIGHT interference effect, and
+            # asserting it on a building-blocked path (where TR 37.885 already fits b = 30) would
+            # be stacking a mechanism on a geometry that does not have it.
+            if self.breakpoint_model == "two_ray":
+                pl += two_ray_excess_db(d, two_ray_breakpoint_m(tx_h, rx_h),
+                                        TR37885_PATHLOSS[self.los_state][1], self.breakpoint_slope)
+        mean_rx = self.tx_dbm - pl + shadow_db
+        if self.ant_pattern != "none":
+            # GAP 1: TR 37.885 Table 6.1.4-8/-9 element gains at BOTH ends.  This is the whole of
+            # the antenna term; before it, the link budget had none at all.
+            mean_rx += (self._antenna_gain_db(tx_vid, txx, txy, rxx, rxy, tx_h, rx_h, d)
+                        + self._antenna_gain_db(rx_vid, rxx, rxy, txx, txy, rx_h, tx_h, d))
+        return mean_rx
+
+    #: Large-scale candidates drawn per synthesis before one is kept in proportion to how likely it
+    #: was to have DECODED (see :meth:`synthesize_rx_dbm`).  The scheme's bias is O(1/K), and it was
+    #: MEASURED rather than assumed, on the hardest geometry available -- 150 m behind a truck,
+    #: where 26% of genuine frames fail the decode floor -- against 60,000 genuine samples
+    #: (se 0.03 dB): K = 2 -> -0.481 dB, 4 -> -0.211, 8 -> -0.097, 16 -> -0.083, 32 -> -0.044,
+    #: 64 -> -0.029 dB, i.e. inside one standard error at 64.  On an unblocked 150 m link, where
+    #: almost nothing is truncated, every K from 2 to 64 is already inside 0.031 dB.
+    SYNTH_LARGE_SCALE_CANDIDATES = 64
+    #: Below this mean P(decode) over those candidates, the model is saying the link cannot deliver
+    #: a frame at all -- so a genuine report of that link does not exist at any RSSI, and the
+    #: synthesis relaxes the link STATE rather than emit a value glued to the decode floor. See
+    #: :meth:`synthesize_rx_dbm`. One in a million is "the model says no": at that rate the genuine
+    #: population carries a handful of such rows per hundred million link-steps.
+    SYNTH_UNDECODABLE_P = 1e-6
+
+    def synthesize_rx_dbm(self, tx_vid, rx_vid, txx, txy, rxx, rxy, d, rng,
+                          tx_h=None, rx_h=None) -> float:
+        """The RSSI this channel WOULD have produced on this TRUE link, GIVEN THAT IT DECODED.
+
+        WHAT IT IS FOR.  A colluder files a fabricated misbehaviour report against a victim it has
+        never exchanged a frame with in the reception loop.  A NULL (or a missing key) in that
+        report's `rssi_dbm` would be a perfect oracle -- "no RSSI, therefore a collusion" -- and so
+        would any hand-rolled stand-in that drifts from the real budget.  The colluder is a real
+        radio standing a real distance from its victim: it genuinely hears the victim's CAMs, it
+        merely lies about their content.  So the honest synthesis is the value THIS model produces
+        for that true link, which is what this returns.
+
+        HOW IT STAYS HONEST, structurally:
+          * the mean comes from :meth:`mean_rx_dbm`, the single budget site, so every enabled term
+            -- antenna pattern, breakpoint, blockage, whatever is added next -- is in it;
+          * the classification is the same rule `_link_state` uses, taken from the live per-link
+            state when the reception loop has already classified this link this step and evaluated
+            READ-ONLY against the same blocker index and building raster when it has not;
+          * every random draw comes from the CALLER's stream, so this never perturbs the reception
+            loop's per-link streams and an A/B on the collusion path cannot move a genuine link.
+
+        AND WHY IT IS NOT A REJECTION LOOP.  A report is only ever filed on a frame that DECODED, so
+        the honest column is the channel law CONDITIONED on clearing the decode floor -- the JOINT
+        law of (shadowing, blockage, fade) conditioned on their sum, not the fade alone conditioned
+        on a shadowing draw that was allowed to stand however unfavourable it was.  The first
+        version of this method resampled only the fade, and that is a measurable oracle in its own
+        right: at 150 m behind a truck it left the fabricated population 1.16 dB BELOW the genuine
+        one, because unfavourable large-scale draws survived in the fabricated column that the
+        genuine column had already lost to the floor.  Instead, K large-scale candidates are drawn
+        and ONE is kept with probability proportional to its own P(decode) -- sampling-importance
+        resampling, exact as K grows, O(1/K) biased at finite K -- and the fade is then drawn from
+        its exactly-inverted truncated Gamma.  Two properties fall out: the result is ALWAYS at or
+        above the decode floor with no clamping (so there is no point mass at exactly -81.00 to
+        recognise), and the method cannot fail or exhaust however hopeless the link is.
+        """
+        d = max(float(d), 1.0)
+        if tx_h is None:
+            tx_h = self._ant_h(tx_vid)
+        if rx_h is None:
+            rx_h = self._ant_h(rx_vid)
+        key = (tx_vid, rx_vid) if tx_vid < rx_vid else (rx_vid, tx_vid)
+        live = self._shadow.get(key)
+        if live is not None and live.get("step") == self.step and live.get("s") is not None:
+            state, mu_base, sig_v = live["state"], live["mu"], live["sig"]
+        else:
+            state, mu_base, sig_v = self._classify_readonly(
+                tx_vid, rx_vid, txx, txy, rxx, rxy, d, tx_h, rx_h, rng)
+        m = nakagami_m_for_distance(d)
+        floor = self.decode_floor_dbm
+
+        def large_scale(link_state, mu_base_db, sig_db):
+            """K candidate (shadowing, blockage) draws; keep one with probability ~ its P(decode)."""
+            sigma = TR37885_SHADOW_SIGMA_DB[link_state]
+            mu_v = tr37885_nlosv_mu_db(mu_base_db, d) if link_state == "NLOSv" else 0.0
+            best = picked = None
+            total = 0.0
+            for _ in range(self.SYNTH_LARGE_SCALE_CANDIDATES):
+                shadow_db = rng.gauss(0.0, sigma)
+                blk = max(0.0, rng.gauss(mu_v, sig_db)) if link_state == "NLOSv" else 0.0
+                mean = self.mean_rx_dbm(tx_vid, rx_vid, txx, txy, rxx, rxy, d, tx_h, rx_h,
+                                        link_state, shadow_db, blk)
+                # the fade power this candidate needs in order to decode, and its probability
+                g0 = 10.0 ** ((floor - mean) / 10.0)
+                p_below = min(_gamma_p(m, m * g0), 1.0 - 1e-15)    # P(no decode | this candidate)
+                cand = (mean, g0, p_below)
+                if best is None or mean > best[0]:
+                    best = cand
+                w = 1.0 - p_below
+                total += w
+                # reservoir of one, weighted: keep this candidate with probability w / total-so-far
+                if total > 0.0 and rng.random() < w / total:
+                    picked = cand
+            return (picked or best), total / self.SYNTH_LARGE_SCALE_CANDIDATES
+
+        picked, p_decode = large_scale(state, mu_base, sig_v)
+        if p_decode < self.SYNTH_UNDECODABLE_P and state != "LOS":
+            # THE BOUNDARY WHERE THIS STOPS BEING A STATEMENT ABOUT THIS LINK, named rather than
+            # hidden. Conditioning on decoding conditions the link STATE too, not only the draws:
+            # a report exists at all only because a frame arrived, and on a link the model says
+            # cannot deliver one -- a building-blocked 300 m path is 30 dB under the floor -- the
+            # genuine population contains no such rows AT ANY RSSI. Keeping the blocked state here
+            # would emit values pinned to within a millionth of a dB of the decode floor, which is
+            # the clamp fingerprint this method exists to avoid, wearing better arithmetic. So the
+            # synthesis falls back to the state a report of that LENGTH does carry -- the unblocked
+            # one -- which is exactly the state mixture conditioning on decode leaves behind.
+            self.stats["synth_undecodable_state_relaxed"] += 1
+            state = "LOS"
+            picked, _p = large_scale("LOS", 0.0, 0.0)
+        mean_rx, g0, p_below = picked
+
+        # the fade, conditioned on clearing the floor. Exact inverse transform on the Gamma while
+        # the tail is numerically resolvable; beyond that the conditional excess of a Gamma tail is
+        # exactly Exponential(rate m) in POWER, which is what the second branch draws -- so the
+        # far tail is asymptotically exact rather than clamped, and never a point mass.
+        u = rng.random()
+        if 1.0 - p_below > 1e-9:
+            g = _gamma_p_inv(m, min(p_below + u * (1.0 - p_below), 1.0 - 1e-15)) / m
+            return mean_rx + 10.0 * math.log10(max(g, 1e-12))
+        e = -math.log(max(u, 1e-300))                            # Exponential(1)
+        return floor + (10.0 / math.log(10.0)) * math.log1p(e / max(m * g0, 1e-300))
+
+    def _ant_h(self, vid) -> float:
+        """This station's antenna height, from the step's own snapshot (V2V default if unknown)."""
+        st = self._stations.get(vid)
+        return V2X_ANTENNA_HEIGHT_M if st is None else st.ant_h_m
+
+    def _classify_readonly(self, tx_vid, rx_vid, txx, txy, rxx, rxy, d, tx_h, rx_h, rng):
+        """`_link_state`'s classification, WITHOUT touching any per-link state. -> (state, mu, sig).
+
+        Same blocker index, same raster, same three-case rule.  The one deliberate difference is the
+        synthetic-map canyon coin: `_link_state` caches its verdict for a decorrelation distance,
+        which is per-link state this function may not write, so the coin is redrawn from `rng`.  The
+        MARGINAL is identical (`P(NLOSb) = 1 - exp(-lambda*d)`); only the temporal correlation of
+        that one binary differs, on a path that is consulted at most once per step per report.
+        """
+        blocker_vid, blocker_h = self.blockers.tallest_blocker_entry(
+            txx, txy, rxx, rxy, tx_vid, rx_vid,
+            per_blocker_width=(self.blocker_width == "tr37885"))
+        if self.buildings is not None:
+            nlosb = self.buildings.blocked(txx, txy, rxx, rxy)
+        elif self.canyon_per_m > 0.0:
+            nlosb = rng.random() >= math.exp(-self.canyon_per_m * d)
+        else:
+            nlosb = False
+        if nlosb:
+            return "NLOSb", 0.0, 0.0
+        if blocker_h > 0.0:
+            case = tr37885_nlosv_case(tx_h, rx_h, blocker_h)
+            mu_base, sig_v = TR37885_NLOSV[case]
+            return ("LOS" if case == "both_above" else "NLOSv"), mu_base, sig_v
+        return "LOS", 0.0, 0.0
+
     def evaluate_raw(self, tx_vid, rx_vid, txx, txy, rxx, rxy, d, tx_h, rx_h):
         """One packet on one link. Returns (heard, rssi_dbm, state, packet_rng).
 
@@ -959,19 +1873,58 @@ class GeometricChannel(LinkChannelModelBase):
         if prng is None:
             prng = random.Random(f"{self.seed}:geo:{tx_vid}:{rx_vid}")
             self._packet[pkey] = prng
-        if state == "NLOSb":
-            pl = tr37885_pathloss_db(self.nlos_state, d)
-        else:
-            pl = tr37885_pathloss_db(self.los_state, d)
-            if state == "NLOSv":
-                # censored Gaussian: draw and clamp at 0, never shortcut to the mean
-                pl += max(0.0, prng.gauss(tr37885_nlosv_mu_db(mu_base, d), sig_v))
-        mean_rx = self.tx_dbm - pl + shadow_db
+        nlosv_db = (self._nlosv_loss_db(tx_vid, rx_vid, d, mu_base, sig_v, prng)
+                    if state == "NLOSv" else 0.0)
+        mean_rx = self.mean_rx_dbm(tx_vid, rx_vid, txx, txy, rxx, rxy, d, tx_h, rx_h,
+                                   state, shadow_db, nlosv_db)
         m = nakagami_m_for_distance(d)
-        fade_db = 10.0 * math.log10(max(prng.gammavariate(m, 1.0 / m), 1e-12))
+        fade_db = 10.0 * math.log10(max(self._fade_power(tx_vid, rx_vid, m, prng), 1e-12))
         rx_dbm = mean_rx + fade_db
         heard = self._per_from_rx_dbm(rx_dbm) <= 0.0
         return heard, rx_dbm, state, prng
+
+    def _fade_power(self, tx_vid, rx_vid, m, prng) -> float:
+        """Nakagami-m fading power for this packet (unit mean), i.i.d. or Clarke-correlated.
+
+        GAP 6.  The default arm is the historic `gammavariate(m, 1/m)`, one independent draw per
+        packet.  The `jakes` arm carries an AR(1) standard normal per ORDERED PAIR -- the same
+        keying the i.i.d. draw already used, so the ONLY thing that changes between the two arms is
+        time correlation -- advances it at most once per step, and maps it onto the identical
+        Nakagami marginal by the probability-integral transform.  The small-scale fade remains
+        NON-reciprocal in both arms, which is a separate (and unaddressed) gap.
+        """
+        if self.fade_correlation != "jakes":
+            return prng.gammavariate(m, 1.0 / m)
+        pkey = (tx_vid, rx_vid)
+        state = self._fade.get(pkey)
+        if state is None or state[0] != self.step:
+            if state is None:
+                z = prng.gauss(0.0, 1.0)
+            else:
+                a, b = self._kin.get(tx_vid), self._kin.get(rx_vid)
+                if a is None or b is None:
+                    self.stats["fade_velocity_unknown"] += 1
+                    v_rel = 0.0
+                else:
+                    v_rel = math.hypot(a[3] - b[3], a[4] - b[4])
+                rho = jakes_rho(v_rel, self.dt)
+                z = rho * state[1] + math.sqrt(max(0.0, 1.0 - rho * rho)) * prng.gauss(0.0, 1.0)
+            self._fade[pkey] = (self.step, z)
+        return nakagami_power_from_normal(m, self._fade[pkey][1])
+
+    def _nlosv_loss_db(self, tx_vid, rx_vid, d, mu_base, sig_v, prng) -> float:
+        """The NLOSv additional blockage loss for this packet, in dB.
+
+        Always TR 37.885's CENSORED Gaussian -- `max(0, N(mu, sigma))`, drawn and clamped, never
+        shortcut to its mean.  The one opt-in decision left here is GAP 2, whether the standardised
+        deviate is fresh per packet or held for the blockage episode; the alternative MEAN that used
+        to live here was retracted (see the section-2 block comment above).
+        """
+        mu, sigma = tr37885_nlosv_mu_db(mu_base, d), sig_v
+        z = self._shadow[(tx_vid, rx_vid) if tx_vid < rx_vid else (rx_vid, tx_vid)].get("z")
+        if z is None:
+            return max(0.0, prng.gauss(mu, sigma))      # historic: a fresh draw per packet
+        return max(0.0, mu + sigma * z)                 # GAP 2: the link's own held deviate
 
     def evaluate(self, tx, rx, d_m, txn):
         """`LinkChannelModel.evaluate` -- the interface form of :meth:`evaluate_raw`.
@@ -2671,15 +3624,48 @@ class PipelineConfig:
     radio_cap_max_mult: float = RADIO_CAP_MAX_MULT  # hard ceiling on cap / range (bounds the cell search)
     # --- geometric (3GPP TR 37.885) channel model; consulted ONLY when radio_model=="geometric" ---
     radio_env: str = "urban"             # TR 37.885 LOS family: "urban" | "highway" (NLOS reuses urban)
-    radio_tx_power_dbm: float = 23.0     # EIRP. A deployed ITS-G5/DSRC OBU runs 20-23 dBm (ETSI caps
-                                         # EIRP at 33); the vendored VeReMi-NextGen INET config's
-                                         # 13.0103 dBm reaches only ~204 m median on highway LOS, so
-                                         # the >=500 m awareness gate is unreachable below ~20.8 dBm.
+    # TWO CONVENTIONS IN ONE BUDGET, and this comment used to name only the first. The 23.0 dBm was
+    # chosen in EIRP terms -- a deployed ITS-G5/DSRC OBU runs 20-23 dBm, ETSI caps EIRP at 33, and
+    # the vendored VeReMi-NextGen INET config's 13.0103 dBm reaches only ~204 m median on highway
+    # LOS, so the >=500 m awareness gate is unreachable below ~20.8 dBm. But the number itself is
+    # TR 37.885 Table 6.1.1-1's "UE Tx power -- Vehicle/pedestrian UE or UE type RSU: 23dBm", which
+    # sits in the same column as "Macro BS: 49dBm" -- a macro's CONDUCTED PA power -- while the
+    # element gain is given SEPARATELY in Table 6.1.4-8 (3 dBi). Read as the standard writes it,
+    # 23 dBm is CONDUCTED and the TR-conformant V2V budget is 23 + 3 - PL + 3 = 29 - PL.
+    # CONSEQUENCE, NAMED RATHER THAN HIDDEN: with radio_antenna_pattern="none" (the shipped default)
+    # this model computes 23 - PL, i.e. it runs 6 dB BELOW TR 37.885's own link budget. That is a
+    # pre-existing conformance gap, not a property of the antenna term; switching the pattern on is
+    # what CLOSES it. See `no_antenna_gain_or_pattern_term` and `link_budget_is_6db_below_tr37885`
+    # in refdata/pathloss_3gpp_tr37885.json.
+    radio_tx_power_dbm: float = 23.0     # CONDUCTED under TR 37.885 Table 6.1.1-1; ALSO defensible
+                                         # as an EIRP under ETSI -- the repository holds both, and
+                                         # which one it is decides whether the pattern double-counts
     radio_rx_sensitivity_dbm: float = -81.0   # decode floor (vendored NextGen 6 Mb/s 802.11p profile)
     radio_nlosb_density_per_km: float = 4.0   # SYNTHETIC-MAP FALLBACK ONLY: expected building
                                          # blockages per km of link path, P(LOS) = exp(-lambda*d),
                                          # used when the map carries no footprints. Ignored entirely
                                          # once real building polygons are present.
+    # --- opt-in channel physics; consulted ONLY when radio_model=="geometric", and every default
+    # below reproduces the model exactly as it behaved before these knobs existed. See the
+    # "OPT-IN CHANNEL PHYSICS" block above tr37885_antenna_gain_dbi for the evidence behind each.
+    radio_nlosv_hold: bool = False       # PHYSICS-MOTIVATED, NOT SPECIFIED: hold the NLOSv blockage
+                                         # draw for the blockage EPISODE instead of redrawing it on
+                                         # every packet. TR 37.885 6.2.1 states no temporal scope
+                                         # for the draw at all -- see `_link_state`'s GAP 2 comment
+    radio_antenna_pattern: str = "none"  # "none" | "tr37885_opt1" (Tables 6.1.4-8/-9: Type 2
+                                         # rooftop azimuth-omni, Types 1/3 front+rear directional).
+                                         # REFUSED with n_rsus > 0: TR 37.885 gives RSUs antenna
+                                         # ARRAYS this model cannot evaluate (Tables 6.1.4-1..-5)
+    radio_antenna_gain_dbi: float = TR37885_ANT_MAX_GAIN_DBI   # max element gain; 0 isolates the
+                                         # pattern SHAPE from the absolute gain offset
+    radio_blocker_width: str = "uniform"  # "uniform" | "tr37885" (clause 6.1.2 body widths: a truck
+                                         # occludes a 2.6 m corridor, a car 2.0 m)
+    radio_breakpoint: str = "none"       # "none" | "two_ray" (ground-reflection breakpoint at
+                                         # d_b = 4*h_tx*h_rx/lambda; UNVALIDATED, see its comment)
+    radio_breakpoint_slope_db_per_decade: float = TWO_RAY_SLOPE_DB_PER_DECADE
+    radio_fading_correlation: str = "none"   # "none" (i.i.d. per packet) | "jakes" (Clarke
+                                         # correlation at the link's own relative speed; matters
+                                         # only at dt <= 0.1 s and near-zero relative speed)
     art_max_m: float = 150.0             # tolerance for claiming a position beyond the radio range
     offroad_tol_m: float = 15.0          # map check: claimed distance from the nearest road tolerated
     max_accel_mps2: float = 12.0         # implausible-acceleration threshold
@@ -3710,6 +4696,46 @@ def validate_config(cfg: PipelineConfig) -> PipelineConfig:
     if cfg.radio_nlosb_density_per_km < 0:
         raise ValueError(f"radio_nlosb_density_per_km must be >= 0 "
                          f"(got {cfg.radio_nlosb_density_per_km})")
+    if cfg.radio_antenna_pattern not in _ENUM_OPTIONS["radio_antenna_pattern"]:
+        raise ValueError(f"radio_antenna_pattern must be one of "
+                         f"{_ENUM_OPTIONS['radio_antenna_pattern']} "
+                         f"(got {cfg.radio_antenna_pattern!r})")
+    if cfg.radio_antenna_pattern != "none" and cfg.n_rsus > 0:
+        # REFUSE LOUDLY rather than run a silently lopsided budget. `_station_antenna` has no
+        # antenna model for an RSU -- TR 37.885 gives RSUs BS-type and UE-type antenna ARRAYS
+        # (Tables 6.1.4-1 to 6.1.4-5) with panel bearings, tilt and TXRU mapping, and this model has
+        # no array factor to put them through -- so with the pattern on a V2V link would gain
+        # 2 x radio_antenna_gain_dbi while every V2I link gained only one end's worth. That is a
+        # PERMANENT relative penalty on infrastructure links, i.e. a shift in the V2I/V2V balance
+        # produced by a missing model rather than by physics, and it would be invisible in any
+        # aggregate. Refusing is the honest option until the arrays are implemented.
+        raise ValueError(
+            f"radio_antenna_pattern={cfg.radio_antenna_pattern!r} cannot be combined with "
+            f"n_rsus={cfg.n_rsus}: TR 37.885 models an RSU with an antenna ARRAY (Tables "
+            f"6.1.4-1..-5) that this channel cannot evaluate, so an RSU endpoint would contribute "
+            f"0 dB while both ends of every V2V link contributed {cfg.radio_antenna_gain_dbi} dBi "
+            f"-- a {cfg.radio_antenna_gain_dbi} dB relative penalty on every V2I link that is a "
+            f"modelling gap, not physics. Run the pattern without RSUs, or the RSUs without the "
+            f"pattern. (A VRU is NOT refused: TR 37.885 Table 6.1.4-6 gives a pedestrian UE an "
+            f"omnidirectional 0 dBi element, so a VRU link's asymmetry is the standard's own.)")
+    if not 0.0 <= cfg.radio_antenna_gain_dbi <= 20.0:
+        raise ValueError(f"radio_antenna_gain_dbi must be in [0, 20] dBi "
+                         f"(got {cfg.radio_antenna_gain_dbi}); TR 37.885 Table 6.1.4-8 gives the "
+                         f"vehicle element 3 dBi at 6 GHz, and 0 isolates the pattern shape")
+    if cfg.radio_blocker_width not in _ENUM_OPTIONS["radio_blocker_width"]:
+        raise ValueError(f"radio_blocker_width must be one of "
+                         f"{_ENUM_OPTIONS['radio_blocker_width']} (got {cfg.radio_blocker_width!r})")
+    if cfg.radio_breakpoint not in _ENUM_OPTIONS["radio_breakpoint"]:
+        raise ValueError(f"radio_breakpoint must be one of {_ENUM_OPTIONS['radio_breakpoint']} "
+                         f"(got {cfg.radio_breakpoint!r})")
+    if cfg.radio_fading_correlation not in _ENUM_OPTIONS["radio_fading_correlation"]:
+        raise ValueError(f"radio_fading_correlation must be one of "
+                         f"{_ENUM_OPTIONS['radio_fading_correlation']} "
+                         f"(got {cfg.radio_fading_correlation!r})")
+    if not 0.0 <= cfg.radio_breakpoint_slope_db_per_decade <= 80.0:
+        raise ValueError(f"radio_breakpoint_slope_db_per_decade must be in [0, 80] dB/decade "
+                         f"(got {cfg.radio_breakpoint_slope_db_per_decade}); the classical two-ray "
+                         f"asymptote is 40 and a slope below the model's own is a no-op")
     if cfg.pathloss_exponent <= 0:
         raise ValueError(f"pathloss_exponent must be > 0 (got {cfg.pathloss_exponent})")
     if cfg.shadowing_sigma_db < 0:
@@ -4352,6 +5378,13 @@ _ENUM_OPTIONS = {
     # the validate_config check, this list, the argparse choices and the GUI dropdown
     "radio_model": list(_api_registry.builtin_names("channel_model")),
     "radio_env": ["urban", "highway"],
+    # opt-in channel physics. Each of these selects between the model's HISTORIC behaviour (first,
+    # and the default) and a term that is conformant, physics-motivated or unvalidated -- see the
+    # "OPT-IN CHANNEL PHYSICS" block above `tr37885_antenna_gain_dbi`, which says which is which.
+    "radio_antenna_pattern": ["none", "tr37885_opt1"],
+    "radio_blocker_width": ["uniform", "tr37885"],
+    "radio_breakpoint": ["none", "two_ray"],
+    "radio_fading_correlation": ["none", "jakes"],
     # same rule as radio_model: sourced from the BUILT-IN REGISTRY so validate_config's message,
     # this list, the argparse choices and the GUI dropdown are one source of truth
     "mobility_source": list(_api_registry.builtin_names("mobility")),
@@ -4682,6 +5715,35 @@ _FIELD_META = {
                                          "blocker density, P(LOS) = exp(-lambda*d). Ignored when the "
                                          "map carries real building footprints", lo=0, hi=50, st=0.5,
                                        u="/km"),
+    "radio_nlosv_hold": dict(h="geometric only: hold the NLOSv blockage draw for the blockage "
+                               "EPISODE instead of redrawing it every packet. Lengthens burst "
+                               "losses. PHYSICS-MOTIVATED, NOT SPECIFIED: TR 37.885 6.2.1 gives "
+                               "the draw no temporal scope at all"),
+    "radio_antenna_pattern": dict(h="geometric only: vehicle antenna element pattern. none = no "
+                                    "antenna term at all (historic). tr37885_opt1 = Tables "
+                                    "6.1.4-8/-9: Type 2 rooftop azimuth-omni, Types 1/3 front+rear "
+                                    "directional with a 120 deg horizontal beamwidth"),
+    "radio_antenna_gain_dbi": dict(h="geometric only: max directional gain of the antenna element "
+                                     "(TR 37.885 Table 6.1.4-8 gives 3 dBi at 6 GHz). Set 0 to keep "
+                                     "the pattern SHAPE without the absolute gain offset",
+                                   lo=0, hi=20, st=0.5, u="dBi"),
+    "radio_blocker_width": dict(h="geometric only: blocker footprint. uniform = one corridor width "
+                                  "for every vehicle. tr37885 = clause 6.1.2 body widths (truck/bus "
+                                  "2.6 m, passenger 2.0 m)"),
+    "radio_breakpoint": dict(h="geometric only: two-ray ground-reflection breakpoint at "
+                               "d_b = 4*h_tx*h_rx/lambda (201.5 m at 1.6 m antennas, 5.9 GHz). "
+                               "UNVALIDATED -- its magnitude is plausible, not confirmed; run with "
+                               "and without to bracket it"),
+    "radio_breakpoint_slope_db_per_decade": dict(h="geometric only: path-loss slope BEYOND the "
+                                                   "breakpoint. 40 = the classical two-ray "
+                                                   "asymptote (d^-4); below the model's own slope "
+                                                   "it is a no-op", lo=0, hi=80, st=1,
+                                                 u="dB/decade"),
+    "radio_fading_correlation": dict(h="geometric only: small-scale fade in time. none = i.i.d. per "
+                                       "packet (right at speed, optimistic in a queue). jakes = "
+                                       "Clarke correlation J0(2*pi*f_D*dt) at the link's own "
+                                       "relative speed, with the Nakagami marginal preserved "
+                                       "exactly. Needs dt <= 0.1 s to bite"),
     "pathloss_exponent": dict(h="Log-distance path-loss exponent n (urban ~2.7-3.5; logdistance only)",
                               lo=1.5, hi=6.0, st=0.1),
     "shadowing_sigma_db": dict(h="Log-normal shadowing std in dB (0 = near-hard cutoff; logdistance only)",
@@ -8036,30 +9098,25 @@ def run_pipeline(cfg: PipelineConfig) -> RunResult:
                 # collusion". The colluder is a real radio standing a real distance from its victim
                 # -- it genuinely hears the victim's CAMs, it just lies about their content -- so the
                 # honest synthesis is the value the channel model would produce for that TRUE link.
-                # Same model, same true geometry, only the *draw* comes from the colluder's own
-                # fabrication stream (keeping the reception loop's per-link streams untouched).
+                #
+                # THE WHOLE COMPUTATION IS THE CHANNEL'S. This block used to hand-roll a SECOND link
+                # budget here (`geo_chan.tx_dbm - tr37885_pathloss_db(state, d)`), which was correct
+                # only for as long as the channel's own budget stayed that short: switching on
+                # `radio_antenna_pattern` -- a knob that never touches this file -- moved the genuine
+                # population 5.824 dB and left the fabricated one where it was, i.e. it turned the
+                # rssi column into a collusion classifier at AUC ~= 0.79. `synthesize_rx_dbm` is the
+                # structural fix: same budget site, same classification rule, same true geometry,
+                # and only the *draws* come from the colluder's own fabrication stream, so the
+                # reception loop's per-link streams stay untouched.
                 fab_rssi = None
                 if geo_chan is not None:
                     vxx, vyy = rx_pos.get(victim.vid, victim.true_state(t)[:2])
                     txx2, txy2 = rx_pos.get(tx.vid, tx.true_state(t)[:2])
                     fab_d = max(1.0, math.hypot(vxx - txx2, vyy - txy2))
-                    fab_state = ("urban_nlos" if cfab.random() < (1.0 - math.exp(
-                        -geo_chan.canyon_per_m * fab_d)) else geo_chan.los_state)
-                    fab_mean = geo_chan.tx_dbm - tr37885_pathloss_db(fab_state, fab_d)
-                    fab_sig = TR37885_SHADOW_SIGMA_DB["NLOSb" if fab_state == "urban_nlos" else "LOS"]
-                    fab_m = nakagami_m_for_distance(fab_d)
-                    # A report is only ever filed on a frame that was DECODED, so the honest column
-                    # is the channel law CONDITIONED on clearing the decode floor. Reproduce that by
-                    # rejection sampling, not by clamping: clamping would pile a point mass at
-                    # exactly the floor and hand an ML model "rssi == -81.00 => fabricated".
-                    for _try in range(16):
-                        fab_rssi = (fab_mean + cfab.gauss(0.0, fab_sig)
-                                    + 10.0 * math.log10(max(cfab.gammavariate(fab_m, 1.0 / fab_m),
-                                                            1e-12)))
-                        if fab_rssi >= geo_chan.decode_floor_dbm:
-                            break
-                    else:   # pathological geometry (very long link): stay in the decodable window
-                        fab_rssi = geo_chan.decode_floor_dbm + abs(cfab.gauss(0.0, fab_sig))
+                    # tx = the VICTIM (whose CAM the colluder hears), rx = the colluder. The budget
+                    # is symmetric, but the roles are not, and this is the direction that is true.
+                    fab_rssi = geo_chan.synthesize_rx_dbm(victim.vid, tx.vid, vxx, vyy,
+                                                          txx2, txy2, fab_d, cfab)
                 file_report(t, reporter_digest, subject_digest, victim,
                             ["positionSpeedInconsistency"], det, fab_conf, 0.0, 0.0, 0.0, 0.0,
                             malicious=True, rssi_dbm=fab_rssi)
@@ -9164,6 +10221,32 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--radio-nlosb-density-per-km", type=float, default=4.0,
                    help="geometric only, synthetic maps: urban-canyon blocker density per km "
                         "(ignored when the map carries real building footprints)")
+    # opt-in channel physics (geometric only). Every default below is the historic behaviour.
+    p.add_argument("--radio-nlosv-hold", action="store_true",
+                   help="geometric only: hold the NLOSv blockage draw for the blockage EPISODE "
+                        "instead of redrawing it on every packet (physics, not specified)")
+    p.add_argument("--radio-antenna-pattern", choices=_ENUM_OPTIONS["radio_antenna_pattern"],
+                   default="none",
+                   help="geometric only: TR 37.885 Table 6.1.4-8/-9 vehicle antenna element "
+                        "pattern (Type 2 rooftop omni, Types 1/3 front+rear directional)")
+    p.add_argument("--radio-antenna-gain-dbi", type=float, default=TR37885_ANT_MAX_GAIN_DBI,
+                   help="geometric only: max element gain in dBi (TR 37.885: 3 at 6 GHz); 0 keeps "
+                        "the pattern shape without the absolute gain offset")
+    p.add_argument("--radio-blocker-width", choices=_ENUM_OPTIONS["radio_blocker_width"],
+                   default="uniform",
+                   help="geometric only: blocker footprint -- uniform, or the TR 37.885 clause "
+                        "6.1.2 body widths (truck/bus 2.6 m vs passenger 2.0 m)")
+    p.add_argument("--radio-breakpoint", choices=_ENUM_OPTIONS["radio_breakpoint"], default="none",
+                   help="geometric only: two-ray ground-reflection breakpoint (UNVALIDATED "
+                        "magnitude -- run with and without to bracket it)")
+    p.add_argument("--radio-breakpoint-slope-db-per-decade", type=float,
+                   default=TWO_RAY_SLOPE_DB_PER_DECADE,
+                   help="geometric only: path-loss slope beyond the breakpoint (40 = the classical "
+                        "two-ray d^-4 asymptote)")
+    p.add_argument("--radio-fading-correlation", choices=_ENUM_OPTIONS["radio_fading_correlation"],
+                   default="none",
+                   help="geometric only: Clarke/Jakes temporal correlation of the Nakagami fade at "
+                        "the link's own relative speed (needs dt <= 0.1 s to matter)")
     p.add_argument("--pathloss-exponent", type=float, default=2.7,
                    help="log-distance path-loss exponent n (logdistance only)")
     p.add_argument("--shadowing-sigma-db", type=float, default=4.0,
@@ -9499,6 +10582,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                          radio_tx_power_dbm=args.radio_tx_power_dbm,
                          radio_rx_sensitivity_dbm=args.radio_rx_sensitivity_dbm,
                          radio_nlosb_density_per_km=args.radio_nlosb_density_per_km,
+                         radio_nlosv_hold=args.radio_nlosv_hold,
+                         radio_antenna_pattern=args.radio_antenna_pattern,
+                         radio_antenna_gain_dbi=args.radio_antenna_gain_dbi,
+                         radio_blocker_width=args.radio_blocker_width,
+                         radio_breakpoint=args.radio_breakpoint,
+                         radio_breakpoint_slope_db_per_decade=args.radio_breakpoint_slope_db_per_decade,
+                         radio_fading_correlation=args.radio_fading_correlation,
                          message_codec=args.message_codec, message_signer=args.message_signer,
                          cam_generation_rules=args.cam_rules, dcc=args.dcc,
                          net_latency_model=args.net_latency, ma_backhaul_s=args.ma_backhaul,

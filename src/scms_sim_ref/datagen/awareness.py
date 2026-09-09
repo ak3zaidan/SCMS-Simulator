@@ -60,7 +60,10 @@ WHAT THIS MODULE COMPUTES
   cannot be passed by making the radio quieter.
 
 TRUST FIREWALL: read-only over a dataset directory, aggregate output only, no per-entity value, no
-RNG, no timestamps. Same contract as ``realism_bench``.
+timestamps. Same contract as ``realism_bench``. The only randomness is the harness's own seeded
+sub-sampler (``realism_bench._subsample``, imported not re-implemented) and the seeded visit order
+of the pair budget: both are keyed strings, neither touches the global RNG, and both are reported
+next to the numbers they produced.
 
     python -m scms_sim_ref.datagen.awareness <dataset_dir> [--json out.json] [--markdown]
 """
@@ -71,6 +74,7 @@ import argparse
 import json
 import math
 import os
+import random
 
 import numpy as np
 
@@ -80,13 +84,33 @@ REFDATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refdata"
 DIST_BIN_M = 50.0             # the reference's NAR bin width (v2x_awareness_conditions.nar_definition)
 MAX_DIST_M = 1000.0
 T_BUCKET_S = 1.0              # co-presence snapshot width == the reference's t = 1 s window
-MAX_SNAPSHOTS = 240           # deterministic even-spaced subsample of time buckets
-MAX_PAIRS_CLASSIFIED = 400_000    # ray-march budget; pairs are taken in deterministic order
+#: Cap on the time buckets this module ray-marches. It is the same cap, on the same quantity, as
+#: ``realism_bench.MAX_TIME_BUCKETS``, and until the sampler audit it was applied by the same
+#: FIXED-STRIDE rule that module withdrew -- ``keys[int(i * step)]`` -- byte for byte, still feeding
+#: published ``comm.*`` rows, under a docstring that still carried the withdrawn sentence
+#: ("subsampled evenly across the run ... so nothing here is random"). Measured on the 8 h reference
+#: arm (240 of 14,135 buckets, 1,955 of 117,151 classifiable pairs), shipped against the uncapped
+#: truth: ``link_state_los_fraction_200m`` 0.4259 against 0.4368 (-2.50%), ``pdr_absolute_200m``
+#: 0.4083 against 0.4142 (-1.42%), ``nar90_equivalent_range_m`` 241.2 against 243.4 (-0.90%), where
+#: the replacement's 8-seed mean is inside 0.22% on every one of those rows. This dataset's 14,135
+#: buckets make the stride fractional, so the TOTAL phase lock the traffic scan suffered did not
+#: occur here -- it occurs when the bucket count is a multiple of the cap, which nothing in that
+#: rule prevented, and a deterministic sampler's error has no spread to look at either way. The
+#: buckets now go through ``realism_bench._subsample`` on the ``"awareness_copresence"`` stream, and
+#: both the cap and the sampler seed are arguments, so ``--max-instants 0`` reaches this scan too.
+MAX_SNAPSHOTS = 240
+#: Ray-march budget. Pairs used to be taken in snapshot order and the scan stopped at the first
+#: ``max_pairs``, i.e. it kept the EARLIEST buckets -- a second, unstated truncation on top of the
+#: bucket cap. Buckets are now visited in a seeded random order and only COMPLETE buckets are
+#: counted, so exhausting the budget drops a random subset of the sampled buckets rather than the
+#: run's tail. It does not bind on the reference arm (117,151 classified pairs).
+MAX_PAIRS_CLASSIFIED = 400_000
 MIN_BAND_PAIRS = 30           # a band needs this many classified pairs before its mix is reported
 AWARENESS_ANCHORS_M = (100.0, 200.0, 300.0)
 NAR_LEVEL = 0.90              # the level Table III and Fig. 18 report crossings of
 
-# Numerical quadrature (deterministic; no RNG anywhere in this module).
+# Numerical quadrature (deterministic; the PDR model draws no random number at all -- the only
+# randomness in this module is the seeded sub-sampling of time buckets and of the pair budget).
 _FADE_LN_LO, _FADE_LN_HI, _FADE_N = math.log(1e-9), math.log(100.0), 1201
 _NLOSV_N = 401                # grid points over the censored-Gaussian blockage loss
 
@@ -297,8 +321,20 @@ def propagation_pdr(state: str, d_m: float, *, tx_power_dbm: float, decode_floor
     fade_db = 10.0 * np.log10(np.maximum(g, 1e-300))
 
     if state == "NLOSv":
-        # V2V antennas sit at 1.5 m and the shortest blocker is 1.6 m, so both endpoints are below
-        # the blocker: TR37885_NLOSV["both_below"]. run.py picks the same branch.
+        # A NAMED APPROXIMATION, restated 2026-09-07 because the sentence it replaces became false.
+        # It used to read "V2V antennas sit at 1.5 m and the shortest blocker is 1.6 m, so both
+        # endpoints are below the blocker ... run.py picks the same branch", and that was exactly
+        # true while every blocker was taller than every antenna. It is not any more: with the fleet
+        # at TR 37.885's own Type 2 height (1.6 m), a CAR blocker (1.6 m body) is the equality case
+        # and the engine charges it TR Case 3 (mu 5.0 dB), while a truck or bus is still Case 2
+        # (mu 9.0 dB). This function is a per-STATE quadrature -- its only input is the state name
+        # and a distance, with no blocker type anywhere -- so it cannot express both, and it keeps
+        # the WORSE case. CONSEQUENCE, stated rather than hidden: on a car-blocked link this
+        # instrument now over-charges blockage by 9.0382 - 5.2023 = 3.836 dB relative to the engine,
+        # i.e. it is PESSIMISTIC about NLOSv delivery, in a module that docs/realism/
+        # CHANNEL-PHYSICS.md section 6 R7 already shows is blind to every opt-in channel term.
+        # Fixing it properly needs the NLOSv state split by blocker case here and in every consumer
+        # of `_STATES`, which is a change to this module's contract, not to a constant.
         mu_base, sig_v = TR37885_NLOSV["both_below"]
         nodes, wl = _nlosv_quadrature(tr37885_nlosv_mu_db(mu_base, d), sig_v)
         z = (margin + fade_db[:, None] - nodes[None, :]) / sigma
@@ -470,15 +506,44 @@ def load_scenario(dataset_dir: str) -> dict:
     }
 
 
+def _seed_of(sampler_seed: int | None) -> int:
+    """This scan's sampler seed: the caller's, or the harness's own default."""
+    return int(sampler_seed) if sampler_seed is not None else int(_harness_sampler()[2])
+
+
+def _harness_sampler():
+    """The harness's own sub-sampler and coverage block, imported rather than re-implemented.
+
+    A second copy of a sampling rule is how this module ended up shipping the withdrawn fixed-stride
+    rule for as long as it did: ``realism_bench`` replaced its own and nothing here changed. The
+    import is deferred to call time so that ``awareness`` still has no module-level dependency on
+    the harness (``panel_rows`` takes its metric constructor by injection for the same reason).
+    """
+    from .realism_bench import SAMPLER_SEED, _sampling_block, _subsample
+    return _subsample, _sampling_block, SAMPLER_SEED
+
+
 def snapshots(emissions: list[dict], bucket_s: float = T_BUCKET_S,
-              max_snaps: int = MAX_SNAPSHOTS) -> list[dict]:
+              max_snaps: int | None = MAX_SNAPSHOTS, *, sampler_seed: int | None = None,
+              stats: dict | None = None) -> list[dict]:
     """Co-presence snapshots: one true position per vehicle per ``bucket_s`` window.
 
     ``bucket_s`` defaults to 1.0 s, which is the reference's own awareness window t. Buckets are
-    subsampled evenly across the run and vehicles kept in sorted-id order, so nothing here is
-    random and the same dataset always yields the same snapshots. Unlike
-    ``realism_bench._snapshots`` no per-bucket vehicle cap is applied: every vehicle present has to
-    be in the blocker index or the NLOSv classification is wrong.
+    sub-sampled by ``realism_bench._subsample`` -- circular jittered systematic, on this module's
+    own seeded stream -- so every bucket in the run has inclusion probability exactly
+    ``max_snaps/available`` and the sample cannot phase-lock onto a signal cycle. ``max_snaps`` of
+    ``None`` or ``<= 0`` means every bucket. ``stats``, when supplied, receives the
+    examined/available counts so the caller can publish this scan's coverage the way the harness's
+    panels publish theirs.
+
+    Vehicles inside a kept bucket are all retained, in sorted-id order: unlike
+    ``realism_bench._snapshots`` no per-bucket vehicle cap is applied, because every vehicle present
+    has to be in the blocker index or the NLOSv classification is wrong.
+
+    The stream is ``"awareness_copresence"``, deliberately NOT the harness's own ``"copresence"``:
+    the two scans cap the same quantity but keep different vehicles inside a bucket, so they are two
+    measurements and their sampling errors are better independent than identical. Naming it
+    separately is also what guarantees this scan cannot move any existing capped row's numbers.
     """
     buckets: dict[int, dict[str, tuple[float, float, float]]] = {}
     for e in emissions:
@@ -493,10 +558,12 @@ def snapshots(emissions: list[dict], bucket_s: float = T_BUCKET_S,
         cur = buckets.setdefault(b, {}).get(str(vid))
         if cur is None or t >= cur[0]:
             buckets[b][str(vid)] = (t, x, y)
-    keys = sorted(buckets)
-    if len(keys) > max_snaps:
-        step = len(keys) / float(max_snaps)
-        keys = [keys[int(i * step)] for i in range(max_snaps)]
+    subsample, _sb, default_seed = _harness_sampler()
+    keys_all = sorted(buckets)
+    keys = subsample(keys_all, max_snaps, stream="awareness_copresence",
+                     seed=(default_seed if sampler_seed is None else int(sampler_seed)))
+    if stats is not None:
+        stats.update(examined=len(keys), available=len(keys_all))
     out = []
     for b in keys:
         vids = sorted(buckets[b])
@@ -511,7 +578,9 @@ def snapshots(emissions: list[dict], bucket_s: float = T_BUCKET_S,
 def link_state_composition(scenario: dict, *, bin_m: float = DIST_BIN_M,
                            max_dist_m: float = MAX_DIST_M,
                            max_pairs: int = MAX_PAIRS_CLASSIFIED,
-                           snaps: list[dict] | None = None) -> dict:
+                           snaps: list[dict] | None = None,
+                           max_snaps: int | None = MAX_SNAPSHOTS,
+                           sampler_seed: int | None = None) -> dict:
     """LOS / NLOSv / NLOSb fraction of the co-present pair population, per distance band.
 
     The classification is the channel's own, imported not re-implemented: ``_BuildingRaster`` for
@@ -526,8 +595,15 @@ def link_state_composition(scenario: dict, *, bin_m: float = DIST_BIN_M,
     ``1 - exp(-lambda*d)`` NLOSb fraction and say so in ``nlosb_method``.
     """
     from ..mock_pipeline.run import (GEO_ENDPOINT_CLEAR_M, V2X_ANTENNA_HEIGHT_M, _BuildingRaster,
-                                     _VehicleBlockerIndex)
-    snaps = snapshots(scenario["emissions"]) if snaps is None else snaps
+                                     _VehicleBlockerIndex, tr37885_nlosv_case)
+    snap_stats: dict = {"examined": 0, "available": 0}
+    if snaps is None:
+        snaps = snapshots(scenario["emissions"], max_snaps=max_snaps, sampler_seed=sampler_seed,
+                          stats=snap_stats)
+    else:
+        # A caller-supplied bucket list was sampled by the CALLER, and this function cannot know
+        # out of how many. Reporting coverage 1.0 would be a claim about a scan it did not draw.
+        snap_stats.update(examined=len(snaps), available=len(snaps), supplied_by_caller=True)
     edges = np.arange(0.0, max_dist_m + bin_m, bin_m)
     nb = edges.size - 1
     counts = {s: np.zeros(nb, dtype=np.int64) for s in _STATES}
@@ -538,19 +614,42 @@ def link_state_composition(scenario: dict, *, bin_m: float = DIST_BIN_M,
     nlosb_method = ("building_raster" if raster is not None else
                     ("canyon_density_expectation" if lam > 0 else "no_blockage_model"))
 
+    # THE PAIR BUDGET IS A SUB-SAMPLE TOO, so it is drawn like one. Taking the first `max_pairs`
+    # pairs in snapshot order keeps the EARLIEST buckets of the run -- the same class of unstated,
+    # non-uniform truncation as the fixed stride this module used to sub-sample buckets with. The
+    # buckets are therefore visited in a seeded random order and a bucket's counts are committed
+    # only when the WHOLE bucket has been classified, so a budget stop drops a random subset of the
+    # sampled buckets instead of the run's tail, and never leaves half a bucket in the counts. When
+    # the budget is not reached this is a no-op: the counters are sums, so visit order cannot move
+    # them (the reference arm classifies 117,151 pairs against a budget of 400,000).
+    order = list(range(len(snaps)))
+    random.Random(f"{_seed_of(sampler_seed)}:awareness.pair_budget:{len(snaps)}:{int(max_pairs)}"
+                  ).shuffle(order)
     classified = 0
     truncated = False
-    for s in snaps:
+    snaps_done = 0
+    for si in order:
+        if truncated:
+            break
+        s = snaps[si]
         vids, xs, ys = s["vids"], s["x"], s["y"]
         n = len(vids)
         if n < 2:
             continue
+        # How many pairs this bucket would add, counted the cheap vectorised way BEFORE any ray
+        # marching, so the budget check costs a distance matrix rather than a discarded bucket's
+        # worth of ray marches. Total work stays bounded by the budget plus one distance matrix.
+        dm = np.hypot(xs[:, None] - xs[None, :], ys[:, None] - ys[None, :])[np.triu_indices(n, 1)]
+        seen = int((dm < max_dist_m).sum())
+        if snaps_done and classified + seen > max_pairs:
+            truncated = True          # this bucket does not fit: stop, and do not half-count it
+            break
         idx = _VehicleBlockerIndex()
         idx.rebuild([(vids[k], float(xs[k]), float(ys[k]), heights.get(vids[k], 1.6))
                      for k in range(n)])
+        local = {st: np.zeros(nb, dtype=np.int64) for st in _STATES}
+        seen = 0
         for i in range(n - 1):
-            if truncated:
-                break
             xi, yi = float(xs[i]), float(ys[i])
             for j in range(i + 1, n):
                 d = math.hypot(xi - float(xs[j]), yi - float(ys[j]))
@@ -565,17 +664,27 @@ def link_state_composition(scenario: dict, *, bin_m: float = DIST_BIN_M,
                 else:
                     blocked = False           # canyon expectation is applied after the loop
                 if blocked:
-                    counts["NLOSb"][b] += 1
+                    local["NLOSb"][b] += 1
                 else:
                     h = idx.tallest_blocker(xi, yi, float(xs[j]), float(ys[j]), vids[i], vids[j])
-                    # run.py: `below = (tx_h < h) + (rx_h < h)`; NLOSv iff at least one antenna is
-                    # under the blocker. Both V2V antennas sit at V2X_ANTENNA_HEIGHT_M, so the two
-                    # terms are the same test -- kept as one to make that explicit.
-                    counts["NLOSv" if (h > 0.0 and ant < h) else "LOS"][b] += 1
-                classified += 1
-                if classified >= max_pairs:
-                    truncated = True
-                    break
+                    # The ENGINE's own three-case rule, imported rather than restated. This line
+                    # used to be `ant < h`, a second transcription of a rule run.py has since
+                    # corrected: TR 37.885 Case 1 (no blockage) needs min(antenna height) STRICTLY
+                    # greater than the blocker, so an antenna EXACTLY at the blocker's height is
+                    # Case 3 and the link is NLOSv. With the fleet at the standard's own Type 2
+                    # height (1.6 m) against a 1.6 m car body, that equality case is the commonest
+                    # urban NLOSv geometry there is -- `ant < h` would have classified every
+                    # car-blocked link in the project as LOS and silently disagreed with the engine
+                    # it exists to grade.
+                    blocked_v = h > 0.0 and tr37885_nlosv_case(ant, ant, h) != "both_above"
+                    local["NLOSv" if blocked_v else "LOS"][b] += 1
+                seen += 1
+        for st in _STATES:
+            counts[st] += local[st]
+        classified += seen
+        snaps_done += 1
+    # `truncated` is set only where a bucket was actually DROPPED, so it means what it says: a
+    # scan that spent its whole budget on the buckets it had is not a truncated scan.
 
     n_pairs = sum(counts[s] for s in _STATES)
     frac = {s: np.zeros(nb, dtype=float) for s in _STATES}
@@ -606,10 +715,44 @@ def link_state_composition(scenario: dict, *, bin_m: float = DIST_BIN_M,
     tot_w = float(w.sum())
     overall = ({s: float(np.average(frac[s], weights=w)) for s in _STATES} if tot_w > 0
                else {s: 0.0 for s in _STATES})
+    _sub, sampling_block, default_seed = _harness_sampler()
+    sampling = sampling_block(snap_stats["examined"], snap_stats["available"],
+                              (int(max_snaps) if max_snaps else None), "buckets",
+                              seed=_seed_of(sampler_seed))
+    if snap_stats.get("supplied_by_caller"):
+        sampling["coverage_frac"] = None
+        sampling["sampling"] = ("the bucket list was supplied by the caller, so this module did "
+                                "not draw it and cannot report what fraction of the run it is")
+    if "comparability" in sampling:
+        # The harness's own wording is about a capped COUNT, and every row this module publishes is
+        # a fraction or a distance. Those ARE comparable across durations under uniform inclusion
+        # probability -- what falls with coverage is precision, not comparability -- so saying
+        # otherwise here would be a false warning, which is its own kind of defect.
+        cov = sampling["coverage_frac"]
+        sampling["comparability"] = (
+            f"read off {snap_stats['examined']} of {snap_stats['available']} time buckets"
+            + (f" ({cov:.2%})" if cov is not None else "")
+            + ". Every row here is a FRACTION or a DISTANCE, not a count, and the bucket sample "
+              "has uniform inclusion probability, so these stay comparable across durations; what "
+              "falls with coverage is PRECISION. Bound it by re-scoring under several "
+              "--sampler-seed values, or remove it with --max-instants 0.")
+    if truncated:
+        sampling["pair_budget"] = (
+            f"THE RAY-MARCH BUDGET BOUND: {snaps_done} of the {snap_stats['examined']} sampled "
+            f"buckets were classified ({classified} pairs against a budget of {int(max_pairs)}). "
+            f"Buckets are visited in a seeded random order and only whole buckets are counted, so "
+            f"this is a random subset of the sampled buckets, not the start of the run -- but it "
+            f"is a THIRD sub-sample on top of the bucket cap and the run itself, and it is the one "
+            f"with the loosest guarantee (a bucket with more pairs is likelier to be the one that "
+            f"does not fit). Raise --max-pairs to remove it.")
     return {"edges": edges, "count": {s: counts[s] for s in _STATES},
             "fraction": frac, "overall": overall, "n_pairs": n_pairs,
             "n_classified": int(classified),
             "truncated": bool(truncated), "snapshots": len(snaps),
+            "snapshots_classified": int(snaps_done),
+            "buckets_examined": int(snap_stats["examined"]),
+            "buckets_available": int(snap_stats["available"]),
+            "sampling": sampling,
             "nlosb_method": nlosb_method, "n_buildings": len(scenario["buildings"]),
             "bin_m": float(bin_m), "max_dist_m": float(max_dist_m)}
 
@@ -640,15 +783,23 @@ def composition_at(comp: dict, dist_m: float, bin_m: float | None = None) -> dic
 # =================================================================================================
 def awareness_report(dataset_dir: str, *, refdata_dir: str | None = None,
                      bin_m: float = DIST_BIN_M, max_dist_m: float = MAX_DIST_M,
-                     max_pairs: int = MAX_PAIRS_CLASSIFIED) -> dict:
+                     max_pairs: int = MAX_PAIRS_CLASSIFIED,
+                     max_snaps: int | None = MAX_SNAPSHOTS,
+                     sampler_seed: int | None = None) -> dict:
     """Measure this dataset's awareness under the reference's own conditions.
 
     Everything reported here is either measured on the dataset's geometry or derived from the
     pinned reference conditions; nothing is normalised against an unknown constant.
+
+    ``max_snaps`` and ``sampler_seed`` are the SAME seam ``realism_bench.scorecard`` exposes as
+    ``--max-instants`` / ``--sampler-seed``, and the harness passes its own through: without them
+    this scan was the one capped scan in the repository that no CLI flag could reach, still capped
+    by the withdrawn fixed-stride rule while every row beside it had been re-drawn.
     """
     cond = load_conditions(refdata_dir)
     sc = load_scenario(dataset_dir)
-    comp = link_state_composition(sc, bin_m=bin_m, max_dist_m=max_dist_m, max_pairs=max_pairs)
+    comp = link_state_composition(sc, bin_m=bin_m, max_dist_m=max_dist_m, max_pairs=max_pairs,
+                                  max_snaps=max_snaps, sampler_seed=sampler_seed)
     curve = mixed_pdr_curve(comp, tx_power_dbm=sc["tx_power_dbm"],
                             rx_sensitivity_dbm=sc["rx_sensitivity_dbm"],
                             radio_env=sc["radio_env"])
@@ -718,7 +869,11 @@ def awareness_report(dataset_dir: str, *, refdata_dir: str | None = None,
         "geometry": {
             "n_buildings": comp["n_buildings"], "buildings_source": sc["buildings_source"],
             "nlosb_method": comp["nlosb_method"], "snapshots": comp["snapshots"],
+            "snapshots_classified": comp["snapshots_classified"],
             "pairs_classified": comp["n_classified"], "pair_budget_reached": comp["truncated"],
+            # WHICH FRACTION OF THE RUN THIS IS, published the way realism_bench's panels publish
+            # theirs. Every number below is read off these buckets and off nothing else.
+            "sampling": comp["sampling"],
         },
         "link_state_mix_overall": {s: _r(comp["overall"][s]) for s in _STATES},
         "pdr_model": {
@@ -847,6 +1002,12 @@ def panel_rows(report: dict, metric_fn, ref_lookup) -> list[dict]:
 
     n_cls = geo["pairs_classified"]
     thin = None if n_cls >= MIN_BAND_PAIRS else f"only {n_cls} classifiable co-present pairs"
+    # THE DENOMINATOR, on every row this module contributes. These rows are read off a CAPPED scan
+    # exactly like the traffic panel's, and until the sampler audit they were the only capped rows
+    # in the scorecard that did not say so -- while being sub-sampled by the rule the harness had
+    # already withdrawn. `_sampling_block`'s own keys are spread in, so a reader parses one shape.
+    samp = dict(geo.get("sampling") or {})
+    samp["snapshots_classified"] = geo.get("snapshots_classified")
     # A LOS share is only comparable across scenes when it was measured the same way in both.
     # Saying so here is what stops a 0.76 from a footprint-free import being read against a 0.03
     # from real Ingolstadt geometry as if the model had changed.
@@ -872,7 +1033,7 @@ def panel_rows(report: dict, metric_fn, ref_lookup) -> list[dict]:
                "nlosb_method": geo["nlosb_method"], "n_buildings": geo["n_buildings"],
                "classification": "the channel's own _BuildingRaster ray march and "
                                  "_VehicleBlockerIndex body test, imported not re-implemented",
-               "by_band": report["link_state_mix_by_band"]}))
+               "by_band": report["link_state_mix_by_band"], **samp}))
 
     for a in AWARENESS_ANCHORS_M:
         row = report["anchors"].get(int(a)) or {}
@@ -886,7 +1047,7 @@ def panel_rows(report: dict, metric_fn, ref_lookup) -> list[dict]:
             extra={"mix": row.get("link_state_mix"),
                    "pdr_per_packet": row.get("pdr_per_packet"),
                    "normalised_like_realism_bench": row.get("normalised_like_realism_bench"),
-                   "nar_at_reference_10hz_rate": row.get("nar_at_reference_10hz_rate")}))
+                   "nar_at_reference_10hz_rate": row.get("nar_at_reference_10hz_rate"), **samp}))
 
     out.append(metric_fn(
         "comm.pdr_absolute_200m", P,
@@ -906,7 +1067,7 @@ def panel_rows(report: dict, metric_fn, ref_lookup) -> list[dict]:
                "near_band_pdr": report["pdr_model"]["near_band_pdr"],
                "normalised_like_realism_bench":
                    (report["anchors"].get(200) or {}).get("normalised_like_realism_bench"),
-               "applies_to_this_run": report["pdr_model"]["applies_to_this_run"]}))
+               "applies_to_this_run": report["pdr_model"]["applies_to_this_run"], **samp}))
 
     # GRADE ONLY WHAT THE RUN ACTUALLY USED. On a `disc`/`logdistance`/MOSAIC-SNS run the modelled
     # PDR curve is what the geometric physics WOULD deliver on this scene, which is a useful
@@ -943,7 +1104,7 @@ def panel_rows(report: dict, metric_fn, ref_lookup) -> list[dict]:
                "nlosb_method": geo["nlosb_method"], "n_buildings": geo["n_buildings"],
                "reference_budget_note": "the reference's own -95 dBm receiver is folded into its "
                                         "budget, so this compares like with like",
-               "verdict": report["verdict"]["text"]}))
+               "verdict": report["verdict"]["text"], **samp}))
 
     out.append(metric_fn(
         "comm.pdr_gray_zone_ratio", P,
@@ -957,7 +1118,7 @@ def panel_rows(report: dict, metric_fn, ref_lookup) -> list[dict]:
                               "lowering transmit power until the curve is broad and low -- the "
                               "canyon-0 run scored a 509 m width while failing awareness",
                "shadowing_only_lower_bounds": {"urban_los": 2.4066, "highway_los": 2.0820,
-                                               "urban_nlos": 1.9191}}))
+                                               "urban_nlos": 1.9191}, **samp}))
     return out
 
 
@@ -1036,6 +1197,13 @@ def render_lines(rep: dict) -> list[str]:
         f"budget={c['link_budget_db']} dB dt={c['dt_s']} s",
         f"geometry: {g['n_buildings']} buildings ({g['nlosb_method']}), {g['snapshots']} snapshots, "
         f"{g['pairs_classified']} pairs classified",
+        f"sampling: {(g.get('sampling') or {}).get('buckets_examined')} of "
+        f"{(g.get('sampling') or {}).get('buckets_available')} time buckets "
+        f"({(g.get('sampling') or {}).get('coverage_frac')}), sampler "
+        f"{(g.get('sampling') or {}).get('sampler')} seed "
+        f"{(g.get('sampling') or {}).get('sampler_seed')}"
+        + ("" if not g.get("pair_budget_reached")
+           else f"; PAIR BUDGET REACHED after {g.get('snapshots_classified')} buckets"),
         "",
         "LINK-STATE COMPOSITION (the quantity that explains the awareness number)",
         f"  overall   LOS {mix['LOS']:.4f}   NLOSv {mix['NLOSv']:.4f}   NLOSb {mix['NLOSb']:.4f}",
@@ -1096,11 +1264,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--bin-m", type=float, default=DIST_BIN_M)
     p.add_argument("--max-dist-m", type=float, default=MAX_DIST_M)
     p.add_argument("--max-pairs", type=int, default=MAX_PAIRS_CLASSIFIED)
+    p.add_argument("--max-snaps", type=int, default=MAX_SNAPSHOTS,
+                   help=f"cap on time buckets classified (default {MAX_SNAPSHOTS}; 0 = every "
+                        f"bucket). The buckets are drawn by realism_bench's own sampler, so this "
+                        f"is the same knob as its --max-instants")
+    p.add_argument("--sampler-seed", type=int, default=None,
+                   help="seed for the bucket sub-sample and the pair-budget visit order (default: "
+                        "realism_bench.SAMPLER_SEED). A published capped number's sampling error "
+                        "is frozen; changing this is the only way to re-roll it")
     a = p.parse_args(argv)
     if not os.path.isdir(a.dataset_dir):
         p.error(f"dataset directory not found: {a.dataset_dir}")
     rep = awareness_report(a.dataset_dir, refdata_dir=a.refdata, bin_m=a.bin_m,
-                           max_dist_m=a.max_dist_m, max_pairs=a.max_pairs)
+                           max_dist_m=a.max_dist_m, max_pairs=a.max_pairs,
+                           max_snaps=a.max_snaps, sampler_seed=a.sampler_seed)
     if a.markdown:
         print("\n".join(render_lines(rep)))
     else:

@@ -486,8 +486,12 @@ def bench(out_dir: str, regime: str = "urban", traffic_source: str = "auto",
     return {"metrics": flat,
             "traffic_source": card.get("traffic_source"),
             "survivorship": card.get("survivorship"),
+            # The caps AND the rule that drew the sample inside them: a cap without its sampler is
+            # not a reproducible description of a capped scan, and the sampler is the half that
+            # carried the phase-lock bias (docs/realism/LONG-RUNS.md 3.5).
             "sampling": {k: card.get("settings", {}).get(k)
                          for k in ("max_instants", "max_time_buckets", "headway_max_instants",
+                                   "max_veh_per_bucket", "sampler", "sampler_seed",
                                    "curve_min_links_per_bin")},
             "summary": card.get("summary"),
             "hard_failures": rb.hard_failures(card)}

@@ -36,6 +36,8 @@ import json
 import math
 import os
 import random
+import subprocess
+import sys
 
 import pytest
 
@@ -97,9 +99,10 @@ def _overlapping_platoon(n_steps, n_veh=4, overlap_every=7, overlap_phase=0):
 
     THAT DEFAULT USED TO BE THE WHOLE PROBLEM WITH THIS FILE. Choosing a period coprime with the
     stride is choosing not to test the sampler, and the failure mode the real signalised arm
-    actually exhibits -- a period that DIVIDES the stride -- was therefore never exercised here. The
-    DEFECT 1b section below passes `overlap_every` and `overlap_phase` explicitly to build exactly
-    that case, and it fails against the old fixed-stride rule.
+    actually exhibits -- a period that DIVIDES the stride -- was therefore never exercised here.
+    Every sampler-sensitive test now passes `overlap_every` and `overlap_phase` explicitly to build
+    exactly that case, and each one is red against BOTH withdrawn rules. The coprime default is
+    kept only for the tests that are about the cap's bookkeeping rather than about the sampler.
     """
     rows = []
     for step in range(n_steps):
@@ -118,16 +121,56 @@ def _overlapping_platoon(n_steps, n_veh=4, overlap_every=7, overlap_phase=0):
 # ==================================================================================================
 # DEFECT 1 -- a count over a capped scan is not comparable; the rate is
 # ==================================================================================================
-def test_overlap_count_saturates_at_the_cap_while_the_rate_does_not(tmp_path):
+def _spread(values):
+    """(mean, sample sd, standard error of the mean) of a list of seed replicates.
+
+    Every bound in this file that is not exact arithmetic is sized from THIS, not chosen. A bound
+    picked by taste is either so tight it fails on the sampler's luck or so loose it no longer
+    discriminates the rule it exists to reject -- and both of those had happened here.
+    """
+    m = sum(values) / len(values)
+    sd = math.sqrt(sum((v - m) ** 2 for v in values) / (len(values) - 1))
+    return m, sd, sd / math.sqrt(len(values))
+
+
+# 5 measured sigmas. On a 16-seed mean that is a two-sided t_15 tail of ~1.5e-4 per assertion, and
+# it is computed from the replicates in the test rather than assumed.
+Z = 5.0
+
+
+def _over_seeds(root, seeds, *mids):
+    """One scorecard per seed; the requested rows of each. The scorecard is the expensive part, so
+    every replicate this file measures comes out of ONE pass over the seeds."""
+    out = {m: [] for m in mids}
+    for s in seeds:
+        card = rb.scorecard(root, sampler_seed=s)
+        for m in mids:
+            out[m].append(_row(card, m))
+    return out
+
+
+def test_overlap_count_saturates_at_the_cap_while_the_rate_does_not(tmp_path, monkeypatch):
     """The measured shape of docs/realism/LONG-RUNS.md section 3.3, reproduced in miniature.
 
     Two runs of the SAME scenario, one 5x longer. The traffic behind the metric grows 5x; the count
     does not grow with it (the scan is capped at MAX_TIME_BUCKETS instants) while the rate per
     examined pair is the constant it should be.
+
+    THE FIXTURE'S PERIOD DIVIDES THE STRIDE (5 into 1,200/240), which is what makes the assertions
+    below discriminating: with `overlap_every=7` -- coprime, the fixture default -- the withdrawn
+    fixed-stride rule lands on exactly 35 of the 240 sampled instants, which is exactly the short
+    run's own count, so it satisfied the bounds this test used to carry with a deviation of
+    0.0000 and the test said nothing about the sampler at all. Here that rule sees phase 0 of a
+    structure at phase 1 and publishes zero, and each bound is sized from the measured spread of the
+    seed replicates, so it is both sound and red against the rule it rejects.
     """
-    short = rb.scorecard(_dataset(str(tmp_path / "s"), _overlapping_platoon(rb.MAX_TIME_BUCKETS)))
-    long_ = rb.scorecard(_dataset(str(tmp_path / "l"),
-                                  _overlapping_platoon(rb.MAX_TIME_BUCKETS * 5)))
+    short = rb.scorecard(_dataset(str(tmp_path / "s"),
+                                  _overlapping_platoon(rb.MAX_TIME_BUCKETS,
+                                                       overlap_every=5, overlap_phase=1)))
+    root_l = _dataset(str(tmp_path / "l"),
+                      _overlapping_platoon(rb.MAX_TIME_BUCKETS * 5,
+                                           overlap_every=5, overlap_phase=1))
+    long_ = rb.scorecard(root_l)
     c_s, c_l = _row(short, "traffic.overlap_events"), _row(long_, "traffic.overlap_events")
     r_s, r_l = (_row(short, "traffic.overlap_rate_per_1k_pair_instants"),
                 _row(long_, "traffic.overlap_rate_per_1k_pair_instants"))
@@ -140,27 +183,41 @@ def test_overlap_count_saturates_at_the_cap_while_the_rate_does_not(tmp_path):
     assert c_l["details"]["coverage_frac"] == pytest.approx(0.2)
 
     # THE DEFECT: 5x the traffic, and the count does not move with it. The long run really contains
-    # 172 overlaps (1,200 instants, one every 7); 240 instants is 240 instants, so the count reports
-    # a fifth of them and a reader comparing it with the short run's 35 learns nothing.
-    true_long = _row(rb.scorecard(_dataset(str(tmp_path / "l0"),
-                                           _overlapping_platoon(rb.MAX_TIME_BUCKETS * 5)),
-                                  max_instants=0), "traffic.overlap_events")
-    assert true_long["details"]["instants_examined"] == 1200 and true_long["value"] == 172
-    assert c_l["value"] == pytest.approx(c_s["value"], rel=0.35)
+    # 240 overlaps (1,200 instants, one every 5); 240 instants is 240 instants, so the count reports
+    # a fifth of them and a reader comparing it with the short run's 48 learns nothing.
+    true_long = _row(rb.scorecard(root_l, max_instants=0), "traffic.overlap_events")
+    assert true_long["details"]["instants_examined"] == 1200 and true_long["value"] == 240
+    assert c_s["value"] == 48                                  # the short run is scanned in full
     assert c_l["value"] < 0.4 * true_long["value"]
+
     # THE FIX: the rate is the same number both times -- which is the truth about this scenario.
-    # The short run is scanned in full, so r_s is exact; r_l is a 240-of-1,200 sample and carries
-    # the sampling noise the jittered sampler trades the old rule's phase bias for. Averaged over
-    # seeds that noise cancels, which is the actual claim: the estimator is UNBIASED, not exact.
-    assert r_l["value"] == pytest.approx(r_s["value"], rel=0.35)
-    reps = [_row(rb.scorecard(_dataset(str(tmp_path / f"r{s}"),
-                                       _overlapping_platoon(rb.MAX_TIME_BUCKETS * 5)),
-                              sampler_seed=s), "traffic.overlap_rate_per_1k_pair_instants")["value"]
-            for s in range(12)]
-    assert (sum(reps) / len(reps)) == pytest.approx(r_s["value"], rel=0.05)
+    # r_s is exact (the short run is uncapped); r_l is one 240-of-1,200 draw and carries the
+    # sampling noise the jittered sampler trades the old rule's phase bias for. The claim is that
+    # the estimator is UNBIASED, so the assertions are: one draw inside a measured 5-sigma band,
+    # and the 16-seed MEAN inside 5 standard errors of it.
+    reps = _over_seeds(root_l, range(16), "traffic.overlap_events",
+                       "traffic.overlap_rate_per_1k_pair_instants")
+    c_mean, c_sd, c_se = _spread([m["value"] for m in reps["traffic.overlap_events"]])
+    assert c_sd > 0, "a sampler with no spread at all is not being exercised"
+    assert abs(c_l["value"] - c_s["value"]) <= Z * c_sd, (c_l["value"], c_s["value"], c_sd)
+    assert abs(c_mean - c_s["value"]) <= Z * c_se, (c_mean, c_s["value"], c_se)
+
+    rate_rows = reps["traffic.overlap_rate_per_1k_pair_instants"]
+    mean, sd, se = _spread([m["value"] for m in rate_rows])
+    assert abs(r_l["value"] - r_s["value"]) <= Z * sd
+    assert abs(mean - r_s["value"]) <= Z * se, (mean, r_s["value"], se)
+
+    # AND THE BOUND REALLY DOES REJECT THE WITHDRAWN RULE, which is the half that had been lost.
+    # (The stride here is the integer 5, where the OTHER withdrawn rule -- real-valued window jitter
+    # -- is exact; its defect needs a fractional stride and has its own test below.)
+    with monkeypatch.context() as mp:
+        mp.setattr(rb, "_subsample", _legacy_sampler)
+        old = _row(rb.scorecard(root_l), "traffic.overlap_rate_per_1k_pair_instants")["value"]
+    assert abs(old - r_s["value"]) > Z * sd, (old, r_s["value"], sd)
+
     # ... and the extrapolated whole-run magnitude DOES grow with the run, as a reader expects
-    assert (r_l["details"]["estimated_run_total"]
-            == pytest.approx(5 * r_s["details"]["estimated_run_total"], rel=0.35))
+    t_mean, _t_sd, t_se = _spread([m["details"]["estimated_run_total"] for m in rate_rows])
+    assert abs(t_mean - 5 * r_s["details"]["estimated_run_total"]) <= Z * t_se
 
 
 def test_a_capped_count_says_out_loud_that_it_cannot_be_compared(tmp_path):
@@ -191,24 +248,40 @@ def test_the_ci_line_for_a_capped_count_carries_its_coverage(tmp_path):
     assert all("instants," not in x for x in rb.hard_failures(full))
 
 
-def test_max_instants_zero_removes_the_cap_and_the_count_becomes_the_run_s(tmp_path):
-    """`--max-instants 0` is the escape hatch for a run long enough to afford the full scan."""
-    root = _dataset(str(tmp_path / "u"), _overlapping_platoon(rb.MAX_TIME_BUCKETS * 4))
+def test_max_instants_zero_removes_the_cap_and_the_count_becomes_the_run_s(tmp_path, monkeypatch):
+    """`--max-instants 0` is the escape hatch for a run long enough to afford the full scan.
+
+    The period is 4 into a stride of exactly 4 (960 instants, cap 240) at phase 1, so -- as in the
+    test above -- the withdrawn fixed-stride rule sees phase 0 and publishes an extrapolated run
+    total of ZERO for a run with 240 overlaps in it, and the bound below is red against it. With the
+    fixture's coprime default this assertion was satisfied by the withdrawn rule EXACTLY.
+    """
+    root = _dataset(str(tmp_path / "u"), _overlapping_platoon(rb.MAX_TIME_BUCKETS * 4,
+                                                              overlap_every=4, overlap_phase=1))
     capped = _row(rb.scorecard(root), "traffic.overlap_events")
     full = _row(rb.scorecard(root, max_instants=0), "traffic.overlap_events")
     assert capped["details"]["instants_examined"] == 240
     assert full["details"]["instants_examined"] == full["details"]["instants_available"] == 960
-    assert full["value"] > capped["value"]
+    assert full["value"] == 240 and full["value"] > capped["value"]
+
     # and the capped RATE was an unbiased estimate of the uncapped truth all along -- UNBIASED, not
-    # exact: a 240-of-960 sample carries binomial noise, so the single-seed value is within a third
-    # and the mean over seeds is within a twentieth. Asserting the tight bound on ONE seed would be
-    # asserting the sampler's luck, which is the mistake this whole section exists to stop making.
+    # exact: a 240-of-960 sample carries binomial noise. Both bounds below are the MEASURED spread
+    # of the seed replicates, so neither is a guess: one draw inside 5 sd, the 16-seed mean inside
+    # 5 standard errors. Asserting a tight bound on ONE seed would be asserting the sampler's luck,
+    # which is the mistake this whole section exists to stop making; asserting a loose one by taste
+    # is how the bound stopped rejecting the rule it was written to reject.
     est = _row(rb.scorecard(root), "traffic.overlap_rate_per_1k_pair_instants")
-    assert est["details"]["estimated_run_total"] == pytest.approx(full["value"], rel=0.30)
-    reps = [_row(rb.scorecard(root, sampler_seed=s),
-                 "traffic.overlap_rate_per_1k_pair_instants")["details"]["estimated_run_total"]
-            for s in range(16)]
-    assert (sum(reps) / len(reps)) == pytest.approx(full["value"], rel=0.05)
+    rows = _over_seeds(root, range(16), "traffic.overlap_rate_per_1k_pair_instants")[
+        "traffic.overlap_rate_per_1k_pair_instants"]
+    tot = [m["details"]["estimated_run_total"] for m in rows]
+    mean, sd, se = _spread(tot)
+    assert sd > 0
+    assert abs(est["details"]["estimated_run_total"] - full["value"]) <= Z * sd
+    assert abs(mean - full["value"]) <= Z * se, (mean, full["value"], se)
+    with monkeypatch.context() as mp:                   # the stride is the integer 4: see above
+        mp.setattr(rb, "_subsample", _legacy_sampler)
+        old = _row(rb.scorecard(root), "traffic.overlap_rate_per_1k_pair_instants")
+    assert abs(old["details"]["estimated_run_total"] - full["value"]) > Z * sd
 
 
 def test_the_default_cap_is_unchanged_so_no_historical_count_moves(tmp_path):
@@ -271,8 +344,17 @@ def test_headway_rows_carry_the_coverage_of_their_own_capped_scan(tmp_path):
 # phases sampled was 12/gcd(stride, 12) = 8/4/2/1: at 14,400 s ALL 240 sampled instants sat at ONE
 # PHASE and the published rate read -38.6% against the uncapped truth.
 #
-# Every test in this section uses a period that DIVIDES the stride -- i.e. exactly the case the
-# `overlap_every=7` default above was chosen to avoid -- and each one is red against the old rule.
+# Every scenario test in this section uses a period that DIVIDES the stride -- i.e. exactly the case
+# the `overlap_every=7` default above was chosen to avoid -- and each one is red against that rule.
+#
+# THE FIRST REPLACEMENT WAS ALSO WRONG, and this section now covers it too. It jittered inside
+# REAL-VALUED windows and advanced an index that collided with its predecessor, which makes the
+# inclusion probability non-uniform at every n the cap does not divide (up to 20.4% item-to-item)
+# and biases a published rate by -8.3% at s = 2.004. So the tests below come in pairs: the property
+# measured on the shipped rule, and the same measurement shown RED on the rule it replaced --
+# because a regression test that has never been seen red is not a regression test, and the previous
+# version of this file proved exactly one case (n=1440, k=240, s=6 EXACTLY) in which both withdrawn
+# rules are correct.
 # ==================================================================================================
 def _legacy_sampler(items, max_items, *, stream=None, seed=None):
     """The withdrawn fixed-stride rule, in the current signature, for monkeypatching.
@@ -282,6 +364,16 @@ def _legacy_sampler(items, max_items, *, stream=None, seed=None):
     re-typed approximation of it.
     """
     return rb._fixed_stride_subsample(items, max_items)
+
+
+def _v1_sampler(items, max_items, *, stream="x", seed=rb.SAMPLER_SEED):
+    """The OTHER withdrawn rule: real-valued jitter windows with the collision tie-break.
+
+    It fixed the phase lock and introduced a smaller bias of its own (see
+    `rb._window_jitter_subsample`), so every bound in this file is now checked against BOTH retired
+    rules -- a bound that only rejects the one you remember is a bound that will be loosened again.
+    """
+    return rb._window_jitter_subsample(items, max_items, stream=stream, seed=seed)
 
 
 def test_the_old_sampler_saw_one_signal_phase_and_the_new_one_sees_them_all():
@@ -298,34 +390,110 @@ def test_the_old_sampler_saw_one_signal_phase_and_the_new_one_sees_them_all():
     new = rb._subsample(items, 240, stream="overlap")
     assert len(new) == 240 and new == sorted(set(new))      # still 240 distinct instants, in order
     assert len({j % 12 for j in new}) == 12                 # ... spread over every phase
-    # and it is still an EVEN sweep of the run, not a clump: exactly one index per stride window
-    assert all(int(i * 6) <= new[i] < int((i + 1) * 6) + 1 for i in range(240))
+    # and it is still an EVEN sweep of the run, not a clump: one index per block of a partition
+    # into 240 blocks of 6, ROTATED by a uniform offset (the rotation is what makes the inclusion
+    # probability exactly k/n when k does not divide n, so the blocks no longer start at 0).
+    gaps = [b - a for a, b in zip(new, new[1:])]
+    assert min(gaps) >= 1 and max(gaps) <= 12               # <= L_i + L_(i+1) = 2 * ceil(n/k)
+    assert (new[0] + 1440 - new[-1]) <= 12                  # ... including across the seam
 
 
-def test_the_sampler_inclusion_probability_is_uniform_over_every_instant():
-    """The property that makes the pooled distribution unbiased, measured rather than asserted.
-
-    Jittered systematic sampling selects item m iff some window's uniform draw lands in [m, m+1);
-    the windows tile [0, n) and each draw is uniform over its own window of width s = n/k, so
-    P(m) = 1/s = k/n for EVERY m, whatever the population does. Over 400 seeds the observed
-    frequency of every one of the 1,440 instants sits inside a 4-sigma binomial band around 240/1440.
-    """
-    n, k, trials = 1440, 240, 400
+def _inclusion_freq(fn, n, k, trials):
+    """Observed selection frequency of every one of the n items, over `trials` sampler seeds."""
     seen = [0] * n
     for sd in range(trials):
-        for j in rb._subsample(list(range(n)), k, stream="p", seed=sd):
+        for j in fn(list(range(n)), k, stream="p", seed=sd):
             seen[j] += 1
+    return [c / trials for c in seen]
+
+
+def _worst_z(freq, n, k, trials):
+    """Largest per-item deviation from k/n, in binomial sigmas.
+
+    ACROSS SEEDS each item's count is exactly Binomial(trials, P(item)) -- the one-per-stratum
+    negative correlation is between ITEMS within a seed, never between seeds -- so this band is
+    exact, not an approximation, whatever the design does.
+    """
     p = k / n
-    sd_band = 4.0 * math.sqrt(p * (1 - p) / trials)
-    lo, hi = p - sd_band, p + sd_band
-    assert all(lo <= c / trials <= hi for c in seen), (min(seen) / trials, max(seen) / trials)
-    # the same draws, read as PHASES of a period-12 structure: flat, where the old rule had 2 of 12
+    return max(abs(f - p) for f in freq) / math.sqrt(p * (1 - p) / trials)
+
+
+# (n, k, seeds): the AWKWARD pairs -- k not dividing n is the whole point, and the two k | n cases
+# are kept as the controls that used to be the only case tested.
+INCLUSION_CASES = [(3, 2, 20000), (7, 5, 20000), (11, 4, 20000), (300, 240, 3000),
+                   (481, 240, 4000), (1201, 240, 3000), (1440, 240, 3000), (1200, 240, 3000)]
+# 5.5 sigma, one-item: over the largest population here (1,440 items) a false alarm costs
+# 1440 * 2 * (1 - Phi(5.5)) = 5.5e-5 per case. Sized for the multiplicity, not by taste.
+INCLUSION_Z = 5.5
+
+
+def test_the_sampler_inclusion_probability_is_uniform_at_awkward_n_AND_k():
+    """The property every capped row's claim rests on, measured where it is HARD -- k not dividing n.
+
+    This test used to run exactly one case, n=1440 k=240, i.e. s = 6 EXACTLY. That is the one family
+    where the claim is trivially true: with an integer stride no item straddles two windows and the
+    previous rule's tie-break can never fire, so the test could not detect either of the defects
+    that were actually in the sampler. Every case below except the last two has a fractional stride.
+    """
+    for n, k, trials in INCLUSION_CASES:
+        z = _worst_z(_inclusion_freq(rb._subsample, n, k, trials), n, k, trials)
+        assert z <= INCLUSION_Z, (n, k, z)
+
+
+def test_the_withdrawn_window_jitter_rule_fails_that_test_and_is_kept_so_it_can():
+    """A regression test that has never been seen red is not a regression test.
+
+    `_window_jitter_subsample` is the rule this module shipped before: one uniform draw inside each
+    REAL-VALUED window of width s = n/k, with `if j <= prev: j = prev + 1` to break the collisions
+    that a fractional s makes possible. Both halves of that break the claim -- an item covered by
+    two windows is selected with less than the expected probability, and the tie-break displaces the
+    collision UPWARD onto the next item -- and the deviation is 9-20% item-to-item at these sizes.
+    It is exact only at k | n, which is why it survived the old test.
+    """
+    z_of = {(n, k): _worst_z(_inclusion_freq(rb._window_jitter_subsample, n, k, trials), n, k,
+                             trials)
+            for n, k, trials in INCLUSION_CASES}
+    # Where its deviation is 9-20% of k/n, this many seeds resolve it overwhelmingly (z = 8 to 45).
+    for case in ((3, 2), (7, 5), (11, 4), (300, 240), (481, 240)):
+        assert z_of[case] > INCLUSION_Z, (case, z_of[case])
+    # ... and at s = 6 and s = 5 EXACTLY it passes, which is the whole of what the old test proved:
+    # with an integer stride no item straddles two windows and the tie-break can never fire.
+    for case in ((1440, 240), (1200, 240)):
+        assert z_of[case] <= INCLUSION_Z, (case, z_of[case])
+    # (n=1201 is deliberately not asserted either way: its worst deviation is 5.0% of k/n, about
+    # 1.4 sigma at this many seeds, which is exactly the regime where a test cannot separate the
+    # rules -- and asserting it would be asserting noise.)
+
+
+def test_the_sampler_edge_cases_are_the_identity_or_a_single_uniform_draw():
+    """k >= n, k = 1, n = 0: the boundaries, where an off-by-one becomes a silent data loss."""
+    assert rb._subsample([], 240, stream="p") == []
+    assert rb._subsample(list(range(50)), 240, stream="p") == list(range(50))     # k > n
+    assert rb._subsample(list(range(240)), 240, stream="p") == list(range(240))   # k = n
+    assert rb._subsample(list(range(17)), 0, stream="p") == list(range(17))       # no cap
+    assert rb._subsample(list(range(17)), None, stream="p") == list(range(17))
+    freq = _inclusion_freq(rb._subsample, 17, 1, 20000)                           # k = 1
+    assert len(rb._subsample(list(range(17)), 1, stream="p")) == 1
+    assert _worst_z(freq, 17, 1, 20000) <= INCLUSION_Z
+
+
+def test_the_sampled_phase_of_a_periodic_structure_is_flat():
+    """The same draws read as PHASES of a period-12 structure: flat, where the old rule had 2 of 12.
+
+    Uniform inclusion probability implies this (a phase is just an indicator over instants), so it
+    is a consequence rather than a second property -- but it is the consequence the signal-cycle
+    defect was about, so it is asserted where a reader will look for it.
+    """
+    n, k, trials = 1440, 240, 400
     phase = [0] * 12
     for sd in range(trials):
         for j in rb._subsample(list(range(n)), k, stream="p", seed=sd):
             phase[j % 12] += 1
     share = [c / (trials * k) for c in phase]
-    assert all(abs(s - 1 / 12) < 0.004 for s in share), share
+    # 4 sigma on a share of 1/12 over trials*k draws (the draws within one seed are dependent, but
+    # only negatively, so the independent band is conservative)
+    band = 4.0 * math.sqrt((1 / 12) * (11 / 12) / (trials * k))
+    assert all(abs(s - 1 / 12) < band for s in share), share
 
 
 def test_a_period_that_divides_the_stride_makes_the_old_sampler_publish_zero(tmp_path, monkeypatch):
@@ -407,6 +575,47 @@ def test_shifting_the_structure_by_one_instant_no_longer_moves_the_published_rat
     assert (sum(new_vals) / len(new_vals)) == pytest.approx(truth, rel=0.10)
 
 
+def test_a_fractional_stride_no_longer_biases_the_published_rate(tmp_path, monkeypatch):
+    """THE SECOND REGRESSION: the tie-break, measured through the real scorecard.
+
+    481 instants capped to 240 is a stride of 2.004 -- fractional, so under the withdrawn
+    window-jitter rule an instant's unit interval could be covered by two adjacent windows and the
+    collision was resolved by advancing to the NEXT index. On a population of period 2 that
+    displacement lands on the other phase every time, and the published rate reads 8.3% low. This
+    is the rung the reference arm's own 300 s run sits on (296 instants, s = 1.23), not an exotic
+    corner: the bias is largest where the stride is SMALL, i.e. on SHORT runs.
+
+    Both bounds are the measured standard error of the seed replicates. The withdrawn rule's mean
+    has to be OUTSIDE its own band -- if it were not, this test would not be evidence of anything.
+    """
+    root = _dataset(str(tmp_path / "frac"),
+                    _overlapping_platoon(481, overlap_every=2, overlap_phase=0))
+    mid = "traffic.overlap_rate_per_1k_pair_instants"
+    truth = _row(rb.scorecard(root, max_instants=0), mid)["value"]
+    assert truth == pytest.approx(1000.0 * 241 / (481 * 6), rel=1e-6)      # 83.5066
+
+    seeds = range(40)
+    new = [m["value"] for m in _over_seeds(root, seeds, mid)[mid]]
+    n_mean, _n_sd, n_se = _spread(new)
+    assert abs(n_mean - truth) <= Z * n_se, (n_mean, truth, n_se)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(rb, "_subsample", _v1_sampler)
+        old = [m["value"] for m in _over_seeds(root, seeds, mid)[mid]]
+    o_mean, _o_sd, o_se = _spread(old)
+    assert o_mean < truth - Z * o_se, (o_mean, truth, o_se)
+    assert o_mean / truth - 1.0 < -0.05          # the measured size of it: about -8%
+    # and the exact arithmetic behind that: the withdrawn rule's inclusion probability at this
+    # (n, k) runs 0.4367 to 0.5612 against a k/n of 0.4990, and the deficit falls on the even
+    # instants -- which are exactly the ones that overlap in this fixture.
+    freq = _inclusion_freq(rb._window_jitter_subsample, 481, 240, 4000)
+    even = sum(freq[m] for m in range(0, 481, 2)) / len(range(0, 481, 2))
+    assert even < 240 / 481 - 0.01
+    new_freq = _inclusion_freq(rb._subsample, 481, 240, 4000)
+    new_even = sum(new_freq[m] for m in range(0, 481, 2)) / len(range(0, 481, 2))
+    assert abs(new_even - 240 / 481) < 0.01
+
+
 def test_the_sampler_is_deterministic_seeded_and_stream_isolated(tmp_path):
     """Byte-identical output for the same seed+config is this repository's core contract.
 
@@ -433,6 +642,29 @@ def test_the_sampler_is_deterministic_seeded_and_stream_isolated(tmp_path):
     assert random.random() == before
 
 
+def test_the_sampler_is_PYTHONHASHSEED_independent():
+    """The draws must not move with the interpreter's hash seed, in a SEPARATE INTERPRETER.
+
+    `random.Random(<str>)` is seeded through SHA-512 of the key, which is why this holds -- but the
+    property is load-bearing for every published capped number and cannot be asserted from inside
+    one process, because `PYTHONHASHSEED` is read at startup. So it is measured across three
+    children: two pinned to different seeds and one with randomisation left on.
+    """
+    src = ("import sys, json; sys.path.insert(0, r'%s');"
+           "from scms_sim_ref.datagen import realism_bench as rb;"
+           "print(json.dumps([rb._subsample(list(range(n)), k, stream='p', seed=3)"
+           " for n, k in ((481, 240), (1201, 240), (7, 5))]))"
+           % os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+    outs = []
+    for hs in ("0", "12345", None):
+        env = dict(os.environ)
+        env.pop("PYTHONHASHSEED", None) if hs is None else env.update(PYTHONHASHSEED=hs)
+        outs.append(subprocess.run([sys.executable, "-c", src], capture_output=True, text=True,
+                                   env=env, check=True).stdout.strip())
+    assert outs[0] == outs[1] == outs[2], outs
+    assert json.loads(outs[0])[2] == rb._subsample(list(range(7)), 5, stream="p", seed=3)
+
+
 def test_the_scorecard_names_the_sampler_that_chose_its_instants(tmp_path):
     """A cap without its sampler is not a reproducible description of a capped scan -- the sampler
     is the half that carried the bias, and it was previously invisible in the output."""
@@ -443,7 +675,10 @@ def test_the_scorecard_names_the_sampler_that_chose_its_instants(tmp_path):
                 "traffic.headway_p50_s", "traffic.headway_ks_shifted_exponential"):
         d = _row(card, mid)["details"]
         assert d["sampler"] == rb.SAMPLER_KEY and d["sampler_seed"] == rb.SAMPLER_SEED
-        assert "jittered systematic" in d["sampling"]
+        assert "circular jittered systematic" in d["sampling"]
+        # the published claim, in the form that is TRUE of the rule that is running
+        assert "exactly examined/available for every unit" in d["sampling"]
+        assert "no divisibility condition" in d["sampling"]
     # the comm panel's co-presence buckets are sub-sampled by the same rule and say so too
     d = _row(card, "comm.copresence_pairs")["details"] if any(
         m["id"] == "comm.copresence_pairs" for m in card["panels"]["comm"]) else None

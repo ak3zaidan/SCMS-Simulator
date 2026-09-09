@@ -301,8 +301,14 @@ def test_a_blocker_behind_the_transmitter_does_not_block():
 def test_known_composition_of_a_two_row_scene():
     """Two rows of three vehicles either side of one long wall. The decomposition is exact:
     9 cross-row pairs all cross the wall (NLOSb); of the 6 same-row pairs, the 2 end-to-end ones
-    have the middle vehicle exactly on the line (NLOSv, since a car roof at 1.6 m is above the
-    1.5 m antenna) and the remaining 4 are clear (LOS). 9 + 2 + 4 = 15 = C(6,2)."""
+    have the middle vehicle exactly on the line (NLOSv) and the remaining 4 are clear (LOS).
+    9 + 2 + 4 = 15 = C(6,2).
+
+    Why the blocked pair is NLOSv changed on 2026-09-07 and the count did not. It used to be "a car
+    roof at 1.6 m is above the 1.5 m antenna"; the antenna is now the standard's own Type 2 height,
+    1.6 m, so roof and antenna are EQUAL -- and TR 37.885 clause 6.2.1 puts equality in Case 3 (no
+    blockage loss requires min(antenna) STRICTLY above the blocker), which is still NLOSv. What
+    changes is the LOSS on that pair, 9.04 dB -> 5.20 dB, not its state."""
     rows = []
     for i in range(3):
         rows.append((f"veh_n{i}", 20.0 * i, 40.0))
@@ -343,13 +349,54 @@ def test_composition_fractions_sum_to_one_per_populated_band():
         assert tot == pytest.approx(1.0, abs=1e-9)
 
 
-def test_pair_budget_truncates_deterministically():
+def test_pair_budget_stops_on_whole_buckets_and_is_deterministic():
+    """The budget stops between BUCKETS, not inside one.
+
+    It used to stop at the 100th pair of whichever bucket was being classified, which left half a
+    bucket in the counts (the first vehicles of it, in id order) and made the classified population
+    the run's earliest instants. Now a bucket is committed only when it is complete, so the counts
+    are always a whole number of buckets; a single bucket bigger than the whole budget is still
+    classified in full, because reporting nothing would be worse than overshooting the budget once.
+    """
     rows = [(f"veh_{i:03d}", 3.0 * i, 0.0) for i in range(60)]
     sc = _scenario(_emit(rows), veh_types={v: "car" for v, _, _ in rows})
     a = aw.link_state_composition(sc, bin_m=50.0, max_dist_m=500.0, max_pairs=100)
     b = aw.link_state_composition(sc, bin_m=50.0, max_dist_m=500.0, max_pairs=100)
-    assert a["truncated"] and a["n_classified"] == 100
+    assert a["n_classified"] == 1770 == 60 * 59 // 2      # the one bucket, whole
+    assert a["snapshots_classified"] == 1
+    assert not a["truncated"]                             # nothing was dropped: nothing to warn of
     assert np.array_equal(a["count"]["LOS"], b["count"]["LOS"])
+
+
+def test_a_pair_budget_stop_no_longer_keeps_the_EARLIEST_buckets():
+    """DEFECT: the budget took pairs in snapshot order, so exhausting it kept the start of the run.
+
+    Twelve buckets, laid out along x so each is its own place; the LAST SIX have a wall across them
+    and are therefore the only source of NLOSb pairs. A budget that fits half the buckets, under
+    the old rule, classified buckets 0-5 and published NLOSb = 0 for a scene that is half blocked.
+    Under a random visit order, seeing no late bucket at all requires every one of eight seeds to
+    draw its six buckets from the early six: 1/924 per seed, so the aggregate assertion below is
+    exact against the old rule and fails against the new one with probability ~1e-18.
+    """
+    walls = [_wall(500.0 * t + 13.5, 0.0, half_x=1.0, half_y=30.0) for t in range(6, 12)]
+    emis = [e for t in range(12)
+            for e in _emit([(f"veh_{i:03d}", 3.0 * i + 500.0 * t, 0.0) for i in range(10)],
+                           t=float(t))]
+    sc = _scenario(emis, buildings=walls,
+                   veh_types={f"veh_{i:03d}": "car" for i in range(10)})
+    per_bucket = 10 * 9 // 2
+    budget = 6 * per_bucket
+    comp = aw.link_state_composition(sc, bin_m=50.0, max_dist_m=500.0, max_pairs=budget)
+    assert comp["snapshots"] == 12 and comp["truncated"]
+    assert 0 < comp["snapshots_classified"] < 12
+    assert comp["n_classified"] == comp["snapshots_classified"] * per_bucket   # whole buckets only
+    assert "THE RAY-MARCH BUDGET BOUND" in comp["sampling"]["pair_budget"]
+
+    late = [int(aw.link_state_composition(sc, bin_m=50.0, max_dist_m=500.0, max_pairs=budget,
+                                          sampler_seed=s)["count"]["NLOSb"].sum())
+            for s in range(8)]
+    assert sum(late) > 0, "every seed kept only the run's earliest buckets"
+    assert sum(1 for v in late if v > 0) >= 3, late
 
 
 # ==================================================================================================
@@ -542,6 +589,106 @@ def test_higher_power_raises_awareness_at_a_fixed_distance(tmp_path):
     same = aw.propagation_pdr("NLOSb", 150.0, tx_power_dbm=13.0, decode_floor_dbm=-91.0)
     other = aw.propagation_pdr("NLOSb", 150.0, tx_power_dbm=23.0, decode_floor_dbm=-81.0)
     assert same == pytest.approx(other, abs=1e-9)
+
+
+# ==================================================================================================
+# the bucket sub-sample: the harness's sampler, its seam, and its coverage
+#
+# This module used to cap its own scan at 240 buckets with `keys[int(i * step)]` -- a byte-identical
+# copy of the FIXED-STRIDE rule `realism_bench` had already withdrawn as phase-locked, still feeding
+# published comm.* rows, with no cap argument and no sampler seed, so `--max-instants 0` could not
+# reach it and no CLI flag could re-draw it.
+# ==================================================================================================
+def _phase_scene(n_steps=1200, period=5, phase=1, near=25.0, far=125.0):
+    """A scene whose PAIR DISTANCE is periodic in the bucket index.
+
+    At `t % period == phase` the pair is `near` apart (the 0-50 m band); otherwise `far` (100-150 m).
+    Which band the classified pairs land in therefore says exactly which phases the bucket sampler
+    saw -- no geometry, no wall, no model in between.
+    """
+    emis = []
+    for t in range(n_steps):
+        d = near if t % period == phase else far
+        emis += _emit([("veh_000", 0.0, 0.0), ("veh_001", d, 0.0)], t=float(t))
+    return _scenario(emis, veh_types={"veh_000": "car", "veh_001": "car"})
+
+
+def test_the_bucket_cap_no_longer_uses_the_withdrawn_fixed_stride_rule(monkeypatch):
+    """1,200 buckets capped to 240 is a stride of 5; the near pairs recur every 5 at phase 1.
+
+    The fixed stride lands on phase 0 every single time and classifies NOT ONE of them -- it
+    publishes a link-state composition for a scene whose entire short-range population it never
+    looked at. The harness sampler sees them at the rate they occur.
+    """
+    sc = _phase_scene()
+    with monkeypatch.context() as mp:
+        mp.setattr(rb, "_subsample", lambda items, mx, *, stream=None, seed=None:
+                   rb._fixed_stride_subsample(items, mx))
+        old = aw.link_state_composition(sc, bin_m=50.0, max_dist_m=300.0)
+    assert old["n_pairs"][0] == 0                      # 0-50 m band: never sampled
+    assert old["n_pairs"][2] == 240
+
+    new = aw.link_state_composition(sc, bin_m=50.0, max_dist_m=300.0)
+    assert new["buckets_examined"] == 240 and new["buckets_available"] == 1200
+    # one near bucket per block of 5, each drawn with probability 1/5: Binomial(240, 0.2),
+    # mean 48, sd 6.20. A 5-sigma band is 48 +/- 31, and it is the sampler's own arithmetic.
+    assert abs(int(new["n_pairs"][0]) - 48) <= 31, new["n_pairs"][:3]
+    assert int(new["n_pairs"][0]) + int(new["n_pairs"][2]) == 240
+    # over seeds the mean lands on the truth: the estimator is unbiased, not exact
+    got = [int(aw.link_state_composition(sc, bin_m=50.0, max_dist_m=300.0,
+                                         sampler_seed=s)["n_pairs"][0]) for s in range(12)]
+    assert abs(sum(got) / len(got) - 48) <= 5 * 6.20 / math.sqrt(12), got
+
+
+def test_the_bucket_cap_and_its_seed_are_arguments_all_the_way_out_to_the_harness(tmp_path):
+    """`--max-instants 0` has to reach THIS scan too, and a seed has to be able to re-draw it."""
+    sc = _phase_scene(n_steps=600)
+    full = aw.link_state_composition(sc, bin_m=50.0, max_dist_m=300.0, max_snaps=0)
+    assert full["buckets_examined"] == full["buckets_available"] == 600
+    assert int(full["n_pairs"][0]) == 120                       # every phase-1 bucket, exactly
+    assert full["sampling"]["coverage_frac"] == 1.0
+    assert aw.link_state_composition(sc, bin_m=50.0, max_dist_m=300.0, max_snaps=0,
+                                     sampler_seed=99)["n_pairs"][0] == full["n_pairs"][0]
+    a = aw.link_state_composition(sc, bin_m=50.0, max_dist_m=300.0, max_snaps=60, sampler_seed=1)
+    b = aw.link_state_composition(sc, bin_m=50.0, max_dist_m=300.0, max_snaps=60, sampler_seed=2)
+    assert a["buckets_examined"] == b["buckets_examined"] == 60
+    assert not np.array_equal(a["n_pairs"], b["n_pairs"])       # the seed is live, not decorative
+
+    root = _write_dataset(str(tmp_path / "seam"), buildings=[_wall(200.0, 0.0, half_x=400.0)],
+                          n_steps=12)
+    capped = aw.awareness_report(root, max_snaps=4)
+    assert capped["geometry"]["sampling"]["buckets_examined"] == 4
+    assert capped["geometry"]["sampling"]["buckets_available"] == 12
+    # and the harness passes its own --max-instants through to it
+    card = rb.scorecard(root, max_instants=0)
+    d = next(m for m in card["panels"]["comm"]
+             if m["id"] == "comm.link_state_los_fraction")["details"]
+    assert d["buckets_examined"] == d["buckets_available"] == 12
+    assert d["coverage_frac"] == 1.0
+
+
+def test_every_awareness_row_publishes_the_coverage_it_was_read_off(tmp_path):
+    """A capped row without its denominator is not a measurement, and these were the last rows in
+    the scorecard that did not carry one."""
+    root = _write_dataset(str(tmp_path / "cov"), buildings=[_wall(200.0, 0.0, half_x=400.0)],
+                          n_steps=12)
+    rep = aw.awareness_report(root, max_snaps=4)
+    rd = rb.load_refdata()
+    rows = aw.panel_rows(rep, rb._metric, lambda k: rb._ref(rd, k))
+    assert rows
+    for r in rows:
+        d = r["details"]
+        assert d["buckets_examined"] == 4 and d["buckets_available"] == 12
+        assert d["coverage_frac"] == pytest.approx(1 / 3, abs=1e-4)
+        assert d["sampler"] == rb.SAMPLER_KEY
+        assert d["sampler_seed"] == rb.SAMPLER_SEED
+        assert "circular jittered systematic" in d["sampling"]
+        # ... and the comparability note is the one that is TRUE of these rows: they are fractions
+        # and distances, not counts, so the cap costs precision, not comparability. Repeating the
+        # traffic panel's "NOT COMPARABLE AS A COUNT" here would be a false warning.
+        assert "read off 4 of 12 time buckets" in d["comparability"]
+        assert "falls with coverage is PRECISION" in d["comparability"]
+        assert "NOT COMPARABLE" not in d["comparability"]
 
 
 def test_panel_rows_plug_into_the_harness(tmp_path):
