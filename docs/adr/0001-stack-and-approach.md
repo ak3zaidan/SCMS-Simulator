@@ -1,6 +1,6 @@
 # ADR 0001 — Base stack, SCMS model, and dataset approach
 
-- **Status:** Accepted (2026-08-09)
+- **Status:** Accepted (2026-08-09); decision 1 (base stack) superseded by ADR 0002 (proposed 2026-09-18); decisions 2, 3 and 5 confirmed and decision 4 refined by ADR 0002
 - **Deciders:** Project owner (approved Option B and "start P0 + P1")
 - **Design document:** <https://claude.ai/code/artifact/9a391e86-95f0-421a-aadd-f2459ddb93f3>
 
