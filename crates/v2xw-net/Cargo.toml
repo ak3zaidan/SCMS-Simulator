@@ -1,0 +1,19 @@
+[package]
+name = "v2xw-net"
+description = "WSMP/GN/BTP headers, fragmentation strategies, loss amplification and byte accounting."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The contract crate: SimTime/Duration, typed ids, deterministic math and quantisation,
+# model cards, the Model base trait, Ctx and Record.
+v2xw-core = { workspace = true }
+# Crate error types.
+thiserror = { workspace = true }
+# Card payloads, parameter structs and the records this crate emits.
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,29 @@
+[package]
+name = "v2xw-core"
+description = "DES kernel: clock, event heap, RNG streams, registry, manifest, provenance ids."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Deterministic RNG (ADR 0004 §3): ChaCha12 keystream keyed by SHA-256.
+rand_chacha = { workspace = true }
+sha2 = { workspace = true }
+# Deterministic transcendentals (ADR 0003, ADR 0004 §4): pure-Rust musl port.
+libm = { workspace = true }
+# Serialization of everything that crosses a crate or process boundary.
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+# Insertion-ordered sets/maps for deterministic iteration.
+indexmap = { workspace = true }
+# Crate-wide error type.
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Phase-parallel determinism tests: the same phase run on 1 and on 8 threads
+# (ADR 0004 §5, 02-architecture.md §6.4).
+rayon = { workspace = true }

@@ -5,20 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "scms-sim-ref"
 version = "0.1.0"
-description = "SCMS-aware V2X simulation & global Misbehavior-Authority dataset framework (Python reference core)"
+description = "FROZEN legacy reference (ADR 0002): SCMS-aware V2X simulation & global Misbehavior-Authority dataset framework (Python reference core)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = ["cryptography>=42", "pydantic>=2"]
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+test = ["pytest>=8", "numpy>=1.26", "pandas>=2.1", "pyarrow>=15"]
 
 [project.scripts]
 scms-poc = "scms_sim_ref.mock_pipeline.run:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["scms_sim_ref*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The GUI tests drove the retired Windows/MOSAIC tooling (run.ps1,
+# scms-sim/scenarios/mapgen.py), deleted in Phase 0 per ADR 0010 and
+# 01-inventory.md 3.7/6. The GUI itself is superseded by the Studio UI
+# (ADR 0009); these modules are kept only as a reference for the JSON-RPC
+# contract tests that replace them.
+addopts = "--ignore=tests/test_gui_backend.py --ignore=tests/test_gui_curated_knobs.py --ignore=tests/test_gui_parity.py --ignore=tests/test_gui_realism.py --ignore=tests/test_gui_cli_contract.py --deselect tests/test_audit_w10_followups.py::test_gui_exposes_denm_and_fakehazard"

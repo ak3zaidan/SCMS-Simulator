@@ -1,0 +1,15 @@
+[package]
+name = "v2xw-proto"
+description = "Protocol host: entity state machines, flows, revocation and reporting formats."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+v2xw-core = { workspace = true }
+v2xw-sec = { workspace = true }
+v2xw-node = { workspace = true }
+v2xw-net = { workspace = true }

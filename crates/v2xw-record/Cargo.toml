@@ -1,0 +1,30 @@
+[package]
+name = "v2xw-record"
+description = "Recorder and exporters: MCAP, Parquet, dataset exporters, leakage linter."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+v2xw-core = { workspace = true }
+# The recording container (ADR 0008 decision 1, docs/protocol/vwp-v1.md §7.1). zstd
+# is the only codec the wire specification names (§2.6) and the only one this crate
+# writes; the crate default feature set is taken as-is because a workspace-inherited
+# dependency cannot narrow `default-features`.
+mcap = { workspace = true }
+# Tabular exports (08-measurement-and-data.md §5): Parquet for tables, Arrow IPC for
+# metric batches.
+arrow = { workspace = true }
+parquet = { workspace = true }
+# The serde `Record` path of build decision D11 item 5.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Crate-wide error type.
+thiserror = { workspace = true }
+
+[[bench]]
+name = "seek"
+harness = false

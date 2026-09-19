@@ -1,0 +1,20 @@
+[package]
+name = "v2xw-mobility"
+description = "Ground-truth kinematics, demand and traffic-signal state: the native mobility tiers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The contract crate: ids, time, geometry, deterministic math and RNG, model cards.
+v2xw-core = { workspace = true }
+# The lane-level world: lanes, junctions, connections, signal plans, spatial indices.
+v2xw-world = { workspace = true }
+# Parameter presets and model cards are (de)serialised with the scenario.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Crate error type.
+thiserror = { workspace = true }

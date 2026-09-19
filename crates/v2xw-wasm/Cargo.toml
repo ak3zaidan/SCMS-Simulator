@@ -1,0 +1,11 @@
+[package]
+name = "v2xw-wasm"
+description = "WASM binding surface for the browser replay reader (wasm-bindgen comes later)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]

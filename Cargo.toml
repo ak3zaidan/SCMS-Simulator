@@ -1,0 +1,103 @@
+# V2X World Simulator — Cargo workspace root (ADR 0010 §1).
+#
+# Phase 0 skeleton: every crate in the ADR 0010 table exists as a stub with its
+# inter-crate dependency edges already wired, so later phases only add code.
+
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.86"
+repository = "https://github.com/ak3zaidan/SCMS-Simulator"
+authors = ["V2X World Simulator contributors"]
+
+# Shared third-party dependencies. Every entry below was resolved and
+# build-checked against Rust 1.86 on macOS arm64 in Phase 0; crates that could
+# not be verified were left out on purpose (see docs and the Phase 0 notes).
+# Member crates opt in with `dep = { workspace = true }`.
+[workspace.dependencies]
+# --- serialization / config -------------------------------------------------
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0.12"
+# --- errors -----------------------------------------------------------------
+thiserror = "2"
+anyhow = "1"
+# --- determinism: RNG and hashing (ADR 0004) --------------------------------
+rand = "0.9"
+rand_chacha = "0.9"
+sha2 = "0.10"
+# --- numerics / containers --------------------------------------------------
+libm = "0.2"
+ordered-float = "5"
+smallvec = "1"
+hashbrown = "0.15"
+indexmap = "2"
+# --- observability ----------------------------------------------------------
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# --- CLI / server -----------------------------------------------------------
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+parking_lot = "0.12"
+rayon = "1"
+# --- recording / export (ADR 0008) ------------------------------------------
+arrow = "56"
+parquet = "56"
+mcap = "0.25"
+flatbuffers = "25"
+# --- security / messages ----------------------------------------------------
+p256 = "0.13"
+# Raw AES-128 block permutation. Needed by `v2xw-sec` for the two CAMP SCMS
+# constructions, which are defined in terms of the bare block cipher and not of any
+# mode: butterfly-key expansion f(k, i, j) evaluates AES three times over consecutive
+# 128-bit blocks (CAMP SCP1), and a pre-linkage value is an AES Davies-Meyer
+# compression truncated to 72 bits (CAMP SCP2). `default-features = false` drops the
+# `zeroize` hookup this simulator has no use for. AES is a fixed permutation, so the
+# hardware-accelerated and software paths agree bit for bit and the choice cannot
+# affect determinism (ADR 0004).
+aes = { version = "0.8", default-features = false }
+rasn = "0.28"
+# ASN.1 -> Rust code generator, used only from `v2xw-msg`'s build script (build
+# decision D2). Emits `rasn`-annotated types from the ETSI forge modules. 0.16 is the
+# version the asset survey verified end to end on the pinned 1.98.1 toolchain: it
+# generates Rust that compiles for the ETSI stack (and does not for SAE J2735, which
+# is why the BSM codec is hand-written).
+rasn-compiler = "0.16"
+# --- geometry / spatial indices ---------------------------------------------
+geo = "0.31"
+rstar = "0.12"
+# --- importers ---------------------------------------------------------------
+# Streaming XML pull parser for the OSM importer (04-models.md §1.2). Chosen over a
+# DOM parser because a city extract is tens of megabytes and the importer needs one
+# pass over it; `default-features = false` drops the `encoding` feature, so the reader
+# accepts UTF-8 only, which is what the OSM XML schema mandates.
+quick-xml = { version = "0.42", default-features = false }
+
+# --- internal crates --------------------------------------------------------
+v2xw-core = { path = "crates/v2xw-core", version = "0.1.0" }
+v2xw-world = { path = "crates/v2xw-world", version = "0.1.0" }
+v2xw-mobility = { path = "crates/v2xw-mobility", version = "0.1.0" }
+v2xw-radio = { path = "crates/v2xw-radio", version = "0.1.0" }
+v2xw-net = { path = "crates/v2xw-net", version = "0.1.0" }
+v2xw-msg = { path = "crates/v2xw-msg", version = "0.1.0" }
+v2xw-sec = { path = "crates/v2xw-sec", version = "0.1.0" }
+v2xw-node = { path = "crates/v2xw-node", version = "0.1.0" }
+v2xw-proto = { path = "crates/v2xw-proto", version = "0.1.0" }
+v2xw-threat = { path = "crates/v2xw-threat", version = "0.1.0" }
+v2xw-metrics = { path = "crates/v2xw-metrics", version = "0.1.0" }
+v2xw-record = { path = "crates/v2xw-record", version = "0.1.0" }
+v2xw-server = { path = "crates/v2xw-server", version = "0.1.0" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+debug = true

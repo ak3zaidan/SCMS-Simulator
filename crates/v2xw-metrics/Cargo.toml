@@ -1,0 +1,22 @@
+[package]
+name = "v2xw-metrics"
+description = "Metric providers, honest statistics and runnable invariant checks."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The contract crate: SimTime/Duration, typed ids, the quantisation helpers, the ordered
+# reductions, model cards, the Model base trait, Record/OwnedRecord/ChannelName.
+v2xw-core = { workspace = true }
+# Crate error type.
+thiserror = { workspace = true }
+# The metric definitions, the samples this crate emits and the reader-side views of the
+# event channels it consumes (03-interfaces.md §14).
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Tabular metric output (ADR 0008 decision 2: Arrow for tabular metric batches).
+arrow = { workspace = true }

@@ -1,0 +1,26 @@
+[package]
+name = "v2xw-world"
+description = "World geometry model, importers, provenance and static spatial indices."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The contract crate: ids, geometry, deterministic math, model cards, hashing.
+v2xw-core = { workspace = true }
+# Serialization of the world model (native JSON form, provenance JSON, model cards).
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Crate error type.
+thiserror = { workspace = true }
+# R-tree over building footprints (03-interfaces.md §2 obstacle queries).
+rstar = { workspace = true }
+# Streaming SHA-256 for the world content hash (invariant I-W2). Same version as
+# v2xw-core's, so the two agree bit for bit.
+sha2 = { workspace = true }
+# Streaming XML pull parser for `world/source/osm` (04-models.md §1.2): one pass over a
+# tens-of-megabytes city extract, no DOM.
+quick-xml = { workspace = true }

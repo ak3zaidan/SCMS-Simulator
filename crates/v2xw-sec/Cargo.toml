@@ -1,0 +1,37 @@
+[package]
+name = "v2xw-sec"
+description = "IEEE 1609.2 / TS 103 097 security envelope, cryptographic primitive descriptors and cost tables, real and modelled crypto backends, and the SCMS scientific core (butterfly keys, linkage values)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The contract crate: SimTime/Duration, NodeId/HwProfileId, WallClock and the IEEE 1609.2
+# epoch, SHA-256, the deterministic RNG streams, model cards, the `Model` base trait.
+v2xw-core = { workspace = true }
+# The *only* home of the generated IEEE 1609.2 / TS 103 097 bindings. `v2xw-sec` imports
+# them from `v2xw_msg::sec_types` and never `include!`s the generated file again — two
+# textual includes would define two unrelated sets of identically named types (see that
+# module's own documentation).
+v2xw-msg = { workspace = true }
+# Needed because this crate constructs `rasn` values directly (`OctetString`,
+# `FixedOctetString`, `Integer`). It must be the exact version the workspace pins: a
+# different minor would give a second, incompatible set of trait impls.
+rasn = { workspace = true }
+# Real ECDSA over NIST P-256, and the P-256 scalar/point arithmetic the butterfly-key
+# expansion and the ECQV reconstruction are written in.
+p256 = { workspace = true }
+# The bare AES-128 block permutation the two CAMP SCMS constructions are defined over.
+aes = { workspace = true }
+# Crate error type.
+thiserror = { workspace = true }
+# Card payloads and descriptor serialisation.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The golden-vector tests read the pinned legacy vectors as JSON.
+serde_json = { workspace = true }

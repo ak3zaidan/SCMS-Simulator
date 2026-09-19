@@ -1,183 +1,101 @@
-# SCMS-Simulator
+# V2X World Simulator
 
-An **SCMS-aware V2X simulation & global Misbehavior-Authority (MA) dataset framework.**
-It models the full Security Credential Management System credential lifecycle
-(enrollment → pseudonym provisioning → signed BSM/CAM → local detection →
-misbehaviour reporting → MA correlation → two-Linkage-Authority identity
-resolution → revocation → CRL → enforcement) and generates a dataset from the
-**global Misbehavior-Authority perspective** — with strict separation between
-MA-visible data (features) and simulation ground truth (labels).
+> **Status: Phase 0/1 under construction.** The Rust workspace is a skeleton —
+> every crate exists with its responsibility and dependency edges fixed, but the
+> engine does not run scenarios yet. The validated Python reference in
+> [`legacy/`](legacy/README.md) is the only thing that produces results today.
 
-## Run the full simulation (one command)
+A simulator for V2X traffic on any world, at any scale from one vehicle to a
+congested city, in which every node behaves as it would in a real deployment:
+ground-truth traffic, frame-level radio, node hardware limits (CPU, HSM, queues,
+storage), real or modeled cryptography, and pluggable credential-management
+protocols (US SCMS, ETSI ITS PKI, threshold and post-quantum variants). It is
+built as a research instrument — no black boxes: every model states its
+equations, defaults, the citation behind each default, and what its fidelity
+tier ignores. Runs are deterministic and reproducible across macOS, Linux and
+Windows, recorded to MCAP, replayable in 2D/3D, and exportable as publishable
+datasets.
 
-```powershell
-. C:\Users\Administrator\tools\env.ps1     # once per shell (JAVA_HOME/SUMO_HOME/MOSAIC_HOME/PATH)
-.\run.ps1                                   # 'smoke' highway scenario (~50 vehicles, seconds)
-.\run.ps1 -Scenario intas_urban_rush        # real Ingolstadt (InTAS) map, 7-9am rush (~333 vehicles)
-.\run.ps1 -Scenario highway -MaxVehicles 200 -Lanes 3     # flow map: control number of cars
-.\run.ps1 -Scenario intas_highway_low -Scale 0.4 -Seed 42 # route map: control density
+## Restructured (ADR 0002)
+
+The original Eclipse MOSAIC + Python stack was superseded on 2026-09-18 by a new
+Rust core with Python and WebAssembly bindings
+([ADR 0002](docs/adr/0002-supersede-base-stack-new-rust-core.md)):
+
+- the Python engine is **frozen** at [`legacy/scms_sim_ref/`](legacy/README.md)
+  as the validated reference — its butterfly, linkage, leakage, ML-contract and
+  dataset-integrity vectors are the conformance suite the new engine must pass;
+- the Java/MOSAIC layer, the PowerShell launchers and the unused
+  `veremi-nextgen` submodule were deleted — they ran only from a Windows
+  toolchain and never produced results (`docs/design/01-inventory.md` §3.7, §6);
+- science is **ported, not rewritten**: each formula carries a model card citing
+  the legacy file and line range it came from.
+
+## Quickstart
+
+Requires Rust 1.86 (pinned by `rust-toolchain.toml`), [`just`](https://just.systems),
+and — for the legacy reference — [`uv`](https://docs.astral.sh/uv/).
+
+```bash
+just setup    # fetch Rust deps; Python/UI deps once those trees exist
+just build    # cargo build --workspace
+just test     # cargo test --workspace
+just --list   # every recipe
 ```
 
-```powershell
-.\run.ps1 -Scenario grid_8x8                 # procedural grid network
-.\run.ps1 -Scenario spider_10a5c -Scale 1.5  # procedural spider network
-.\run.ps1 -Scenario osm_tokyo                # real Tokyo streets (OpenStreetMap)
+Not yet working, by design: `just run <scenario>` (Phase 1) and `just studio`
+(Phase 6) print what they are waiting on.
+
+To run the frozen reference and its conformance vectors:
+
+```bash
+just legacy-setup
+just legacy-conformance
 ```
 
-## Quick start (pure Python — no MOSAIC toolchain needed)
+## Repository layout
 
-```powershell
-python -m pip install -r requirements.txt      # cryptography, pydantic, pytest
-python -m pytest -q                            # full test suite
-$env:PYTHONPATH = "src"
-python -m scms_sim_ref.mock_pipeline.run --out datasets/poc_run   # small reference run
-```
+| Path | Contents |
+|---|---|
+| `Cargo.toml` | workspace root: shared dependency versions, one entry per crate |
+| `crates/v2xw-core` | DES kernel: clock, event heap, RNG streams, registry, provenance |
+| `crates/v2xw-world` | geometry model, importers, static spatial indices |
+| `crates/v2xw-mobility` | ground-truth kinematics, demand, signal state |
+| `crates/v2xw-radio` | propagation, fading, shadowing, PHY, MAC, DCC |
+| `crates/v2xw-net` | WSMP/GN/BTP, fragmentation, backhaul, cellular Uu |
+| `crates/v2xw-msg` | ASN.1 encoders and message envelopes |
+| `crates/v2xw-sec` | primitive descriptors, crypto backends, cost tables |
+| `crates/v2xw-node` | node runtimes: queues, CPU/HSM servers, stores, telemetry |
+| `crates/v2xw-proto` | protocol host: entity state machines, flows, revocation |
+| `crates/v2xw-threat` | attackers, jammers, detectors, misbehavior-authority host |
+| `crates/v2xw-metrics` | metric providers |
+| `crates/v2xw-record` | MCAP and Parquet recording, dataset exporters, leakage linter |
+| `crates/v2xw-server` | JSON-RPC control surface and the VWP WebSocket stream |
+| `crates/v2xw-cli` | the `v2xw` binary |
+| `crates/v2xw-py`, `crates/v2xw-wasm` | binding surfaces (PyO3 / wasm-bindgen arrive later) |
+| `python/v2xw/` | Python package: bindings, SDK, ported libraries (Phase 5) |
+| `ui/` | pnpm workspace: protocol, viewer, Studio app (Phase 6) |
+| `plugins/examples/` | one worked example per plug-in interface, with model cards |
+| `scenarios/` | scenario files (YAML/JSON, schema v1) |
+| `profiles/hardware/` | OBU/RSU/backend hardware profiles, each number cited |
+| `worlds/cache/` | content-addressed world builds (git-ignored) |
+| `tests/` | cross-crate golden determinism, conformance, validation, benchmarks |
+| `legacy/` | the frozen Python reference and its conformance vectors |
+| `docs/` | the design and the architecture decision records |
 
-The built-in generator is a full microscopic traffic simulator: routed trips on a road network
-(`--road` ∈ linear, grid, ring, radial **spider** city, or a fully **custom node/edge map** via
-`--road custom --custom-network map.json` — including a **real city** imported from OpenStreetMap)
-with IDM car-following (queues/congestion), signalized intersections, time-of-day demand, a mixed
-fleet (car/moto/truck/bus), weather, and range-limited lossy radio. It renders **21 attack types
-across 7 families** (position / speed / heading / timing / stealth / identity / credential) plus an
-opt-in **combined** family of 4 more that falsify several fields at once — **25 renderable types
-across 8 families** — including **CRL-aware evasive** attackers that go dormant after a bust
-(`--crl-aware-pct` / `--crl-dormant-s`). Reports are scored by a **12-detector suite (13 `detnorm`
-signals, incl. one soft Kalman feature)** feeding a windowed Misbehavior-Authority. A JSON
-`--events` timeline adds deterministic mid-run dynamics: demand surges, weather fronts, road
-closures, attack waves, and geofenced attack zones. In the GUI, the AI Copilot designs custom maps
-and timelines from plain language. Deterministic (same seed + config → byte-identical data) and
-memory-bounded via streaming.
+## The design
 
-```powershell
-# long-running routed traffic-flow simulation (spawn/despawn over time)
-python -m scms_sim_ref.mock_pipeline.run --flow --road grid --grid 8 --duration 1800 `
-    --arrival-rate 2 --attacker-pct 0.15 --collude-pct 0.3 --traffic-lights --demand rush `
-    --featurize --out datasets/long_run
-# a multi-domain training corpus (scenario x permutation, merged with domain_id). grids: quick|medium|full
-python -m scms_sim_ref.datagen.massive --grid medium --flow --out datasets/massive   # --dry-run to preview size
+The full design is in [`docs/design/`](docs/design/README.md) — brief, inventory,
+architecture, interfaces, models, protocols, node models, threats, measurement,
+UI, roadmap and open questions — with the decisions recorded as ADRs in
+[`docs/adr/`](docs/adr/). Start with
+[`00-design-brief.md`](docs/design/00-design-brief.md) for the goal,
+[`02-architecture.md`](docs/design/02-architecture.md) for the component map, and
+[`10-roadmap.md`](docs/design/10-roadmap.md) for what each phase delivers.
 
-# one-command named scenario (flags still override); reproduce any past run byte-for-byte from its manifest
-python -m scms_sim_ref.mock_pipeline.run --preset urban_rush --featurize --out datasets/urban
-python -m scms_sim_ref.mock_pipeline.run --config datasets/urban/manifest.json --out datasets/replay
-```
+## Licensing
 
-#### Scenario recipes
-
-```powershell
-# --- Custom / OSM map: import a real city's streets from OpenStreetMap, then run on it ---
-# (11 named cities: amsterdam, berlin, chicago, ingolstadt, london, manhattan, munich,
-#  paris, rome, sanfrancisco, vienna — or pass --bbox minLon,minLat,maxLon,maxLat)
-python -m scms_sim_ref.mock_pipeline.osm --city paris --out paris.json
-python -m scms_sim_ref.mock_pipeline.run --road custom --custom-network paris.json `
-    --flow --duration 300 --arrival-rate 2 --attacker-pct 0.15 --out datasets/paris
-# (a hand-authored map works the same: --custom-network map.json, where map.json is
-#  {"nodes":[[x,y],...],"edges":[[a,b],...]} with node coords in metres)
-
-# --- Scenario-events timeline: deterministic mid-run dynamics from a JSON file ---
-# events.json = a chronological list, e.g.
-#   [{"t":30,"until":90,"type":"demand","mult":3},
-#    {"t":40,"type":"weather","value":"fog"},
-#    {"t":50,"until":100,"type":"attack_wave"}]
-python -m scms_sim_ref.mock_pipeline.run --flow --road grid --grid 6 --duration 300 `
-    --arrival-rate 2 --attacker-pct 0.15 --events events.json --out datasets/events_run
-
-# --- CRL-aware evasive attackers: watch the public CRL, go dormant after a bust ---
-python -m scms_sim_ref.mock_pipeline.run --flow --road grid --grid 6 --duration 600 `
-    --arrival-rate 2 --attacker-pct 0.2 --crl-aware-pct 0.5 --crl-dormant-s 60 `
-    --attack-duty-cycle 0.3 --out datasets/evasive
-
-# --- Combined attacks (opt-in): each attacker falsifies several fields at once ---
-python -m scms_sim_ref.mock_pipeline.run --flow --road grid --grid 6 --duration 300 `
-    --arrival-rate 2 --attacker-pct 0.2 `
-    --attack-mix "Disruptive:0.5,PosSpeedInconsistent:0.5" --out datasets/combined
-```
-
-Presets: `urban_rush`, `highway`, `night_rain`, `gridlock`, `stealth_hard`. Other realism knobs:
-`--od-model gravity` (distance-decay trip lengths), `--turn-slowdown` (slow into corners),
-`--attack-duty-cycle 0.3` (pulsed/intermittent attackers), `--attack-delay-jitter 20` (varied onset),
-`--boundary-origins` (trips enter at the network edge), `--n-rsus 12` (fixed always-trusted Road-Side
-Units — infrastructure-assisted detection that lifts recall in sparse traffic). Long runs are
-interruptible — Ctrl-C finalizes a valid partial dataset.
-
-### Full control (RSUs / traffic / network)
-
-The CLI exposes the most-used flags (below); **every** config field is controllable via the
-GUI **"⚙ Advanced: all fields"** panel or a `--config` JSON (both described at the end of this
-section). Highlights:
-
-```powershell
-# RSUs: how many, where, and how far they hear (or place them by hand)
-python -m scms_sim_ref.mock_pipeline.run --flow --road grid --n-rsus 12 `
-    --rsu-placement perimeter --rsu-range 350 --out datasets/rsu_demo
-python -m ... --flow --road grid --rsu-coords "300,300;600,300;300,600" --out datasets/rsu_manual
-
-# Traffic: custom fleet composition, speeds, and car-following (IDM) dynamics
-python -m ... --flow --road grid --fleet-mix "car:0.6,truck:0.3,bus:0.1" `
-    --trip-speed-min 10 --trip-speed-max 22 --idm-accel 1.2 --idm-time-headway 1.6
-
-# Network: topology (grid / ring / spider / linear / custom), non-square grid, block spacing, lanes, lane width, signals
-python -m ... --flow --road grid --grid 10 --grid-h 4 --grid-block 160 `
-    --lanes 3 --lane-width 3.25 --traffic-lights --light-cycle 30
-python -m ... --flow --road ring --grid 24 --grid-block 120   # circular beltway of 24 intersections
-
-# Attacks: control the scenario composition (per-type weights)
-python -m ... --flow --road grid --attacker-pct 0.2 --attack-mix "ConstPos:0.5,Sybil:0.3,SlowDrift:0.2"
-```
-
-`--rsu-placement` ∈ {spread, perimeter, center, corners, all}. The GUI mirrors all of this, and its
-**"⚙ Advanced: all fields"** panel exposes *every* config field (runs the exact config via replay).
-`--dump-config-schema out.json` lists the full field surface; `--check-config cfg.json` validates one.
-
-Each run writes `ma/*.jsonl` (MA-visible features), a **separate** `ground_truth/*.jsonl`
-(oracle-only labels), `ml/*` (train/val/test ML tables via `--featurize`), a `DATASHEET.md`, and
-`manifest.json` (seed, config, per-file SHA-256, data digest, standards profile).
-
-## GUI control panel
-
-```powershell
-.\gui.ps1      # http://127.0.0.1:8710 — pick the "python-flow" generator (default), tweak/preset, Start
-```
-
-A dependency-free web panel: choose the generator, use one-click presets (urban rush / highway /
-sparse night / gridlock), watch the live congestion map, and read the full results dashboard
-(precision/recall, per-task ROC-AUC with GBDT + CIs, calibration, generalization).
-
-### AI Copilot (GUI)
-
-The GUI ships an AI Copilot that drives the whole panel from plain language (needs an
-`OPENAI_API_KEY` in the repo-root `.env`; model defaults to `gpt-4o-mini`, override with
-`OPENAI_MODEL`). Working only through the tools it is given, it can:
-
-- **Design maps** — build a connected custom road graph from scratch (`design_network`), read the
-  current map back to edit it incrementally (`get_network`), or **import a real city** from
-  OpenStreetMap (`import_osm`).
-- **Author timelines** — set a scenario-events timeline of demand surges, weather fronts, road
-  closures, and attack waves/zones (`set_events`).
-- **Configure runs** — set or reset any config field and apply named presets (`set_config`,
-  `reset_config`, `apply_preset`, `get_config`, `describe_fields`).
-- **Run & analyze** — run the current config and return a compact analysis: counts,
-  precision/recall, per-family & hardest-type recall, detector reliability, ML AUCs, latency, and
-  RSU contribution (`run_and_analyze`).
-- **Sweep & compare** — vary one field across values (`sweep`) or run labelled A/B variants side by
-  side (`compare`).
-- **Scenario library** — save, load, and list named scenarios (`save_scenario`, `load_scenario`,
-  `list_scenarios`).
-
-## MOSAIC layer — build & run the custom app
-
-The toolchain lives under `C:\Users\Administrator\tools` (JDK 17, SUMO 1.25.0,
-MOSAIC 25.2). Activate it, build our app with `javac` (no Maven), generate the
-scenario, and run:
-
-```powershell
-. C:\Users\Administrator\tools\env.ps1                       # JAVA_HOME, SUMO_HOME, MOSAIC_HOME, PATH
-.\scms-sim\mosaic-apps\scms-app\build.ps1                    # -> ScmsApp-0.1.0.jar (javac + jar)
-.\scms-sim\scenarios\make_scms_smoke.ps1                     # derive scms_smoke from MOSAIC HelloWorld + wire our app
-cd $env:MOSAIC_HOME
-.\mosaic.bat -c C:\Users\Administrator\SCMS-Simulator\scms-sim\scenarios\scms_smoke\scenario_config.json -w 0
-# app logs: $env:MOSAIC_HOME\logs\log-*-scms_smoke\...  (grep "SCMS beacon app")
-```
-
-`mosaic.bat` builds a relative classpath, so always run it with the MOSAIC bundle
-as the working directory. `ScmsBeaconApp` receives SUMO-driven vehicle updates —
-the hook point for signing, detection, and reporting.
+Code is Apache-2.0 ([`LICENSE`](LICENSE)); generated datasets are CC-BY-4.0.
+The design deliberately avoids GPL dependencies (Veins, Artery, F2MD, in-process
+ns-3): they are read as references and re-implemented. SUMO is optional and runs
+out of process ([ADR 0005](docs/adr/0005-mobility-provider.md)).

@@ -1,0 +1,24 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "types": [
+      "node"
+    ],
+    "moduleResolution": "bundler",
+    "paths": {
+      "@vwp/protocol": [
+        "../protocol/src/index.ts"
+      ]
+    }
+  },
+  "include": [
+    "src/**/*.ts"
+  ],
+  "references": [
+    {
+      "path": "../protocol"
+    }
+  ]
+}

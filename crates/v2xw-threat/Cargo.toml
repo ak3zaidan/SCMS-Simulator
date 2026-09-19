@@ -1,0 +1,13 @@
+[package]
+name = "v2xw-threat"
+description = "Attacker host, jammers, perception hook, detector host and MA host."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+v2xw-core = { workspace = true }
+v2xw-node = { workspace = true }

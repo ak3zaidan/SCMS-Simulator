@@ -1,0 +1,44 @@
+{
+  "name": "@vwp/viewer",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Framework-free Three.js viewer for the V2X World Simulator: one scene, two views, instanced actors, overlays, cameras",
+  "license": "Apache-2.0",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -b tsconfig.json",
+    "dev": "tsc -b tsconfig.json --watch --preserveWatchOutput",
+    "typecheck": "tsc -b tsconfig.json && tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc -b tsconfig.json && tsc -p tsconfig.test.json",
+    "bench": "NODE_OPTIONS=--expose-gc vitest run test/budget.test.ts"
+  },
+  "peerDependencies": {
+    "three": ">=0.170.0"
+  },
+  "dependencies": {
+    "@vwp/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/three": "0.186.0",
+    "three": "^0.186.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.9"
+  }
+}

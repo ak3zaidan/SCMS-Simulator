@@ -1,0 +1,23 @@
+[package]
+name = "v2xw-server"
+description = "Control surface and streaming: JSON-RPC control plus the VWP WebSocket."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+v2xw-core = { workspace = true }
+v2xw-world = { workspace = true }
+v2xw-mobility = { workspace = true }
+v2xw-radio = { workspace = true }
+v2xw-net = { workspace = true }
+v2xw-msg = { workspace = true }
+v2xw-sec = { workspace = true }
+v2xw-node = { workspace = true }
+v2xw-proto = { workspace = true }
+v2xw-threat = { workspace = true }
+v2xw-metrics = { workspace = true }
+v2xw-record = { workspace = true }

@@ -1,0 +1,30 @@
+[package]
+name = "v2xw-radio"
+description = "Propagation, fading, shadowing, PHY, MAC, DCC and channel accounting."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The contract crate: SimTime/Duration, typed ids, Vec3, deterministic math and
+# quantisation, RNG streams, model cards, the Model base trait, Ctx.
+v2xw-core = { workspace = true }
+# The lane-level world: buildings (the Sommer obstacle model's input), terrain (the
+# knife-edge profile), land use (the propagation environment class).
+v2xw-world = { workspace = true }
+# `v2xw_core::math` re-exports the pure-Rust `libm` crate but not its error function,
+# which the NIST PER model needs (04-models.md §4.7). Depending on the same crate
+# directly keeps the determinism property that matters — no platform libm anywhere —
+# and `crate::numeric` is the only module that names it (see its docs).
+libm = { workspace = true }
+# The obstacle model builds its own R-tree over `World::buildings`, because the world's
+# own index is crate-private (see `crate::obstacle`). Same crate, same tree shape.
+rstar = { workspace = true }
+# Card payloads (parameter defaults are `serde_json::Value`) and recorded records.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Crate error type.
+thiserror = { workspace = true }

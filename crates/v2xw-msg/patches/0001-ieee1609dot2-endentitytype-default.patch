@@ -1,0 +1,28 @@
+# Defect: rasn-compiler 0.16 emits an uncompilable DEFAULT value for a fixed-size
+# BIT STRING.
+#
+# Module:   Ieee1609Dot2 (IEEE 1609.2, ETSI forge mirror, commit 77e2c822a11b)
+# ASN.1:    PsidGroupPermissions ::= SEQUENCE { ..., eeType EndEntityType DEFAULT {app} }
+#           EndEntityType ::= BIT STRING { app (0), enrol (1) } (SIZE (8))
+# Emitted:  EndEntityType([true, false].into_iter().collect())
+# Error:    E0277 — `FixedBitString<8>` is a `bitvec::array::BitArray`, which does not
+#           implement `FromIterator<bool>`; only `BitVec` does.
+#
+# The fix keeps the same value — bit 0 ("app") set, every other bit clear — built the way
+# a `BitArray` is built. Recorded in docs/design/12-build-decisions.md D5 and verified in
+# the 2026-09-18 asset survey (MANIFEST section E.2).
+#
+# `expect: 1` is load-bearing: if rasn-compiler fixes this, the count goes to 0 and the
+# build fails, which is how we find out.
+unit: sec_types.rs
+expect: 1
+@@FIND@@
+        EndEntityType([true, false].into_iter().collect())
+@@REPLACE@@
+        {
+            // PATCHED by crates/v2xw-msg/patches/0001-ieee1609dot2-endentitytype-default.patch
+            let mut bits = FixedBitString::<8usize>::ZERO;
+            bits.set(0usize, true);
+            EndEntityType(bits)
+        }
+@@END@@

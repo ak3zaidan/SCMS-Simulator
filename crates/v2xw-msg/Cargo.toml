@@ -1,0 +1,28 @@
+[package]
+name = "v2xw-msg"
+description = "V2X message layer: real ASN.1 encoders for the ETSI stack, generators, and the validated J2735 size model."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+[dependencies]
+# The contract crate: SimTime/Duration, ids, Vec3, deterministic math and quantisation,
+# model cards, the Model base trait, NodeView.
+v2xw-core = { workspace = true }
+# ASN.1 runtime. UPER for the ETSI facilities layer, COER for 1609.2 / TS 103 097
+# (04-models.md §8.3).
+rasn = { workspace = true }
+# Crate error type.
+thiserror = { workspace = true }
+# Size-model tables and card payloads.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+# ASN.1 -> Rust code generation at build time (build decision D2). Reads only files
+# inside the repository: the build is hermetic and offline.
+rasn-compiler = { workspace = true }

@@ -1,0 +1,41 @@
+{
+  "name": "@vwp/mock-server",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "A VWP v1 server-side fixture: synthetic Manhattan world, live stream and JSON-RPC, for developing the UI without the Rust engine",
+  "license": "Apache-2.0",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "vwp-mock-server": "./dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b tsconfig.json",
+    "dev": "tsc -b tsconfig.json --watch",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -b tsconfig.json && tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "lint": "tsc -b tsconfig.json && tsc -p tsconfig.test.json"
+  },
+  "dependencies": {
+    "@vwp/protocol": "workspace:*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.9"
+  }
+}
