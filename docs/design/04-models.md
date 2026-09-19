@@ -1023,13 +1023,15 @@ The size model is a table of (message type, content profile) → bytes with, for
 | `Ieee1609Dot2Data` outer | 2 | protocolVersion 1 + content choice tag 1 |
 | `hashId` | 1 | |
 | `SignedDataPayload` preamble + inner `Ieee1609Dot2Data` | 1 + (1 + 1 + 1-2 length) | |
-| `HeaderInfo` preamble + `psid` + `generationTime` | 1 + 2 (PSID 0x20; ITS-AIDs ≥ 128 take 3) + 8 (Time64) | `generationTime` always present in ETSI |
+| `HeaderInfo` preamble + `psid` + `generationTime` | 1 + 2 (PSID 0x20; ITS-AIDs ≥ 256 take 3) + 8 (Time64) | `generationTime` always present in ETSI |
 | `generationLocation` (DENM) | 10 | Latitude 4 + Longitude 4 + Elevation 2 |
 | signer = digest | 9 | choice 1 + HashedId8 8 |
 | signer = certificate | 3 + cert | choice 1 + SequenceOfCertificate quantity 2 + certificate |
 | ECDSA P-256 signature | 66 | Signature choice 1 + rSig (EccP256CurvePoint choice 1 + 32) + sSig 32 |
 | **Total with digest** | **≈ 93-94** | |
 | **Total with certificate** | **≈ 87 + cert** | |
+
+**MEASURED 2026-09-18** against the real COER encoder in `v2xw-sec` (`crates/v2xw-sec/tests/overhead.rs`), and the derivation above is confirmed line for line: overhead is **exactly 93 B** with a digest signer and PSID 0x20, **exactly 94 B** with a PSID of 128 or more (which is the 94 in the "93-94" range — the third PSID byte, and nothing else), and **exactly 87 B + the certificate** with a certificate signer. `generationLocation` costs exactly 10 B. The only variation beyond those is the COER length determinant of the inner `unsecuredData`: 93 B for a payload below 128 B, 94 B from 128 to 255, 95 B from 256. Invariant I-S3 therefore holds as equality, not as a tolerance.
 
 HashedId8 and HashedId3 are the low-order 8 and 3 bytes of SHA-256 over the canonical COER encoding (SHA-256("") gives a495991b7852b855 and 52b855) [IEEE 1609.2a-2017 §6.3.25-6.3.26]; the Time64 epoch (2004-01-01 TAI µs) wording is UNVERIFIED. NDSS accounting for cross-checks: certificate = 30 + pk + sig; SPDU = 24 + BSM + cert + sig; MAC frame = 40 + SPDU [NDSS 2024 §V-D]. The prior "about 150 with digest / about 280 with certificate" appears in no source (UNVERIFIED, not used).
 
@@ -1041,6 +1043,8 @@ HashedId8 and HashedId3 are the low-order 8 and 3 bytes of SHA-256 over the cano
 | Explicit, 1609.2 | ≈ 147 (DERIVED) / 162 (NDSS: 30 + pk + sig) | implicit − 34 + 35 (verificationKey) + 66 (signature) | DERIVED / VERIFIED (secondary); one-certificate P2PCD learning response 172 B |
 | ETSI Authorization Ticket | 90-130 (DERIVED: `CertificateId` none, 2 PsidSsp, validity, region); 100-150 "certificates and signatures" field | TS 103 097 §7.2.1; C2C-CC TR 2052 §3.2 | DERIVED / VERIFIED (range) |
 | ECQV reconstruction value | 33 (compressed point) | SEC 4 §3.4-3.5 with SEC 1 §2.3.3 | VERIFIED |
+
+**MEASURED 2026-09-18** against the real COER encoder (`crates/v2xw-sec/src/cert.rs`, `the_derivation_reconciles_field_by_field`): an implicit pseudonym certificate of exactly the shape derived above is **77 B** and its explicit counterpart **144 B**, three bytes under each derived figure. Every component of the derivation is confirmed by the encoder — issuer 9, `linkageData` 13, `cracaId` 3, `crlSeries` 2, `validityPeriod` 7, reconstruction value 34, verification key 35, signature 66 — except **`appPermissions`, which the derivation gives as 8 B and which encodes in 5**: `SEQUENCE OF` quantity 2 (a one-byte length determinant plus the count) + `PsidSsp` preamble 1 + `psid` 2 (an unbounded INTEGER: one length byte, one value byte). Eight is what the same field costs with a service-specific permission present or a PSID of 128 or more, so the derivation is right about the shape and generous by three bytes about the one-`PsidSsp`, PSID-0x20 instance. The derived figures stay in the table as the conservative ones; the measured figures are what the simulator emits, and the difference between the explicit and the implicit form — 67 B, the whole point of ECQV — is exactly as derived.
 
 ### 9.3 Signed message totals
 
