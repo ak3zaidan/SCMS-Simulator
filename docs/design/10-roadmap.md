@@ -4,7 +4,7 @@ Status: design draft for review (2026-09-18). Effort is given as person-months (
 
 ## Phase 0 — Foundations (2–3 weeks, 0.5–0.75 PM)
 
-Scope: monorepo layout (ADR 0010), `mise` + `just` one-command setup on macOS/Linux/Windows, CI matrix, workspace crates with empty interfaces and model-card schema, the FlatBuffers schema set (`world-1`, event channels, VWP `Hello`), MCAP writer/reader smoke test, Python package skeleton with `maturin`, UI skeleton with Vite, `legacy/scms_sim_ref` moved and its conformance tests running in CI, PowerShell/MOSAIC tooling removed, VeReMi submodule removed.
+Scope: monorepo layout (ADR 0010), `mise` + `just` one-command setup on macOS/Linux/Windows, CI matrix, workspace crates with empty interfaces and model-card schema, the hand-written binary layouts (the `world-1` world container of 04-models §1.1, the event channel records, and the VWP frame header and `Hello` of `docs/protocol/vwp-v1.md`, with that specification's hex vectors as their golden tests), MCAP writer/reader smoke test, Python package skeleton with `maturin`, UI skeleton with Vite, `legacy/scms_sim_ref` moved and its conformance tests running in CI, PowerShell/MOSAIC tooling removed, VeReMi submodule removed.
 
 Acceptance: `just setup && just test` green on all three OSes from a fresh clone; `legacy` tests pass; ADR set accepted or amended.
 

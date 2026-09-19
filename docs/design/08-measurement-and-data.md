@@ -110,9 +110,9 @@ experiment:
 | `ma-dataset` | `ma/*.jsonl`, `ground_truth/*.jsonl`, `ml/*` (parquet + csv + `schema.json`), `manifest.json`, `DATASHEET.md` | MA / ORACLE separated | port of `datagen` (§6) |
 | `receiver-logs` | per-receiver Parquet/JSONL of received messages with node-visible fields, plus a GT file keyed by message id (VeReMi-style separation; VeReMi field names mapped where they exist) | NODE + separate GT | `--veremi-json` writes VeReMi-compatible JSON per receiver |
 | `telemetry` | `node.telemetry` time series per node (Parquet) | NODE | HUD-equivalent data |
-| `net-trace` | every frame with outcome and cause (`phy.rx`, `node.tx`, `mac.cbr`, `net.frag`) as Parquet; optional PCAP-NG with a custom link type carrying the FlatBuffers frame record | NODE (+ GT tx id in a separate column file) | "PCAP-like" per the brief |
+| `net-trace` | every frame with outcome and cause (`phy.rx`, `node.tx`, `mac.cbr`, `net.frag`) as Parquet; optional PCAP-NG with a custom link type carrying the serde-encoded frame record | NODE (+ GT tx id in a separate column file) | "PCAP-like" per the brief |
 | `backend-log` | `proto.msg`, `proto.revocation`, entity queue samples | NODE | flows and stages |
-| `recording` | MCAP with all channels (ADR 0008) | mixed, channel-tagged | replay |
+| `recording` | MCAP with all channels (ADR 0008) | mixed, channel-tagged | replay; snapshot channels hold the VWP frames verbatim, every other channel holds serde records (03-interfaces §14) |
 | `metrics` | `metric.sample` as Parquet | derived | experiments |
 
 Schema versioning: every file carries `schema` (e.g., `v2xw/receiver-logs/1`); migrations are per version step with tests; the manifest lists schema ids. Parquet is the primary format; JSONL is emitted where the legacy contract requires it.

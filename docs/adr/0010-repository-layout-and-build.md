@@ -19,7 +19,7 @@ Development moved to macOS; the README's PowerShell scripts and `C:\Users\Admini
 
 | Option | Cross-platform | Reproducible toolchain | Friction | Verdict |
 |---|---|---|---|---|
-| A. Multiple repositories (engine, python, ui) | yes | harder to keep schemas in sync | high | rejected: one `.fbs` schema set must drive three languages |
+| A. Multiple repositories (engine, python, ui) | yes | harder to keep the wire layout in sync | high | rejected: one hand-written VWP layout must be implemented, and conformance-tested against one set of golden vectors, in three languages |
 | B. Monorepo + mise + just + uv + pnpm (chosen) | yes | good | low | chosen |
 | C. Nix/devenv | yes (Windows via WSL only) | best | high on Windows and for newcomers | rejected as the default; a `devenv` file may be offered later (Apache-2.0 [R8 §C]) |
 | D. conda/pixi | yes | good | SUMO not on conda-forge (the `sumo` package is unrelated [R8 §C]) | rejected as primary |
