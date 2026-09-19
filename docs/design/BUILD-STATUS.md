@@ -54,15 +54,41 @@ routing: only 52.8 % of driving lanes lie in a strongly connected component.
 
 ## Phase 1 acceptance criteria
 
+Three of seven are now met with independently reproduced evidence. "Independent"
+means a second agent re-derived the number from the standard or the literature
+rather than re-running the builder's test.
+
 | # | Criterion | Status |
 |---|---|---|
-| 1 | Golden determinism, identical digests on each OS | **gate built, not yet run.** CI now imports a committed fixture on all three platforms, publishes the engine's own world and VWP payload digests, and fails unless all three agree. Previously CI ran tests per-platform, which proves nothing about agreement. The fixture digest is stable across repeated local runs on macOS arm64. No CI run has executed yet. |
-| 2 | Envelope size equals the size-model prediction, 0 bytes tolerance | pending `v2xw-sec` |
-| 3 | `modeled` and `real` crypto produce identical logs | pending `v2xw-sec` |
-| 4 | Seek ≤ 100 ms p95 over a 10-minute recording | pending `v2xw-record`; a benchmark is specified as part of it |
-| 5 | 60 fps with the HUD, every value resolving to a model card | pending the UI review |
-| 6 | Manifest lists engine, plug-in, world and card hashes | world hash exists; manifest assembly is owed by `v2xw-engine` |
-| 7 | Manual map-to-chase fly-down | pending Studio |
+| 1 | Golden determinism, identical digests on each operating system | **Gate built, never run.** CI imports a committed fixture on all three platforms and fails unless the digests agree. Determinism itself is repeatedly proven *within* a platform: a double import of the real 30 MB extract is byte-identical across all four artefacts in separate processes, and two recordings of one run have identical data sections. No CI run has executed. |
+| 2 | Envelope size equals the size model, zero bytes tolerance | **Met.** Exactly 93 bytes for a digest signer and 87 plus the certificate for a certificate signer, confirmed by decomposing a real signed message octet by octet against the derivation. The derivation's own byte-count threshold was wrong and is corrected (D12.1). |
+| 3 | Modelled and real crypto produce identical logs | **Not met.** Genuine but incomplete: a verifier broke equivalence three ways, through signature malleability, invalid key material and unsupported post-quantum primitives. Repairs in flight. |
+| 4 | Seek at most 100 ms at the 95th percentile | **Met, 57x margin.** 1.763 ms independently measured on a 9,001-frame, 600-second recording, using a type-7 quantile rather than nearest-rank so the figure is not a ranking artefact. |
+| 5 | 60 fps with the heads-up display, every value resolving to a model card | **Met and exceeded.** 604 fps on a real GPU at 5,000 actors against ADR 0011's 60 fps target. Every heads-up value is keyboard reachable and opens its provenance; the focus indicator measures 9.10:1 contrast against a 3:1 floor. |
+| 6 | Manifest lists engine, plug-in, world and card hashes | Pending. The world hash exists; manifest assembly is owed by `v2xw-engine`. |
+| 7 | Manual map-to-chase fly-down | The automated fly-down passes end to end against the mock engine. Needs a human to judge. |
+
+## Verification standard used
+
+Every crate was built, then adversarially validated by an agent told to re-derive
+rather than review. That produced results worth recording, because in several
+cases the independent derivation was the only thing that could have caught the
+defect:
+
+- The packet-error model was re-implemented from scratch in Python and agrees
+  with the crate to 5e-10 dB across all 24 cells.
+- The message encoder was checked against two independent implementations: a
+  Python oracle compiled from the real standards modules, and an encoder the
+  verifier wrote from the encoding rules. 235 vectors, both directions.
+- Signature determinism was confirmed by reimplementing the relevant standard in
+  Python and reproducing the exact 64 bytes.
+- The cryptographic port was checked by re-running the legacy Python to capture
+  fresh vectors rather than trusting committed ones.
+- The wire specification's worked hex dumps were re-extracted from the
+  specification text at run time and shown byte-identical to the checked-in
+  fixture, so the golden test really is the specification's bytes.
+- Timing fixes were mutation-verified: reintroducing each bug reproduced the
+  original failure signature.
 
 ## Corrections made to the design during the build
 
