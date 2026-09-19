@@ -1,0 +1,10 @@
+# Pinned toolchain (ADR 0010 §2, build-decision D1). Every contributor, every CI runner and every
+# release build use this exact compiler, so golden determinism tests (ADR 0004)
+# compare like with like.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+# No `targets` entry: the host target is always installed, and naming one here would make
+# every non-macOS runner fetch a cross std it does not need. Add a target only when a build
+# actually requires it (wasm32-unknown-unknown arrives with v2xw-wasm in a later phase).

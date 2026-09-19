@@ -1,0 +1,162 @@
+# CI per ADR 0010 §4.
+#
+# Three jobs matter here:
+#   * `rust`        — fmt, clippy and tests on all three platforms.
+#   * `determinism` — Phase 1 acceptance criterion 1. Running the same tests on
+#                     three platforms does NOT prove they agree: each job only
+#                     checks its own assertions. So each platform imports the
+#                     committed map fixture, publishes the engine's own canonical
+#                     digests, and `determinism-compare` fails unless all three
+#                     are identical. This is the gate ADR 0004 exists to defend,
+#                     and it is the one that would have caught the legacy
+#                     engine's platform-dependent transcendental digest.
+#   * `legacy-conformance` — the frozen Python reference (ADR 0002) on Linux
+#                     only, because its vectors are platform independent and
+#                     macOS/Windows minutes bill at 10x/2x.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deliberately no `RUSTFLAGS: -D warnings`: RUSTFLAGS applies to dependencies
+  # too, so one upstream crate warning under a new compiler would break the
+  # build. Warnings are denied for our own code on the clippy line instead.
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup reads rust-toolchain.toml and installs the pinned channel and its
+      # components. The version is asserted against the file so CI and the pin
+      # can never drift apart, which they previously had (CI said 1.86.0 while
+      # the file said 1.98.1, and `rasn` needs 1.88+).
+      - name: Install the pinned toolchain
+        shell: bash
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          pinned=$(grep -E '^channel' rust-toolchain.toml | sed -E 's/.*"(.*)".*/\1/')
+          actual=$(rustc --version | awk '{print $2}')
+          echo "pinned=$pinned actual=$actual"
+          test "$pinned" = "$actual" || { echo "::error::rustc $actual does not match the pin $pinned"; exit 1; }
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+  determinism:
+    name: determinism digest (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        shell: bash
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The importer is the deepest deterministic path available today: it runs
+      # the projection (transcendentals), lane inference, geometry and the
+      # writer-side quantisation of ADR 0004 §7, then prints digests the engine
+      # computed itself. More subsystems join this gate as they land.
+      - name: Import the committed fixture and capture the digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --release --quiet -p v2xw-world --example import_osm -- \
+            tests/fixtures/midtown-6block.osm.xml target/determinism 2000-01-01T00:00:00Z \
+            | tee import.log
+          world=$(sed -n 's/^world hash \([0-9a-f]*\).*/\1/p' import.log | head -1)
+          payload=$(sed -n 's|.*/world/\([0-9a-f]*\)\.vwb.*|\1|p' import.log | head -1)
+          warn=$(sed -n 's/.*, \([0-9]*\) precision warning.*/\1/p' import.log | head -1)
+          test -n "$world"   || { echo "::error::no world hash in the import output"; exit 1; }
+          test -n "$payload" || { echo "::error::no payload hash in the import output"; exit 1; }
+          test "${warn:-0}" = "0" || { echo "::error::$warn value(s) off their quantisation grid"; exit 1; }
+          printf 'world=%s\npayload=%s\n' "$world" "$payload" > digests.txt
+          cat digests.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.os }}
+          path: digests.txt
+          if-no-files-found: error
+
+  determinism-compare:
+    name: determinism digests agree across platforms
+    runs-on: ubuntu-latest
+    needs: determinism
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: digests
+
+      - name: Compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=0
+          for f in digests/*/digests.txt; do
+            echo "$f: $(tr '\n' ' ' < "$f")"
+            found=$((found + 1))
+          done
+          test "$found" -eq 3 || { echo "::error::expected 3 platform digests, got $found"; exit 1; }
+          distinct=$(sort -u digests/*/digests.txt | grep -c '^world=')
+          if [ "$distinct" -ne 1 ]; then
+            echo "::error::the platforms disagree on the world digest — see ADR 0004; this is a bug, not a tolerance"
+            exit 1
+          fi
+          distinct=$(sort -u digests/*/digests.txt | grep -c '^payload=')
+          test "$distinct" -eq 1 || { echo "::error::the platforms disagree on the VWP payload digest"; exit 1; }
+          echo "all three platforms agree"
+
+  legacy-conformance:
+    name: legacy python conformance (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Create the legacy environment
+        run: |
+          uv venv --python 3.12 legacy/.venv
+          uv pip install --python legacy/.venv -e "./legacy[test]"
+
+      - name: Conformance vectors (butterfly, linkage, leakage, ML contract, dataset integrity)
+        working-directory: legacy
+        run: |
+          .venv/bin/python -m pytest \
+            tests/test_butterfly.py tests/test_linkage.py tests/test_leakage.py \
+            tests/test_ml_contract.py tests/test_dataset_integrity.py -q

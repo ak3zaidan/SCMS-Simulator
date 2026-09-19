@@ -1,6 +1,26 @@
-# Generated datasets (large, reproducible from seed + config)
+# --- Rust -------------------------------------------------------------------
+/target
+**/target
+*.profraw
+
+# --- Generated worlds and datasets (large, reproducible from seed + config) ---
+/worlds/cache/*
+!/worlds/cache/.gitkeep
+!/worlds/cache/README.md
 /datasets/
-# Python
+*.mcap
+
+# --- Importer and run outputs written to the working directory -----------------
+# `import_osm` and the CLI default their output directory to ".", so a bare
+# invocation from the repository root drops these here. They are large and fully
+# reproducible from the extract plus the options, so they are never committed.
+/world.json
+/world.v2xw
+/world.vwb
+/report.txt
+/out/
+
+# --- Python -----------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -9,26 +29,34 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
-# Toolchain (JDK 17 / SUMO 1.25 / MOSAIC 25.2) is installed OUTSIDE the repo under
-# C:\Users\Administrator\tools (activate with . C:\Users\Administrator\tools\env.ps1).
-# Vendored dependencies live in third_party/ as git submodules (tracked as gitlinks).
-# Editors / OS
+/python/**/dist/
+/python/**/*.so
+
+# --- Node / UI --------------------------------------------------------------
+node_modules/
+/ui/**/dist/
+.vite/
+
+# --- Editors / OS -----------------------------------------------------------
 .idea/
 .vscode/
 *.swp
 .DS_Store
 Thumbs.db
-# MOSAIC app build artifacts + generated (EPL-derived) scenario
-scms-sim/**/out/
-scms-sim/**/build/
-*.jar
-scms-sim/scenarios/scms_smoke/
-scms-sim/scenarios/scms_intas/
-scms-sim/scenarios/gen_*/
-scms-sim/scenarios/_mapcache/
 tmp/
-gui/last_run.log
 
-# Secrets — never commit API keys
+# --- Third-party ASN.1 that may not be redistributed (build decision D3) ------
+# The SAE J2735 modules carry an embedded SAE user-licence agreement forbidding
+# redistribution ("prohibits the end user from posting or distributing content via
+# any public forum"). They may be kept locally for research and read by the build as
+# a reference for the hand-written BSM codec, but they are never committed. The ETSI
+# forge modules are BSD-3-Clause and ARE committed, under third_party/asn1/etsi/.
+/third_party/asn1/j2735/
+/third_party/sae/
+
+# --- Legacy reference (frozen, ADR 0002) ------------------------------------
+legacy/gui/last_run.log
+
+# --- Secrets — never commit API keys ----------------------------------------
 .env
 .env.*
