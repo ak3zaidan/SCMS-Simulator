@@ -10,9 +10,16 @@ The UI must attach to a live run or replay a recording with sub-100 ms scrubbing
 ## Decision
 
 1. **Recording container: MCAP** (MIT; libraries in Rust, Python, TypeScript, C++; chunked, indexed, append-only, self-describing schemas; default rosbag2 format since ROS 2 Iron) [R9: mcap.dev spec; foxglove/mcap]. Channels = the event families in 03-interfaces §14, each with a FlatBuffers schema record; chunk compression zstd; keyframes every 1 s of simulated time on `snapshot.keyframe`, deltas per mobility step on `snapshot.delta`.
-2. **Event encoding: FlatBuffers** (Apache-2.0; zero-copy access in JS/TS, Rust, Python) [R9: flatbuffers.dev] for events and snapshots; **Arrow IPC** (Apache-2.0) for tabular metric batches and for Python plug-in exchange; **Parquet** for exported tables; JSONL retained for the legacy MA dataset profile.
+2. **Event encoding: a flat fixed-layout struct-of-arrays** carried in MCAP message payloads (see the amendment below); **Arrow IPC** (Apache-2.0) for tabular metric batches and for Python plug-in exchange; **Parquet** for exported tables; JSONL retained for the legacy MA dataset profile.
 3. **Engine-to-UI protocol "VWP v1":** WebSocket; binary frames are the same FlatBuffers tables as the recording (`Hello`, `Keyframe`, `Delta`, `Telemetry`, `Metric`, `Provenance`, `Event`); a JSON-RPC 2.0 control channel (text frames or HTTP) carries commands. The live engine and the replay reader emit identical streams; the UI supports versions N and N−1 via `Hello.version`.
-4. **Seek contract:** keyframe + ≤ 1 s of deltas; poses quantised to int16 millimetres on a per-keyframe origin; the replay reader (native or WASM) uses MCAP's chunk index and per-channel message index [R9: mcap.dev spec].
+4. **Seek contract:** keyframe + ≤ 1 s of deltas; poses quantised as in the amendment below; the replay reader (native or WASM) uses MCAP's chunk index and per-channel message index [R9: mcap.dev spec].
+
+## Amendments (2026-09-18, from the VWP v1 wire specification)
+
+Writing `docs/protocol/vwp-v1.md` against this ADR exposed two defects in it. Both are corrected there and the specification is authoritative where the two disagree.
+
+- **Pose quantisation was impossible as written.** Int16 millimetres spans ±32.767 m, which cannot address a square-kilometre world from a single per-keyframe origin. Corrected: **keyframe** positions are `i32` millimetres relative to an origin that is constant for the run but is carried in **every** keyframe, and `i16` centimetres for z. Saying only "per-run" is the lossy shorthand: the wire specification §3.3.1 requires a client to read the origin from each keyframe rather than cache it from the handshake, so that a later minor version can re-centre without a format change. A reader who caches it violates that requirement; **delta** positions are `i16` millimetres relative to the previously transmitted quantised value, which is where the original int16 intent belongs (3.6 m of travel per 100 ms step at 130 km/h fits with room to spare), with an absolute-escape flag for teleports so there is no failure mode. Quantising against the previously *transmitted* value, not the true value, keeps the error from accumulating. Headings are `u16` binary radians, which wrap by construction.
+- **FlatBuffers is dropped for v1.** A hand-specified flat layout gives zero *parsing* rather than merely zero copy, needs no schema compiler pinned across three build systems, and lets the recorder store exactly the bytes that went over the wire, which is what makes live and replay streams provably byte-identical. The cost is that field addition is manual and governed by explicit versioning rules. Revisit if the channel set grows faster than the layout table can be reviewed.
 
 ## Alternatives
 

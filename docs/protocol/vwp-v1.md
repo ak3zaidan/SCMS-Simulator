@@ -533,7 +533,7 @@ millimetres.** ADR 0008 says "int16 millimetres on a per-keyframe origin", which
 *deltas* (an actor at 130 km/h moves 3.6 m per 100 ms step, well inside ±32.767 m) but impossible for
 *keyframes*: `i16` mm spans ±32.767 m, so it cannot address a 1 km² world from one origin. The ADR's
 intent — 1 mm precision and ~10 bytes of pose per actor — is preserved: a keyframe row is 28 B raw
-(≈ 280 KB for 10,000 actors, ≈ 60–90 KB after zstd, matching the ≈ 100 KB figure in 09-ui §7) and a delta
+(≈ 280 KB for 10,000 actors, ≈ 60–90 KB after zstd, comfortably inside §7.1's 4 MiB chunk target) and a delta
 row is 20 B.
 
 **`DECISION`: world geometry is `f32` ENU metres; actor poses are `i32` millimetres.** `f32` has a 24-bit
