@@ -48,16 +48,26 @@ parse at `osm.rs:3548` serves another path). Manhattan avenue lanes are ~3.0–3
 Impact: corridor half-widths, lane offsets and therefore every lateral position
 and sidewalk placement carry a systematic error.
 
-## W3 (major) — only 52.8 % of driving lanes are strongly connected
+## W3 — RETRACTED. The strong-connectivity figure is close to meaningless
 
-56 weakly connected components; largest holds 95.6 % of lanes. But the strongly
-connected core reachable both ways from lane 0 is 1278 of 2421 driving lanes.
-70 driving lanes have no successor and 251 have no predecessor.
+**I got this wrong.** I originally recorded "only 52.8 % of driving lanes are
+strongly connected, across 2,422 strong components" as a major routing defect.
+An independent reviewer refuted it, and the refutation is correct.
 
-Impact: routing strands vehicles on nearly half the network. Midtown is a
-well-connected one-way grid, so 52.8 % is far too low even accounting for the
-70.1 % one-way share. Suspect turn-connection generation is too restrictive at
-junctions, leaving lanes enterable but not exitable.
+A lane change is not a `Connection`. The lane graph's edges are turn movements
+only, so a lane whose sole permitted movement leads onward is its own strongly
+connected component by construction. In a largely one-way grid clipped to a
+small bounding box, the turn graph is close to acyclic at lane granularity, so
+thousands of singleton components are the expected result, not a symptom.
+
+The meaningful connectivity measure is the weak one, and it is healthy: 56
+components with the largest holding 95.6 % of lanes. What survives from the
+original observation is much narrower: 70 driving lanes have no successor and
+251 no predecessor, most of which is bounding-box clipping (see W5) rather than
+a topology defect.
+
+Recorded rather than deleted, because the reasoning error is worth keeping: a
+graph metric was quoted without checking what the graph's edges actually mean.
 
 ## W4 (medium) — subway-station polygons are treated as buildings
 
