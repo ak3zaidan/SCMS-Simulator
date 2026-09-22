@@ -68,6 +68,21 @@ rather than re-running the builder's test.
 | 6 | Manifest lists engine, plug-in, world and card hashes | Pending. The world hash exists; manifest assembly is owed by `v2xw-engine`. |
 | 7 | Manual map-to-chase fly-down | The automated fly-down passes end to end against the mock engine. Needs a human to judge. |
 
+## Correction, 2026-09-22 — the end-to-end run is a stub at the message layer
+
+An earlier entry here and my report to the owner both described the Phase 1 run
+as producing "970 signed messages". That was wrong, and an independent audit
+caught it. Nothing is encoded and nothing is signed: the node returns a size from
+a model and hands the engine a byte count. The layers below messaging are real
+and verifiably deterministic; the messaging layer is a faithful size model with
+no payload and no signature behind it.
+
+Recorded rather than quietly fixed, because the reason it passed unnoticed is
+instructive. Every number in the run report was plausible and self-consistent,
+the recording verified, and the digest reproduced. What gave it away was one
+comparison nobody had made: two different message formats came out at exactly the
+same size. Full detail in `findings/slice-verification.md`.
+
 ## Verification standard used
 
 Every crate was built, then adversarially validated by an agent told to re-derive
