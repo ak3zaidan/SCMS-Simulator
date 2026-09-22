@@ -307,11 +307,26 @@ function requireRange(buffer: ArrayBuffer, abs: number, bytes: number, what: str
  * probed on the real Manhattan payload with `point_off[0]` pushed 1,000 past the total,
  * `worldToJson` emitted `centreline: [null, null, null, …]` and the renderer would have built
  * NaN geometry from it. The directory arrives over HTTP, so it is untrusted input.
+ *
+ * `min` enforces the row minimums the section tables state — §4.3 `point_count` "≥ 2", §4.4
+ * `ring_count` "number of points in the outer ring, ≥ 3". The producer already guarantees both (a
+ * lane is rejected at construction with fewer than two points, and rings are closed and rewound
+ * before they are written), but the producer's guarantee is not the client's: the payload arrives
+ * over HTTP. And the failure is not merely a degenerate shape — a one-point lane, or two identical
+ * points, is a zero-length segment, and a heading taken from it divides by zero, so the same NaN
+ * the extent check keeps out has a second way in.
  */
-function checkRowRanges(offs: Uint32Array, counts: Uint32Array, total: number, what: string): void {
+function checkRowRanges(offs: Uint32Array, counts: Uint32Array, total: number, what: string, min: number, clause: string): void {
   for (let i = 0; i < offs.length; i++) {
     const off = offs[i];
     const n = counts[i];
+    if (n < min) {
+      throw new ProtocolError(
+        "bad_length",
+        `${what}[${i}] has ${n} point${n === 1 ? "" : "s"}; ${clause} requires at least ${min}`,
+        { offset: i, expected: min, actual: n, field: what },
+      );
+    }
     if (off + n > total) {
       throw new ProtocolError(
         "bad_offset",
@@ -402,6 +417,16 @@ export function decodeWorld(
       throw new ProtocolError("compressed_unsupported", "world payload is zstd-compressed but no decompressor was supplied");
     }
     const out = options.decompress(new Uint8Array(payload, VWB_HEADER_BYTES), bodyLen);
+    // §4.1 — `body_len` is the **uncompressed** body length, so the decompressor's output is the
+    // same declared extent as on the plain path below and gets the same check. Without it a short
+    // decompression measured every section bound against the wrong length.
+    if (out.byteLength !== bodyLen) {
+      throw new ProtocolError(
+        "bad_length",
+        `world header declares a ${bodyLen}-byte body but decompression produced ${out.byteLength} bytes`,
+        { expected: bodyLen, actual: out.byteLength, field: "world.body_len" },
+      );
+    }
     body = out.byteOffset === 0 && out.byteLength === out.buffer.byteLength ? (out.buffer as ArrayBuffer) : (out.slice().buffer as ArrayBuffer);
   } else {
     // §4.1 — `body_len` is a declared extent and the payload arrives over HTTP, so it is checked
@@ -559,9 +584,12 @@ export function decodeWorld(
     return { landuseId: s.words[w], ringOff: s.words[w + 1], ringCount: s.words[w + 2], classIdx: s.bytes[b + 12] };
   });
 
-  checkRowRanges(lanes.pointOff, lanes.pointCount, lanePoints.count, "world.lanes.point_off");
-  checkRowRanges(buildings.ringOff, buildings.ringCount, ringPoints.count, "world.buildings.ring_off");
-  // Landuse rings share the ring-point arrays with buildings (see `encodeWorld`'s `writeRing`).
+  checkRowRanges(lanes.pointOff, lanes.pointCount, lanePoints.count, "world.lanes.point_off", 2, "§4.3");
+  checkRowRanges(buildings.ringOff, buildings.ringCount, ringPoints.count, "world.buildings.ring_off", 3, "§4.4");
+  // Landuse rings share the ring-point arrays with buildings (see `encodeWorld`'s `writeRing`), but
+  // §4.5's landuse row states no minimum the way §4.3 and §4.4 do, so only the extent is checked
+  // here: inventing a MUST the specification does not state is how the other half of this register
+  // got written.
   for (let i = 0; i < landuse.count; i++) {
     const off = landuse.words[i * 4 + 1];
     const n = landuse.words[i * 4 + 2];

@@ -1,6 +1,14 @@
 // GENERATED FROM docs/protocol/vwp-v1.md §9 — DO NOT EDIT BY HAND.
-// These are the exact annotated hex dumps of §9.1 (Hello, 796 B), §9.2 (Keyframe, 180 B)
-// and §9.3 (Delta, 120 B), extracted byte for byte from the specification text.
+// These are the exact annotated hex dumps of §9.1 (Hello, 796 B), §9.2 (Keyframe, 180 B),
+// §9.3 (Delta, 120 B) and §9.4 (Delta with a non-zero vertical delta, 128 B), extracted byte for
+// byte from the specification text. `spec-vectors.test.ts` decodes all four and asserts every
+// field against what §9 states in prose beside the hex, so a vector that drifted from the
+// document would have to drift consistently with its own annotations to pass.
+//
+// NOT YET AUTOMATED: re-extracting the hex from the document at run time. That was done once,
+// by hand, and confirmed all three original vectors byte-identical to this file with zero
+// gaps against their stated totals. Making it a test would close the last gap between the
+// document and this fixture.
 
 /** §9.1 — Hello frame, 796 bytes total (24 header + 772 body). */
 export const SPEC_HELLO_HEX =
@@ -34,6 +42,20 @@ export const SPEC_DELTA_HEX =
   "565750310100030060000000000000000b0000000000000000ab90410000000001000000010000000100000000000000" +
   "01000000000000000000000001000000400000000000000054000000000000000000000058000000000000006d050000" +
   "00000000f8062000080802002c0000000700000076000300";
+
+/**
+ * §9.4 — Delta frame, 128 bytes total (24 header + 104 body), 2 moved actors with a **non-zero**
+ * vertical delta: `dz_mm = +100` on slot 0 and `−50` on slot 1, against a `z_cm` of 15 from §9.2.
+ *
+ * This is the vector build decision D12.3 asked §9 to owe: every other worked example carries
+ * `dz_mm = 0`, so none of them distinguishes millimetres from centimetres, which is how a tenfold
+ * vertical error survived in this client until an adversarial review found it. Reading `dz_mm` as
+ * centimetres gives slot 0 `z = 1.150 m` instead of `0.250 m`.
+ */
+export const SPEC_DELTA_VERTICAL_HEX =
+  "565750310100030068000000000000000c00000000000000008c86470000000001000000020000000200000000000000" +
+  "000000000000000000000000000000004000000000000000000000000000000000000000000000000000000001000000" +
+  "6d05b4fb000000006400ceff00000080f80680052000b3ff0809080500000000";
 
 /** Decode a hex string into a fresh, 8-aligned ArrayBuffer (offset 0 of its own buffer). */
 export function hexToArrayBuffer(hex: string): ArrayBuffer {

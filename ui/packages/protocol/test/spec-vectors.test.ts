@@ -29,11 +29,18 @@ import {
   parseFrameHeader,
   viewFrame,
 } from "../src/index.js";
-import { SPEC_DELTA_HEX, SPEC_HELLO_HEX, SPEC_KEYFRAME_HEX, hexToArrayBuffer } from "./vectors/spec-vectors.js";
+import {
+  SPEC_DELTA_HEX,
+  SPEC_DELTA_VERTICAL_HEX,
+  SPEC_HELLO_HEX,
+  SPEC_KEYFRAME_HEX,
+  hexToArrayBuffer,
+} from "./vectors/spec-vectors.js";
 
 const helloFrame = (): ArrayBuffer => hexToArrayBuffer(SPEC_HELLO_HEX);
 const keyframeFrame = (): ArrayBuffer => hexToArrayBuffer(SPEC_KEYFRAME_HEX);
 const deltaFrame = (): ArrayBuffer => hexToArrayBuffer(SPEC_DELTA_HEX);
+const deltaVerticalFrame = (): ArrayBuffer => hexToArrayBuffer(SPEC_DELTA_VERTICAL_HEX);
 
 describe("§9.1 Hello — 796 bytes (24 header + 772 body)", () => {
   const frame = helloFrame();
@@ -183,7 +190,7 @@ describe("§9.2 Keyframe — 180 bytes (24 header + 156 body), 3 actors", () => 
     expect(dv.getUint32(44, true)).toBe(148); // off_signals
   });
 
-  it("produces exactly the columns §9.4 says both reference decoders produce", () => {
+  it("produces exactly the columns §9.5 says both reference decoders produce", () => {
     const kf = decodeKeyframe(viewFrame(frame));
     const a = kf.actors;
     expect(Array.from(a.actorId)).toEqual([0, 1, 2]);
@@ -363,11 +370,81 @@ describe("§9.3 Delta — 120 bytes (24 header + 96 body), 1 moved actor", () =>
   });
 });
 
+describe("§9.4 Delta with a non-zero vertical delta — 128 bytes, 2 moved actors", () => {
+  const frame = deltaVerticalFrame();
+
+  it("is exactly 128 bytes with the header §9.4 shows", () => {
+    expect(frame.byteLength).toBe(128);
+    const h = parseFrameHeader(frame);
+    expect(h.msgType).toBe(MsgType.Delta);
+    expect(h.bodyLen).toBe(104);
+    expect(h.seq).toBe(12n);
+  });
+
+  it("decodes the §3.4.1 prefix — step 2 of the same GOP, two moved rows", () => {
+    const d = decodeDelta(viewFrame(frame));
+    expect(d.simTimeNs).toBe(1_200_000_000n);
+    expect(d.gopIndex).toBe(1);
+    expect(d.stepIndex).toBe(2);
+    expect(d.moved.count).toBe(2);
+    expect(d.absolute.count).toBe(0);
+    expect(d.lanes.length).toBe(0);
+    expect(d.spawns.count).toBe(0);
+    expect(d.despawns.count).toBe(0);
+  });
+
+  it("carries dz_mm = +100 on slot 0 and -50 on slot 1", () => {
+    const d = decodeDelta(viewFrame(frame));
+    expect(Array.from(d.moved.slot)).toEqual([0, 1]);
+    expect(Array.from(d.moved.dzMm)).toEqual([100, -50]);
+  });
+
+  // THE POINT OF THIS VECTOR. Build decision D12.3: §3.2 calls the delta millimetres on all
+  // three axes while the absolute vertical field is centimetres everywhere it appears, and every
+  // other worked example carries dz_mm = 0, so none of them distinguishes the two readings. A
+  // tenfold error survived in this client because of exactly that. Prose cannot settle a unit.
+  it("applies dz_mm as MILLIMETRES, not centimetres (§3.2, §3.4.2, D12.3)", () => {
+    const poses = new PoseBuffer(8);
+    poses.applyKeyframe(decodeKeyframe(viewFrame(keyframeFrame())));
+    poses.applyDelta(decodeDelta(viewFrame(deltaFrame())));
+
+    // Both slots entered the GOP at z_cm = 15 and §9.3 left them there.
+    expect(poses.positionOf(0).z).toBeCloseTo(0.15, 9);
+    expect(poses.positionOf(1).z).toBeCloseTo(0.15, 9);
+
+    const result = poses.applyDelta(decodeDelta(viewFrame(frame)));
+    expect(result).toEqual({ applied: true, moved: 2, spawned: 0, despawned: 0 });
+
+    // +100 mm on 0.150 m is 0.250 m. Reading dz_mm as centimetres gives 1.150 m.
+    expect(poses.positionOf(0).z).toBeCloseTo(0.25, 9);
+    expect(poses.positionOf(0).z).not.toBeCloseTo(1.15, 3);
+    // -50 mm on 0.150 m is 0.100 m. A centimetre reading gives -0.350 m.
+    expect(poses.positionOf(1).z).toBeCloseTo(0.1, 9);
+    expect(poses.positionOf(1).z).not.toBeCloseTo(-0.35, 3);
+
+    // The millimetre reference is exact, not a rounded mirror of the centimetre column.
+    expect(poses.zMm[0]).toBe(250);
+    expect(poses.zMm[1]).toBe(100);
+  });
+
+  it("uses the same unit on all three axes, so one row proves the shared scale", () => {
+    const d = decodeDelta(viewFrame(frame));
+    const poses = new PoseBuffer(8);
+    poses.applyKeyframe(decodeKeyframe(viewFrame(keyframeFrame())));
+    poses.applyDelta(decodeDelta(viewFrame(deltaFrame())));
+    const xBefore = poses.xMm[0];
+    poses.applyDelta(d);
+    expect(poses.xMm[0] - xBefore).toBe(d.moved.dxMm[0]);
+    expect(poses.zMm[0] - 150).toBe(d.moved.dzMm[0]);
+  });
+});
+
 describe("the dispatcher decodes each vector by msg_type", () => {
   it("routes Hello, Keyframe and Delta", () => {
     expect(decodeMessage(helloFrame()).kind).toBe("hello");
     expect(decodeMessage(keyframeFrame()).kind).toBe("keyframe");
     expect(decodeMessage(deltaFrame()).kind).toBe("delta");
+    expect(decodeMessage(deltaVerticalFrame()).kind).toBe("delta");
   });
 
   it("exposes ByeReason exactly as Appendix A numbers it", () => {

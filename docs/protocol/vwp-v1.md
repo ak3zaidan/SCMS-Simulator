@@ -23,7 +23,7 @@ is no `TBD`. Where the design documents left a choice open, the choice is made h
 | 6 | [JSON-RPC 2.0 control surface](#6-json-rpc-20-control-surface) — 32 methods, 8 notifications, error codes |
 | 7 | [Replay](#7-replay) — MCAP mapping, byte-identity, seek algorithm, 100 ms budget |
 | 8 | [Versioning](#8-versioning) |
-| 9 | [Worked example](#9-worked-example-unit-test-vectors) — annotated hex dumps + reference decoders |
+| 9 | [Worked example](#9-worked-example-unit-test-vectors) — annotated hex dumps (§9.1–§9.4, including the §9.4 vertical-delta vector) + reference decoders (§9.5) |
 | 10 | [Conformance checklist](#10-conformance-checklist) |
 | A | [Enum reference](#appendix-a--enum-reference) |
 | B | [Message-type summary](#appendix-b--message-type-summary) |
@@ -2765,11 +2765,12 @@ it does not know. A file with a different plug-in hash set is refused with `-320
 ## 9. Worked example (unit-test vectors)
 
 Every byte below was generated from the layout tables in §3 and then re-parsed by an independent decoder
-written only from those tables: all three frames round-trip, every `off_*` lands where the tables predict,
+written only from those tables: all four frames round-trip, every `off_*` lands where the tables predict,
 every section size matches its formula, and the poses reconstruct to the metre values in the table below.
 Use it as a golden test in both implementations. Offsets are **frame-relative** (the 24-byte header occupies
-`0x00`–`0x17`, the body starts at `0x18`). The `seq` values (0, 10, 11) are illustrative: `Hello` carries
-the next canonical seq, and the keyframe/delta pair here is the 11th and 12th canonical frame of the run.
+`0x00`–`0x17`, the body starts at `0x18`). The `seq` values (0, 10, 11, 12) are illustrative: `Hello`
+carries the next canonical seq, and the keyframe and the two deltas here are the 11th, 12th and 13th
+canonical frame of the run.
 
 **Scenario of the example**
 
@@ -3147,7 +3148,110 @@ slots 1, 2: unchanged
 signal 7: phase 3, 11.8 s to change
 ```
 
-### 9.4 Reference decoder skeletons
+### 9.4 `Delta` with a non-zero vertical delta — 128 bytes total (24 header + 104 body)
+
+**This vector exists to pin one unit.** §3.2 defines the delta on all three axes as `i16`
+millimetres against the previously transmitted quantised value, but the absolute vertical field is
+centimetres everywhere it appears (§3.3.2, §3.4.3, §3.4.5), so "the same field" names a field in a
+different unit from the delta. Every other worked example in §9 carries `dz_mm = 0`, so none of
+them distinguishes the two readings, and a tenfold error survived in a real client because of it.
+Prose cannot settle a unit; this vector can. A decoder that reads `dz_mm` as centimetres produces
+`z = 1.150 m` for slot 0 below instead of `0.250 m` and fails on the first row.
+
+It continues the worked example: it is the next canonical frame after §9.3, `seq = 12`, step 2 of
+the same GOP, at `t = 1.2 s`. Slots 0 and 1 both entered the GOP at `z_cm = 15` (0.150 m) from the
+§9.2 keyframe and were left there by §9.3, whose `dz_mm` is 0. Slot 0 rises by `dz_mm = +100` and
+slot 1 falls by `dz_mm = −50`, so the vector pins the magnitude and the sign, and carries a
+non-zero `dx_mm` alongside so the shared unit of the three axes is visible in one row.
+
+#### Delta (vertical) — frame header (24 bytes)
+
+```text
+  offset  bytes                                            field
+--------  -----------------------------------------------  ----------------------------------------
+00000000  56 57 50 31                                      magic = 0x31505756 -> wire bytes "V" "W" "P" "1"
+00000004  01 00                                            version = 1 (major)
+00000006  03 00                                            msg_type = 0x0003 (Delta)
+00000008  68 00 00 00                                      body_len = 104 (uncompressed body bytes)
+0000000c  00 00                                            flags = 0x0000
+0000000e  00 00                                            reserved = 0
+00000010  0c 00 00 00 00 00 00 00                          seq = 12
+--------
+total: 24 bytes
+```
+
+#### Delta (vertical) — body (104 bytes, starts at frame offset 24)
+
+```text
+  offset  bytes                                            field
+--------  -----------------------------------------------  ----------------------------------------
+00000018  00 8c 86 47 00 00 00 00                          sim_time_ns = 1_200_000_000 (t = 1.2 s)
+00000020  01 00 00 00                                      gop_index = 1
+00000024  02 00 00 00                                      step_index = 2
+00000028  02 00 00 00                                      moved_count = 2
+0000002c  00 00 00 00                                      abs_count = 0
+00000030  00 00 00 00                                      lane_count = 0
+00000034  00 00 00 00                                      spawn_count = 0
+00000038  00 00 00 00                                      despawn_count = 0
+0000003c  00 00 00 00                                      signal_count = 0
+00000040  40 00 00 00                                      off_moved = 64
+00000044  00 00 00 00                                      off_abs = 0 (absent)
+00000048  00 00 00 00                                      off_lanes = 0 (absent)
+0000004c  00 00 00 00                                      off_spawns = 0 (absent)
+00000050  00 00 00 00                                      off_despawns = 0 (absent)
+00000054  00 00 00 00                                      off_signals = 0 (absent)
+00000058  00 00 00 00                                      moved.slot[0] = 0
+0000005c  01 00 00 00                                      moved.slot[1] = 1
+00000060  6d 05                                            moved.dx_mm[0] = 1389 (+1.389 m)
+00000062  b4 fb                                            moved.dx_mm[1] = -1100 (-1.100 m)
+00000064  00 00                                            moved.dy_mm[0] = 0
+00000066  00 00                                            moved.dy_mm[1] = 0
+00000068  64 00                                            moved.dz_mm[0] = 100 = +0.100 m (MILLIMETRES, the same unit as dx_mm)
+0000006a  ce ff                                            moved.dz_mm[1] = -50 = -0.050 m
+0000006c  00 00                                            moved.heading_brad[0] = 0 (absolute)
+0000006e  00 80                                            moved.heading_brad[1] = 32768 (pi rad, absolute)
+00000070  f8 06                                            moved.speed_cq[0] = 1784 (13.9375 m/s, absolute)
+00000072  80 05                                            moved.speed_cq[1] = 1408 (11.0 m/s, absolute)
+00000074  20 00                                            moved.accel_cq[0] = 32 (0.5 m/s2, absolute) [GT]
+00000076  b3 ff                                            moved.accel_cq[1] = -77 (-1.203125 m/s2, absolute) [GT]
+00000078  08                                               moved.state[0] = 0x08 (EQUIPPED)
+00000079  09                                               moved.state[1] = 0x09 (EQUIPPED|ATTACKER)
+0000007a  08                                               moved.verified_neighbors[0] = 8
+0000007b  05                                               moved.verified_neighbors[1] = 5
+0000007c  00                                               moved.mflags[0] = 0x00 (no absolute entry, no lane change)
+0000007d  00                                               moved.mflags[1] = 0x00
+0000007e  00                                               moved.reserved[0] = 0
+0000007f  00                                               moved.reserved[1] = 0
+--------
+total: 104 bytes
+```
+
+Body size check: `64 (prefix) + 20 × 2 (moved) + 0 + 0 + 0 + 0 + 0 = 64 + 40 = 104`. ✔
+`off_moved = 64`; every other `off_*` is `0`, which per §2.2 means the section is absent — and
+`moved_count` is the only non-zero count, so nothing is declared that is not placed.
+
+**Applying it to the state §9.3 left behind.** The vertical column is the point of the vector, so
+it is shown before and after in both the transmitted quantisation and in metres:
+
+| Slot | z before | `dz_mm` | z after | as `z_cm` | x before | `dx_mm` | x after |
+|---|---|---|---|---|---|---|---|
+| 0 | 0.150 m (`z_cm = 15`) | `+100` | **0.250 m** | 25 | 13.734 m | `+1389` | 15.123 m |
+| 1 | 0.150 m (`z_cm = 15`) | `−50` | **0.100 m** | 10 | −20.000 m | `−1100` | −21.100 m |
+
+```
+slot 0:  z = 15 cm × 10 = 150 mm;  150 + 100 = 250 mm  →  z = 0.250 m   (z_cm mirrors to 25)
+         x_mm = 513734 + 1389 = 515123                 →  x = 515123/1000 + (−500) = 15.123 m
+slot 1:  z = 15 cm × 10 = 150 mm;  150 − 50  = 100 mm  →  z = 0.100 m   (z_cm mirrors to 10)
+         x_mm = 480000 − 1100 = 478900                 →  x = 478900/1000 + (−500) = −21.100 m
+slot 2:  unchanged (not in the moved block)
+```
+
+The delta reference for the vertical axis is therefore the previously transmitted quantised value
+**expressed in millimetres**, `z_cm × 10`, exactly as it is for `x` and `y`. A client that keeps its
+vertical reference in centimetres and adds `dz_mm` into it is wrong by a factor of ten on every
+vertical delta, and no other vector in this section would catch it.
+
+### 9.5 Reference decoder skeletons
 
 TypeScript (zero-copy view of an uncompressed keyframe):
 

@@ -132,6 +132,23 @@ describe("§4 — the other directory fields the decoder used to trust", () => {
     expect(failure(() => decodeWorld(buf))).toMatchObject({ code: "truncated", field: "world.body_len" });
   });
 
+  it("§4.1 — the compressed path checks the same declared extent", () => {
+    // zstd is not bundled (the decompressor is injected through `options.decompress`, §2.6), so
+    // this drives the branch with a stub: the body is not really compressed, the stub just hands
+    // back a slice of it. What is under test is that `body_len` is checked against what the
+    // decompressor produced, exactly as it is against what the server served.
+    const compressed = served();
+    new DataView(compressed).setUint16(H.flags, 1, true); // bit0 = zstd
+    const bodyLen = new DataView(compressed).getUint32(H.bodyLen, true);
+    const raw = new Uint8Array(compressed, VWB_HEADER_BYTES);
+
+    const whole = decodeWorld(compressed, { decompress: () => raw.slice() });
+    expect(whole.lanes.count).toBe(world.counts.lanes);
+
+    expect(failure(() => decodeWorld(compressed, { decompress: () => raw.slice(0, bodyLen - 8) })))
+      .toMatchObject({ code: "bad_length", field: "world.body_len" });
+  });
+
   it("§2.2 — a misaligned column base is a typed error, not a bare RangeError", () => {
     // `new Uint32Array(body, 193, n)` throws `RangeError: start offset of Uint32Array should be a
     // multiple of 4`, which is not a ProtocolError, so it escaped the decoder's error contract and
@@ -177,6 +194,63 @@ describe("§4 — the other directory fields the decoder used to trust", () => {
       code: "bad_offset",
       field: "world.landuse.ring_off",
     });
+  });
+});
+
+describe("§4.3 / §4.4 — the row minimums the section tables state are enforced", () => {
+  it("a lane with fewer than two centreline points is refused", () => {
+    // §4.3: `point_count` "≥ 2". The producer guarantees it — a lane is rejected at construction
+    // with fewer than two points — but the payload arrives over HTTP, so the client checks. A
+    // one-point lane is a zero-length segment, and a heading taken from it divides by zero.
+    const lanes = decodeWorld(served()).lanes;
+    const buf = served();
+    const dv = new DataView(buf, VWB_HEADER_BYTES);
+    dv.setUint32(directory(buf, D.offLanes) + 8 * lanes.count, 1, true); // point_count[0] = 1
+    expect(failure(() => decodeWorld(buf))).toMatchObject({
+      code: "bad_length",
+      closeCode: 1002,
+      field: "world.lanes.point_off",
+    });
+  });
+
+  it("a building ring with fewer than three points is refused", () => {
+    // §4.4: `ring_count` "number of points in the outer ring, ≥ 3".
+    const buildings = decodeWorld(served()).buildings;
+    const buf = served();
+    const dv = new DataView(buf, VWB_HEADER_BYTES);
+    dv.setUint32(directory(buf, D.offBuildings) + 8 * buildings.count, 2, true); // ring_count[0] = 2
+    expect(failure(() => decodeWorld(buf))).toMatchObject({
+      code: "bad_length",
+      closeCode: 1002,
+      field: "world.buildings.ring_off",
+    });
+  });
+
+  it("but a lane of exactly two points and a ring of exactly three still decode", () => {
+    // The control that keeps the minimum a minimum. Encoder-built, because every lane in the
+    // served payload has more than two points and every ring more than three.
+    const minimal = encodeWorld(
+      {
+        originLatDeg: 40.75, originLonDeg: -73.98, originAltM: 10,
+        bboxMinXM: -100, bboxMinYM: -100, bboxMaxXM: 100, bboxMaxYM: 100, bboxMinZM: 0, bboxMaxZM: 20,
+        lanes: [{
+          laneId: 1, edgeId: 1, junctionId: 0xffffffff, strName: 0, widthM: 3.2, speedLimitMps: 13.9,
+          allowedClasses: 1, laneType: 0, indexInEdge: 0, points: [[-50, 0, 0], [50, 0, 0]],
+        }],
+        buildings: [{
+          buildingId: 1, heightM: 10, baseZM: 0, strName: 0, material: 1, lodHint: 0, levels: 3,
+          ring: [[0, 0], [10, 0], [10, 10]],
+        }],
+        junctions: [], signals: [], sites: [], crossings: [], landuse: [],
+        strings: [""], provenanceJson: "",
+      },
+      sha256,
+    );
+    const w = decodeWorld(minimal.buffer.slice(minimal.byteOffset, minimal.byteOffset + minimal.byteLength) as ArrayBuffer);
+    expect(w.lanes.pointCount[0]).toBe(2);
+    expect(w.buildings.ringCount[0]).toBe(3);
+    expect(w.lanePoints.count).toBe(2);
+    expect(w.ringPoints.count).toBe(3);
   });
 });
 

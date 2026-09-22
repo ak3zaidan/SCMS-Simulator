@@ -155,7 +155,7 @@ pub const LATITUDE_UNAVAILABLE: i32 = 900_000_001;
 /// an encoder that assumed symmetry would offset every longitude by one LSB and produce a
 /// 32-bit field whose every value is wrong by 11 mm — a defect no round-trip test of its
 /// own encoder could ever find. This is exactly what the `pycrate` oracle is for.
-pub const LONGITUDE_MIN: i64 = -1_799_999_999;
+pub const LONGITUDE_MIN: i64 = -1_800_000_000;
 /// See [`LONGITUDE_MIN`].
 pub const LONGITUDE_MAX: i64 = 1_800_000_001;
 /// `Longitude` value meaning "unavailable".
