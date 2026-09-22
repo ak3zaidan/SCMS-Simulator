@@ -1,0 +1,62 @@
+# 06-node-models.md §7.2 — the proposed reference OBU (11-open-questions A3).
+id: obu/unex-obu-301-craton2
+kind: obu
+version: 2026-09-18.1
+reference_profile: true
+purpose: >-
+  Reference OBU profile (Autotalks CRATON2 in the Unex OBU-301E). The only OBU in the
+  hardware sheet publishing core count, clock and DMIPS, RAM and flash, HSM signing
+  throughput and latency, hardware verification throughput, RX threshold, TX power,
+  antenna gain and GNSS sensitivity. Two caveats: Autotalks itself publishes no numeric
+  rates (the Unex integrator sheets quote them), and 128 MB of RAM is an order of
+  magnitude below the Cohda units, which matters for store-size accounting.
+sources:
+  - {kind: info-sheet, ref: "Unex OBU-301E information sheet [R7 §A4, §A10: pdftxt/unex_obu301e.txt]", accessed: 2026-09-18}
+  - {kind: info-sheet, ref: "Unex OBU-351U information sheet [R7 §A4, §A10: pdftxt/unex_obu351u.txt]", accessed: 2026-09-18}
+  - {kind: security-policy, ref: "Autotalks CRATON2/SECTON eHSM FIPS 140-2 Security Policy, CMVP #3556 [R7 §A4; §7.10 #6]", accessed: 2026-09-18}
+  - {kind: fcc-filing, ref: "Unex OBU-201U spec v2.03 (CRATON gen-1, per-MCS sensitivity proxy) [R7 §A5; §7.10 #5]", accessed: 2026-09-18}
+cpu:
+  cores: {value: 2, source: "\"dual 600 MHz ARM Cortex-A7 cores\" [R7 §A4]"}
+  clock_hz: {value: 6.0e8, source: "[R7 §A4]"}
+  arch: {value: armv7-a, source: "Cortex-A7 [R7 §A4]"}
+  dmips: {value: 2280, source: "1140 DMIPS per core x 2 cores (derived from the per-core rating) [R7 §A4]"}
+ram_bytes: {value: 134217728, source: "128 MB DDR3 as integrated in the OBU-301E [R7 §A4]"}
+flash_bytes: {value: 134217728, source: "128 MB NAND [R7 §A4]"}
+hsm:
+  kind: soc-hsm
+  part: {value: "Autotalks CRATON2 eHSM (ARM Cortex-M0, 32 KB RAM, 128 KB ROM, dedicated crypto accelerator, OTP); HW P/N ATK66610 v2.1.2; FIPS 140-2 overall Level 3 on the eHSM boundary", source: "[R7 §A4: FIPS security policy; R5 §C: CMVP #3556]"}
+  ops:
+    ecdsa-p256-sign:
+      throughput_per_s: {value: 110, status: lower-bound, source: "\">110 signatures/s\" [R7 §A4]"}
+      latency_us: {value: 9000, status: upper-bound, source: "\"<9 ms signing latency\" [R7 §A4]"}
+      runs_on: hsm
+    ecdsa-p256-verify:
+      throughput_per_s: {value: 2500, status: lower-bound, source: "\">2500 ECDSA NIST P-256 verifications/s ('line-rate')\" [R7 §A4]"}
+      latency_us: {value: null, status: not-published, calibration: "engine latency not stated; an upper bound of 400 us per verify follows from 1/2500 s (derived) if modelled as a single server; measure the pipeline depth on device"}
+      runs_on: accelerator
+    ecies-p256-decrypt:
+      throughput_per_s: {value: null, status: not-published, calibration: "ECIES is supported by the security subsystem (gen-1 datasheet [R7 §A5]); no CRATON2 rate published; bench on device"}
+      latency_us: {value: null, status: not-published, calibration: "as the throughput figure above: ECIES is supported by the security subsystem but no CRATON2 rate is published; bench on device"}
+      runs_on: hsm
+  queue_depth: {value: null, status: todo-calibrate, calibration: "not published; measure with back-to-back sign requests"}
+  servers: {value: null, status: todo-calibrate, calibration: "the FIPS policy documents one Cortex-M0 and one separate verification engine, but not how many requests either serves concurrently; measure the pipeline depth on device and set the server count from it"}
+software_crypto:
+  ecdsa-p256-verify: {us: null, status: not-published, calibration: "run `openssl speed ecdsap256` on the OBU; PROXY = Pi 3B Cortex-A53 @ 1.2 GHz 775.3 verify/s (1290 us, derived) [R7 §D8], the slowest benchmarked Cortex-A class"}
+  ecdsa-p256-sign: {us: null, status: not-published, calibration: "same; PROXY = Pi 3B 1631.1 sign/s (613 us, derived) [R7 §D8]"}
+  ml-dsa-44-verify: {us: null, status: not-published, calibration: "liboqs on device; bracket between Cortex-M7 @ 216 MHz Dilithium-2 verify 6.6 ms [R7 §E1] (pessimistic) and Pi 4 Cortex-A72 ML-DSA-44 3213.9/s = 311 us [R5 §B.2] (optimistic)"}
+  falcon-512-verify: {us: null, status: not-published, calibration: "bracket between Cortex-M7 2.6 ms [R7 §E1] and Pi 4 7866.3/s = 127 us [R5 §B.2]"}
+radio:
+  rat: [dsrc-80211p]
+  chipset: {value: "Autotalks CRATON2 + PLUTON2 RF transceiver", source: "[R7 §A4]"}
+  tx_power_dbm:
+    min: {value: null, status: not-published, calibration: "not stated for CRATON2; the gen-1 CRATON unit had a 4.5-25 dBm dynamic range [R7 §A5], a different generation; measure or request from Unex"}
+    max: {value: 20.0, status: lower-bound, source: "\">+20 dBm, Class C mask\" (OBU-301E); \"max +20 dBm\" (OBU-351U) [R7 §A10]"}
+    default: {value: 20.0, source: "J2945/1 constant-rate baseline [R7 §H3]"}
+  sensitivity_dbm: {value: -92.0, source: "\"RX threshold <-92 dBm, SAE J2945-compliant\" [R7 §A10]; per-MCS table only exists for CRATON gen-1 [R7 §A5], carried as a previous-generation proxy in the sheet"}
+  noise_figure_db: {value: 9.0, status: evaluation-assumption, source: "NOT PUBLISHED for CRATON2/PLUTON2; 3GPP TR 36.885 Annex A.1.1 UE receiver noise figure 9 dB [R2 Topic A; R2c] (schema default, §1)"}
+  antenna:
+    gain_dbi: {value: 5.0, source: "\"2x detachable FAKRA-Z, 5 dBi omni dipole\" [R7 §A10]"}
+    height_m: {value: 1.5, status: evaluation-assumption, source: "3GPP TR 36.885 Annex A.1.1 [R2 Topic A; R2c]; override per vehicle type"}
+    pattern: {value: omni, source: "[R7 §A10]"}
+power_w: {value: null, status: not-published, calibration: "not stated; input 6-48 V DC [R7 §A10]; measure at 12 V"}
+storage_model: inherit

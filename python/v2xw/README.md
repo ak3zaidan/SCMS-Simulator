@@ -1,5 +1,15 @@
-# `python/v2xw/` — Python package (PyO3 bindings + SDK)
+# `python/v2xw/`
 
-Placeholder. Phase 5 puts the PyO3 extension, the scripting SDK and the ported
-libraries (protocols, detectors, exporters, foundry) here, built with `maturin`
-and installed by `just setup` (ADR 0010 §1).
+The `v2xw` Python package. Read `../README.md` for what it does and how to build it; this
+directory holds:
+
+| File | What is in it |
+|---|---|
+| `__init__.py` | the package surface, and the one wall-clock read in the whole system |
+| `plugins.py` | `CarFollowing` and `Detector` to subclass, and `card()`/`parameter()`/`equation()`/`source()` to build a model card that validates |
+| `conformance.py` | the Python half of the 03-interfaces.md §17 suite: the purity guard and the source scan |
+| `_v2xw.pyi` | typed stubs for the native module (§15: "the SDK ships typed stubs") |
+| `py.typed` | the marker that tells a type checker the stubs are authoritative |
+
+The native module is built from `../../crates/v2xw-py` and installed here as `_v2xw` by
+maturin. It is not in version control.

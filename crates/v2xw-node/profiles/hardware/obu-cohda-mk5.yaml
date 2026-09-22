@@ -1,0 +1,54 @@
+# 06-node-models.md §7.1. Every number carries its research-sheet anchor; every field with
+# no number carries the measurement that would produce one (rule H1).
+id: obu/cohda-mk5
+kind: obu
+version: 2026-09-18.1
+purpose: >-
+  Commercial DSRC OBU (Cohda MK5). The most widely fielded DSRC OBU of the USDOT pilots'
+  era and the least documented for crypto: Cohda publishes CPU rating, memory, radio and
+  GNSS figures but nothing about SXF1700 sign or verify throughput, so the verify rate is
+  a flagged proxy from a later NXP baseband and the sign path is unknown.
+sources:
+  - {kind: product-brief, ref: "Cohda MK5 OBU product brief (2024) [R7 §A1; 06-node-models §7.10 #1]", accessed: 2026-09-18}
+  - {kind: datasheet, ref: "Cohda MK5 radio module datasheet v1.2.0 (May 2015), FCC filing [R7 §A1; §7.10 #2]", accessed: 2026-09-18}
+  - {kind: fact-sheet, ref: "NXP SAF5400 fact sheet SAF5400V2XFS REV 2 [R7 §D5; §7.10 #12]", accessed: 2026-09-18}
+cpu:
+  cores: {value: 2, source: "\"NXP i.MX6 DL (dual-core)\" [R7 §A1: Cohda MK5 OBU brief 2024]"}
+  clock_hz: {value: null, status: not-published, calibration: "the brief gives only the DMIPS rating; read the core clock from the NXP i.MX6 DualLite datasheet or /proc/cpuinfo on the device"}
+  arch: {value: null, status: not-published, calibration: "the brief names the SoC (i.MX6 DL) but not the core; confirm core type and ISA from the NXP i.MX6 DualLite datasheet before choosing a cycle-count table"}
+  dmips: {value: 4000, source: "\"rated 4000 DMIPS\" [R7 §A1: Cohda MK5 OBU brief 2024]"}
+ram_bytes: {value: 1073741824, source: "1 GB SDRAM [R7 §A1]"}
+flash_bytes: {value: 4294967296, source: "4 GB eMMC; the brief lists a further 4 GB storage, not counted here [R7 §A1]"}
+hsm:
+  kind: secure-element
+  part: {value: "NXP SXF1700", source: "[R7 §A1: Cohda MK5 OBU brief 2024]"}
+  ops:
+    ecdsa-p256-verify:
+      throughput_per_s: {value: 2000, status: proxy, source: "NOT PUBLISHED by Cohda for the SXF1700 [R7 §A1]; PROXY = NXP SAF5400 integrated verification engine, 2000 messages/s, Brainpool or NIST 256-bit [R7 §D5]. SAF5400 is a later baseband than the MK5's SAF5100; flagged."}
+      latency_us: {value: null, status: not-published, calibration: "measure on device (Cohda SDK security API timing); until then the service time is 1/throughput = 500 us (derived) with a single HSM server"}
+      runs_on: accelerator
+    ecdsa-p256-sign:
+      throughput_per_s: {value: null, status: not-published, calibration: "NOT PUBLISHED for SXF1700 [R7 §A1]; request the NXP SXF1700 datasheet under NDA or bench on device"}
+      latency_us: {value: null, status: not-published, calibration: "NOT PUBLISHED; the nearest documented same-role figure is the Infineon SLI97/SLE97 family '<50 ms' performance-profile requirement [R7 §D2] — pessimistic placeholder only, flag in the manifest"}
+      runs_on: hsm
+  queue_depth: {value: null, status: todo-calibrate, calibration: "no published host-SE queue depth; measure with back-to-back sign requests on device"}
+  servers: {value: 1, source: "§7.1 models the unpublished latency as 1/throughput \"with a single HSM server\""}
+software_crypto:
+  ecdsa-p256-verify: {us: null, status: not-published, calibration: "run `openssl speed ecdsap256` on the device (Ubuntu 20.04 ships OpenSSL); until then PROXY = Raspberry Pi 3B Cortex-A53 @ 1.2 GHz OpenSSL 775.3 verify/s (1290 us, derived) [R7 §D8], the slowest benchmarked Cortex-A class; optimistic bound Pi 4 Cortex-A72 1550.7/s (645 us) [R7 §D8]"}
+  ecdsa-p256-sign: {us: null, status: not-published, calibration: "same measurement; PROXY = Pi 3B 1631.1 sign/s (613 us, derived) [R7 §D8]"}
+  ml-dsa-44-verify: {us: null, status: not-published, calibration: "liboqs speed_sig on device; no Cortex-A53/A9-class liboqs figure exists in R5 §B.2 (UNVERIFIED / not found)"}
+radio:
+  rat: [dsrc-80211p]
+  chipset: {value: "NXP RoadLINK SAF5100", source: "[R7 §A1]"}
+  tx_power_dbm:
+    min: {value: -10.0, source: "module datasheet: \"-10 to +23 dBm/antenna port\" [R7 §A1]"}
+    max: {value: 22.0, source: "system spec: \"+22 dBm (ETSI Mask C)\" [R7 §A1]; module spec +23 dBm/port, +26 dBm effective with 2 antennas — both genuine, different measurement points, not reconciled"}
+    default: {value: 20.0, source: "J2945/1 constant-rate baseline \"20 dBm\" used by Rostami et al. [R7 §H3]; scenario may override"}
+  sensitivity_dbm: {value: -99.0, source: "\"-99 dBm @ 3 Mbps\" [R7 §A1]; module datasheet -97 dBm (5.9 GHz), different measurement point"}
+  noise_figure_db: {value: 6.0, source: "NXP RoadLINK \"noise figure 6 dB @ 5.9 GHz\", chip-level [R7 §D5]; system NF including front-end NOT PUBLISHED"}
+  antenna:
+    gain_dbi: {value: null, status: not-published, calibration: "one DSRC antenna is bundled with the OBU kit, gain not stated in the brief [R7 §G]; measure, or take the shark-fin datasheet; the 3GPP evaluation assumption 3 dBi for a vehicle UE is the fallback [R2c: TR 36.885 Table A.1.1-1]"}
+    height_m: {value: 1.5, status: evaluation-assumption, source: "3GPP TR 36.885 Annex A.1.1 vehicle-UE antenna height 1.5 m [R2 Topic A, R2c] — not a Cohda figure"}
+    pattern: {value: omni, source: "[R7 §G]"}
+power_w: {value: null, status: not-published, calibration: "OBU system draw not stated; the radio module alone is '4 W max' [R7 §A1]; supply 7-36 V DC; measure at a 12 V bench supply"}
+storage_model: inherit

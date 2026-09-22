@@ -1,0 +1,15 @@
+# The base, plus traffic. Everything this file does not mention comes from `grid-base`.
+schema: v2xw/scenario/1
+meta:
+  name: grid-traffic
+  description: The grid base with Poisson demand and a weather front, for the end-to-end run.
+  base: grid-base.yaml
+actors:
+  vehicles:
+    demand:
+      kind: mobility/demand/poisson
+      rate_veh_per_h: 3600.0
+events:
+  - t: 4.0
+    type: weather.front
+    value: fog

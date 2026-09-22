@@ -6,6 +6,14 @@
 //! come back as a named variant. That is a requirement, not a courtesy — a recording is
 //! the artefact a reviewer reaches for *after* something went wrong, so it is routinely
 //! read half-written.
+//!
+//! The promise has a second half that is easy to lose, and this crate lost it twice: a
+//! malformed file must not be *accepted* either. Unchecked arithmetic on a wire value
+//! fails both ways at once — it panics in a debug build and it wraps in a release build,
+//! and a wrapped sum walks straight through the bounds check that was meant to stop it.
+//! [`RecordError::WireOverflow`] and [`RecordError::ImplausibleCount`] exist so that the
+//! overflow and the absurd allocation are themselves the rejection, in release as well as
+//! in debug.
 
 use std::path::PathBuf;
 
@@ -133,6 +141,59 @@ pub enum RecordError {
         row: usize,
     },
 
+    /// Arithmetic on a value the file itself supplied would not fit, so the value is
+    /// refused rather than used.
+    ///
+    /// Every offset, length, count and capacity in a container is a number an attacker or
+    /// a bit flip chooses. `a + b` on two of them is wrong twice over: it panics in a
+    /// debug build, and in a release build — which is what people run — it *wraps*, so a
+    /// sum that should have been rejected as past the end of the file becomes a small
+    /// number that passes the bounds check. That is silent acceptance of a corrupt file,
+    /// which is worse than a crash. Wherever this crate derives an offset, a length, a
+    /// count or an allocation size from the wire it uses checked arithmetic and returns
+    /// this variant, so the overflow *is* the rejection.
+    #[error("{what}: {detail}")]
+    WireOverflow {
+        /// The structure the value came from, e.g. `"mcap chunk index"`.
+        what: &'static str,
+        /// The arithmetic that would not fit, with the operands named.
+        detail: String,
+    },
+
+    /// A row count or block length off the wire would reserve more memory than the buffer
+    /// it is supposed to describe could possibly fill.
+    ///
+    /// `Vec::with_capacity(n)` on a wire `u32` is an allocation of up to 4.29 billion rows
+    /// chosen by the file. It is not caught by the bounds checks inside the loop that
+    /// follows, because the reservation happens first — so an allocator that refuses it
+    /// aborts, which `catch_unwind` cannot trap, and one that grants it lazily lets a
+    /// 20-byte frame decide how much of the machine a decode takes. Every row costs at
+    /// least one byte, so no honest count can exceed the length of the buffer it indexes,
+    /// and that is the bound this variant reports.
+    #[error("{what}: {detail}")]
+    ImplausibleCount {
+        /// The structure being decoded.
+        what: &'static str,
+        /// The count, its stride and the buffer it claims to describe.
+        detail: String,
+    },
+
+    /// A chunk declares `uncompressed_crc = 0` and this reader was asked to require a
+    /// checksum ([`crate::Reader::require_chunk_checksums`]).
+    ///
+    /// The container defines a zero CRC as "not present", so the field is also the switch
+    /// that turns validation off — four bytes, chosen by whoever supplied the file. The
+    /// default is to read the chunk and report that nothing was checked, because a zero is
+    /// legal and refusing it would reject a conforming producer; this variant is what a
+    /// caller gets when it has said that a missing checksum is disqualifying.
+    #[error(
+        "mcap chunk {chunk}: uncompressed_crc is zero, so nothing in it was checked, and this reader was asked to require a checksum"
+    )]
+    UncheckedChunk {
+        /// The index of the chunk in [`crate::SeekIndex::chunks`].
+        chunk: usize,
+    },
+
     /// The MCAP container rejected an operation.
     #[error("mcap: {0}")]
     Mcap(#[from] mcap::McapError),
@@ -168,6 +229,22 @@ impl RecordError {
     /// A [`RecordError::Malformed`] from a formatted detail.
     pub fn malformed(what: &'static str, detail: impl Into<String>) -> Self {
         RecordError::Malformed {
+            what,
+            detail: detail.into(),
+        }
+    }
+
+    /// A [`RecordError::WireOverflow`] from a formatted detail.
+    pub fn wire_overflow(what: &'static str, detail: impl Into<String>) -> Self {
+        RecordError::WireOverflow {
+            what,
+            detail: detail.into(),
+        }
+    }
+
+    /// A [`RecordError::ImplausibleCount`] from a formatted detail.
+    pub fn implausible_count(what: &'static str, detail: impl Into<String>) -> Self {
+        RecordError::ImplausibleCount {
             what,
             detail: detail.into(),
         }

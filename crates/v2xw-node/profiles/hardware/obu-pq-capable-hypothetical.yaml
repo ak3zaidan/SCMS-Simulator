@@ -1,0 +1,64 @@
+# 06-node-models.md §7.5. No vendor-announced automotive PQ accelerator exists in any
+# collateral gathered [R7 §E5], so this profile is software-only by construction.
+id: obu/pq-capable-hypothetical
+kind: obu
+version: 2026-09-18.1
+hypothetical: true
+purpose: >-
+  A post-quantum-capable OBU modelled as a Cortex-A76-class application processor running
+  PQ signatures in software, with no security hardware. The optimistic anchor is liboqs on
+  a Raspberry Pi 5; the pessimistic bound is the NDSS 2024 measurement on production Cohda
+  MK6 hardware, carried in obu/cohda-mk6c-qualcomm-9150.
+sources:
+  - {kind: paper, ref: "Berger, Lemoudden, Buchanan, arXiv 2503.10238 Table 8 — liboqs on Raspberry Pi 5 (Cortex-A76) [R5 §B.2; §7.10 #19]", accessed: 2026-09-17}
+  - {kind: benchmark, ref: "wolfSSL vs mbedTLS benchmark, June 2026, Pi 5 row [R5 §B.5; §7.10 #18]", accessed: 2026-09-17}
+  - {kind: paper, ref: "Twardokus et al., NDSS 2024 Table V, Cohda MK6 measurements [R7 §E3; §7.10 #22]", accessed: 2026-09-18}
+  - {kind: paper, ref: "Howe & Westerbaan, NIST 4th PQC conf. 2022, Cortex-M7 @ 216 MHz [R7 §E1; §7.10 #24]", accessed: 2026-09-18}
+  - {kind: gap, ref: "Announced PQ hardware accelerators (NXP/Infineon): NOT PUBLISHED / none found [R7 §E5]", accessed: 2026-09-18}
+cpu:
+  cores: {value: null, status: not-published, calibration: "the Pi 5 core count is not restated in R5/R7 and every row below is single-core; a scenario sets it, and a 4-core default would be a scenario choice rather than a sourced figure"}
+  clock_hz: {value: 2.4e9, status: proxy, source: "\"Raspberry Pi 5 (Cortex-A76 @ 2.4 GHz)\" [R5 §B.5]"}
+  arch: {value: armv8-a, status: proxy, source: "Cortex-A76 class [R5 §B.5]"}
+  dmips: {value: null, status: not-published, calibration: "no DMIPS rating in R5/R7; scale by measured openssl/liboqs ratios"}
+ram_bytes: {value: null, status: not-published, calibration: "hypothetical unit; a scenario parameter. Note the PQ store growth it has to cover: an ML-DSA-44 signature is 2420 B and a Falcon-512 one 666 B against ECDSA's 64 B [R5 §A]"}
+flash_bytes: {value: null, status: not-published, calibration: "hypothetical unit; a scenario parameter"}
+hsm:
+  kind: none
+  part: {value: null, status: not-applicable, calibration: "no vendor PQ accelerator exists in any NXP, Infineon or Autotalks collateral gathered [R7 §E5]; the only published PQ hardware throughput is a backend appliance (backend/hsm-appliance-luna7). To offload classical ECDSA, compose this profile's software table with the hsm block of obu/unex-obu-301-craton2 or obu/cohda-mk6c-qualcomm-9150 in the manifest"}
+  ops: {}
+  queue_depth: {value: null, status: not-applicable, calibration: "rule H2: no HSM queue exists on this profile"}
+  servers: {value: null, status: not-applicable, calibration: "rule H2: no HSM server exists on this profile"}
+software_crypto:
+  ecdsa-p256-verify: {us: 67.0, ops_per_s: 14933, source: "wolfSSL 5.9.1 on a Pi 5 [R5 §B.5]; mbedTLS 3.6.6 on the same board gives 592/s (1689 us), which is the library spread"}
+  ecdsa-p256-sign: {us: null, status: not-published, calibration: "the Pi 5 sign rate is not in the fetched rows [R5 §B.5]; PROXY = Pi 4 OpenSSL 244 us [R7 §D8], flagged"}
+  ml-dsa-44-sign: {us: 531, ops_per_s: 1885.0, source: "liboqs on a Pi 5 [R5 §B.2: arXiv 2503.10238 Table 8]"}
+  ml-dsa-44-verify: {us: 123, ops_per_s: 8139.0, source: "[R5 §B.2]"}
+  falcon-512-sign: {us: 298, ops_per_s: 3360.6, source: "[R5 §B.2]"}
+  falcon-512-verify: {us: 50.4, ops_per_s: 19831.3, source: "[R5 §B.2]"}
+  ml-dsa-65-verify: {us: null, status: not-published, calibration: "ML-DSA-65/87, Falcon-1024 and SLH-DSA on a Pi 4/5 were not found — UNVERIFIED [R5 §B.2]; run liboqs speed_sig on the board. Until then scale ML-DSA-44 by the pqm4 m4f verify cycle ratio 2415944/1421623 [R5 §B.3] and flag the result as derived"}
+  ml-dsa-87-verify: {us: null, status: not-published, calibration: "as above; the pqm4 m4f ratio is 4193104/1421623 [R5 §B.3]"}
+  slh-dsa-sha2-128s-verify: {us: null, status: not-published, calibration: "not measured on a Cortex-A76; the NDSS 2024 SPHINCS+ verify of 5.436 ms on a Cohda MK6 [R7 §E3] is the only V2X-hardware figure"}
+software_crypto_classes:
+  cortex-m7-216mhz:
+    ml-dsa-44-verify: {us: 6600, source: "Dilithium-2 verify, 1429 kcycles, STM32F767ZI [R7 §E1: Howe & Westerbaan 2022]"}
+    ml-dsa-44-sign: {us: 16900, source: "3658 kcycles [R7 §E1]"}
+    ml-dsa-65-verify: {us: 11400, source: "Dilithium-3, 2453 kcycles [R7 §E1]"}
+    ml-dsa-87-verify: {us: 19800, source: "Dilithium-5, 4287 kcycles [R7 §E1]"}
+    falcon-512-verify: {us: 2600, source: "559 kcycles [R7 §E1]"}
+    falcon-512-sign: {us: 22100, source: "4778 kcycles, dynamic tree, native FPU [R7 §E1]"}
+    falcon-1024-verify: {us: 5300, source: "1136 kcycles [R7 §E1]"}
+radio:
+  rat: [lte-v2x-pc5]
+  chipset: {value: null, status: not-published, calibration: "hypothetical unit; §7.5 says to reuse the documented C-V2X radio block of obu/cohda-mk6c-qualcomm-9150 or the DSRC block of obu/unex-obu-301-craton2 per scenario, and to say in the manifest which was used"}
+  tx_power_dbm:
+    min: {value: null, status: not-published, calibration: "inherit from the radio block the scenario composes in"}
+    max: {value: null, status: not-published, calibration: "inherit from the radio block the scenario composes in"}
+    default: {value: null, status: not-published, calibration: "inherit from the radio block the scenario composes in"}
+  sensitivity_dbm: {value: null, status: not-published, calibration: "inherit from the radio block the scenario composes in"}
+  noise_figure_db: {value: 9.0, status: evaluation-assumption, source: "3GPP UE receiver noise figure 9 dB [R2 Topic A; R2c] (schema default, §1)"}
+  antenna:
+    gain_dbi: {value: 3.0, status: evaluation-assumption, source: "3GPP TR 36.885 Table A.1.1-1 vehicle UE 3 dBi [R2c]"}
+    height_m: {value: 1.5, status: evaluation-assumption, source: "TR 36.885 Annex A.1.1 [R2 Topic A; R2c]"}
+    pattern: {value: omni, source: "[R2c]"}
+power_w: {value: null, status: not-published, calibration: "hypothetical; measure on the chosen board under sustained liboqs load"}
+storage_model: inherit

@@ -60,12 +60,7 @@ pub fn scan_batches(
     for batch in batches {
         report.rows += batch.num_rows();
         for col in &schema.columns {
-            // INJECTED FAULT: Text columns are skipped again.
             if col.kind == ColumnKind::Text {
-                continue;
-            }
-            #[allow(unreachable_code)]
-            if false {
                 if let Some(array) = batch.column_by_name(&col.name) {
                     let texts = array
                         .as_any()
@@ -181,12 +176,7 @@ pub fn scan_jsonl(path: impl AsRef<Path>, schema: &TableSchema) -> Result<ScanRe
     for (i, row) in rows.iter().enumerate() {
         let Some(obj) = row.as_object() else { continue };
         for col in &schema.columns {
-            // INJECTED FAULT: Text columns skipped in jsonl too.
             if col.kind == ColumnKind::Text {
-                continue;
-            }
-            #[allow(unreachable_code)]
-            if false {
                 match obj.get(&col.name) {
                     // JSONL keeps a nested value's shape, so it arrives as a value…
                     Some(v @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => {

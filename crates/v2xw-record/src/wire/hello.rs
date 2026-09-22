@@ -350,6 +350,14 @@ impl HelloBody {
         let off_channels = get_u32(body, 228, WHAT)? as usize;
         let off_world_ref = get_u32(body, 232, WHAT)? as usize;
         let off_strings = get_u32(body, 236, WHAT)? as usize;
+        // Three counts straight off the wire, each of them about to size an allocation.
+        // A `Hello` claiming `u32::MAX` nodes reserved 137 GB before the first bounds
+        // check inside the loop below could discover the body was 800 bytes long, and a
+        // reservation that large aborts rather than erroring. The strides are the encoded
+        // widths from §3.1: 32 bytes per node row, 22 per class row, 8 per channel row.
+        let n = crate::wire::checked_count(n, 32, body.len(), WHAT, "node_count")?;
+        let c = crate::wire::checked_count(c, 22, body.len(), WHAT, "class_count")?;
+        let k = crate::wire::checked_count(k, 8, body.len(), WHAT, "channel_count")?;
 
         let mut nodes = Vec::with_capacity(n);
         for i in 0..n {

@@ -66,3 +66,4 @@ legacy/gui/last_run.log
 # --- Secrets — never commit API keys ----------------------------------------
 .env
 .env.*
+runs/

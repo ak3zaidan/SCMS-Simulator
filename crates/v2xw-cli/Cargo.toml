@@ -8,6 +8,13 @@ rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# The tool is a library plus a thin binary: every command is a plain function over an
+# options struct, so the tests call them directly rather than shelling out to a binary and
+# parsing its output.
+[lib]
+name = "v2xw_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "v2xw"
 path = "src/main.rs"
@@ -26,3 +33,11 @@ v2xw-threat = { workspace = true }
 v2xw-metrics = { workspace = true }
 v2xw-record = { workspace = true }
 v2xw-server = { workspace = true }
+# The kernel. Not a `workspace = true` entry because `v2xw-engine` is a workspace member
+# that the root manifest's shared dependency table does not list.
+v2xw-engine = { path = "../v2xw-engine", version = "0.1.0" }
+
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

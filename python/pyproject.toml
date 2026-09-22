@@ -1,0 +1,51 @@
+# The `v2xw` Python package.
+#
+# Build:  maturin develop      (an editable install into the current environment)
+#         maturin build -r     (a wheel in ../target/wheels)
+#
+# The native module lives in ../crates/v2xw-py and is built into this package as
+# `v2xw._v2xw`. The Python half in `v2xw/` is what a researcher imports; it is thin on
+# purpose, and everything it does that the Rust side could have done instead is marked
+# with the reason (see v2xw/__init__.py).
+
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "v2xw"
+version = "0.1.0"
+description = "The V2X World Simulator: scenarios, runs, recordings, metrics as Arrow, and Python plug-ins."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "V2X World Simulator contributors" }]
+keywords = ["v2x", "simulation", "scms", "its", "vehicular-networks"]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Topic :: Scientific/Engineering",
+  "License :: OSI Approved :: Apache Software License",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# `pyarrow` is optional by design: every table also crosses as Arrow IPC bytes, which
+# `polars` reads and which a file on disk holds. It is required only for the zero-copy
+# path (`Metrics.arrow`, `Recording.arrow`, the detector plug-in seam).
+arrow = ["pyarrow>=14"]
+dev = ["pyarrow>=14", "pytest>=7"]
+
+[project.urls]
+Repository = "https://github.com/ak3zaidan/SCMS-Simulator"
+
+[tool.maturin]
+manifest-path = "../crates/v2xw-py/Cargo.toml"
+module-name = "v2xw._v2xw"
+python-source = "."
+# Tells pyo3 not to link libpython, which is right for a wheel. It is not a default
+# feature of the crate, because `cargo test -p v2xw-py` needs those symbols.
+features = ["extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

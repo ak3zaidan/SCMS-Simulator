@@ -258,7 +258,12 @@ impl Frame {
                 "FLAG_COMPRESSED is set: the recorder stores uncompressed bodies (§7.1)",
             ));
         }
-        let have = f.bytes.len() - HEADER_BYTES;
+        // `header()` above reads a `u64` at offset 16 and therefore already refuses
+        // anything shorter than the 24-byte header — but this subtraction underflows to a
+        // colossal number if that ever stops being true, and an underflow is the same
+        // defect as an overflow wearing a different sign. `saturating_sub` does not
+        // depend on the ordering of two statements holding for ever.
+        let have = f.bytes.len().saturating_sub(HEADER_BYTES);
         if have != h.body_len as usize {
             return Err(RecordError::malformed(
                 "vwp frame",
@@ -410,6 +415,52 @@ fn need(buf: &[u8], at: usize, n: usize, what: &'static str) -> Result<()> {
 /// [`RecordError::Truncated`] if `buf` has fewer than `n` bytes at `at`.
 pub(crate) fn need_pub(buf: &[u8], at: usize, n: usize, what: &'static str) -> Result<()> {
     need(buf, at, n, what)
+}
+
+/// Checks a row count read off the wire *before* anything reserves memory for it, and
+/// returns it.
+///
+/// # Why a separate check, when every read inside the loop is already bounds-checked
+///
+/// Because the reservation happens first. `let n = get_u32(body, 212)? as usize;` followed
+/// by `Vec::with_capacity(n)` asks the allocator for up to 4.29 billion rows on the word of
+/// the file: a `Hello` whose node count is `u32::MAX` reserves 137 GB before the first
+/// `get_u32` inside the loop ever runs and discovers the body is 800 bytes long. What that
+/// costs depends on the allocator, and neither outcome is acceptable — where the request is
+/// refused, `Vec` aborts, and an abort is not a `RecordError`, so `catch_unwind` cannot trap
+/// it and there is nothing for a caller to handle; where it is granted lazily, as it is on
+/// a 64-bit host that overcommits, a 20-byte frame makes the process touch pages until it
+/// is killed. Either way the file, not the code, decides how much memory a decode takes.
+/// This is the same class of defect [`crate::index`] closed for the chunk reader, in the
+/// frame decoders.
+///
+/// The bound is not a guess. `stride` is the smallest number of bytes one row occupies in
+/// the encoding, so a body of `len` bytes can describe at most `len / stride` rows; any
+/// larger count is describing a body that is not there, whatever offsets it also carries.
+/// That makes the reservation proportional to the input, which is the property that
+/// matters, and it rejects nothing a conforming encoder can produce.
+///
+/// # Errors
+/// [`RecordError::ImplausibleCount`] if `count` rows of `stride` bytes cannot fit in
+/// `buf_len` bytes.
+pub(crate) fn checked_count(
+    count: usize,
+    stride: usize,
+    buf_len: usize,
+    what: &'static str,
+    name: &str,
+) -> Result<usize> {
+    debug_assert!(stride > 0, "a row occupies at least one byte");
+    if count.saturating_mul(stride) > buf_len {
+        return Err(RecordError::implausible_count(
+            what,
+            format!(
+                "{name} declares {count} rows of at least {stride} bytes, which is {} bytes inside a                  {buf_len}-byte body; the count is not describing this body",
+                count.saturating_mul(stride)
+            ),
+        ));
+    }
+    Ok(count)
 }
 
 macro_rules! getter {
@@ -564,6 +615,10 @@ impl StrTable {
         const WHAT: &str = "vwp StrTable";
         let n = get_u32(buf, at, WHAT)? as usize;
         let blob_bytes = get_u32(buf, at + 4, WHAT)? as usize;
+        // Each string costs four bytes of offset table, so `n` cannot exceed a quarter of
+        // the buffer — checked before `with_capacity`, which would otherwise reserve
+        // `8 * (n + 1)` bytes on the file's word alone.
+        let n = checked_count(n, 4, buf.len(), WHAT, "the symbol table")?;
         let mut offsets = Vec::with_capacity(n + 1);
         for i in 0..=n {
             offsets.push(get_u32(buf, at + 8 + 4 * i, WHAT)? as usize);

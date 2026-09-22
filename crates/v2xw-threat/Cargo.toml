@@ -9,5 +9,14 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# The contract crate: SimTime/Duration, typed ids, model cards, the Model base trait,
+# Record/Ctx, the deterministic RNG streams, the pure-Rust transcendentals and the
+# quantiser. This is the crate's ONLY internal dependency, on purpose: the attackers and
+# detectors here consume belief-side inputs defined in `obs`, so nothing in this crate
+# has to name a node-runtime or engine type. See the crate documentation, "The seam".
 v2xw-core = { workspace = true }
-v2xw-node = { workspace = true }
+# Crate error type.
+thiserror = { workspace = true }
+# The recorded records of `records` and the serialised model-card parameter defaults.
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,63 @@
+# 06-node-models.md §7.3.
+id: obu/cohda-mk6c-qualcomm-9150
+kind: obu
+version: 2026-09-18.1
+purpose: >-
+  Commercial C-V2X OBU (Cohda MK6C EVK: Qualcomm 9150 PC5 modem, NXP i.MX 8QXP host, NXP
+  SXF1800 secure element). Qualcomm never released a public 9150 datasheet, so cores,
+  clock and any modem-side verification engine are not published; what makes the profile
+  valuable is the NDSS 2024 software measurements taken on Cohda MK6 hardware.
+sources:
+  - {kind: product-brief, ref: "Cohda MK6C EVK product brief (2024) [R7 §A3; §7.10 #3]", accessed: 2026-09-18}
+  - {kind: press-release, ref: "Qualcomm 9150 C-V2X announcement, 2017-09-01 [R7 §B1]", accessed: 2026-09-18}
+  - {kind: product-page, ref: "NXP SXF1800 product page and block diagram [R7 §D4; §7.10 #13]", accessed: 2026-09-18}
+  - {kind: paper, ref: "Twardokus, Bindel, Rahbari, McCarthy, NDSS 2024 (ePrint 2022/483), Table V, measured on a Cohda MK6 [R7 §E3; R5 §B.6; §7.10 #22]", accessed: 2026-09-18}
+cpu:
+  cores: {value: null, status: not-published, calibration: "the EVK brief names the SoC only; take the core count from the NXP i.MX 8QXP datasheet. Sibling MK6 OBU brief: 'NXP i.MX 8, 8544 DMIPS, operating at 800 MHz' [R7 §A2] is a sibling-product proxy, flag in the manifest"}
+  clock_hz: {value: null, status: not-published, calibration: "as above; sibling proxy 8.0e8 Hz [R7 §A2]"}
+  arch: {value: null, status: not-published, calibration: "not restated in the brief; the NDSS 2024 measurements name the platform 'Qualcomm ARMv8' [R7 §E3]; confirm the i.MX 8QXP core type from the NXP datasheet"}
+  dmips: {value: null, status: not-published, calibration: "sibling MK6 OBU proxy 8544 DMIPS [R7 §A2]; confirm for the 8QXP part"}
+ram_bytes: {value: null, status: not-published, calibration: "not in the EVK brief; sibling MK6 OBU 1 GB SDRAM [R7 §A2] as a flagged proxy"}
+flash_bytes: {value: null, status: not-published, calibration: "not in the EVK brief; sibling MK6 OBU 16 GB eMMC + microSD [R7 §A2] as a flagged proxy"}
+hsm:
+  kind: secure-element
+  part: {value: "NXP SXF1800, FIPS 140-2 Level 3; Arm SC300 core, 2 MB flash, JCOP with a V2X applet (ECDSA sign, ECIES, key management) and a GS applet; SPI host interface up to 5 Mbit/s", source: "[R7 §A3, §D4]"}
+  ops:
+    ecdsa-p256-sign:
+      throughput_per_s: {value: null, status: not-published, calibration: "NXP states only 'signature generation performance exceeding single and dual channel requirements, with low latency' [R7 §D4]; bench on device or request the NXP datasheet under NDA"}
+      latency_us: {value: null, status: not-published, calibration: "NOT PUBLISHED [R7 §D4]; the software fallback on the host, measured at 7.820 ms, is the documented upper bound for the sign path"}
+      runs_on: hsm
+    ecdsa-p256-verify:
+      throughput_per_s: {value: 1000, status: vendor-claim-system-level, source: "NXP marketing copy: 'ultra-fast verification on incoming messages at greater than 1000 messages per second' [R7 §D4] — reads as a system-level claim, not SE-silicon-alone; lower bound only"}
+      latency_us: {value: null, status: not-published, calibration: "NOT PUBLISHED; bench on device with the Cohda SDK security API, timing back-to-back verifications against the vendor-claimed 1000/s"}
+      runs_on: {value: null, status: not-published, calibration: "unknown whether verification runs on the SXF1800, the 9150 modem or the i.MX 8QXP host; the Qualcomm reference design 'includes ... an application processor running the ITS V2X stack, and an HSM' [R7 §B1]; determine from the Cohda SDK security configuration"}
+    ecies-p256-decrypt:
+      throughput_per_s: {value: null, status: not-published, calibration: "ECIES is in the V2X applet [R7 §D4]; no rate published; bench on device"}
+      latency_us: {value: null, status: not-published, calibration: "as the throughput figure above: ECIES is in the V2X applet [R7 §D4] with no rate published; bench on device"}
+      runs_on: hsm
+  queue_depth: {value: null, status: todo-calibrate, calibration: "not published; measure. The SPI host interface is capped at 5 Mbit/s [R7 §D4], which is a hard ceiling on request/response bytes per second and bounds any answer"}
+  servers: {value: null, status: todo-calibrate, calibration: "not published; measure whether the SE serves one request at a time over SPI"}
+software_crypto:
+  ecdsa-p256-sign: {us: 7820, ops_per_s: 128, source: "[R7 §E3: NDSS 2024 Table V, Botan on a Cohda MK6, 1000-execution mean, sigma 141 us, no ARMv8 optimizations]"}
+  ecdsa-p256-verify: {us: null, status: not-published, calibration: "the published 0.001 ms (675219/s) is flagged ANOMALOUS by R7 §E3 and R5 §B.2 ('treat with care'); do not use it as a service time. PROXY = Pi 4 Cortex-A72 OpenSSL 1550.7 verify/s (645 us, derived) [R7 §D8] until measured on device with a cold-cache harness"}
+  falcon-512-sign: {us: 2152, ops_per_s: 465, source: "[R7 §E3: NDSS 2024 Table V, sigma 36 us; the parameter set behind the label 'Falcon' is not restated in the R7/R5 extracts]"}
+  falcon-512-verify: {us: 446, ops_per_s: 2243, source: "[R7 §E3, sigma 23 us]"}
+  ml-dsa-44-sign: {us: 2634, ops_per_s: 380, source: "[R7 §E3, labelled 'Dilithium', sigma 1741 us reflecting rejection sampling]"}
+  ml-dsa-44-verify: {us: 189, ops_per_s: 5299, source: "[R7 §E3, sigma 184 us]"}
+  slh-dsa-sha2-128s-sign: {us: 5485, ops_per_s: 182, source: "[R7 §E3, labelled 'SPHINCS+', sigma 2 us]"}
+  slh-dsa-sha2-128s-verify: {us: 5436, ops_per_s: 184, source: "[R7 §E3, sigma 191 us]"}
+radio:
+  rat: [lte-v2x-pc5]
+  chipset: {value: "Qualcomm 9150 (MDM 9150)", source: "[R7 §A3; R5 §C]"}
+  tx_power_dbm:
+    min: {value: null, status: not-published, calibration: "not stated; the 3GPP UE Tx-power assumption 23 dBm, with 33 dBm not precluded [R11 §A4: TR 37.885 Table 6.1.1-1], is the evaluation default if a range is needed"}
+    max: {value: 21.5, source: "\"C-V2X max TX power Class 3, 21.5 dBm\" [R7 §A3]"}
+    default: {value: 20.0, source: "J2945/1 constant-rate baseline [R7 §H3]"}
+  sensitivity_dbm: {value: -93.4, source: "\"C-V2X RX sensitivity -93.4 dBm\" [R7 §A3]"}
+  noise_figure_db: {value: 9.0, status: evaluation-assumption, source: "NOT PUBLISHED for the 9150; 3GPP TR 36.885 / TR 37.885 UE receiver noise figure 9 dB [R2 Topic A, D.2; R2c]"}
+  antenna:
+    gain_dbi: {value: null, status: not-published, calibration: "not stated; 3GPP evaluation assumption 3 dBi for a vehicle UE [R2c] is the fallback; measure the fitted antenna"}
+    height_m: {value: 1.5, status: evaluation-assumption, source: "3GPP TR 36.885 Annex A.1.1 [R2 Topic A; R2c]"}
+    pattern: {value: omni, source: "[R2c]"}
+power_w: {value: null, status: not-published, calibration: "not stated; supply 6-24 V [R7 §A3]; the sibling MK6 OBU backup draw '<1 mA @ 12 V' [R7 §A2] is standby only; measure"}
+storage_model: inherit

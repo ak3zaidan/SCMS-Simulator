@@ -80,14 +80,27 @@ fn spec_frames() -> Vec<Vec<u8>> {
     out
 }
 
-/// The three frames of §9, each as header bytes followed by body bytes.
-fn spec_example() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+/// Every §9 frame, as header bytes followed by body bytes, in document order.
+///
+/// §9 grows: it printed three frames when this file was written and now prints four,
+/// because D12.3 owed a vector for the vertical unit (§9.4). The floor is what this
+/// asserts, not the exact number — a hard `== 6` here turned a *new* test vector in the
+/// specification into seven red tests in this crate, which is the assertion punishing the
+/// document for improving. What must not be allowed to drift is the pairing, so the count
+/// is still required to be even and non-empty.
+fn spec_blocks() -> Vec<Vec<u8>> {
     let blocks = spec_frames();
-    assert_eq!(
-        blocks.len(),
-        6,
-        "§9 prints three frames as a header block and a body block each"
+    assert!(
+        blocks.len() >= 6 && blocks.len() % 2 == 0,
+        "§9 prints each frame as a header block and a body block, and at least three frames;                  found {} blocks",
+        blocks.len()
     );
+    blocks
+}
+
+/// The first three frames of §9 — the `Hello`, `Keyframe` and `Delta` of §9.1–§9.3.
+fn spec_example() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let blocks = spec_blocks();
     let join = |a: &[u8], b: &[u8]| {
         let mut v = a.to_vec();
         v.extend_from_slice(b);
@@ -520,4 +533,68 @@ fn an_unknown_message_type_is_recognised_as_unknown_rather_than_an_error() {
     assert_eq!(header.msg_type, 0x0077);
     assert!(header.kind().is_none(), "this build does not know 0x0077");
     assert!(MsgType::from_id(0x0002) == Some(MsgType::Keyframe));
+}
+
+/// The §9.4 frame: the fourth pair of blocks, header followed by body.
+fn spec_vertical_delta() -> Vec<u8> {
+    let blocks = spec_blocks();
+    assert!(
+        blocks.len() >= 8,
+        "§9.4 prints a Delta with a non-zero vertical delta; it is missing from the specification"
+    );
+    let mut v = blocks[6].clone();
+    v.extend_from_slice(&blocks[7]);
+    v
+}
+
+#[test]
+fn the_vertical_delta_of_section_9_4_decodes_in_millimetres() {
+    // §9.4 exists to pin one unit, and says why: "§3.2 defines the delta on all three axes
+    // as i16 millimetres … but the absolute vertical field is centimetres everywhere it
+    // appears, so 'the same field' names a field in a different unit from the delta … A
+    // decoder that reads dz_mm as centimetres produces z = 1.150 m for slot 0 below instead
+    // of 0.250 m and fails on the first row." Every other vector in §9 carries dz_mm = 0,
+    // so this is the only one that can catch the tenfold error.
+    let frame = Frame::from_bytes(spec_vertical_delta()).expect("§9.4 is a valid frame");
+    let h = frame.header().expect("a header");
+    assert_eq!(h.kind(), Some(MsgType::Delta));
+    assert_eq!(h.seq, 12, "§9.4: the next canonical frame after §9.3");
+    assert_eq!(frame.as_bytes().len(), 128, "§9.4: 24 header + 104 body");
+
+    let d = DeltaBody::decode(frame.body()).expect("the Delta decodes");
+    assert_eq!(d.sim_time_ns, 1_200_000_000);
+    assert_eq!((d.gop_index, d.step_index), (1, 2));
+    assert_eq!(
+        d.moved.iter().map(|r| r.dz_mm).collect::<Vec<_>>(),
+        vec![100, -50],
+        "§9.4: +0.100 m and -0.050 m, in MILLIMETRES"
+    );
+    assert_eq!(
+        d.moved.iter().map(|r| r.dx_mm).collect::<Vec<_>>(),
+        vec![1389, -1100],
+        "a non-zero dx alongside, so the shared unit of the three axes is visible in one row"
+    );
+    assert!(d.abs.is_empty(), "§9.4: abs_count = 0, no escape");
+
+    // And the consequence the section tabulates: both slots entered the GOP at z_cm = 15,
+    // and the reference is that value expressed in millimetres.
+    for (row, want_z_mm, want_z_cm) in [(0usize, 250i64, 25i16), (1, 100, 10)] {
+        let reference = quant::PoseRef::from_keyframe(0, 0, 15);
+        assert_eq!(reference.z_mm, 150, "z_cm x 10, not z_cm");
+        let after = reference.z_mm + i64::from(d.moved[row].dz_mm);
+        assert_eq!(after, want_z_mm, "§9.4's table, slot {row}");
+        assert_eq!(
+            (after / 10) as i16,
+            want_z_cm,
+            "§9.4: the mirrored z_cm, slot {row}"
+        );
+        // The error the vector exists to catch, stated so it cannot be read as arithmetic
+        // that happens to agree: reading dz_mm as centimetres is wrong by ten.
+        let as_if_centimetres = 15i64 + i64::from(d.moved[row].dz_mm);
+        assert_ne!(
+            as_if_centimetres * 10,
+            want_z_mm,
+            "slot {row}: a centimetre reading must not coincide with the right answer, or this                  vector would prove nothing"
+        );
+    }
 }

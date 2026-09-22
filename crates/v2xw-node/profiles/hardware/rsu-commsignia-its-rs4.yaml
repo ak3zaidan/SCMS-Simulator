@@ -1,0 +1,53 @@
+# 06-node-models.md §7.6, first RSU profile.
+id: rsu/commsignia-its-rs4
+kind: rsu
+version: 2026-09-18.1
+purpose: >-
+  Roadside unit (Commsignia ITS-RS4), the most complete public RSU datasheet in the
+  hardware sheet. Two figures are carried as the sheet carries them rather than
+  reconciled: the brief's '<50 usec signing delay' is almost certainly an OCR error for
+  the corroborated cross-vendor SLI97 figure of <50 ms, and the radio block is
+  variant-dependent because the board takes interchangeable radios.
+sources:
+  - {kind: product-brief, ref: "Commsignia ITS-RS4 Product Brief v0.9.3 (2020-04-22) [R7 §C2; §7.10 #10]", accessed: 2026-09-18}
+  - {kind: press-release, ref: "Autotalks/Infineon SLI 97 announcement (signing-latency performance profile) [R7 §D2]", accessed: 2026-09-18}
+  - {kind: deployment-facts, ref: "USDOT CV Pilot deployment facts [R7 §C7]", accessed: 2026-09-18}
+cpu:
+  cores: {value: 4, source: "\"NXP i.MX 6, quad-core, 792 MHz\" [R7 §C2]"}
+  clock_hz: {value: 7.92e8, source: "[R7 §C2]"}
+  arch: {value: null, status: not-published, calibration: "the brief names the i.MX 6 only; confirm the core type from the NXP i.MX 6 Quad datasheet"}
+  dmips: {value: null, status: not-published, calibration: "not stated; derive from the NXP datasheet or measure with dhrystone on the device"}
+ram_bytes: {value: 2147483648, source: "2 GB DDR3 SDRAM [R7 §C2]"}
+flash_bytes: {value: 4294967296, source: "4 GB eMMC, plus dual micro-SD [R7 §C2]"}
+hsm:
+  kind: secure-element
+  part: {value: "Infineon SLI97 (32-bit security controller, CC EAL5+ platform); secure flash up to 1 MB 'SOLID FLASH', EAL6+", source: "[R7 §C2, §D2]"}
+  ops:
+    ecdsa-p256-verify:
+      throughput_per_s: {value: 2000, status: lower-bound, source: "brief: '>2000 verifications' — per second is implied by context, not stated numerically in that phrase [R7 §C2]; NIST and Brainpool. R7 §D2 notes that line-rate verification on SLI97-based designs is done by the companion V2X communication processor, not the SLI97 itself"}
+      latency_us: {value: null, status: not-published, calibration: "NOT PUBLISHED; bench on device, timing back-to-back verifications against the brief's >2000/s claim"}
+      runs_on: accelerator
+    ecdsa-p256-sign:
+      throughput_per_s: {value: null, status: not-published, calibration: "not stated; bench on device"}
+      latency_us: {value: 50000, status: unverified, source: "the RS4 brief text as extracted reads '<50 usec signing delay' — UNVERIFIED, likely an OCR error [R7 §C2]; the corroborated cross-vendor figure for the SLI97/SLE97 family is '<50 ms' ECDSA-256 signing latency [R7 §C2 discrepancy note, §D2]. Modelled as 50000 us (the upper bound) until measured; flagged"}
+      runs_on: hsm
+  queue_depth: {value: null, status: todo-calibrate, calibration: "not published; measure with back-to-back sign requests"}
+  servers: {value: null, status: todo-calibrate, calibration: "not published; the brief does not say whether the SLI97 and the radio-variant verification engine serve concurrently. Measure"}
+software_crypto:
+  ecdsa-p256-verify: {us: null, status: not-published, calibration: "no benchmark on an i.MX 6 quad exists in R7/R5; PROXY = Pi 3B Cortex-A53 @ 1.2 GHz 1290 us [R7 §D8], flagged; run openssl speed on the device"}
+  ecdsa-p256-sign: {us: null, status: not-published, calibration: "PROXY = Pi 3B 613 us [R7 §D8], flagged; run openssl speed on the device"}
+radio:
+  rat: [dsrc-80211p, lte-v2x-pc5]
+  chipset: {value: null, status: not-published, calibration: "interchangeable radio variants on one board: Autotalks Secton, NXP TEF5100+SAF5100, Marvell 88W8987PA or Qualcomm 9150 [R7 §C2]. Name the fitted variant in the scenario and take its radio block from obu/unex-obu-301-craton2, obu/cohda-mk5 or obu/cohda-mk6c-qualcomm-9150 respectively"}
+  tx_power_dbm:
+    min: {value: null, status: not-published, calibration: "radio-variant dependent [R7 §C2]; inherit from the fitted variant's profile"}
+    max: {value: null, status: not-published, calibration: "radio-variant dependent [R7 §C2]; inherit from the fitted variant's profile"}
+    default: {value: null, status: not-published, calibration: "radio-variant dependent [R7 §C2]; inherit from the fitted variant's profile"}
+  sensitivity_dbm: {value: null, status: not-published, calibration: "radio-variant dependent [R7 §C2]; inherit from the fitted variant's profile"}
+  noise_figure_db: {value: null, status: not-published, calibration: "radio-variant dependent; the NXP variant's chip-level figure is 6 dB [R7 §D5]"}
+  antenna:
+    gain_dbi: {value: null, status: not-published, calibration: "not stated; the antenna is site-specific. 3GPP UE-type RSU assumption 3 dBi [R2c] is the fallback; take the fitted antenna's datasheet"}
+    height_m: {value: 5.0, status: evaluation-assumption, source: "the USDOT pilot sources reviewed give RSU counts and backhaul, not mounting heights [R7 §C7]; fallback = 3GPP TR 36.885 Annex A.1.1 UE-type RSU antenna height 5 m [R2 Topic A]. Set per site from the survey or FHWA RSU spec v4.1"}
+    pattern: {value: null, status: not-published, calibration: "site-specific; take from the fitted antenna's datasheet"}
+power_w: {value: null, status: not-published, calibration: "8-32 V DC or PoE [R7 §C2]; draw not stated. Kapsch RIS-9260 '<25 W PoE 802.3at' [R7 §C3] and the Yunex RSU '12 W max' [R7 §C5] bracket the class; measure"}
+storage_model: inherit

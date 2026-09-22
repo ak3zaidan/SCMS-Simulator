@@ -2424,6 +2424,388 @@ fn asking_for_an_unimplemented_simplification_records_that_it_did_not_run() {
 }
 
 // ---------------------------------------------------------------------------
+// Which outline a `building:part` is folded into
+// ---------------------------------------------------------------------------
+
+/// The height of the tallest building of a given name, or 0 if there is none.
+fn height_of(world: &World, name: &str) -> f64 {
+    world
+        .buildings
+        .iter()
+        .filter(|b| b.name.map(|n| world.symbols.resolve(n)) == Some(name))
+        .map(|b| b.height_m)
+        .fold(0.0f64, f64::max)
+}
+
+/// Two footprints drawn from different surveys overlap in a sliver, and a tall part sits
+/// in the sliver — so it is wholly inside *both*, and neither outline is inside the
+/// other. This is Rose Hill (905 m², 195 m) against the 156 m² building beside it: part
+/// 1473999184 is 24 m² of Rose Hill starting 60 m up, drawn on the neighbour's own nodes,
+/// and the importer stood a 155 m prism on the neighbour's 156 m² footprint.
+///
+/// Overlap area alone cannot separate them — the part is 1.0000 inside each — and neither
+/// can nesting. What can is that one of the two is mapped part by part and the other is a
+/// plain footprint with a height on it: a structure that is not subdivided has no
+/// subdivisions.
+#[test]
+fn a_part_in_the_sliver_two_footprints_share_belongs_to_the_subdivided_one() {
+    let body = [
+        // The west building, 66 m by 44 m, with a plain tagged height and no parts.
+        node(1, 0.0, 0.0),
+        node(2, 0.0, 0.0006),
+        node(3, 0.0004, 0.0006),
+        node(4, 0.0004, 0.0),
+        // The east tower, overlapping it by a 22 m strip, stating no height of its own
+        // because its parts carry them.
+        node(5, 0.0, 0.0004),
+        node(6, 0.0, 0.0012),
+        node(7, 0.0004, 0.0012),
+        node(8, 0.0004, 0.0004),
+        // The tower's other part, which only the tower claims.
+        node(9, 0.0001, 0.0008),
+        node(10, 0.0001, 0.0011),
+        node(11, 0.0003, 0.0011),
+        node(12, 0.0003, 0.0008),
+        way(
+            100,
+            &[1, 2, 3, 4, 1],
+            &[
+                ("building", "yes"),
+                ("height", "25"),
+                ("name", "West Annex"),
+            ],
+        ),
+        way(
+            200,
+            &[5, 6, 7, 8, 5],
+            &[("building", "apartments"), ("name", "East Tower")],
+        ),
+        // The overhang: exactly the strip the two outlines share, starting 60 m up.
+        way(
+            300,
+            &[5, 2, 3, 8, 5],
+            &[
+                ("building:part", "yes"),
+                ("height", "150"),
+                ("min_height", "60"),
+            ],
+        ),
+        way(
+            400,
+            &[9, 10, 11, 12, 9],
+            &[("building:part", "yes"), ("height", "80")],
+        ),
+    ]
+    .concat();
+    let (world, report) = import(&document(&body));
+    assert_eq!(report.counts.building_parts_merged, 2);
+    assert_eq!(report.counts.building_parts_orphan, 0);
+    // The tower is as tall as its tallest part; the annex is left at its own 25 m. The
+    // west annex is the *lower* candidate index — it is the lower way id — so a rule that
+    // broke the tie on id, or on the smaller footprint, would put the 150 m here.
+    assert!(
+        (height_of(&world, "East Tower") - 150.0).abs() < 1e-9,
+        "East Tower is {} m",
+        height_of(&world, "East Tower")
+    );
+    assert!(
+        (height_of(&world, "West Annex") - 25.0).abs() < 1e-9,
+        "West Annex is {} m",
+        height_of(&world, "West Annex")
+    );
+}
+
+/// A building outline drawn wholly inside another — a structure on a campus, a tower in a
+/// podium — takes the parts that are inside them both. This is the United Nations
+/// Secretariat Building (1 920 m²) inside the United Nations Headquarters outline
+/// (16 441 m², the whole campus): the Secretariat's two parts are 1.0000 inside each, and
+/// giving them to the campus stands a 156 m prism on 16 441 m² of lawn and river frontage.
+///
+/// Nesting decides this one and nothing else does. Area would take the campus. So would
+/// "the subdivided one", because the campus has parts of its own that the Secretariat does
+/// not claim — which is why nesting is asked first.
+#[test]
+fn a_part_inside_two_nested_outlines_belongs_to_the_inner_one() {
+    let body = [
+        // The campus, 222 m square.
+        node(1, 0.0, 0.0),
+        node(2, 0.0, 0.002),
+        node(3, 0.002, 0.002),
+        node(4, 0.002, 0.0),
+        // The tower on it, wholly inside the campus outline.
+        node(5, 0.0005, 0.0005),
+        node(6, 0.0005, 0.001),
+        node(7, 0.001, 0.001),
+        node(8, 0.001, 0.0005),
+        // The tower's part, wholly inside the tower and so wholly inside the campus.
+        node(9, 0.00052, 0.00052),
+        node(10, 0.00052, 0.00098),
+        node(11, 0.00098, 0.00098),
+        node(12, 0.00098, 0.00052),
+        // A part of the campus that stands somewhere else on it.
+        node(13, 0.0014, 0.0014),
+        node(14, 0.0014, 0.0018),
+        node(15, 0.0018, 0.0018),
+        node(16, 0.0018, 0.0014),
+        way(
+            100,
+            &[1, 2, 3, 4, 1],
+            &[("building", "public"), ("name", "Campus")],
+        ),
+        way(
+            200,
+            &[5, 6, 7, 8, 5],
+            &[("building", "office"), ("name", "Secretariat")],
+        ),
+        way(
+            300,
+            &[9, 10, 11, 12, 9],
+            &[("building:part", "yes"), ("height", "150")],
+        ),
+        way(
+            400,
+            &[13, 14, 15, 16, 13],
+            &[("building:part", "yes"), ("height", "30")],
+        ),
+    ]
+    .concat();
+    let (world, report) = import(&document(&body));
+    assert_eq!(report.counts.building_parts_merged, 2);
+    assert!(
+        (height_of(&world, "Secretariat") - 150.0).abs() < 1e-9,
+        "Secretariat is {} m",
+        height_of(&world, "Secretariat")
+    );
+    // The campus keeps the height of the part that is only its own, and is not raised to
+    // the height of the building standing on it.
+    assert!(
+        (height_of(&world, "Campus") - 30.0).abs() < 1e-9,
+        "Campus is {} m",
+        height_of(&world, "Campus")
+    );
+}
+
+/// A part that hangs over the edge of an outline is not a subdivision of it, however
+/// deeply that outline is nested in the one that does contain the part. This is the
+/// Helmsley Building (6 114 m²) against the market hall in its concourse (1 580 m²,
+/// 99.1% inside the Helmsley): part 291189626 is 1.0000 inside the Helmsley and 0.9553
+/// inside the market hall, and it belongs to the Helmsley.
+#[test]
+fn a_part_that_overhangs_the_inner_outline_belongs_to_the_outer_one() {
+    let body = [
+        // The tower, 111 m square.
+        node(1, 0.0, 0.0),
+        node(2, 0.0, 0.001),
+        node(3, 0.001, 0.001),
+        node(4, 0.001, 0.0),
+        // The hall inside it.
+        node(5, 0.0002, 0.0002),
+        node(6, 0.0002, 0.0008),
+        node(7, 0.0008, 0.0008),
+        node(8, 0.0008, 0.0002),
+        // The part: wholly inside the tower, but 22 m of it hangs over each end of the
+        // hall, so only three quarters of it is the hall's.
+        node(9, 0.0003, 0.0001),
+        node(10, 0.0003, 0.0009),
+        node(11, 0.0007, 0.0009),
+        node(12, 0.0007, 0.0001),
+        way(
+            100,
+            &[1, 2, 3, 4, 1],
+            &[
+                ("building", "office"),
+                ("height", "30"),
+                ("name", "Terminal Tower"),
+            ],
+        ),
+        way(
+            200,
+            &[5, 6, 7, 8, 5],
+            &[
+                ("building", "retail"),
+                ("height", "12"),
+                ("name", "Market Hall"),
+            ],
+        ),
+        way(
+            300,
+            &[9, 10, 11, 12, 9],
+            &[("building:part", "yes"), ("height", "100")],
+        ),
+    ]
+    .concat();
+    let (world, report) = import(&document(&body));
+    assert_eq!(report.counts.building_parts_merged, 1);
+    assert!(
+        (height_of(&world, "Terminal Tower") - 100.0).abs() < 1e-9,
+        "Terminal Tower is {} m",
+        height_of(&world, "Terminal Tower")
+    );
+    assert!(
+        (height_of(&world, "Market Hall") - 12.0).abs() < 1e-9,
+        "Market Hall is {} m",
+        height_of(&world, "Market Hall")
+    );
+}
+
+/// A part shaped like a C has a vertex mean in its own notch, which is not in the part at
+/// all. The rule this replaces tested that one point, so whatever stood in the notch
+/// inherited the part's height: parts 292032000, 292032001 and 292032005 were folded into
+/// outlines they do not touch. Overlap area cannot make that mistake — the kiosk in the
+/// notch shares nothing with the part.
+#[test]
+fn a_part_is_not_folded_into_whatever_stands_in_its_notch() {
+    let body = [
+        // The C, opening east, 66 m across.
+        node(1, 0.0, 0.0),
+        node(2, 0.0, 0.0006),
+        node(3, 0.0002, 0.0006),
+        node(4, 0.0002, 0.0002),
+        node(5, 0.0004, 0.0002),
+        node(6, 0.0004, 0.0006),
+        node(7, 0.0006, 0.0006),
+        node(8, 0.0006, 0.0),
+        // The kiosk in the notch, which holds the C's vertex mean at 0.00035 E,
+        // 0.0003 N.
+        node(9, 0.00025, 0.0003),
+        node(10, 0.00025, 0.0005),
+        node(11, 0.00035, 0.0005),
+        node(12, 0.00035, 0.0003),
+        way(
+            100,
+            &[1, 2, 3, 4, 5, 6, 7, 8, 1],
+            &[
+                ("building", "apartments"),
+                ("height", "15"),
+                ("name", "Courtyard Block"),
+            ],
+        ),
+        way(
+            200,
+            &[9, 10, 11, 12, 9],
+            &[
+                ("building", "kiosk"),
+                ("height", "8"),
+                ("name", "Notch Kiosk"),
+            ],
+        ),
+        // The part is the block's own outer ring, which is how Simple 3D Buildings is
+        // usually drawn: the part borrows the outline's nodes.
+        way(
+            300,
+            &[1, 2, 3, 4, 5, 6, 7, 8, 1],
+            &[("building:part", "yes"), ("height", "90")],
+        ),
+    ]
+    .concat();
+    let (world, report) = import(&document(&body));
+    assert_eq!(report.counts.building_parts_merged, 1);
+    assert!(
+        (height_of(&world, "Courtyard Block") - 90.0).abs() < 1e-9,
+        "Courtyard Block is {} m",
+        height_of(&world, "Courtyard Block")
+    );
+    assert!(
+        (height_of(&world, "Notch Kiosk") - 8.0).abs() < 1e-9,
+        "Notch Kiosk is {} m",
+        height_of(&world, "Notch Kiosk")
+    );
+}
+
+/// A part that merely grazes an outline it does not belong to — two footprints drawn from
+/// different surveys overlap by a metre along a shared wall — is not that outline's, and
+/// lending it the part's height is the same defect as folding it in outright. A part that
+/// no outline covers is kept as a building of its own, which is what
+/// [`Anomaly::BuildingPartWithoutOutline`] counts.
+///
+/// Nothing on the Phase 1 extract exercises the floor this asserts: every part there is
+/// either 0.934 or more covered by its outline or touches no outline at all. So the floor
+/// is only ever as good as this fixture.
+#[test]
+fn a_part_that_only_grazes_an_outline_is_kept_as_its_own_building() {
+    let body = [
+        // The neighbour, 44 m square.
+        node(1, 0.0, 0.0),
+        node(2, 0.0, 0.0004),
+        node(3, 0.0004, 0.0004),
+        node(4, 0.0004, 0.0),
+        // The part: 66 m of it lies east of the neighbour and 11 m of it laps over the
+        // shared wall, so a sixth of it is inside.
+        node(5, 0.0001, 0.0003),
+        node(6, 0.0001, 0.0009),
+        node(7, 0.0003, 0.0009),
+        node(8, 0.0003, 0.0003),
+        way(
+            100,
+            &[1, 2, 3, 4, 1],
+            &[("building", "yes"), ("height", "20"), ("name", "Neighbour")],
+        ),
+        way(
+            200,
+            &[5, 6, 7, 8, 5],
+            &[("building:part", "yes"), ("height", "70")],
+        ),
+    ]
+    .concat();
+    let (world, report) = import(&document(&body));
+    assert_eq!(report.counts.building_parts_merged, 0);
+    assert_eq!(report.counts.building_parts_orphan, 1);
+    assert_eq!(world.buildings.len(), 2);
+    assert!(
+        (height_of(&world, "Neighbour") - 20.0).abs() < 1e-9,
+        "Neighbour is {} m",
+        height_of(&world, "Neighbour")
+    );
+}
+
+/// Two outlines drawn on the same ground — a duplicate import, which Manhattan does not
+/// have but some extracts do — are each nested in the other, so nesting cannot order them
+/// and neither is subdivided. The part goes to the lower OSM id, which is the lower
+/// candidate index, so the answer is the geometry and the ids and never the order a grid
+/// bucket happened to list them in (crate rule 2).
+#[test]
+fn coincident_outlines_give_the_part_to_the_lower_osm_id() {
+    let body = [
+        node(1, 0.0, 0.0),
+        node(2, 0.0, 0.0004),
+        node(3, 0.0004, 0.0004),
+        node(4, 0.0004, 0.0),
+        node(5, 0.0001, 0.0001),
+        node(6, 0.0001, 0.0003),
+        node(7, 0.0003, 0.0003),
+        node(8, 0.0003, 0.0001),
+        way(
+            100,
+            &[1, 2, 3, 4, 1],
+            &[("building", "yes"), ("name", "First Survey")],
+        ),
+        way(
+            200,
+            &[1, 2, 3, 4, 1],
+            &[("building", "yes"), ("name", "Second Survey")],
+        ),
+        way(
+            300,
+            &[5, 6, 7, 8, 5],
+            &[("building:part", "yes"), ("height", "100")],
+        ),
+    ]
+    .concat();
+    let (world, report) = import(&document(&body));
+    assert_eq!(report.counts.building_parts_merged, 1);
+    assert!(
+        (height_of(&world, "First Survey") - 100.0).abs() < 1e-9,
+        "First Survey is {} m",
+        height_of(&world, "First Survey")
+    );
+    assert!(
+        height_of(&world, "Second Survey") < 100.0,
+        "Second Survey is {} m",
+        height_of(&world, "Second Survey")
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The real city (D7)
 // ---------------------------------------------------------------------------
 
@@ -2830,4 +3212,89 @@ fn manhattan_with_the_phase_1_box_is_bounded_and_reproducible() {
     for lane in world.roads.lanes() {
         assert!(!self_intersects(&lane.centreline), "lane {}", lane.id);
     }
+}
+
+/// D7 on the real extract: no structure wears its neighbour's height.
+///
+/// Four parts were folded into the wrong footprint by the rule this replaces, and the
+/// visible damage was a set of phantom towers — a 155 m prism on a 156 m² footprint whose
+/// own building is three storeys, a 153.9 m prism on a 603 m² roof. Both are gone, and
+/// their real structures were already as tall as they should be, so the city barely
+/// moves: 0.18147 km³ of prism becomes 0.18112, a fifth of one per cent.
+#[test]
+#[ignore = "needs worlds/cache/manhattan.osm.xml, which is gitignored and 30 MB"]
+fn no_part_is_folded_onto_a_neighbouring_footprint() {
+    let (world, report) = import_osm(MANHATTAN, &opts()).expect("Manhattan imports");
+    let area = |b: &v2xw_world::Building| v2xw_world::ring_signed_area_2x(&b.footprint).abs() * 0.5;
+
+    // The named cases. Each structure keeps the height its own parts give it, and each
+    // neighbour keeps its own.
+    for (name, expected) in [
+        // Part 1473999184 (24 m², 155 m, 60 m up) is Rose Hill's, not the 156 m²
+        // building's; Rose Hill's own tag already states 195 m.
+        ("Rose Hill", 195.0),
+        // Part 283472143 (25 m², 147 m) is 785 Eighth Avenue's, not the three-storey
+        // neighbour's; its own parts already reach 172.5 m.
+        ("785 Eighth Avenue", 172.5),
+        // Part 261243304 (14 m², 153.9 m) is One United Nations Plaza's, not the roof
+        // next door's.
+        ("One United Nations Plaza", 153.9),
+        // And the case that nesting decides: the Secretariat's parts stay the
+        // Secretariat's rather than becoming the campus's.
+        ("United Nations Secretariat Building", 156.3),
+        ("United Nations Headquarters", 25.0),
+        // Parts 288306218, 288306219 and 288306222 belong to the church they stand on,
+        // not to the 28 m² outline beside them.
+        ("Marble Collegiate Church", 41.0),
+    ] {
+        let got = height_of(&world, name);
+        println!("{name}: {got:.1} m");
+        assert!(
+            (got - expected).abs() < 0.05,
+            "{name} is {got} m, expected {expected} m"
+        );
+    }
+
+    // The invariant behind all of them: a 150 m structure needs a footprint to stand on.
+    // Before the fix two buildings broke this — the 156 m² one at 155 m and, just over
+    // the line at 603 m², the roof at 153.9 m.
+    let name_of = |b: &v2xw_world::Building| b.name.map(|n| world.symbols.resolve(n));
+    let phantoms: Vec<(f64, f64, Option<&str>)> = world
+        .buildings
+        .iter()
+        .filter(|b| b.height_m > 150.0 && area(b) < 300.0)
+        .map(|b| (b.height_m, area(b), name_of(b)))
+        .collect();
+    println!("over 150 m on less than 300 m²: {phantoms:?}");
+    assert_eq!(
+        phantoms.len(),
+        1,
+        "only 262 Fifth Avenue is that slender: {phantoms:?}"
+    );
+    assert_eq!(phantoms[0].2, Some("262 Fifth Avenue"));
+
+    // And the city as a whole is where it was. 147 buildings of 150 m or more becomes
+    // 145: the two the fold had invented.
+    let volume: f64 = world.buildings.iter().map(|b| area(b) * b.height_m).sum();
+    let tall = world
+        .buildings
+        .iter()
+        .filter(|b| b.height_m >= 150.0)
+        .count();
+    println!(
+        "built volume {:.5} km³ over {} buildings, {tall} of them 150 m or taller",
+        volume / 1e9,
+        world.buildings.len()
+    );
+    assert_eq!(tall, 145, "buildings 150 m or taller");
+    assert!(
+        (volume - 0.18112e9).abs() < 0.001e9,
+        "built volume {volume} m³"
+    );
+
+    // Nine parts are claimed by more than one outline and 4 364 by exactly one; nothing
+    // in the extract leaves a part claimed by none but the nine that touch no outline at
+    // all, and those are kept as buildings rather than dropped.
+    assert_eq!(report.counts.building_parts_orphan, 9);
+    assert_eq!(report.counts.building_parts_merged, 4364);
 }

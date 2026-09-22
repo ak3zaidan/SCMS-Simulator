@@ -1,0 +1,64 @@
+# 06-node-models.md §7.7, first backend profile: the host-CPU bound.
+id: backend/cloud-vm-x86
+kind: backend-server
+version: 2026-09-18.1
+purpose: >-
+  Cloud VM class with software crypto only — the host-CPU bound for an SCMS or ETSI
+  backend entity. Appliance-level RA/PCA/MA transaction rates are not published anywhere
+  in the hardware sheet, so 06-node-models §4's service model composes them from these
+  per-operation costs plus a fixed overhead that is itself uncalibrated.
+sources:
+  - {kind: book, ref: "Ristic, OpenSSL Cookbook, 'Performance' chapter [R7 §F1; §7.10 #26]", accessed: 2026-09-18}
+  - {kind: benchmark, ref: "wolfSSL vs mbedTLS benchmark, June 2026, Intel i9-11950H rows [R5 §B.5; §7.10 #18]", accessed: 2026-09-17}
+  - {kind: spec, ref: "Dilithium round-3 specification Table 1 (Skylake) [R5 §B.1; §7.10 #29]", accessed: 2026-09-17}
+  - {kind: paper, ref: "Pornin, ePrint 2019/893 §5.2 (Falcon on Skylake); falcon-sign.info [R5 §B.1; §7.10 #30, #31]", accessed: 2026-09-17}
+  - {kind: spec, ref: "CAMP SCMS PoC EE Requirements, Release 1.1, 2016-05-04, Crypto Basics p. 75 [R7 §F4; §7.10 #35]", accessed: 2026-09-17}
+cpu:
+  cores: {value: null, status: todo-calibrate, calibration: "this is the M/M/c 'c' of 06-node-models §4 and no source picks a VM size; the scenario sets it and the manifest records it"}
+  clock_hz: {value: null, status: not-published, calibration: "the OpenSSL Cookbook excerpt does not state the CPU [R7 §F1]; record the VM's CPU model in the manifest and re-run openssl speed on it"}
+  arch: {value: x86-64, source: "[R7 §F1]"}
+  dmips: {value: null, status: not-published, calibration: "not used for backend nodes; scale application-task costs by the measured openssl ratio"}
+ram_bytes: {value: null, status: todo-calibrate, calibration: "a scenario parameter; the storage counters of 06-node-models §4 (issued certificates, stored request hashes, reports, CRL entries) drive the requirement"}
+flash_bytes: {value: null, status: todo-calibrate, calibration: "a scenario parameter, as ram_bytes; the storage counters of 06-node-models §4 drive the requirement"}
+hsm:
+  kind: none
+  part: {value: null, status: not-applicable, calibration: "host-only variant by construction; compose with backend/hsm-appliance-luna7 for the HSM-bound service model"}
+  ops: {}
+  queue_depth: {value: null, status: not-applicable, calibration: "rule H2: no HSM queue exists on this profile"}
+  servers: {value: null, status: not-applicable, calibration: "rule H2: no HSM server exists on this profile"}
+software_crypto:
+  ecdsa-p256-sign: {us: 48.8, ops_per_s: 20508.1, source: "openssl speed ecdsap256, CPU not stated [R7 §F1: OpenSSL Cookbook]"}
+  ecdsa-p256-verify: {us: 152, ops_per_s: 6566.2, source: "[R7 §F1]"}
+  falcon-512-sign: {us: 168, ops_per_s: 5948.1, source: "Intel Core i5-8259U @ 2.3 GHz, TurboBoost off [R5 §B.1: falcon-sign.info]"}
+  falcon-512-verify: {us: 35.8, ops_per_s: 27933.0, source: "[R5 §B.1: falcon-sign.info]"}
+  falcon-1024-sign: {us: 343, ops_per_s: 2913.0, source: "[R5 §B.1]"}
+  falcon-1024-verify: {us: 73.3, ops_per_s: 13650.0, source: "[R5 §B.1]"}
+  ml-dsa-44-verify: {us: null, status: not-published, calibration: "the Dilithium round-3 spec gives 118412 Skylake AVX2 cycles for dilithium2 verify [R5 §B.1] but not the clock the cycles were taken at, and round-3 sizes differ slightly from FIPS 204 ML-DSA. Record the VM's CPU model and re-measure with liboqs speed_sig; until then use the cycle count with an explicit clock assumption and flag it as derived"}
+  ml-dsa-65-verify: {us: null, status: not-published, calibration: "as ml-dsa-44-verify; the spec's dilithium3 figure is 179424 Skylake AVX2 cycles [R5 §B.1]"}
+software_crypto_classes:
+  i9-11950h:
+    ecdsa-p256-verify-wolfssl-5.9.1: {us: 16.3, ops_per_s: 61357, source: "[R5 §B.5: wolfSSL benchmark June 2026]"}
+    ecdsa-p256-sign-wolfssl-5.9.1: {us: 15.6, ops_per_s: 64194, source: "[R5 §B.5]"}
+    ecdsa-p256-verify-mbedtls-3.6.6: {us: 804, ops_per_s: 1244, source: "[R5 §B.5]"}
+    ecdsa-p256-sign-mbedtls-3.6.6: {us: 237, ops_per_s: 4227, source: "[R5 §B.5]"}
+  camp-2016-baseline:
+    ecdsa-p256-sign: {us: 667, ops_per_s: 1500, source: "'about 1500 signatures per second on a 2 GHz processor' [R5 §B.5: CAMP EE Requirements p. 75]"}
+    ecdsa-p256-verify: {us: 3333, ops_per_s: 300, source: "'can verify only about 300 signatures per second' [R5 §B.5]; the verify-slower-than-sign asymmetry is era-specific and is reported as published [R7 §F4]"}
+  community-i7-unverified:
+    ecdsa-p256-sign: {us: 22.2, ops_per_s: 45069.6, status: unverified, source: "WebSearch snippet, provenance not re-fetched [R7 §F1]"}
+    ecdsa-p256-verify: {us: 70.6, ops_per_s: 14166.6, status: unverified, source: "[R7 §F1]"}
+radio:
+  rat: [none]
+  chipset: {value: null, status: not-applicable, calibration: "a backend node has no V2X radio; connectivity is over the BackendNet links of 06-node-models §4. Nothing to measure"}
+  tx_power_dbm:
+    min: {value: null, status: not-applicable, calibration: "no radio on this profile"}
+    max: {value: null, status: not-applicable, calibration: "no radio on this profile"}
+    default: {value: null, status: not-applicable, calibration: "no radio on this profile"}
+  sensitivity_dbm: {value: null, status: not-applicable, calibration: "no radio on this profile"}
+  noise_figure_db: {value: null, status: not-applicable, calibration: "no radio on this profile"}
+  antenna:
+    gain_dbi: {value: null, status: not-applicable, calibration: "no radio on this profile"}
+    height_m: {value: null, status: not-applicable, calibration: "no radio on this profile"}
+    pattern: {value: null, status: not-applicable, calibration: "no radio on this profile"}
+power_w: {value: null, status: not-published, calibration: "a cloud VM's draw is not modelled; if a scenario needs it, take the instance type's published TDP share"}
+storage_model: inherit

@@ -300,3 +300,88 @@ fn headings_wrap_by_construction_across_the_turn() {
     );
     assert_eq!(quant::heading_brad(core::f64::consts::TAU), 0);
 }
+
+/// Ten times the run above, still in one GOP: the figure the hardening work was told not
+/// to regress is **0.0005 m over 100,000 steps with zero integer mismatches**.
+const LONG_STEPS: u32 = 100_000;
+
+#[test]
+fn a_hundred_thousand_steps_in_one_gop_stay_inside_half_a_millimetre() {
+    // `delta_quantisation_does_not_drift_over_ten_thousand_steps` proves the scheme does
+    // not drift. This one pins the number, at the length the acceptance criterion states,
+    // and counts the integer comparisons rather than only asserting them — a sweep that
+    // quietly stopped comparing would otherwise pass while proving nothing, which is the
+    // failure this project has produced four times.
+    let cadence = Cadence::new(Duration::from_secs(10_000), Duration::from_millis(100))
+        .expect("a whole number of steps per keyframe period");
+    let origin = [-500.0, -500.0, 0.0];
+    let mut encoder = SnapshotEncoder::new(origin, cadence, Profile::Full, 0);
+    let mut state = SlotState::default();
+    let mut keyframes = 0;
+    let mut compared = 0u32;
+    let mut mismatches = 0u32;
+    let mut worst = [0.0f64; 3];
+    // z is on the centimetre grid at the keyframe and on the millimetre grid from the
+    // first delta onwards, so its worst case is measured both ways.
+    let mut worst_z_after_the_keyframe = 0.0f64;
+
+    for step in 0..LONG_STEPS {
+        let pos = truth(step);
+        let snap = Snapshot::new(u64::from(step) * 100_000_000, vec![pose(step, pos)]);
+        let frame = encoder.encode(&snap).expect("the step encodes");
+        if frame.is_keyframe() {
+            keyframes += 1;
+        }
+        apply(&mut state, frame.frame(), 0);
+
+        compared += 1;
+        if state.x_mm != i64::from(quant::x_mm(pos[0], origin[0]))
+            || state.y_mm != i64::from(quant::x_mm(pos[1], origin[1]))
+        {
+            mismatches += 1;
+        }
+
+        let decoded = [
+            quant::mm_to_m(state.x_mm, origin[0]),
+            quant::mm_to_m(state.y_mm, origin[1]),
+            quant::mm_to_m(state.z_mm, origin[2]),
+        ];
+        for axis in 0..3 {
+            let err = (decoded[axis] - pos[axis]).abs();
+            worst[axis] = worst[axis].max(err);
+        }
+        if step > 0 {
+            worst_z_after_the_keyframe =
+                worst_z_after_the_keyframe.max((decoded[2] - pos[2]).abs());
+        }
+    }
+
+    assert_eq!(
+        keyframes, 1,
+        "the whole run must be one GOP for this to mean anything"
+    );
+    assert_eq!(
+        compared, LONG_STEPS,
+        "the integer comparison must have run on every step, not on some of them"
+    );
+    assert_eq!(
+        mismatches, 0,
+        "the reconstructed integers must equal the transmitted ones on every step"
+    );
+    assert!(
+        worst[0] <= 5e-4 && worst[1] <= 5e-4,
+        "worst-case drift over {LONG_STEPS} steps: x {:.9} m, y {:.9} m, budget 0.0005 m",
+        worst[0],
+        worst[1]
+    );
+    assert!(
+        worst_z_after_the_keyframe <= 5e-4,
+        "z after the keyframe re-anchors it on the millimetre grid: {:.9} m",
+        worst_z_after_the_keyframe
+    );
+    println!(
+        "{LONG_STEPS} steps, one GOP, {compared} integer comparisons, {mismatches} mismatches: \
+         max |decoded - true| = {:.9} m (x), {:.9} m (y), {:.9} m (z, {:.9} m after the keyframe)",
+        worst[0], worst[1], worst[2], worst_z_after_the_keyframe
+    );
+}

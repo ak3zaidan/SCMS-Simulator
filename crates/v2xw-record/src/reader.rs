@@ -24,7 +24,7 @@ use v2xw_core::time::SimTime;
 
 use crate::encoder::Cadence;
 use crate::error::{RecordError, Result};
-use crate::index::{ChannelMeta, FileSource, MemorySource, SeekIndex, Source};
+use crate::index::{ChannelMeta, ChunkIntegrity, FileSource, MemorySource, SeekIndex, Source};
 use crate::profile::Profile;
 use crate::wire::snapshot::{DeltaBody, KeyframeBody};
 use crate::wire::{
@@ -113,6 +113,30 @@ pub struct VerifyReport {
     pub cadence: Cadence,
     /// The profile the manifest declared.
     pub profile: Profile,
+    /// Chunks whose stored CRC-32 was present and matched.
+    pub chunks_checksummed: u64,
+    /// Chunks that declared `uncompressed_crc = 0`, so nothing in them was checked.
+    ///
+    /// The container defines a zero CRC as "not present", which makes the field a switch
+    /// the file can throw to skip validation. Those chunks are still read — a zero CRC is
+    /// legal and refusing it would reject conforming third-party files — but they are
+    /// counted here, and [`VerifyReport::integrity_verified`] is false while the count is
+    /// non-zero, so nothing in this crate can report a recording as verified when it
+    /// checked nothing. See [`ChunkIntegrity`].
+    pub chunks_without_checksum: u64,
+}
+
+impl VerifyReport {
+    /// True only if every chunk walked carried a checksum and it matched.
+    ///
+    /// This is deliberately separate from `verify` returning `Ok`. `Ok` means the stream
+    /// is self-consistent: the seq is dense, the deltas are rooted, the bodies decode. It
+    /// does **not** mean the bytes are the bytes that were written, and for a chunk whose
+    /// `uncompressed_crc` is zero nothing stands behind them at all. A caller reporting
+    /// "verified" to a human should be asking this, not just the `Result`.
+    pub const fn integrity_verified(&self) -> bool {
+        self.chunks_without_checksum == 0
+    }
 }
 
 /// Reads a recording.
@@ -123,6 +147,31 @@ pub struct Reader<S: Source> {
     cadence: Cadence,
     profile: Profile,
     manifest: BTreeMap<String, String>,
+    require_chunk_checksums: bool,
+    integrity: IntegrityTally,
+}
+
+/// How many chunks a walk checked and how many it could not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct IntegrityTally {
+    checksummed: u64,
+    unchecked: u64,
+}
+
+impl IntegrityTally {
+    /// Records one chunk's integrity, refusing it if the caller asked for a checksum.
+    fn note(&mut self, chunk: usize, integrity: ChunkIntegrity, require: bool) -> Result<()> {
+        match integrity {
+            ChunkIntegrity::Verified => self.checksummed += 1,
+            ChunkIntegrity::NotChecked => {
+                if require {
+                    return Err(RecordError::UncheckedChunk { chunk });
+                }
+                self.unchecked += 1;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Reader<MemorySource> {
@@ -179,7 +228,31 @@ impl<S: Source> Reader<S> {
             cadence,
             profile,
             manifest,
+            require_chunk_checksums: false,
+            integrity: IntegrityTally::default(),
         })
+    }
+
+    /// Refuse a chunk that declares no checksum, instead of reading it and reporting it.
+    ///
+    /// Off by default, and the default is the considered one: `uncompressed_crc = 0` means
+    /// "no CRC available" in the container, so refusing it outright would reject a file
+    /// that conforms to the specification, and this crate would be the tool that cannot
+    /// open other people's recordings. What the default does instead is *report* — see
+    /// [`ChunkIntegrity`] and [`VerifyReport::integrity_verified`].
+    ///
+    /// Turn it on where a missing checksum is genuinely disqualifying rather than merely
+    /// unusual: ingesting into an archive whose whole value is that every artefact in it is
+    /// checked, or re-reading a recording this crate wrote, which always carries one, so a
+    /// zero can only be damage or tampering. Every read path then fails with
+    /// [`RecordError::UncheckedChunk`] naming the chunk.
+    pub fn require_chunk_checksums(&mut self, require: bool) {
+        self.require_chunk_checksums = require;
+    }
+
+    /// Whether this reader refuses a chunk that declares no checksum.
+    pub const fn requires_chunk_checksums(&self) -> bool {
+        self.require_chunk_checksums
     }
 
     /// The index: chunks, channels, schemas and the keyframe and delta message indexes.
@@ -243,9 +316,12 @@ impl<S: Source> Reader<S> {
         mut on_record: impl FnMut(RecordedRecord) -> Result<()>,
     ) -> Result<()> {
         let index = std::mem::take(&mut self.index);
+        self.integrity = IntegrityTally::default();
+        let require = self.require_chunk_checksums;
+        let mut tally = IntegrityTally::default();
         let result = (|| -> Result<()> {
             for chunk in 0..index.chunks.len() {
-                index.for_each_message_in_chunk(
+                let integrity = index.for_each_message_in_chunk(
                     &mut self.src,
                     chunk,
                     |header, data, channel| {
@@ -280,10 +356,12 @@ impl<S: Source> Reader<S> {
                         }
                     },
                 )?;
+                tally.note(chunk, integrity, require)?;
             }
             Ok(())
         })();
         self.index = index;
+        self.integrity = tally;
         result
     }
 
@@ -352,9 +430,23 @@ impl<S: Source> Reader<S> {
     /// not know is counted in [`VerifyReport::unknown_frames`] and its body is not decoded,
     /// so nothing inside it is checked at all (§8.4).
     ///
+    /// # `Ok` is not the same as "verified"
+    ///
+    /// `Ok` says the recording is *self-consistent*: it decoded, the seq is dense, the
+    /// deltas are rooted, the times run forwards. It does not by itself say the bytes are
+    /// the bytes that were written, because a chunk's CRC can be switched off from the
+    /// wire — `uncompressed_crc = 0` is the container's "not present". Those chunks are
+    /// read and counted in [`VerifyReport::chunks_without_checksum`], and
+    /// [`VerifyReport::integrity_verified`] is false while that count is non-zero. Anything
+    /// that reports a recording to a human as verified should consult that as well as this
+    /// `Result`; anything that would rather refuse should call
+    /// [`Reader::require_chunk_checksums`] first. See [`ChunkIntegrity`] for why the
+    /// default reports rather than refuses.
+    ///
     /// # Errors
     /// [`RecordError::Inconsistent`] naming the first failure, with the time and frame
-    /// count at which it was found.
+    /// count at which it was found, and [`RecordError::UncheckedChunk`] if
+    /// [`Reader::require_chunk_checksums`] is on and a chunk carries no checksum.
     pub fn verify(&mut self) -> Result<VerifyReport> {
         let cadence = self.cadence;
         let mut report = VerifyReport {
@@ -411,22 +503,28 @@ impl<S: Source> Reader<S> {
                     // consumed none, and nothing is assumed.
                     unknown_frames += 1;
                     if state.next_seq == Some(h.seq) {
-                        state.next_seq = Some(h.seq + 1);
+                        state.next_seq = Some(next_dense(h.seq, "seq", f.sim_time, seen)?);
                     }
                     return Ok(());
                 };
                 if kind.is_canonical() {
                     match state.next_seq {
-                        None => state.next_seq = Some(h.seq + 1),
+                        None => {
+                            state.next_seq = Some(next_dense(h.seq, "seq", f.sim_time, seen)?);
+                        }
                         Some(want) => {
                             if h.seq != want {
                                 return Err(bad(format!(
                                     "canonical seq {} follows {}, which is not dense (§1.4, H4)",
                                     h.seq,
-                                    want - 1
+                                    // `want` is a successor this reader computed, so it is
+                                    // at least one; `saturating_sub` states that rather
+                                    // than relying on it, since the value it prints came
+                                    // from the file.
+                                    want.saturating_sub(1)
                                 )));
                             }
-                            state.next_seq = Some(h.seq + 1);
+                            state.next_seq = Some(next_dense(h.seq, "seq", f.sim_time, seen)?);
                         }
                     }
                     let node_only = h.flags & FLAG_NODE_ONLY != 0;
@@ -462,7 +560,7 @@ impl<S: Source> Reader<S> {
                             )));
                         }
                         if let Some(prev) = state.last_gop {
-                            if kf.gop_index != prev + 1 {
+                            if kf.gop_index != next_dense(prev, "gop_index", f.sim_time, seen)? {
                                 return Err(bad(format!(
                                     "keyframe gop_index {} does not follow {prev}",
                                     kf.gop_index
@@ -519,7 +617,9 @@ impl<S: Source> Reader<S> {
                                 d.gop_index
                             )));
                         }
-                        if d.step_index != state.last_step + 1 {
+                        if d.step_index
+                            != next_dense(state.last_step, "step_index", f.sim_time, seen)?
+                        {
                             return Err(bad(format!(
                                 "delta step_index {} does not follow {} (§3.4.1)",
                                 d.step_index, state.last_step
@@ -607,6 +707,8 @@ impl<S: Source> Reader<S> {
         report.provenance_references = provenance_references;
         report.span = first.map(|f| (f, last));
         report.max_snapshot_gap_ns = max_gap;
+        report.chunks_checksummed = self.integrity.checksummed;
+        report.chunks_without_checksum = self.integrity.unchecked;
         Ok(report)
     }
 
@@ -698,6 +800,8 @@ impl<S: Source> Reader<S> {
         let mut keyframe: Option<Frame> = None;
         let mut deltas: Vec<Frame> = Vec::new();
         let mut chunks_read = 0usize;
+        let require = self.require_chunk_checksums;
+        let mut integrity_seen = IntegrityTally::default();
 
         // The deltas this seek wants end at `t` and at the next keyframe, whichever comes
         // first: nothing after the GOP's end belongs to it. A chunk whose earliest message
@@ -714,17 +818,22 @@ impl<S: Source> Reader<S> {
         let mut chunk = slot.chunk as usize;
         loop {
             chunks_read += 1;
-            index.for_each_message_in_chunk(&mut self.src, chunk, |header, data, channel| {
-                if channel == kf_channel && header.log_time == slot.sim_time {
-                    keyframe = Some(Frame::from_bytes(data.to_vec())?);
-                } else if Some(channel) == delta_channel
-                    && header.log_time > slot.sim_time
-                    && header.log_time <= t
-                {
-                    deltas.push(Frame::from_bytes(data.to_vec())?);
-                }
-                Ok(())
-            })?;
+            let integrity = index.for_each_message_in_chunk(
+                &mut self.src,
+                chunk,
+                |header, data, channel| {
+                    if channel == kf_channel && header.log_time == slot.sim_time {
+                        keyframe = Some(Frame::from_bytes(data.to_vec())?);
+                    } else if Some(channel) == delta_channel
+                        && header.log_time > slot.sim_time
+                        && header.log_time <= t
+                    {
+                        deltas.push(Frame::from_bytes(data.to_vec())?);
+                    }
+                    Ok(())
+                },
+            )?;
+            integrity_seen.note(chunk, integrity, require)?;
             let more = index
                 .chunks
                 .get(chunk + 1)
@@ -752,6 +861,47 @@ impl<S: Source> Reader<S> {
             keyframe_time: slot.sim_time,
             chunks_read,
         })
+    }
+}
+
+/// The value that must follow `v` in a dense sequence, refused rather than wrapped if
+/// `v` is already at the top of its type.
+///
+/// `seq`, `gop_index` and `step_index` are all numbers a recording supplies, and `v + 1`
+/// on any of them is the same defect the chunk index had: a panic in a debug build and a
+/// wrap in a release build. A wrapped `seq` is the worse half — `u64::MAX + 1` becomes
+/// `0`, so the *next* frame's density check compares against `0`, and the reader either
+/// reports a nonsense gap or, if the file is built for it, accepts a stream that is not
+/// dense. Neither is a thing `verify` may do on input it was handed.
+fn next_dense<T>(v: T, what: &str, at: SimTime, frames: u64) -> Result<T>
+where
+    T: num_traits_lite::CheckedSucc,
+{
+    v.checked_succ().ok_or_else(|| RecordError::Inconsistent {
+        at,
+        frames,
+        detail: format!(
+            "{what} is at the maximum its field can hold, so the frame after it cannot exist; the            recording is not a dense sequence (§1.4)"
+        ),
+    })
+}
+
+/// The one operation [`next_dense`] needs, without pulling in a numeric-traits crate.
+mod num_traits_lite {
+    /// A counter that can say whether it has a successor.
+    pub trait CheckedSucc: Copy {
+        /// `self + 1`, or `None` at the type's maximum.
+        fn checked_succ(self) -> Option<Self>;
+    }
+    impl CheckedSucc for u64 {
+        fn checked_succ(self) -> Option<Self> {
+            self.checked_add(1)
+        }
+    }
+    impl CheckedSucc for u32 {
+        fn checked_succ(self) -> Option<Self> {
+            self.checked_add(1)
+        }
     }
 }
 

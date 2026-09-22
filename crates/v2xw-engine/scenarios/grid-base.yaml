@@ -1,0 +1,55 @@
+# The base every example in this crate overlays: a procedural grid, no traffic, no radio.
+#
+# It exists to be inherited from. A base is a path relative to the including file's
+# directory (`meta.base`), and the merge is document-level: a key the overlay does not
+# mention keeps the base's value, a sequence is replaced whole, and `null` deletes.
+schema: v2xw/scenario/1
+meta:
+  name: grid-base
+  description: A 4x4 procedural grid with no demand; the base for this crate's examples.
+  authors: [v2xw]
+  tags: [base, procedural]
+  created: "2026-09-22"
+seed: "0x5EED0BADC0FFEE"
+time:
+  t0: "2027-03-04T07:00:00Z"
+  duration_s: 10.0
+  mobility_step_ms: 100
+  des_resolution: 1us
+world:
+  source:
+    kind: procedural
+    generator: world/source/procedural-grid
+    params:
+      cols: 4
+      rows: 4
+actors:
+  vehicles:
+    equipped_fraction: 1.0
+    demand:
+      kind: mobility/demand/none
+radio:
+  rat: dsrc-80211p
+  tiers:
+    propagation: medium
+    phy: medium
+    mac: medium
+net:
+  layer: wsmp
+messages:
+  sets: [bsm]
+  codec_tier: uper
+security:
+  envelope: ieee1609.2
+  signature: ecdsa-p256
+  crypto_mode: modeled
+  verification_policy: prioritized
+  pseudonym_change:
+    strategy: time
+    period_s: 300.0
+nodes:
+  default_obu: obu/unex-obu-301-craton2
+  compute_tier: medium
+  backend_tier: medium
+metrics: [all]
+exporters: []

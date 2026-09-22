@@ -9,7 +9,20 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# The contract crate: SimTime/Duration, NodeId, the deterministic RNG streams, model cards,
+# the `Model` base trait and SHA-256.
 v2xw-core = { workspace = true }
+# The SCMS scientific core this crate orchestrates rather than reimplements: butterfly key
+# expansion, linkage values and linked-CRL matching, certificate construction and the real
+# COER encoder that sizes every certificate on every flow.
 v2xw-sec = { workspace = true }
-v2xw-node = { workspace = true }
-v2xw-net = { workspace = true }
+# The single home of the generated IEEE 1609.2 bindings; needed to name `Certificate` when
+# asking the real encoder for its length.
+v2xw-msg = { workspace = true }
+# The P-256 scalar type the butterfly construction's `c` randomiser is.
+p256 = { workspace = true }
+# Card payloads, message records and size provenance.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Crate error type.
+thiserror = { workspace = true }

@@ -56,6 +56,26 @@
 //! is what a UI stream needs, D11's is what a dataset needs, and the byte-identity
 //! guarantee attaches to whatever was actually stored.
 //!
+//! # Reading a file this crate did not write
+//!
+//! A recording is routinely read half-written, and sometimes it is read hostile. Two
+//! promises hold on every read path, and both are stated where they are kept — in
+//! [`error`] and in [`index`] — because both were once false:
+//!
+//! * **Malformed input is never a panic, an abort or an acceptance.** Every offset,
+//!   length, count and capacity derived from a file is computed with checked arithmetic
+//!   and bounded by the buffer it claims to describe. Unchecked arithmetic on a wire value
+//!   fails both ways at once: it panics in a debug build, and in a release build it wraps,
+//!   so a sum that should have been rejected as past the end of the file becomes a small
+//!   number that walks through the bounds check meant to stop it. `tests/overflow.rs` runs
+//!   in both profiles for that reason.
+//! * **Nothing is reported as verified that was not checked.** A chunk's CRC can be
+//!   switched off from the wire — `uncompressed_crc = 0` is the container's "not present" —
+//!   so such a chunk is read, because a zero is legal, and counted in
+//!   [`VerifyReport::chunks_without_checksum`], so [`VerifyReport::integrity_verified`]
+//!   goes false. [`Reader::require_chunk_checksums`] turns it into a refusal for a caller
+//!   that wants one. See [`ChunkIntegrity`].
+//!
 //! # The rules this crate is written under
 //!
 //! * No `std` transcendental: every one goes through [`v2xw_core::math`] (ADR 0003,
@@ -95,7 +115,9 @@ pub use encoder::{
 };
 pub use error::{RecordError, Result};
 pub use export::{ExportFormat, ExportProfile, ExportedFile, Exporter, TableSchema};
-pub use index::{ChunkSpan, FileSource, MemorySource, MessageSlot, SeekIndex, Source};
+pub use index::{
+    ChunkIntegrity, ChunkSpan, FileSource, MemorySource, MessageSlot, SeekIndex, Source,
+};
 pub use profile::{NodeProfileStripper, Profile};
 pub use quant::{DeltaStep, PoseRef};
 pub use reader::{Reader, RecordedFrame, RecordedRecord, SeekResult, VerifyReport};

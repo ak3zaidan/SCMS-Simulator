@@ -14,3 +14,14 @@ v2xw-sec = { workspace = true }
 v2xw-msg = { workspace = true }
 v2xw-radio = { workspace = true }
 v2xw-net = { workspace = true }
+# The 208-byte `NodeTelemetry` record of vwp-v1 §3.5.2 is defined once, in the recording
+# crate, and this crate populates it rather than declaring a second shape (build task §6).
+# `v2xw-record` depends only on `v2xw-core`, so this edge adds no cycle.
+v2xw-record = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Hardware profiles are data files (06-node-models.md §1), authored in YAML so that the
+# citation attached to every number stays readable next to it.
+serde_yml = { workspace = true }
+thiserror = { workspace = true }

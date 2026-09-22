@@ -297,3 +297,61 @@ fn the_default_recording_reports_what_it_actually_wrote() {
     assert!(summary.largest_gop_bytes > 0);
     assert!(summary.largest_chunk_bytes >= summary.largest_gop_bytes);
 }
+
+#[test]
+fn a_recording_split_into_hundreds_of_chunks_is_still_byte_identical_on_replay() {
+    // `a_chunk_target_of_one_byte_still_produces_a_readable_recording` forces a boundary
+    // everywhere but on a run short enough to hold a handful of GOPs. The property the
+    // hardening work was told not to regress is stated over *hundreds* of chunks, because
+    // the chunk walk is where the corrupt-file guards live and every chunk boundary is a
+    // fresh trip through them: a guard that were too strict by one byte would show up here
+    // and nowhere else.
+    let dir = scratch_dir("chunking-hundreds").expect("a scratch directory");
+    let path = dir.join("many.mcap");
+    // One GOP per second at the default cadence, one chunk per GOP at a one-byte target.
+    let shape = RunShape::new(3, 3_000);
+    let (live, summary) = write_recording_with(
+        &path,
+        &shape,
+        RecordingOptions {
+            cadence: shape.cadence,
+            chunk_target_bytes: 1,
+            ..Default::default()
+        },
+        false,
+    )
+    .expect("the recording is written");
+
+    let mut reader = Reader::open(&path).expect("the recording opens");
+    let chunks = reader.index().chunks.len();
+    assert!(
+        chunks >= 200,
+        "this test only means something with hundreds of chunks; got {chunks}"
+    );
+    assert_eq!(summary.chunk_count, chunks as u64);
+
+    let replayed = reader.replay().expect("it replays");
+    assert_eq!(
+        replayed.len(),
+        live.len(),
+        "no frame was lost at a boundary"
+    );
+    let mut compared = 0;
+    for (i, (l, r)) in live.iter().zip(replayed.iter()).enumerate() {
+        assert_eq!(
+            l.canonical().as_bytes(),
+            r.frame.as_bytes(),
+            "frame {i} is not byte-identical across {chunks} chunks"
+        );
+        compared += 1;
+    }
+    assert_eq!(compared, live.len(), "every frame must have been compared");
+
+    let report = reader.verify().expect("the recording verifies");
+    assert_eq!(
+        report.chunks_checksummed, chunks as u64,
+        "every one of those chunks carried a checksum and it was checked"
+    );
+    assert!(report.integrity_verified());
+    println!("{chunks} chunks, {compared} frames compared byte for byte");
+}

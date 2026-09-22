@@ -1,0 +1,37 @@
+[package]
+name = "v2xw-engine"
+description = "The simulation kernel: scenario schema and loader, the concrete event enum, the main loop and the run manifest."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+v2xw-core = { workspace = true }
+v2xw-world = { workspace = true }
+v2xw-mobility = { workspace = true }
+v2xw-radio = { workspace = true }
+v2xw-net = { workspace = true }
+v2xw-msg = { workspace = true }
+v2xw-sec = { workspace = true }
+v2xw-node = { workspace = true }
+v2xw-record = { workspace = true }
+v2xw-metrics = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Scenarios are authored in YAML (03-interfaces.md §13); JSON is the same schema through
+# the same structs, which is why one loader serves both.
+serde_yml = { workspace = true }
+thiserror = { workspace = true }
+# Phase-parallel maps over actors, receivers and nodes (ADR 0004 decision 5). The event
+# loop never touches it.
+rayon = { workspace = true }
+
+[dev-dependencies]
+# The tests compare a run on one thread against the same run on eight; the pool has to be
+# built explicitly, because the global pool's size is whatever the machine has.
+rayon = { workspace = true }
+v2xw-metrics = { workspace = true }

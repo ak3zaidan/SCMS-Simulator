@@ -1,0 +1,45 @@
+# 06-node-models.md §7.8. R7 and R5 contain no base-station data, so this profile carries
+# only the 3GPP V2X evaluation-methodology assumptions and leaves everything else to be
+# calibrated. It is included because leaving the cellular path with no profile at all
+# would hide that gap rather than record it.
+id: bs/lte-macro-generic
+kind: base-station
+version: 2026-09-18.1
+purpose: >-
+  Generic LTE macro base station for the Uu top-up and report paths. Carries only 3GPP
+  evaluation assumptions (macro Tx power, BS and UE noise figures, inter-site distance and
+  the eNB-UE path-loss reference); every hardware, antenna and scheduling parameter is
+  uncalibrated, which is the honest state of the cellular research sheets.
+sources:
+  - {kind: spec, ref: "3GPP TR 37.885 V15.3.0 Tables 6.1.1-1/2, 6.1.3-1/2 [R11 §A4; R2 Topic D.2]", accessed: 2026-09-18}
+  - {kind: spec, ref: "3GPP TR 38.913 Tables 6.1.8-1, 6.1.9-1 [R11 §A4; §7.10 #40]", accessed: 2026-09-18}
+  - {kind: spec, ref: "3GPP TR 36.885 V14.0.0 Annex A.1.1, A.1.4 [R2 Topic A, D.1; R2c]", accessed: 2026-09-18}
+cpu:
+  cores: {value: null, status: todo-calibrate, calibration: "no base-station compute data exists in R7/R5, and the abstract and medium tiers of 06-node-models §5 do not need it. Set it only if a scenario models BS-side processing, and cite the vendor specification when it does"}
+  clock_hz: {value: null, status: todo-calibrate, calibration: "no base-station compute data exists in R7/R5, as for cpu.cores; set it only if a scenario models BS-side processing, citing the vendor specification"}
+  arch: {value: null, status: todo-calibrate, calibration: "no base-station compute data exists in R7/R5, as for cpu.cores; set it only if a scenario models BS-side processing, citing the vendor specification"}
+  dmips: {value: null, status: todo-calibrate, calibration: "no base-station compute data exists in R7/R5, as for cpu.cores; set it only if a scenario models BS-side processing, citing the vendor specification"}
+ram_bytes: {value: null, status: todo-calibrate, calibration: "not modelled at the abstract or medium tier of §5; take from the vendor specification if a scenario needs it"}
+flash_bytes: {value: null, status: todo-calibrate, calibration: "not modelled at the abstract or medium tier of 06-node-models §5, as for ram_bytes; take from the vendor specification if a scenario needs it"}
+hsm:
+  kind: none
+  part: {value: null, status: not-applicable, calibration: "no security operations are modelled at the base station; Uu security is out of scope (06-node-models §5)"}
+  ops: {}
+  queue_depth: {value: null, status: not-applicable, calibration: "rule H2: no HSM queue exists on this profile"}
+  servers: {value: null, status: not-applicable, calibration: "rule H2: no HSM server exists on this profile"}
+software_crypto: {}
+radio:
+  rat: [lte-uu]
+  chipset: {value: null, status: todo-calibrate, calibration: "generic; name the vendor and part if a scenario pins a real deployment"}
+  tx_power_dbm:
+    min: {value: null, status: todo-calibrate, calibration: "TR 37.885 gives the maximum only; take the minimum from the vendor's power-control range"}
+    max: {value: 49.0, status: evaluation-assumption, source: "TR 37.885 Table 6.1.1-1 macro BS Tx power below 6 GHz [R11 §A4]; above 6 GHz it is 43 dBm with EIRP <= 78 dBm"}
+    default: {value: 49.0, status: evaluation-assumption, source: "as max; TR 37.885 Table 6.1.1-1 [R11 §A4]"}
+  sensitivity_dbm: {value: null, status: todo-calibrate, calibration: "derive from the BS noise figure, the carrier bandwidth and the MCS SINR thresholds in the PHY model (04-models §10) rather than carrying a single number"}
+  noise_figure_db: {value: 5.0, status: evaluation-assumption, source: "TR 37.885 §6.1.1 BS receiver noise figure 5 dB [R2 Topic D.2]; the UE receiver figure is 9 dB and lives on the OBU profiles"}
+  antenna:
+    gain_dbi: {value: null, status: todo-calibrate, calibration: "BS antenna gain was not extracted from TR 37.885 in R2/R11; take it from TR 37.885 §6.1.1 or the TR 38.901 UMa tables"}
+    height_m: {value: null, status: todo-calibrate, calibration: "BS antenna height was not extracted in R2/R11; TR 37.885 Table 6.2.1-2 reuses TR 38.901 UMa/RMa with hE = 0.25 m [R2c]. Take it from TR 38.901"}
+    pattern: {value: null, status: todo-calibrate, calibration: "a sectorised pattern per TR 37.885 §6.1.1; not extracted. Take it from the same clause"}
+power_w: {value: null, status: todo-calibrate, calibration: "not modelled; take from the vendor specification if a scenario needs an energy figure"}
+storage_model: inherit

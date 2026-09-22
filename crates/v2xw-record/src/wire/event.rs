@@ -162,6 +162,10 @@ impl EventBody {
                 ),
             ));
         }
+        // `e` is a wire `u32` and the next line reserves memory for it. §3.6.1 gives each
+        // index entry 8 bytes of time, 4 of payload offset, 2 of length and 2 of channel
+        // id, so 16 bytes is the least a real entry can occupy.
+        let e = crate::wire::checked_count(e, 16, body.len(), WHAT, "event_count")?;
         let mut entries = Vec::with_capacity(e);
         let mut prev = (0u64, 0u16);
         for i in 0..e {
@@ -184,7 +188,18 @@ impl EventBody {
                     format!("payload_off = {payload_off} of entry {i} must be a multiple of 8"),
                 ));
             }
-            if payload_off + payload_len > payload_bytes {
+            // Both operands are wire values. On a 64-bit target a `u32` plus a `u16`
+            // cannot overflow, but stating that here rather than relying on it costs one
+            // method call and keeps the check true on a 32-bit target too.
+            let payload_end = payload_off.checked_add(payload_len).ok_or_else(|| {
+                RecordError::wire_overflow(
+                    WHAT,
+                    format!(
+                        "entry {i} declares payload_off = {payload_off} and payload_len = {payload_len},                          whose sum does not fit"
+                    ),
+                )
+            })?;
+            if payload_end > payload_bytes {
                 return Err(RecordError::Truncated {
                     what: "vwp Event.payload",
                     at: payload_off,

@@ -1,0 +1,55 @@
+# 06-node-models.md §7.7, second backend profile: the bound production RA/PCA/MA nodes
+# normally hit, since HSM throughput rather than host CPU limits them.
+id: backend/hsm-appliance-luna7
+kind: hsm-appliance
+version: 2026-09-18.1
+purpose: >-
+  Network-attached HSM appliance (Thales Luna Network HSM 7, A750 enterprise tier). The
+  brief does not split the ECC P-256 transactions-per-second figure into sign and verify,
+  so it is applied to both and the choice is flagged; per-operation latency is not
+  published and the service time is the derived reciprocal.
+sources:
+  - {kind: product-brief, ref: "Thales Luna Network HSM 7 product brief (Dec 2019) [R7 §F2; §7.10 #36]", accessed: 2026-09-18}
+  - {kind: product-brief, ref: "Thales Luna PCIe HSM product brief [R7 §F2]", accessed: 2026-09-18}
+  - {kind: performance-brief, ref: "Thales Luna HSM for 5G performance brief (A790 cluster cross-check: 56,000 TPS ECIES P-256 decrypt with 8 HSMs) [R7 §F2]", accessed: 2026-09-18}
+cpu:
+  cores: {value: null, status: not-published, calibration: "appliance internals are not published; the profile is characterised by operation throughput only. Nothing to measure short of vendor disclosure"}
+  clock_hz: {value: null, status: not-published, calibration: "appliance internals are not published, as for cpu.cores; nothing to measure short of vendor disclosure"}
+  arch: {value: null, status: not-published, calibration: "appliance internals are not published, as for cpu.cores; nothing to measure short of vendor disclosure"}
+  dmips: {value: null, status: not-published, calibration: "appliance internals are not published, as for cpu.cores; nothing to measure short of vendor disclosure"}
+ram_bytes: {value: null, status: not-published, calibration: "the R7 summary table lists 'up to 64 MB' for the A790 without a row-level source, so it is not carried as a value; request the appliance specification from Thales"}
+flash_bytes: {value: null, status: not-published, calibration: "not published anywhere in the Thales collateral gathered; request the appliance specification from the vendor"}
+hsm:
+  kind: accelerator
+  part: {value: "Thales Luna Network HSM 7, A750/S750 enterprise tier; the Luna PCIe HSM has identical per-tier figures. FIPS 140-2 and 140-3 Level 3, Common Criteria EAL4+", source: "[R7 §F2]"}
+  ops:
+    ecdsa-p256-sign:
+      throughput_per_s: {value: 10000, source: "A750/S750 enterprise tier, ECC P-256 [R7 §F2; R5 §B.5]. Other tiers: A700 2000, A790 22000"}
+      latency_us: {value: null, status: not-published, calibration: "per-operation latency is not published; the service time is the derived reciprocal, 100 us for the A750 (500 us A700, 45.5 us A790), and the BackendNet round trip is added by 06-node-models §4. Measure with the Thales client library"}
+      runs_on: hsm
+    ecdsa-p256-verify:
+      throughput_per_s: {value: 10000, status: applied-from-combined-ecc-tps, source: "the brief gives one ECC P-256 tps figure and does not split it into sign and verify; R5 §B.5 labels it 'ECC P-256 sign'. Applied to both as an appliance rate, flagged [R7 §F2]"}
+      latency_us: {value: null, status: not-published, calibration: "as ecdsa-p256-sign.latency_us: not published, the service time is the derived reciprocal of the tps figure; measure with the Thales client library"}
+      runs_on: hsm
+    ml-dsa-87-sign:
+      throughput_per_s: {value: null, status: not-published, calibration: "no ML-DSA tps is published for the A-series. The only published post-quantum HSM throughput in the sheet is 20 tps on the 'Luna Tablet & Backup' T-series model [R7 §F2]. Request Thales PQC performance data"}
+      latency_us: {value: null, status: not-published, calibration: "as ml-dsa-87-sign.throughput_per_s: no ML-DSA figure is published for the A-series; request Thales PQC performance data"}
+      runs_on: hsm
+  queue_depth: {value: null, status: todo-calibrate, calibration: "client-library session concurrency; not published. Measure with a concurrent-request harness against the appliance"}
+  servers: {value: null, status: todo-calibrate, calibration: "not published; the A790 cluster cross-check reached 56,000 TPS with 8 appliances [R7 §F2], which bounds a per-appliance answer but does not give one. Measure"}
+software_crypto: {}
+radio:
+  rat: [none]
+  chipset: {value: null, status: not-applicable, calibration: "an appliance has no radio; nothing to measure"}
+  tx_power_dbm:
+    min: {value: null, status: not-applicable, calibration: "no radio on this profile"}
+    max: {value: null, status: not-applicable, calibration: "no radio on this profile"}
+    default: {value: null, status: not-applicable, calibration: "no radio on this profile"}
+  sensitivity_dbm: {value: null, status: not-applicable, calibration: "no radio on this profile"}
+  noise_figure_db: {value: null, status: not-applicable, calibration: "no radio on this profile"}
+  antenna:
+    gain_dbi: {value: null, status: not-applicable, calibration: "no radio on this profile"}
+    height_m: {value: null, status: not-applicable, calibration: "no radio on this profile"}
+    pattern: {value: null, status: not-applicable, calibration: "no radio on this profile"}
+power_w: {value: 100.0, source: "Luna Network HSM: 100 W maximum, 84 W typical, 1U [R7 §F2]; the Luna PCIe card is 18 W max / 14 W typical"}
+storage_model: inherit

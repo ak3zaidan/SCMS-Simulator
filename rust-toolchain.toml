@@ -5,6 +5,15 @@
 channel = "1.98.1"
 profile = "minimal"
 components = ["rustfmt", "clippy"]
-# No `targets` entry: the host target is always installed, and naming one here would make
-# every non-macOS runner fetch a cross std it does not need. Add a target only when a build
-# actually requires it (wasm32-unknown-unknown arrives with v2xw-wasm in a later phase).
+# `wasm32-unknown-unknown` is the Studio's static-hosting target: the replay reader of
+# 09-ui §7 and §9 is the same Rust code compiled natively or to WebAssembly, and
+# `crates/v2xw-wasm` is that build. It is named here rather than left to each machine
+# because the reader has to keep compiling for both targets, and a target nobody has
+# installed is a target that quietly stops being built.
+#
+# It costs every runner one cross std download (a few tens of megabytes), which is the
+# trade this file previously declined to make while `v2xw-wasm` was a stub. Building the
+# crate additionally needs a C toolchain that can target WebAssembly, because the
+# recording container's zstd codec is C; that part is *not* a rustup concern and is
+# documented in `crates/v2xw-wasm/README.md` and its `scripts/build-wasm.sh`.
+targets = ["wasm32-unknown-unknown"]

@@ -1,6 +1,6 @@
 [package]
 name = "v2xw-py"
-description = "Python binding surface (PyO3 is wired in a later phase)."
+description = "Python bindings: the `v2xw` package's native module — scenarios, runs, recordings, metric tables as Arrow, and the Python plug-in seam."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,4 +8,41 @@ rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+# `_v2xw` is the private native module the `v2xw` Python package re-exports from
+# (python/v2xw/__init__.py). `cdylib` is what maturin ships; `rlib` is what
+# `cargo test -p v2xw-py` links, so the Rust-side tests run without maturin.
+name = "_v2xw"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
+v2xw-core = { workspace = true }
+v2xw-mobility = { workspace = true }
+v2xw-metrics = { workspace = true }
+v2xw-record = { workspace = true }
+v2xw-world = { workspace = true }
+# Not a workspace dependency: build decision D8 created this crate after the workspace
+# dependency table was written, and the table lives in the root manifest, which belongs
+# to no single crate. A path dependency here is the same edge with a narrower blast
+# radius; move it to the table when the root manifest is next touched.
+v2xw-engine = { path = "../v2xw-engine", version = "0.1.0" }
+
+# pyo3 0.25 rather than the newest release, and the pin is load-bearing: `arrow`'s
+# `pyarrow` feature (the zero-copy hand-off below) depends on `arrow-pyarrow`, which
+# requires `pyo3 ^0.25.1`. Two pyo3 versions in one binary do not interoperate — a
+# `Bound<'py, PyAny>` from one is a different type from the other's — so the Arrow
+# bridge is what fixes this version. Raising it means waiting for `arrow-pyarrow` to
+# follow.
+pyo3 = { version = "0.25.1", features = ["abi3-py39"] }
+# `pyarrow` turns on `RecordBatch::to_pyarrow`, which hands Python the Arrow buffers
+# through the C data interface instead of copying them into Python objects.
+arrow = { workspace = true, features = ["pyarrow"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = []
+# maturin turns this on. It tells pyo3 not to link libpython, which is right for a
+# wheel and wrong for `cargo test`, so it is not a default: the Rust tests need the
+# interpreter symbols.
+extension-module = ["pyo3/extension-module"]

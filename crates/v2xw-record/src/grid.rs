@@ -119,13 +119,14 @@ fn scan_json(channel: &str, key: &str, value: &serde_json::Value) -> Result<()> 
                 }
             }
         }
-        // INJECTED FAULT: nested values are no longer walked.
-        serde_json::Value::Array(_) => {}
+        serde_json::Value::Array(a) => {
+            for e in a {
+                scan_json(channel, key, e)?;
+            }
+        }
         serde_json::Value::Object(m) => {
             for (k, e) in m {
-                if matches!(e, serde_json::Value::Number(_)) {
-                    scan_json(channel, k, e)?;
-                }
+                scan_json(channel, k, e)?;
             }
         }
         _ => {}

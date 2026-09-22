@@ -1,6 +1,6 @@
 [package]
 name = "v2xw-wasm"
-description = "WASM binding surface for the browser replay reader (wasm-bindgen comes later)."
+description = "The replay reader compiled to WebAssembly: seek a recording in the browser with no server."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,4 +8,28 @@ rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+# `cdylib` is what `wasm-bindgen` post-processes; `rlib` is what the host-side
+# integration tests and `examples/` link against. Both are needed: the crate builds for
+# the browser and for the host from one source tree (the ADR 0003 "one reader, two
+# targets" rule), and `cargo test -p v2xw-wasm` runs on the host.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# The JavaScript binding surface. On by default so `wasm-pack`/`wasm-bindgen` users get
+# it without a flag, and it is a no-op on any target that is not `wasm32`: every item it
+# gates is additionally `cfg(target_arch = "wasm32")`, because `wasm-bindgen` has no
+# meaning on the host.
+default = ["js"]
+js = ["dep:wasm-bindgen"]
+
 [dependencies]
+# The replay reader itself. This crate compiles it; it does not reimplement it.
+v2xw-record = { workspace = true }
+v2xw-core = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Pinned exactly: `wasm-bindgen`'s generated glue and the `wasm-bindgen` CLI that
+# rewrites the module must be the same version, and a range would let `cargo update`
+# break the build silently.
+wasm-bindgen = { version = "=0.2.128", optional = true }

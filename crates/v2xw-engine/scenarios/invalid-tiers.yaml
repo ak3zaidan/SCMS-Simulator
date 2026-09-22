@@ -1,0 +1,15 @@
+# Deliberately invalid: a frame-level PHY over a medium MAC. Loading it must produce the
+# actionable error of 03-interfaces.md §13, naming `radio.tiers.phy` and the MAC's value.
+schema: v2xw/scenario/1
+meta:
+  name: invalid-tiers
+world:
+  source:
+    kind: procedural
+    generator: world/source/procedural-grid
+    params: {}
+radio:
+  tiers:
+    propagation: high
+    phy: high
+    mac: medium

@@ -892,12 +892,17 @@ fn check_section(
             format!("{name} has {count} rows but off_{name} = 0, which means absent (§2.2)"),
         ));
     }
-    let end = off.saturating_add(stride.saturating_mul(count));
+    let want = stride.saturating_mul(count);
+    let end = off.saturating_add(want);
     if end > body_len {
         return Err(RecordError::Truncated {
             what,
             at: off,
-            need: stride * count,
+            // The same product, saturated. Writing `stride * count` a second time here
+            // would have been an unchecked multiplication of a wire count reached only on
+            // the malformed path — a panic in debug and a nonsense number in the error
+            // message in release, on exactly the input this branch exists to report.
+            need: want,
             have: body_len.saturating_sub(off),
         });
     }

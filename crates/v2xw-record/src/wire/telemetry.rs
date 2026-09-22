@@ -419,8 +419,19 @@ impl TelemetryBody {
                 format!("off_records = {off_records} must be 8-aligned (§3.5.1)"),
             ));
         }
+        // `n` is a wire `u32` about to size an allocation of `NodeTelemetry`, which is a
+        // wide struct; `record_size` is the exact stride and is already known to be at
+        // least v1's, so it is also the bound.
+        let n = crate::wire::checked_count(
+            n,
+            (record_size as usize).max(RECORD_SIZE_V1 as usize),
+            body.len(),
+            WHAT,
+            "node_count",
+        )?;
         let mut records = Vec::with_capacity(n);
         for i in 0..n {
+            // Bounded by the check above: `n * record_size <= body.len()`.
             records.push(NodeTelemetry::decode_at(
                 body,
                 off_records + i * record_size as usize,

@@ -160,6 +160,10 @@ impl ProvenanceBody {
         let off_dims = get_u32(body, 20, WHAT)? as usize;
         let off_strings = get_u32(body, 24, WHAT)? as usize;
         let flags = get_u32(body, 28, WHAT)?;
+        // Two wire `u32` counts, each about to size an allocation. §3.8 gives an entry
+        // five `u32` ids and two `u16`s — 24 bytes — and a dim entry two `u32`s.
+        let p = crate::wire::checked_count(p, 24, body.len(), WHAT, "entry_count")?;
+        let dk = crate::wire::checked_count(dk, 8, body.len(), WHAT, "dim_count")?;
         let mut entries = Vec::with_capacity(p);
         for i in 0..p {
             entries.push(ProvEntry {

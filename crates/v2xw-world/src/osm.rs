@@ -5446,7 +5446,7 @@ impl OutlineIndex {
     }
 
     /// Builds the index over `rings`, which are the closed outer rings of the outlines.
-    fn build(rings: &[(usize, Vec<Vec3>)]) -> Self {
+    fn build<'a>(rings: impl Iterator<Item = (usize, &'a [Vec3])>) -> Self {
         let mut index = OutlineIndex {
             cells: BTreeMap::new(),
             oversized: Vec::new(),
@@ -5461,26 +5461,74 @@ impl OutlineIndex {
             }
             let span = ((max.0 - min.0 + 1) as usize).saturating_mul((max.1 - min.1 + 1) as usize);
             if span > OUTLINE_MAX_CELLS {
-                index.oversized.push(*which);
+                index.oversized.push(which);
                 continue;
             }
             for cx in min.0..=max.0 {
                 for cy in min.1..=max.1 {
-                    index.cells.entry((cx, cy)).or_default().push(*which);
+                    index.cells.entry((cx, cy)).or_default().push(which);
                 }
             }
         }
         index
     }
 
-    /// The outlines whose cell `p` falls in, plus the oversized ones.
-    fn candidates(&self, p: Vec3) -> impl Iterator<Item = usize> + '_ {
-        self.cells
-            .get(&Self::cell(p))
-            .into_iter()
-            .flatten()
-            .copied()
-            .chain(self.oversized.iter().copied())
+    /// The outlines whose cells the box `min..=max` touches, plus the oversized ones, in
+    /// ascending candidate index and without repeats.
+    ///
+    /// A part is a building-sized polygon, so this is a handful of 100 m cells and the
+    /// scan stays proportional to the parts, not to the parts times the outlines. The
+    /// result is sorted, so it is ordered by candidate index rather than by which cell
+    /// happened to list an outline first (crate rule 2): the caller's tie-break is then
+    /// meaningful. An outline whose cells are not in the list cannot share area with the
+    /// box, so nothing is lost by not visiting it.
+    fn candidates_over(&self, min: Vec3, max: Vec3, out: &mut Vec<usize>) {
+        out.clear();
+        out.extend(self.oversized.iter().copied());
+        let (lo, hi) = (Self::cell(min), Self::cell(max));
+        let span = ((hi.0 - lo.0 + 1) as usize).saturating_mul((hi.1 - lo.1 + 1) as usize);
+        if span > OUTLINE_MAX_CELLS {
+            // A "part" spanning 10 km is a mistagged relation, not a building. Rather
+            // than walk a million empty cells for it, offer it every indexed outline;
+            // the caller's own box test throws out the ones that cannot overlap.
+            out.extend(self.cells.values().flatten().copied());
+        } else {
+            for cx in lo.0..=hi.0 {
+                for cy in lo.1..=hi.1 {
+                    if let Some(cell) = self.cells.get(&(cx, cy)) {
+                        out.extend(cell.iter().copied());
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+    }
+}
+
+/// One candidate's `building=*` outline: its closed outer ring and the bounding box of
+/// that ring.
+///
+/// There is one of these per candidate, empty for every candidate that is not an
+/// outline, so a grid bucket's index is a direct index into the slice. The box is
+/// computed once here rather than per part, because the part scan asks for it 76 000
+/// times on the Phase 1 extract and the rings do not move.
+struct Outline {
+    /// The closed outer ring, or empty when this candidate is not an outline.
+    ring: Vec<Vec3>,
+    /// The ring's bounding box, or `None` when there is no usable ring.
+    bounds: Option<(Vec3, Vec3)>,
+}
+
+impl Outline {
+    /// Wraps a ring, which may be empty, and measures it.
+    fn new(ring: Vec<Vec3>) -> Self {
+        let bounds = if ring.len() >= 4 {
+            ring_bounds(&ring)
+        } else {
+            None
+        };
+        Outline { ring, bounds }
     }
 }
 
@@ -5512,10 +5560,11 @@ struct Candidate<'a> {
 /// parts are its detail. So:
 ///
 /// * an outline always becomes a building;
-/// * a part whose representative point lies inside an outline is **folded into it** —
-///   the outline already covers that ground, and counting the part again would give the
-///   same wall two or three attenuations in any obstacle model that sums over
-///   intersected buildings. Folding means the part's height goes into the outline: the
+/// * a part that shares its footprint with an outline is **folded into it** — which
+///   outline is [`choose_parent`]'s question, and it is answered by clipped overlap area
+///   rather than by a sampled point. The outline already covers that ground, and counting
+///   the part again would give the same wall two or three attenuations in any obstacle
+///   model that sums over intersected buildings. Folding means the part's height goes into the outline: the
 ///   outline's height becomes the taller of its own and the tallest part inside it, with
 ///   [`HeightSource::FromParts`] when the parts won. It is counted in
 ///   [`ImportCounts::building_parts_merged`];
@@ -5645,26 +5694,26 @@ fn build_buildings(
     }
 
     // --- pass 2: the outline index ------------------------------------------------
-    // One closed ring per candidate, empty for everything that is not an outline, so a
-    // grid bucket's index is a direct index into it.
-    let closed_outlines: Vec<Vec<Vec3>> = candidates
+    // One entry per candidate, empty for everything that is not an outline, so a grid
+    // bucket's index is a direct index into it.
+    let outlines: Vec<Outline> = candidates
         .iter()
         .map(|c| {
-            if c.role == BuildingRole::Outline {
+            let ring = if c.role == BuildingRole::Outline {
                 closed(&c.ring)
             } else {
                 Vec::new()
-            }
+            };
+            Outline::new(ring)
         })
         .collect();
-    let indexed: Vec<(usize, Vec<Vec3>)> = closed_outlines
-        .iter()
-        .enumerate()
-        .filter(|(_, ring)| ring.len() >= 4)
-        .map(|(i, ring)| (i, ring.clone()))
-        .collect();
-    let index = OutlineIndex::build(&indexed);
-    drop(indexed);
+    let index = OutlineIndex::build(
+        outlines
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.bounds.is_some())
+            .map(|(i, o)| (i, o.ring.as_slice())),
+    );
 
     // --- pass 3: fold every part's height into the outline that covers it ----------
     // This is what "folded" has to mean. Dropping the part and leaving the outline to
@@ -5680,11 +5729,45 @@ fn build_buildings(
     // 443.2 m mast folds in as its 330 m structural top, not as a 443 m prism.
     let mut part_top_m = vec![0.0f64; candidates.len()];
     let mut folded = vec![false; candidates.len()];
+
+    // 3a: the outlines that claim each part, by real footprint overlap, and the parts
+    // exactly one outline claims. Those are assignable on the spot, and they are also
+    // what marks an outline as **subdivided** — a structure whose ground is mapped part
+    // by part — which is the third rung of [`choose_parent`]'s ladder. Only the
+    // unambiguous parts mark it, so the mark does not depend on the order the contested
+    // ones are settled in (crate rule 2).
+    let mut owner_of: Vec<Option<usize>> = vec![None; candidates.len()];
+    let mut scratch: Vec<usize> = Vec::new();
+    let mut subdivided = vec![false; candidates.len()];
+    let mut contested: Vec<(usize, Vec<(f64, usize)>)> = Vec::new();
     for i in 0..candidates.len() {
         if candidates[i].role != BuildingRole::Part {
             continue;
         }
-        let Some(owner) = covering_outline(&candidates[i].ring, &index, &closed_outlines) else {
+        let claims = outline_claims(&candidates[i].ring, &index, &outlines, &mut scratch);
+        match claims.len() {
+            0 => {}
+            1 => {
+                owner_of[i] = Some(claims[0].1);
+                subdivided[claims[0].1] = true;
+            }
+            _ => contested.push((i, claims)),
+        }
+    }
+
+    // 3b: the parts more than one outline claims — nine of 4 373 on the Phase 1 extract.
+    for (i, claims) in &contested {
+        owner_of[*i] = Some(choose_parent(
+            ring_area_m2(&candidates[*i].ring),
+            claims,
+            &outlines,
+            &subdivided,
+        ));
+    }
+
+    // 3c: fold each part's height into the outline that owns it.
+    for i in 0..candidates.len() {
+        let Some(owner) = owner_of[i] else {
             continue;
         };
         let (element, tags) = (candidates[i].element, candidates[i].tags);
@@ -5763,45 +5846,339 @@ fn build_buildings(
     out
 }
 
-/// Which indexed `building=*` outline covers `ring`, or `None` if none does.
+/// The least share of a part's own footprint that an outline must cover before it counts
+/// as a claim on that part.
 ///
-/// The test point is the ring's vertex mean, which is inside every convex footprint and
-/// inside almost every real one; a ring whose mean falls outside itself — an L or a U —
-/// falls back to its first vertex. Both are points *of the part*, so a part that sits on
-/// an outline is found and one that sits beside it is not.
+/// A part is a *subdivision* of the structure it belongs to, so the structure's outline
+/// covers essentially all of it: on the Phase 1 extract every one of the 4 368 folded
+/// parts is at least 0.934 covered by the outline it is folded into, and 4 364 of them
+/// are covered 0.983 or more. A half is therefore a threshold with nothing near it in
+/// either direction — it says "more of this part is inside that outline than is outside
+/// it" — and moving it anywhere between 0.35 and 0.93 changes no part's parent on the
+/// real extract.
 ///
-/// When outlines overlap — a tower outline drawn inside a podium outline, which Midtown
-/// does — the **smallest** covering footprint wins, so a part is folded into the
-/// structure it actually belongs to rather than into whichever outline the grid bucket
-/// happened to list first. Ties go to the lower candidate index, which is OSM id order,
-/// so the answer never depends on iteration order (crate rule 2).
-fn covering_outline(
+/// It exists at all because *some* floor is needed: without one, a part that merely
+/// grazes a neighbour it does not belong to — two footprints drawn from different
+/// surveys overlap by a metre along a shared wall — would be folded into that neighbour
+/// and lend it its full height, which is the same defect this rule is here to remove.
+const PART_COVERAGE_MIN: f64 = 0.5;
+
+/// The share of a part's footprint an outline must cover before the part counts as
+/// lying *wholly inside* it rather than merely mostly inside it.
+///
+/// A part that subdivides an outline is drawn inside it, very often on its own nodes, so
+/// the honest reading of "inside" is 1.0 and this is 1.0 less the slack that the
+/// projection and the mapper's drawing leave. The extract says the same: of the nine
+/// parts more than one outline claims, the covering fraction is either 1.0000 to four
+/// decimals or 0.9553 or less, so anywhere from 0.96 to 1.0 selects the same set. The
+/// distinction matters because the tie-breaks below only make sense between outlines
+/// that each contain the *whole* part; a part that hangs over the edge of one candidate
+/// and not the other is already decided by area.
+const PART_INSIDE_MIN: f64 = 0.99;
+
+/// The share of an outline that a second outline must cover before the first counts as
+/// nested inside the second.
+///
+/// Same reasoning and same slack as [`PART_INSIDE_MIN`], one level up: the United
+/// Nations Secretariat Building's outline is 1.0000 inside the United Nations
+/// Headquarters outline, and the next-closest pair among the contested parts is 0.9906,
+/// which is [`is_nested_in`]'s only near miss and is not a nesting — it is a market hall
+/// that pokes out of the Helmsley Building's footprint by 15 m².
+const OUTLINE_NESTED_MIN: f64 = 0.999;
+
+/// Every indexed `building=*` outline that claims `ring`: the ones sharing at least
+/// [`PART_COVERAGE_MIN`] of the part's own footprint, as `(shared m², candidate index)`
+/// in ascending candidate index.
+///
+/// Area, not a sampled point. The question "does this part sit inside that structure" is
+/// a question about two polygons, and any single probe point answers a different one.
+///
+/// A probe point was the rule until it put four Midtown structures on the wrong
+/// footprint. The failure is not exotic. A part that overhangs its own outline — or one
+/// whose vertex mean falls outside its own concave ring — has a probe point that can
+/// land in a *neighbouring* outline, and the old rule then picked the **smallest**
+/// outline containing that one point. Part 1473999184 is 24 m² of Rose Hill (905 m²,
+/// 195 m); its mean landed in the 156 m² building next door, whose own height is 25 m,
+/// so a 155 m prism was imported on a 156 m² footprint and Rose Hill lost its height.
+/// Parts 292032000, 292032001 and 292032005 were folded into outlines they do not touch
+/// at all.
+///
+/// The spatial pre-filter survives: the grid answers in whole 100 m cells, an exact
+/// bounding-box test throws out most of what a cell offers, and only what is left is
+/// clipped. The scan stays proportional to the parts, not to the parts times the
+/// outlines.
+fn outline_claims(
     ring: &[Vec3],
     index: &OutlineIndex,
-    closed_outlines: &[Vec<Vec3>],
-) -> Option<usize> {
-    let mut sum = Vec3::ZERO;
-    for p in ring {
-        sum = sum + *p;
+    outlines: &[Outline],
+    scratch: &mut Vec<usize>,
+) -> Vec<(f64, usize)> {
+    let Some((part_min, part_max)) = ring_bounds(ring) else {
+        return Vec::new();
+    };
+    // A part with no area at all — a ring folded onto a line — shares nothing with
+    // anything, so the floor below leaves it an orphan.
+    let floor = PART_COVERAGE_MIN * ring_area_m2(ring);
+    let mut claims: Vec<(f64, usize)> = Vec::new();
+    index.candidates_over(part_min, part_max, scratch);
+    for which in scratch.iter().copied() {
+        let Some((min, max)) = outlines[which].bounds else {
+            continue;
+        };
+        // The index answers in whole 100 m cells; this is the exact box test, and on the
+        // Phase 1 extract it rejects 86% of what the cells offer before any clipping.
+        if min.x > part_max.x || max.x < part_min.x || min.y > part_max.y || max.y < part_min.y {
+            continue;
+        }
+        let shared = polygon_overlap_m2(ring, &outlines[which].ring);
+        if shared > 0.0 && shared >= floor {
+            claims.push((shared, which));
+        }
     }
-    let mean = sum.scale(1.0 / ring.len() as f64);
-    for probe in [mean, ring[0]] {
-        let mut best: Option<(f64, usize)> = None;
-        for which in index.candidates(probe) {
-            let outline = &closed_outlines[which];
-            if outline.len() < 4 || !crate::model::point_in_ring(outline, probe) {
+    claims
+}
+
+/// True if outline `inner` lies inside outline `outer`, up to [`OUTLINE_NESTED_MIN`].
+fn is_nested_in(inner: &[Vec3], outer: &[Vec3]) -> bool {
+    let area = ring_area_m2(inner);
+    area > 0.0 && polygon_overlap_m2(inner, outer) >= OUTLINE_NESTED_MIN * area
+}
+
+/// Which of the outlines that claim a part is its parent. `claims` is what
+/// [`outline_claims`] returned and holds at least two entries.
+///
+/// # The ladder, and the case that forces each rung
+///
+/// 1. **The outline that shares the most footprint with the part.** Nearly every
+///    contested part is settled here: part 261243304 is 1.0000 inside One United Nations
+///    Plaza and 0.8533 inside the roof next door, and part 291189626 is 1.0000 inside
+///    the Helmsley Building and 0.9553 inside the market hall in its concourse. A part
+///    that hangs over the edge of a candidate is not a subdivision of it.
+///
+/// 2. **Where several outlines contain the whole part ([`PART_INSIDE_MIN`]), the
+///    innermost one** — the candidate nested inside all the others. The United Nations
+///    Secretariat Building's outline (1 920 m²) is drawn wholly inside the United
+///    Nations Headquarters outline (16 441 m², the whole campus), and the Secretariat's
+///    two parts are 1.0000 inside both. They are the Secretariat's: the campus outline
+///    is the site, the Secretariat outline is the building on it, and taking the campus
+///    would stand a 156 m prism on 16 441 m² of lawn and river frontage. Nesting decides
+///    this one and area cannot — area would pick the campus, and the smallest-area rule
+///    that this replaces happened to pick the Secretariat for the same reason it picked
+///    the wrong parent elsewhere.
+///
+/// 3. **Otherwise, the outline that is already subdivided into parts.** Two named cases
+///    reach this rung and nothing else in the extract does. Part 1473999184 (24 m²,
+///    155 m, starting 60 m up) is 1.0000 inside both Rose Hill (905 m²) and the 156 m²
+///    building beside it, because those two footprints overlap in a 23.8 m² sliver and
+///    the part *is* that sliver: it is the tower's overhang over its neighbour's lot,
+///    drawn on the neighbour's own nodes. Neither outline is nested in the other — they
+///    share 2.6% and 15.2% of themselves — so rung 2 says nothing. What separates them
+///    is that Rose Hill is mapped part by part (seven parts of its own, no other
+///    claimant) and the neighbour is a plain 25.2 m footprint with no parts at all: a
+///    structure that is not subdivided has no subdivisions, so the sliver is Rose Hill's.
+///    Part 283472143 is the same shape of case at 785 Eighth Avenue (four parts of its
+///    own) against a three-storey neighbour with none.
+///
+/// 4. **Ascending candidate index**, which is ascending OSM way id and then ascending
+///    OSM relation id — the order pass 1 builds candidates in. Nothing in the extract
+///    reaches this rung; it is here so that the answer can never depend on iteration
+///    order (crate rule 2), and [`OutlineIndex::candidates_over`] hands the claims over
+///    in that order for the same reason.
+///
+/// # What it does not look at
+///
+/// Interior holes. [`Outline`] carries outer rings only, so a part standing in a
+/// courtyard counts as inside the outline around the courtyard, exactly as it did under
+/// the point test. Folding it in is also the conservative answer for an obstacle model:
+/// it raises an existing structure rather than inventing a free-standing one.
+///
+/// Tags, too — heights especially. The wrong parents all had a tagged height far below
+/// the part's, so "a part may not be taller than its parent says it is" would also have
+/// caught them, but it would be wrong in general: Midtown is mapped part-first and the
+/// Chrysler Building's outline carries no height at all, which is exactly why the fold
+/// exists.
+fn choose_parent(
+    part_area: f64,
+    claims: &[(f64, usize)],
+    outlines: &[Outline],
+    subdivided: &[bool],
+) -> usize {
+    // Rung 1.
+    let mut best = claims[0];
+    for &(shared, which) in &claims[1..] {
+        if shared > best.0 {
+            best = (shared, which);
+        }
+    }
+    let inside: Vec<usize> = claims
+        .iter()
+        .filter(|(shared, _)| *shared >= PART_INSIDE_MIN * part_area)
+        .map(|(_, which)| *which)
+        .collect();
+    if inside.len() < 2 {
+        return best.1;
+    }
+    // Rung 2: the candidate nested inside every other candidate.
+    let mut innermost: Option<usize> = None;
+    for &which in &inside {
+        let nested_in_all = inside.iter().all(|&other| {
+            other == which || is_nested_in(&outlines[which].ring, &outlines[other].ring)
+        });
+        if nested_in_all {
+            // Two coincident outlines are each nested in the other; the lower index
+            // wins, which is rung 4 reached early.
+            innermost = Some(innermost.map_or(which, |prev: usize| prev.min(which)));
+        }
+    }
+    if let Some(which) = innermost {
+        return which;
+    }
+    // Rung 3, then rung 4. `inside` is in ascending candidate index, so `find` is the
+    // lowest index in whichever set it is asked for.
+    inside
+        .iter()
+        .find(|&&which| subdivided[which])
+        .or_else(|| inside.first())
+        .copied()
+        .unwrap_or(best.1)
+}
+
+/// The axis-aligned bounds of a ring as `(min, max)`, or `None` if it has no points.
+fn ring_bounds(ring: &[Vec3]) -> Option<(Vec3, Vec3)> {
+    let first = *ring.first()?;
+    let (mut min, mut max) = (first, first);
+    for p in ring {
+        min = Vec3::new_2d(min.x.min(p.x), min.y.min(p.y));
+        max = Vec3::new_2d(max.x.max(p.x), max.y.max(p.y));
+    }
+    Some((min, max))
+}
+
+/// A ring without the closing point, so that a closed ring and an open one describe the
+/// same polygon to the area code below.
+fn open_slice(ring: &[Vec3]) -> &[Vec3] {
+    match (ring.first(), ring.last()) {
+        (Some(f), Some(l)) if ring.len() > 1 && f.x == l.x && f.y == l.y => &ring[..ring.len() - 1],
+        _ => ring,
+    }
+}
+
+/// The area two simple polygons share, m². Zero when they are disjoint or touch only
+/// along an edge.
+///
+/// Each polygon is decomposed into the fan of triangles `(o, v[i], v[i+1])` about a
+/// common origin `o`, taken **signed**: the sum of the signed fans is the polygon's own
+/// signed area, and the sum of the signed indicator functions is the polygon's indicator
+/// function, including where the fan folds back over itself. A concave footprint is
+/// therefore exact, not approximated, and no polygon-clipping library is needed — the
+/// only clip performed is triangle against triangle, and a triangle is convex, so
+/// Sutherland–Hodgman is exact for it.
+///
+/// So the shared area is `Σ_i Σ_j sign(a_i)·sign(b_j)·|a_i ∩ b_j|` over the two fans,
+/// with both rings first turned counter-clockwise so that the sum comes out positive.
+///
+/// Arithmetic: multiply, add, subtract, and one division per clipped edge. No
+/// `sqrt`, no trigonometry, nothing from the platform's libm (crate rule 4), so two
+/// machines agree on the last bit. The summation order is `i` then `j` over the rings as
+/// given, so it is also the same number on every run.
+///
+/// Cost is `O(n·m)` triangle clips for an `n`- and an `m`-vertex ring, which is why the
+/// caller reaches it only for a candidate whose bounding box already meets the part's.
+fn polygon_overlap_m2(a: &[Vec3], b: &[Vec3]) -> f64 {
+    let (a, b) = (open_slice(a), open_slice(b));
+    if a.len() < 3 || b.len() < 3 {
+        return 0.0;
+    }
+    // Counter-clockwise, and about an origin on the smaller ring: the coordinates that
+    // reach the cross products are then metres across one building rather than
+    // kilometres across the city, which is where the precision goes.
+    let ccw_a = crate::model::ring_signed_area_2x(a) >= 0.0;
+    let ccw_b = crate::model::ring_signed_area_2x(b) >= 0.0;
+    let at = |i: usize| a[if ccw_a { i } else { a.len() - 1 - i }];
+    let bt = |j: usize| b[if ccw_b { j } else { b.len() - 1 - j }];
+    let origin = a[0];
+    let mut acc = 0.0;
+    for i in 0..a.len() {
+        let (a0, a1) = (at(i) - origin, at((i + 1) % a.len()) - origin);
+        let sa = a0.x * a1.y - a1.x * a0.y;
+        if sa == 0.0 {
+            continue;
+        }
+        let tri_a = if sa > 0.0 {
+            [Vec3::ZERO, a0, a1]
+        } else {
+            [Vec3::ZERO, a1, a0]
+        };
+        for j in 0..b.len() {
+            let (b0, b1) = (bt(j) - origin, bt((j + 1) % b.len()) - origin);
+            let sb = b0.x * b1.y - b1.x * b0.y;
+            if sb == 0.0 {
                 continue;
             }
-            let area = ring_area_m2(outline);
-            if best.is_none_or(|(a, w)| area < a || (area == a && which < w)) {
-                best = Some((area, which));
+            let tri_b = if sb > 0.0 {
+                [Vec3::ZERO, b0, b1]
+            } else {
+                [Vec3::ZERO, b1, b0]
+            };
+            let shared = triangle_overlap_m2(tri_a, tri_b);
+            if shared == 0.0 {
+                continue;
+            }
+            if (sa > 0.0) == (sb > 0.0) {
+                acc += shared;
+            } else {
+                acc -= shared;
             }
         }
-        if let Some((_, which)) = best {
-            return Some(which);
+    }
+    // Both fans are of the same handedness as their ring, so the sum is non-negative up
+    // to rounding; a hair below zero is a cancelled sum, not a negative area.
+    acc.max(0.0)
+}
+
+/// The area two counter-clockwise triangles share, m².
+///
+/// Sutherland–Hodgman: the first triangle is cut by each edge of the second in turn.
+/// Clipping a convex polygon by a half-plane adds at most one vertex, so three cuts of a
+/// triangle can reach six vertices and never more — the buffers are fixed-size and
+/// nothing allocates.
+fn triangle_overlap_m2(subject: [Vec3; 3], clip: [Vec3; 3]) -> f64 {
+    let mut poly = [Vec3::ZERO; 8];
+    let mut n = 3;
+    poly[..3].copy_from_slice(&subject);
+    let mut next = [Vec3::ZERO; 8];
+    for e in 0..3 {
+        let (c0, c1) = (clip[e], clip[(e + 1) % 3]);
+        let (ex, ey) = (c1.x - c0.x, c1.y - c0.y);
+        // Positive to the left of the directed edge, which is inside a CCW triangle.
+        let side = |p: Vec3| ex * (p.y - c0.y) - ey * (p.x - c0.x);
+        let mut m = 0;
+        for k in 0..n {
+            let (p, q) = (poly[k], poly[(k + 1) % n]);
+            let (dp, dq) = (side(p), side(q));
+            if dp >= 0.0 {
+                next[m] = p;
+                m += 1;
+            }
+            if (dp > 0.0 && dq < 0.0) || (dp < 0.0 && dq > 0.0) {
+                let t = dp / (dp - dq);
+                next[m] = Vec3::new_2d(p.x + t * (q.x - p.x), p.y + t * (q.y - p.y));
+                m += 1;
+            }
+        }
+        n = m;
+        poly[..n].copy_from_slice(&next[..n]);
+        if n < 3 {
+            return 0.0;
         }
     }
-    None
+    // Shoelace over the clipped convex polygon, in the order it was built.
+    let mut twice = 0.0;
+    for k in 0..n {
+        let (p, q) = (poly[k], poly[(k + 1) % n]);
+        twice += p.x * q.y - q.x * p.y;
+    }
+    (twice * 0.5).abs()
 }
 
 /// The area of a closed ring, m².
@@ -7058,11 +7435,34 @@ pub fn card() -> ModelCard {
         Parameter::new("yellow_min_s", "s", 3.0.into(), fhwa()),
         Parameter::new("yellow_max_s", "s", 6.0.into(), fhwa()),
         Parameter::new("height_tag_rule", "-", "height".into(), osm_wiki()),
+        // V1: which outline a part is folded into, and on what evidence.
+        Parameter::new(
+            "building_part_parent_rule",
+            "-",
+            "greatest shared footprint area, at least 0.50 of the part; among outlines \
+             covering 0.99 or more of it, the one nested in the others, then the one \
+             already subdivided into parts, then the lower OSM id"
+                .into(),
+            Source::new(
+                SourceKind::Code,
+                "OSM Simple 3D Buildings says a building:part subdivides the building=* \
+                 outline it lies in, which is a statement about two polygons, so the \
+                 parent is chosen by clipped overlap area rather than by testing one \
+                 point of the part. The thresholds are read off the Phase 1 Manhattan \
+                 extract, where they have nothing near them: of 4 373 parts, every one \
+                 that has a parent is 0.934 or more covered by it and the runner-up is \
+                 0.32 or less, and of the nine parts that more than one outline claims \
+                 the covering fraction is either 1.0000 to four decimals or 0.9553 or \
+                 less. The tie-breaks are each forced by a real case: the United Nations \
+                 Secretariat inside the United Nations Headquarters campus for nesting, \
+                 Rose Hill against the 156 m² building beside it for subdivision",
+            ),
+        ),
         // V1: what "folded into its outline" does to the height, and what it costs.
         Parameter::new(
             "building_parts_as_max_height",
             "-",
-            "outline height = max(own height, tallest contained building:part)".into(),
+            "outline height = max(own height, tallest building:part folded into it)".into(),
             Source::new(
                 SourceKind::Code,
                 "OSM Simple 3D Buildings says a building:part subdivides its outline, so \

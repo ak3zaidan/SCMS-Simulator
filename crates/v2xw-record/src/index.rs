@@ -40,6 +40,33 @@
 //!
 //! `tests/fuzz_corrupt.rs` flips and truncates across a whole recording and asserts the
 //! promise.
+//!
+//! # Nothing here does unchecked arithmetic on a wire value either
+//!
+//! The same promise has a second half, and it was false here too. The chunk-index bounds
+//! check read `if c.file_offset + c.record_length > size`, an unchecked 64-bit addition of
+//! two numbers taken straight out of the chunk index. It failed differently in each build
+//! profile: a `file_offset` of `u64::MAX` panicked in debug, and in release the addition
+//! wrapped, the sum came out small, the check *passed* and the corrupt file was accepted.
+//! Release is what people run, so the shipped behaviour was silent acceptance — the exact
+//! failure a bounds check exists to prevent.
+//!
+//! Every offset, length, count and capacity this module derives from a recording is
+//! therefore computed with checked arithmetic and refused as
+//! [`RecordError::WireOverflow`] if it does not fit, including the two siblings that are
+//! bounded today only by someone else's invariant: `offset + RECORD_PREFIX` in
+//! `SeekIndex::read_message_indexes`, which is guarded only by the saturating comparison
+//! inside the two [`Source`] implementations, and the chunk record's `compressed_size`,
+//! which is guarded only by `mcap::read::parse_record`. `tests/overflow.rs` runs the
+//! chunk-index case in **both** profiles, because the two behaviours differ and release is
+//! the dangerous one.
+//!
+//! # What was checked is reported, never assumed
+//!
+//! A chunk's CRC can be switched off from the wire — `uncompressed_crc = 0` is the
+//! container's "not present" — so [`SeekIndex::for_each_message_in_chunk`] returns
+//! [`ChunkIntegrity`] rather than `()`. The policy, and the reasoning behind choosing it
+//! over refusing and over ignoring, is on [`ChunkIntegrity`].
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -68,6 +95,56 @@ pub const FOOTER_BODY: usize = 20;
 /// that genuinely needs a larger chunk is refused with a named error, which is the right
 /// answer: the alternative is trusting a number a bit flip can choose.
 pub const MAX_CHUNK_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Whether a chunk's contents were actually checked against a stored checksum.
+///
+/// # Why this is a return value and not an assumption
+///
+/// MCAP protects a chunk with a CRC-32 over its uncompressed records, and this reader
+/// verifies it *before* parsing anything inside the chunk. But the container defines
+/// `uncompressed_crc = 0` as "no CRC is available", so the field is also the switch that
+/// turns the check off — and the switch is four bytes of the file, which is to say it is
+/// under the control of whoever supplied the file. Zeroing it skips validation entirely.
+///
+/// # The policy, and why
+///
+/// **A chunk without a checksum is read, and the fact that nothing was checked is
+/// reported.** Neither of the alternatives is right:
+///
+/// * *Refusing it* would reject a conforming file. A zero CRC is explicitly legal, and a
+///   producer that streams into a chunk it cannot rewind to cannot compute one. This
+///   crate would be the tool that cannot open half the files in the ecosystem.
+/// * *Accepting it silently* is what was wrong before, and it is the worse failure. Every
+///   recording [`crate::writer::RecordingWriter`] produces carries a CRC on every chunk,
+///   so a zero on read means an unusual producer or tampering, and the one behaviour that
+///   must never happen is this crate calling a file verified when it checked nothing.
+///
+/// So the check is reported rather than assumed. [`SeekIndex::for_each_message_in_chunk`]
+/// returns which of the two happened, [`crate::VerifyReport::chunks_without_checksum`]
+/// counts them across a whole recording and
+/// [`crate::VerifyReport::integrity_verified`] is false as soon as one is found, and a
+/// caller that would rather refuse — an archive ingest, a conformance kit — turns on
+/// [`crate::Reader::require_chunk_checksums`] and gets
+/// [`RecordError::UncheckedChunk`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChunkIntegrity {
+    /// The chunk declared a non-zero CRC-32 and it matched, checked before any record
+    /// inside the chunk was parsed.
+    Verified,
+    /// The chunk declared `uncompressed_crc = 0`, the container's "not present", so
+    /// nothing about its contents was checked. The records were still read under every
+    /// other guard — the header cross-check against the chunk index, the
+    /// [`MAX_CHUNK_UNCOMPRESSED_BYTES`] ceiling and the per-record length cap — but no
+    /// checksum stands behind them.
+    NotChecked,
+}
+
+impl ChunkIntegrity {
+    /// True only for [`ChunkIntegrity::Verified`].
+    pub const fn is_verified(self) -> bool {
+        matches!(self, ChunkIntegrity::Verified)
+    }
+}
 
 /// Somewhere bytes can be read from by offset.
 ///
@@ -366,13 +443,28 @@ impl SeekIndex {
         }
         index.chunks.sort_by_key(|c| c.file_offset);
         for c in &index.chunks {
-            if c.file_offset + c.record_length > size {
+            // Both operands come straight out of the chunk index, so the file chooses
+            // them. `c.file_offset + c.record_length` was wrong in both build profiles at
+            // once: it panicked in debug on `file_offset = u64::MAX`, and in release it
+            // *wrapped* — the sum became small, this very check passed, and the corrupt
+            // file was accepted. Release is what people run, so the production behaviour
+            // was silent acceptance. `checked_add` makes the overflow the rejection.
+            let end = c.file_offset.checked_add(c.record_length).ok_or_else(|| {
+                RecordError::wire_overflow(
+                    "mcap chunk index",
+                    format!(
+                        "chunk at {} declares a length of {}, and {} + {} does not fit in 64 bits, so                          the chunk index cannot be describing a real file",
+                        c.file_offset, c.record_length, c.file_offset, c.record_length
+                    ),
+                )
+            })?;
+            if end > size {
                 return Err(RecordError::malformed(
                     "mcap chunk index",
                     format!(
                         "chunk at {} runs {} bytes past the end of a {size}-byte file",
                         c.file_offset,
-                        c.file_offset + c.record_length - size
+                        end - size
                     ),
                 ));
             }
@@ -403,10 +495,28 @@ impl SeekIndex {
                 if !want_kf && !want_delta {
                     continue;
                 }
+                // The sibling of the chunk-index overflow above, and the reason it is
+                // checked here rather than argued about: `offset` is a wire value, and
+                // `offset + RECORD_PREFIX` can only overflow when `offset` is within nine
+                // bytes of `u64::MAX`. Today the `read_at` on the line below refuses
+                // every such offset first, because both `Source` implementations compare
+                // a *saturating* `offset + len` against the file size — but that is an
+                // invariant of two other types, reachable only by reading them, and a
+                // `Source` written elsewhere that did not saturate would hand this line a
+                // wrapped offset pointing at byte 8 of the file. One `checked_add` costs
+                // nothing and does not depend on anyone else's arithmetic.
+                let body_at = offset.checked_add(RECORD_PREFIX as u64).ok_or_else(|| {
+                    RecordError::wire_overflow(
+                        "mcap message index",
+                        format!(
+                            "a message-index record at {offset} plus its {RECORD_PREFIX}-byte prefix does                              not fit in 64 bits"
+                        ),
+                    )
+                })?;
                 let prefix = src.read_at(*offset, RECORD_PREFIX)?;
                 let len = u64::from_le_bytes(prefix[1..9].try_into().unwrap_or([0; 8]));
                 let len = usize::try_from(len).unwrap_or(0);
-                let body = src.read_at(*offset + RECORD_PREFIX as u64, len)?;
+                let body = src.read_at(body_at, len)?;
                 let records::Record::MessageIndex(mi) = mcap::read::parse_record(prefix[0], &body)?
                 else {
                     return Err(RecordError::malformed(
@@ -459,18 +569,26 @@ impl SeekIndex {
     /// This is §7.3 steps 5–7: exactly one chunk's bytes leave the disk, and exactly one
     /// chunk is decompressed.
     ///
+    /// # What the return value says
+    ///
+    /// [`ChunkIntegrity`], because the chunk's checksum can be switched off from the wire
+    /// and a caller that is about to call the file verified needs to know whether anything
+    /// was checked. See [`ChunkIntegrity`] for the policy and why it is this one.
+    ///
     /// # Errors
     /// [`RecordError::Truncated`] if the chunk range is outside the file,
     /// [`RecordError::Malformed`] if the record at the chunk offset is not a chunk or its
-    /// header disagrees with the chunk index, and [`RecordError::Mcap`] if decompression,
-    /// the chunk CRC or record parsing fails. Never a panic, an abort or an allocation
-    /// sized by a number that came off the wire unchecked — see the module note.
+    /// header disagrees with the chunk index, [`RecordError::WireOverflow`] if a length in
+    /// the chunk header does not fit the arithmetic that would use it, and
+    /// [`RecordError::Mcap`] if decompression, the chunk CRC or record parsing fails.
+    /// Never a panic, an abort or an allocation sized by a number that came off the wire
+    /// unchecked — see the module note.
     pub fn for_each_message_in_chunk(
         &self,
         src: &mut impl Source,
         chunk: usize,
         mut f: impl FnMut(&records::MessageHeader, &[u8], u16) -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<ChunkIntegrity> {
         let span = self.chunks.get(chunk).ok_or_else(|| {
             RecordError::malformed("mcap chunk index", format!("no chunk {chunk}"))
         })?;
@@ -491,7 +609,8 @@ impl SeekIndex {
                 ),
             ));
         }
-        let limit = self.validated_chunk_header(chunk, span, &bytes[RECORD_PREFIX..])?;
+        let (limit, integrity) =
+            self.validated_chunk_header(chunk, span, &bytes[RECORD_PREFIX..])?;
         let mut reader = mcap::sans_io::LinearReader::new_with_options(
             mcap::sans_io::LinearReaderOptions::default()
                 // The buffer is one chunk record, not a file: no magic at either end.
@@ -526,7 +645,7 @@ impl SeekIndex {
                 }
             }
         }
-        Ok(())
+        Ok(integrity)
     }
 
     /// Cross-checks a chunk record's own header against the summary's chunk index and
@@ -537,7 +656,16 @@ impl SeekIndex {
     /// a different part of the file, so a bit flip in either one is caught by the
     /// disagreement. Everything a decompressor would size an allocation from is checked
     /// here, before it is handed over.
-    fn validated_chunk_header(&self, chunk: usize, span: &ChunkSpan, body: &[u8]) -> Result<usize> {
+    ///
+    /// Returns the record-length cap and whether the chunk carries a checksum at all — the
+    /// second is [`ChunkIntegrity`]'s reason for existing, and it is read here because this
+    /// is the one place the chunk's own header is decoded.
+    fn validated_chunk_header(
+        &self,
+        chunk: usize,
+        span: &ChunkSpan,
+        body: &[u8],
+    ) -> Result<(usize, ChunkIntegrity)> {
         let header = match mcap::read::parse_record(op::CHUNK, body)? {
             records::Record::Chunk { header, .. } => header,
             _ => {
@@ -599,10 +727,24 @@ impl SeekIndex {
         // empty input and a non-empty output buffer, which is a spin, not an error.
         // Requiring the record to add up refuses that here instead.
         const CHUNK_HEADER_FIXED: u64 = 8 + 8 + 8 + 4 + 4 + 8;
-        let declared = RECORD_PREFIX as u64
-            + CHUNK_HEADER_FIXED
-            + header.compression.len() as u64
-            + header.compressed_size;
+        // `compressed_size` is a wire `u64`. `mcap::read::parse_record` already refuses a
+        // chunk whose `compressed_size` exceeds the bytes present, so today this sum is
+        // bounded by the record length — but that is the MCAP crate's invariant, not this
+        // function's, and an unchecked `+` here would have exactly the shape that made the
+        // chunk-index check useless: a wrap could land on `span.record_length` and pass.
+        let declared = (RECORD_PREFIX as u64)
+            .checked_add(CHUNK_HEADER_FIXED)
+            .and_then(|n| n.checked_add(header.compression.len() as u64))
+            .and_then(|n| n.checked_add(header.compressed_size))
+            .ok_or_else(|| {
+                RecordError::wire_overflow(
+                    "mcap chunk",
+                    format!(
+                        "chunk {chunk} declares {} compressed bytes, which with its header does not fit                          in 64 bits",
+                        header.compressed_size
+                    ),
+                )
+            })?;
         if declared != span.record_length {
             return Err(RecordError::malformed(
                 "mcap chunk",
@@ -614,9 +756,24 @@ impl SeekIndex {
                 ),
             ));
         }
+        // §4 of the MCAP specification: "A zero value indicates that CRC validation should
+        // not be performed." `LinearReader` implements that literally — `prevalidate_chunk_crcs`
+        // is skipped when the stored CRC is zero — so the four bytes at chunk-header offset
+        // 24 are a switch the file can throw to turn this reader's only content check off.
+        // The chunk is still read, because a zero CRC is legal and a conforming third-party
+        // file must not be refused over it, but the caller is told, because reporting a file
+        // as verified when nothing was checked is the failure that must not happen.
+        let integrity = if header.uncompressed_crc == 0 {
+            ChunkIntegrity::NotChecked
+        } else {
+            ChunkIntegrity::Verified
+        };
         // `usize::try_from` cannot fail after the ceiling above on any target this crate
         // builds for; `unwrap_or` keeps the promise on one where it could.
-        Ok(usize::try_from(header.uncompressed_size).unwrap_or(usize::MAX))
+        Ok((
+            usize::try_from(header.uncompressed_size).unwrap_or(usize::MAX),
+            integrity,
+        ))
     }
 
     /// Reads a metadata record by name, returning its key/value map.

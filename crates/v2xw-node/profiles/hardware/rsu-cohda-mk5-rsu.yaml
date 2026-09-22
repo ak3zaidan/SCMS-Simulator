@@ -1,0 +1,51 @@
+# 06-node-models.md §7.6, second RSU profile. The RSU brief publishes radio figures only;
+# every compute and HSM field is not-published and the OBU block is the flagged proxy.
+id: rsu/cohda-mk5-rsu
+kind: rsu
+version: 2026-09-18.1
+purpose: >-
+  Roadside unit (Cohda MK5 RSU). Shares the MK5 OBU radio, but the RSU brief publishes
+  module-level radio specifications only, so every compute and security field here is
+  not-published with obu/cohda-mk5 named as the proxy to inherit from.
+sources:
+  - {kind: product-brief, ref: "Cohda MK5 RSU product brief [R7 §C1: pdftxt/cohda_mk5_rsu_brief.txt]", accessed: 2026-09-18}
+  - {kind: product-brief, ref: "Cohda MK5 OBU brief (compute/HSM proxy) [R7 §A1; §7.10 #1]", accessed: 2026-09-18}
+cpu:
+  cores: {value: null, status: not-published, calibration: "NOT PUBLISHED in the RSU brief, which gives module-level radio specifications only; presumably the MK5 OBU's i.MX6 DL, but the brief does not restate it [R7 §C1]. Use the obu/cohda-mk5 cpu block as a flagged proxy, or read /proc/cpuinfo on the device"}
+  clock_hz: {value: null, status: not-published, calibration: "NOT PUBLISHED in the RSU brief, as for cpu.cores; the obu/cohda-mk5 proxy does not publish the core clock either, so measure it on the device"}
+  arch: {value: null, status: not-published, calibration: "NOT PUBLISHED in the RSU brief, as for cpu.cores; confirm the core type and ISA from the NXP i.MX6 DualLite datasheet"}
+  dmips: {value: null, status: not-published, calibration: "NOT PUBLISHED in the RSU brief, as for cpu.cores; the obu/cohda-mk5 proxy is 4000 DMIPS [R7 §A1], to be confirmed on the device"}
+ram_bytes: {value: null, status: not-published, calibration: "NOT PUBLISHED in the RSU brief; obu/cohda-mk5 proxy is 1 GB [R7 §A1]"}
+flash_bytes: {value: null, status: not-published, calibration: "NOT PUBLISHED in the RSU brief; obu/cohda-mk5 proxy is 4 GB eMMC [R7 §A1]"}
+hsm:
+  kind: secure-element
+  part: {value: null, status: not-published, calibration: "NOT PUBLISHED in the RSU brief; presumably an SXF17xx like the MK5 OBU [R7 §C1]. Use the obu/cohda-mk5 hsm block (SAF5400 2000/s verify proxy, sign NOT PUBLISHED) and flag it"}
+  ops:
+    ecdsa-p256-verify:
+      throughput_per_s: {value: null, status: not-published, calibration: "inherit obu/cohda-mk5, whose own figure is the flagged NXP SAF5400 proxy of 2000/s [R7 §D5]"}
+      latency_us: {value: null, status: not-published, calibration: "inherit obu/cohda-mk5; measure on device"}
+      runs_on: {value: null, status: not-published, calibration: "inherit obu/cohda-mk5, where verification is in the baseband engine"}
+    ecdsa-p256-sign:
+      throughput_per_s: {value: null, status: not-published, calibration: "inherit obu/cohda-mk5, where it is NOT PUBLISHED [R7 §A1]"}
+      latency_us: {value: null, status: not-published, calibration: "inherit obu/cohda-mk5, where it is NOT PUBLISHED [R7 §A1]"}
+      runs_on: hsm
+  queue_depth: {value: null, status: todo-calibrate, calibration: "not published; measure with back-to-back sign requests"}
+  servers: {value: null, status: todo-calibrate, calibration: "not published; inherit obu/cohda-mk5's single-server assumption or measure"}
+software_crypto:
+  ecdsa-p256-verify: {us: null, status: not-published, calibration: "inherit obu/cohda-mk5: no benchmark on this SoC exists; PROXY = Pi 3B 1290 us [R7 §D8]"}
+  ecdsa-p256-sign: {us: null, status: not-published, calibration: "inherit obu/cohda-mk5: PROXY = Pi 3B 613 us [R7 §D8]"}
+radio:
+  rat: [dsrc-80211p]
+  chipset: {value: "NXP SAF5100-based RoadLINK, same as the MK5 OBU", source: "[R7 §C1]"}
+  tx_power_dbm:
+    min: {value: -10.0, source: "module datasheet [R7 §A1]"}
+    max: {value: 22.0, source: "\"+22 dBm (ETSI Mask C)\" [R7 §C1]"}
+    default: {value: 20.0, source: "J2945/1 baseline [R7 §H3]"}
+  sensitivity_dbm: {value: -99.0, source: "-99 dBm @ 3 Mbps [R7 §C1]; per-MCS not published, see the §7.1 proxy"}
+  noise_figure_db: {value: 6.0, source: "NXP RoadLINK chip-level 6 dB @ 5.9 GHz [R7 §D5, §G]"}
+  antenna:
+    gain_dbi: {value: null, status: not-published, calibration: "not stated; the site antenna's datasheet gives it"}
+    height_m: {value: 5.0, status: evaluation-assumption, source: "no mounting height appears in the USDOT pilot facts [R7 §C7]; 3GPP TR 36.885 UE-type RSU 5 m [R2 Topic A]. Set per site"}
+    pattern: {value: null, status: not-published, calibration: "site-specific; take from the fitted antenna's datasheet"}
+power_w: {value: null, status: not-published, calibration: "PoE; draw not stated [R7 §C1]; measure at the injector"}
+storage_model: inherit

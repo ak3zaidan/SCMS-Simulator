@@ -137,8 +137,18 @@ impl MetricBody {
                 format!("off_samples = {off_samples} must be 8-aligned (§3.7)"),
             ));
         }
+        // `m` is a wire `u32` about to size an allocation, and `record_size` — already
+        // checked to be at least v1's — is the exact stride, so it is also the right bound.
+        let m = crate::wire::checked_count(
+            m,
+            (record_size as usize).max(RECORD_SIZE_V1 as usize),
+            body.len(),
+            WHAT,
+            "sample_count",
+        )?;
         let mut samples = Vec::with_capacity(m);
         for i in 0..m {
+            // Bounded by the check above: `m * record_size <= body.len()`.
             let at = off_samples + i * record_size as usize;
             samples.push(MetricRow {
                 value: get_f64(body, at, WHAT)?,

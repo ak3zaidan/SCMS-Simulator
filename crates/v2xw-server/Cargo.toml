@@ -9,15 +9,33 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# The contract crate: SimTime, ids, deterministic math, model cards.
 v2xw-core = { workspace = true }
+# The world model and the `vwp-world/1` payload writer (vwp-v1 §4), reused rather than
+# re-encoded: the world endpoint serves exactly the bytes this writer produced.
 v2xw-world = { workspace = true }
-v2xw-mobility = { workspace = true }
-v2xw-radio = { workspace = true }
-v2xw-net = { workspace = true }
-v2xw-msg = { workspace = true }
-v2xw-sec = { workspace = true }
-v2xw-node = { workspace = true }
-v2xw-proto = { workspace = true }
-v2xw-threat = { workspace = true }
-v2xw-metrics = { workspace = true }
+# The single VWP frame encoder and decoder (vwp-v1 §2, §3) and the replay reader (§7).
+# There is deliberately no second encoder in this crate: two encoders drift.
 v2xw-record = { workspace = true }
+# HTTP and the WebSocket upgrade. `ws` is not an axum default feature.
+axum = { workspace = true, features = ["ws"] }
+tokio = { workspace = true }
+# JSON-RPC 2.0 bodies, the OpenRPC document and every introspection result.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Crate-wide error type.
+thiserror = { workspace = true }
+# Structured logs; also the source of the `log` notification of §6.14.
+tracing = { workspace = true }
+# Non-async locks around run state that is touched from both the producer task and the
+# connection tasks. Held for microseconds and never across an await.
+parking_lot = { workspace = true }
+# The session token and the run-id digest.
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[[bin]]
+name = "v2xw-server"
+path = "src/bin/server.rs"
