@@ -2558,6 +2558,7 @@ dependencies = [
  "thiserror",
  "v2xw-core",
  "v2xw-engine",
+ "v2xw-experiment",
  "v2xw-metrics",
  "v2xw-mobility",
  "v2xw-msg",
@@ -2570,6 +2571,34 @@ dependencies = [
  "v2xw-server",
  "v2xw-threat",
  "v2xw-world",
+]
+
+[[package]]
+name = "v2xw-conformance"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "v2xw-core",
+ "v2xw-engine",
+ "v2xw-node",
+ "v2xw-record",
+ "v2xw-server",
+ "v2xw-world",
+]
+
+[[package]]
+name = "v2xw-copilot"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "thiserror",
+ "v2xw-core",
+ "v2xw-engine",
+ "v2xw-metrics",
+ "v2xw-server",
 ]
 
 [[package]]
@@ -2608,6 +2637,19 @@ dependencies = [
  "v2xw-sec",
  "v2xw-threat",
  "v2xw-world",
+]
+
+[[package]]
+name = "v2xw-experiment"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "v2xw-core",
+ "v2xw-engine",
+ "v2xw-metrics",
+ "v2xw-record",
 ]
 
 [[package]]

@@ -1,0 +1,36 @@
+[package]
+name = "v2xw-copilot"
+description = "Natural-language assistant over the simulator's own registry and JSON-RPC surface. Reads and drives; never a result."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The contract crate: model cards, the registry, the licence gate. This is what every
+# grounded answer is read out of.
+v2xw-core = { workspace = true }
+# `MetricDef` and the provider set, for the metric half of the catalogue.
+v2xw-metrics = { workspace = true }
+# The OpenRPC document and `rpc::METHODS`. The tool surface is *generated* from these
+# rather than transcribed, which is the only way it cannot drift from the server
+# (09-ui.md §8: "the copilot's tool registry is generated from them").
+v2xw-server = { workspace = true }
+# The scenario schema, the migrator chain and `scenario::validate`, for scenario
+# authoring. A workspace member the root manifest's shared table does not list, exactly as
+# `v2xw-server` notes for the same dependency.
+v2xw-engine = { path = "../v2xw-engine", version = "0.1.0" }
+# Tool arguments, tool results, the OpenAI body, the OpenRPC document.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# A scenario draft arrives as YAML as often as JSON; this is the loader's own parser, so
+# the copilot and the engine cannot disagree about what a draft says.
+serde_yml = { workspace = true }
+# Crate-wide error type.
+thiserror = { workspace = true }
+
+# NOTE: there is deliberately no HTTP client, no TLS stack and no async runtime here.
+# `crate::http::HttpPost` is the seam; `CurlPost` is the shipped implementation and adds no
+# dependency. See `crate::boundary` for the rule this is part of.

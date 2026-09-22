@@ -137,6 +137,17 @@ impl RunRecorder for TeeRecorder<'_> {
         }
     }
 
+    // Forwarded, not defaulted. `RunRecorder::write_wire_frame` discards by default so a
+    // record-only recorder need not know the binary path exists, but a WRAPPER that
+    // forwards `write` and not this one silently drops the normative binary stream and
+    // nothing in the resulting file says so. That is exactly what happened here: every
+    // run wrote zero keyframes and zero deltas while reporting success.
+    fn write_wire_frame(&mut self, frame: &v2xw_record::wire::Frame) {
+        if let Some(w) = self.writer.as_deref_mut() {
+            let _ = w.write_frame(frame);
+        }
+    }
+
     fn refused(&self) -> u64 {
         self.refused
     }

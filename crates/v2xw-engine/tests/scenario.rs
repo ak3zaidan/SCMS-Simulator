@@ -215,3 +215,106 @@ time: {duration_seconds: 30}
     let err = Scenario::parse(text, None).expect_err("must not load");
     assert!(err.to_string().contains("duration_seconds"), "{err}");
 }
+
+/// A key this build cannot act on is refused, not accepted and ignored.
+///
+/// The vertical-slice audit's finding: six keys were validated, documented and hashed and
+/// never reached the engine, so the scenario file overstated what it controlled. Those six
+/// are now wired; the ones that remain genuinely unimplemented are refused here, each with
+/// the field named, so that an author finds out at load rather than by reading a result
+/// the file appears to explain and does not.
+#[test]
+fn a_key_the_engine_cannot_act_on_is_refused_and_names_itself() {
+    // Each case sets exactly one thing and expects exactly that field back. A case that
+    // set two would pass while one of the rules was missing.
+    let cases: Vec<(&str, Box<dyn Fn(&mut Scenario)>)> = vec![
+        (
+            "radio.tiers.focus",
+            Box::new(|s: &mut Scenario| {
+                s.radio.tiers.propagation = v2xw_core::card::Tier::Abstract;
+                s.radio.tiers.phy = v2xw_core::card::Tier::Abstract;
+                s.radio.tiers.mac = v2xw_core::card::Tier::Abstract;
+                s.radio.tiers.focus = Some(v2xw_engine::scenario::Focus {
+                    region: v2xw_engine::scenario::FocusRegion::Follow {
+                        node: 0,
+                        radius_m: 250.0,
+                    },
+                    tier: v2xw_core::card::Tier::High,
+                });
+            }),
+        ),
+        (
+            "actors.vru",
+            Box::new(|s: &mut Scenario| {
+                s.actors.vru.pedestrians = 40;
+                s.actors.vru.device_fraction = 0.5;
+            }),
+        ),
+        (
+            "exporters",
+            Box::new(|s: &mut Scenario| {
+                s.exporters = vec![v2xw_engine::scenario::ExporterSpec {
+                    id: "ma-dataset-v2".to_string(),
+                    opts: serde_json::Value::Null,
+                }];
+            }),
+        ),
+        (
+            "net.layer",
+            Box::new(|s: &mut Scenario| s.net.layer = "gn-btp".to_string()),
+        ),
+        (
+            "messages.sets[0]",
+            Box::new(|s: &mut Scenario| s.messages.sets = vec!["denm".to_string()]),
+        ),
+        (
+            "messages.codec_tier",
+            Box::new(|s: &mut Scenario| s.messages.codec_tier = "size-model".to_string()),
+        ),
+    ];
+
+    for (field, apply) in cases {
+        let mut s = Scenario::minimal();
+        apply(&mut s);
+        let errors = validate(&s);
+        let fields: Vec<&str> = errors.iter().filter_map(ScenarioError::field).collect();
+        assert!(
+            fields.contains(&field),
+            "setting {field} produced no error naming it: {errors:#?}"
+        );
+        for e in &errors {
+            let f = e.field().unwrap_or_else(|| panic!("{e} names no field"));
+            assert!(
+                e.to_string().starts_with(f),
+                "the message should lead with the field: {e}"
+            );
+        }
+    }
+}
+
+/// And the control: a scenario that sets none of them validates, so the rules above are
+/// refusing the keys rather than refusing everything.
+///
+/// The shipped scenarios are the fixture, because they are what the rules must not break.
+#[test]
+fn the_shipped_scenarios_still_validate() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("the crate is two levels below the workspace root")
+        .join("scenarios");
+    for name in [
+        "phase1-grid.yaml",
+        "phase1-manhattan.yaml",
+        "phase2-manhattan.yaml",
+    ] {
+        let path = repo.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let s = Scenario::load(&path).unwrap_or_else(|e| panic!("{name} does not load: {e}"));
+        let errors = validate(&s);
+        assert!(errors.is_empty(), "{name} no longer validates: {errors:#?}");
+    }
+    assert!(validate(&Scenario::minimal()).is_empty());
+}

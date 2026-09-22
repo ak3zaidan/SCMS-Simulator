@@ -1,0 +1,32 @@
+[package]
+name = "v2xw-experiment"
+description = "The experiment runner: parameter sweeps, replications, aggregation, resume."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The contract crate: SimTime, the ordered reductions, the canonical JSON and SHA-256 the
+# plan digest and the derived seeds are built from.
+v2xw-core = { workspace = true }
+# The scenario schema and its `experiment` block, plus the loader a run's materialised
+# scenario is written for.
+#
+# Not a `workspace = true` entry because `v2xw-engine` is a workspace member the root
+# manifest's shared dependency table does not list — the same reason `v2xw-cli` spells it
+# out (see that crate's manifest).
+v2xw-engine = { path = "../v2xw-engine", version = "0.1.0" }
+# `MetricSample` and the honest statistics: `Proportion` with the Wilson score interval,
+# `ConfidenceLevel`, and the insufficiency that replaces a point estimate over too few
+# samples. This crate computes no interval of its own for a proportion.
+v2xw-metrics = { workspace = true }
+# The exporters the results table is written through: Parquet, Arrow IPC and JSONL, each
+# quantising every float to its column's declared grid (D9).
+v2xw-record = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

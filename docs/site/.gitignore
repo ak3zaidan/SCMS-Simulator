@@ -1,0 +1,3 @@
+# The built site and the generated card dump are outputs, not sources.
+build/
+generated/

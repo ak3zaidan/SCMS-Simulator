@@ -53,9 +53,40 @@ pub trait RunRecorder {
     /// failing backend counts the failure and reports it at [`RunRecorder::finish`].
     fn write(&mut self, at: SimTime, record: &OwnedRecord);
 
+    /// Stores one VWP wire frame — a `Keyframe` or a `Delta` (vwp-v1 §3.3, §3.4).
+    ///
+    /// The engine's snapshot stream is *binary* and does not go through
+    /// [`RunRecorder::write`]: build decision D11 item 5 keeps the two encodings apart,
+    /// and §7.2's byte-identity guarantee attaches to the frame's own bytes, so a frame
+    /// is handed to the recorder verbatim rather than re-serialised as a record.
+    ///
+    /// Defaulted to a discard, so a recorder that only wants the record stream need not
+    /// know the binary path exists. **A recorder that wraps another one must forward
+    /// this**, exactly as it forwards [`RunRecorder::write`]. A wrapper that forwards
+    /// only `write` silently drops the normative binary stream — which is precisely the
+    /// defect this method exists to close — and nothing in the resulting file says so.
+    fn write_wire_frame(&mut self, frame: &v2xw_record::wire::Frame) {
+        let _ = frame;
+    }
+
     /// How many records were refused, for the run report.
     fn refused(&self) -> u64 {
         0
+    }
+
+    /// How many records the backend confirms it *stored*, when it can say.
+    ///
+    /// `None` means "this recorder cannot tell you", which is a different answer from
+    /// zero and is reported as such: [`crate::RunReport::records`] counts what the engine
+    /// emitted, and the two disagree whenever a write failed. A run report that quoted
+    /// only the emitted count could contradict the artefact lying beside it.
+    fn records_written(&self) -> Option<u64> {
+        None
+    }
+
+    /// How many VWP frames the backend confirms it stored, when it can say.
+    fn frames_written(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -63,6 +94,7 @@ pub trait RunRecorder {
 #[derive(Debug, Default)]
 pub struct MemoryRecorder {
     records: Vec<(SimTime, OwnedRecord)>,
+    frames: Vec<v2xw_record::wire::Frame>,
 }
 
 impl MemoryRecorder {
@@ -84,6 +116,33 @@ impl MemoryRecorder {
             .count()
     }
 
+    /// Every VWP frame written, in emission order.
+    ///
+    /// Kept separately from the records, and deliberately *not* part of
+    /// [`MemoryRecorder::digest_hex`]: the record digest is what the determinism
+    /// comparison is written against, and folding a second stream into it would change
+    /// every published digest for a reason that has nothing to do with determinism.
+    /// [`MemoryRecorder::frame_digest_hex`] covers the frames.
+    pub fn frames(&self) -> &[v2xw_record::wire::Frame] {
+        &self.frames
+    }
+
+    /// How many of the stored frames are keyframes rather than deltas.
+    ///
+    /// A frame whose header will not parse is counted as neither, which cannot happen for
+    /// a frame this crate produced and is stated rather than unwrapped.
+    pub fn keyframe_count(&self) -> usize {
+        self.frames
+            .iter()
+            .filter(|f| {
+                f.header()
+                    .ok()
+                    .and_then(|h| h.kind())
+                    .is_some_and(|k| k == v2xw_record::wire::MsgType::Keyframe)
+            })
+            .count()
+    }
+
     /// A digest over every record, in order: `SHA-256(t ‖ channel ‖ visibility ‖ json)*`.
     ///
     /// This is what "two runs of one scenario produce identical outputs" is asserted on.
@@ -100,11 +159,35 @@ impl MemoryRecorder {
         }
         w.finish_hex()
     }
+
+    /// A digest over every VWP frame, in order: `SHA-256(frame bytes)*`.
+    ///
+    /// The frames are the normative wire stream (vwp-v1 §7.2), so this is the digest that
+    /// says two runs put the same bytes on the air.
+    pub fn frame_digest_hex(&self) -> String {
+        let mut w = v2xw_core::hash::Sha256Writer::new();
+        for f in &self.frames {
+            w.update(f.as_bytes());
+        }
+        w.finish_hex()
+    }
 }
 
 impl RunRecorder for MemoryRecorder {
     fn write(&mut self, at: SimTime, record: &OwnedRecord) {
         self.records.push((at, record.clone()));
+    }
+
+    fn write_wire_frame(&mut self, frame: &v2xw_record::wire::Frame) {
+        self.frames.push(frame.clone());
+    }
+
+    fn records_written(&self) -> Option<u64> {
+        Some(self.records.len() as u64)
+    }
+
+    fn frames_written(&self) -> Option<u64> {
+        Some(self.frames.len() as u64)
     }
 }
 
@@ -122,7 +205,9 @@ impl RunRecorder for MemoryRecorder {
 /// self-consistent proves nothing about the stream it claims to cover.
 pub struct DigestRecorder {
     hasher: v2xw_core::hash::Sha256Writer,
+    frame_hasher: v2xw_core::hash::Sha256Writer,
     written: u64,
+    frames: u64,
     per_channel: std::collections::BTreeMap<String, (u64, u64)>,
 }
 
@@ -132,6 +217,7 @@ impl core::fmt::Debug for DigestRecorder {
         // of a debug print can use anyway; the counts are.
         f.debug_struct("DigestRecorder")
             .field("written", &self.written)
+            .field("frames", &self.frames)
             .field("channels", &self.per_channel.len())
             .finish_non_exhaustive()
     }
@@ -148,7 +234,9 @@ impl DigestRecorder {
     pub fn new() -> Self {
         Self {
             hasher: v2xw_core::hash::Sha256Writer::new(),
+            frame_hasher: v2xw_core::hash::Sha256Writer::new(),
             written: 0,
+            frames: 0,
             per_channel: std::collections::BTreeMap::new(),
         }
     }
@@ -163,9 +251,23 @@ impl DigestRecorder {
         &self.per_channel
     }
 
+    /// How many VWP frames it was handed.
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
+
     /// The digest over every record, in order: `SHA-256(t ‖ channel ‖ visibility ‖ json)*`.
     pub fn digest_hex(&self) -> String {
         self.hasher.clone().finish_hex()
+    }
+
+    /// The digest over every VWP frame, in order: `SHA-256(frame bytes)*`.
+    ///
+    /// Kept apart from [`DigestRecorder::digest_hex`] for the reason
+    /// [`MemoryRecorder::frame_digest_hex`] gives: the record digest is a published
+    /// number and adding a second stream to it would move it for no determinism reason.
+    pub fn frame_digest_hex(&self) -> String {
+        self.frame_hasher.clone().finish_hex()
     }
 }
 
@@ -183,12 +285,26 @@ impl RunRecorder for DigestRecorder {
         entry.0 += 1;
         entry.1 += record.json.len() as u64;
     }
+
+    fn write_wire_frame(&mut self, frame: &v2xw_record::wire::Frame) {
+        self.frame_hasher.update(frame.as_bytes());
+        self.frames += 1;
+    }
+
+    fn records_written(&self) -> Option<u64> {
+        Some(self.written)
+    }
+
+    fn frames_written(&self) -> Option<u64> {
+        Some(self.frames)
+    }
 }
 
 /// A recorder that drops everything, for a run measuring only its metrics.
 #[derive(Debug, Default)]
 pub struct NullRecorder {
     written: u64,
+    frames: u64,
 }
 
 impl NullRecorder {
@@ -201,20 +317,53 @@ impl NullRecorder {
     pub fn written(&self) -> u64 {
         self.written
     }
+
+    /// How many VWP frames it was handed.
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
 }
 
 impl RunRecorder for NullRecorder {
     fn write(&mut self, _at: SimTime, _record: &OwnedRecord) {
         self.written += 1;
     }
+
+    fn write_wire_frame(&mut self, _frame: &v2xw_record::wire::Frame) {
+        self.frames += 1;
+    }
+
+    /// A recorder that drops everything nevertheless *accepted* everything: nothing was
+    /// refused, so the count it reports is the count it was handed. That is what makes a
+    /// run report over a null recorder read the same as one over a real file.
+    fn records_written(&self) -> Option<u64> {
+        Some(self.written)
+    }
+
+    fn frames_written(&self) -> Option<u64> {
+        Some(self.frames)
+    }
 }
 
 impl<W: std::io::Write + std::io::Seek> RunRecorder for v2xw_record::RecordingWriter<W> {
     fn write(&mut self, at: SimTime, record: &OwnedRecord) {
         // `write_record` fails on a channel the recording does not declare or on an I/O
-        // error. Neither is something a phase can act on, so the count is what the run
-        // report carries; `refused` is how a caller notices.
+        // error. Neither is something a phase can act on, so what the run report carries
+        // is the container's own count of what it stored — `records_written` below — and
+        // not the engine's count of what it handed over.
         let _ = v2xw_record::RecordingWriter::write_record(self, at, record);
+    }
+
+    fn write_wire_frame(&mut self, frame: &v2xw_record::wire::Frame) {
+        let _ = v2xw_record::RecordingWriter::write_frame(self, frame);
+    }
+
+    fn records_written(&self) -> Option<u64> {
+        Some(v2xw_record::RecordingWriter::summary(self).record_count)
+    }
+
+    fn frames_written(&self) -> Option<u64> {
+        Some(v2xw_record::RecordingWriter::summary(self).frame_count)
     }
 }
 
@@ -240,6 +389,19 @@ pub struct EngineCtx<'a> {
     pub(crate) recorder: &'a mut dyn RunRecorder,
     /// Records refused because their visibility is not allowed on their channel.
     pub(crate) refused: u64,
+    /// The instant a record emitted through this context is *stamped* at, when that is
+    /// not the scheduler's current instant.
+    ///
+    /// Mobility is the one phase where the two differ. A mobility step dispatched at `t`
+    /// advances the world to `t + dt` and publishes the states it produced, so the
+    /// scheduler's instant is the start of the step and the state describes its end;
+    /// stamping such a record at `Ctx::now` filed every ground-truth kinematics record
+    /// one mobility step early, against its own `t` field. This is how the engine says
+    /// "the time of this record is the time of the state it describes".
+    ///
+    /// It never changes [`Ctx::now`]: a model that asks what time it is still gets the
+    /// scheduler's answer, because that is the instant it is being run at.
+    pub(crate) emit_at: Option<SimTime>,
 }
 
 impl core::fmt::Debug for EngineCtx<'_> {
@@ -273,7 +435,15 @@ impl<'a> EngineCtx<'a> {
             params,
             recorder,
             refused: 0,
+            emit_at: None,
         }
+    }
+
+    /// Stamps every record emitted from now on at `at` rather than at [`Ctx::now`].
+    ///
+    /// `None` restores the default. See [`EngineCtx::emit_at`] for why the two can differ.
+    pub fn stamp_records_at(&mut self, at: Option<SimTime>) {
+        self.emit_at = at;
     }
 
     /// Schedules `payload` at its own class, which is the spelling the engine's own phases
@@ -339,7 +509,10 @@ impl Ctx for EngineCtx<'_> {
             self.refused += 1;
             return;
         }
-        let at = self.scheduler.now();
+        let at = match self.emit_at {
+            Some(t) => t,
+            None => self.scheduler.now(),
+        };
         self.recorder.write(at, &owned);
     }
 

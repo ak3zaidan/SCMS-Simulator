@@ -1,0 +1,61 @@
+# Documentation site — task recipes, in the style of the repository's root justfile
+# (ADR 0010 §2/§3): one command per line, no shell syntax, so every recipe behaves the
+# same under sh and PowerShell.
+#
+# Run them directly:
+#
+#     just --justfile docs/site/justfile --working-directory . build
+#
+# or import this file once from the root justfile, which is the tidier way:
+#
+#     mod site 'docs/site/justfile'
+#
+# and then `just site build`, `just site check`, `just site cards`.
+
+set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
+
+# `python3` everywhere except Windows, where the launcher is `python`.
+python := if os_family() == "windows" { "python" } else { "python3" }
+
+out := "docs/site/build"
+cards := "docs/site/generated/cards.json"
+
+# Show the available recipes.
+default:
+    @just --justfile docs/site/justfile --list
+
+[doc("Build the site into docs/site/build")]
+build:
+    {{ python }} docs/site/build.py --clean --out {{ out }} --cards {{ cards }}
+
+[doc("Build the site and fail if any input was missing (what CI should run)")]
+check:
+    {{ python }} docs/site/build.py --clean --strict --out {{ out }} --cards {{ cards }}
+
+# Export the model cards the reference pages are generated from.
+#
+# This is the one recipe that compiles Rust: it builds the engine's registry and
+# serialises every registration. Everything else in this file is pure Python and runs in
+# under a second.
+[doc("Regenerate the model-card dump from the engine's registry")]
+cards:
+    cargo run --release --manifest-path docs/site/tools/cardgen/Cargo.toml -- --out {{ cards }}
+
+[doc("Regenerate the cards, then the site")]
+all: cards build
+
+[doc("Serve the built site at http://localhost:8000")]
+serve port="8000":
+    {{ python }} -m http.server {{ port }} --directory {{ out }}
+
+[doc("Delete the built site")]
+clean:
+    {{ python }} -c "import shutil; shutil.rmtree('{{ out }}', ignore_errors=True)"
+
+# Build the site with a tree identifier in the footer. Off by default: a build with no
+# stamp is byte-reproducible, which is the property the rest of this project holds
+# itself to.
+[unix]
+[doc("Build with the current commit hash in the footer")]
+build-stamped:
+    {{ python }} docs/site/build.py --clean --out {{ out }} --cards {{ cards }} --stamp "$(git rev-parse --short HEAD)"

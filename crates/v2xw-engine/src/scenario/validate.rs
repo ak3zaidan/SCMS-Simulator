@@ -64,7 +64,106 @@ pub fn validate(s: &Scenario) -> Vec<ScenarioError> {
     metrics_and_exporters(s, &mut e);
     timeline(s, &mut e);
     experiment(s, &mut e);
+    unreachable_keys(s, &mut e);
     e
+}
+
+/// Keys this build validates, documents and hashes but **cannot act on**.
+///
+/// The vertical-slice audit's finding, in one function: a scenario that says something the
+/// engine never reads is a scenario that overstates what it controls, and a run that
+/// accepted it produced a result the file appears to explain and does not. Everything
+/// here is refused rather than warned about, because a warning in a log is a warning
+/// nobody reads and the whole point of §13's validation is that the author finds out at
+/// load rather than at analysis.
+///
+/// Each message names the *seam* — the model or the field that would have to exist — so
+/// that removing a rule from here is a one-line change the day the seam is filled, and so
+/// that a reader can tell "not implemented" from "not allowed".
+///
+/// The six keys the audit found are wired rather than refused and are **not** here:
+/// `messages.sets` reaches [`crate::wiring::service_set`], `security.crypto_mode`
+/// reaches the node's crypto backend, `security.envelope` and
+/// `security.signer_id_policy` reach its security stack, `nodes.per_class` reaches its
+/// hardware profile, and `time.t0` reaches its wall clock through
+/// [`crate::wiring::NodeEnv`].
+fn unreachable_keys(s: &Scenario, e: &mut Vec<ScenarioError>) {
+    // A mixed-tier focus region (02-architecture.md §7.3) needs a per-region tier
+    // dispatch the run loop does not have: `Engine::build` selects one propagation model,
+    // one PHY and one MAC for the whole world from `radio.tiers`.
+    if s.radio.tiers.focus.is_some() {
+        e.push(conflict(
+            "radio.tiers.focus",
+            "names a focus region, and this build runs one tier for the whole world:              `wiring::build_phy`, `build_mac` and `build_radio` each select one model from              `radio.tiers` at build time and nothing re-selects per region. Remove the key              rather than letting the run quietly ignore it (02-architecture.md §7.3)"
+                .to_string(),
+        ));
+    }
+
+    // Vulnerable road users are a mobility population. `v2xw-mobility` spawns vehicles
+    // from a demand model and nothing spawns a pedestrian or a cyclist, so the three
+    // fields select a population that never exists.
+    let vru = &s.actors.vru;
+    if vru.pedestrians > 0 || vru.cyclists > 0 || vru.device_fraction > 0.0 {
+        e.push(conflict(
+            "actors.vru",
+            format!(
+                "asks for {} pedestrians and {} cyclists at a device fraction of {}, and                  nothing in this build spawns a vulnerable road user: the mobility provider                  creates vehicles from `actors.vehicles.demand` only, so these three fields                  change nothing and the run would report no VRU traffic without saying why",
+                vru.pedestrians, vru.cyclists, vru.device_fraction
+            ),
+        ));
+    }
+
+    // Exporters run after a run, from the command-line tool's own options; the engine has
+    // no exporter stage and `Scenario::exporters` reaches nothing.
+    if !s.exporters.is_empty() {
+        e.push(conflict(
+            "exporters",
+            format!(
+                "lists {} exporter(s), and the engine runs none: exporting is the                  command-line tool's stage (`v2xw run --record`, `v2xw export`) and this                  list is not read by `Engine::run`. Drive the exporter from the tool                  instead of from the scenario",
+                s.exporters.len()
+            ),
+        ));
+    }
+
+    // The network layer. `v2xw-net` implements both, and the engine composes neither:
+    // `Engine::hand_down_app` puts a signed SPDU straight into the MAC's queue with no
+    // WSMP or GeoNetworking header between them.
+    if s.net.layer != "wsmp" {
+        e.push(conflict(
+            "net.layer",
+            format!(
+                "is '{}', and this build composes no network layer at all: a frame goes                  from the node's signer to the MAC with no header between them, so                  'gn-btp' would not be the thing that ran. Only 'wsmp' is accepted, and                  even that is a declaration rather than a layer — see `Engine::hand_down_app`",
+                s.net.layer
+            ),
+        ));
+    }
+
+    // Message generators. `v2xw-node::ServiceSet` has exactly two flags, so a set outside
+    // those two names a generator that does not exist. This is a different rule from the
+    // codec check in `messages`: that one is about encoding a message, this one is about
+    // deciding to send it.
+    for (i, set) in s.messages.sets.iter().enumerate() {
+        if !matches!(set.as_str(), "bsm" | "cam") {
+            e.push(conflict(
+                &format!("messages.sets[{i}]"),
+                format!(
+                    "'{set}' has no generator: `v2xw_node::ServiceSet` carries a flag for                      the CAM and a flag for the BSM and nothing else, so a node would never                      decide to send one. 06-node-models.md §2.1's application layer is the                      seam; until it ships, only 'bsm' and 'cam' reach the air"
+                ),
+            ));
+        }
+    }
+
+    // The codec tier. `ObuRuntime` constructs an `EtsiUperCodec` and calls the J2735 BSM
+    // encoder directly; `v2xw_msg::J2735SizeCodec` exists and nothing selects it.
+    if s.messages.codec_tier != "uper" {
+        e.push(conflict(
+            "messages.codec_tier",
+            format!(
+                "is '{}', and the node runtime encodes real UPER unconditionally: it holds                  an `EtsiUperCodec` and calls the J2735 BSM encoder directly, and nothing                  reads this field to choose `v2xw_msg::J2735SizeCodec` instead. Build                  decision D2's size model is reachable through `v2xw-msg` and not through a                  scenario, so 'size-model' here would select nothing",
+                s.messages.codec_tier
+            ),
+        ));
+    }
 }
 
 fn conflict(field: &str, conflict: String) -> ScenarioError {

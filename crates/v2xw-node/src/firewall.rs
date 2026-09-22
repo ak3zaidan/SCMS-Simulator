@@ -26,6 +26,7 @@
 //! | `no-actor-ids` | [`v2xw_core::ids::ActorId`] by name | linking two pseudonyms of one vehicle for free, which is the thing a Sybil detector must work out |
 //! | `narrowed-context-has-no-truth` | `fn world`/`fn actors` on [`crate::ctx::NodeCtx`] | re-opening the hole one level up, in the trait the runtime is driven through |
 //! | `ground-truth-fields-reach-only-telemetry` | a `gt_`-prefixed field read outside the telemetry path | a value that arrived legitimately and is then used to decide something |
+//! | `security-bridge-carries-no-truth` | a `World` or `Actors` associated type on [`crate::secure::SecCtx`] bound to anything but `()` | the adapter that lets a node sign for real quietly widening back to the engine's full context, which does have both |
 //!
 //! The last rule is the one worth the most. Two numbers in vwp-v1 §3.5.2 are marked **GT**
 //! and a node genuinely cannot compute them, so they are handed in from outside. That is a
@@ -188,6 +189,72 @@ pub fn scan_context_trait(src: &str) -> Vec<Violation> {
     out
 }
 
+/// The two associated types the security bridge must bind to the unit type, and the
+/// exact text that binds them.
+///
+/// A pair rather than a `format!` so the needle a violation reports is the literal the
+/// reviewer will search for.
+const BRIDGE_BINDINGS: &[(&str, &str)] = &[
+    ("World", "type World = ();"),
+    ("Actors", "type Actors = ();"),
+];
+
+/// Scans the security bridge for an associated type that is no longer the unit type.
+///
+/// `v2xw-sec` is generic over the engine's full context, which *does* have `world()` and
+/// `actors()`, so adapting the narrowed node context to it is the one place in this crate
+/// where the firewall could be re-opened by accident and look entirely reasonable while
+/// doing it. [`crate::secure::SecCtx`] closes it by binding both associated types to `()`:
+/// there is then no world to return and no actor list to index, which is a stronger
+/// statement than a promise not to look.
+///
+/// That is a textual property of one `impl` block, so it is checked textually. A binding
+/// that disappears is a violation and so is a binding to anything other than `()`; a
+/// renamed type would take the first branch, which fails rather than passing silently.
+///
+/// `src` is the whole of `src/secure.rs`. Comment lines are skipped for the same reason
+/// [`scan_source`] skips them: the rule has to be documentable in the file it polices.
+pub fn scan_security_bridge(src: &str) -> Vec<Violation> {
+    let because = "the bridge from the narrowed node context to the context v2xw-sec is \
+                   generic over must carry no world and no actors: both associated types \
+                   are the unit type, so there is nothing to read rather than a promise \
+                   not to read it (build decision D12.2, invariant I-C2)";
+    let mut out = Vec::new();
+    let code: Vec<(usize, &str)> = src
+        .lines()
+        .enumerate()
+        .map(|(i, l)| (i + 1, l.trim()))
+        .filter(|(_, l)| !l.starts_with("//") && !l.starts_with("*") && !l.starts_with("/*"))
+        .collect();
+
+    for (name, binding) in BRIDGE_BINDINGS {
+        if !code.iter().any(|(_, l)| l == binding) {
+            out.push(Violation {
+                rule: "security-bridge-carries-no-truth",
+                file: "src/secure.rs".to_string(),
+                line: 0,
+                text: format!("`{binding}` is gone from the security bridge"),
+                because,
+            });
+        }
+        // A binding that is present but says something else is the interesting breach:
+        // `type World = v2xw_world::World;` reads as an improvement and is the leak.
+        let prefix = format!("type {name} =");
+        for (line, text) in &code {
+            if text.starts_with(&prefix) && text != binding {
+                out.push(Violation {
+                    rule: "security-bridge-carries-no-truth",
+                    file: "src/secure.rs".to_string(),
+                    line: *line,
+                    text: (*text).to_string(),
+                    because,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Scans for a ground-truth field being read outside the telemetry path.
 ///
 /// A field whose name starts with `gt_` is one the engine handed in from outside the
@@ -291,6 +358,31 @@ mod tests {
         let v = scan_context_trait(leaky);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].rule, "narrowed-context-has-no-truth");
+    }
+
+    /// The security-bridge rule accepts the unit bindings, catches a binding that has
+    /// been widened to a real type, and catches one that has been deleted outright.
+    #[test]
+    fn the_security_bridge_rule_catches_a_widened_associated_type() {
+        let clean = "impl Ctx for SecCtx<'_> {\n    \
+                     type World = ();\n    \
+                     type Actors = ();\n    \
+                     type Payload = ();\n}\n";
+        assert_eq!(scan_security_bridge(clean), Vec::new());
+
+        let widened = "impl Ctx for SecCtx<'_> {\n    \
+                       type World = v2xw_world::World;\n    \
+                       type Actors = ();\n}\n";
+        let v = scan_security_bridge(widened);
+        assert_eq!(v.len(), 2, "the miss and the widening both report: {v:?}");
+        assert!(
+            v.iter()
+                .all(|x| x.rule == "security-bridge-carries-no-truth")
+        );
+        assert_eq!(v[1].line, 2);
+
+        let deleted = "impl Ctx for SecCtx<'_> {\n    type Actors = ();\n}\n";
+        assert_eq!(scan_security_bridge(deleted).len(), 1);
     }
 
     /// The ground-truth field rule lets the write and the telemetry read through and

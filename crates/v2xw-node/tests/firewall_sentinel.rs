@@ -20,12 +20,20 @@
 //!    `ground_truth_reaches_only_the_telemetry_record` fails.
 //! 4. `self.belief.pos = truth.pos;` — the behavioural half, covered by
 //!    `ground_truth_changes_nothing_a_node_does` in `tests/runtime_behaviour.rs`.
+//! 5. `type World = v2xw_world::World;` in the `impl Ctx for SecCtx` block of
+//!    `src/secure.rs` — `the_security_bridge_carries_no_world_and_no_actors` fails,
+//!    naming the line. This is the rule the signing path made necessary: `v2xw-sec` is
+//!    generic over the engine's full context, so the adapter that lets a node sign for
+//!    real is the one place where widening an associated type would re-open the firewall
+//!    and look like an improvement.
 //!
 //! The results are recorded in the build notes for this crate.
 
 use std::path::{Path, PathBuf};
 
-use v2xw_node::firewall::{Violation, scan_context_trait, scan_ground_truth_fields, scan_source};
+use v2xw_node::firewall::{
+    Violation, scan_context_trait, scan_ground_truth_fields, scan_security_bridge, scan_source,
+};
 
 fn src_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -132,6 +140,30 @@ fn ground_truth_reaches_only_the_telemetry_record() {
     assert!(
         violations.is_empty(),
         "a ground-truth value is being used to decide something:\n{}",
+        report(&violations)
+    );
+}
+
+/// **I-C2, the signing path.** The bridge from the narrowed node context to the context
+/// `v2xw-sec` is generic over binds both ground-truth associated types to the unit type,
+/// so a security model asking for the world gets nothing rather than something.
+///
+/// The node encodes and signs real messages through `v2xw-sec`, and `v2xw-sec` is generic
+/// over `v2xw_core::ctx::Ctx`, which *does* have `world()` and `actors()`. That adapter is
+/// therefore the one place in this crate where the firewall can be re-opened by a change
+/// that reads as an improvement, which is why it has its own rule rather than relying on
+/// the textual scan above.
+#[test]
+fn the_security_bridge_carries_no_world_and_no_actors() {
+    let secure = std::fs::read_to_string(src_dir().join("secure.rs")).expect("src/secure.rs");
+    assert!(
+        secure.contains("impl Ctx for SecCtx"),
+        "the sentinel is looking for a bridge that has been renamed or removed"
+    );
+    let violations = scan_security_bridge(&secure);
+    assert!(
+        violations.is_empty(),
+        "the security bridge can reach the truth:\n{}",
         report(&violations)
     );
 }

@@ -333,6 +333,27 @@ impl Projection {
     }
 }
 
+/// The core crate's [`v2xw_core::GeoOrigin`] is the canonical definition of this type and
+/// this one is a duplicate of it, field for field, with the same projection and the same
+/// quantisation grid. Until this becomes a re-export the two must not diverge, so the
+/// conversions are total and lossless in both directions and there is no constructor
+/// between them that could quietly reinterpret a field.
+///
+/// The duplication is real technical debt and it has already cost once: it produced a
+/// type error at the engine's world-to-node boundary that no reader had noticed, because
+/// the two names are identical and only the crate path differs.
+impl From<GeoOrigin> for v2xw_core::GeoOrigin {
+    fn from(o: GeoOrigin) -> Self {
+        Self { lat_deg: o.lat_deg, lon_deg: o.lon_deg, alt_m: o.alt_m }
+    }
+}
+
+impl From<v2xw_core::GeoOrigin> for GeoOrigin {
+    fn from(o: v2xw_core::GeoOrigin) -> Self {
+        Self { lat_deg: o.lat_deg, lon_deg: o.lon_deg, alt_m: o.alt_m }
+    }
+}
+
 impl From<GeoOrigin> for Projection {
     fn from(origin: GeoOrigin) -> Self {
         Projection::new(origin)

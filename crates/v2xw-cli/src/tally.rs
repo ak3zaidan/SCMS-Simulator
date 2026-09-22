@@ -32,6 +32,8 @@ pub struct ChannelTally {
 /// A recorder that counts and forwards.
 #[derive(Debug)]
 pub struct Tally<R: RunRecorder> {
+    /// Binary frames forwarded to the inner recorder.
+    frames: u64,
     inner: R,
     by_channel: BTreeMap<String, ChannelTally>,
     /// Every `metric.sample` record, kept whole: a run's metrics are the one output a
@@ -48,7 +50,13 @@ impl<R: RunRecorder> Tally<R> {
             by_channel: BTreeMap::new(),
             metric_samples: Vec::new(),
             records: 0,
+            frames: 0,
         }
+    }
+
+    /// How many binary frames were forwarded to the inner recorder.
+    pub fn frames(&self) -> u64 {
+        self.frames
     }
 
     /// The per-channel counts, in channel-name order.
@@ -98,6 +106,17 @@ impl<R: RunRecorder> RunRecorder for Tally<R> {
             self.metric_samples.push(v);
         }
         self.inner.write(at, record);
+    }
+
+
+    // Forwarded, not defaulted. `RunRecorder::write_wire_frame` discards by default so a
+    // record-only recorder need not know the binary path exists, but a WRAPPER that
+    // forwards `write` and not this one silently drops the normative binary stream and
+    // nothing in the resulting file says so. That is exactly what happened here: every
+    // run wrote zero keyframes and zero deltas while reporting success.
+    fn write_wire_frame(&mut self, frame: &v2xw_record::wire::Frame) {
+        self.frames += 1;
+        self.inner.write_wire_frame(frame);
     }
 
     fn refused(&self) -> u64 {

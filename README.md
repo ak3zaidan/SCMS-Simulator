@@ -82,6 +82,26 @@ just legacy-conformance
 | `tests/` | cross-crate golden determinism, conformance, validation, benchmarks |
 | `legacy/` | the frozen Python reference and its conformance vectors |
 | `docs/` | the design and the architecture decision records |
+| `docs/site/` | the generated documentation site and its generator |
+
+## The documentation site
+
+[`docs/site/`](docs/site/README.md) generates a browsable site from this repository
+rather than beside it: the model reference is generated from the engine's model cards,
+the scenario schema from the loader's Rust types, and the defect register from
+`docs/design/findings/`, so none of the three can drift from the code.
+
+```bash
+just --justfile docs/site/justfile cards   # export the model cards (compiles Rust)
+just --justfile docs/site/justfile build   # generate into docs/site/build/
+just --justfile docs/site/justfile serve   # http://localhost:8000
+```
+
+The generator is one Python script with no dependencies beyond the standard library and
+takes no timestamp, so the same tree produces byte-identical output. Three of its pages
+exist to say what is *not* done: every parameter still marked for calibration, the
+validation status of every model, and the full defect register with what each defect
+teaches.
 
 ## The design
 

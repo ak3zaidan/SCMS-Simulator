@@ -237,3 +237,109 @@ pub fn info(o: &InfoOutcome) -> String {
     }
     s
 }
+
+/// Renders a sweep.
+///
+/// Three things a person wants after a sweep, in the order they want them: did every run
+/// finish, where are the files, and what did the table say. The per-metric block prints
+/// the interval and the replication count together, because an estimate without them is
+/// what this project's measurement layer exists to stop being printed.
+pub fn experiment_run(o: &crate::experiment::ExperimentRunOutcome) -> String {
+    let r = &o.outcome;
+    let mut s = String::new();
+    let _ = writeln!(s, "experiment      {}", r.name);
+    let _ = writeln!(s, "plan            {}", r.plan_digest);
+    let _ = writeln!(s, "outputs         {}", r.out_dir);
+    let _ = writeln!(s);
+    let _ = writeln!(
+        s,
+        "runs            {} planned, {} already done, {} run now, {} outstanding",
+        r.runs_planned, r.runs_skipped, r.runs_executed, r.runs_pending
+    );
+    let _ = writeln!(
+        s,
+        "cells           {} sweep point(s), {} at a time",
+        r.cells, r.concurrency
+    );
+    if r.concurrency > 1 {
+        let _ = writeln!(
+            s,
+            "                running {} simulations at once holds {} worlds in memory at \
+             the same time",
+            r.concurrency, r.concurrency
+        );
+    }
+    let _ = writeln!(s);
+    let _ = writeln!(
+        s,
+        "results         {} row(s), {} with an estimate",
+        r.rows, o.rows_with_estimate
+    );
+    let _ = writeln!(s, "results digest  {}", o.results_digest);
+    if !o.exported.is_empty() {
+        let _ = writeln!(s, "exported");
+        for file in &o.exported {
+            let _ = writeln!(s, "  {file}");
+        }
+    }
+    let _ = writeln!(s, "files");
+    for file in &r.files {
+        let _ = writeln!(s, "  {file}");
+    }
+    if r.runs_pending > 0 {
+        let _ = writeln!(s);
+        let _ = writeln!(
+            s,
+            "{} run(s) outstanding — `v2xw experiment resume` continues from the journal",
+            r.runs_pending
+        );
+    }
+    s
+}
+
+/// Renders where a sweep stands.
+pub fn experiment_status(o: &v2xw_experiment::ExperimentStatus) -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "experiment      {}", o.name);
+    let _ = writeln!(s, "plan            {}", o.plan_digest);
+    let _ = writeln!(s, "outputs         {}", o.out_dir);
+    let _ = writeln!(
+        s,
+        "sweep           {} cell(s) x {} seed slot(s) x {} replication(s)",
+        o.cells, o.seed_slots, o.replications
+    );
+    let _ = writeln!(s);
+    match &o.journal_plan_digest {
+        None => {
+            let _ = writeln!(
+                s,
+                "journal         none — this sweep has not been started here"
+            );
+        }
+        Some(digest) => {
+            let _ = writeln!(s, "journal         {digest}");
+        }
+    }
+    if o.plan_changed {
+        let _ = writeln!(
+            s,
+            "                the scenario's sweep has CHANGED since this directory was \
+             started; a resume would mix two experiments and will be refused"
+        );
+    }
+    let _ = writeln!(
+        s,
+        "progress        {} of {} run(s) done, {} outstanding",
+        o.runs_completed, o.runs_planned, o.runs_pending
+    );
+    if !o.next_run_ids.is_empty() {
+        let _ = writeln!(s, "next");
+        for id in &o.next_run_ids {
+            let _ = writeln!(s, "  {id}");
+        }
+        if o.runs_pending > o.next_run_ids.len() {
+            let _ = writeln!(s, "  … and {} more", o.runs_pending - o.next_run_ids.len());
+        }
+    }
+    s
+}

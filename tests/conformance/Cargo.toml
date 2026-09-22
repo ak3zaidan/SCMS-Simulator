@@ -1,0 +1,44 @@
+# The conformance kit (03-interfaces.md §17, vwp-v1.md §10).
+#
+# A workspace member rather than a loose directory, because everything in it is meant to be
+# *run* by somebody outside this repository: a contributor checking their own plug-in, a
+# second implementation checking its wire format, and CI comparing three platforms. A
+# directory of files that no `cargo test` reaches would be documentation wearing a test's
+# clothes.
+#
+# `publish = false`: the kit pins path dependencies on every crate it polices, so it is a
+# workspace tool, not a library anyone installs from a registry.
+[package]
+name = "v2xw-conformance"
+description = "The V2X World Simulator conformance kit: the VWP v1 wire checklist, the plug-in suite, the golden determinism harness and the interface firewall."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "v2xw_conformance"
+path = "src/lib.rs"
+
+# The three-platform determinism gate in CI runs this rather than a shell pipeline of its
+# own, so the digest CI compares is produced by the same code the test asserts on
+# (vwp-v1.md §10.5 W5, ADR 0004).
+[[bin]]
+name = "v2xw-golden-digest"
+path = "src/bin/golden_digest.rs"
+
+[dependencies]
+v2xw-core = { workspace = true }
+v2xw-world = { workspace = true }
+v2xw-record = { workspace = true }
+v2xw-server = { workspace = true }
+v2xw-node = { workspace = true }
+# The kernel. Not a `workspace = true` entry because `v2xw-engine` is a workspace member
+# that the root manifest's shared dependency table does not list (see `v2xw-cli`).
+v2xw-engine = { path = "../../crates/v2xw-engine", version = "0.1.0" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -20,13 +20,22 @@
 //! A scenario measuring provisioning must not use it, which is why the run report counts
 //! the credentials it installed.
 
+use v2xw_core::geo::GeoOrigin;
+use v2xw_core::geom::Dims;
 use v2xw_core::ids::NodeId;
 use v2xw_core::registry::Registry;
-use v2xw_core::time::{Duration, SimTime};
+use v2xw_core::time::{Duration, SimTime, WallClock};
 use v2xw_core::weather::{SurfaceCondition, WeatherKind, WeatherState};
-use v2xw_mobility::{Demand, GnssModel, Mobility, NativeMobility, NoDemand, PoissonDemand};
+use v2xw_mobility::{
+    Demand, GnssModel, Mobility, NativeMobility, NoDemand, PoissonDemand, VehicleClass,
+};
+use v2xw_msg::cam::ParticipantType;
 use v2xw_node::stores::{CredState, CredentialHandle, RotationPolicy, pseudo_signer};
-use v2xw_node::{NodeConfig, ObuRuntime, OnDemand, Prioritized, VerificationPolicy, VerifyAll};
+use v2xw_node::{
+    CryptoMode, NodeConfig, ObuRuntime, OnDemand, Prioritized, ServiceSet, VerificationPolicy,
+    VerifyAll,
+};
+use v2xw_sec::envelope::{EnvelopeProfile, SignerIdPolicy};
 use v2xw_world::{ImportOptions, World, WorldSource, WorldSourceSpec};
 
 use crate::adapters::{BoxedFading, BoxedPropagation};
@@ -269,9 +278,151 @@ pub fn build_metrics(
     Ok(set)
 }
 
+/// The two run-wide facts a node needs that are not in the scenario's `nodes` section.
+///
+/// Both were left at `NodeConfig`'s defaults by the Phase 1 build, and both are wrong by
+/// default in a way that is invisible in a record:
+///
+/// * `origin` is the world's geodetic anchor. Both message formats carry latitude and
+///   longitude, so a node that does not know where world `(0, 0, 0)` is encodes every
+///   position about **null island** — a perfectly valid CAM off the coast of Ghana.
+/// * `wall` is what `time.t0` means. It is what a 1609.2 `generationTime` and a J2735
+///   `secMark` are stamped from, so a node left on the default clock encodes timestamps
+///   that have nothing to do with the run's declared civil time.
+///
+/// Neither is a wall-clock *read*: `wall` comes from the scenario's `time.t0` and
+/// `origin` from the world's provenance (02-architecture.md §6.1).
+#[derive(Debug, Clone, Copy)]
+pub struct NodeEnv {
+    /// The geodetic anchor of the world's ENU frame.
+    pub origin: GeoOrigin,
+    /// The civil instant `SimTime` zero maps to, from `time.t0`.
+    pub wall: WallClock,
+}
+
+impl NodeEnv {
+    /// The environment a run over `world` starting at `wall` gives its nodes.
+    pub fn new(world: &World, wall: WallClock) -> Self {
+        NodeEnv {
+            origin: world.origin.into(),
+            wall,
+        }
+    }
+}
+
+/// The hardware profile id the scenario gives a vehicle of this class.
+///
+/// `nodes.per_class` overrides `nodes.default_obu` by vehicle-class name. The key is the
+/// class's own [`VehicleClass::as_str`] spelling, which is the same spelling
+/// `actors.vehicles.classes` is keyed by and the one `validate` checks `per_class`
+/// against — so a scenario cannot name a class in one section and a different string for
+/// the same class in the other.
+pub fn obu_profile_id(scenario: &Scenario, class: VehicleClass) -> &str {
+    scenario
+        .nodes
+        .per_class
+        .get(class.as_str())
+        .map_or(scenario.nodes.default_obu.as_str(), String::as_str)
+}
+
+/// Which message services the scenario's `messages.sets` turns on.
+///
+/// The Phase 1 build left this at [`ServiceSet::BOTH`], so every node generated a CAM
+/// *and* a BSM whatever the scenario said — which is why the vertical-slice audit found
+/// two different formats on the air in a scenario whose `messages.sets` named one of
+/// them. `validate` refuses a set this build has no generator for, so anything that
+/// reaches here is one of the two or is deliberately absent.
+pub fn service_set(scenario: &Scenario) -> ServiceSet {
+    ServiceSet {
+        cam: scenario.messages.sets.iter().any(|s| s == "cam"),
+        bsm: scenario.messages.sets.iter().any(|s| s == "bsm"),
+    }
+}
+
+/// The envelope profile `security.envelope` names.
+///
+/// `validate` restricts the field to the two this build implements, so the fallback is
+/// unreachable from a validated scenario and is 1609.2 rather than a panic.
+pub fn envelope_profile(scenario: &Scenario) -> EnvelopeProfile {
+    match scenario.security.envelope.as_str() {
+        "etsi103097" => EnvelopeProfile::EtsiTs103097,
+        _ => EnvelopeProfile::Ieee1609Dot2,
+    }
+}
+
+/// The crypto backend `security.crypto_mode` names.
+///
+/// Phase 1 acceptance criterion 3 requires a `real` run and a `modeled` run to produce
+/// identical event logs apart from the manifest, and `NodeConfig::crypto_mode` is the
+/// only thing either mode changes. Until now the scenario's choice reached the *manifest*
+/// and not the nodes, so a scenario asking for `real` got modelled cryptography and a
+/// manifest that said otherwise.
+pub fn crypto_mode(scenario: &Scenario) -> CryptoMode {
+    match scenario.security.crypto_mode {
+        crate::scenario::schema::CryptoModeSpec::Real => CryptoMode::Real,
+        crate::scenario::schema::CryptoModeSpec::Modeled => CryptoMode::Modeled,
+    }
+}
+
+/// The certificate-attachment cadence `security.signer_id_policy` names.
+///
+/// 05-protocols.md §2.4 expresses both readings as an interval, and the scenario gives it
+/// in milliseconds. `full_cert_every_ms: 0` with `digest_otherwise: false` means "a
+/// certificate on every message", which is TS 103 097 §7.1.2's DENM rule; `validate`
+/// refuses the contradictory combination of zero with `digest_otherwise` true.
+pub fn signer_id_policy(scenario: &Scenario) -> SignerIdPolicy {
+    let p = &scenario.security.signer_id_policy;
+    if p.full_cert_every_ms == 0 {
+        return SignerIdPolicy::ALWAYS_CERTIFICATE;
+    }
+    if !p.digest_otherwise {
+        return SignerIdPolicy::ALWAYS_CERTIFICATE;
+    }
+    SignerIdPolicy {
+        full_cert_every: Some(Duration::from_millis(p.full_cert_every_ms)),
+        always_certificate: false,
+    }
+}
+
+/// The CAM `stationType` a vehicle class is.
+///
+/// SUMO's vClass table and the CDD's `TrafficParticipantType` are two vocabularies for
+/// the same thing; this is the mapping between them, and it is here rather than in
+/// `v2xw-mobility` because it is the *scenario's* composition of a traffic model with a
+/// message format and neither crate should know about the other.
+pub fn station_type(class: VehicleClass) -> ParticipantType {
+    match class {
+        VehicleClass::Passenger => ParticipantType::PassengerCar,
+        // An ambulance or a fire appliance is a special vehicle in the CDD, which is the
+        // category the emergency light bar belongs to rather than a size class.
+        VehicleClass::Emergency => ParticipantType::SpecialVehicle,
+        VehicleClass::Delivery => ParticipantType::LightTruck,
+        VehicleClass::Truck => ParticipantType::HeavyTruck,
+        VehicleClass::Trailer => ParticipantType::Trailer,
+        VehicleClass::Bus | VehicleClass::Coach => ParticipantType::Bus,
+        VehicleClass::Motorcycle => ParticipantType::Motorcycle,
+        VehicleClass::Moped => ParticipantType::Moped,
+        VehicleClass::Bicycle => ParticipantType::Cyclist,
+        VehicleClass::Pedestrian => ParticipantType::Pedestrian,
+        VehicleClass::Scooter => ParticipantType::LightVruVehicle,
+    }
+}
+
 /// Builds one node on the scenario's profile, with a bootstrap credential.
-pub fn build_node(scenario: &Scenario, node: NodeId, at: SimTime) -> ObuRuntime {
-    let profile = v2xw_node::profiles::get(&scenario.nodes.default_obu)
+///
+/// `class` selects the hardware profile through `nodes.per_class` and the CAM
+/// `stationType`; `dims` are the actor's own body dimensions, which both message formats
+/// carry. `env` brings the world's geodetic anchor and the scenario's civil clock.
+pub fn build_node(
+    scenario: &Scenario,
+    env: NodeEnv,
+    node: NodeId,
+    at: SimTime,
+    class: VehicleClass,
+    dims: Dims,
+) -> ObuRuntime {
+    let wanted = obu_profile_id(scenario, class);
+    let profile = v2xw_node::profiles::get(wanted)
         .cloned()
         .unwrap_or_else(|| {
             v2xw_node::profiles::get(v2xw_node::profiles::REFERENCE_OBU)
@@ -289,11 +440,42 @@ pub fn build_node(scenario: &Scenario, node: NodeId, at: SimTime) -> ObuRuntime 
     };
     let config = NodeConfig {
         tx_power_dbm: TX_POWER_DBM,
+        services: service_set(scenario),
+        crypto_mode: crypto_mode(scenario),
+        wall: env.wall,
+        origin: env.origin,
+        dims,
+        station_type: station_type(class),
         ..NodeConfig::default()
     };
     let mut runtime = ObuRuntime::new(node, profile, policy, config, at);
+    apply_security_profile(&mut runtime, scenario, env);
     bootstrap_credentials(&mut runtime, scenario, node, at);
     runtime
+}
+
+/// Puts `security.envelope` and `security.signer_id_policy` into a fresh node's security
+/// stack.
+///
+/// A whole replacement rather than a mutation: [`v2xw_node::NodeSecurity`]'s two builder
+/// methods take `self` by value, and the stack this replaces was constructed by
+/// `ObuRuntime::new` moments ago and holds no signers, no issuer and no peer keys. Called
+/// anywhere but immediately after construction it would discard credential state, which
+/// is why it is private and why both call sites are in this module.
+fn apply_security_profile(runtime: &mut ObuRuntime, scenario: &Scenario, env: NodeEnv) {
+    let policy = signer_id_policy(scenario);
+    let configured = v2xw_node::NodeSecurity::new(
+        env.wall,
+        crypto_mode(scenario),
+        v2xw_node::secure::PSID_SAFETY,
+    )
+    .with_profile(envelope_profile(scenario), env.wall)
+    // One cadence, from the one scenario field. 05-protocols.md §2.4 gives CAM and BSM
+    // different published defaults, and a scenario that states a cadence is overriding
+    // both: two stacks behind one number would make the field mean different things for
+    // different message types with nothing saying so.
+    .with_signer_id_policies(policy, policy);
+    *runtime.security_mut() = configured;
 }
 
 /// Which reading of the pseudonym-rotation rule the scenario selected.
@@ -414,6 +596,7 @@ pub fn build_dcc(scenario: &Scenario) -> Option<v2xw_radio::SaeJ2945Dcc> {
 /// path hands it.
 pub fn build_rsu(
     scenario: &Scenario,
+    env: NodeEnv,
     spec: &crate::phase2::RsuSpec,
     node: NodeId,
     at: SimTime,
@@ -431,12 +614,20 @@ pub fn build_rsu(
             cam: false,
             bsm: false,
         },
+        crypto_mode: crypto_mode(scenario),
+        wall: env.wall,
+        origin: env.origin,
+        // A mast is infrastructure, not a vehicle: the CDD has a category for it and a
+        // unit that signed as a passenger car would be a unit a plausibility detector is
+        // entitled to disbelieve.
+        station_type: ParticipantType::Infrastructure,
         ..NodeConfig::default()
     };
     // `verify-all` at a roadside unit, whatever the vehicles run: a unit that forwards
     // misbehaviour reports has to have verified the report it forwards, and the
     // `prioritized` policy would skip a distant sender — which is every sender, at a mast.
     let mut runtime = ObuRuntime::new(node, profile, Box::new(VerifyAll::new()), config, at);
+    apply_security_profile(&mut runtime, scenario, env);
     bootstrap_credentials(&mut runtime, scenario, node, at);
     runtime
 }

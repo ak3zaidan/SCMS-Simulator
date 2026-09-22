@@ -12,6 +12,7 @@
 //! | the world, actor and node state, and the main loop | [`run`] |
 //! | the phase-parallel structure of ADR 0004 | [`run`] |
 //! | the run manifest assembly | [`manifest`] |
+//! | the normative `Keyframe`/`Delta` wire stream | [`snapshot`] |
 //!
 //! Two more modules exist because the layering demands them rather than because the
 //! decision listed them: [`ctx`] is the one implementation of
@@ -64,10 +65,12 @@ pub mod phase2;
 pub mod records;
 pub mod run;
 pub mod scenario;
+pub mod snapshot;
 pub mod wiring;
 
 pub use ctx::{DigestRecorder, EngineCtx, MemoryRecorder, NullRecorder, RunRecorder};
 pub use error::{EngineError, Result, ScenarioError};
 pub use event::{Event, NodeTask, Observe};
 pub use run::{Engine, RunReport};
+pub use snapshot::{ActorState, SnapshotStream, snapshot_cadence};
 pub use scenario::Scenario;

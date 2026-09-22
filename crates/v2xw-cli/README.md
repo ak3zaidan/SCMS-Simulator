@@ -6,6 +6,9 @@ v2xw validate <scenario>       load and check a scenario without building its wo
 v2xw import-osm <extract> <out> --speed-preset <name>
                                import an OpenStreetMap extract into the three world formats
 v2xw info <recording>          print a recording's manifest, channels and verification report
+v2xw experiment run <scenario>      expand the scenario's sweep, run it, aggregate it
+v2xw experiment status <scenario>   say how far along a sweep is; run nothing
+v2xw experiment resume <scenario>   continue a sweep that was started here
 ```
 
 No model logic lives here (02-architecture.md §2, ADR 0010): every command is a call into a
@@ -70,3 +73,43 @@ v2xw import-osm worlds/cache/manhattan.osm.xml out/ \
 a jurisdictional fact: under `sumo-german` a Midtown side street ends up at 100 km/h. The
 preset's own citation is printed next to the choice, so the choice is on the record before
 the world is written.
+
+## `experiment`
+
+```
+v2xw experiment run scenarios/downtown-sweep.yaml --out runs/downtown --format parquet
+```
+
+Expands the scenario's `experiment` block into runs, executes each one through the same
+`run` above, pools its metrics and aggregates across replications into `results.json` (plus
+a Parquet, Arrow IPC or JSONL table with `--format`). `v2xw-experiment`'s README has the
+sweep expansion, the seed derivation and the statistics; three things belong here.
+
+### One simulation at a time
+
+`--concurrency` **defaults to 1**, and on a small machine it should stay there. Each
+concurrent run holds its own world, scheduler, node state and recording buffer, so `k` runs
+cost `k` times the *peak* memory of one — and the engine already uses the machine's cores
+inside a single run. This repository has lost a wave of work to several processes running at
+once on an 8 GB machine; raising this is how a sweep is killed at run 340 of 600.
+
+### Resume is the point
+
+Every finished run is appended to `journal.jsonl` and flushed before the next one starts.
+`v2xw experiment resume` continues from there and refuses a directory whose journal belongs
+to a different sweep — the experiment changed, and appending would put two sweeps in one
+results table. `v2xw experiment status` says how far along it is and names the run it
+stopped on, without running anything.
+
+### `--no-recording` for a long sweep
+
+A sweep of six hundred cells writes six hundred MCAP files. The metrics, the run report and
+the manifest are written either way, and the results table is built from the metrics, so a
+sweep whose recordings you will not open is much cheaper without them.
+
+### The clock is read once
+
+`--build-utc` pins the manifest timestamp every run in the sweep is built with. Left out, it
+is read once, in this crate, and handed to every run — so two runs of one cell differ in
+their seed and in nothing else, and a manifest diff across a sweep shows the sweep rather
+than the minute each run started in.

@@ -39,6 +39,10 @@ pub enum CliError {
     #[error(transparent)]
     World(#[from] v2xw_world::WorldError),
 
+    /// The experiment runner refused the sweep, or one of its runs failed.
+    #[error(transparent)]
+    Experiment(#[from] v2xw_experiment::ExperimentError),
+
     /// A value on the command line is not one this build knows.
     #[error("--{flag}: {problem}")]
     BadArgument {

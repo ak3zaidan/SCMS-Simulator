@@ -5,7 +5,10 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+# `tests/conformance` is the conformance kit (03-interfaces.md §17). It is a member rather
+# than a loose directory because a suite that no `cargo test` reaches is documentation, not
+# a test; it is outside `crates/` because it is not part of the engine.
+members = ["crates/*", "tests/conformance"]
 
 [workspace.package]
 version = "0.1.0"

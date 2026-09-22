@@ -1,0 +1,37 @@
+# The model-card exporter for the documentation site.
+#
+# Deliberately its own workspace (`[workspace]` below): the root workspace's members are
+# `crates/*`, and a package under the repository root that is neither a member nor its
+# own workspace is a cargo error. Declaring it here keeps `cargo build --workspace` in
+# the repository root untouched -- building the documentation never changes what the
+# engine's own build does.
+#
+# The path dependencies reach into the workspace members; each of those keeps resolving
+# its own `workspace = true` dependencies against the root workspace, which is what
+# makes this arrangement work at all.
+#
+# If the owner would rather have one target directory and one lock file, adding
+# "docs/site/tools/cardgen" to the root `[workspace] members` list and deleting the
+# `[workspace]` table below is the whole change.
+
+[package]
+name = "v2xw-cardgen"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Serialises the engine's model registry for the documentation site"
+
+[workspace]
+
+[dependencies]
+serde_json = "1"
+v2xw-core = { path = "../../../../crates/v2xw-core" }
+v2xw-engine = { path = "../../../../crates/v2xw-engine" }
+v2xw-metrics = { path = "../../../../crates/v2xw-metrics" }
+v2xw-proto = { path = "../../../../crates/v2xw-proto" }
+v2xw-sec = { path = "../../../../crates/v2xw-sec" }
+
+[[bin]]
+name = "v2xw-cardgen"
+path = "src/main.rs"

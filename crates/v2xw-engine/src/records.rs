@@ -150,6 +150,25 @@ impl NodeTx {
             t_generated: Some(t_generated),
         })
     }
+
+    /// Fills in the payload/envelope split, when the node's own generator encoded one.
+    ///
+    /// These two fields were null on every `node.tx` record the Phase 1 build wrote,
+    /// because nothing above them knew the split: the node carried a byte *count* and not
+    /// bytes. They are what "security overhead as a fraction of airtime" is computed
+    /// from, so an aggregation over a recording that finds them null is looking at a run
+    /// in which nobody encoded anything — and it can now tell the difference between that
+    /// and a zero-byte envelope.
+    ///
+    /// Both stay `None` for a frame the engine sized from a protocol wire table rather
+    /// than encoding (the misbehaviour report and the CRL broadcast); there is no split
+    /// to report for a frame whose octets were never built.
+    #[must_use]
+    pub fn with_sizes(mut self, payload_bytes: Option<u32>, envelope_bytes: Option<u32>) -> Self {
+        self.0.payload_bytes = payload_bytes.map(u64::from);
+        self.0.envelope_bytes = envelope_bytes.map(u64::from);
+        self
+    }
 }
 
 impl PhyRx {

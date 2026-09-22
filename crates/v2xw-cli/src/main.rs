@@ -11,8 +11,8 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use v2xw_cli::cli::{Cli, Command};
-use v2xw_cli::{fmt, import, info, run, validate};
+use v2xw_cli::cli::{Cli, Command, ExperimentCommand};
+use v2xw_cli::{experiment, fmt, import, info, run, validate};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -81,6 +81,27 @@ fn dispatch(cli: &Cli) -> v2xw_cli::Result<String> {
                 Ok(fmt::info(&outcome))
             }
         }
+        Command::Experiment(args) => match &args.command {
+            // `run` and `resume` are one code path with one flag between them, so there is
+            // no second implementation to drift.
+            ExperimentCommand::Run(a) | ExperimentCommand::Resume(a) => {
+                let resume = matches!(&args.command, ExperimentCommand::Resume(_));
+                let outcome = experiment::run(&a.to_options(resume))?;
+                if a.json {
+                    json(&outcome, "experiment outcome")
+                } else {
+                    Ok(fmt::experiment_run(&outcome))
+                }
+            }
+            ExperimentCommand::Status(a) => {
+                let outcome = experiment::status(&a.scenario, a.out.as_deref())?;
+                if a.json {
+                    json(&outcome, "experiment status")
+                } else {
+                    Ok(fmt::experiment_status(&outcome))
+                }
+            }
+        },
     }
 }
 

@@ -393,6 +393,18 @@ impl v2xw_engine::RunRecorder for StepRecorder {
         }
     }
 
+
+    // Forwarded, not defaulted. `RunRecorder::write_wire_frame` discards by default so a
+    // record-only recorder need not know the binary path exists, but a WRAPPER that
+    // forwards `write` and not this one silently drops the normative binary stream and
+    // nothing in the resulting file says so. That is exactly what happened here: every
+    // run wrote zero keyframes and zero deltas while reporting success.
+    fn write_wire_frame(&mut self, frame: &v2xw_record::wire::Frame) {
+        if let Some(writer) = &mut self.recording {
+            let _ = v2xw_record::RecordingWriter::write_frame(writer, frame);
+        }
+    }
+
     fn refused(&self) -> u64 {
         self.refused
     }

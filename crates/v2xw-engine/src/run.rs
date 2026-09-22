@@ -19,6 +19,29 @@
 //!   └─ Observe      p9  metric flush, and the end-of-run sentinel
 //! ```
 //!
+//! # The mobility step publishes the instant it is dispatched at
+//!
+//! A mobility step dispatched at `t` advances the world to `t + dt`, so what it produces
+//! describes the *end* of the step. The phase therefore publishes in this order:
+//!
+//! ```text
+//! MobilityStep at t
+//!   1. gt.kinematics for every actor, stamped at t  (what the previous step produced)
+//!   2. one VWP Keyframe or Delta at t               (the same state, binary, §3.3/§3.4)
+//!   3. mobility.step(dt)                            (the world advances to t + dt)
+//!   4. absorb, reindex, beliefs
+//! ```
+//!
+//! Publishing the step's own result instead would file every record one mobility step
+//! before the state it describes, against the record's own `t` field — which is what the
+//! vertical-slice audit found. Steps 1 and 2 are two encodings of one fact and are
+//! deliberately adjacent: `tests/wire.rs` checks they agree, which neither can satisfy by
+//! being self-consistent.
+//!
+//! The binary stream is [`crate::snapshot`]. It is what a browser replays, and the Phase 1
+//! build produced none of it at all: `RecordingWriter::write_frame` was called from
+//! nowhere, so a recording carried JSON records and no snapshot frames.
+//!
 //! # Between mobility steps
 //!
 //! Mobility is periodic (ADR 0004 decision 2). A radio event at `t′` strictly inside a
@@ -76,6 +99,7 @@ use v2xw_mobility::{
 };
 use v2xw_msg::generator::DccState;
 use v2xw_node::{NodeConfig, ObuRuntime, RxFrame, StepOutcome, Transmission};
+use v2xw_record::{Cadence, Profile};
 use v2xw_radio::{
     AccessCategory, Arrival, ChannelId, Dcc, EdcaOcbMac, FrameDescriptor, FrameKind,
     InterferenceSource, LosResult, LossCause, Mac, MacSdu, Mcs, OfdmPhy, Phy, RadioEndpoint,
@@ -89,6 +113,7 @@ use crate::error::{EngineError, Result};
 use crate::event::{Event, Observe};
 use crate::records::{GtKinematics, NodeTx, PhyRx};
 use crate::scenario::Scenario;
+use crate::snapshot::{ActorState, SnapshotStream};
 
 /// The 5.9 GHz safety channel, and the frequency the link budget is evaluated at.
 ///
@@ -186,10 +211,33 @@ pub struct RunReport {
     /// How many frames were *not* generated because the instant fell in a time-dilation
     /// window (02-architecture.md §5.4).
     pub suppressed_frames: u64,
-    /// How many records were emitted.
+    /// How many records the engine **emitted**.
+    ///
+    /// Not what was stored: a recorder can refuse a record the engine handed it (an
+    /// undeclared channel, a full disk), and this counts the handing over.
+    /// [`RunReport::records_written`] is what the recorder says it kept, and the two
+    /// disagreeing is exactly the condition a run report has to be able to state.
     pub records: u64,
     /// How many records the context refused, by the visibility rule.
     pub records_refused: u64,
+    /// How many records the **recorder** confirms it stored, when it can say.
+    ///
+    /// `None` means the recorder does not report a count — a wrapper that forwards
+    /// [`crate::RunRecorder::write`] and nothing else, for instance. It is `None` rather
+    /// than zero on purpose: "I do not know" and "nothing was written" are different
+    /// facts and a report that conflated them would be the same defect one layer up.
+    pub records_written: Option<u64>,
+    /// How many VWP `Keyframe` frames the engine produced (vwp-v1 §3.3).
+    pub keyframes: u64,
+    /// How many VWP `Delta` frames the engine produced (vwp-v1 §3.4).
+    pub deltas: u64,
+    /// How many VWP frames the **recorder** confirms it stored, when it can say.
+    ///
+    /// Compared against `keyframes + deltas` it says whether the normative binary stream
+    /// reached the artefact. A recording whose frame count is zero while the engine
+    /// produced thousands is a recording a browser cannot replay, and that is now a
+    /// number in the report rather than something an auditor has to discover.
+    pub frames_written: Option<u64>,
     /// The instant the loop stopped at.
     pub end_ns: SimTime,
     /// What the Phase 2 path did, when a scenario declared one
@@ -218,8 +266,12 @@ impl RunReport {
     /// counts frames that reached *at least one* node and is a different quantity.
     #[must_use]
     pub fn pdr(&self) -> Option<f64> {
+        // `then_some`, not `then`: the body is a cast and a division of two integers
+        // already in hand, so there is nothing to defer and `clippy::unnecessary_lazy_
+        // evaluations` says so. A zero denominator never reaches the division, because
+        // the predicate is what guards it.
         (self.reception_attempts > 0)
-            .then(|| self.receptions_ok as f64 / self.reception_attempts as f64)
+            .then_some(self.receptions_ok as f64 / self.reception_attempts as f64)
     }
 }
 
@@ -306,6 +358,17 @@ struct FrameState {
     /// table and never build one; the receiver then falls back to the engine's own
     /// validity decision, which is what [`v2xw_node::RxFrame::spdu`] documents.
     spdu: Option<Vec<u8>>,
+    /// The facilities-layer payload's length in octets, when the node encoded one.
+    ///
+    /// This and [`FrameState::envelope_bytes`] are what make `node.tx`'s `payload_bytes`
+    /// and `envelope_bytes` real. They were null for every frame of the Phase 1 build,
+    /// which is why "security overhead as a fraction of airtime" — one of the three
+    /// results this simulator exists to produce — could not be computed from a recording
+    /// at all. `None` for a frame the engine sized from a protocol table rather than
+    /// encoding, which is the same set of frames `spdu` is `None` for.
+    payload_bytes: Option<u32>,
+    /// The 1609.2 envelope's cost in octets: the SPDU less the payload.
+    envelope_bytes: Option<u32>,
 }
 
 /// What a Phase 2 application message carries, beyond its length.
@@ -378,6 +441,19 @@ pub struct Engine {
     next_sdu: u32,
     next_node: u32,
     next_frame: u32,
+    /// The producer of the normative `Keyframe`/`Delta` stream (vwp-v1 §3.3, §3.4).
+    snapshots: SnapshotStream,
+    /// Whether that stream is produced at all.
+    ///
+    /// On by default, because a recording without it is a recording a browser cannot
+    /// replay — the defect this field's default is set against. A scale measurement that
+    /// records nothing turns it off, since encoding ten thousand rows per step into
+    /// frames nobody stores is cost with no artefact.
+    snapshots_enabled: bool,
+    /// Which nodes put a frame on the air since the last mobility step, for §3.3.4's
+    /// `ST_TRANSMITTING` bit. A `BTreeSet`, so nothing about the frame depends on hash
+    /// iteration order (02-architecture.md §6.1).
+    transmitted_since_step: std::collections::BTreeSet<NodeId>,
     providers: v2xw_metrics::ProviderSet,
     metric_period: Duration,
     reverse_node_walk: bool,
@@ -444,6 +520,19 @@ impl Engine {
 
         let providers = crate::wiring::build_metrics(&scenario, &mut registry)?;
         let manifest = crate::manifest::assemble(&scenario, &world, &registry, build_utc)?;
+        // The snapshot stream's cadence is the scenario's mobility step and, by default,
+        // a keyframe every simulated second (§3.1.1). A caller recording into a container
+        // with a different `RecordingOptions::cadence` must say so with
+        // [`Engine::configure_snapshots`], because `Reader::verify` checks the gap
+        // between keyframes against the cadence the *container* declares.
+        let snapshots = SnapshotStream::new(
+            &world.bbox,
+            crate::snapshot::snapshot_cadence(
+                scenario.time.mobility_step(),
+                crate::snapshot::DEFAULT_KEYFRAME_PERIOD,
+            ),
+            Profile::Full,
+        );
         // The radio stack is selected from the scenario, which the struct literal below
         // moves; the clone is one `Scenario` per run, not per anything.
         let scenario_for_radio = scenario.clone();
@@ -479,6 +568,9 @@ impl Engine {
             next_sdu: 0,
             next_node: 0,
             next_frame: 0,
+            snapshots,
+            snapshots_enabled: true,
+            transmitted_since_step: std::collections::BTreeSet::new(),
             providers,
             metric_period: Duration::from_secs(1),
             reverse_node_walk: false,
@@ -494,6 +586,39 @@ impl Engine {
     /// The manifest this run will be recorded under.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// Sets the cadence and profile the binary snapshot stream is produced at.
+    ///
+    /// **A caller recording into a container must call this with the same
+    /// [`v2xw_record::Cadence`] it gave [`v2xw_record::RecordingOptions`].**
+    /// `Reader::verify` checks the gap between two keyframes against the cadence the
+    /// *container* declares, so a producer running at a slower cadence than the container
+    /// advertises writes a recording that fails its own verification — and one running
+    /// faster writes more keyframes than §7.3's seek bound was sized for. The default is
+    /// the scenario's mobility step with a keyframe every simulated second, which is
+    /// §3.1.1's default pair.
+    ///
+    /// It resets the stream: the next frame is a keyframe opening GOP 0, with sequence
+    /// numbers from zero. Call it before [`Engine::run`].
+    pub fn configure_snapshots(&mut self, cadence: Cadence, profile: Profile) {
+        self.snapshots = SnapshotStream::new(&self.world.bbox, cadence, profile);
+        self.report.keyframes = 0;
+        self.report.deltas = 0;
+    }
+
+    /// The cadence the binary snapshot stream is being produced at.
+    pub fn snapshot_cadence(&self) -> Cadence {
+        self.snapshots.cadence()
+    }
+
+    /// Turns the binary snapshot stream on or off.
+    ///
+    /// On by default. Off is for a run that records nothing and is measuring the
+    /// simulation's own cost; a run that writes a file and turns this off writes a file
+    /// no browser can replay, which is the state this engine has just been brought out of.
+    pub fn set_snapshots_enabled(&mut self, enabled: bool) {
+        self.snapshots_enabled = enabled;
     }
 
     /// The model registry, for a caller assembling a report.
@@ -598,8 +723,8 @@ impl Engine {
         for spec in specs {
             let id = NodeId::new(self.next_node);
             self.next_node += 1;
-            let mut runtime =
-                crate::wiring::build_rsu(&self.scenario, &spec, id, 0);
+            let env = crate::wiring::NodeEnv::new(&self.world, self.wall);
+            let mut runtime = crate::wiring::build_rsu(&self.scenario, env, &spec, id, 0);
             // A surveyed position, not a fix: an RSU knows where its own mast is because
             // somebody measured it, which is why this is not a GNSS estimate and why the
             // node is not being handed ground truth it could not have (invariant I-C2).
@@ -766,6 +891,14 @@ impl Engine {
         if let Some(phase2) = self.phase2.as_ref() {
             self.report.phase2 = phase2.report().clone();
         }
+        // What the *recorder* says it kept, asked once at the end and never inferred from
+        // what the engine handed over. The two numbers sitting side by side is the point:
+        // a run report that quoted only the emitted count could contradict the artefact
+        // beside it and nothing would say which was right.
+        self.report.records_written = recorder.records_written();
+        self.report.frames_written = recorder.frames_written();
+        self.report.keyframes = self.snapshots.keyframes();
+        self.report.deltas = self.snapshots.deltas();
         Ok(self.report.clone())
     }
 
@@ -822,6 +955,18 @@ impl Engine {
     ) -> Result<()> {
         let now = self.scheduler.now();
 
+        // The published state of *this* instant goes out before the world advances past
+        // it. A mobility step dispatched at `now` produces states for `now + step`, so
+        // publishing the step's own result here would file every record one step early
+        // against its own `t` field — which is the defect this ordering closes. What is
+        // published instead is what the previous step left in `self.actors`, every entry
+        // of which carries `k.t == now`.
+        self.publish_state_at(recorder);
+        self.emit_snapshot(recorder, now)?;
+        // The transmit bit is "since the last mobility step", so the window closes with
+        // the frame that reports it.
+        self.transmitted_since_step.clear();
+
         let update = {
             let Engine {
                 scheduler,
@@ -842,7 +987,6 @@ impl Engine {
 
         self.absorb(&update, now);
         self.rebuild_snapshot(&update);
-        self.publish(recorder, &update);
         self.update_beliefs(recorder, now);
 
         self.report.mobility_steps += 1;
@@ -873,7 +1017,15 @@ impl Engine {
             let node = if equipped {
                 let id = NodeId::new(self.next_node);
                 self.next_node += 1;
-                let mut runtime = crate::wiring::build_node(&self.scenario, id, now);
+                let env = crate::wiring::NodeEnv::new(&self.world, self.wall);
+                let mut runtime = crate::wiring::build_node(
+                    &self.scenario,
+                    env,
+                    id,
+                    now,
+                    spawn.class,
+                    spawn.kinematics.dims,
+                );
                 // Phase 2: the backend enrols and provisions the device, and the
                 // credentials it installs carry the linkage values a CRL revokes. The
                 // digest stays the `pseudo_signer` stand-in — see `crate::phase2`, joint 1
@@ -931,6 +1083,11 @@ impl Engine {
             );
         }
         for (actor, _) in &update.despawned {
+            // The wire slot goes into its cooling-off period here, one step before the
+            // frame whose row set no longer holds it. §3.3.1 forbids reusing a slot for
+            // one keyframe period after a despawn, so a delta that arrives late cannot be
+            // applied to whichever actor inherited the row.
+            self.snapshots.retire(*actor, now);
             if let Some(rec) = self.actors.remove(actor)
                 && let Some(node) = rec.node
             {
@@ -984,16 +1141,71 @@ impl Engine {
         self.snapshot = ActorSnapshot::build(update.t, MAX_RANGE_M, entries);
     }
 
-    /// Emits `gt.kinematics` for every published state, in actor order.
-    fn publish(&mut self, recorder: &mut dyn RunRecorder, update: &MobilityUpdate) {
-        for (actor, k) in &update.states {
-            let class = self
-                .actors
-                .get(actor)
-                .map_or("unknown", |a| a.class.as_str());
-            let rec = GtKinematics::new(*actor, k, class);
-            self.emit(recorder, &rec);
+    /// Emits `gt.kinematics` for every live actor's current state, in actor order.
+    ///
+    /// The record is stamped at **the instant the state describes** — `k.t`, not the
+    /// scheduler's instant — which is the correction the vertical-slice audit asked for.
+    /// The two coincide for every actor the previous mobility step published, and `k.t`
+    /// is used rather than the scheduler's instant so that an actor whose state is older
+    /// than the step — a spawn the provider did not include in its own state list — is
+    /// filed at the time it is actually about, rather than at a time the engine asserted
+    /// for it.
+    fn publish_state_at(&mut self, recorder: &mut dyn RunRecorder) {
+        let states: Vec<(ActorId, Kinematics, &'static str)> = self
+            .actors
+            .iter()
+            .map(|(actor, rec)| (*actor, rec.last, rec.class.as_str()))
+            .collect();
+        for (actor, k, class) in states {
+            let rec = GtKinematics::new(actor, &k, class);
+            self.emit_at(recorder, k.t, &rec);
         }
+    }
+
+    /// Encodes and stores this instant's `Keyframe` or `Delta` (vwp-v1 §3.3, §3.4).
+    ///
+    /// One frame per mobility step; which of the two it is, is the encoder's decision
+    /// from the cadence. This is the *only* producer of the binary snapshot stream in the
+    /// engine, and the frame it hands the recorder is stored verbatim, which is what
+    /// makes §7.2's byte-identity guarantee between a live stream and a replay hold by
+    /// construction rather than by care.
+    ///
+    /// # Errors
+    /// [`EngineError::Record`] if the encoder refuses the step. Each of its refusals is
+    /// an engine bug — time that did not advance, a slot used twice — and a run that
+    /// carried on after one would be a run whose recording silently stopped being
+    /// replayable.
+    fn emit_snapshot(&mut self, recorder: &mut dyn RunRecorder, at: SimTime) -> Result<()> {
+        if !self.snapshots_enabled {
+            return Ok(());
+        }
+        let mut states: Vec<ActorState> = Vec::with_capacity(self.actors.len());
+        for (actor, rec) in &self.actors {
+            let verified_neighbors = rec
+                .node
+                .and_then(|n| self.nodes.get(&n))
+                .map_or(0, |runtime| runtime.stores().neighbors.counts().1 as u32);
+            let attacker = rec.node.is_some_and(|n| {
+                self.phase2.as_ref().is_some_and(|p| p.is_attacker(n))
+            });
+            let transmitting = rec
+                .node
+                .is_some_and(|n| self.transmitted_since_step.contains(&n));
+            states.push(ActorState {
+                actor: *actor,
+                node: rec.node,
+                kinematics: rec.last,
+                class: rec.class,
+                attacker,
+                transmitting,
+                verified_neighbors,
+            });
+        }
+        let frame = self.snapshots.encode(at, &states)?;
+        recorder.write_wire_frame(&frame);
+        self.report.keyframes = self.snapshots.keyframes();
+        self.report.deltas = self.snapshots.deltas();
+        Ok(())
     }
 
     /// Advances every node's belief from its ground truth through the GNSS model.
@@ -1258,18 +1470,18 @@ impl Engine {
             // as having no published value and which `v2xw-proto` carries with its
             // provenance rather than inventing here.
             let bytes = crate::phase2::report_bytes();
-            let tx = Transmission {
-                msg_type: v2xw_msg::MsgType::Mbr,
+            // `Transmission::sized`, not a struct literal: the report's size comes from
+            // `v2xw-proto`'s own wire table and nothing builds the octets, which is
+            // exactly the case the constructor exists for — and it is one edit in
+            // `v2xw-node` rather than one here when that struct grows a field.
+            let tx = Transmission::sized(
+                v2xw_msg::MsgType::Mbr,
                 bytes,
                 signer,
-                full_certificate: true,
-                // No encoded bytes: the report's size comes from `v2xw-proto`'s own wire
-                // table and nothing builds the octets, which is exactly the case
-                // `Transmission::signed` documents `None` for.
-                signed: None,
-                ready_at: self.signing_cost(node).after(believed),
-                generation_time: now,
-            };
+                true,
+                self.signing_cost(node).after(believed),
+                now,
+            );
             self.hand_down_app(
                 node,
                 &tx,
@@ -1451,6 +1663,11 @@ impl Engine {
                 claimed_linkage,
                 app,
                 spdu: tx.signed.as_ref().map(|f| f.spdu.clone()),
+                // Read from the node's own `SignedFrame`, not recomputed here: the split
+                // between payload and envelope is the security stack's answer and the
+                // engine has no business having a second one.
+                payload_bytes: tx.payload_bytes(),
+                envelope_bytes: tx.envelope_bytes(),
             },
         );
         if self.mac.is_some() {
@@ -1822,6 +2039,10 @@ impl Engine {
         state.tx_handle = Some(handle);
         state.end = handle.end;
         self.report.frames_transmitted += 1;
+        // §3.3.4 bit 4: "transmitted at least once in the last mobility step". Set where
+        // the preamble actually goes on the air, not where the node decided to send, so
+        // a frame the MAC dropped does not light the bit.
+        self.transmitted_since_step.insert(state.tx);
         if state.end > horizon {
             // The frame would finish after the run does, so its outcome is never
             // evaluated. It still occupied the medium, which `begin_tx` has recorded.
@@ -2138,7 +2359,8 @@ impl Engine {
                 SignerId::Digest
             },
             state.generation_time,
-        );
+        )
+        .with_sizes(state.payload_bytes, state.envelope_bytes);
         self.emit(recorder, &tx_record);
     }
 
@@ -2297,19 +2519,21 @@ impl Engine {
             else {
                 continue;
             };
-            let tx = Transmission {
-                msg_type: v2xw_msg::MsgType::Crl,
+            let ready_at = self.signing_cost(rsu).after(
+                self.nodes
+                    .get(&rsu)
+                    .map_or(now, |n| n.clock().believed_time(now)),
+            );
+            // Sized from `v2xw-proto`'s CRL wire table; see `run_detectors` for why this
+            // frame carries no encoded octets.
+            let tx = Transmission::sized(
+                v2xw_msg::MsgType::Crl,
                 bytes,
                 signer,
-                full_certificate: true,
-                signed: None,
-                ready_at: self.signing_cost(rsu).after(
-                    self.nodes
-                        .get(&rsu)
-                        .map_or(now, |n| n.clock().believed_time(now)),
-                ),
-                generation_time: now,
-            };
+                true,
+                ready_at,
+                now,
+            );
             self.hand_down_app(
                 rsu,
                 &tx,
@@ -2397,7 +2621,27 @@ impl Engine {
     }
 
     /// Emits a record through a context, so the visibility rule applies to it.
+    ///
+    /// Stamped at the scheduler's instant, which is right for every phase whose records
+    /// describe the instant they are dispatched at. Mobility is the exception, and it
+    /// uses [`Engine::emit_at`].
     fn emit(&mut self, recorder: &mut dyn RunRecorder, record: &dyn v2xw_core::ctx::ErasedRecord) {
+        let at = self.scheduler.now();
+        self.emit_at(recorder, at, record);
+    }
+
+    /// [`Engine::emit`], stamping the record at the instant it describes.
+    ///
+    /// The correction the vertical-slice audit asked for: a ground-truth kinematics
+    /// record's time is the time of the *state*, not the time of the phase that happened
+    /// to publish it. The two differ by one mobility step, because a step dispatched at
+    /// `t` produces the world at `t + dt`.
+    fn emit_at(
+        &mut self,
+        recorder: &mut dyn RunRecorder,
+        at: SimTime,
+        record: &dyn v2xw_core::ctx::ErasedRecord,
+    ) {
         let Engine {
             scheduler,
             rng,
@@ -2416,6 +2660,7 @@ impl Engine {
         let mut ctx = EngineCtx::new(
             scheduler, rng, world, snapshot, provenance, params, &mut tee,
         );
+        ctx.stamp_records_at(Some(at));
         v2xw_core::ctx::Ctx::emit_erased(&mut ctx, record);
         let refused = ctx.refused();
         report.records_refused += refused;
@@ -2443,8 +2688,23 @@ impl RunRecorder for Tee<'_> {
         self.inner.write(at, record);
     }
 
+    /// Forwarded, not dropped. A wrapper that forwards `write` and silently swallows the
+    /// binary stream is the defect [`RunRecorder::write_wire_frame`] documents; this is
+    /// the in-crate wrapper, and it is the one an out-of-crate wrapper is modelled on.
+    fn write_wire_frame(&mut self, frame: &v2xw_record::wire::Frame) {
+        self.inner.write_wire_frame(frame);
+    }
+
     fn refused(&self) -> u64 {
         self.inner.refused()
+    }
+
+    fn records_written(&self) -> Option<u64> {
+        self.inner.records_written()
+    }
+
+    fn frames_written(&self) -> Option<u64> {
+        self.inner.frames_written()
     }
 }
 

@@ -1,6 +1,6 @@
 //! `v2xw` — the command-line control surface.
 //!
-//! Four commands, and no model logic in any of them (02-architecture.md §2, ADR 0010):
+//! Five commands, and no model logic in any of them (02-architecture.md §2, ADR 0010):
 //!
 //! | Command | What it does |
 //! |---|---|
@@ -8,6 +8,7 @@
 //! | [`validate`] | loads and checks a scenario without building its world |
 //! | [`import`] | imports an OpenStreetMap extract into the three world formats |
 //! | [`info`] | prints a recording's manifest, channels and verification report |
+//! | [`experiment`] | expands a scenario's sweep, runs it, aggregates it, resumes it |
 //!
 //! Everything the tool does is a call into a library crate. The one thing it adds is the
 //! clock: [`v2xw_engine::Engine::build`] takes its manifest timestamp as an argument and
@@ -24,6 +25,7 @@
 
 pub mod cli;
 pub mod error;
+pub mod experiment;
 pub mod fmt;
 pub mod import;
 pub mod info;
