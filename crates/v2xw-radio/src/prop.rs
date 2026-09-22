@@ -1380,8 +1380,7 @@ fn log_distance_card(preset: LogDistancePreset, auto: bool, building_term: bool)
             range: Some(vec![serde_json::json!(0.0), serde_json::json!(2.0)]),
             source: Source {
                 kind: SourceKind::Paper,
-                reference: "Sommer 2011 (R3 §C.1), via 04-models.md §3.5: 0.4 dB/m"
-                    .to_string(),
+                reference: "Sommer 2011 (R3 §C.1), via 04-models.md §3.5: 0.4 dB/m".to_string(),
                 accessed: None,
                 note: Some("Applies only when building_term is on.".to_string()),
             },
@@ -1887,8 +1886,8 @@ mod tests {
         // The constant is 180 + 20·log10(4π/c) with c the defined speed of light, which
         // is 32.447783…, not the textbook's rounded 32.44. Pinned against the metre/hertz
         // form, which involves no rounding at all.
-        let exact = 180.0
-            + 20.0 * math::log10(4.0 * core::f64::consts::PI / numeric::SPEED_OF_LIGHT_M_S);
+        let exact =
+            180.0 + 20.0 * math::log10(4.0 * core::f64::consts::PI / numeric::SPEED_OF_LIGHT_M_S);
         assert!(
             (FRIIS_CONST_DB - exact).abs() < 1e-12,
             "{FRIIS_CONST_DB} vs {exact}"
@@ -2046,7 +2045,10 @@ mod tests {
         // The single-slope reading this replaced put 25.2 dB at 100 m. Guard the number
         // itself so a revert is visible.
         let at_100 = olos_hw.path_loss_db(100.0) - los_hw.path_loss_db(100.0);
-        assert!(at_100 < 12.0, "the extrapolated near slope is back: {at_100}");
+        assert!(
+            at_100 < 12.0,
+            "the extrapolated near slope is back: {at_100}"
+        );
 
         // Above the breakpoint the gap grows only with the difference between the two
         // FITTED far slopes (3.18 against 2.88), which is the paper's own data: 10.85 dB

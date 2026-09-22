@@ -1,0 +1,17 @@
+# The 2-vehicle rung of the scaling ladder: one pair, so the reception path has exactly one link.
+#
+# `max_total_vehicles` is a cap on *trips*, and the lane-insertion gap turns it into a
+# count of vehicles; the run report states what it realised. See `base.yaml` for the method
+# and for what the bulk spawn costs in realism.
+schema: v2xw/scenario/1
+meta:
+  name: scale-2
+  base: base.yaml
+  description: The scaling ladder at a nominal 2 vehicles.
+time:
+  duration_s: 2.0
+actors:
+  vehicles:
+    demand:
+      params:
+        max_total_vehicles: 5

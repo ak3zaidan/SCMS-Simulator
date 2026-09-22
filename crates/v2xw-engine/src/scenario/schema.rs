@@ -410,7 +410,23 @@ pub struct Vru {
 #[serde(deny_unknown_fields)]
 pub struct Rsu {
     /// The world site it stands at, by site id.
-    pub site: u32,
+    ///
+    /// Optional, because not every world has a site table: the procedural generator makes
+    /// one site per junction with `rsu_at_junctions: true`, and the OSM importer makes
+    /// none at all — an extract carries road geometry and buildings, not the mast
+    /// inventory of a deployment. A scenario on a real city therefore states the position
+    /// itself, in [`Rsu::position_m`]. Exactly one of the two must be given, which
+    /// [`crate::scenario::validate`] enforces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<u32>,
+    /// Where it stands, world-local ENU metres `[east, north, up]`, when the world has no
+    /// site to name.
+    ///
+    /// The `up` component is the **ground** height; the antenna height the propagation
+    /// model reads is the profile's mast, added the same way a site's is
+    /// ([`v2xw_world::Site::antenna_position`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position_m: Option<[f64; 3]>,
     /// What it does: `crl`, `provisioning-proxy`, `report-forward`, `spat`, `map`, `wsa`.
     #[serde(default)]
     pub roles: Vec<String>,

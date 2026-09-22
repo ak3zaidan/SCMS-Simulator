@@ -185,23 +185,75 @@ impl Run {
         self.engine.lock().seek(t)
     }
 
+    /// The metric catalogue (§6.12), for the RPC layer's visibility checks.
+    pub fn metric_catalogue(&self) -> Vec<crate::introspect::MetricInfo> {
+        self.engine.lock().metric_catalogue()
+    }
+
+    /// The node table as of now: the engine's, for a run whose nodes appear during it,
+    /// and the `Hello` table otherwise.
+    pub fn nodes(&self) -> Vec<crate::engine::NodeFacts> {
+        if let Some(live) = self.engine.lock().live_nodes() {
+            return live;
+        }
+        let hello = &self.descriptor.hello;
+        hello
+            .nodes
+            .iter()
+            .map(|row| crate::engine::NodeFacts {
+                node_id: row.node_id,
+                actor_id: row.actor_id,
+                pos_m: row.pos_m,
+                label: hello.strings.get(row.str_label).unwrap_or("").to_string(),
+                profile_id: hello
+                    .strings
+                    .get(row.str_profile_id)
+                    .unwrap_or("")
+                    .to_string(),
+                flags: row.flags,
+                kind: row.kind,
+                class_idx: row.class_idx,
+            })
+            .collect()
+    }
+
+    /// The node table for a run whose nodes appear during it, together with the strings
+    /// the run has appended to the symbol table; `None` when the `Hello` table is already
+    /// the whole set.
+    pub fn live_node_table(&self) -> Option<(Vec<crate::engine::NodeFacts>, Vec<String>)> {
+        let engine = self.engine.lock();
+        let nodes = engine.live_nodes()?;
+        Some((nodes, engine.live_strings()))
+    }
+
     /// True if the run has this node.
+    ///
+    /// A live run is asked, because its node set grows: the Phase 1 Manhattan scenario has
+    /// no node at all until its demand model produces a vehicle, and a `view.follow` on
+    /// the node that then appears must not be refused because the `Hello` table was empty
+    /// when the server bound.
     pub fn has_node(&self, node: u32) -> bool {
+        if self.engine.lock().live_nodes().is_some() {
+            return self.nodes().iter().any(|r| r.node_id == node);
+        }
         self.node_ids.binary_search(&node).is_ok() || self.node_ids.contains(&node)
     }
 
     /// The nodes within `radius_m` of `node`, in id order, `node` included.
     ///
-    /// Used by `view.follow`'s `radius_m` (§6.7). Positions come from the node table,
-    /// which holds a mobile node's position at `t0`; a live engine answers this against
-    /// the current pose instead, which is why the engine trait, not this function, is
-    /// where it belongs once there is one.
+    /// Used by `view.follow`'s `radius_m` (§6.7). A live run is asked against the poses it
+    /// holds *now*; a fixture or a replay answers from the `Hello` table, which holds a
+    /// mobile node's position at `t0`.
     pub fn nodes_within(&self, node: u32, radius_m: f64) -> Vec<u32> {
-        let Some(origin) = self.node_positions.get(&node) else {
+        let positions: BTreeMap<u32, [f32; 3]> = match self.engine.lock().live_nodes() {
+            Some(live) => live.into_iter().map(|r| (r.node_id, r.pos_m)).collect(),
+            None => self.node_positions.clone(),
+        };
+        let Some(origin) = positions.get(&node).copied() else {
             return Vec::new();
         };
         let r2 = radius_m * radius_m;
-        self.node_positions
+        positions
             .iter()
             .filter(|(_, p)| {
                 let dx = f64::from(p[0] - origin[0]);

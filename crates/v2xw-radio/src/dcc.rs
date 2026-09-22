@@ -1825,7 +1825,11 @@ mod tests {
         assert_eq!(table.len(), Mcs::ALL.len());
         let floor = En302571Floor::CONFORMANT;
         for (mcs, bytes) in table {
-            assert!(floor.admits(air_time(bytes, mcs)), "{} {bytes} B", mcs.label());
+            assert!(
+                floor.admits(air_time(bytes, mcs)),
+                "{} {bytes} B",
+                mcs.label()
+            );
             if bytes < timing::MAX_MSDU_BYTES {
                 assert!(
                     !floor.admits(air_time(bytes + 1, mcs)),
@@ -1841,7 +1845,10 @@ mod tests {
             .map(|(m, b)| (m.label(), b))
             .collect();
         assert!(by_mcs["3-bpsk-1/2"] < timing::MAX_MSDU_BYTES, "{by_mcs:?}");
-        assert!(by_mcs["4.5-bpsk-3/4"] < timing::MAX_MSDU_BYTES, "{by_mcs:?}");
+        assert!(
+            by_mcs["4.5-bpsk-3/4"] < timing::MAX_MSDU_BYTES,
+            "{by_mcs:?}"
+        );
         for rate in [
             "6-qpsk-1/2",
             "9-qpsk-3/4",
@@ -1855,7 +1862,9 @@ mod tests {
         // And the card carries the table, so the generated model page shows it.
         let card = adaptive_card();
         assert!(
-            card.limitations.iter().any(|l| l.contains("largest admissible PSDU")),
+            card.limitations
+                .iter()
+                .any(|l| l.contains("largest admissible PSDU")),
             "{:?}",
             card.limitations
         );

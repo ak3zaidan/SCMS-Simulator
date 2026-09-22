@@ -1,20 +1,20 @@
 //! The seam between this crate and the simulation engine.
 //!
-//! `v2xw-engine` (build decision D8) is being built in parallel with this crate, so the
-//! transport is written against the trait it needs rather than against the engine it does
-//! not yet have. Everything below is defined here, in this crate, and there are two
-//! implementations in-tree:
+//! This trait is defined here, in the transport, rather than in `v2xw-engine`, because
+//! what the transport needs is *state per mobility step* and what the kernel offers is a
+//! run loop and a record stream. There are three implementations in-tree:
 //!
+//! * [`crate::live::LiveEngine`] — a real `v2xw-engine` run (build decision D8). This is
+//!   the one that matters; the other two exist around it.
 //! * [`crate::stub::StubEngine`] — a deterministic synthetic run on a procedurally
-//!   generated grid world. It is what the tests and the `--stub` binary mode drive, and
-//!   it is a real implementation of the trait, not a panicking placeholder.
+//!   generated grid world, kept because it is what lets the framing and session tests run
+//!   without importing a city, and because it is the fixture a client developer can point
+//!   at with no scenario at all.
 //! * [`crate::replay::ReplayEngine`] — a run served from an MCAP recording through
 //!   `v2xw-record`'s reader, which is the replay mode of §7.
 //!
-//! When the engine crate lands, wiring it in is one `impl Engine for …` block plus the
-//! one line in [`crate::ServerOptions`] that chooses which implementation the run holds.
-//! Nothing in [`crate::session`], [`crate::rpc`] or [`crate::http`] refers to either
-//! implementation by name.
+//! Nothing in [`crate::session`], [`crate::rpc`] or [`crate::http`] refers to any of them
+//! by name.
 //!
 //! # Why the engine hands over state and not frames
 //!
@@ -158,6 +158,33 @@ pub struct StepOutput {
     /// recorder stored and the session passes it to the socket. When this is non-empty the
     /// session ignores `snapshot`, `telemetry`, `events` and `metrics`.
     pub recorded: Vec<v2xw_record::wire::Frame>,
+}
+
+/// One node as the engine knows it *now*, with its strings unresolved.
+///
+/// §3.1.3's node table is "the set known at connect time", and for a live run that set
+/// grows: the Phase 1 Manhattan scenario has no vehicle at all until its demand model
+/// produces one. [`RunDescriptor::hello`] is fixed when the run is wrapped, so a run whose
+/// nodes appear later reports them through [`Engine::live_nodes`] instead, and the session
+/// interns the two strings into the table its own `Hello` establishes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeFacts {
+    /// The node id.
+    pub node_id: u32,
+    /// The actor it is mounted on, or `0xFFFF_FFFF`.
+    pub actor_id: u32,
+    /// Its position now (a mobile node's position at `t0` in a static table).
+    pub pos_m: [f32; 3],
+    /// The label, e.g. `veh_0421`.
+    pub label: String,
+    /// The hardware profile id, e.g. `obu/unex-obu-301-craton2`.
+    pub profile_id: String,
+    /// §3.1.3's `flags`.
+    pub flags: u16,
+    /// §3.1.3's `kind`.
+    pub kind: u8,
+    /// Index into the class table, `0xFF` if not an actor.
+    pub class_idx: u8,
 }
 
 /// A run-control command: the engine-facing half of §6.6.
@@ -326,6 +353,40 @@ pub trait Engine: Send + std::fmt::Debug {
 
     /// Counts for `run.status`: `(actors, nodes)`.
     fn counts(&self) -> (u32, u32);
+
+    /// The metric catalogue this run can answer for (§6.12).
+    ///
+    /// On [`Engine`] rather than on [`crate::introspect::Introspect`] because the RPC
+    /// layer needs it before it dispatches: §6.9 and §6.12 refuse a ground-truth metric on
+    /// a `node`-profile connection, and that check is a visibility rule, not an
+    /// introspection answer.
+    fn metric_catalogue(&self) -> Vec<crate::introspect::MetricInfo> {
+        Vec::new()
+    }
+
+    /// The node table as of now, for an engine whose nodes appear during the run.
+    ///
+    /// `None` means the run's nodes are exactly [`RunDescriptor::hello`]`.nodes` and were
+    /// known when it started, which is true of the fixture and of every replay. A live
+    /// engine returns `Some`, and the transport uses it for `Hello`'s node table, for
+    /// `view.follow`'s radius query and for `inspect.node`.
+    fn live_nodes(&self) -> Option<Vec<NodeFacts>> {
+        None
+    }
+
+    /// Strings this run has appended to [`RunDescriptor::hello`]'s symbol table since it
+    /// started, in the order it appended them.
+    ///
+    /// A run whose actors appear during it needs a string per node label, and §2.5 makes
+    /// the symbol table append-only: an id must mean the same string on every connection
+    /// of the run, or a client that cached one is wrong. So the labels are kept run-scoped
+    /// and **append-only even across a despawn** — a node that leaves does not free its
+    /// label's id — and the session appends this list to the table its `Hello`
+    /// establishes. Without that, two connections made either side of a despawn would
+    /// disagree about what every id after it meant.
+    fn live_strings(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Applies a run-control command (§6.6).
     ///

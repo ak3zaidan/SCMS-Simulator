@@ -26,3 +26,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # Crate error type.
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Records are serialised through `v2xw_core::ctx::ErasedRecord`, which this crate already
+# depends on, so the channel-and-shape test needs nothing further. Writing an MCAP would
+# need `v2xw-record`, and a protocol plug-in does not write recordings — it emits `Record`s
+# and the engine's recorder writes them.

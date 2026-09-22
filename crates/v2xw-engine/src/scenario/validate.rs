@@ -261,15 +261,39 @@ fn actors(s: &Scenario, e: &mut Vec<ScenarioError>) {
 
     let mut seen_sites = BTreeSet::new();
     for (i, r) in s.actors.rsus.iter().enumerate() {
-        if !seen_sites.insert(r.site) {
-            e.push(conflict(
-                &format!("actors.rsus[{i}].site"),
-                format!(
-                    "site {} already carries a roadside unit; two units at one site would \
-                     share a position and the node ids would be assigned by list order",
-                    r.site
-                ),
-            ));
+        match (r.site, r.position_m) {
+            (Some(site), None) => {
+                if !seen_sites.insert(site) {
+                    e.push(conflict(
+                        &format!("actors.rsus[{i}].site"),
+                        format!(
+                            "site {site} already carries a roadside unit; two units at one \
+                             site would share a position and the node ids would be assigned \
+                             by list order"
+                        ),
+                    ));
+                }
+            }
+            (None, Some(p)) => {
+                if p.iter().any(|v| !v.is_finite()) {
+                    e.push(conflict(
+                        &format!("actors.rsus[{i}].position_m"),
+                        "is not a finite world-local position".to_string(),
+                    ));
+                }
+            }
+            (Some(_), Some(_)) => e.push(conflict(
+                &format!("actors.rsus[{i}]"),
+                "names both a world `site` and an explicit `position_m`; give exactly one, \
+                 because two answers to where the mast stands is one answer too many"
+                    .to_string(),
+            )),
+            (None, None) => e.push(conflict(
+                &format!("actors.rsus[{i}]"),
+                "says where it stands neither by world `site` nor by `position_m`; an OSM \
+                 import carries no mast inventory, so a scenario on one states the position"
+                    .to_string(),
+            )),
         }
     }
 

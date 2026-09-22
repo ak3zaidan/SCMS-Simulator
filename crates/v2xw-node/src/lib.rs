@@ -45,6 +45,7 @@
 //! | BSM at 10 Hz, CAM on the EN 302 637-2 triggers | [`generate`] | EN 302 637-2 §6.1.3, SAE J2945/1 |
 //! | The 208-byte `NodeTelemetry` record | [`telemetry`] | vwp-v1 §3.5.2 |
 //! | The step function and the `NodeView` implementation | [`runtime`] | 06-node-models.md §2 |
+//! | Real payloads, real signatures, real bytes | [`secure`] | IEEE 1609.2 §5.3.1, 04-models.md §9.1 |
 //! | The ground-truth conformance sentinel | [`firewall`] | 03-interfaces.md §17, D11 |
 //!
 //! # What is not here yet
@@ -76,6 +77,7 @@ pub mod profile;
 pub mod profiles;
 pub mod queue;
 pub mod runtime;
+pub mod secure;
 pub mod server;
 pub mod stores;
 pub mod telemetry;
@@ -88,6 +90,7 @@ pub use policy::{OnDemand, Prioritized, VerificationPolicy, VerifyAll, VerifyDec
 pub use profile::{Field, FieldStatus, HardwareProfile, HsmKind, NodeKind, RunsOn, StorageModel};
 pub use queue::{DropCause, DropLedger, NodeQueue, QueueKind};
 pub use runtime::{NodeConfig, ObuRuntime, RxFrame, StepOutcome, Transmission, VerifiedMessage};
+pub use secure::{CryptoMode, NodeCrypto, NodeSecurity, SecCtx, SignedFrame, SpduVerdict};
 pub use server::{OpClass, OpDescriptor, ProfileServiceModel, ServerBank, ServiceModel};
 pub use stores::{
     CertStore, CredState, CredentialHandle, CrlGate, CrlVerdict, Neighbor, NeighborTable,

@@ -42,7 +42,36 @@
 //! `v2xw-node`'s `VerifiedMessage` and `NeighborTable` and `v2xw-engine`'s scenario types
 //! are not named anywhere in this crate. The belief shapes in [`obs`] mirror them field
 //! for field, and the engine supplies them through a `From` adapter on its side of the
-//! seam. That adapter is the one piece this crate owes the engine; see the crate's report.
+//! seam.
+//!
+//! ## What the engine has to call
+//!
+//! `tests/common/sim.rs` is a **running** attack-in-the-loop simulation built on the same
+//! models `v2xw_engine::wiring` selects — the procedural world, `NativeMobility`,
+//! `GaussMarkovGnss`, `LogDistanceShadowing` + `NakagamiFading`, the `PerModel`, and
+//! `ObuRuntime` on the reference profile — so the two calls the engine's own loop is
+//! missing are exercised rather than described. They are:
+//!
+//! 1. **Between `ObuRuntime::step` and the frame going on the air.** The engine's
+//!    `run::Engine::launch` already takes the node's belief and turns it into a frame's
+//!    `claimed_pos`/`claimed_speed_mps`/`claimed_heading_rad`. An attacker is
+//!    [`attack::Attacker::act`] called on an [`attack::Emission`] built from that belief,
+//!    immediately before the frame is constructed; the returned actions go to
+//!    [`attack::log_actions`] with the `ActorId` the engine knows and the attacker does
+//!    not. The emission's `repetitions`, `signature_valid`, `cert_valid_from/to`,
+//!    `station_type`, `suppressed` and `ghosts` are what the frame must then carry, and
+//!    `ghosts` are extra frames signed with the attacker's other pseudonyms.
+//! 2. **On each node's delivered messages.** [`detect::Detector::on_message`] takes an
+//!    [`obs::ObservedMessage`], the node's own [`obs::SelfBelief`] and the node's map
+//!    store, and writes its own `det.observation` records. Four of
+//!    `v2xw_node::VerifiedMessage`'s fields are not on it — the repetition count, the
+//!    certificate validity window, the declared station type and the broadcast position
+//!    confidence — so the frame has to carry them alongside; the harness joins them back
+//!    by `(signer, generation time)`.
+//!
+//! Two things the harness found that the engine will meet as soon as it makes those calls
+//! are recorded where they belong: [`detect`]'s module documentation, under "Measured
+//! against the legacy engine".
 //!
 //! # Conformance
 //!

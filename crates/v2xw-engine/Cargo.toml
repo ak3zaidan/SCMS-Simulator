@@ -17,6 +17,12 @@ v2xw-net = { workspace = true }
 v2xw-msg = { workspace = true }
 v2xw-sec = { workspace = true }
 v2xw-node = { workspace = true }
+# The Phase 2 path (`phase2`): the CAMP SCMS deployment and the attacker, detector and
+# report families. Both sit below this crate in ADR 0010's table — neither depends on
+# `v2xw-engine`, and `v2xw-threat`'s manifest says why it must not — so composing them
+# here is the layering working rather than a new edge.
+v2xw-proto = { workspace = true }
+v2xw-threat = { workspace = true }
 v2xw-record = { workspace = true }
 v2xw-metrics = { workspace = true }
 

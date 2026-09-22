@@ -60,12 +60,13 @@ pub mod ctx;
 pub mod error;
 pub mod event;
 pub mod manifest;
+pub mod phase2;
 pub mod records;
 pub mod run;
 pub mod scenario;
 pub mod wiring;
 
-pub use ctx::{EngineCtx, MemoryRecorder, NullRecorder, RunRecorder};
+pub use ctx::{DigestRecorder, EngineCtx, MemoryRecorder, NullRecorder, RunRecorder};
 pub use error::{EngineError, Result, ScenarioError};
 pub use event::{Event, NodeTask, Observe};
 pub use run::{Engine, RunReport};

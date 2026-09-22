@@ -15,6 +15,7 @@
 //! | The 32 methods and the 8 notifications | [`rpc`] | §6 |
 //! | The OpenRPC 1.3.2 document | [`openrpc`] | §6.3 |
 //! | The engine seam | [`engine`] | — |
+//! | A live `v2xw-engine` run | [`live`] | — |
 //! | A deterministic synthetic engine | [`stub`] | — |
 //! | Replay from a recording | [`replay`] | §7 |
 //! | The `{path, message, hint}` error surface | [`error`] | §6.4 |
@@ -52,6 +53,7 @@ pub mod engine;
 pub mod error;
 pub mod http;
 pub mod introspect;
+pub mod live;
 pub mod openrpc;
 pub mod replay;
 pub mod ring;
@@ -63,8 +65,9 @@ pub mod stub;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-pub use engine::{Engine, RunDescriptor, RunState, StepOutput};
+pub use engine::{Engine, NodeFacts, RunDescriptor, RunState, StepOutput};
 pub use error::{ParamError, Result, ServerError};
+pub use live::{LiveEngine, LiveOptions};
 pub use replay::ReplayEngine;
 pub use run::Run;
 pub use session::{ConnectParams, Session};
@@ -209,11 +212,32 @@ impl VwpServer {
     }
 }
 
+/// Starts a server on `bind` running `scenario` on the real engine.
+///
+/// The scenario is loaded, the world is imported and the kernel is built before this
+/// returns, so a caller that gets an `Ok` has a run: the banner it prints names a world
+/// hash and a run id that exist. A scenario that does not load, or a world that does not
+/// import, is an error here rather than a server listening on a run that failed.
+///
+/// # Errors
+/// Whatever the scenario loader, the world importer, the kernel or the bind refuses.
+pub async fn serve_scenario(
+    options: ServerOptions,
+    scenario: impl AsRef<std::path::Path>,
+    mut live: LiveOptions,
+) -> Result<VwpServer> {
+    live.session_token = options.session_token.clone();
+    let engine = LiveEngine::open(scenario, live)?;
+    let world_json = engine.world_json().to_string();
+    let run = Run::new(Box::new(engine), world_json)?;
+    VwpServer::start(run, options).await
+}
+
 /// Starts a server on `bind` with the synthetic fixture engine.
 ///
-/// This is what the binary and the tests use. It is also the shape the wiring will take
-/// when `v2xw-engine` lands: build an engine, wrap it in a [`Run`], hand the run to
-/// [`VwpServer::start`]. Only the first line changes.
+/// Kept for a client developer who wants a stream with no scenario, no city extract and
+/// no import: it is a real implementation of the [`Engine`] seam on a procedurally
+/// generated grid. Every number it reports is a fixture value — see [`stub`].
 ///
 /// # Errors
 /// Whatever the fixture or the bind refuses.

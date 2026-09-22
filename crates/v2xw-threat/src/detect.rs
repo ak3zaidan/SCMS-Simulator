@@ -30,12 +30,56 @@
 //!   therefore harder to catch here than in the legacy engine, which is a real property of
 //!   the attack and not a regression. See the crate report.
 //!
+//! # Measured against the legacy engine
+//!
+//! `tests/legacy_engine_compare.rs` extracts the legacy detection pass out of
+//! `legacy/scms_sim_ref/mock_pipeline/run.py` at test time, executes it, and hands both
+//! implementations the same 1 330-message claim trace covering all 28 legacy attack
+//! renderings. **Thirteen of the fourteen checks reproduce the legacy score on every
+//! message**, to the 1e-3 quantum both sides round to, and the fired set — streak gate and
+//! reason ordering included — agrees on every message.
+//!
+//! The fourteenth is `sybilCoLocation`, and the comparison sharpens the divergence above
+//! into two mechanisms rather than one:
+//!
+//! 1. the census here is **per receiver**, as declared; and
+//! 2. it is **incremental within the step**. The legacy engine builds `cells` over the
+//!    whole step *before* the detection pass, so every message of that step sees the full
+//!    count; this port counts a claim as it arrives, so the attacker's own beacon sees a
+//!    census of one and the *n*-th ghost sees *n*.
+//!
+//! Measured on that trace: 210 of 1 330 messages disagree, **all of them scoring lower
+//! here, none higher**, with a largest shortfall of 1.5 — six of a seven-identity Sybil's
+//! certificates missed on the message that arrived first. The direction is the safe one
+//! (this port under-accuses rather than over-accuses), and the fix, if the operating point
+//! is ever to match the legacy corpus, is to score a step's messages after the step's
+//! census is complete rather than during it.
+//!
+//! One smaller note from the same comparison: the cell index is
+//! [`v2xw_core::math::grid_index`], which rounds half away from zero, while the legacy
+//! `round(cx / cell)` is Python's round-half-to-even. It can only differ on an exact tie.
+//!
 //! # What is deliberately soft
 //!
 //! `kalmanConsistency` is carried in the fingerprint and never fires on its own: a
 //! constant-velocity tracker false-positives on a sustained curve, so promoting it to a
 //! trigger would manufacture false accusations against honest vehicles going round
 //! corners. The legacy engine says exactly this and so does the JVM reference.
+//!
+//! It has one failure mode the legacy engine cannot reach, and it is recorded here because
+//! it is a *feature column* even though it is never a trigger. The tracker's velocity
+//! update divides the residual by `dtk = max(1e-3, t − t_prev)`, so two messages from one
+//! signer bearing the **same** received instant multiply the residual by 300. The legacy
+//! engine emits one beacon per sender per step and so never produces such a pair; a
+//! dual-stack node does — `v2xw_node::NodeConfig::default()` is `ServiceSet::BOTH`, and a
+//! CAM and a BSM in one generation interval carry one signer and one claimed generation
+//! time. Measured in `tests/common/sim.rs` with `BOTH`: 135 809 such pairs in a
+//! 345 088-reception run and a `kalmanConsistency` that reached `inf`; with
+//! `ServiceSet::SAE` the same run has none and the score peaks at 22. The arithmetic here
+//! is the legacy arithmetic and is left alone; what the engine has to decide is whether a
+//! receiver may be handed two beacons from one signer at one instant, and if so whether
+//! this tracker should key on `(signer, message type)` or guard `dtk` at the generation
+//! interval rather than at a millisecond.
 
 use std::collections::BTreeMap;
 
@@ -487,6 +531,8 @@ pub struct Legacy12 {
     subjects: BTreeMap<[u8; 8], SubjectState>,
     /// Co-location census: `(cell_x, cell_y, heading_octant) -> digest -> last heard`.
     cells: BTreeMap<(i64, i64, u8), BTreeMap<[u8; 8], SimTime>>,
+    /// The last instant the census dropped its dead cells. See [`Legacy12::census`].
+    last_sweep: SimTime,
 }
 
 impl Legacy12 {
@@ -499,6 +545,7 @@ impl Legacy12 {
             params,
             subjects: BTreeMap::new(),
             cells: BTreeMap::new(),
+            last_sweep: 0,
         }
     }
 
@@ -523,7 +570,9 @@ impl Legacy12 {
     /// Records a claimed position in the co-location census and returns how many distinct
     /// certificates this receiver has heard in that cell within the window.
     ///
-    /// The cell is `(⌊x/cell⌋, ⌊y/cell⌋, heading octant)`. Keying on heading too means
+    /// The cell is `(round(x/cell), round(y/cell), heading octant)` —
+    /// [`v2xw_core::math::grid_index`], matching the legacy `round(cx / cfg.sybil_cell_m)`
+    /// except on an exact tie. Keying on heading too means
     /// crossing traffic converging at a junction is not mistaken for a Sybil, whose ghosts
     /// copy one position *and* one heading.
     fn census(&mut self, m: &ObservedMessage, t: SimTime) -> u32 {
@@ -535,7 +584,19 @@ impl Legacy12 {
         entry.retain(|_, last| *last >= cutoff);
         let n = entry.len();
         // Keep the census bounded: a cell nobody has claimed inside the window is dead.
-        self.cells.retain(|_, v| !v.is_empty());
+        //
+        // The sweep is **amortised to once per window** rather than run per message, and
+        // the reason is a measurement rather than a preference: a receiver in a
+        // sixty-vehicle fleet at 10 Hz visits tens of thousands of cells over a minute, so
+        // an O(cells) sweep on every message made one harness run take longer than the
+        // rest of the loop put together. It cannot change a score — the sweep only drops
+        // cells that are already empty, and an empty cell contributes nothing to any
+        // census — so what it changes is the wall time and the peak size of the map, both
+        // of which are bounded by one window's worth of claims.
+        if t.saturating_sub(self.last_sweep) >= window {
+            self.cells.retain(|_, v| !v.is_empty());
+            self.last_sweep = t;
+        }
         u32::try_from(n).unwrap_or(u32::MAX)
     }
 

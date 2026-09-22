@@ -24,6 +24,7 @@ use v2xw_sec::primitive::{PrimitiveId, PrimitiveOpKind};
 use crate::error::{ProtoError, Result};
 use crate::kernel::{Delivery, Kernel, Outbox};
 use crate::net::{BackendNet, Link, Transport};
+use crate::pseudonym::{CertEvent, PseudonymStore, PseudonymStrategy};
 use crate::scms::msg::{
     CertRequestItem, IssuedCredential, LaIndex, Lci, PcaLookup, PreLinkageBatch,
     ProvisioningRequest, ReportSubmission, ScmsMsg, ScmsSizes, SealedForPca,
@@ -55,6 +56,8 @@ pub struct DeviceState {
     pub silenced: bool,
     /// How many times it has polled for a batch that was not ready.
     pub download_retries: u32,
+    /// Which of its pseudonyms is active, and the rule that changes it.
+    pub store: PseudonymStore,
     /// The run of the provisioning flow in progress.
     provisioning: Option<ProvisioningProgress>,
 }
@@ -78,8 +81,30 @@ impl DeviceState {
             crl: Vec::new(),
             silenced: false,
             download_retries: 0,
+            store: PseudonymStore::default(),
             provisioning: None,
         }
+    }
+
+    /// The `(i, j)` pairs this device could sign with at `now`, in ascending order.
+    ///
+    /// Usable means three things at once: downloaded, inside its validity window, and not
+    /// matched by the CRL this device has processed. All three are the *device's* own
+    /// view — the CRL it holds, not the CRL that exists — which is invariant I-P5.
+    pub fn usable_at(&self, params: &ScmsParams, now: SimTime) -> Vec<(u32, u32)> {
+        self.credentials
+            .keys()
+            .copied()
+            .filter(|&(i, j)| {
+                let (from, until) = params.validity(i);
+                now >= from && now < until && !self.is_revoked(i, j)
+            })
+            .collect()
+    }
+
+    /// The credential the device would sign with now, if it has one.
+    pub fn active_credential(&self) -> Option<&IssuedCredential> {
+        self.store.active().and_then(|k| self.credentials.get(&k))
     }
 
     /// Whether the credential for `(i, j)` is revoked by the CRL this device holds.
@@ -301,6 +326,18 @@ impl ScmsRun {
     /// # Errors
     /// [`ProtoError::Size`] if the certificate profile does not encode.
     pub fn new(params: ScmsParams) -> Result<ScmsRun> {
+        ScmsRun::new_at(params, 0)
+    }
+
+    /// The same deployment with its clock starting at `t0`.
+    ///
+    /// The engine's clock does not start at zero, and a provisioning flow that began at
+    /// the scenario's `t0` must stamp its stages on the engine's timeline rather than on
+    /// one of its own. `t0` is supplied by the caller; nothing here reads a clock.
+    ///
+    /// # Errors
+    /// [`ProtoError::Size`] if the certificate profile does not encode.
+    pub fn new_at(params: ScmsParams, t0: SimTime) -> Result<ScmsRun> {
         let nodes = ScmsNodes::default();
         let sizes = ScmsSizes::new(CertificateSizes::measured()?, params.sizes);
         let mut net = BackendNet::new();
@@ -312,7 +349,7 @@ impl ScmsRun {
         for (a, b) in nodes.backend_links() {
             net.connect(a, b, backend);
         }
-        let mut kernel = Kernel::new(net);
+        let mut kernel = Kernel::new_at(net, t0);
         for (node, spec) in nodes.backend_service_models(&params) {
             kernel.host(node, &spec, params.backend_profile);
         }
@@ -363,6 +400,80 @@ impl ScmsRun {
         self.state.devices.insert(node, DeviceState::new(node));
     }
 
+    /// Puts `device` in range of the roadside CRL broadcast path.
+    ///
+    /// The second distribution path of 05-protocols §3.2: the same signed CRL, over the
+    /// 5.9 GHz air interface instead of the cellular uplink. The two differ in exactly one
+    /// modelled thing — the link — which is what makes "how long until an RSU-only vehicle
+    /// enforces it" a different number from "how long until a connected one does".
+    ///
+    /// The air interface itself belongs to `v2xw-radio`: this is a point-to-point link
+    /// with the OFDM rate as its bandwidth, so a 400 kB CRL takes the 533 ms it takes at
+    /// 6 Mbit/s. Contention, fragmentation and the loss process are the radio crate's, and
+    /// a scenario that needs them drives the broadcast through the engine's PHY instead.
+    pub fn attach_rsu(&mut self, device: NodeId) {
+        let p = &self.state.params;
+        let air = Link {
+            latency: p.v2x_air_latency,
+            bandwidth_bps: p.v2x_air_bandwidth_bps,
+            transport: Transport::V2xAir,
+        };
+        let broadcast = self.state.nodes.crl_broadcast;
+        self.kernel.net_mut().connect(device, broadcast, air);
+    }
+
+    /// Sets the pseudonym-change rule `device` follows.
+    pub fn set_strategy(&mut self, device: NodeId, strategy: PseudonymStrategy) {
+        if let Some(d) = self.state.devices.get_mut(&device) {
+            d.store.set_strategy(strategy);
+        }
+    }
+
+    /// Adds travel since the last pseudonym change, for the `distance` rule.
+    pub fn travelled_cm(&mut self, device: NodeId, cm: u64) {
+        if let Some(d) = self.state.devices.get_mut(&device) {
+            d.store.travelled_cm(cm);
+        }
+    }
+
+    /// Tells `device` it has left a mix zone, for the `mix-zone` rule.
+    pub fn left_mix_zone(&mut self, device: NodeId) {
+        if let Some(d) = self.state.devices.get_mut(&device) {
+            d.store.left_mix_zone();
+        }
+    }
+
+    /// Rotates `device`'s pseudonym if its rule says one is due at `now`.
+    ///
+    /// Returns the `sec.cert` record for the change, or `None` if none happened. The
+    /// device's own store is what swaps: [`DeviceState::active_credential`] returns a
+    /// different credential afterwards, with a different linkage value, which is the only
+    /// identifier a receiver of its next message would see.
+    pub fn rotate(&mut self, device: NodeId, now: SimTime) -> Option<CertEvent> {
+        let params = self.state.params;
+        let dev = self.state.devices.get_mut(&device)?;
+        let usable = dev.usable_at(&params, now);
+        let active_revoked = dev
+            .store
+            .active()
+            .is_some_and(|(i, j)| dev.is_revoked(i, j));
+        let (reason, next) = dev.store.rotate(now, &usable, active_revoked)?;
+        let (i, j) = next.unwrap_or((0, 0));
+        let lv = next
+            .and_then(|k| dev.credentials.get(&k))
+            .map_or([0u8; 9], |c| *c.lv.as_bytes());
+        Some(CertEvent {
+            t: now,
+            node: device,
+            event: "change",
+            reason: Some(reason),
+            i_period: i,
+            j_index: j,
+            linkage_value: lv,
+            changes: dev.store.changes(),
+        })
+    }
+
     fn new_run(&mut self) -> FlowRun {
         self.state.next_run += 1;
         FlowRun(self.state.next_run)
@@ -370,7 +481,17 @@ impl ScmsRun {
 
     fn inject(&mut self, to: NodeId, msg: ScmsMsg, flow: FlowId, run: FlowRun) {
         let at = self.kernel.now();
-        self.kernel.inject(
+        self.inject_at(at, to, msg, flow, run);
+    }
+
+    /// Schedules a flow's first message at `at`, never earlier than the kernel's clock.
+    ///
+    /// A device that spawns 1.5 s into a run asks for credentials at 1.5 s. Clamping to
+    /// the clock matters: the heap is ordered by `(time, sequence)`, and an injection in
+    /// the past would be dispatched before deliveries already in flight, which is a
+    /// causality violation rather than an early message.
+    fn inject_at(&mut self, at: SimTime, to: NodeId, msg: ScmsMsg, flow: FlowId, run: FlowRun) {
+        self.kernel.inject_at(
             at,
             Delivery {
                 at,
@@ -385,8 +506,15 @@ impl ScmsRun {
 
     /// Starts the enrolment flow for a device.
     pub fn enrol(&mut self, device: NodeId) -> FlowRun {
+        let at = self.kernel.now();
+        self.enrol_at(device, at)
+    }
+
+    /// Starts the enrolment flow at `at`.
+    pub fn enrol_at(&mut self, device: NodeId, at: SimTime) -> FlowRun {
         let run = self.new_run();
-        self.inject(
+        self.inject_at(
+            at,
             device,
             ScmsMsg::EnrolRequest { device },
             FlowId::Enrolment,
@@ -397,12 +525,26 @@ impl ScmsRun {
 
     /// Starts the butterfly provisioning flow.
     pub fn provision(&mut self, device: NodeId, start_i: u32, periods: u32, jmax: u32) -> FlowRun {
-        self.start_provisioning(device, start_i, periods, jmax, FlowId::Provisioning)
+        let at = self.kernel.now();
+        self.provision_at(device, at, start_i, periods, jmax)
+    }
+
+    /// Starts the butterfly provisioning flow at `at`.
+    pub fn provision_at(
+        &mut self,
+        device: NodeId,
+        at: SimTime,
+        start_i: u32,
+        periods: u32,
+        jmax: u32,
+    ) -> FlowRun {
+        self.start_provisioning(device, at, start_i, periods, jmax, FlowId::Provisioning)
     }
 
     fn start_provisioning(
         &mut self,
         device: NodeId,
+        at: SimTime,
         start_i: u32,
         periods: u32,
         jmax: u32,
@@ -438,7 +580,8 @@ impl ScmsRun {
                 first_batch_seen: false,
             });
         }
-        self.inject(
+        self.inject_at(
+            at,
             device,
             ScmsMsg::ProvisioningRequest(Box::new(request)),
             flow,
@@ -452,7 +595,8 @@ impl ScmsRun {
     /// The same flow with a different name, which is what 05-protocols §3.2 says top-up is
     /// — "RA pre-generates up to 3 years ahead and adds a week every week".
     pub fn topup(&mut self, device: NodeId, i: u32, jmax: u32) -> FlowRun {
-        self.start_provisioning(device, i, 1, jmax, FlowId::Topup)
+        let at = self.kernel.now();
+        self.start_provisioning(device, at, i, 1, jmax, FlowId::Topup)
     }
 
     /// Submits a misbehaviour report about the certificate `(subject_i, subject_lv)`.
@@ -531,6 +675,43 @@ impl ScmsRun {
         run
     }
 
+    /// Has the roadside broadcast path push the current CRL to `device`.
+    ///
+    /// The device must have been attached with [`ScmsRun::attach_rsu`]; without a link the
+    /// kernel refuses to deliver rather than delivering for free (invariant I-P1).
+    pub fn broadcast_crl_to(&mut self, device: NodeId) -> FlowRun {
+        let run = self.new_run();
+        let broadcast = self.state.nodes.crl_broadcast;
+        self.inject(
+            broadcast,
+            ScmsMsg::CrlAirBroadcast { device },
+            FlowId::CrlDistribution,
+            run,
+        );
+        run
+    }
+
+    /// Runs every delivery due at or before `horizon`, then stops.
+    ///
+    /// How the engine drives the deployment: it advances its own clock to `t`, calls this,
+    /// and the backend does exactly the work that was due by then. What is still in flight
+    /// stays in flight, which is the difference between a provisioning round trip that
+    /// costs simulated time and one that completes inside a single engine step.
+    ///
+    /// # Errors
+    /// Whatever [`Kernel::dispatch`] or a handler returns.
+    pub fn run_until(&mut self, horizon: SimTime) -> Result<()> {
+        let ScmsRun { state, kernel } = self;
+        while let Some(d) = kernel.next_delivery_before(horizon) {
+            let profile = kernel.profile_of(d.to);
+            let mut out = Outbox::new(profile);
+            let (at, to) = (d.at, d.to);
+            state.handle(d, &mut out)?;
+            kernel.dispatch(at, to, out)?;
+        }
+        Ok(())
+    }
+
     /// The single entry on the published CRL, for a test that needs to inspect it.
     pub fn crl_entry(&self) -> Option<&v2xw_sec::linkage::CrlLinkageEntry> {
         self.state.crl_store.entries.first()
@@ -585,7 +766,7 @@ impl ScmsState {
     #[allow(clippy::too_many_lines)]
     fn handle(&mut self, d: Delivery<ScmsMsg>, out: &mut Outbox<ScmsMsg>) -> Result<()> {
         let n = self.nodes;
-        let (flow, run, to, at) = (d.flow, d.run, d.to, d.at);
+        let (flow, run, to, at, from) = (d.flow, d.run, d.to, d.at, d.from);
         match d.msg {
             // ---------------- enrolment ----------------
             ScmsMsg::EnrolRequest { device } if to == device => {
@@ -1443,6 +1624,21 @@ impl ScmsState {
                     run,
                 );
             }
+            ScmsMsg::CrlAirBroadcast { device } => {
+                // The roadside unit puts the list it holds on the air. It performs no
+                // cryptography: the CRL Generator already signed it, and re-signing at
+                // every RSU would be both wrong and a cost the deployment does not pay.
+                let entries = u32::try_from(self.crl_broadcast.entries.len()).unwrap_or(u32::MAX);
+                out.send(
+                    device,
+                    ScmsMsg::CrlDownload { device, entries },
+                    "crl-air-broadcast",
+                    self.sizes.crl(entries),
+                    Transport::V2xAir,
+                    flow,
+                    run,
+                );
+            }
             ScmsMsg::CrlDownload { device, entries } => {
                 let size = self.sizes.crl(entries).bytes();
                 out.stage_at(StageId::Downloaded, device, Some(size), flow, run);
@@ -1450,7 +1646,15 @@ impl ScmsState {
                 // per i-period walked and two AES per index searched ([ACPC §2],
                 // [BRECHT §VII]).
                 Self::verify(out, 1);
-                let list = self.crl_store.entries.clone();
+                // The device processes the list it *received*, from whichever path
+                // delivered it. The two paths carry the same signed artefact, and reading
+                // the store's copy on the broadcast path would make an RSU-only vehicle
+                // silently enforce a CRL it never heard.
+                let list = if from == n.crl_broadcast {
+                    self.crl_broadcast.entries.clone()
+                } else {
+                    self.crl_store.entries.clone()
+                };
                 let Some(dev) = self.devices.get_mut(&device) else {
                     return Err(ProtoError::NoEntity { node: device });
                 };

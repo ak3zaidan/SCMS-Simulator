@@ -122,6 +122,14 @@ impl ServiceQueue {
         done
     }
 
+    /// The latest instant any of this entity's servers becomes free.
+    ///
+    /// What "this entity has finished everything it was given" means for a `c`-server
+    /// queue: the last server to finish, not the first.
+    pub fn busy_until(&self) -> SimTime {
+        self.free_at.iter().copied().max().unwrap_or(0)
+    }
+
     /// How many requests this entity has served.
     pub const fn served(&self) -> u64 {
         self.served

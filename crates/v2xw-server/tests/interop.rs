@@ -6,9 +6,16 @@
 //! ported from the mock server's own interop suite, minus the ones that describe the
 //! mock's synthetic Manhattan geometry — and this test is what makes them run in CI.
 //!
-//! Three servers are started, because three of the checks need a run of a particular
-//! shape: a long live run, a three-second run for the end-of-run path (§2.3, §3.11), and
-//! a replay of a recording (§7).
+//! Four servers are started, because the checks need runs of particular shapes: a long
+//! fixture run, a three-second run for the end-of-run path (§2.3, §3.11), a replay of a
+//! recording (§7), and — the one that matters — **a real `v2xw-engine` run**.
+//!
+//! The fixture sections and the kernel section assert different things on purpose. The
+//! fixture's shape is known (seven actor classes, RSUs in the fleet, a ground-truth metric
+//! in the catalogue), so its sections can assert it; none of that is a property of the
+//! protocol, and a kernel run has none of it. The kernel's section therefore asserts only
+//! what `docs/protocol/vwp-v1.md` says, which is what makes it evidence about a live run
+//! rather than about a fixture.
 //!
 //! # Skipping, and why it is announced loudly
 //!
@@ -22,7 +29,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use v2xw_record::fixture::{self, RunShape};
-use v2xw_server::{ServerOptions, StubOptions, serve_replay, serve_stub};
+use v2xw_server::{
+    LiveOptions, ServerOptions, StubOptions, serve_replay, serve_scenario, serve_stub,
+};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -107,7 +116,31 @@ async fn the_real_typescript_client_conforms_against_this_server() {
     .await
     .expect("short server");
 
-    // 3. a replay of a recording, for §7.
+    // 3. a real kernel run. The demand rate is raised off `phase1-grid.yaml`'s 30 veh/h,
+    // which realises one vehicle under this seed: the assertions are about a fleet — a
+    // node table, events between nodes, a metric with trials behind it — and one vehicle
+    // would make them vacuous rather than false.
+    let scenario_dir = fixture::scratch_dir("interop-live").expect("scratch dir");
+    let scenario_path = scenario_dir.join("interop-live.yaml");
+    let scenario_text = std::fs::read_to_string(root.join("scenarios/phase1-grid.yaml"))
+        .expect("read phase1-grid.yaml")
+        .replace("rate_veh_per_h: 30.0", "rate_veh_per_h: 4000.0")
+        .replace("duration_s: 60.0", "duration_s: 600.0");
+    std::fs::write(&scenario_path, scenario_text).expect("write scenario");
+    let live_engine = serve_scenario(
+        ephemeral(),
+        &scenario_path,
+        LiveOptions {
+            // The manifest timestamp is the caller's: no part of the engine may read a
+            // clock, and a fixed one keeps two runs of this test comparable.
+            build_utc: "2026-09-22T00:00:00Z".to_string(),
+            ..LiveOptions::default()
+        },
+    )
+    .await
+    .expect("live engine server");
+
+    // 4. a replay of a recording, for §7.
     let dir = fixture::scratch_dir("interop-replay").expect("scratch dir");
     let path = dir.join("interop.mcap");
     fixture::write_recording(&path, &RunShape::new(6, 120)).expect("recording");
@@ -123,6 +156,7 @@ async fn the_real_typescript_client_conforms_against_this_server() {
         .arg(live.http_url())
         .arg(short.http_url())
         .arg(replay.http_url())
+        .arg(live_engine.http_url())
         .current_dir(&root)
         .output()
         .await
@@ -138,6 +172,7 @@ async fn the_real_typescript_client_conforms_against_this_server() {
     live.stop().await;
     short.stop().await;
     replay.stop().await;
+    live_engine.stop().await;
 
     assert!(
         output.status.success(),
@@ -160,7 +195,7 @@ async fn the_real_typescript_client_conforms_against_this_server() {
         })
         .unwrap_or(0);
     assert!(
-        count >= 30,
-        "the harness reported only {count} passing checks; it should run at least 30"
+        count >= 35,
+        "the harness reported only {count} passing checks; it should run at least 35"
     );
 }

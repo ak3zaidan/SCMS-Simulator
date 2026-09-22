@@ -30,6 +30,7 @@
 //! | The footer, summary and message-index reader | [`index`] | vwp-v1 §7.3 |
 //! | Replay, `verify` and `seek` | [`reader`] | vwp-v1 §7.2, §7.3 |
 //! | Parquet, Arrow IPC and JSONL exporters | [`export`] | 08-measurement §5 |
+//! | Dataset profiles, datasheet and leakage linter | [`dataset`] | 08-measurement §5, §6 |
 //! | A deterministic synthetic run to record | [`fixture`] | — |
 //!
 //! # Two encodings, and why they are not unified
@@ -96,6 +97,7 @@
 #![forbid(unsafe_code)]
 
 pub mod channels;
+pub mod dataset;
 pub mod encoder;
 pub mod error;
 pub mod export;
@@ -110,6 +112,10 @@ pub mod wire;
 pub mod writer;
 
 pub use channels::{CHANNELS, ChannelSpec};
+pub use dataset::{
+    DatasetAssembler, DatasetManifest, DatasetProfile, DatasetWriter, LeakageReport, LogProfile,
+    MaDataset, RunProvenance, WrittenDataset,
+};
 pub use encoder::{
     ActorPose, Cadence, SignalState, SlotAllocator, Snapshot, SnapshotEncoder, SnapshotFrame,
 };

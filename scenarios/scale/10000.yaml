@@ -1,0 +1,17 @@
+# The 10000-vehicle rung of the scaling ladder: the ADR 0011 abstract-tier target density; three tenths of a second, because two seconds here is most of an hour of wall clock.
+#
+# `max_total_vehicles` is a cap on *trips*, and the lane-insertion gap turns it into a
+# count of vehicles; the run report states what it realised. See `base.yaml` for the method
+# and for what the bulk spawn costs in realism.
+schema: v2xw/scenario/1
+meta:
+  name: scale-10000
+  base: base.yaml
+  description: The scaling ladder at a nominal 10000 vehicles.
+time:
+  duration_s: 0.3
+actors:
+  vehicles:
+    demand:
+      params:
+        max_total_vehicles: 30000

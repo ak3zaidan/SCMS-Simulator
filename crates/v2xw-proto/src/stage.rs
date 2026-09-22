@@ -92,7 +92,12 @@ impl core::fmt::Display for FlowId {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
-#[serde(rename_all = "kebab-case")]
+// Snake case, not kebab: 05-protocols.md §8 spells these `report_sent` and
+// `first_rsu_broadcast`, and that is the vocabulary "revocation latency by stage" is
+// defined over. A recording that wrote `report-sent` would carry a second spelling of the
+// same stage, which is how one query answers a question and another silently does not.
+// `stage_names_serialise_as_the_design_set_spells_them` pins the two together.
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum StageId {
     // --- 05-protocols §8, the revocation decomposition ---
@@ -247,6 +252,8 @@ pub struct WireStep {
     pub to: NodeId,
     /// Which flow.
     pub flow: FlowId,
+    /// Which run of that flow, so a per-run byte count is a filter rather than a guess.
+    pub run: FlowRun,
     /// Which step, by name.
     pub step: &'static str,
     /// Bytes on the wire.

@@ -287,3 +287,91 @@ impl CertificateSizes {
 fn encoded(c: &v2xw_msg::sec_types::ieee1609_dot2::Certificate, what: &'static str) -> Result<u32> {
     cert::encoded_size(c).map_err(|source| ProtoError::Size { what, source })
 }
+
+// ---------------------------------------------------------------------------------------
+// Representative application payloads
+// ---------------------------------------------------------------------------------------
+
+/// The belief the representative payloads are built from.
+///
+/// One passenger car at 50 km/h heading north-east, 1,200 m east and 800 m north of the
+/// Phase 1 Manhattan origin, with a metre-scale GNSS error ellipse — the same vehicle the
+/// message crates' own fixtures use, restated here because those fixtures are
+/// `#[cfg(test)]` and a size a report prints must come from code that ships.
+fn representative_belief() -> v2xw_core::belief::PositionEstimate {
+    use v2xw_core::geom::Vec3;
+    let speed_mps = 13.89;
+    let component = speed_mps * core::f64::consts::FRAC_1_SQRT_2;
+    v2xw_core::belief::PositionEstimate {
+        pos: Vec3::new(1_200.0, 800.0, 12.5),
+        vel: Vec3::new(component, component, 0.0),
+        heading_rad: core::f64::consts::FRAC_PI_4,
+        semi_major_m: 1.8,
+        semi_minor_m: 1.1,
+        orientation_rad: 0.6,
+        time_ns: 0,
+        fix: v2xw_core::belief::FixQuality::ThreeD,
+    }
+}
+
+/// The Phase 1 world origin: the south-west corner of the Manhattan preset (build
+/// decision D7).
+fn representative_origin() -> v2xw_core::geo::GeoOrigin {
+    v2xw_core::geo::GeoOrigin::new(40.7440, -73.9900, 0.0)
+}
+
+/// The UPER length of a representative SAE J2735 Basic Safety Message, Part I only.
+///
+/// The real encoder's answer for a real message, which is what the airtime and the
+/// overhead fraction are computed from. A BSM carrying a Part II extension is longer, and
+/// that is a different message rather than a tolerance on this one.
+///
+/// # Errors
+/// [`ProtoError::Size`] if the encoder refuses the message.
+pub fn representative_bsm_bytes() -> Result<u32> {
+    use v2xw_msg::j2735::bsm::{BsmInput, build_bsm, encode_bsm};
+    let input = BsmInput::new(
+        7,
+        [0x0A, 0x0B, 0x0C, 0x0D],
+        representative_belief(),
+        representative_origin(),
+        v2xw_core::geom::Dims::CAR,
+        4_321,
+    );
+    let bsm = build_bsm(&input).map_err(|e| ProtoError::Payload {
+        what: "representative BSM",
+        detail: e.to_string(),
+    })?;
+    let encoded = encode_bsm(&bsm).map_err(|e| ProtoError::Payload {
+        what: "representative BSM",
+        detail: e.to_string(),
+    })?;
+    Ok(encoded.size)
+}
+
+/// The UPER length of a representative ETSI CAM, basic vehicle container only.
+///
+/// # Errors
+/// [`ProtoError::Size`] if the encoder refuses the message.
+pub fn representative_cam_bytes() -> Result<u32> {
+    use v2xw_msg::cam::{CamInput, build_cam, encode_cam};
+    let mut input = CamInput::new(
+        0x0A0B_0C0D,
+        v2xw_msg::cam::ParticipantType::PassengerCar,
+        representative_belief(),
+        representative_origin(),
+        v2xw_core::geom::Dims::CAR,
+        v2xw_msg::asn1::cdd::TimestampIts(716_212_800_000),
+    );
+    input.longitudinal_acceleration_mps2 = Some(0.8);
+    input.yaw_rate_rad_s = Some(0.05);
+    let cam = build_cam(&input).map_err(|e| ProtoError::Payload {
+        what: "representative CAM",
+        detail: e.to_string(),
+    })?;
+    let encoded = encode_cam(&cam).map_err(|e| ProtoError::Payload {
+        what: "representative CAM",
+        detail: e.to_string(),
+    })?;
+    Ok(encoded.size)
+}

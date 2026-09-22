@@ -1,0 +1,116 @@
+# The base of the scaling ladder: `phase1-manhattan.yaml` with the demand model set up to
+# put a *fleet* on the map rather than a trickle, and nothing else changed.
+#
+# Each overlay beside this file names one fleet size. Every one of them runs the same
+# world, the same radio stack, the same security path and the same seed, so the only thing
+# that differs between two rungs is how many vehicles are on the map — which is what makes
+# the wall-clock comparison a measurement of scale and not of five different scenarios.
+#
+# # How a size is asked for
+#
+# The demand model takes a rate, and a rate over sixty seconds is a random count. So the
+# ladder uses the model's own `max_total_vehicles` cap with an arrival rate far above what
+# the network can absorb: the cap is the number of *trips* the model will produce, and the
+# lane-insertion gap turns that into a number of vehicles — about 62 % of it on this world.
+# Each overlay states the cap it uses and the count it realises, and the run report is what
+# says which is right.
+#
+# # What this costs in realism, stated
+#
+# A fleet raised this way is **denser and more clustered** than the same number of vehicles
+# reached by letting demand run: every trip is inserted in the first few hundred
+# milliseconds, at origins the origin-destination model drew independently, and nothing has
+# had time to disperse. At a hundred vehicles that is about fifty candidate receivers per
+# frame against about thirty-three for the same fleet reached over sixty seconds, so the
+# wall-clock numbers this ladder produces are **pessimistic by roughly half** — and
+# reproducible, which the sixty-second version is not at a fixed count.
+schema: v2xw/scenario/1
+
+meta:
+  name: scale-base
+  description: >-
+    The scaling ladder's base: the Phase 1 Manhattan stack with a bulk-spawned fleet, for
+    measuring wall-clock cost against vehicle count.
+  authors: [v2xw]
+  tags: [scale, manhattan, osm, dsrc, signed]
+  created: "2026-09-22"
+
+seed: "0xC0FFEE_5EED"
+
+time:
+  t0: "2027-03-04T08:00:00Z"
+  # Two seconds: twenty mobility steps, twenty BSMs per vehicle, and long enough that the
+  # cost per simulated second has stopped being the cost of the first step. The largest
+  # rung overrides it, because two seconds there is two thousand seconds of wall clock.
+  duration_s: 2.0
+  mobility_step_ms: 100
+  des_resolution: 1us
+
+world:
+  source:
+    kind: osm-xml
+    path: worlds/cache/manhattan.osm.xml
+    bbox:
+      min_lat_deg: 40.7440
+      min_lon_deg: -73.9900
+      max_lat_deg: 40.7620
+      max_lon_deg: -73.9680
+  highway_preset: urban-us-nyc
+  imported_at: "2026-09-18T00:00:00Z"
+  buildings:
+    enabled: true
+    keep_holes: true
+  terrain:
+    dem: null
+
+actors:
+  vehicles:
+    equipped_fraction: 1.0
+    demand:
+      kind: mobility/demand/poisson
+      # Far above what the lanes can absorb, so the cap and not the clock decides how many
+      # vehicles there are: 1,000 trips per second offered against an insertion gap that
+      # accepts about three fifths of them.
+      rate_veh_per_h: 3600000.0
+      params:
+        # Each overlay sets this.
+        max_total_vehicles: 1
+
+weather:
+  initial: clear
+  intensity: 0.0
+
+radio:
+  rat: dsrc-80211p
+  tiers:
+    propagation: medium
+    phy: medium
+    mac: medium
+
+net:
+  layer: wsmp
+
+messages:
+  sets: [bsm]
+  codec_tier: uper
+
+security:
+  envelope: ieee1609.2
+  signature: ecdsa-p256
+  crypto_mode: modeled
+  verification_policy: prioritized
+  signer_id_policy:
+    full_cert_every_ms: 1000
+    digest_otherwise: true
+  pseudonym_change:
+    strategy: time
+    period_s: 300.0
+
+nodes:
+  default_obu: obu/unex-obu-301-craton2
+  compute_tier: medium
+  backend_tier: medium
+
+metrics: [pdr]
+
+exporters: []

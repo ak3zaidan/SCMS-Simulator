@@ -95,6 +95,7 @@ fn frame(from: u32, pos: Vec3, at: SimTime, valid: bool) -> RxFrame {
         signature_valid: valid,
         claimed_cert_period: 100,
         claimed_linkage: None,
+        spdu: None,
     }
 }
 
@@ -407,9 +408,26 @@ fn a_revoked_node_stops_transmitting() {
         "the node was transmitting before it was revoked"
     );
 
-    for j in 0..4 {
-        let d = pseudo_signer(node, j);
-        rt.stores_mut().crl.revoke_own(&d);
+    // Revoked by the digest the store actually holds, which after the first transmission
+    // is the digest of the real certificate the node provisioned for that pseudonym — not
+    // the `pseudo_signer` stand-in it started with. Revoking the stand-in would revoke a
+    // certificate that was never on the air, and the node would carry on transmitting:
+    // that is the second fault injected to prove this test can fail.
+    let mine: Vec<_> = rt
+        .stores()
+        .certs
+        .credentials()
+        .iter()
+        .map(|c| c.digest.clone())
+        .collect();
+    assert_eq!(mine.len(), 4);
+    for d in &mine {
+        assert_ne!(
+            *d,
+            pseudo_signer(node, 0),
+            "the node must be using a certificate it can prove, not a stand-in digest"
+        );
+        rt.stores_mut().crl.revoke_own(d);
     }
     let after = run_from(&mut rt, 6, 6, 100 * NS_PER_MS, |_| Vec::new());
     assert!(

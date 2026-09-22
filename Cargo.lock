@@ -2602,9 +2602,11 @@ dependencies = [
  "v2xw-msg",
  "v2xw-net",
  "v2xw-node",
+ "v2xw-proto",
  "v2xw-radio",
  "v2xw-record",
  "v2xw-sec",
+ "v2xw-threat",
  "v2xw-world",
 ]
 
@@ -2721,6 +2723,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "v2xw-core",
+ "v2xw-metrics",
 ]
 
 [[package]]
@@ -2750,6 +2753,9 @@ dependencies = [
  "tokio",
  "tracing",
  "v2xw-core",
+ "v2xw-engine",
+ "v2xw-metrics",
+ "v2xw-mobility",
  "v2xw-record",
  "v2xw-world",
 ]
@@ -2762,6 +2768,14 @@ dependencies = [
  "serde_json",
  "thiserror",
  "v2xw-core",
+ "v2xw-metrics",
+ "v2xw-mobility",
+ "v2xw-msg",
+ "v2xw-node",
+ "v2xw-radio",
+ "v2xw-record",
+ "v2xw-sec",
+ "v2xw-world",
 ]
 
 [[package]]

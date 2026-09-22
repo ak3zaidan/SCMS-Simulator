@@ -1192,8 +1192,7 @@ fn phy_card(sensitivity: SensitivityPreset, rx_impl_loss_db: f64) -> ModelCard {
             "a_frame_below_sensitivity_is_lost_for_that_reason".to_string(),
             "airtime_accounting_sums_to_the_transmitted_time".to_string(),
             "windowed_sinr_reduces_to_the_flat_per".to_string(),
-            "the_sensitivity_gate_sits_above_the_error_model_and_the_margin_is_pinned"
-                .to_string(),
+            "the_sensitivity_gate_sits_above_the_error_model_and_the_margin_is_pinned".to_string(),
             "preamble_capture_does_not_depend_on_the_order_arrivals_are_finished".to_string(),
             "an_undetectable_signal_does_not_hold_the_receiver".to_string(),
             "every_completion_order_of_five_arrivals_gives_the_same_ledger".to_string(),
@@ -1656,9 +1655,8 @@ mod tests {
                     if o.tx == a.tx || o.start >= a.end || a.start >= o.end {
                         continue;
                     }
-                    a.interferers.push(InterferenceSource::new(
-                        o.tx, o.power_dbm, o.start, o.end,
-                    ));
+                    a.interferers
+                        .push(InterferenceSource::new(o.tx, o.power_dbm, o.start, o.end));
                 }
                 reg.insert(a.tx.index(), phy.register_arrival(a));
             }

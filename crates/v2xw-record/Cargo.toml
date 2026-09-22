@@ -10,6 +10,12 @@ authors.workspace = true
 
 [dependencies]
 v2xw-core = { workspace = true }
+# The reader-side channel views (03-interfaces.md §14). The dataset exporters read the
+# event channels through the *same* typed views a metric provider reads them through,
+# rather than declaring a second copy of every field list: two independently mutable
+# copies is the drift D11's one-type-per-channel rule exists to prevent. `v2xw-metrics`
+# does not depend on this crate, so there is no cycle.
+v2xw-metrics = { workspace = true }
 # The recording container (ADR 0008 decision 1, docs/protocol/vwp-v1.md §7.1). zstd
 # is the only codec the wire specification names (§2.6) and the only one this crate
 # writes; the crate default feature set is taken as-is because a workspace-inherited

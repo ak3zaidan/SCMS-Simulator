@@ -1045,8 +1045,255 @@ impl Engine for StubEngine {
         (0, self.descriptor.duration)
     }
 
+    fn metric_catalogue(&self) -> Vec<crate::introspect::MetricInfo> {
+        FIXTURE_METRICS
+            .iter()
+            .map(
+                |(name, unit, agg, visibility)| crate::introspect::MetricInfo {
+                    name: (*name).to_string(),
+                    unit: (*unit).to_string(),
+                    agg: (*agg).to_string(),
+                    visibility: (*visibility).to_string(),
+                    definition_md: format!("`{name}` as defined in 08-measurement."),
+                    dims: vec!["t".to_string()],
+                    not_accounted: vec![
+                        "nothing: this is a fixture, not a measurement".to_string(),
+                    ],
+                    str_id: self.str_id(name),
+                    agg_code: match *agg {
+                        "ratio" => 5,
+                        "mean" => 1,
+                        "p95" => 3,
+                        "min" => 8,
+                        _ => 0,
+                    },
+                },
+            )
+            .collect()
+    }
+
+    fn live_nodes(&self) -> Option<Vec<crate::engine::NodeFacts>> {
+        None
+    }
+
     fn query(&mut self, query: &Query) -> Result<Value> {
         crate::introspect::answer(self, query)
+    }
+}
+
+/// The metric catalogue the fixture answers `metrics.query` with.
+///
+/// `visibility` follows §5.2: `ttc_min` is ground truth and therefore refused on a
+/// `node`-profile connection, which is what conformance V3 checks.
+pub const FIXTURE_METRICS: [(&str, &str, &str, &str); 5] = [
+    ("pdr", "-", "ratio", "DERIVED"),
+    ("cbr", "-", "mean", "NODE"),
+    ("pir_p95_s", "s", "p95", "NODE"),
+    ("verify_wait_p95_ms", "ms", "p95", "NODE"),
+    ("ttc_min", "s", "min", "GT"),
+];
+
+impl crate::introspect::Introspect for StubEngine {
+    fn node_list(&self) -> Vec<crate::engine::NodeFacts> {
+        let hello = &self.descriptor.hello;
+        hello
+            .nodes
+            .iter()
+            .map(|row| crate::engine::NodeFacts {
+                node_id: row.node_id,
+                actor_id: row.actor_id,
+                pos_m: row.pos_m,
+                label: hello.strings.get(row.str_label).unwrap_or("").to_string(),
+                profile_id: hello
+                    .strings
+                    .get(row.str_profile_id)
+                    .unwrap_or("")
+                    .to_string(),
+                flags: row.flags,
+                kind: row.kind,
+                class_idx: row.class_idx,
+            })
+            .collect()
+    }
+
+    fn telemetry_of(&self, node: u32) -> Option<NodeTelemetry> {
+        let index = self.nodes.iter().position(|n| n.index() == node)?;
+        Some(self.telemetry_of(index, NodeId::new(node), self.step_index))
+    }
+
+    fn metric_series(
+        &self,
+        name: &str,
+        from: u64,
+        to: u64,
+        bin: u64,
+        limit: usize,
+    ) -> Vec<(u64, Option<f64>)> {
+        let bin = bin.max(1);
+        let mut out = Vec::new();
+        let mut t = from;
+        while t <= to && out.len() < limit {
+            let phase = (t as f64) * 1e-9 * 0.1;
+            out.push((t, Some(fixture_metric_value(name, phase))));
+            t = t.saturating_add(bin);
+        }
+        out
+    }
+
+    fn provenance_chain(&self) -> Vec<Value> {
+        vec![
+            json!({"prov_id": 1, "model_id": "net/delivery/pdr-from-phy-rx",
+                   "model_version": "0.1.0", "param_set_id": "b3:stub-fixture",
+                   "family": "net", "card_url": "/cards/net-delivery-pdr-from-phy-rx",
+                   "assumptions": ["a transport fixture, not a model"]}),
+            json!({"prov_id": 2, "model_id": "radio/mac/cbr-window", "model_version": "0.1.0",
+                   "param_set_id": "b3:stub-fixture", "family": "mac",
+                   "card_url": "/cards/radio-mac-cbr-window"}),
+            json!({"prov_id": 3, "model_id": "node/hsm/ecdsa-p256-service-time",
+                   "model_version": "0.1.0", "param_set_id": "b3:stub-fixture",
+                   "family": "primitive",
+                   "card_url": "/cards/node-hsm-ecdsa-p256-service-time"}),
+        ]
+    }
+
+    fn caveats(&self) -> Vec<String> {
+        vec![
+            "produced by the server's synthetic fixture, not by an engine".to_string(),
+            "every number this run reports is a plausible shape with no source".to_string(),
+        ]
+    }
+
+    fn node_section(&self, node: u32, section: &str, limit: usize) -> Option<Value> {
+        match section {
+            "queues" => Some(json!({
+                "rx": {"depth": 4, "p50": 2.0, "p95": 9.0, "policy": "drop-tail",
+                       "drops": {"overflow": 0}},
+                "verify": {"depth": 3, "p50": 1.0, "p95": 7.0, "policy": "prioritized",
+                           "drops": {"overflow": 0, "policy_skip": 2}},
+                "tx": {"depth": 1, "p50": 1.0, "p95": 2.0, "policy": "edca",
+                       "drops": {"overflow": 0}}
+            })),
+            "stores" => Some(json!({
+                "cert_store": {"entries": 20, "bytes": 8_192, "capacity": 100},
+                "peer_cache": {"entries": 40, "bytes": 32_768, "capacity": 256},
+                "crl_store": {"entries": 12, "bytes": 4_096},
+                "trust_store": {"anchors": 2},
+                "neighbor_table": {"entries": 24, "capacity": 128},
+                "evidence_buffer": {"entries": 0, "bytes": 0},
+                "report_outbox": {"entries": 0, "bytes": 0}
+            })),
+            "crl" => Some(json!({"entries": 12, "bytes": 4096, "i_period": 0})),
+            "gnss" => Some(json!({"fix": "3D", "hdop": 1.1, "sigma_m": 1.6,
+                                  "satellites": 11})),
+            "clock" => Some(json!({"offset_ns": 0, "drift_ppm": 1.5,
+                                   "source": "gnss-disciplined"})),
+            "apps" => Some(json!([{"id": "fcw", "state": "armed", "warnings": 0},
+                                  {"id": "eebl", "state": "armed", "warnings": 0}])),
+            "detectors" => Some(json!([{"id": "detector/plausibility/position-jump",
+                                        "observations": 3, "prov_id": 5}])),
+            "neighbors" => Some(Value::Array(
+                (0..limit.min(8))
+                    .map(|i| {
+                        let d = v2xw_core::hash::sha256(&(node + i as u32).to_le_bytes());
+                        json!({
+                            "digest": v2xw_core::hash::hex_encode(&d[..8]),
+                            "verify_state": if i % 4 == 3 { "unverified" } else { "verified" },
+                            "last_seen_ns": 0,
+                            "distance_m": 35.0 + f64::from(i as u32) * 11.0,
+                            "relevance": 0.7,
+                            "messages": 10 + i,
+                        })
+                    })
+                    .collect(),
+            )),
+            "certs" => Some(Value::Array(
+                (0..limit.min(4))
+                    .map(|i| {
+                        let d = v2xw_core::hash::sha256(&(node * 31 + i as u32).to_le_bytes());
+                        json!({
+                            "cert_id": node * 13 + i as u32,
+                            "digest": v2xw_core::hash::hex_encode(&d[..8]),
+                            "kind": "pseudonym",
+                            "valid_from_ns": 0,
+                            "valid_until_ns": 300_000_000_000u64,
+                            "i": 0, "j": i,
+                        })
+                    })
+                    .collect(),
+            )),
+            _ => None,
+        }
+    }
+
+    fn link_facts(&self, tx: u32, rx: u32, _t_ns: u64, _window_ns: u64) -> Option<Value> {
+        let hello = &self.descriptor.hello;
+        let a = hello.nodes.iter().find(|r| r.node_id == tx)?;
+        let b = hello.nodes.iter().find(|r| r.node_id == rx)?;
+        let distance = math::hypot(
+            f64::from(a.pos_m[0] - b.pos_m[0]),
+            f64::from(a.pos_m[1] - b.pos_m[1]),
+        );
+        // Free-space-shaped path loss at 5.9 GHz, so the number moves with distance
+        // instead of being a constant. It is a fixture value, not a propagation model.
+        let path_loss = 32.45
+            + 20.0 * math::log10(5_900.0)
+            + 20.0 * math::log10((distance / 1_000.0).max(1e-6));
+        Some(json!({
+            "distance_m": math::quantize(distance, 3),
+            "los": {"class": "LOS", "walls_crossed": 0, "obstructed_len_m": 0.0},
+            "path_loss_db": math::quantize(path_loss, 3),
+            "shadowing_db": 0.0,
+            "fading_db": 0.0,
+            "rx_power_dbm": math::quantize(20.0 - path_loss, 3),
+            "sinr_db": 12.0,
+            "pdr": 0.86,
+            "pir_p95_s": 0.31,
+            "frames": 10,
+            "bytes": 3_500,
+            "latency_ms": {"p50": 0.5, "p95": 1.4},
+        }))
+    }
+
+    fn export(&mut self, query: &Query) -> Result<Value> {
+        match query {
+            Query::ExportDataset {
+                exporter,
+                out_dir,
+                visibility,
+            } => Err(ServerError::ExportFailed {
+                stage: "open".to_string(),
+                detail: format!(
+                    "the fixture engine records nothing, so exporter `{exporter}` \
+                     (visibility `{visibility}`) has no run to read; out_dir was {:?}. \
+                     A real run writes a recording and this succeeds.",
+                    out_dir.as_deref().unwrap_or("(default)")
+                ),
+            }),
+            Query::ExportRecording { path, profile } => Err(ServerError::ExportFailed {
+                stage: "open".to_string(),
+                detail: format!(
+                    "no recording to copy from the fixture engine (requested profile \
+                     `{profile}`, path {:?})",
+                    path.as_deref().unwrap_or("(default)")
+                ),
+            }),
+            _ => Err(ServerError::NotSupportedHere(
+                "not an export query".to_string(),
+            )),
+        }
+    }
+}
+
+/// The fixture's metric shapes: a smooth function of time so a chart has a line in it.
+fn fixture_metric_value(name: &str, phase: f64) -> f64 {
+    let w = 0.5 + 0.5 * math::sin(phase);
+    match name {
+        "pdr" => 0.82 + 0.12 * w,
+        "cbr" => 0.18 + 0.30 * w,
+        "pir_p95_s" => 0.28 + 0.20 * w,
+        "verify_wait_p95_ms" => 1.2 + 3.0 * w,
+        "ttc_min" => 2.4 + 1.5 * w,
+        _ => f64::NAN,
     }
 }
 

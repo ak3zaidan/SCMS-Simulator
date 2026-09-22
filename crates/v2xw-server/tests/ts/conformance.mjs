@@ -27,6 +27,16 @@ const base = process.argv[2] ?? "http://127.0.0.1:8791";
 const shortBase = process.argv[3] && process.argv[3] !== "-" ? process.argv[3] : null;
 /** A third server replaying a recording, for §7's indistinguishability. Optional. */
 const replayBase = process.argv[4] && process.argv[4] !== "-" ? process.argv[4] : null;
+/**
+ * A fourth server running the **real engine** (`v2xw-engine`), for the §8 section.
+ *
+ * It is a separate url rather than a mode because the sections above assert facts about
+ * the *fixture* — that its class table has seven rows, that its fleet includes RSUs, that
+ * its catalogue holds a ground-truth metric — and none of those is a property of the
+ * protocol. The section this url drives asserts only what the specification says, so it is
+ * the part that is evidence about a live run.
+ */
+const liveBase = process.argv[5] && process.argv[5] !== "-" ? process.argv[5] : null;
 
 let passed = 0;
 const failures = [];
@@ -881,6 +891,143 @@ if (replayBase) {
 } else {
   skipped.push("replay (no replay server url given)");
   console.log("\n§7 replay\n  skip (no replay server url)");
+}
+
+// --- the real engine ----------------------------------------------------------------
+if (liveBase) {
+  console.log("\nthe real engine (v2xw-engine)");
+  const liveClient = (options = {}) =>
+    new P.VwpClient({ url: liveBase, compress: "none", autoReconnect: false, ...options });
+
+  await check("a live kernel run opens with Hello + RESYNC keyframe and reconstructs poses", async () => {
+    const c = liveClient();
+    const stream = collect(c, { keyframes: 1, deltas: 5 }, 40000);
+    const hello = await c.connect();
+    eq(hello.versionMajor, 1, "version_major");
+    eq(hello.helloFlags & P.HelloFlags.LIVE, P.HelloFlags.LIVE, "HELLO_LIVE");
+    eq(hello.helloFlags & P.HelloFlags.REPLAY, 0, "not HELLO_REPLAY");
+    assert(hello.classes.count > 0, "a class table");
+    assert(/^[0-9a-f]{64}$/.test(P.bytesToHex(hello.scenarioHash)), "scenario hash");
+    assert(hello.simDurationNs > 0n, "a duration");
+    assert(hello.t0WallNs !== 0n, "t0 is the scenario's civil instant, not zero");
+    const { keyframes, deltas } = await stream;
+    eq(keyframes[0].resync, true, "H2 — the opening keyframe re-seeds interpolation");
+    assert(deltas.length >= 5, "deltas follow");
+    assert(c.poses.occupiedSlots().length > 0, "poses reconstruct from a kernel run");
+    // §3.1.1: the client refuses a slot at or beyond actor_capacity, so every slot the
+    // kernel's run put on the wire has to be inside it.
+    for (const slot of c.poses.occupiedSlots()) {
+      assert(slot < hello.actorCapacity, `slot ${slot} is beyond actor_capacity ${hello.actorCapacity}`);
+    }
+    c.close();
+  });
+
+  await check("the world a kernel run serves decodes and hashes to its own url", async () => {
+    const c = liveClient();
+    const hello = await c.connect();
+    const hash = P.bytesToHex(hello.worldHash);
+    const res = await fetch(`${liveBase}/world/${hash}.vwb`);
+    eq(res.status, 200, "status");
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const world = P.decodeWorld(bytes.buffer);
+    assert(world.lanes.count > 0, "lanes");
+    assert(world.junctions.count > 0, "junctions");
+    c.close();
+  });
+
+  await check("events, metrics and provenance all resolve against a kernel run", async () => {
+    const c = liveClient();
+    const provenance = new Promise((res, rej) => {
+      const timer = setTimeout(() => rej(new Error("no provenance within 20 s")), 20000);
+      const off = c.onProvenance((p) => { clearTimeout(timer); off(); res(p); });
+    });
+    await c.connect();
+    const prov = await provenance;
+    assert(prov.entries.count > 0, "provenance entries");
+    const ids = new Set(Array.from(prov.entries.provId));
+    // Every model id resolves to a real card id, which is what makes `explain` answerable.
+    for (let i = 0; i < prov.entries.count; i++) {
+      assert(c.strings.get(prov.entries.strModelId[i]).includes("/"), "model id resolves");
+    }
+    await c.request("events.set", { subscribe: ["node.tx", "phy.rx"] });
+    const event = await new Promise((res, rej) => {
+      const timer = setTimeout(() => rej(new Error("no events within 20 s")), 20000);
+      const off = c.onEvent((e) => { if (e.count === 0) return; clearTimeout(timer); off(); res(e); });
+    });
+    for (let i = 1; i < event.count; i++) {
+      assert(event.index.simTimeNs[i] >= event.index.simTimeNs[i - 1], "C4 time order");
+    }
+    for (let i = 0; i < event.count; i++) eq(event.index.payloadOff[i] % 8, 0, "C4 payload alignment");
+    const tx = event.payload(0);
+    assert(["node.tx", "phy.rx"].includes(tx.channel), `subscribed channels only, got ${tx.channel}`);
+    const metric = await new Promise((res, rej) => {
+      const timer = setTimeout(() => rej(new Error("no metrics within 25 s")), 25000);
+      const off = c.onMetric((m) => { if (m.sampleCount === 0) return; clearTimeout(timer); off(); res(m); });
+    });
+    eq(metric.recordSize, 32, "record size");
+    for (const sample of metric.samples()) {
+      assert(c.strings.get(sample.strMetric) !== "", "C5 — the metric name resolves");
+      if (sample.provId !== 0) assert(ids.has(sample.provId), `C5 — prov_id ${sample.provId} unresolved`);
+    }
+    c.close();
+  });
+
+  await check("the control methods drive a kernel run: pause, step, seek, speed, resume", async () => {
+    const c = liveClient();
+    await c.connect();
+    const paused = await c.request("run.pause", {});
+    eq(paused.state, "paused", "paused");
+    const before = paused.t_ns;
+    const stepped = await c.request("run.step", { count: 5 });
+    eq(stepped.stepped, 5, "five steps");
+    const step = Number(c.hello.mobilityStepNs);
+    eq(stepped.t_ns, before + 5 * step, "t advanced by five mobility steps");
+
+    // §6.6: the seek keyframe and its deltas are sent before the reply.
+    const seen = [];
+    const off = c.onKeyframe((kf) => seen.push(kf));
+    const target = before - 10 * step;
+    if (target >= 0) {
+      const seek = await c.request("run.seek", { t_ns: target });
+      eq(seek.t_ns, target, "seek target");
+      assert(seen.length > 0, "R4 — a keyframe arrived before the reply");
+      eq(seen[seen.length - 1].seekResult, true, "R4 — FLAG_SEEK_RESULT");
+      eq(seen[seen.length - 1].resync, true, "R4 — FLAG_RESYNC");
+      const status = await c.request("run.status", {});
+      eq(status.state, "paused", "§6.6 — seeking a live run pauses it");
+    }
+    off();
+    const speed = await c.request("run.speed", { speed: 2 });
+    eq(speed.speed, 2, "speed");
+    const resumed = await c.request("run.resume", {});
+    eq(resumed.state, "running", "resumed");
+    c.close();
+  });
+
+  await check("inspect and explain answer from the kernel's own models", async () => {
+    const c = liveClient();
+    const hello = await c.connect();
+    assert(hello.nodes.count > 0, "the node table is populated as of the stream position");
+    const node = hello.nodes.nodeId[0];
+    const inspected = await c.request("inspect.node", { node, include: ["telemetry", "neighbors"] });
+    eq(inspected.node, node, "node id");
+    assert(Array.isArray(inspected.neighbors), "neighbors");
+    assert(inspected.profile_id.includes("/"), "a real hardware profile id");
+    const catalogue = await c.request("metrics.query", {});
+    assert(catalogue.catalogue.length > 0, "the run has a metric catalogue");
+    const name = catalogue.catalogue[0].name;
+    const why = await c.request("explain", { subject: { kind: "metric", id: name }, depth: 3 });
+    assert(why.chain.length > 0, "a provenance chain");
+    assert(why.chain[0].model_id.includes("/"), "a real model id");
+    assert(why.definition_md.length > 0, "the metric's own definition, not a placeholder");
+    assert(why.caveats.length > 0, "a run reports what its numbers do not account for");
+    const series = await c.request("metrics.query", { metrics: [name], bin_ns: 1_000_000_000 });
+    assert(series.rows.length > 0, "a metric series");
+    c.close();
+  });
+} else {
+  skipped.push("the real engine (no live server url given)");
+  console.log("\nthe real engine\n  skip (no live server url)");
 }
 
 console.log(`\n${passed} passed, ${failures.length} failed, ${skipped.length} skipped\n`);

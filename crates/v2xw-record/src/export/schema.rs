@@ -187,7 +187,19 @@ pub fn quantise_nested(key: &str, value: &serde_json::Value) -> serde_json::Valu
 /// withholds it entirely rather than column by column.
 pub fn ground_truth_fields(channel: &str) -> &'static [&'static str] {
     match channel {
-        "phy.rx" => &["tx_node", "distance_m", "los_class"],
+        // Both spellings, deliberately. §5.2 names these columns in prose
+        // (`tx_node`, `distance_m`), and the record the engine actually emits — a
+        // `#[serde(transparent)]` newtype around `v2xw_metrics::channels::PhyRxView` —
+        // spells them `tx` and `dist_m`. This list once held only the prose names, so
+        // `without_ground_truth` matched nothing on a real `phy.rx` record and a
+        // `NODE-only` export carried the transmitter's identity and the true
+        // transmitter-to-receiver distance: the exact leak the whole profile exists to
+        // prevent, silently, with the scan and the profile both reporting success.
+        // Listing every spelling a producer might use is cheap; a column that is
+        // withheld under a name nothing emits is worthless. The test
+        // `the_ground_truth_list_matches_the_field_names_records_really_carry` pins the
+        // real ones to the view.
+        "phy.rx" => &["tx", "tx_node", "dist_m", "distance_m", "los_class"],
         "node.neighbor" => &["peer_actor_id"],
         "det.observation" => &["subject_actor_id"],
         "app.warning" => &["truth", "subject_actor_id"],

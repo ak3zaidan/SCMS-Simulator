@@ -677,6 +677,34 @@ fn card(p: &ScmsParams) -> ModelCard {
             serde_json::json!(p.uu_link_bandwidth_bps),
             "Cellular uplink capacity; same source as uu_link_latency_ms.",
         ),
+        Parameter::new(
+            "v2x_air_bandwidth_bps",
+            "bit/s",
+            serde_json::json!(p.v2x_air_bandwidth_bps),
+            std_src(
+                "EN 302 663 V1.3.1 Annex C.3 Table C.1: QPSK rate 1/2 on the 10 MHz OFDM \
+                 PHY, the mode the safety channel transmits at",
+            ),
+        ),
+        todo(
+            "v2x_air_latency_ms",
+            "ms",
+            serde_json::json!(p.v2x_air_latency.as_nanos() / 1_000_000),
+            "Channel-access delay before a roadside CRL broadcast's first bit, not \
+             propagation. It is the MAC's answer and belongs to v2xw-radio; a scenario that \
+             needs contention drives the broadcast through the engine's PHY instead of \
+             through this link. Replace with the measured access delay at the CBR the \
+             deployment runs at.",
+        ),
+        todo(
+            "epoch_ns",
+            "ns",
+            serde_json::json!(p.epoch),
+            "The SimTime at which i-period 0 begins, which aligns the protocol's week \
+             numbering with the scenario's time.t0. IEEE 1609.2.1 numbers periods from a \
+             fixed calendar epoch; set this from the scenario's t0 and that epoch, or leave \
+             it at 0 to number periods from the run's own origin.",
+        ),
         todo(
             "first_batch_delay_s",
             "s",
@@ -759,9 +787,17 @@ fn card(p: &ScmsParams) -> ModelCard {
         "Availability (entity outages) is a declared hook and is not modelled: \
          06-node-models.md §4 leaves the two-state Markov parameters todo-calibrate."
             .into(),
-        "Epidemic V2V CRL exchange and RSU-relayed provisioning are not built; the CRL \
-         broadcast path is modelled as one node so that `first_rsu_broadcast` has a real \
-         timestamp, but the air interface itself belongs to the radio crates."
+        "Epidemic V2V CRL exchange and RSU-relayed *provisioning* are not built. CRL \
+         *distribution* has both paths: the cellular fetch from the CRL Store and the \
+         roadside broadcast, the latter as a point-to-point link at the OFDM rate. \
+         Contention, fragmentation and the loss process on that link belong to the radio \
+         crates, so a scenario that needs them drives the broadcast through the engine's \
+         PHY rather than through this link."
+            .into(),
+        "The CRL expansion cost is counted and charged zero time, because no hardware \
+         profile in 04-models.md §9.4 publishes a SHA-256 or AES-128 anchor. A device's \
+         `processed` and `enforced` stages therefore share their `downloaded` instant, and \
+         the expansion's operation counts — not its duration — are what the metric reports."
             .into(),
         "The P2PCD and certificate-attachment policies are declared as parameters here and \
          enforced by the envelope in `v2xw-sec`, not by this crate."

@@ -34,7 +34,7 @@ use v2xw_record::profile::Profile;
 use v2xw_record::wire::event::{EventBody, EventEntry};
 use v2xw_record::wire::hello::{
     HELLO_LIVE, HELLO_NODE_ONLY, HELLO_PAUSED, HELLO_REPLAY, HELLO_RESUMED, HELLO_SEEKABLE,
-    HELLO_WRITABLE, NODE_IS_ATTACKER,
+    HELLO_WRITABLE, NODE_IS_ATTACKER, NodeRow,
 };
 use v2xw_record::wire::metric::MetricBody;
 use v2xw_record::wire::provenance::ProvenanceBody;
@@ -273,6 +273,9 @@ pub struct Session {
     origin_m: [f64; 3],
     /// The cadence, kept for the same reason.
     cadence: v2xw_record::encoder::Cadence,
+    /// How many strings the run's own table held, so a §3.8 extension's ids can be
+    /// rebased onto this connection's table. See [`Session::provenance_frame`].
+    hello_base: usize,
     /// True once `Hello` has been sent.
     greeted: bool,
     /// Whether the handshake resumed an existing stream (§1.4 rule 1).
@@ -312,6 +315,7 @@ impl Session {
             provenance: descriptor.provenance.clone(),
             origin_m: descriptor.origin_m,
             cadence: descriptor.cadence,
+            hello_base: descriptor.hello.strings.strings.len(),
             greeted: false,
             resumed: false,
             params,
@@ -387,6 +391,27 @@ impl Session {
         sim_time: SimTime,
         session_token: &str,
     ) -> Result<Frame> {
+        self.hello_frame_with_nodes(descriptor, state, sim_time, session_token, None)
+    }
+
+    /// As [`Session::hello_frame`], with the node table the run has *now*.
+    ///
+    /// §3.1.3 makes the node table "the set known at connect time", and a live run's set
+    /// grows — the Phase 1 Manhattan scenario has no node until its demand model produces
+    /// a vehicle. [`RunDescriptor`] is fixed when the run is wrapped, so the live table
+    /// arrives here separately and its two strings are interned into the table *this*
+    /// `Hello` establishes, which is what makes the ids resolvable on this connection.
+    ///
+    /// # Errors
+    /// As [`Session::hello_frame`].
+    pub fn hello_frame_with_nodes(
+        &mut self,
+        descriptor: &RunDescriptor,
+        state: RunState,
+        sim_time: SimTime,
+        session_token: &str,
+        nodes: Option<(&[crate::engine::NodeFacts], &[String])>,
+    ) -> Result<Frame> {
         let resume_target = self.params.resume.filter(|seq| self.ring.can_resume(*seq));
         self.resumed = resume_target.is_some();
         if !self.resumed {
@@ -419,6 +444,29 @@ impl Session {
         }
         body.sim_time_ns = sim_time;
         body.strings = self.strings.clone();
+        if let Some((nodes, appended)) = nodes {
+            // §2.5 is append-only and an id must mean one string for the whole run, so the
+            // run's own appended strings go on in the order it appended them — *before*
+            // any label is resolved, and including labels of nodes that have since left.
+            // Resolving a label with `intern` after this is therefore a lookup, not an
+            // append, and two connections agree about every id.
+            for string in appended {
+                body.strings.intern(string);
+            }
+            body.nodes = nodes
+                .iter()
+                .map(|facts| NodeRow {
+                    node_id: facts.node_id,
+                    actor_id: facts.actor_id,
+                    pos_m: facts.pos_m,
+                    str_label: body.strings.intern(&facts.label),
+                    str_profile_id: body.strings.intern(&facts.profile_id),
+                    flags: facts.flags,
+                    kind: facts.kind,
+                    class_idx: facts.class_idx,
+                })
+                .collect();
+        }
         body.str_session_token = body.strings.intern(session_token);
         self.strings = body.strings.clone();
 
@@ -700,11 +748,40 @@ impl Session {
 
     fn provenance_frame(&mut self, prov: &ProvenanceBody) -> Result<Frame> {
         // `Provenance` is META (§5.1): nothing in it is withheld by the node profile.
-        let body = prov.clone();
+        let mut body = prov.clone();
         if let Some(ext) = &body.strings {
             // §2.5: the extension's entry `i` takes id `table_size_before + i`, and the
-            // table is append-only. Mirroring it here keeps the session's view of the
-            // table exactly what the client will compute (conformance C7).
+            // table is append-only.
+            //
+            // The engine numbered those ids against the table in its `RunDescriptor`,
+            // which is the table *before* this connection's `Hello` interned its session
+            // token and its live node labels. Ids past that base therefore have to be
+            // shifted by however much this connection's table has grown, or every
+            // `str_model_id` in the frame resolves one entry short and conformance C7
+            // fails silently on exactly the connections that carry a token. The shift is
+            // computed here, where the actual table size is known, rather than being
+            // something the engine has to guess.
+            let shift = self.strings.strings.len().saturating_sub(self.hello_base);
+            if shift > 0 {
+                let base = u32::try_from(self.hello_base).unwrap_or(u32::MAX);
+                let by = u32::try_from(shift).unwrap_or(0);
+                let bump = |id: &mut u32| {
+                    if *id >= base {
+                        *id = id.saturating_add(by);
+                    }
+                };
+                for entry in &mut body.entries {
+                    bump(&mut entry.str_model_id);
+                    bump(&mut entry.str_model_version);
+                    bump(&mut entry.str_param_set_id);
+                    bump(&mut entry.str_card_url);
+                }
+                for dim in &mut body.dims {
+                    bump(&mut dim.str_dims);
+                }
+            }
+            // Mirroring the append here keeps the session's view of the table exactly what
+            // the client will compute.
             self.strings.strings.extend(ext.strings.iter().cloned());
         }
         let seq = self.take_seq();

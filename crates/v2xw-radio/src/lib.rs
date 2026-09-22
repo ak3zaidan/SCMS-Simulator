@@ -1,5 +1,6 @@
-//! `v2xw-radio` — propagation, fading, obstacle shadowing, the IEEE 802.11p PHY and MAC,
-//! decentralised congestion control and channel accounting.
+//! `v2xw-radio` — propagation, fading, obstacle shadowing, the IEEE 802.11p, LTE-V2X and
+//! NR-V2X PHY and MAC layers, the cellular Uu link, decentralised congestion control and
+//! channel accounting.
 //!
 //! This is the crate that turns geometry into decibels and decibels into frame outcomes.
 //! It holds the six plug-in families of 03-interfaces.md §4 ([`traits`]) and the models
@@ -27,6 +28,13 @@
 //! | EDCA in OCB mode, the slotted abstraction, the CBR meter | [`mac`] | 04-models.md §4.3, §4.5 |
 //! | The ETSI adaptive and reactive algorithms, the EN 302 571 floor, SAE J2945/1 | [`dcc`] | 04-models.md §6 |
 //! | The calibrated abstract tier, the legacy models, the calibration routine | [`abstract_tier`] | 04-models.md §4.9 |
+//! | Sidelink resource structure: numerologies, sub-channels, MCS, SCI, IBE, CBR/CR | [`sidelink`] | 04-models.md §5.1, §5.2 |
+//! | The C-V2X block-error lookups and the spectral-efficiency fit | [`bler`] | 04-models.md §5.1 |
+//! | Sensing-based semi-persistent scheduling, Mode 4 and Mode 2 | [`sps`] | 04-models.md §5.1, §5.2 |
+//! | The sidelink PHY: per-sub-channel SINR, in-band emissions, SCI decoding | [`cv2x`] | 04-models.md §5.1, §5.2, §5.4 |
+//! | The cellular Uu link, handover, outage and store-and-forward | [`cellular`] | 04-models.md §10.1 |
+//! | Hybrid operation: a node with both radios and a policy | [`hybrid`] | composition over §4-§5 and §10.1 |
+//! | The measurement harness behind the §13 validation curves | [`sweep`] | 04-models.md §13 |
 //! | The error function, dB arithmetic, ordered power sums | [`numeric`] | ADR 0003, 02-architecture.md §6.3 |
 //!
 //! # The four properties this crate is built to keep
@@ -90,16 +98,23 @@
 #![forbid(unsafe_code)]
 
 pub mod abstract_tier;
+pub mod bler;
 pub mod budget;
+pub mod cellular;
+pub mod cv2x;
 pub mod dcc;
 pub mod error;
 pub mod fading;
+pub mod hybrid;
 pub mod mac;
 pub mod numeric;
 pub mod obstacle;
 pub mod per;
 pub mod phy;
 pub mod prop;
+pub mod sidelink;
+pub mod sps;
+pub mod sweep;
 pub mod traits;
 pub mod types;
 
@@ -140,4 +155,34 @@ pub use phy::{
 pub use prop::{
     DualSlope, FreeSpace, LogDistancePreset, LogDistanceShadowing, Polarization, ShadowProcess,
     SommerCoefficients, Tr37885, Tr37885State, TwoRayGround, friis_loss_db, two_ray_ground_loss_db,
+};
+
+pub use bler::{
+    BlerCurve, CurveProvenance, SeAnchor, SeGapFit, SidelinkErrorModel, WILAB_LTE_SINR_AT_10PC,
+    WilabRow, cited_anchors, wilab_sinr_at_10pc,
+};
+pub use cellular::{
+    CellCapacityUu, CellPlan, CellQuality, CellView, CellularUu, Direction, FixedLatencyUu,
+    HandoverKind, HandoverOutageUu, LatencySpec, MecPlacement, Qos, RadioLatencyClass, SendOutcome,
+    StoreAndForward, UuLatencyPreset, loss_at_percentile, uu_path_loss_db,
+};
+pub use cv2x::{
+    InterferenceSplit, SIDELINK_SENSITIVITY_DBM, SIDELINK_TX_POWER_DBM, SidelinkPhy, SlArrival,
+    SlInterferer, THERMAL_NOISE_DBM_PER_HZ, UE_NOISE_FIGURE_DB,
+};
+pub use hybrid::{
+    Destination, HybridDecision, HybridPolicy, HybridReason, HybridRequest, HybridSelector,
+    RadioChoice,
+};
+pub use sidelink::{
+    IbeMask, NrMcsTable, Numerology, PoolConfig, ProbResourceKeep, Rri, SciSize, SidelinkOccupancy,
+    SlMcsSpec, SlRat, SlResource, TxPercentage, cr_limit, nr_mcs, rsrp_threshold_dbm,
+};
+pub use sps::{
+    Reservation, SelectionOutcome, SelectionReason, SensingHistory, SpsEngine, SpsParams,
+    slot_air_time,
+};
+pub use sweep::{
+    BinStats, ChannelModel, DsrcConfig, HighwaySweep, SweepCtx, SweepReport, molina_masegosa_sweep,
+    sweep_dsrc, sweep_sidelink,
 };

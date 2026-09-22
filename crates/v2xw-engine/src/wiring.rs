@@ -137,12 +137,27 @@ pub fn build_demand(scenario: &Scenario, world: &World) -> Result<Box<dyn Demand
     if d.kind == "mobility/demand/none" {
         return Ok(Box::new(NoDemand::new()));
     }
-    let rate_per_s = d.rate_veh_per_h.unwrap_or(0.0) / 3600.0;
-    let params = v2xw_mobility::demand::PoissonParams {
-        arrival_rate_per_s: rate_per_s,
-        duration: Duration::from_secs_f64(scenario.time.duration_s),
-        ..v2xw_mobility::demand::PoissonParams::default()
+    // `params` is the model's own parameter struct, so a scenario reaches every field the
+    // demand model publishes — including `max_total_vehicles`, which is the only way to
+    // ask for an exact fleet size. Until this read the field was unreachable and a
+    // scenario could only state a rate, so "one vehicle" was a property of the seed.
+    let mut params: v2xw_mobility::demand::PoissonParams = if d.params.is_null() {
+        v2xw_mobility::demand::PoissonParams::default()
+    } else {
+        serde_json::from_value(d.params.clone()).map_err(|e| {
+            EngineError::Scenario(crate::ScenarioError::conflict(
+                "actors.vehicles.demand.params",
+                format!("does not fit the thinned-Poisson demand model's parameters: {e}"),
+            ))
+        })?
     };
+    // Two fields the scenario states outside `params`, and the outer spelling wins:
+    // `duration` is the run's, not the demand model's, and `rate_veh_per_h` is the
+    // friendlier unit for the same quantity as `arrival_rate_per_s`.
+    params.duration = Duration::from_secs_f64(scenario.time.duration_s);
+    if let Some(rate) = d.rate_veh_per_h {
+        params.arrival_rate_per_s = rate / 3600.0;
+    }
     let od = v2xw_mobility::demand::OdParams::default();
     Ok(Box::new(PoissonDemand::new(world, params, od)?))
 }
@@ -281,6 +296,26 @@ pub fn build_node(scenario: &Scenario, node: NodeId, at: SimTime) -> ObuRuntime 
     runtime
 }
 
+/// Which reading of the pseudonym-rotation rule the scenario selected.
+///
+/// 05-protocols.md §2.4 admits two, and the period is what picks between them: 300 s is
+/// the J2945/1 rule, anything else the NYC pilot's. It is a function rather than two
+/// copies of the same `if`, because the credential store's policy has to be the same one
+/// whether the credentials came from the bootstrap stand-in or from the SCMS provisioning.
+pub fn rotation_policy(scenario: &Scenario) -> RotationPolicy {
+    let period = scenario
+        .security
+        .pseudonym_change
+        .period_s
+        .map(Duration::from_secs_f64)
+        .unwrap_or(Duration::from_secs(300));
+    if (period.as_secs_f64() - 300.0).abs() < 1e-9 {
+        RotationPolicy::J2945_1
+    } else {
+        RotationPolicy::NYC_PILOT
+    }
+}
+
 /// Installs the pseudonym a node starts with. See the module documentation: this stands in
 /// for the credential protocol and does not model it.
 pub fn bootstrap_credentials(
@@ -289,19 +324,7 @@ pub fn bootstrap_credentials(
     node: NodeId,
     at: SimTime,
 ) {
-    let period = scenario
-        .security
-        .pseudonym_change
-        .period_s
-        .map(Duration::from_secs_f64)
-        .unwrap_or(Duration::from_secs(300));
-    let policy = if (period.as_secs_f64() - 300.0).abs() < 1e-9 {
-        // 05-protocols.md §2.4 admits two readings of the rotation rule; the scenario's
-        // period selects which one the store enforces.
-        RotationPolicy::J2945_1
-    } else {
-        RotationPolicy::NYC_PILOT
-    };
+    let policy = rotation_policy(scenario);
     let store = runtime.stores_mut();
     *store = v2xw_node::Stores {
         certs: core::mem::take(&mut store.certs).with_policy(policy),
@@ -323,4 +346,136 @@ pub fn bootstrap_credentials(
         valid_until: SimTime::MAX,
         state: CredState::Active,
     });
+}
+
+/// The physical layer the scenario names.
+///
+/// `OfdmPhy` at the scenario's PHY tier, with the crate's own defaults for everything the
+/// scenario does not select: the EN 302 663 static sensitivity table, the −85 dBm CCA
+/// busy threshold of EN 302 571 §4.2.10.1, the per-window SINR capture rule, the hardware
+/// noise figure and the standards-ideal NIST error model.
+///
+/// Every one of those is a *model card* default with a citation, which is why none of them
+/// is restated here. The Phase 1 build instead carried a hand-written noise floor
+/// (`−174 dBm/Hz + 10·log10(10 MHz) + 9 dB = −95 dBm`) and its own `PerModel`, so the
+/// engine and the PHY's card could disagree about the receiver; they now cannot, and the
+/// noise floor a run uses is the card's −98 dBm (−104 dBm thermal in 10 MHz plus the 6 dB
+/// hardware noise figure) rather than the engine's 3GPP 9 dB figure.
+///
+/// The abstract tier gets the same instance. `phy/abstract/distance-load-table` is the
+/// tier's own model and it needs a **calibrated** table — `v2xw_radio::calibrate` produces
+/// one from a `high`-tier run — which this build has not produced, so an abstract-tier
+/// scenario runs the link-budget PHY over free-space propagation and no fading. That is a
+/// missing calibration artefact, not a missing seam.
+pub fn build_phy(scenario: &Scenario) -> v2xw_radio::OfdmPhy {
+    v2xw_radio::OfdmPhy::new(scenario.radio.tiers.phy)
+}
+
+/// The medium-access model the scenario names, or `None` when the tier models no access.
+///
+/// `mac/80211p/edca-ocb` at the medium and high tiers. The abstract tier has no MAC at
+/// all: 02-architecture.md §7 defines it as a reception probability from a calibrated
+/// table, and a contention window inside it would be counted twice.
+///
+/// `SlottedMac` (`mac/80211p/slotted-abstraction`) exists in `v2xw-radio` and is not
+/// selected by any tier here, because nothing in the scenario schema distinguishes the two
+/// CSMA abstractions; it is one `radio.models` entry away.
+pub fn build_mac(scenario: &Scenario) -> Option<v2xw_radio::EdcaOcbMac> {
+    match scenario.radio.tiers.mac {
+        v2xw_core::card::Tier::Abstract => None,
+        _ => Some(v2xw_radio::EdcaOcbMac::new()),
+    }
+}
+
+/// The congestion-control model the scenario names, or `None` when the tier models none.
+///
+/// `dcc/sae/j2945-1-rate-power` for `rat: dsrc-80211p`, because J2945/1 is the congestion
+/// control that goes with the US DSRC band plan this engine transmits in (channel 172) and
+/// with the 20 dBm Class B default the node profile already carries. The ETSI adaptive and
+/// reactive algorithms of TS 102 687 ship in `v2xw-radio` and are the right choice for
+/// `rat: lte-v2x-pc5` in ITS-G5 spectrum; nothing selects them yet, and a scenario that
+/// needs one is a `radio.models` entry rather than a new model.
+///
+/// `None` at the abstract MAC tier, which measures no channel busy ratio to feed it.
+pub fn build_dcc(scenario: &Scenario) -> Option<v2xw_radio::SaeJ2945Dcc> {
+    match scenario.radio.tiers.mac {
+        v2xw_core::card::Tier::Abstract => None,
+        _ => Some(v2xw_radio::SaeJ2945Dcc::new()),
+    }
+}
+
+/// Builds one roadside unit's node runtime.
+///
+/// An [`ObuRuntime`] on an RSU hardware profile with **no message services**: 06-node-
+/// models.md §3 describes an RSU as "the same queue/server structure as the OBU with a
+/// larger profile" plus roles and failure states, and the roles and failure states are
+/// what does not ship. A unit that generated CAMs or BSMs would be a vehicle with a mast,
+/// so the service set is empty and what it puts on the air is what the engine's Phase 2
+/// path hands it.
+pub fn build_rsu(
+    scenario: &Scenario,
+    spec: &crate::phase2::RsuSpec,
+    node: NodeId,
+    at: SimTime,
+) -> ObuRuntime {
+    let profile = v2xw_node::profiles::get(&spec.profile)
+        .cloned()
+        .unwrap_or_else(|| {
+            v2xw_node::profiles::get(v2xw_node::profiles::REFERENCE_OBU)
+                .expect("the reference profile ships with v2xw-node")
+                .clone()
+        });
+    let config = NodeConfig {
+        tx_power_dbm: TX_POWER_DBM,
+        services: v2xw_node::ServiceSet {
+            cam: false,
+            bsm: false,
+        },
+        ..NodeConfig::default()
+    };
+    // `verify-all` at a roadside unit, whatever the vehicles run: a unit that forwards
+    // misbehaviour reports has to have verified the report it forwards, and the
+    // `prioritized` policy would skip a distant sender — which is every sender, at a mast.
+    let mut runtime = ObuRuntime::new(node, profile, Box::new(VerifyAll::new()), config, at);
+    bootstrap_credentials(&mut runtime, scenario, node, at);
+    runtime
+}
+
+/// Replaces a node's bootstrap credential pool with the certificates the SCMS provisioned.
+///
+/// One [`CredentialHandle`] per provisioned certificate, so the store has something to
+/// *rotate* to and two pseudonyms of one device appear on the air inside a run — which is
+/// what a linkage resolution needs, since the Misbehaviour Authority correlates two
+/// reports about two different pseudonyms.
+///
+/// The digest stays [`pseudo_signer`]'s, and the validity window and the i-period are the
+/// protocol's. See [`crate::phase2`], joint 1, for why that split is the honest one while
+/// no `CredentialProtocol` plug-in ships.
+pub fn install_provisioned(
+    runtime: &mut ObuRuntime,
+    scenario: &Scenario,
+    node: NodeId,
+    creds: &[crate::phase2::ProvisionedCred],
+) {
+    // A fresh store rather than a cleared one: `CertStore` has no `clear`, and it should
+    // not — a credential store that can be emptied in place is one a bug can silently
+    // empty. The rotation policy is re-applied from the scenario, exactly as
+    // `bootstrap_credentials` set it.
+    let policy = rotation_policy(scenario);
+    *runtime.stores_mut() = v2xw_node::Stores {
+        certs: v2xw_node::CertStore::new().with_policy(policy),
+        ..core::mem::take(runtime.stores_mut())
+    };
+    for cred in creds {
+        runtime.stores_mut().certs.insert(CredentialHandle {
+            digest: pseudo_signer(node, cred.j),
+            cert_coer: vec![0u8; 117],
+            key: v2xw_sec::KeyId(u64::from(node.index()) << 8 | u64::from(cred.j)),
+            i_period: cred.i,
+            j_index: cred.j,
+            valid_from: cred.valid_from,
+            valid_until: cred.valid_until,
+            state: CredState::Active,
+        });
+    }
 }

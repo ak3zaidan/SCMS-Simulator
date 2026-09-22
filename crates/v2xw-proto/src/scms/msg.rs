@@ -352,6 +352,15 @@ pub enum ScmsMsg {
         /// How many entries.
         entries: u32,
     },
+    /// CRL Broadcast → device: the same list, over the 5.9 GHz air interface.
+    ///
+    /// Injected at the broadcast node rather than requested by the device, because that is
+    /// what a broadcast is: the vehicle did not ask, and a vehicle with no cellular
+    /// subscription gets its CRL this way or not at all.
+    CrlAirBroadcast {
+        /// The device in range.
+        device: NodeId,
+    },
 }
 
 /// Every SCMS message size, in one place.
@@ -648,6 +657,7 @@ impl ScmsSizes {
             ("crl-broadcast", self.crl(1)),
             ("crl-request", self.crl_request()),
             ("crl-download", self.crl(1)),
+            ("crl-air-broadcast", self.crl(1)),
         ]
     }
 }

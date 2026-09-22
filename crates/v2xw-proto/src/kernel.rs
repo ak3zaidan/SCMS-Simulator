@@ -234,10 +234,20 @@ pub struct Kernel<M> {
 }
 
 impl<M> Kernel<M> {
-    /// A kernel over `net` with no entities yet.
+    /// A kernel over `net` with no entities yet, with its clock at zero.
     pub fn new(net: BackendNet) -> Kernel<M> {
+        Kernel::new_at(net, 0)
+    }
+
+    /// A kernel whose clock starts at `t0`.
+    ///
+    /// The engine's clock does not start at zero — a scenario's `time.t0` puts the run on
+    /// a calendar, and a vehicle that spawns 1.5 s into the run must ask for credentials
+    /// at 1.5 s and not at 0. `t0` is a [`SimTime`] the caller supplies; nothing here
+    /// reads a clock to obtain it.
+    pub fn new_at(net: BackendNet, t0: SimTime) -> Kernel<M> {
         Kernel {
-            now: 0,
+            now: t0,
             seq: 0,
             heap: BinaryHeap::new(),
             queues: BTreeMap::new(),
@@ -275,14 +285,49 @@ impl<M> Kernel<M> {
         &mut self.net
     }
 
+    /// The instant `node` will have finished everything already given to it.
+    ///
+    /// The clock alone is not that instant. [`Kernel::now`] is the *arrival* time of the
+    /// delivery being dispatched, and an entity's stages are stamped at the completion of
+    /// its service time, so an externally triggered action injected at `now` can be
+    /// stamped before work the entity was already doing. That is not an early message, it
+    /// is a stage inversion: a Misbehaviour Authority's `decision` appearing before the
+    /// `report_received` that caused it. [`Kernel::inject_at`] clamps to this.
+    pub fn busy_until(&self, node: NodeId) -> SimTime {
+        let free = self
+            .queues
+            .get(&node)
+            .map_or(0, crate::service::ServiceQueue::busy_until);
+        free.max(self.now)
+    }
+
     /// The service queue of `node`, for the telemetry a run reports.
     pub fn queue(&self, node: NodeId) -> Option<&ServiceQueue> {
         self.queues.get(&node)
     }
 
     /// Injects a message with no link delay — how a flow starts.
+    ///
+    /// `at` is taken as given: the caller is the kernel's own dispatch or a test placing an
+    /// event on the schedule deliberately. A driver that is triggering an entity from
+    /// outside wants [`Kernel::inject_at`], which clamps.
     pub fn inject(&mut self, at: SimTime, delivery: Delivery<M>) {
         self.push(at, delivery);
+    }
+
+    /// Injects at the earliest instant that cannot invert a stage at the receiver.
+    ///
+    /// `max(at, busy_until(to))`. It only ever moves an injection later, and only past
+    /// work the entity had already been given, so it cannot hide a flow from a horizon —
+    /// it can only stop a flow from starting inside another one.
+    ///
+    /// Returns the instant the delivery was scheduled for.
+    pub fn inject_at(&mut self, at: SimTime, delivery: Delivery<M>) -> SimTime {
+        let at = at.max(self.busy_until(delivery.to));
+        let mut delivery = delivery;
+        delivery.at = at;
+        self.push(at, delivery);
+        at
     }
 
     fn push(&mut self, at: SimTime, delivery: Delivery<M>) {
@@ -303,6 +348,51 @@ impl<M> Kernel<M> {
         let Reverse(q) = self.heap.pop()?;
         self.now = q.at;
         Some(q.delivery)
+    }
+
+    /// The next delivery, but only if it is due at or before `horizon`.
+    ///
+    /// This is what makes the deployment drivable from a foreign event loop: the engine
+    /// advances its own clock to `t` and hands it here, and the backend does exactly the
+    /// work that was due by then and no more. Without it the only way to advance a flow
+    /// is to run it to quiescence, which would let a provisioning round trip complete
+    /// inside one engine step and cost nothing.
+    ///
+    /// The clock is advanced only when something is popped, so a horizon in the middle of
+    /// a quiet interval does not move the backend's `now` past the engine's.
+    pub fn next_delivery_before(&mut self, horizon: SimTime) -> Option<Delivery<M>> {
+        let due = self.heap.peek().map(|Reverse(q)| q.at)?;
+        if due > horizon {
+            return None;
+        }
+        self.next_delivery()
+    }
+
+    /// When the next scheduled delivery is due, if anything is scheduled.
+    pub fn next_due(&self) -> Option<SimTime> {
+        self.heap.peek().map(|Reverse(q)| q.at)
+    }
+
+    /// How many deliveries are still scheduled.
+    pub fn pending(&self) -> usize {
+        self.heap.len()
+    }
+
+    /// The stage stamps made since `cursor`, and the new cursor.
+    ///
+    /// The log keeps everything — a decomposition is a query over the whole run — so a
+    /// recorder that must emit each stamp exactly once carries a cursor rather than the
+    /// log being drained under it.
+    pub fn stages_since(&self, cursor: usize) -> (&[StageStamp], usize) {
+        let all = self.stages.stamps();
+        let from = cursor.min(all.len());
+        (&all[from..], all.len())
+    }
+
+    /// The wire steps made since `cursor`, and the new cursor.
+    pub fn steps_since(&self, cursor: usize) -> (&[WireStep], usize) {
+        let from = cursor.min(self.steps.len());
+        (&self.steps[from..], self.steps.len())
     }
 
     /// Charges an entity's work, stamps its stages and schedules what it sent.
@@ -360,6 +450,7 @@ impl<M> Kernel<M> {
                 from: node,
                 to: s.to,
                 flow: s.flow,
+                run: s.run,
                 step: s.step,
                 bytes,
                 transport: s.transport,

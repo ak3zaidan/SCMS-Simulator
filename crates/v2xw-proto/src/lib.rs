@@ -79,8 +79,11 @@ pub mod error;
 pub mod etsi;
 pub mod kernel;
 pub mod net;
+pub mod overhead;
+pub mod pseudonym;
 pub mod scms;
 pub mod service;
+pub mod sim;
 pub mod sizes;
 pub mod spec;
 pub mod stage;
@@ -89,8 +92,13 @@ pub mod threshold;
 pub use error::{ProtoError, Result};
 pub use kernel::{Delivery, Kernel, Outbox};
 pub use net::{BackendNet, Link, Transport};
+pub use overhead::{AirInterface, MessageOverhead, OverheadProfile, Payload};
+pub use pseudonym::{CertEvent, ChangeReason, ChangeTrigger, PseudonymStore, PseudonymStrategy};
 pub use scms::{CAMP_SCMS_ID, CampScms, ScmsNodes, ScmsParams, ScmsRun};
 pub use service::{BatchPolicy, ServiceModelSpec, ServiceQueue};
+pub use sim::{
+    Bootstrap, CredentialService, Drained, ProvisioningCost, Pseudonym, RevocationLatency,
+};
 pub use sizes::{CertificateSizes, SizeParams, SizeProvenance, WireSize};
 pub use spec::{
     ActiveRevocation, Centrality, CredState, CredentialTypeSpec, EntityRoleSpec, FlowSpec,

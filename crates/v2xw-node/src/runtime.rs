@@ -37,17 +37,23 @@
 //! exactly the leak the firewall exists to stop.
 
 use v2xw_core::belief::PositionEstimate;
+use v2xw_core::geo::GeoOrigin;
+use v2xw_core::geom::Dims;
 use v2xw_core::ids::NodeId;
 use v2xw_core::nodeview::NodeView;
-use v2xw_core::time::{Duration, SimTime};
+use v2xw_core::time::{Duration, SimTime, WallClock};
 use v2xw_msg::MsgType;
-use v2xw_msg::generator::{DccState, GenRequest};
+use v2xw_msg::cam::{self, ParticipantType};
+use v2xw_msg::codec::{EtsiUperCodec, Message, MessageCodec};
+use v2xw_msg::generator::DccState;
+use v2xw_msg::j2735::bsm;
 use v2xw_msg::sec_types::HashedId8;
 use v2xw_record::wire::telemetry::NodeTelemetry;
 
 use crate::clock::ClockModel;
 use crate::ctx::{NodeCtx, NodeCtxExt};
 use crate::generate::{MessageSchedule, ServiceSet};
+use crate::secure::{CryptoMode, NodeSecurity, PSID_SAFETY, SignedFrame, SpduVerdict};
 use crate::policy::{
     PolicyView, Prioritized, RxSummary, SkipReason, VerificationPolicy, VerifyDecision,
     VerifyDecisionRecord, VerifyReason,
@@ -90,6 +96,14 @@ pub struct RxFrame {
     pub claimed_cert_period: u32,
     /// The linkage value the signer's certificate carries.
     pub claimed_linkage: Option<v2xw_sec::linkage::LinkageValue>,
+    /// The signed SPDU as it arrived on the air, when the engine carries the bytes.
+    ///
+    /// `Some` is the honest path: the node parses these bytes, resolves the signer's
+    /// certificate out of its own cache and checks the signature with its own crypto
+    /// backend, so [`RxFrame::signature_valid`] is not consulted at all. `None` is the
+    /// legacy path, where the engine decided validity on the node's behalf and the node
+    /// only pays for the check. See [`ObuRuntime::classify`].
+    pub spdu: Option<Vec<u8>>,
 }
 
 /// A message this node received and has an opinion about — the
@@ -120,11 +134,22 @@ pub struct VerifiedMessage {
 }
 
 /// One message this node wants transmitted.
+///
+/// # The bytes, not a count
+///
+/// [`Transmission::bytes`] used to be the whole story, and the story was
+/// `93 + signer identifier` with no payload at all. It is kept — every consumer reads it
+/// and it is still exactly the frame's length — but it is now *derived* from
+/// [`Transmission::signed`], which carries the encoded facilities-layer payload and the
+/// IEEE 1609.2 SPDU that wraps it. A consumer that wants the split (and the `node.tx`
+/// record wants it: `payload_bytes` and `envelope_bytes` are two of its columns) takes it
+/// from there rather than recomputing an overhead nobody measured.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Transmission {
     /// What it is.
     pub msg_type: MsgType,
-    /// The signed size, bytes.
+    /// The signed size, bytes. Equal to `signed.bytes_on_wire()` whenever `signed` is
+    /// present, which it is for every message a node's own generator produced.
     pub bytes: u32,
     /// The credential it was signed with.
     pub signer: HashedId8,
@@ -135,6 +160,50 @@ pub struct Transmission {
     pub ready_at: SimTime,
     /// The instant the payload claims, on this node's own clock.
     pub generation_time: SimTime,
+    /// The real bytes: the encoded payload and the signed SPDU.
+    ///
+    /// `None` only for a frame the *engine* synthesised on a node's behalf — the
+    /// misbehaviour-report and CRL-broadcast paths of `v2xw-engine`, which size a payload
+    /// from a protocol table and never build one. Every frame a node's own generator
+    /// produced carries `Some`, and an aggregation over `node.tx` that finds `None` is
+    /// looking at a frame nobody encoded.
+    pub signed: Option<SignedFrame>,
+}
+
+impl Transmission {
+    /// The facilities-layer payload's length, for the `node.tx` record's `payload_bytes`.
+    pub fn payload_bytes(&self) -> Option<u32> {
+        self.signed.as_ref().map(SignedFrame::payload_bytes)
+    }
+
+    /// The security envelope's length, for the `node.tx` record's `envelope_bytes`.
+    pub fn envelope_bytes(&self) -> Option<u32> {
+        self.signed.as_ref().map(SignedFrame::envelope_bytes)
+    }
+
+    /// A transmission whose size is known but whose bytes are not — the shape the engine's
+    /// own application-layer frames need.
+    ///
+    /// Named rather than a struct literal so that adding a field here is one edit in this
+    /// crate instead of one in every caller.
+    pub fn sized(
+        msg_type: MsgType,
+        bytes: u32,
+        signer: HashedId8,
+        full_certificate: bool,
+        ready_at: SimTime,
+        generation_time: SimTime,
+    ) -> Transmission {
+        Transmission {
+            msg_type,
+            bytes,
+            signer,
+            full_certificate,
+            ready_at,
+            generation_time,
+            signed: None,
+        }
+    }
 }
 
 /// What one step produced.
@@ -167,6 +236,29 @@ pub struct NodeConfig {
     pub sign_op: &'static str,
     /// The verification primitive.
     pub verify_op: &'static str,
+    /// The scenario's wall clock, for `generationTime`, `secMark` and certificate
+    /// validity. Real messages carry real timestamps, so the node needs one.
+    pub wall: WallClock,
+    /// The geodetic anchor of the world's ENU frame.
+    ///
+    /// Both message formats carry latitude and longitude, so a node cannot encode one
+    /// without knowing where `(0, 0, 0)` is. The default is the null island anchor, which
+    /// encodes perfectly well and is obviously wrong in a map view — better than a
+    /// plausible city that silently misplaces every run that forgot to set it.
+    pub origin: GeoOrigin,
+    /// The vehicle's dimensions, for `vehicleLength`/`vehicleWidth` and `size`.
+    pub dims: Dims,
+    /// What kind of road user this is, for the CAM's `stationType`.
+    pub station_type: ParticipantType,
+    /// Which crypto backend signs and verifies.
+    ///
+    /// Phase 1 acceptance criterion 3: a run in `real` and a run in `modeled` must produce
+    /// identical event logs apart from the manifest. That holds here because this field is
+    /// the *only* thing either mode changes — see [`crate::secure::NodeCrypto`].
+    pub crypto_mode: CryptoMode,
+    /// The PSID a safety message is signed under. Changing it changes the envelope
+    /// overhead; see [`crate::secure::PSID_SAFETY`].
+    pub psid: u64,
 }
 
 impl Default for NodeConfig {
@@ -186,6 +278,12 @@ impl Default for NodeConfig {
             tx_power_dbm: 20.0,
             sign_op: "ecdsa-p256-sign",
             verify_op: "ecdsa-p256-verify",
+            wall: WallClock::default(),
+            origin: GeoOrigin::new(0.0, 0.0, 0.0),
+            dims: Dims::CAR,
+            station_type: ParticipantType::PassengerCar,
+            crypto_mode: CryptoMode::Modeled,
+            psid: PSID_SAFETY,
         }
     }
 }
@@ -219,6 +317,11 @@ pub struct ObuRuntime {
     window: TelemetryWindow,
     dcc: DccState,
     dcc_state_code: u16,
+    /// The node's own security stack: the envelope, the crypto backend, the signer.
+    security: NodeSecurity,
+    /// The ETSI codec. Stateless, but it carries the model card that says *which* ASN.1
+    /// modules produced these bytes, which is what a manifest pins.
+    etsi: EtsiUperCodec,
     /// The two §3.5.2 fields marked **GT**, handed in from outside the firewall by
     /// [`ObuRuntime::observe_truth`] and read by nothing but the telemetry path.
     gt_pos_error_m: f32,
@@ -280,9 +383,22 @@ impl ObuRuntime {
             dcc: DccState::UNRESTRICTED,
             dcc_state_code: v2xw_record::wire::U16_NONE,
             gt_pos_error_m: f32::NAN,
+            security: NodeSecurity::new(config.wall, config.crypto_mode, config.psid),
+            etsi: EtsiUperCodec::new(),
             service,
             config,
         }
+    }
+
+    /// The node's security stack, for a test that wants to check a signature this node
+    /// produced or ask which backend is running.
+    pub fn security(&self) -> &NodeSecurity {
+        &self.security
+    }
+
+    /// The security stack, mutably, for a credential protocol installing real credentials.
+    pub fn security_mut(&mut self) -> &mut NodeSecurity {
+        &mut self.security
     }
 
     /// The node's stores (03-interfaces.md §8).
@@ -493,16 +609,23 @@ impl ObuRuntime {
         believed: SimTime,
         out: &mut StepOutcome,
     ) {
-        let op = OpDescriptor::verify(self.config.verify_op, 0);
-        let Some(cost) = self.service.service_time(ctx, &op) else {
+        let probe = OpDescriptor::verify(self.config.verify_op, 0);
+        if self.service.service_time(ctx, &probe).is_none() {
             // The profile costs no verification. Nothing is verified and nothing is
             // silently delivered as if it had been: the queue simply does not drain, which
             // shows up as a growing `q_verify` and a `verifications_per_s` of zero.
             return;
-        };
-        let where_ = self.service.runs_on(&op);
+        }
+        let where_ = self.service.runs_on(&probe);
 
         for q in self.queues[1].drain() {
+            let frame = q.item;
+            // Charged over the bytes actually checked, as signing is over the bytes
+            // actually signed.
+            let op = OpDescriptor::verify(self.config.verify_op, frame.bytes);
+            let Some(cost) = self.service.service_time(ctx, &op) else {
+                continue;
+            };
             let sched = match where_ {
                 RunsOn::Hsm => self.hsm.submit(q.enqueued_at, cost),
                 RunsOn::Accelerator => self.accel.submit(q.enqueued_at, cost),
@@ -510,8 +633,7 @@ impl ObuRuntime {
             };
             self.window.verification(sched.wait);
 
-            let frame = q.item;
-            let verdict = self.classify(&frame);
+            let verdict = self.classify(ctx, &frame);
             let m = self.to_message(&frame, believed, verdict);
             self.deliver(m, out);
         }
@@ -519,11 +641,32 @@ impl ObuRuntime {
 
     /// What the node concludes about one frame, having spent the verification time.
     ///
+    /// When the frame carries its SPDU the node does the real work: it parses the bytes,
+    /// resolves the signer's certificate out of its own bounded cache, and checks the
+    /// signature with its own crypto backend. [`RxFrame::signature_valid`] is not read at
+    /// all on that path — it is the engine's opinion, and a receiver does not have access
+    /// to one.
+    ///
+    /// When the frame carries no bytes the node falls back to that field, which is the
+    /// state the engine is still in. The fallback is visible rather than silent: it is the
+    /// only branch that reads `signature_valid`, and `tests/wire_bytes.rs` drives both.
+    ///
     /// The revocation check is the bounded one: `authenticated` is the outcome of the
     /// signature check, so a frame whose signature failed never reaches the CRL with an
     /// attacker-chosen i-period in hand.
-    fn classify(&mut self, frame: &RxFrame) -> VerificationState {
-        if !frame.signature_valid {
+    fn classify(&mut self, ctx: &mut dyn NodeCtx, frame: &RxFrame) -> VerificationState {
+        let authentic = match &frame.spdu {
+            Some(bytes) => match self.verify_on_the_wire(ctx, bytes) {
+                SpduVerdict::Valid => true,
+                SpduVerdict::Invalid => false,
+                // The node holds no certificate for this signer, so it has concluded
+                // nothing. Answering `Invalid` would blame a peer for this node's own
+                // empty cache; the P2PCD request is counted in `learn_or_request`.
+                SpduVerdict::Unverifiable => return VerificationState::Unverified,
+            },
+            None => frame.signature_valid,
+        };
+        if !authentic {
             return VerificationState::Invalid;
         }
         let Some(lv) = frame.claimed_linkage else {
@@ -532,7 +675,7 @@ impl ObuRuntime {
         match self
             .stores
             .crl
-            .check(frame.claimed_cert_period, lv, frame.signature_valid)
+            .check(frame.claimed_cert_period, lv, authentic)
         {
             crate::stores::CrlVerdict::Revoked => VerificationState::Revoked,
             crate::stores::CrlVerdict::NotRevoked => VerificationState::Verified,
@@ -542,6 +685,32 @@ impl ObuRuntime {
                 VerificationState::Invalid
             }
         }
+    }
+
+    /// Parses an SPDU, resolves its signer's certificate and checks the signature.
+    ///
+    /// The certificate comes from exactly two places, and both are the node's own: the
+    /// SPDU itself when the sender attached one, or this node's bounded peer cache when it
+    /// named one by digest. A miss is [`SpduVerdict::Unverifiable`] — the P2PCD case —
+    /// and never a rejection, because a receiver that has not been told a certificate has
+    /// learned nothing about the message signed under it.
+    fn verify_on_the_wire(&mut self, ctx: &mut dyn NodeCtx, bytes: &[u8]) -> SpduVerdict {
+        let Some(parsed) = self.security.parse(bytes) else {
+            return SpduVerdict::Invalid;
+        };
+        let certificate = match NodeSecurity::attached_certificate(&parsed) {
+            Some(c) => {
+                self.stores.peers.learn_certificate(c.clone());
+                Some(c)
+            }
+            None => NodeSecurity::parsed_signer_digest(&parsed)
+                .and_then(|d| self.stores.peers.certificate(&d)),
+        };
+        let Some(certificate) = certificate else {
+            return SpduVerdict::Unverifiable;
+        };
+        self.security
+            .verify_parsed(ctx, &parsed, &certificate, self.node)
     }
 
     fn to_message(
@@ -587,6 +756,23 @@ impl ObuRuntime {
         out.delivered.push(m);
     }
 
+    /// Builds, encodes, signs and queues whatever the schedule says is due.
+    ///
+    /// The order is the order a real stack does it in, and each step is real:
+    ///
+    /// 1. the timers decide, from the node's **belief** and the node's **clock**;
+    /// 2. the active credential is turned into a real key and a real certificate, once per
+    ///    pseudonym ([`crate::secure::NodeSecurity::provision`]);
+    /// 3. the payload is built from the belief and encoded by the format's own encoder —
+    ///    a CAM through the generated ETSI UPER bindings, a BSM through the hand-written
+    ///    J2735 encoder that was cross-validated against `pycrate` over 235 vectors;
+    /// 4. it is signed into an IEEE 1609.2 `SignedData` SPDU by the node's crypto backend;
+    /// 5. the signature's *modelled* time is charged against the profile's own server
+    ///    bank, so a slow signer queues and a node that cannot keep up falls behind.
+    ///
+    /// Step 3 is why a CAM and a BSM come out at different sizes. They are different
+    /// formats carrying different fields; the only way they can agree to the byte is if
+    /// neither was encoded.
     fn generate(&mut self, ctx: &mut dyn NodeCtx, believed: SimTime, out: &mut StepOutcome) {
         // The two arguments are the node's own clock and the node's own belief. Nothing
         // else is in scope, and `crate::firewall` checks that this stays true.
@@ -601,28 +787,71 @@ impl ObuRuntime {
                 .record_n(DropCause::TxOverflow, requests.len() as u32);
             return;
         };
-        let op = OpDescriptor::sign(self.config.sign_op, 0);
-        let Some(cost) = self.service.service_time(ctx, &op) else {
+        // The credential protocol's stand-in: a real key and a real certificate for every
+        // pseudonym the store holds, and each certificate's own digest written back into
+        // the store so that what the node announces is what it can actually prove.
+        //
+        // Every pseudonym, not just the active one, and that is the difference between a
+        // revocation that sticks and one that does not: a linked CRL revokes a
+        // certificate, the node matches its own credentials against it *by digest*, and a
+        // certificate that only came into existence at the moment the node rotated onto it
+        // would let a revoked node walk away from its revocation by rotating.
+        if !self.provision_all(ctx, believed) {
+            self.drops
+                .record_n(DropCause::TxOverflow, requests.len() as u32);
+            return;
+        }
+        if !self.security.set_active(cred.i_period, cred.j_index) {
+            self.drops
+                .record_n(DropCause::TxOverflow, requests.len() as u32);
+            return;
+        }
+        let Some(cred) = self.stores.certs.active().cloned() else {
             self.drops
                 .record_n(DropCause::TxOverflow, requests.len() as u32);
             return;
         };
-        let where_ = self.service.runs_on(&op);
 
         for r in requests {
-            let sched = match where_ {
+            let Some(payload) = self.encode_payload(r.msg_type, believed, &cred) else {
+                // The node could not build a conformant message — a belief with no fix, a
+                // position outside the ASN.1's range, a clock before the 1609.2 epoch. It
+                // transmits nothing rather than a payload that would not decode.
+                self.drops.record(DropCause::TxOverflow);
+                continue;
+            };
+            let sid = self.security.signer_id_for(r.msg_type, believed);
+            let Ok((frame, pdu)) =
+                self.security
+                    .sign(ctx, r.msg_type, &payload, sid, None)
+            else {
+                self.drops.record(DropCause::TxOverflow);
+                continue;
+            };
+            // The cost is charged over the bytes actually signed, not over zero: a cost
+            // table that ever grows a per-byte term will then be read correctly without
+            // anyone having to remember to come back here.
+            let op = OpDescriptor::sign(self.config.sign_op, frame.payload_bytes());
+            let Some(cost) = self.service.service_time(ctx, &op) else {
+                // The profile costs no signature. Nothing is signed for free.
+                self.drops.record(DropCause::TxOverflow);
+                continue;
+            };
+            let sched = match self.service.runs_on(&op) {
                 RunsOn::Hsm => self.hsm.submit(believed, cost),
                 RunsOn::Accelerator => self.accel.submit(believed, cost),
                 RunsOn::Cpu => self.cpu.submit(believed, cost),
             };
-            let bytes = self.signed_size(&r, &cred);
+            let full_certificate = pdu.signer_id == v2xw_sec::SignerIdChoice::Certificate;
+            let bytes = frame.bytes_on_wire();
             let tx = Transmission {
                 msg_type: r.msg_type,
                 bytes,
                 signer: cred.digest.clone(),
-                full_certificate: r.include_low_frequency,
+                full_certificate,
                 ready_at: sched.finish,
                 generation_time: r.at,
+                signed: Some(frame),
             };
             if let Admission::Refused(_) = self.queues[3].push(Queued {
                 item: RxFrame {
@@ -633,10 +862,11 @@ impl ObuRuntime {
                     claimed_speed_mps: self.belief.ground_speed_mps(),
                     claimed_heading_rad: self.belief.heading_rad,
                     claimed_generation_time: r.at,
-                    full_certificate: tx.full_certificate,
+                    full_certificate,
                     signature_valid: true,
                     claimed_cert_period: cred.i_period,
                     claimed_linkage: None,
+                    spdu: None,
                 },
                 enqueued_at: believed,
             }) {
@@ -644,6 +874,10 @@ impl ObuRuntime {
                 continue;
             }
             let _ = self.queues[3].pop();
+            if full_certificate {
+                self.security
+                    .note_certificate_attached(r.msg_type, believed);
+            }
             // Air time is the PHY's to compute; until a scenario wires one in, the node
             // reports the byte count and leaves `airtime_ms_per_s` at zero contribution
             // rather than inventing a data rate.
@@ -652,22 +886,105 @@ impl ObuRuntime {
         }
     }
 
-    /// The signed size of a message.
+    /// Issues a certificate for every credential the store holds and writes each one's own
+    /// identity back into it. `false` if any of it failed.
     ///
-    /// Payload plus the 1609.2 envelope overhead, which 04-models.md §9.1 derives and
-    /// build decision D12.1 confirms octet by octet. A digest signer identifier costs 8
-    /// bytes where a full certificate costs the encoded certificate, so the difference
-    /// between the two is real bytes on the air and not a modelling constant.
-    fn signed_size(&self, r: &GenRequest, cred: &CredentialHandle) -> u32 {
-        // Payload sizes are the codec's; a node that has not been given one reports the
-        // envelope alone rather than guessing a payload.
-        const ENVELOPE_OVERHEAD_B: u32 = 93;
-        let signer_id = if r.include_low_frequency {
-            cred.cert_coer.len() as u32
-        } else {
-            8
-        };
-        ENVELOPE_OVERHEAD_B.saturating_add(signer_id)
+    /// Until a `CredentialProtocol` ships, a credential arrives carrying
+    /// [`crate::stores::pseudo_signer`]'s stand-in digest and a zero-filled `cert_coer` of
+    /// the modelled length. Both are wrong in the only way that matters: the SPDU this node
+    /// is about to sign names the *real* certificate, so the store has to name it too, or
+    /// the digest a receiver sees will not be the digest the sender's store holds.
+    ///
+    /// Idempotent and therefore cheap after the first call: [`NodeSecurity::provision`]
+    /// returns the handle it already made.
+    fn provision_all(&mut self, ctx: &mut dyn NodeCtx, believed: SimTime) -> bool {
+        let pseudonyms: Vec<(u32, u32)> = self
+            .stores
+            .certs
+            .credentials()
+            .iter()
+            .map(|c| (c.i_period, c.j_index))
+            .collect();
+        for (i, j) in pseudonyms {
+            if self
+                .security
+                .provision(ctx, self.node, i, j, believed)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        for cred in self.stores.certs.credentials_mut() {
+            let Some(signer) = self
+                .security
+                .signer_for_pseudonym(cred.i_period, cred.j_index)
+            else {
+                return false;
+            };
+            if cred.digest != *signer.digest() {
+                cred.digest = signer.digest().clone();
+                cred.cert_coer = signer.cert_coer().to_vec();
+            }
+        }
+        true
+    }
+
+    /// Builds one message from the node's belief and encodes it with its own encoder.
+    ///
+    /// `None` when the belief cannot be expressed in the format — which is a real
+    /// condition, not a defensive `unwrap`: `Latitude` and `Longitude` are constrained
+    /// integers and a node whose world position falls outside the ellipsoid, or whose
+    /// clock predates the 1609.2 epoch, has nothing conformant to send.
+    ///
+    /// The station identifier is the first four bytes of the credential's own
+    /// `HashedId8`. That is not decoration: it means the identifier on the air changes
+    /// exactly when the pseudonym changes, which is the property a linkability study
+    /// measures. A station id derived from the node id would have made every pseudonym
+    /// change trivially reversible.
+    fn encode_payload(
+        &self,
+        msg_type: MsgType,
+        believed: SimTime,
+        cred: &CredentialHandle,
+    ) -> Option<Vec<u8>> {
+        let mut id = [0u8; 4];
+        id.copy_from_slice(&cred.digest.0[..4]);
+        match msg_type {
+            MsgType::Cam => {
+                let generation_time = cam::timestamp_its(self.config.wall, believed).ok()?;
+                let input = cam::CamInput::new(
+                    u32::from_be_bytes(id),
+                    self.config.station_type,
+                    self.belief,
+                    self.config.origin,
+                    self.config.dims,
+                    generation_time,
+                );
+                let message = cam::build_cam(&input).ok()?;
+                let encoded = self.etsi.encode(&Message::Cam(Box::new(message))).ok()?;
+                debug_assert!(encoded.is_real(), "the ETSI codec produces real UPER bytes");
+                Some(encoded.bytes)
+            }
+            MsgType::Bsm => {
+                let input = bsm::BsmInput::new(
+                    self.schedule.bsm_msg_count(),
+                    id,
+                    self.belief,
+                    self.config.origin,
+                    self.config.dims,
+                    bsm::sec_mark(self.config.wall, believed),
+                );
+                let message = bsm::build_bsm(&input).ok()?;
+                // A `MessageFrame`, because that is what goes in a WSM payload; the bare
+                // PDU is three octets shorter and is not what a receiver decodes.
+                let encoded = bsm::encode_message_frame(&message).ok()?;
+                debug_assert!(encoded.is_real(), "the J2735 encoder produces real bytes");
+                Some(encoded.bytes)
+            }
+            // Nothing else is generated here. A DENM is an application's decision and a
+            // CRL or a report is the engine's; none of them arrives through the schedule.
+            _ => None,
+        }
     }
 
     fn log_decision(

@@ -1,27 +1,41 @@
 //! `v2xw-server` — serve one run over VWP v1.
 //!
-//! Two modes: the synthetic fixture engine (the default, for developing a client without
-//! an engine) and replay of an MCAP recording. A third mode — a live `v2xw-engine` run —
-//! is one line away and lands with that crate.
+//! Two modes. `--scenario <path>` runs the real kernel: the scenario is loaded, the world
+//! is imported and `v2xw-engine` produces the stream. With no `--scenario`, the synthetic
+//! fixture engine runs instead, which is what a client developer points at when they want
+//! a conforming stream and no city extract.
 
 use std::net::{IpAddr, SocketAddr};
 
-use v2xw_server::{ServerOptions, StubOptions, serve_stub};
+use v2xw_server::{LiveOptions, ServerOptions, StubOptions, serve_scenario, serve_stub};
 
 const USAGE: &str = "\
 v2xw-server — the VWP v1 control surface and stream (docs/protocol/vwp-v1.md)
 
-  v2xw-server [options]
+  v2xw-server --scenario scenarios/phase1-manhattan.yaml
+  v2xw-server [fixture options]
 
+  live run (the real engine):
+  --scenario <p>  scenario to run; without it the synthetic fixture runs instead
+  --record <p>    write the MCAP recording here
+  --build-utc <t> manifest build timestamp (the engine may not read a clock)
+  --retain <n>    mobility steps of history kept for run.seek (default 36000)
+  --lookahead <n> steps the kernel may run ahead of the stream (default 64)
+
+  fixture run:
   --actors <n>    actors to drive (default 120)
   --grid <n>      junctions per side of the generated grid (default 8)
   --block <m>     junction spacing, metres (default 150)
   --duration <s>  simulated seconds (default 600)
+  --seed <n>      fixture phase seed (default 20260918)
+
+  both:
   --port <n>      TCP port, 0 for an ephemeral one (default 8787)
   --host <addr>   bind address (default 127.0.0.1; a non-loopback bind needs --token)
   --token <t>     bearer token required on the upgrade and every HTTP request
-  --seed <n>      fixture phase seed (default 20260918)
+  --speed <x>     multiple of real time; 0 is unthrottled (default 1)
   --paused        start the run paused at t = 0
+  --label <s>     human label for Hello.str_run_label
   --quiet         do not print the banner
   --help          this message
 ";
@@ -30,6 +44,8 @@ v2xw-server — the VWP v1 control surface and stream (docs/protocol/vwp-v1.md)
 async fn main() -> std::process::ExitCode {
     let mut options = ServerOptions::default();
     let mut stub = StubOptions::default();
+    let mut live = LiveOptions::default();
+    let mut scenario: Option<String> = None;
     let mut host: IpAddr = [127, 0, 0, 1].into();
     let mut port: u16 = 8787;
     let mut quiet = false;
@@ -53,8 +69,36 @@ async fn main() -> std::process::ExitCode {
             }
             "--paused" => {
                 stub.paused = true;
+                live.paused = true;
                 Ok(())
             }
+            "--scenario" => next()
+                .map(|v| scenario = Some(v))
+                .ok_or("--scenario needs a path"),
+            "--record" => next()
+                .map(|v| live.recording = Some(std::path::PathBuf::from(v)))
+                .ok_or("--record needs a path"),
+            "--build-utc" => next()
+                .map(|v| live.build_utc = v)
+                .ok_or("--build-utc needs a timestamp"),
+            "--retain" => next()
+                .and_then(|v| v.parse().ok())
+                .map(|v| live.retain_steps = v)
+                .ok_or("--retain needs a number"),
+            "--lookahead" => next()
+                .and_then(|v| v.parse().ok())
+                .map(|v| live.lookahead_steps = v)
+                .ok_or("--lookahead needs a number"),
+            "--speed" => next()
+                .and_then(|v| v.parse().ok())
+                .map(|v| live.speed = v)
+                .ok_or("--speed needs a number"),
+            "--label" => next()
+                .map(|v| {
+                    stub.label = v.clone();
+                    live.label = v;
+                })
+                .ok_or("--label needs a value"),
             "--actors" => next()
                 .and_then(|v| v.parse().ok())
                 .map(|v| stub.actors = v)
@@ -100,7 +144,11 @@ async fn main() -> std::process::ExitCode {
     }
     options.bind = SocketAddr::new(host, port);
 
-    let server = match serve_stub(options, stub).await {
+    let started = match &scenario {
+        Some(path) => serve_scenario(options, path, live).await,
+        None => serve_stub(options, stub).await,
+    };
+    let server = match started {
         Ok(s) => s,
         Err(e) => {
             eprintln!("v2xw-server: {e}");
@@ -125,6 +173,16 @@ async fn main() -> std::process::ExitCode {
             server.http_url()
         );
         println!("  run      {}", d.run_id);
+        println!(
+            "  source   {}",
+            scenario
+                .as_deref()
+                .unwrap_or("synthetic fixture (no --scenario)")
+        );
+        println!("  scenario {}", d.scenario_hash_hex);
+        if let Some(path) = &d.recording_path {
+            println!("  record   {path}");
+        }
         println!("  traffic  {actors} actors, {nodes} nodes");
         // The banner is the readiness signal a test harness waits on, so it must be
         // flushed before the process starts serving quietly.

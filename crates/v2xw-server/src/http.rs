@@ -311,12 +311,17 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
     let mut session = Session::new(params, &descriptor);
     let mut steps = state.run.subscribe();
 
-    // §1.3: the server sends exactly one Hello immediately, before anything else.
-    let hello = match session.hello_frame(
+    // §1.3: the server sends exactly one Hello immediately, before anything else. A live
+    // run's node table is the set it has *now*, not the set it had when the server bound
+    // (§3.1.3), so it is read here per connection.
+    let live = state.run.live_node_table();
+    let hello = match session.hello_frame_with_nodes(
         &descriptor,
         state.run.state(),
         state.run.sim_time(),
         &state.session_token,
+        live.as_ref()
+            .map(|(nodes, strings)| (&nodes[..], &strings[..])),
     ) {
         Ok(frame) => frame,
         Err(e) => {

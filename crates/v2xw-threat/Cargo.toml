@@ -20,3 +20,21 @@ thiserror = { workspace = true }
 # The recorded records of `records` and the serialised model-card parameter defaults.
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# The attack-in-the-loop harness in `tests/common/sim.rs`. These are DEV dependencies on
+# purpose: the library's single internal dependency on `v2xw-core` is the crate's stated
+# seam (see the crate documentation, "The seam"), and the wiring that proves the attacks
+# and detectors run in a real simulation belongs to the tests rather than to the library.
+# `v2xw-engine` is deliberately NOT here: its `EngineCtx::new` is `pub(crate)`, so its
+# loop cannot be driven from outside it anyway, and depending on it would make this
+# crate's tests fail whenever the engine is mid-edit. The harness constructs the same
+# models `v2xw_engine::wiring` selects, and says so at each call site.
+v2xw-world = { workspace = true }
+v2xw-mobility = { workspace = true }
+v2xw-radio = { workspace = true }
+v2xw-msg = { workspace = true }
+v2xw-sec = { workspace = true }
+v2xw-node = { workspace = true }
+v2xw-metrics = { workspace = true }
+v2xw-record = { workspace = true }

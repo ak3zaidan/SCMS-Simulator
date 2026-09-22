@@ -108,6 +108,83 @@ impl RunRecorder for MemoryRecorder {
     }
 }
 
+/// A recorder that keeps only the digest of what it was handed.
+///
+/// It exists because the determinism comparison and the scale measurement pull in
+/// opposite directions: the comparison needs the record stream's digest, and
+/// [`MemoryRecorder`] holds every record to produce one, which at ten thousand nodes is
+/// tens of gigabytes of `phy.rx`. This hashes the same bytes in the same order and keeps
+/// none of them, so "identical content digest across repeated runs" is checkable at any
+/// size.
+///
+/// `digest_hex` agrees with [`MemoryRecorder::digest_hex`] record for record; the two are
+/// checked against each other in this module's tests, because a digest that is only
+/// self-consistent proves nothing about the stream it claims to cover.
+pub struct DigestRecorder {
+    hasher: v2xw_core::hash::Sha256Writer,
+    written: u64,
+    per_channel: std::collections::BTreeMap<String, (u64, u64)>,
+}
+
+impl core::fmt::Debug for DigestRecorder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // `Sha256Writer` is not `Debug`, and the running state is not something a reader
+        // of a debug print can use anyway; the counts are.
+        f.debug_struct("DigestRecorder")
+            .field("written", &self.written)
+            .field("channels", &self.per_channel.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for DigestRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DigestRecorder {
+    /// An empty recorder.
+    pub fn new() -> Self {
+        Self {
+            hasher: v2xw_core::hash::Sha256Writer::new(),
+            written: 0,
+            per_channel: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// How many records it was handed.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// How many records and how many JSON bytes landed on each channel, by channel name.
+    pub fn per_channel(&self) -> &std::collections::BTreeMap<String, (u64, u64)> {
+        &self.per_channel
+    }
+
+    /// The digest over every record, in order: `SHA-256(t ‖ channel ‖ visibility ‖ json)*`.
+    pub fn digest_hex(&self) -> String {
+        self.hasher.clone().finish_hex()
+    }
+}
+
+impl RunRecorder for DigestRecorder {
+    fn write(&mut self, at: SimTime, record: &OwnedRecord) {
+        self.hasher.update(&at.to_le_bytes());
+        self.hasher.update(record.channel.as_bytes());
+        self.hasher.update(record.visibility.to_string().as_bytes());
+        self.hasher.update(&record.json);
+        self.written += 1;
+        let entry = self
+            .per_channel
+            .entry(record.channel.to_string())
+            .or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += record.json.len() as u64;
+    }
+}
+
 /// A recorder that drops everything, for a run measuring only its metrics.
 #[derive(Debug, Default)]
 pub struct NullRecorder {

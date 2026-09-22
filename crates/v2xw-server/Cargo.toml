@@ -14,6 +14,15 @@ v2xw-core = { workspace = true }
 # The world model and the `vwp-world/1` payload writer (vwp-v1 §4), reused rather than
 # re-encoded: the world endpoint serves exactly the bytes this writer produced.
 v2xw-world = { workspace = true }
+# The metric channel views and the metric-sample type: the record stream the kernel
+# emits is decoded through the *reader's* own views, so the server cannot disagree with
+# the producer about a field name (the defect `v2xw-engine::records` closes).
+v2xw-metrics = { workspace = true }
+# `VehicleClass` and its sourced dimension table, for the §3.1.4 class table.
+v2xw-mobility = { workspace = true }
+# The kernel this server drives. Not a `workspace = true` entry because `v2xw-engine` is
+# a workspace member the root manifest's shared dependency table does not list.
+v2xw-engine = { path = "../v2xw-engine", version = "0.1.0" }
 # The single VWP frame encoder and decoder (vwp-v1 §2, §3) and the replay reader (§7).
 # There is deliberately no second encoder in this crate: two encoders drift.
 v2xw-record = { workspace = true }

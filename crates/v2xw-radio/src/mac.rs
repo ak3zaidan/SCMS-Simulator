@@ -1398,15 +1398,27 @@ mod tests {
         ctx.set_now(1_000_000);
         let at = ctx.now();
         for i in 0..6u32 {
-            Mac::enqueue(&mut mac, &mut ctx, node, sdu(300 + i, at), AccessCategory::Be)
-                .expect("queued");
+            Mac::enqueue(
+                &mut mac,
+                &mut ctx,
+                node,
+                sdu(300 + i, at),
+                AccessCategory::Be,
+            )
+            .expect("queued");
         }
         let mut granted = 0;
         for ms in 1..=400u64 {
             ctx.set_now(ms * 1_000_000);
             // Ten milliseconds of busy medium every fifty.
             if ms % 50 == 0 {
-                Mac::on_cca(&mut mac, &mut ctx, node, CH, CcaState::Busy { energy_dbm: -60.0 });
+                Mac::on_cca(
+                    &mut mac,
+                    &mut ctx,
+                    node,
+                    CH,
+                    CcaState::Busy { energy_dbm: -60.0 },
+                );
             } else if ms % 50 == 10 {
                 Mac::on_cca(&mut mac, &mut ctx, node, CH, CcaState::Idle);
             }
@@ -1676,9 +1688,11 @@ mod tests {
                 assert_eq!(granted_at[&a], u64::from(drawn[&a]) * slot_ns);
             }
         }
-        let distinct: std::collections::BTreeSet<SimTime> =
-            granted_at.values().copied().collect();
-        assert!(distinct.len() > 1, "every node granted in one instant: {granted_at:?}");
+        let distinct: std::collections::BTreeSet<SimTime> = granted_at.values().copied().collect();
+        assert!(
+            distinct.len() > 1,
+            "every node granted in one instant: {granted_at:?}"
+        );
 
         // EDCA answers the same question from its own state: AIFS plus the drawn slots,
         // and nothing at all when the queue is empty or the medium is busy.
@@ -1687,7 +1701,13 @@ mod tests {
         let node = NodeId::new(0);
         assert_eq!(Mac::<TestCtx>::next_poll_at(&edca, node, CH), None);
         ctx.set_now(1_000_000);
-        Mac::on_cca(&mut edca, &mut ctx, node, CH, CcaState::Busy { energy_dbm: -60.0 });
+        Mac::on_cca(
+            &mut edca,
+            &mut ctx,
+            node,
+            CH,
+            CcaState::Busy { energy_dbm: -60.0 },
+        );
         let at = ctx.now();
         Mac::enqueue(&mut edca, &mut ctx, node, sdu(300, at), AccessCategory::Vo).expect("queued");
         assert_eq!(

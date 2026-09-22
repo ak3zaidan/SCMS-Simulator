@@ -189,9 +189,30 @@ impl CertStore {
         &self.creds
     }
 
+    /// Every credential, mutably. See [`CertStore::active_mut`] for the one caller and
+    /// the one field pair it is allowed to write.
+    pub fn credentials_mut(&mut self) -> &mut [CredentialHandle] {
+        &mut self.creds
+    }
+
     /// The credential a message signed now would use.
     pub fn active(&self) -> Option<&CredentialHandle> {
         self.creds.first().filter(|c| c.state == CredState::Active)
+    }
+
+    /// The active credential, mutably.
+    ///
+    /// Exists for one caller: [`crate::secure::NodeSecurity`] provisions the real key and
+    /// the real certificate for a pseudonym and then writes the certificate's *own*
+    /// `HashedId8` and encoding back here. Until it does, a credential's `digest` is a
+    /// stand-in ([`pseudo_signer`]) and its `cert_coer` is a zero fill of the modelled
+    /// length — which is what made every SPDU the same size and is the defect this
+    /// accessor exists to let the node repair. Nothing else should write to a credential:
+    /// its validity window and its i-period belong to the credential protocol.
+    pub fn active_mut(&mut self) -> Option<&mut CredentialHandle> {
+        self.creds
+            .first_mut()
+            .filter(|c| c.state == CredState::Active)
     }
 
     /// How many credentials are inside their validity window at `t`.
@@ -722,6 +743,31 @@ impl PeerCertCache {
     /// costing a request.
     pub fn learn(&mut self, digest: &HashedId8) -> Option<[u8; 8]> {
         self.note_insert(digest)
+    }
+
+    /// Learns a real certificate that arrived attached to a message.
+    ///
+    /// The digest form ([`PeerCertCache::learn`]) models *that* a certificate is held and
+    /// what it costs in bytes; this holds the certificate itself, which is what a receiver
+    /// needs in order to check the next signature from that peer against a real public
+    /// key. `verified` stays `false`: this node has checked no chain — see
+    /// [`crate::secure::NodeSecurity::verify_parsed`] for why there is none to check while
+    /// no credential protocol ships — and a cache that claimed otherwise would be
+    /// asserting exactly the thing nobody computed.
+    pub fn learn_certificate(
+        &mut self,
+        certificate: std::sync::Arc<v2xw_msg::sec_types::Certificate>,
+    ) -> Option<[u8; 8]> {
+        let digest = self.inner.insert(certificate, false).ok()?;
+        self.note_insert(&digest)
+    }
+
+    /// The certificate held for `digest`, if this cache holds one.
+    pub fn certificate(
+        &self,
+        digest: &HashedId8,
+    ) -> Option<std::sync::Arc<v2xw_msg::sec_types::Certificate>> {
+        self.inner.get(digest).map(|c| c.certificate.clone())
     }
 
     /// How many P2PCD requests this node has issued in the window.

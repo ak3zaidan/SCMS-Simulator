@@ -45,6 +45,19 @@ pub enum ProtoError {
     #[error(transparent)]
     Sec(#[from] v2xw_sec::error::SecError),
 
+    /// An application payload could not be built or encoded.
+    ///
+    /// Separate from [`ProtoError::Size`] because that variant carries a `SecError` — the
+    /// security layer's encoder — and a J2735 or CAM payload is refused by the message
+    /// layer's, whose error type this crate does not otherwise name.
+    #[error("payload: {what}: {detail}")]
+    Payload {
+        /// Which payload was being built.
+        what: &'static str,
+        /// The encoder's complaint.
+        detail: String,
+    },
+
     /// A flow was asked to do something its state machine does not allow here.
     #[error("flow {flow}: {detail}")]
     Flow {

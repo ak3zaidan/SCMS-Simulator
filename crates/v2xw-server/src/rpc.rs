@@ -19,7 +19,6 @@ use v2xw_record::wire::Frame;
 
 use crate::engine::{Control, Query, RunState};
 use crate::error::{ParamError, Result, ServerError};
-use crate::introspect::METRICS;
 use crate::run::Run;
 use crate::session::{CameraState, OVERLAYS, Session, overlay_is_gt};
 
@@ -806,7 +805,7 @@ fn explain(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
         .is_some_and(|s| s.profile().is_node_only())
     {
         let id = subject.get("id").and_then(Value::as_str).unwrap_or("");
-        if is_gt_metric(id) {
+        if is_gt_metric(ctx.run, id) {
             return Err(ServerError::VisibilityDenied {
                 field: id.to_string(),
                 visibility: "GT",
@@ -820,10 +819,11 @@ fn explain(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
     })?))
 }
 
-fn is_gt_metric(name: &str) -> bool {
-    METRICS
+/// True if the run's catalogue marks this metric ground truth (§5.2, §6.9, §6.12).
+fn is_gt_metric(run: &crate::Run, name: &str) -> bool {
+    run.metric_catalogue()
         .iter()
-        .any(|(n, _, _, vis)| *n == name && *vis == "GT")
+        .any(|m| m.name == name && m.visibility == "GT")
 }
 
 fn scenario_get(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
@@ -1221,7 +1221,7 @@ fn metrics_query(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcom
         return Ok(Outcome::of(ctx.run.query(&Query::MetricCatalogue)?));
     }
     for name in &metrics {
-        if node_profile && is_gt_metric(name) {
+        if node_profile && is_gt_metric(ctx.run, name) {
             return Err(ServerError::VisibilityDenied {
                 field: name.clone(),
                 visibility: "GT",
@@ -1268,14 +1268,15 @@ fn metrics_plot(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome
         .session
         .as_ref()
         .is_some_and(|s| s.profile().is_node_only());
+    let catalogue = ctx.run.metric_catalogue();
     for name in &metrics {
-        if !METRICS.iter().any(|(n, ..)| n == name) {
+        if !catalogue.iter().any(|m| &m.name == name) {
             return Err(ServerError::UnknownMetric {
                 metric: name.clone(),
                 did_you_mean: Vec::new(),
             });
         }
-        if node_profile && is_gt_metric(name) {
+        if node_profile && is_gt_metric(ctx.run, name) {
             return Err(ServerError::VisibilityDenied {
                 field: name.clone(),
                 visibility: "GT",

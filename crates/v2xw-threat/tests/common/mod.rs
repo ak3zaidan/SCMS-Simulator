@@ -8,6 +8,8 @@
 
 #![allow(dead_code)]
 
+pub mod sim;
+
 use std::collections::BTreeSet;
 
 use v2xw_core::ids::NodeId;

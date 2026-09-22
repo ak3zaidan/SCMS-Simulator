@@ -1,0 +1,182 @@
+# Phase 2 vertical slice: two honest vehicles, one that lies, a roadside unit with a
+# backhaul, the CAMP SCMS backend, a misbehaviour report and a revocation that reaches the
+# other vehicle through the roadside.
+#
+# 10-roadmap.md's Phase 2 is a *path*, not a feature list, and this file is that path:
+#
+#   the liar broadcasts a frozen position
+#     -> an honest vehicle's detector suite fires on the inconsistency
+#     -> it files a misbehaviour report, on the air, as a real frame
+#     -> the roadside unit decodes it and carries it over its backhaul
+#     -> the Misbehaviour Authority holds two reports about two pseudonyms
+#     -> both Linkage Authorities resolve them to one device
+#     -> the CRL Generator issues, the roadside broadcasts
+#     -> the honest vehicles install the entry and stop trusting the liar
+#
+# Run it, and inspect the decomposition, with:
+#
+#     v2xw run scenarios/phase2-manhattan.yaml --out runs/phase2
+#
+# Everything above the threat and protocol layers is `phase1-manhattan.yaml` unchanged, so
+# a difference between the two runs is a difference this file's four new blocks made.
+schema: v2xw/scenario/1
+
+meta:
+  name: phase2-manhattan
+  description: >-
+    Three equipped vehicles on the real Manhattan network, one of them a ConstPos
+    attacker, with a roadside unit on a mast, the CAMP SCMS backend, the legacy
+    twelve-detector suite on every honest node, and a revocation distributed over the
+    5.9 GHz broadcast path.
+  authors: [v2xw]
+  tags: [phase2, manhattan, osm, dsrc, signed, scms, misbehaviour, revocation]
+  created: "2026-09-22"
+
+seed: "0xC0FFEE_5EED"
+
+time:
+  t0: "2027-03-04T08:00:00Z"
+  duration_s: 300.0
+  mobility_step_ms: 100
+  des_resolution: 1us
+
+world:
+  source:
+    kind: osm-xml
+    path: worlds/cache/manhattan.osm.xml
+    bbox:
+      min_lat_deg: 40.7440
+      min_lon_deg: -73.9900
+      max_lat_deg: 40.7620
+      max_lon_deg: -73.9680
+  highway_preset: urban-us-nyc
+  imported_at: "2026-09-18T00:00:00Z"
+  buildings:
+    enabled: true
+    keep_holes: true
+  terrain:
+    dem: null
+
+actors:
+  vehicles:
+    equipped_fraction: 1.0
+    demand:
+      kind: mobility/demand/poisson
+      # 200 veh/h over 60 s realises three vehicles under this seed, which is the smallest
+      # fleet the path needs: one to lie, one to detect and report, and one to still be
+      # listening when the revocation arrives. The run report states the count rather than
+      # this file claiming it.
+      rate_veh_per_h: 200.0
+
+  # One roadside unit, on a mast in the middle of the box.
+  #
+  # `position_m` and not `site`, because an OSM extract carries road geometry and buildings
+  # and *no mast inventory*: the importer produces no infrastructure sites at all, so a
+  # scenario on an imported city says where the mast stands. The coordinates are
+  # world-local ENU metres from the bounding box's south-west corner (build decision D6),
+  # and the 6 m antenna height is added on top of the ground height given here.
+  #
+  # 900 m east, 1,000 m north is the middle of the D7 box — 45th to 60th, 8th to Park —
+  # which puts every street in the extract inside the 1 km candidate range.
+  rsus:
+    - position_m: [900.0, 1000.0, 0.0]
+      # `report-forward` is what makes the unit carry a misbehaviour report over its
+      # backhaul, and `crl` is what makes it broadcast the revocation. A unit with neither
+      # role hears both and does nothing, which is the point of naming them.
+      roles: [report-forward, crl]
+      profile: rsu/cohda-mk5-rsu
+
+  backend:
+    # The CAMP SCMS of 05-protocols.md (`v2xw_proto::CAMP_SCMS_ID`): eleven entities, butterfly key expansion, two
+    # Linkage Authorities, and the linkage-value CRL. `v2xw-proto` is the deployment; this
+    # line selects it.
+    protocol: protocol/scms/camp
+    entities:
+      ra: {}
+      pca: {}
+      la1: {}
+      la2: {}
+      ma: {}
+      crlg: {}
+      lop: {}
+      crl_store: {}
+
+weather:
+  initial: clear
+  intensity: 0.0
+
+radio:
+  rat: dsrc-80211p
+  tiers:
+    propagation: medium
+    phy: medium
+    mac: medium
+
+net:
+  layer: wsmp
+
+messages:
+  sets: [bsm]
+  codec_tier: uper
+
+security:
+  envelope: ieee1609.2
+  signature: ecdsa-p256
+  crypto_mode: modeled
+  # `verify-all`, which is what 10-roadmap.md's Phase 2 scope names. It is not a stylistic
+  # choice: a detector only sees what the node's verification policy delivered, and
+  # `prioritized` skips a sender beyond its range — so a liar 400 m away would never be
+  # checked and the run would report "no misbehaviour" for a reason that has nothing to do
+  # with misbehaviour.
+  verification_policy: verify-all
+  signer_id_policy:
+    full_cert_every_ms: 1000
+    digest_otherwise: true
+  pseudonym_change:
+    strategy: time
+    # Ten seconds, not the J2945/1 five minutes, and this is the one number in this file
+    # that exists to make the path *reachable* rather than to model a deployment.
+    #
+    # The Misbehaviour Authority resolves a device by correlating **two** reports about
+    # **two different pseudonyms** — that is the whole reason the resolution asks two
+    # Linkage Authorities anything. A vehicle that keeps one pseudonym for the whole run
+    # is reported once, the authority holds one report, and no case is ever opened. Ten
+    # seconds puts both of the device's provisioned certificates on the air inside a
+    # sixty-second run. A deployment study sets it back to 300 and runs for longer.
+    period_s: 10.0
+
+nodes:
+  default_obu: obu/unex-obu-301-craton2
+  compute_tier: medium
+  backend_tier: medium
+
+threats:
+  attackers:
+    # The legacy ConstPos attacker: it freezes its claimed position at the first instant it
+    # acts and keeps broadcasting it while it drives away. It is the simplest falsification
+    # in the ported catalog and the one the legacy suite's consistency checks are
+    # calibrated on, which makes it the right first attacker for a path test — a detector
+    # that cannot catch ConstPos cannot catch anything.
+    - id: threat/attacker/legacy/ConstPos
+      # The first vehicle, counted over vehicles and not over nodes: the roadside unit is a
+      # node too, and it is created first.
+      count: 1
+      schedule:
+        # Five seconds of honest behaviour first, so the detectors have a motion reference
+        # to find the claim inconsistent *with*. A liar that lies from its first message is
+        # a vehicle with no history, which is a different (and easier) detection problem.
+        from_s: 5.0
+        to_s: 300.0
+
+detection:
+  local:
+    # The ported twelve-detector suite, with the legacy thresholds. It runs on every node
+    # that is not an attacker, sees only what that node's own runtime delivered to its
+    # applications, and has no world argument — invariant I-T2 expressed as a signature.
+    - id: detect/legacy-12
+
+# `all` rather than `[pdr]`: a Phase 2 run is measured on the revocation latency
+# decomposition as well as on the air interface.
+metrics: [all]
+
+exporters: []

@@ -5,7 +5,7 @@
 //! `tests/model_card.rs` checks that no parameter is in the second group without one.
 
 use v2xw_core::ids::NodeId;
-use v2xw_core::time::Duration;
+use v2xw_core::time::{Duration, SimTime};
 use v2xw_sec::primitive::profiles;
 
 use crate::scms::msg::LaIndex;
@@ -133,6 +133,12 @@ impl ScmsNodes {
 pub struct ScmsParams {
     /// The master seed of the deterministic streams.
     pub master_seed: u64,
+    /// The [`SimTime`] at which i-period 0 begins.
+    ///
+    /// A certificate's validity window is `[epoch + i·i_period, + cert_lifetime)`, so this
+    /// is what aligns the protocol's week numbering with the scenario's `time.t0`. It is a
+    /// supplied instant, never a clock read.
+    pub epoch: SimTime,
     /// The i-period: 10,080 minutes [CAMP-EE §2.1.5.3.2].
     pub i_period: Duration,
     /// Certificate lifetime: 10,140 minutes, one hour of overlap [CAMP-EE §2.1.5.3.2].
@@ -167,6 +173,16 @@ pub struct ScmsParams {
     pub uu_link_latency: Duration,
     /// Cellular link bandwidth.
     pub uu_link_bandwidth_bps: u64,
+    /// One-way latency on the 5.9 GHz air interface between a roadside unit and a vehicle.
+    ///
+    /// Not propagation — that is under a microsecond at V2X ranges — but the channel access
+    /// a broadcast frame waits for before its first bit goes out.
+    pub v2x_air_latency: Duration,
+    /// The 5.9 GHz air interface's data rate, bits per second.
+    ///
+    /// 6 Mbit/s is the 10 MHz OFDM PHY's QPSK rate-1/2 mode, which is what the Phase 1
+    /// scenario's medium PHY transmits at [EN 302 663 V1.3.1 Annex C.3 Table C.1].
+    pub v2x_air_bandwidth_bps: u64,
     /// The hardware profile backend costs are read from.
     pub backend_profile: &'static str,
     /// The hardware profile device costs are read from.
@@ -179,6 +195,7 @@ impl Default for ScmsParams {
     fn default() -> ScmsParams {
         ScmsParams {
             master_seed: 0,
+            epoch: 0,
             i_period: Duration::from_secs(10_080 * 60),
             cert_lifetime: Duration::from_secs(10_140 * 60),
             certs_per_period: 20,
@@ -196,6 +213,8 @@ impl Default for ScmsParams {
             backend_link_bandwidth_bps: 1_000_000_000,
             uu_link_latency: Duration::from_millis(50),
             uu_link_bandwidth_bps: 10_000_000,
+            v2x_air_latency: Duration::from_millis(1),
+            v2x_air_bandwidth_bps: 6_000_000,
             backend_profile: profiles::I9_11950H_WOLFSSL,
             device_profile: profiles::COHDA_MK6_BOTAN,
             sizes: SizeParams::default(),
@@ -204,6 +223,24 @@ impl Default for ScmsParams {
 }
 
 impl ScmsParams {
+    /// When i-period `i` begins.
+    #[must_use]
+    pub const fn period_start(&self, i: u32) -> SimTime {
+        self.i_period.saturating_mul(i as u64).after(self.epoch)
+    }
+
+    /// The validity window of a certificate issued for i-period `i`.
+    ///
+    /// `[start(i), start(i) + cert_lifetime)`. The lifetime is an hour longer than the
+    /// period, so consecutive windows overlap by an hour — which is the whole reason
+    /// CAMP-EE §2.1.5.3.2 states the two numbers separately, and the reason a device that
+    /// rotates at a period boundary always has something valid to rotate to.
+    #[must_use]
+    pub const fn validity(&self, i: u32) -> (SimTime, SimTime) {
+        let from = self.period_start(i);
+        (from, self.cert_lifetime.after(from))
+    }
+
     /// A deployment whose batching windows are short enough for a test to run through.
     ///
     /// The CAMP shuffle is "10,000 requests or one day"; a test that waits a day of
