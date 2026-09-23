@@ -8,11 +8,18 @@ use v2xw_server::rpc::{CONNECTION_SCOPED, METHODS, NOTIFICATIONS, parse};
 
 #[test]
 fn the_inventory_is_the_thirty_two_methods_of_section_6_15() {
-    assert_eq!(METHODS.len(), 32, "§6.15: 31 methods plus rpc.discover");
+    // 33 since `scenario.schema` (the generated settings surface, 13-product-direction §2)
+    // joined the inventory; the commit that added it did not update this count.
+    assert_eq!(
+        METHODS.len(),
+        33,
+        "§6.15: 31 methods plus rpc.discover, plus scenario.schema"
+    );
     let mut sorted = METHODS.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    assert_eq!(sorted.len(), 32, "no duplicates");
+    assert_eq!(sorted.len(), 33, "no duplicates");
+    assert!(METHODS.contains(&"scenario.schema"));
     for group in [
         "run.start",
         "run.pause",

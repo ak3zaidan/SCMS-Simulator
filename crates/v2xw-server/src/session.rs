@@ -280,6 +280,11 @@ pub struct Session {
     greeted: bool,
     /// Whether the handshake resumed an existing stream (§1.4 rule 1).
     resumed: bool,
+    /// The [`crate::Run`] generation this session's `Hello` described. A step of any
+    /// other generation is never encoded against this session's tables.
+    generation: u64,
+    /// The opaque token every `Hello` on this connection echoes (§3.1.1).
+    session_token: String,
 }
 
 impl Session {
@@ -318,8 +323,109 @@ impl Session {
             hello_base: descriptor.hello.strings.strings.len(),
             greeted: false,
             resumed: false,
+            generation: 0,
+            session_token: String::new(),
             params,
         }
+    }
+
+    /// Binds this session to the run generation its first `Hello` describes and to the
+    /// token that `Hello` echoes.
+    pub fn bind(&mut self, generation: u64, session_token: &str) {
+        self.generation = generation;
+        self.session_token = session_token.to_string();
+    }
+
+    /// The run generation this session's `Hello` described.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The session for this same connection on the run `descriptor` describes.
+    ///
+    /// What belongs to the *connection* survives — its profile, its event-channel
+    /// subscription and its caps, its overlays and camera. What belongs to the *run* does
+    /// not: `seq` starts again at 0 (§1.4: "starting at 0 for the first canonical frame of
+    /// the run"), the symbol table, the snapshot encoder and the resume ring are the new
+    /// run's, and node-scoped subscriptions are dropped because node ids are not stable
+    /// across runs — a follow of node 12 in one run is a follow of an unrelated vehicle,
+    /// or of nothing, in the next.
+    fn for_new_run(&self, descriptor: &RunDescriptor) -> Session {
+        let mut params = self.params.clone();
+        params.resume = None;
+        let mut next = Session::new(params, descriptor);
+        next.event_channels = self.event_channels.clone();
+        next.max_events_per_step = self.max_events_per_step;
+        next.sample_1_in = self.sample_1_in;
+        next.overlays = self.overlays.clone();
+        next.opacity = self.opacity.clone();
+        next.camera = self.camera.clone();
+        next.session_token = self.session_token.clone();
+        next
+    }
+
+    /// Moves this connection onto the run's current generation and returns what it must
+    /// send, in order: a fresh, non-resumed `Hello` (§6.6's `run.start`: "the server sends
+    /// a fresh `Hello` on this connection before the first `Keyframe` of the new run") and,
+    /// when the new run is not advancing, the state at its stream position.
+    ///
+    /// # Errors
+    /// As [`Session::hello_frame_with_nodes`].
+    pub fn regreet(&mut self, run: &crate::Run) -> Result<Vec<Frame>> {
+        let generation = run.generation();
+        let descriptor = run.descriptor();
+        *self = self.for_new_run(&descriptor);
+        self.generation = generation;
+        self.greet(run, &descriptor)
+    }
+
+    /// The `Hello` for this connection and, when the run is not advancing, the state at its
+    /// stream position (see [`crate::engine::Engine::current`]).
+    ///
+    /// # Errors
+    /// As [`Session::hello_frame_with_nodes`].
+    pub fn greet(&mut self, run: &crate::Run, descriptor: &RunDescriptor) -> Result<Vec<Frame>> {
+        let state = run.state();
+        let live = run.live_node_table();
+        let token = self.session_token.clone();
+        let hello = self.hello_frame_with_nodes(
+            descriptor,
+            state,
+            run.sim_time(),
+            &token,
+            live.as_ref()
+                .map(|(nodes, strings)| (&nodes[..], &strings[..])),
+        )?;
+        let mut frames = vec![hello];
+        if !self.resumed && state != RunState::Running {
+            if let Some(current) = run.current() {
+                if current.generation == self.generation {
+                    frames.extend(self.encode_current(&current)?);
+                }
+            }
+        }
+        Ok(frames)
+    }
+
+    /// Encodes the state at the stream position as a `FLAG_RESYNC` keyframe, for a
+    /// connection that attached to a run that is not moving.
+    ///
+    /// The step's events and metric samples are left out: they happened before this
+    /// connection existed, and replaying them would draw a burst of transmissions that
+    /// is not happening. `FLAG_END_OF_RUN` is left off for the same reason — this is a
+    /// view of the last instant, not the end of the stream arriving again.
+    ///
+    /// # Errors
+    /// As [`Session::encode_step`].
+    pub fn encode_current(&mut self, out: &StepOutput) -> Result<Vec<Frame>> {
+        self.encoder = SnapshotEncoder::new(self.origin_m, self.cadence, self.profile, self.seq);
+        self.encoder.request_keyframe();
+        self.resync_pending = true;
+        let mut view = out.clone();
+        view.events.clear();
+        view.metrics.clear();
+        view.end_of_run = false;
+        Ok(self.encode_step(&view)?.frames)
     }
 
     /// The connection's parameters.

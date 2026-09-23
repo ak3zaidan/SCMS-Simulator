@@ -270,7 +270,11 @@ fn seeking_a_live_run_returns_a_gop_of_recorded_time_and_pauses_it() {
         RunState::Paused,
         "§6.6: seeking pauses a live run"
     );
-    assert_eq!(engine.sim_time(), target + step_ns);
+    // The stream position is the instant of the last step sent, which after a seek is the
+    // target itself. (It was `target + step_ns`: the cursor, one step ahead of what the
+    // client was shown — the same off-by-one that made a finished run's clock read past
+    // its end.)
+    assert_eq!(engine.sim_time(), target);
 
     // Past the end of recorded time is out of range, with the range in the error.
     let err = engine
@@ -356,7 +360,10 @@ fn pause_holds_the_stream_and_resume_continues_from_the_same_step() {
     assert_eq!(engine.state(), RunState::Running);
     assert_eq!(engine.sim_time(), held, "resuming does not move the stream");
     let next = engine.step().expect("step").expect("a step");
-    assert_eq!(next.sim_time, held, "the next step is the one pause held");
+    // `sim_time` is the instant of the last step sent, so the step after a pause is the
+    // one right after it — nothing skipped, nothing repeated.
+    let step_ns = engine.descriptor().cadence.mobility_step.as_nanos();
+    assert_eq!(next.sim_time, held + step_ns, "the next step is the one pause held");
 }
 
 /// Every channel the kernel emits is either projected onto a §3.6 payload or *reported*.
