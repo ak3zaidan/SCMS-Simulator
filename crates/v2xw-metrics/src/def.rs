@@ -252,6 +252,15 @@ pub struct MetricDef {
     /// means unbounded above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_value: Option<f64>,
+    /// One dimension whose values a live view shows as series of their own, and the values
+    /// it will see: `latency_stage` by `stage`, `loss_rate` by `cause`.
+    ///
+    /// A live stream has to name every series before its first frame (the VWP symbol table
+    /// is append-only), so a dimension can only become a series if its values are known in
+    /// advance. `None` means the metric is shown by its headline alone; its full breakdown
+    /// is still in the recording and in `metrics.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakdown: Option<(Dim, Vec<String>)>,
 }
 
 impl MetricDef {
@@ -283,7 +292,19 @@ impl MetricDef {
             diagnostic: false,
             min_value: None,
             max_value: None,
+            breakdown: None,
         }
+    }
+
+    /// Declares the dimension a live view breaks this metric down by, and its values.
+    #[must_use]
+    pub fn with_breakdown<S: Into<String>>(
+        mut self,
+        dim: Dim,
+        values: impl IntoIterator<Item = S>,
+    ) -> Self {
+        self.breakdown = Some((dim, values.into_iter().map(Into::into).collect()));
+        self
     }
 
     /// Declares the physically possible range. A non-finite bound means unbounded on that
@@ -387,6 +408,16 @@ impl MetricDef {
             && lo > hi
         {
             return Err(bad(format!("the range [{lo}, {hi}] is empty")));
+        }
+        if let Some((dim, values)) = &self.breakdown {
+            if !self.dims.contains(dim) {
+                return Err(bad(format!(
+                    "the breakdown dimension {dim} is not one of the metric's dimensions"
+                )));
+            }
+            if values.is_empty() {
+                return Err(bad("a breakdown with no values shows nothing".to_string()));
+            }
         }
         let mut seen = std::collections::BTreeSet::new();
         for d in &self.dims {

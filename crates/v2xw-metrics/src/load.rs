@@ -241,6 +241,13 @@ impl LoadProvider {
                  Summed over causes it is one minus the delivery ratio.",
             )
             .with_dims([Dim::T, Dim::Cause])
+            .with_breakdown(
+                Dim::Cause,
+                crate::channels::rx_cause::PHY
+                    .iter()
+                    .chain(crate::channels::rx_cause::ABOVE_PHY.iter())
+                    .copied(),
+            )
             .with_source(src.clone())
             .with_min_samples(self.min_samples)
             .with_range(0.0, 1.0)

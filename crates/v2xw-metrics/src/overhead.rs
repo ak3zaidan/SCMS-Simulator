@@ -145,6 +145,7 @@ impl OverheadProvider {
                 def.to_string(),
             )
             .with_dims([Dim::T, Dim::MsgType])
+            .with_breakdown(Dim::MsgType, ["bsm", "cam"])
             .with_source(layers.clone())
             .with_min_samples(1)
             .with_range(0.0, 1.0)
@@ -212,6 +213,7 @@ impl OverheadProvider {
                  window. Every byte is in exactly one bucket (invariant I-N1).",
             )
             .with_dims([Dim::T, Dim::Bucket])
+            .with_breakdown(Dim::Bucket, ByteBucket::ALL.iter().map(|b| b.as_str()))
             .with_source(cards::design("03-interfaces.md §5 (I-N1)"))
             .with_min_samples(1)
             .with_range(0.0, f64::INFINITY)

@@ -265,6 +265,7 @@ impl AwarenessProvider {
                  second. Reported at R = 100 m and R = 300 m.",
             )
             .with_dims([Dim::T, Dim::Radius])
+            .with_breakdown(Dim::Radius, NAR_RADII_M.iter().map(|r| format!("{r}m")))
             .with_source(cards::paper(
                 "Boban and d'Orey, IEEE Trans. Veh. Technol. 65(6), 2016; \
                  08-measurement-and-data.md §2.1",
@@ -288,6 +289,10 @@ impl AwarenessProvider {
                  50 m bins out to 1 km.",
             )
             .with_dims([Dim::T, Dim::DistBin])
+            .with_breakdown(
+                Dim::DistBin,
+                (0..self.bins.len()).map(|i| self.bins.label(i)),
+            )
             .with_source(src)
             .with_min_samples(self.min_samples)
             .with_range(0.0, 1.0)

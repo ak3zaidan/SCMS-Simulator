@@ -285,6 +285,7 @@ impl CommsProvider {
                  a rounding artefact.",
             )
             .with_dims([Dim::T, Dim::Cause])
+            .with_breakdown(Dim::Cause, crate::channels::rx_cause::PHY)
             .with_source(src.clone())
             .with_min_samples(self.min_samples)
             .with_range(0.0, 1.0)
@@ -302,6 +303,8 @@ impl CommsProvider {
                  window's per-node measurements.",
             )
             .with_dims([Dim::T, Dim::Channel])
+            // The one channel this build puts safety traffic on (SAE J2945/1: channel 172).
+            .with_breakdown(Dim::Channel, ["172"])
             .with_source(cards::standard("3GPP TS 38.215 §5.1.27; TS 36.214"))
             .with_min_samples(self.min_samples)
             .with_range(0.0, 1.0)
@@ -352,7 +355,8 @@ impl CommsProvider {
                 Agg::Rate,
                 Visibility::Node,
                 Quantum::TIME_MS,
-                "Transmitted air time per node, divided by the window's length.",
+                "Transmitted air time per node, divided by the window's length. With no \
+                 dimension, the mean over the nodes that transmitted in the window.",
             )
             .with_dims([Dim::T, Dim::Node])
             .with_source(src.clone())
@@ -376,6 +380,7 @@ impl CommsProvider {
                 ),
             )
             .with_dims([Dim::T, Dim::Bucket])
+            .with_breakdown(Dim::Bucket, [b.as_str()])
             .with_source(cards::design("08-measurement-and-data.md §2.1 (bytes per bucket)"))
             .with_min_samples(1)
             .with_range(0.0, f64::INFINITY)
@@ -646,7 +651,9 @@ impl MetricProvider for CommsProvider {
 
         // --- airtime per node ------------------------------------------------------------
         let airtime_def = self.def("airtime_per_node");
-        for (node, us) in core::mem::take(&mut self.airtime_us) {
+        let airtime_us = core::mem::take(&mut self.airtime_us);
+        for (node, us) in &airtime_us {
+            let (node, us) = (*node, *us);
             let mut dims = Dims::new();
             dims.insert(Dim::Node, DimValue::index(u64::from(node.index())));
             // Airtime is in µs and the metric is in ms/s: µs/1000 is ms, divided by the
@@ -663,6 +670,22 @@ impl MetricProvider for CommsProvider {
                 at,
                 dims,
                 SampleValue::Scalar(value),
+            ));
+        }
+
+        // The headline: the mean over the nodes that transmitted, so a live view has one
+        // line to draw where the per-node samples would be one line per vehicle.
+        if let (Some(s), false) = (secs, airtime_us.is_empty()) {
+            let n = airtime_us.len() as u64;
+            let total: u64 = airtime_us.values().sum();
+            out.push(MetricSample::new(
+                &airtime_def,
+                at,
+                Dims::new(),
+                SampleValue::Scalar(Estimate::Value {
+                    point: (total as f64) / 1000.0 / s / (n as f64),
+                    n,
+                }),
             ));
         }
 
