@@ -399,6 +399,13 @@ impl Walk<'_> {
         if depth >= MAX_DEPTH {
             out.insert("x-opaque".into(), json!(true));
             out.insert("x-rust-type".into(), json!(ty));
+            // `with_meta` is what gives a node its identity — path, pointer, group,
+            // unit, default, range and implementation status. Returning before it, as
+            // this branch and the free-form branch below both did, published the field
+            // with no path at all: invisible to a form keyed by path, and invisible to
+            // every table that names a path, so a `KEY_STATUS` row for one of these
+            // silently did nothing.
+            self.with_meta(path, &mut out);
             return Value::Object(out);
         }
 
@@ -407,6 +414,11 @@ impl Walk<'_> {
         if matches!(base_name(ty), "Value") {
             out.insert("x-any".into(), json!(true));
             out.insert("x-rust-type".into(), json!(ty));
+            // Before `push_leaf`, so the flat index carries the path too. These are the
+            // model-parameter blocks — `actors.vehicles.demand.params`,
+            // `threats.attackers[].params` — which is to say exactly the fields a
+            // generated settings form most needs to be able to name.
+            self.with_meta(path, &mut out);
             self.push_leaf(path, "json", &out);
             return Value::Object(out);
         }

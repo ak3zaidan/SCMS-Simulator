@@ -63,6 +63,21 @@ export interface CameraControllerOptions {
    * {@link WorldRenderer}'s viewer — supplies the action.
    */
   readonly onFrameActors?: () => void;
+  /**
+   * Travel distance at and below which {@link CameraControllerOptions.positionLambda} applies in
+   * full, metres. Default 120.
+   *
+   * Above it the smoothing rate is stretched so a long move takes longer, which is what turns the
+   * map-to-chase fly-down into a flight instead of a snap. A bare `1 − exp(−4·dt)` covers 90 % of
+   * *any* distance in 0.58 s, so a 1.7 km descent starts at 6,800 m/s and then crawls the last
+   * 30 m — measured on `scenarios/phase1-manhattan.yaml`, where frame 3 of the fly-down was
+   * already 305 m below frame 0. See {@link CameraController.update}.
+   */
+  readonly flyReferenceM?: number;
+  /** Slowest rate a very long move is stretched to. Default 1.1 (90 % in about 2.1 s). */
+  readonly flyMinLambda?: number;
+  /** Seconds a newly started move eases in over, so it begins from rest. Default 0.4. */
+  readonly flyEaseSeconds?: number;
   /** Field of view per mode, degrees. */
   readonly fovMapDeg?: number;
   readonly fovChaseDeg?: number;
@@ -100,7 +115,21 @@ export class CameraController {
   #mode: CameraMode = "map";
   #followActorId: number | null = null;
   #followValid = false;
+  /**
+   * Whether {@link setFollowPose} has ever supplied a pose for the *current* followed actor.
+   *
+   * Distinct from `#followValid`, which is false the moment the actor stops streaming. The chase
+   * and dashboard modes need a *place to be*, and the last known pose of a stopped vehicle is a
+   * perfectly good one; the map focus is not (finding: chase fell back to the map focus, which at
+   * start-up is the world's centre, and parked the camera in a random city block a kilometre from
+   * the only vehicle).
+   */
+  #followPosKnown = false;
   #rsuIndex = -1;
+  /** A street-level mode that was asked for with no vehicle to sit behind, or null. */
+  #rejectedMode: CameraMode | null = null;
+  /** Set by the pointer and wheel handlers, so automatic framing never overrides a user gesture. */
+  #userMoved = false;
 
   /** The point the camera orbits or looks at, in ENU metres. */
   readonly target = new Vector3();
@@ -131,6 +160,11 @@ export class CameraController {
   readonly positionLambda: number;
   readonly lookLambda: number;
   readonly fovLambda: number;
+  #flyReference: number;
+  #flyMinLambda: number;
+  #flyEase: number;
+  /** Seconds since the current move began; drives the ease-in. */
+  #travelT = Infinity;
   #fovMap: number;
   #fovChase: number;
   #fovDashboard: number;
@@ -159,6 +193,9 @@ export class CameraController {
     this.#maxAltitude = options.maxAltitudeM ?? 20_000;
     this.#clearance = options.buildingClearanceM ?? 3;
     this.#occlusionRange = options.occlusionRangeM ?? 60;
+    this.#flyReference = Math.max(1, options.flyReferenceM ?? 120);
+    this.#flyMinLambda = Math.max(0.05, options.flyMinLambda ?? 1.1);
+    this.#flyEase = Math.max(0, options.flyEaseSeconds ?? 0.4);
     this.#fovMap = options.fovMapDeg ?? 45;
     this.#fovChase = options.fovChaseDeg ?? 55;
     this.#fovDashboard = options.fovDashboardDeg ?? 68;
