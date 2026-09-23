@@ -362,6 +362,18 @@ impl MetricProvider for OverheadProvider {
         let buckets = core::mem::take(&mut self.buckets);
         let vehicle_ns = core::mem::take(&mut self.vehicle_ns);
         let hours = (vehicle_ns as f64) / 3.6e12;
+        // The headline: every bucket together, per equipped-vehicle hour.
+        let all: u64 = buckets.values().sum();
+        out.push(MetricSample::new(
+            &hours_def,
+            at,
+            Dims::new(),
+            if vehicle_ns > 0 {
+                SampleValue::Ratio(ratio_of_sums(all as f64, hours, 1, 1))
+            } else {
+                SampleValue::Scalar(Estimate::Insufficient { n: 0, required: 1 })
+            },
+        ));
         for bucket in ByteBucket::ALL {
             let bytes = buckets.get(&bucket).copied().unwrap_or(0);
             let mut dims = Dims::new();

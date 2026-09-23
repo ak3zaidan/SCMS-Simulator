@@ -475,6 +475,7 @@ impl LatencyProvider {
             .with_min_samples(self.min_samples)
             .with_range(0.0, f64::INFINITY)
             .with_breakdown(Dim::Stage, crate::channels::V2V_STAGES)
+            .breakdown_only()
             .not_accounting_for("undelivered messages")
             .not_accounting_for(
                 "the interleaving of AIFS, backoff and deferral inside the access delay",
@@ -494,6 +495,7 @@ impl LatencyProvider {
             .with_min_samples(1)
             .with_range(0.0, 1.0)
             .with_breakdown(Dim::Stage, crate::channels::V2V_STAGES)
+            .breakdown_only()
             .not_accounting_for("undelivered messages")
             .not_accounting_for(
                 "per-message variation: it is a ratio of sums, not a mean of ratios",

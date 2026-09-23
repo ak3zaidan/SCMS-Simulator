@@ -519,6 +519,17 @@ impl MetricProvider for LoadProvider {
                 ),
             ));
         }
+        // The headline: every loss over every resolved attempt — one minus the delivery
+        // ratio, summed over the causes above.
+        let all_lost: u64 = lost.values().sum();
+        out.push(MetricSample::new(
+            &loss_def,
+            at,
+            Dims::new(),
+            SampleValue::Ratio(
+                Proportion::from_counts(all_lost, resolved).estimate(self.min_samples, self.level),
+            ),
+        ));
         let of = |causes: &[&str]| -> u64 {
             lost.iter()
                 .filter(|(c, _)| causes.contains(&c.as_str()))
@@ -647,9 +658,11 @@ mod tests {
         assert_eq!(point(&s, "half_duplex_rate"), Some(0.25));
         let total: f64 = s
             .iter()
-            .filter(|x| x.metric == "loss_rate")
+            .filter(|x| x.metric == "loss_rate" && !x.dims.is_empty())
             .map(|x| x.value.point().unwrap())
             .sum();
+        // The headline is every loss over every resolved attempt: that same sum.
+        assert_eq!(point(&s, "loss_rate"), Some(0.75));
         assert!(
             (total - 0.75).abs() < 1e-9,
             "Σ loss rates = 1 − delivery ratio"

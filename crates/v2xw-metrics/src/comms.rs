@@ -286,6 +286,7 @@ impl CommsProvider {
             )
             .with_dims([Dim::T, Dim::Cause])
             .with_breakdown(Dim::Cause, crate::channels::rx_cause::PHY)
+            .breakdown_only()
             .with_source(src.clone())
             .with_min_samples(self.min_samples)
             .with_range(0.0, 1.0)
@@ -300,13 +301,15 @@ impl CommsProvider {
                 "Channel busy ratio as measured by the MAC: for 802.11p, the fraction of a \
                  100 ms window with CCA busy above −85 dBm; for C-V2X, the TS 38.215 \
                  §5.1.27 / TS 36.214 definition. Reported as a distribution over the \
-                 window's per-node measurements.",
+                 window's per-node measurements; each is a node's own measurement over its \
+                 own window, so the distribution is reported whatever the node count, with \
+                 that count.",
             )
             .with_dims([Dim::T, Dim::Channel])
             // The one channel this build puts safety traffic on (SAE J2945/1: channel 172).
             .with_breakdown(Dim::Channel, ["172"])
             .with_source(cards::standard("3GPP TS 38.215 §5.1.27; TS 36.214"))
-            .with_min_samples(self.min_samples)
+            .with_min_samples(1)
             .with_range(0.0, 1.0)
             .not_accounting_for("energy the receiver could not hear (a hidden terminal)")
             .not_accounting_for("which node measured it: this is the distribution across nodes"),
@@ -620,7 +623,7 @@ impl MetricProvider for CommsProvider {
                 &cbr_def,
                 at,
                 dims,
-                SampleValue::Distribution(d.summary(self.min_samples)),
+                SampleValue::Distribution(d.summary(1)),
             ));
         }
 

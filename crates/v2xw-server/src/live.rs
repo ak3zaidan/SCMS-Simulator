@@ -936,22 +936,28 @@ enum Series {
 ///
 /// The headline (no dimension); for a distribution, its p50, p95 and p99; and for a metric
 /// that declares a breakdown (`MetricDef::breakdown`), one `name[value]` series per
-/// declared value — or, when it declares exactly one value, an alias of the headline.
+/// declared value — or, when it declares exactly one value, an alias of the headline. A
+/// metric declared `breakdown_only` has no headline (every sample carries its value), so
+/// it offers only the per-value series rather than a row that would never receive data.
 fn metric_series(def: &v2xw_metrics::MetricDef) -> Vec<Series> {
-    let mut out = vec![Series::Row {
-        name: def.name.clone(),
-        agg: if matches!(def.agg, v2xw_metrics::Agg::Distribution) {
-            "mean".to_string()
-        } else {
-            def.agg.tag()
-        },
-        note: if matches!(def.agg, v2xw_metrics::Agg::Distribution) {
-            "Mean over the window.".to_string()
-        } else {
-            String::new()
-        },
-    }];
-    if matches!(def.agg, v2xw_metrics::Agg::Distribution) {
+    let mut out = Vec::new();
+    let distribution = matches!(def.agg, v2xw_metrics::Agg::Distribution);
+    if !def.breakdown_only {
+        out.push(Series::Row {
+            name: def.name.clone(),
+            agg: if distribution {
+                "mean".to_string()
+            } else {
+                def.agg.tag()
+            },
+            note: if distribution {
+                "Mean over the window.".to_string()
+            } else {
+                String::new()
+            },
+        });
+    }
+    if distribution && !def.breakdown_only {
         for q in ["p50", "p95", "p99"] {
             out.push(Series::Row {
                 name: format!("{}.{q}", def.name),

@@ -261,6 +261,11 @@ pub struct MetricDef {
     /// is still in the recording and in `metrics.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub breakdown: Option<(Dim, Vec<String>)>,
+    /// True when the metric has no value without its breakdown dimension — a stage's
+    /// share of the delay, an awareness ratio at a radius — so a live view offers only the
+    /// per-value series and no headline that would never receive a sample.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub breakdown_only: bool,
 }
 
 impl MetricDef {
@@ -293,7 +298,15 @@ impl MetricDef {
             min_value: None,
             max_value: None,
             breakdown: None,
+            breakdown_only: false,
         }
+    }
+
+    /// Marks the metric as having no headline: every sample carries its breakdown value.
+    #[must_use]
+    pub const fn breakdown_only(mut self) -> Self {
+        self.breakdown_only = true;
+        self
     }
 
     /// Declares the dimension a live view breaks this metric down by, and its values.
@@ -418,6 +431,11 @@ impl MetricDef {
             if values.is_empty() {
                 return Err(bad("a breakdown with no values shows nothing".to_string()));
             }
+        }
+        if self.breakdown_only && self.breakdown.is_none() {
+            return Err(bad(
+                "a metric with no headline must declare the breakdown it is shown by".to_string(),
+            ));
         }
         let mut seen = std::collections::BTreeSet::new();
         for d in &self.dims {

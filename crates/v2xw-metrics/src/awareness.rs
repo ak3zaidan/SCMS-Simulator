@@ -266,6 +266,7 @@ impl AwarenessProvider {
             )
             .with_dims([Dim::T, Dim::Radius])
             .with_breakdown(Dim::Radius, NAR_RADII_M.iter().map(|r| format!("{r}m")))
+            .breakdown_only()
             .with_source(cards::paper(
                 "Boban and d'Orey, IEEE Trans. Veh. Technol. 65(6), 2016; \
                  08-measurement-and-data.md §2.1",
