@@ -993,7 +993,15 @@ export class PoseInterpolator {
     const u = (t - a.simSeconds) / T;
     const ha = a.heading[i];
     const dh = wrapAngle(b.heading[i] - ha);
-    if (this.curve === "linear") {
+    // A segment whose length disagrees with the speeds reported at its ends is not motion the
+    // tangents describe — measured on manhattan-5min, 2.7 % of steps: a vehicle held still for half
+    // a second while reporting 8.5 m/s, then moved 5.6 m in one step. A Hermite curve through such
+    // a step compresses the jump into the middle of the interval (peak 1.5x the chord speed); a
+    // constant speed along the chord is the least violent faithful rendering of it.
+    const chord = Math.sqrt(chord2);
+    const expected = 0.5 * (Math.abs(a.speed[i]) + Math.abs(b.speed[i])) * T;
+    const consistent = Math.abs(chord - expected) <= Math.max(0.3, 0.35 * expected);
+    if (this.curve === "linear" || !consistent) {
       out[0] = ax + cx * u;
       out[1] = ay + cy * u;
       out[2] = az + cz * u;
