@@ -1030,20 +1030,16 @@ impl Engine {
                 // credentials it installs carry the linkage values a CRL revokes. The
                 // digest stays the `pseudo_signer` stand-in — see `crate::phase2`, joint 1
                 // — so the *pool* is the protocol's and the *identity* is not.
+                //
+                // The digest the certificate is *announced under* is not knowable here:
+                // `ObuRuntime` issues a real certificate for each pseudonym on its first
+                // transmission and writes that certificate's own `HashedId8` back into the
+                // store, replacing the stand-in this installs. So the digest → pseudonym
+                // map is filled in `hand_down_app`, at the instant a frame carries one.
                 if let Some(phase2) = self.phase2.as_mut() {
                     let creds = phase2.provision(id);
                     if !creds.is_empty() {
                         crate::wiring::install_provisioned(&mut runtime, &self.scenario, id, &creds);
-                        let digests: Vec<v2xw_msg::sec_types::HashedId8> = runtime
-                            .stores()
-                            .certs
-                            .credentials()
-                            .iter()
-                            .map(|c| c.digest.clone())
-                            .collect();
-                        for digest in digests {
-                            phase2.note_digest(id, &digest);
-                        }
                     }
                 }
                 self.nodes.insert(id, runtime);
@@ -1548,6 +1544,14 @@ impl Engine {
             ),
             _ => (0, None),
         };
+        // Joint 2's map, filled here and not at spawn: this is the first instant the
+        // digest a receiver will see is the digest the sender's store holds, because the
+        // node rewrote it when it issued the certificate it is about to sign with. A
+        // subject a report names is a subject that was on the air, so registering here
+        // registers exactly the digests that can be reported — and nothing else.
+        if let (Some(cred), Some(phase2)) = (credential.as_ref(), self.phase2.as_mut()) {
+            phase2.note_digest(node, &cred.digest, cred.i_period, cred.j_index);
+        }
         // The attacker's edit, immediately before the frame is built: everything after it
         // — the signing cost already paid, the MAC, DCC, the PHY — is the ordinary path.
         let mut claim = (

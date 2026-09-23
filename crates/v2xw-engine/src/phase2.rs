@@ -229,8 +229,17 @@ pub struct Phase2 {
     jmax: u32,
     /// The credentials provisioned for each engine node.
     creds: BTreeMap<NodeId, Vec<ProvisionedCred>>,
-    /// The digest → node map that stands in for the PCA's certificate lookup.
-    by_digest: BTreeMap<[u8; 8], NodeId>,
+    /// The digest → `(node, i, j)` map that stands in for the PCA's certificate lookup.
+    ///
+    /// Keyed by the digest the certificate is **announced under on the air**, which is not
+    /// the digest the credential was installed with: `ObuRuntime` issues a real
+    /// certificate for every pseudonym on its first transmission and writes that
+    /// certificate's own `HashedId8` back into the store, so a map built at spawn time
+    /// holds the [`v2xw_node::stores::pseudo_signer`] stand-ins and resolves nothing. The
+    /// engine therefore registers a digest when the node hands a frame down
+    /// ([`Phase2::note_digest`]), which is the moment it is knowable and the only moment
+    /// it can be reported.
+    by_digest: BTreeMap<[u8; 8], (NodeId, u32, u32)>,
     rsus: Vec<RsuSpec>,
     /// The roadside units' node ids, once the engine has created them.
     rsu_nodes: Vec<NodeId>,
@@ -494,9 +503,23 @@ impl Phase2 {
     /// Registers the air digest one provisioned credential is carried under.
     ///
     /// This is joint 2: the map a report's subject digest is resolved through, standing in
-    /// for the Misbehaviour Authority asking the PCA about a certificate.
-    pub fn note_digest(&mut self, node: NodeId, digest: &v2xw_msg::sec_types::HashedId8) {
-        self.by_digest.insert(digest_key(digest), node);
+    /// for the Misbehaviour Authority asking the PCA about a certificate. `i` and `j` name
+    /// the pseudonym, so the lookup answers with **that pseudonym's** linkage value and
+    /// not merely with the device — two reports about two pseudonyms are then two
+    /// different linkage values, which is what the Linkage Authorities are asked to
+    /// correlate.
+    ///
+    /// Called from the transmit path rather than once at spawn, because a credential's
+    /// digest is not fixed at spawn: see [`Phase2::by_digest`]. It is idempotent, and a
+    /// pseudonym the node never transmits under is a pseudonym nothing can report.
+    pub fn note_digest(
+        &mut self,
+        node: NodeId,
+        digest: &v2xw_msg::sec_types::HashedId8,
+        i: u32,
+        j: u32,
+    ) {
+        self.by_digest.insert(digest_key(digest), (node, i, j));
     }
 
     /// Arms this node as an attacker if the scenario's selection rule names it.
@@ -717,12 +740,16 @@ impl Phase2 {
     /// Joint 2 again, from the other end: this is the lookup the PCA performs.
     fn resolve_subject(&self, digest_hex: &str) -> Option<(NodeId, u32, LinkageValue)> {
         let bytes = decode_hex8(digest_hex)?;
-        let node = *self.by_digest.get(&bytes)?;
-        // The certificate the subject signed with is one of the ones provisioned for it;
-        // the digest map does not say which `j`, so the first is reported. What the
-        // authority resolves is the *device*, and every `j` of a period resolves to the
-        // same one — which is the property the two Linkage Authorities exist to provide.
-        let cred = self.creds.get(&node)?.first()?;
+        let (node, i, j) = *self.by_digest.get(&bytes)?;
+        // The exact certificate the subject signed with, and therefore the linkage value
+        // *that pseudonym* carries. Two pseudonyms of one device are two different linkage
+        // values that resolve to the same device, which is the property the two Linkage
+        // Authorities exist to provide and the thing the authority is asking them about.
+        let cred = self
+            .creds
+            .get(&node)?
+            .iter()
+            .find(|c| c.i == i && c.j == j)?;
         Some((node, cred.i, cred.lv))
     }
 

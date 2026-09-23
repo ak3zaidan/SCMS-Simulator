@@ -332,23 +332,41 @@ fn a_transposed_bounding_box_is_refused_by_name() {
     );
 }
 
-/// The engine cannot yet build an OSM world, and this test pins the *symptom* so that the
-/// day `wiring::build_world` dispatches to `world/source/osm` this test fails and is
-/// replaced by a real Manhattan run.
+/// The Manhattan scenario builds a real OSM world.
 ///
-/// It asserts on the world layer specifically: the scenario loads, validates and hashes,
-/// and `Engine::build` fails with a world error naming the source it refused. If it ever
-/// starts passing `Engine::build`, the assertion below goes red and says so.
+/// This replaces a tripwire. Until the engine's `wiring::build_world` learned to dispatch
+/// `osm-xml`, a test here pinned the *symptom* — `Engine::build` failing with a world
+/// error naming the source it refused — and its own documentation said to delete it the
+/// day the dispatch landed. The dispatch landed, that test went red as designed, and this
+/// is the real assertion it asked for.
+///
+/// It checks the world layer specifically: that the import produced the lane-level network
+/// the radio and mobility models need, rather than merely that no error was returned. A
+/// world that builds but is empty would satisfy the weaker reading.
 #[test]
-fn building_the_manhattan_world_is_refused_by_the_grid_source() {
+fn the_manhattan_scenario_builds_a_real_osm_world() {
     let scenario = v2xw_engine::Scenario::load(manhattan_scenario()).expect("it loads");
-    let err = v2xw_engine::Engine::build(scenario, "2026-09-22T00:00:00Z").expect_err(
-        "v2xw-engine's wiring::build_world now builds an OSM world — delete this test \
-             and run scenarios/phase1-manhattan.yaml for real",
-    );
-    let text = err.to_string();
+    let engine = v2xw_engine::Engine::build(scenario, "2026-09-22T00:00:00Z")
+        .expect("the engine builds an OSM world");
+    let world = engine.world();
+    let counts = world.counts();
     assert!(
-        text.contains("procedural-grid") && text.contains("osm-xml"),
-        "the failure moved: {text}"
+        counts.lanes > 1_000,
+        "only {} lanes: this is not the Midtown extract",
+        counts.lanes
+    );
+    assert!(
+        counts.junctions > 100,
+        "only {} junctions",
+        counts.junctions
+    );
+    assert!(
+        !world.buildings.is_empty(),
+        "no buildings, so nothing would shadow a radio link"
+    );
+    assert_eq!(
+        world.provenance.projection,
+        v2xw_core::GeoOrigin::PROJECTION,
+        "the world came out on a different projection than the one D6 fixes"
     );
 }
