@@ -87,6 +87,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod audit;
 pub mod carfollowing;
 pub mod classes;
 pub mod clock;

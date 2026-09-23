@@ -25,6 +25,7 @@
 pub mod gap_acceptance;
 pub mod signal_fixed_time;
 pub mod two_coloring;
+pub mod zones;
 
 pub use gap_acceptance::{GapAcceptance, HcmGaps, Movement};
 pub use signal_fixed_time::{FixedTimeSignals, SignalPlanParams};

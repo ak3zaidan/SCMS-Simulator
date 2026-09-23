@@ -66,6 +66,7 @@ use crate::error::{MobError, Result};
 use crate::intersection::gap_acceptance::{GapAcceptance, GapAcceptanceParams};
 use crate::intersection::signal_fixed_time::{FixedTimeSignals, SignalPlanParams};
 use crate::intersection::two_coloring::{TwoColoring, TwoColoringParams};
+use crate::intersection::zones::ConflictZones;
 use crate::intersection::{STOP_LINE_OFFSET_M, headings_conflict};
 use crate::lanechange::mobil::{Mobil, MobilParams, MobilPreset, smoothstep};
 use crate::routing::dijkstra::DijkstraParams;
@@ -86,6 +87,35 @@ pub const MODEL_ID: &str = "mobility/native/medium";
 
 /// The model version.
 pub const MODEL_VERSION: &str = "1.0.0";
+
+/// How far before a stop line a discretionary lane change may no longer start, metres.
+///
+/// MUTCD 2009 §3B.04 marks the approach to a junction with a solid lane line where
+/// "crossing the lane line markings is discouraged"; the manual does not fix its length.
+/// 30 m is **this crate's choice**: about two car lengths more than the longest
+/// lane-change transition covers at the 25 mph urban limit (2.5 s × 11.2 m/s = 28 m), so a
+/// change that starts outside the zone has finished before the stop line.
+pub const DEFAULT_NO_CHANGE_ZONE_M: f64 = 30.0;
+
+/// The average lateral acceleration a junction turn is driven at, m/s²: SUMO `netconvert
+/// --junctions.limit-turn-speed`'s default.
+pub const DEFAULT_TURN_LATERAL_ACCEL_MPS2: f64 = 5.5;
+
+/// The card's note on how a stop line is braked for (see [`static_obstacle_accel`]).
+const STOP_LINE_ONSET_NOTE: &str = "a virtual stop-line obstacle is braked for at \
+    max(a_IDM, −v²/(2·(s − s0))): the constant-acceleration heuristic (Kesting, Treiber & \
+    Helbing 2010, Phil. Trans. R. Soc. A 368:4585) for a standing obstacle, which stops at \
+    the line with the least deceleration that does, instead of the IDM's over-reaction to \
+    an obstacle that appears at a signal change";
+
+/// Above this speed the tail of the queue on a junction's exit counts as moving, so the
+/// room behind it is opening and a vehicle may enter, m/s. **This crate's choice**: a
+/// walking pace; below it the queue is standing or creeping.
+const EXIT_QUEUE_MOVING_MPS: f64 = 2.0;
+
+/// How many lanes behind its front a vehicle's body is tracked across. A car is shorter
+/// than any three consecutive lanes; a connector can be shorter than a car.
+const TRAIL_LANES: usize = 3;
 
 /// Which intersection rule the engine applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -130,6 +160,20 @@ pub struct EngineParams {
     pub insertion_gap_m: f64,
     /// Whether to re-plan a route when a closure or a travel-time update changes it.
     pub dynamic_rerouting: bool,
+    /// How far before the end of a lane a discretionary lane change may no longer start,
+    /// metres ([`DEFAULT_NO_CHANGE_ZONE_M`]). Not applied in the legacy parity mode.
+    pub no_change_zone_m: f64,
+    /// The average lateral acceleration a turn through a junction is driven at, m/s²:
+    /// a connector of average radius `R` is taken at `sqrt(a·R)` at most. `0` disables it.
+    /// Not applied in the legacy parity mode.
+    ///
+    /// 5.5 m/s² is SUMO `netconvert --junctions.limit-turn-speed`'s default ("limits speed
+    /// on junctions to an average lateral acceleration of at most FLOAT m/s²").
+    pub turn_lateral_accel_mps2: f64,
+    /// Whether a vehicle yields to vehicles already inside the junction on a conflicting
+    /// movement, and does not enter a junction whose exit has no room for it. Not applied
+    /// in the legacy parity mode. See [`crate::intersection::zones`].
+    pub junction_clearance: bool,
     /// **A test hook, not a model parameter.** Walks the decision pass in reverse actor
     /// order. Because the pass reads only the frozen snapshot, the published result must be
     /// bit-identical either way; that is the ADR 0004 Jacobi property, and this is how the
@@ -148,6 +192,9 @@ impl Default for EngineParams {
             max_lifetime: None,
             insertion_gap_m: 2.0,
             dynamic_rerouting: true,
+            no_change_zone_m: DEFAULT_NO_CHANGE_ZONE_M,
+            turn_lateral_accel_mps2: DEFAULT_TURN_LATERAL_ACCEL_MPS2,
+            junction_clearance: true,
             reverse_order: false,
         }
     }
@@ -170,6 +217,9 @@ struct Transition {
     to_offset_m: f64,
     /// Whether the lane change has already been applied to the actor's lane.
     switched: bool,
+    /// `s` on the lane being left minus `s` on the lane being entered, at the switch:
+    /// where the body still is on the lane it is leaving.
+    from_s_delta: f64,
 }
 
 /// One actor the engine drives.
@@ -195,6 +245,12 @@ struct Actor {
     cooldown_until: SimTime,
     speed_cap_mps: Option<f64>,
     stopped_until: Option<SimTime>,
+    /// The lanes the vehicle drove to reach `lane`, most recent last, at most
+    /// [`TRAIL_LANES`] of them: where its body still is while it straddles a boundary.
+    /// Empty after a spawn or a lane change.
+    trail: Vec<LaneId>,
+    /// The junction the vehicle chose to clear on amber; see the decision pass.
+    amber_commit: Option<JunctionId>,
 }
 
 impl Actor {
@@ -217,14 +273,50 @@ impl Actor {
 
     /// The published ground truth: the reference point is the rear-axle centre, taken at
     /// the rear bumper (see the module documentation).
-    fn kinematics(&self, world: &World, t: SimTime) -> Kinematics {
+    ///
+    /// `along_path` selects how the rear is placed when the body straddles two lanes.
+    /// `false` is the legacy placement, which clamps the rear to the start of the front
+    /// bumper's lane: on every lane boundary the published point jumped forward by up to a
+    /// body length and then stood still until the front had driven that far, and the
+    /// heading was the lane's at that clamped point. `true` — every mode but the legacy
+    /// parity one — puts the rear where it is, on the lane the vehicle came from, and takes
+    /// the heading along the body from rear to front, so the pose moves continuously across
+    /// every boundary and turns smoothly through a junction.
+    fn kinematics(&self, world: &World, t: SimTime, along_path: bool) -> Kinematics {
         let lane = world.lane(self.lane);
         let length = self.class.spec().length_m;
-        let s_rear = (self.s_m - length).clamp(0.0, lane.length_m);
-        let heading = lane.heading_at(s_rear);
-        let pos = lane.offset_point(s_rear, self.lateral_m);
-        let (sin_h, cos_h) = math::sin_cos(heading);
         let lateral_rate = self.lateral_rate();
+        if !along_path {
+            let s_rear = (self.s_m - length).clamp(0.0, lane.length_m);
+            let heading = lane.heading_at(s_rear);
+            let pos = lane.offset_point(s_rear, self.lateral_m);
+            let (sin_h, cos_h) = math::sin_cos(heading);
+            return Kinematics {
+                t,
+                pos,
+                vel: Vec3::new(
+                    self.speed_mps * cos_h - lateral_rate * sin_h,
+                    self.speed_mps * sin_h + lateral_rate * cos_h,
+                    0.0,
+                ),
+                acc: Vec3::new(self.accel_mps2 * cos_h, self.accel_mps2 * sin_h, 0.0),
+                heading_rad: heading + lateral_heading_offset(lateral_rate, self.speed_mps),
+                yaw_rate_rad_s: 0.0,
+                lane: Some(LanePos::new(self.lane, s_rear, self.lateral_m)),
+                dims: self.class.dims(),
+            };
+        }
+        let s_front = self.s_m.clamp(0.0, lane.length_m);
+        let front = lane.offset_point(s_front, self.lateral_m);
+        let s_rear = self.s_m - length;
+        let (pos, rear_lane, rear_s) = self.rear_point(world, s_rear);
+        let chord = Vec3::new(front.x - pos.x, front.y - pos.y, 0.0);
+        let body = if chord.norm_2d() > 0.25 * length.max(0.1) {
+            math::atan2(chord.y, chord.x)
+        } else {
+            lane.heading_at(s_rear.max(0.0))
+        };
+        let (sin_h, cos_h) = math::sin_cos(body);
         Kinematics {
             t,
             pos,
@@ -234,11 +326,73 @@ impl Actor {
                 0.0,
             ),
             acc: Vec3::new(self.accel_mps2 * cos_h, self.accel_mps2 * sin_h, 0.0),
-            heading_rad: heading + lateral_heading_offset(lateral_rate, self.speed_mps),
+            heading_rad: v2xw_world::model::normalise_angle(
+                body + lateral_heading_offset(lateral_rate, self.speed_mps),
+            ),
             yaw_rate_rad_s: 0.0,
-            lane: Some(LanePos::new(self.lane, s_rear, self.lateral_m)),
+            lane: Some(LanePos::new(rear_lane, rear_s, self.lateral_m)),
             dims: self.class.dims(),
         }
+    }
+
+    /// Where the rear of the body is when it is `s_rear` along the front's lane — behind
+    /// the lane's start when negative, which is walked back along the trail of lanes the
+    /// vehicle came by. Past the end of the trail (a spawn, or a lane change right at a
+    /// lane start) the first lane's first segment is extended backwards.
+    fn rear_point(&self, world: &World, s_rear: f64) -> (Vec3, LaneId, f64) {
+        let lane = world.lane(self.lane);
+        if s_rear >= 0.0 {
+            return (lane.offset_point(s_rear, self.lateral_m), self.lane, s_rear);
+        }
+        let mut behind = -s_rear;
+        let mut earliest = lane;
+        for id in self.trail.iter().rev() {
+            let Some(prev) = world.try_lane(*id) else { break };
+            if behind <= prev.length_m {
+                let s = prev.length_m - behind;
+                return (prev.offset_point(s, self.lateral_m), prev.id, s);
+            }
+            behind -= prev.length_m;
+            earliest = prev;
+        }
+        let start = earliest.offset_point(0.0, self.lateral_m);
+        let (sin0, cos0) = math::sin_cos(earliest.heading_at(0.0));
+        (
+            Vec3::new(start.x - behind * cos0, start.y - behind * sin0, start.z),
+            earliest.id,
+            0.0,
+        )
+    }
+
+    /// The stretches of junction connector the body covers: `(connector, rear, front)` in
+    /// arc length along each — the front's own lane if it is one, and every connector on
+    /// the trail the body still overhangs.
+    fn connector_spans(&self, world: &World) -> Vec<(LaneId, f64, f64)> {
+        let mut out = Vec::new();
+        let length = self.class.spec().length_m;
+        let lane = world.lane(self.lane);
+        if lane.kind == LaneKind::Internal {
+            out.push((self.lane, self.s_m - length, self.s_m));
+        }
+        // How far the body reaches back past the start of the lane walked so far.
+        let mut behind = length - self.s_m;
+        let mut ahead_of_start = self.s_m;
+        for id in self.trail.iter().rev() {
+            if behind <= 0.0 {
+                break;
+            }
+            let Some(prev) = world.try_lane(*id) else { break };
+            if prev.kind == LaneKind::Internal {
+                out.push((
+                    prev.id,
+                    prev.length_m - behind,
+                    prev.length_m + ahead_of_start,
+                ));
+            }
+            behind -= prev.length_m;
+            ahead_of_start += prev.length_m;
+        }
+        out
     }
 
     /// The lateral velocity the transition is producing, m/s.
@@ -282,6 +436,10 @@ pub struct NativeMobility {
     closed: BTreeSet<LaneId>,
     pending: Vec<MobilityCommand>,
     weather: WeatherState,
+    /// Every junction's conflict zones, built at `init` (not in the legacy parity mode).
+    zones: ConflictZones,
+    /// The speed each junction connector may be taken at, from its curvature.
+    turn_speed: BTreeMap<LaneId, f64>,
     next_actor: u32,
     next_seq: u64,
     dropped_trips: u64,
@@ -369,6 +527,8 @@ impl NativeMobility {
             closed: BTreeSet::new(),
             pending: Vec::new(),
             weather: WeatherState::CLEAR,
+            zones: ConflictZones::default(),
+            turn_speed: BTreeMap::new(),
             next_actor: 0,
             next_seq: 0,
             dropped_trips: 0,
@@ -390,6 +550,12 @@ impl NativeMobility {
     pub fn with_clock(mut self, clock: Box<dyn ClockModel>) -> Self {
         self.clock = Some(clock);
         self
+    }
+
+    /// True unless the engine runs the legacy parity configuration, whose placement,
+    /// integration and junction rules are kept exactly as the reference engine had them.
+    fn along_path(&self) -> bool {
+        self.params.intersections != IntersectionMode::TwoColoringLegacy
     }
 
     /// Sets the weather every vehicle drives in.
@@ -438,6 +604,35 @@ impl NativeMobility {
         self.actors
             .values()
             .map(|a| (a.id, a.lane, a.s_m, a.speed_mps))
+            .collect()
+    }
+
+    /// Every vehicle's internal state, in actor-id order, for the traffic-invariant
+    /// auditor ([`crate::audit`]). Read-only: nothing the auditor sees feeds back.
+    pub fn audit_actors(&self, world: &World, t: SimTime) -> Vec<crate::audit::AuditActor> {
+        self.actors
+            .values()
+            .map(|a| {
+                let k = a.kinematics(world, t, self.along_path());
+                let dims = a.class.dims();
+                crate::audit::AuditActor {
+                    actor: a.id,
+                    length_m: dims.length_m,
+                    width_m: dims.width_m,
+                    min_gap_m: a.driver.min_gap_m,
+                    max_accel_mps2: a.driver.max_accel_mps2,
+                    lane: a.lane,
+                    prev_lane: a.trail.last().copied(),
+                    s_m: a.s_m,
+                    lateral_m: a.lateral_m,
+                    speed_mps: a.speed_mps,
+                    accel_mps2: a.accel_mps2,
+                    changing: a.transition.map(|t| (t.from, t.to)),
+                    route_next: a.route.lanes.get(a.route_index + 1).copied(),
+                    pos: k.pos,
+                    heading_rad: k.heading_rad,
+                }
+            })
             .collect()
     }
 
@@ -516,6 +711,8 @@ impl NativeMobility {
                 cooldown_until: t,
                 speed_cap_mps: None,
                 stopped_until: None,
+                trail: Vec::new(),
+                amber_commit: None,
             },
         );
         Ok(id)
@@ -622,6 +819,33 @@ impl NativeMobility {
                 self.dropped_trips += 1;
                 return None;
             }
+            // A vehicle behind the insertion point must be able to follow the newcomer
+            // without an emergency stop: its standstill gap plus its time headway at its
+            // current speed, the IDM's own desired gap for a standing leader. The fixed
+            // 2 m gap alone dropped cars at rest in front of traffic doing 11 m/s, which
+            // then braked at the IDM's -6 m/s² floor. Not applied in the legacy mode.
+            if self.along_path() && behind >= 0.0 {
+                let need = a.driver.min_gap_m + a.speed_mps * a.driver.time_headway_s;
+                if behind < need {
+                    self.dropped_trips += 1;
+                    return None;
+                }
+            }
+        }
+        if self.along_path() {
+            // The same for traffic about to arrive from the lanes that feed this one.
+            for c in world.predecessors(trip.origin) {
+                let from = c.via.unwrap_or(c.from_lane);
+                let Some(up) = world.try_lane(from) else { continue };
+                for a in self.actors.values().filter(|a| a.lane == from) {
+                    let gap = (up.length_m - a.s_m) + (front - length);
+                    let need = a.driver.min_gap_m + a.speed_mps * a.driver.time_headway_s;
+                    if gap < need {
+                        self.dropped_trips += 1;
+                        return None;
+                    }
+                }
+            }
         }
         let id = ActorId::new(self.next_actor);
         self.next_actor += 1;
@@ -651,6 +875,8 @@ impl NativeMobility {
                 cooldown_until: trip.t,
                 speed_cap_mps: None,
                 stopped_until: None,
+                trail: Vec::new(),
+                amber_commit: None,
             },
         );
         self.next_seq = self.next_seq.max(trip.seq + 1);
@@ -667,7 +893,7 @@ impl NativeMobility {
             actor: id,
             t,
             class: actor.class,
-            kinematics: actor.kinematics(world, t),
+            kinematics: actor.kinematics(world, t, self.along_path()),
             route: actor.route.clone(),
             driver: actor.driver,
             seq: actor.seq,
@@ -687,13 +913,33 @@ impl NativeMobility {
 
     /// Pass 3: the frozen snapshot.
     fn snapshot(&self, world: &World, t: SimTime) -> ActorSnapshot {
-        ActorSnapshot::build(
+        let mut snapshot = ActorSnapshot::build(
             t,
             self.params.lookahead_m.max(1.0),
             self.actors
                 .values()
-                .map(|a| (a.view(world), a.kinematics(world, t))),
-        )
+                .map(|a| (a.view(world), a.kinematics(world, t, self.along_path()))),
+        );
+        if self.along_path() {
+            // A vehicle part-way through a lane change is in the target lane's frame, but
+            // until its body has slid clear of the lane it is leaving it still occupies
+            // that lane too. Registering it there keeps the follower it is leaving from
+            // driving into the space its body is still in — which the frame switch alone
+            // allowed, and which the auditor counted as overlaps.
+            for a in self.actors.values() {
+                let Some(tr) = a.transition else { continue };
+                if !tr.switched {
+                    continue;
+                }
+                let half_body = 0.5 * a.class.spec().width_m;
+                let half_lane = 0.5 * world.lane(tr.to).width_m;
+                if a.lateral_m.abs() + half_body > half_lane {
+                    snapshot.push_ghost(tr.from, a.s_m + tr.from_s_delta, a.id);
+                }
+            }
+            snapshot.sort();
+        }
+        snapshot
     }
 
     /// Pass 4: every signal plan's state at `t`.
@@ -719,19 +965,70 @@ impl NativeMobility {
         if stop_line_gap_m > self.params.lookahead_m {
             return None;
         }
+        let next = actor.route.lanes.get(actor.route_index + 1).copied();
+        self.junction_view(world, actor.lane, next, stop_line_gap_m, actor, t)
+    }
+
+    /// Every junction within the lookahead along the actor's route, nearest first: the
+    /// one [`Self::junction_ahead`] finds, and — outside the legacy parity mode — the ones
+    /// at the ends of the lanes after it.
+    ///
+    /// Looking only as far as the end of the lane the vehicle is on hid a signal whose
+    /// approach lane was short — Manhattan has many a few metres long — until the
+    /// vehicle was on that lane, by which time a red a few metres ahead could only be
+    /// braked for at −6 m/s² and was run anyway.
+    fn junctions_ahead(&self, world: &World, actor: &Actor, t: SimTime) -> Vec<JunctionView> {
+        let mut out: Vec<JunctionView> = self.junction_ahead(world, actor, t).into_iter().collect();
+        if !self.along_path() {
+            return out;
+        }
+        let Some(lane) = world.try_lane(actor.lane) else {
+            return out;
+        };
+        let mut dist = lane.length_m - actor.s_m;
+        let mut k = actor.route_index + 1;
+        while dist <= self.params.lookahead_m {
+            let Some(id) = actor.route.lanes.get(k).copied() else {
+                break;
+            };
+            let Some(l) = world.try_lane(id) else { break };
+            let gap = dist + l.length_m;
+            if l.kind != LaneKind::Internal && gap <= self.params.lookahead_m {
+                let next = actor.route.lanes.get(k + 1).copied();
+                if let Some(view) = self.junction_view(world, id, next, gap, actor, t) {
+                    out.push(view);
+                }
+            }
+            dist = gap;
+            k += 1;
+        }
+        out
+    }
+
+    /// The junction at the end of `lane`, `gap` metres ahead of the actor, taken by the
+    /// movement onto `next`.
+    fn junction_view(
+        &self,
+        world: &World,
+        lane_id: LaneId,
+        next: Option<LaneId>,
+        stop_line_gap_m: f64,
+        actor: &Actor,
+        t: SimTime,
+    ) -> Option<JunctionView> {
+        let lane = world.try_lane(lane_id)?;
         let junction_id = world.edge(lane.edge).to;
         let junction = world.roads.try_junction(junction_id)?;
         // The movement the route takes through it.
-        let next = actor.route.lanes.get(actor.route_index + 1).copied();
         let (movement, movement_lane) = match next {
             Some(next) => {
                 let connection = world
-                    .successors(actor.lane)
+                    .successors(lane_id)
                     .iter()
                     .find(|c| c.via == Some(next) || (c.via.is_none() && c.to_lane == next));
                 match connection {
                     Some(c) => (c.direction, c.via.or(Some(next))),
-                    None => (TurnDirection::Straight, None),
+                    None => self.fallback_movement(world, lane_id),
                 }
             }
             None => (TurnDirection::Straight, None),
@@ -748,6 +1045,24 @@ impl NativeMobility {
             signal,
             major_lanes,
         })
+    }
+
+    /// The movement a vehicle whose route does not name one through this junction is
+    /// judged by: the first permitted signal-controlled connector off its lane.
+    ///
+    /// A route that has lost its place — the defect that let a vehicle change lane round a
+    /// queue and then drive through the junction — used to leave the movement unknown,
+    /// and an unknown movement shows no signal, so the vehicle proceeded on red. It is now
+    /// held to the lane's own movements. Not applied in the legacy parity mode.
+    fn fallback_movement(&self, world: &World, lane: LaneId) -> (TurnDirection, Option<LaneId>) {
+        if !self.along_path() {
+            return (TurnDirection::Straight, None);
+        }
+        world
+            .successors(lane)
+            .iter()
+            .find(|c| c.permitted && c.via.is_some())
+            .map_or((TurnDirection::Straight, None), |c| (c.direction, c.via))
     }
 
     /// The state the actor's movement is being shown, if this junction shows one.
@@ -843,8 +1158,23 @@ impl NativeMobility {
                 // The world's conflict matrix decides when both movements are in it; a
                 // world without internal connectors (a ring, a legacy import) falls back on
                 // the geometric rule of §2.3 and the legacy closest-first priority.
+                let ego_closer = junction.stop_line_gap_m < c.stop_line_gap_m
+                    || (junction.stop_line_gap_m == c.stop_line_gap_m && ego.actor < c.actor);
                 let (conflicts, ego_must_yield) = match (matrix.as_ref(), ego_row, other_row) {
-                    (Some((_, m)), Some(a), Some(b)) => (m.is_foe(a, b), m.must_yield(a, b)),
+                    (Some((_, m)), Some(a), Some(b)) => {
+                        let foe = m.is_foe(a, b);
+                        let level = foe && !m.must_yield(a, b) && !m.must_yield(b, a);
+                        // A conflicting pair the matrix leaves level — two opposing left
+                        // turns, which no highway code ranks — used to be yielded by
+                        // neither, so both entered together. The closest-first order
+                        // settles it, as it settles a world with no matrix at all. Not
+                        // applied in the legacy parity mode.
+                        if level && self.along_path() {
+                            (true, !ego_closer)
+                        } else {
+                            (foe, m.must_yield(a, b))
+                        }
+                    }
                     _ => {
                         let conflicts = headings_conflict(ego.heading_rad, c.heading_rad);
                         // The legacy rule: the closest claimant has priority, ties by the
@@ -903,6 +1233,379 @@ impl NativeMobility {
         }
     }
 
+    /// Whether a vehicle may consider a discretionary lane change at all this step.
+    ///
+    /// Not on a junction connector, not while its body still overhangs the lane it came
+    /// from, and not once it is inside the no-change zone before the end of its lane —
+    /// MUTCD 2009 §3B.04's solid lane line on the approach to a junction, sized so the
+    /// lateral transition finishes before the stop line. Changing lane inside that zone is
+    /// what put vehicles round a queue standing at a red light.
+    fn may_consider_lane_change(&self, world: &World, actor: &Actor, mobil: &Mobil) -> bool {
+        let lane = world.lane(actor.lane);
+        if lane.kind == LaneKind::Internal || actor.s_m < actor.class.spec().length_m {
+            return false;
+        }
+        // The zone is the approach to a junction: a lane that simply continues into the
+        // next one (a ring, a road split at a shape point) has no stop line to protect.
+        if !world.successors(actor.lane).iter().any(|c| c.via.is_some()) {
+            return true;
+        }
+        let zone = self
+            .params
+            .no_change_zone_m
+            .max(actor.speed_mps * mobil.params().transition_s);
+        lane.length_m - actor.s_m >= zone
+    }
+
+    /// Settles the lane changes pass 6 decided, in actor-id order, and returns the route
+    /// each surviving change drives on.
+    ///
+    /// * **The route.** The vehicle's route is re-planned from the target lane; a change
+    ///   whose target lane cannot continue to the same next road as the route it leaves
+    ///   (or cannot reach the destination at all) is refused.
+    /// * **Two into one gap.** Every decision was taken on the frozen snapshot, so two
+    ///   vehicles from the lanes either side could each pick the same gap, and two
+    ///   vehicles side by side could swap lanes through each other. Each change is checked
+    ///   against every change already accepted into the same lane (or swapping with it),
+    ///   and refused when the two would be closer than the follower's standstill gap plus
+    ///   one second of its speed.
+    ///
+    /// Actor-id order makes it a function of the decisions, not of the walk order, so the
+    /// Jacobi property holds.
+    fn resolve_lane_changes(
+        &self,
+        world: &World,
+        t: SimTime,
+        decisions: &mut [Decision],
+    ) -> BTreeMap<ActorId, (Route, LaneId)> {
+        let costs = self.costs(world);
+        let mut order: Vec<usize> = (0..decisions.len())
+            .filter(|i| matches!(decisions[*i].lane_change, LaneChangeDecision::Change { .. }))
+            .collect();
+        order.sort_by_key(|i| decisions[*i].actor);
+        let mut accepted: Vec<(ActorId, LaneId, LaneId)> = Vec::new();
+        let mut out = BTreeMap::new();
+        for i in order {
+            let LaneChangeDecision::Change { to, .. } = decisions[i].lane_change else {
+                continue;
+            };
+            let Some(actor) = self.actors.get(&decisions[i].actor) else {
+                continue;
+            };
+            let from = actor.lane;
+            let clash = accepted.iter().any(|(other, o_from, o_to)| {
+                let same_gap = *o_to == to || (*o_from == to && *o_to == from);
+                if !same_gap {
+                    return false;
+                }
+                let Some(o) = self.actors.get(other) else {
+                    return false;
+                };
+                let (lead, follow) = if o.s_m >= actor.s_m { (o, actor) } else { (actor, o) };
+                let gap = lead.s_m - lead.class.spec().length_m - follow.s_m;
+                gap < follow.driver.min_gap_m + follow.speed_mps * 1.0
+            });
+            let route = if clash {
+                None
+            } else {
+                self.route_after_change(world, actor, to, t, &costs)
+            };
+            match route {
+                Some(r) => {
+                    accepted.push((actor.id, from, to));
+                    out.insert(actor.id, r);
+                }
+                None => decisions[i].lane_change = LaneChangeDecision::Stay,
+            }
+        }
+        out
+    }
+
+    /// The route (and destination) a vehicle drives after changing onto `to`, or `None` if
+    /// that lane cannot make the route's next movement.
+    ///
+    /// The remaining route is *shifted* onto the new lane: movement by movement, the
+    /// connection off the current lane that leaves for the same road as the old route's —
+    /// the same connector when there is one — so the trip keeps its roads, a closed
+    /// circuit stays a circuit, and no router is run on the common path. Where a later
+    /// movement cannot be made from the shifted lane, the rest is re-planned from there to
+    /// the destination road. A target lane that cannot make even the *next* movement is
+    /// refused: this model has no mandatory lane change to get back.
+    fn route_after_change(
+        &self,
+        world: &World,
+        actor: &Actor,
+        to: LaneId,
+        t: SimTime,
+        costs: &DynamicCost<'_>,
+    ) -> Option<(Route, LaneId)> {
+        let target = world.try_lane(to)?;
+        let old = &actor.route.lanes;
+        let dest_edge = world.try_lane(actor.destination).map(|l| l.edge);
+        if old.len() <= actor.route_index + 1 && dest_edge == Some(target.edge) {
+            // Changing lane on the destination road: the trip ends at the end of this lane.
+            return Some((Self::route_of(world, vec![to]), to));
+        }
+        let mut lanes = vec![to];
+        let mut cur = to;
+        let mut k = actor.route_index + 1;
+        let mut stuck = false;
+        while k < old.len() {
+            let o = world.lane(old[k]);
+            let (via, exit_edge, want_exit) = if o.kind == LaneKind::Internal {
+                let Some(exit) = old.get(k + 1).copied() else { break };
+                (true, world.lane(exit).edge, exit)
+            } else {
+                (false, o.edge, old[k])
+            };
+            let pick = world
+                .successors(cur)
+                .iter()
+                .filter(|c| {
+                    c.permitted
+                        && c.via.is_some() == via
+                        && world.lane(c.to_lane).edge == exit_edge
+                })
+                .min_by_key(|c| (c.to_lane != want_exit, c.via != Some(old[k]), c.to_lane));
+            let Some(c) = pick.copied() else {
+                stuck = true;
+                break;
+            };
+            if let Some(i) = c.via {
+                lanes.push(i);
+                k += 2;
+            } else {
+                k += 1;
+            }
+            lanes.push(c.to_lane);
+            cur = c.to_lane;
+        }
+        if !stuck {
+            let destination = *lanes.last().expect("starts with the target lane");
+            return Some((Self::route_of(world, lanes), destination));
+        }
+        if lanes.len() == 1 {
+            return None; // the target lane cannot make the next movement
+        }
+        // Re-plan the rest from where the shift stopped, to any lane of the destination
+        // road.
+        let dest_lanes: Vec<LaneId> = dest_edge
+            .map(|e| world.edge(e).lanes.clone())
+            .unwrap_or_default();
+        for d in std::iter::once(actor.destination).chain(dest_lanes) {
+            if let Some(rest) = self.router.replan(world, cur, d, t, costs) {
+                lanes.extend(rest.lanes.into_iter().skip(1));
+                return Some((Self::route_of(world, lanes), d));
+            }
+        }
+        None
+    }
+
+    /// A route over `lanes`, with its length and free-flow cost.
+    fn route_of(world: &World, lanes: Vec<LaneId>) -> Route {
+        let length_m = math::sum_ordered(
+            lanes.iter().map(|l| world.lane(*l).length_m).collect::<Vec<_>>(),
+        );
+        let cost_s = math::sum_ordered(
+            lanes
+                .iter()
+                .map(|l| {
+                    let l = world.lane(*l);
+                    l.length_m / l.speed_limit_mps.max(1e-9)
+                })
+                .collect::<Vec<_>>(),
+        );
+        Route {
+            lanes,
+            length_m,
+            cost_s,
+        }
+    }
+
+    /// Who is inside which junction connector at the start of the step: `(actor, rear,
+    /// front)` in arc length along the connector, for every vehicle whose body is on one —
+    /// including one whose front has already left it and whose rear has not.
+    fn occupancy(&self, world: &World) -> BTreeMap<LaneId, Vec<(ActorId, f64, f64)>> {
+        let mut out: BTreeMap<LaneId, Vec<(ActorId, f64, f64)>> = BTreeMap::new();
+        if !self.along_path() || !self.params.junction_clearance {
+            return out;
+        }
+        for a in self.actors.values() {
+            for (lane, rear, front) in a.connector_spans(world) {
+                out.entry(lane).or_default().push((a.id, rear, front));
+            }
+        }
+        out
+    }
+
+    /// Whether `actor` must wait at the stop line before taking `movement`, although the
+    /// junction's own control would let it go:
+    ///
+    /// * a vehicle already inside the junction on a conflicting movement has not yet
+    ///   cleared the zone the two paths share — UVC §11-202(a)1 / NY VTL §1111(a)1: a
+    ///   driver facing a green "shall yield the right of way to other vehicles … lawfully
+    ///   within the intersection";
+    /// * the movement's exit lane has no room for the vehicle behind a queue standing on
+    ///   it — NY VTL §1175, "no driver shall enter an intersection … unless there is
+    ///   sufficient space on the opposite side … to accommodate the vehicle", the rule
+    ///   that keeps a queue from spilling back across the junction and locking the grid.
+    fn junction_blocked(
+        &self,
+        world: &World,
+        snapshot: &ActorSnapshot,
+        occupancy: &BTreeMap<LaneId, Vec<(ActorId, f64, f64)>>,
+        actor: &Actor,
+        movement: LaneId,
+    ) -> bool {
+        for z in self.zones.of(movement) {
+            if z.merge {
+                continue; // a merge is followed through, not waited for: `junction_leader`
+            }
+            if let Some(list) = occupancy.get(&z.other)
+                && list
+                    .iter()
+                    .any(|(other, rear, _)| *other != actor.id && z.other_not_clear(*rear))
+            {
+                return true;
+            }
+        }
+        let Some(exit) = self.zones.exit_of(movement) else {
+            return false;
+        };
+        let Some(&(tail_front, tail)) = snapshot.on_lane(exit).first() else {
+            return false;
+        };
+        let Some(tail_view) = snapshot.view(tail) else {
+            return false;
+        };
+        if tail_view.speed_mps > EXIT_QUEUE_MOVING_MPS {
+            return false; // the queue is moving: the room is opening
+        }
+        let need = actor.class.spec().length_m + actor.driver.min_gap_m;
+        let mut room = tail_front - tail_view.dims.length_m;
+        // Whoever is already inside heading for the same exit takes room first.
+        for (lane, list) in occupancy {
+            if self.zones.exit_of(*lane) != Some(exit) {
+                continue;
+            }
+            for (other, _, _) in list {
+                if *other == actor.id {
+                    continue;
+                }
+                if let Some(v) = snapshot.view(*other) {
+                    room -= v.dims.length_m + v.driver.min_gap_m;
+                }
+            }
+        }
+        let _ = world;
+        room < need
+    }
+
+    /// The constraint other vehicles inside a junction put on `actor`, as a virtual leader.
+    ///
+    /// * **A merge** (two connectors ending on one exit lane): whichever of the two is
+    ///   nearer the merge point goes first and the other follows it, at the gap their
+    ///   distances to the merge point imply — a zip, not a stop. Ties go to the lower id.
+    /// * **A crossing, both inside**: a vehicle already inside the junction that will
+    ///   reach (or is in) a zone the actor's path crosses before the actor does, and has
+    ///   not cleared it, is waited for at the zone's edge. The actor waits only if it has
+    ///   not yet entered the zone itself; ties go to the lower id. (A vehicle still
+    ///   *approaching* is held at the stop line instead, by [`Self::junction_blocked`].)
+    fn junction_leader(
+        &self,
+        world: &World,
+        snapshot: &ActorSnapshot,
+        occupancy: &BTreeMap<LaneId, Vec<(ActorId, f64, f64)>>,
+        actor: &Actor,
+    ) -> Option<LeaderView> {
+        let lane = world.lane(actor.lane);
+        // The connector the actor is on or about to take, and its front's arc length
+        // along it (negative before the stop line).
+        let (movement, pos) = if lane.kind == LaneKind::Internal {
+            (actor.lane, actor.s_m)
+        } else {
+            let gap = lane.length_m - actor.s_m;
+            if gap > self.params.lookahead_m {
+                return None;
+            }
+            let next = actor.route.lanes.get(actor.route_index + 1).copied()?;
+            if world.try_lane(next)?.kind != LaneKind::Internal {
+                return None;
+            }
+            (next, -gap)
+        };
+        let inside = pos >= 0.0;
+        let len_m = world.lane(movement).length_m;
+        let mut best: Option<LeaderView> = None;
+        for z in self.zones.of(movement) {
+            let Some(list) = occupancy.get(&z.other) else {
+                continue;
+            };
+            let len_o = world.lane(z.other).length_m;
+            for &(other, rear, front) in list {
+                if other == actor.id {
+                    continue;
+                }
+                let Some(view) = snapshot.view(other) else {
+                    continue;
+                };
+                if z.merge {
+                    let d_self = len_m - pos;
+                    let d_other = len_o - front;
+                    let ahead = d_other < d_self || (d_other == d_self && other < actor.id);
+                    if !ahead || rear > len_o {
+                        continue; // behind us, or already off the connector
+                    }
+                    let gap = d_self - d_other - view.dims.length_m;
+                    let l = LeaderView::of(*view, gap.max(0.0));
+                    best = Self::closest(best, Some(l));
+                } else if inside {
+                    let edge = z.s_self - z.half_self;
+                    if pos > edge || !z.other_not_clear(rear) {
+                        continue; // we are in it already, or they have cleared it
+                    }
+                    let d_self = edge - pos;
+                    let d_other = (z.s_other - z.half_other) - front;
+                    let first = d_other <= 0.0
+                        || d_other < d_self
+                        || (d_other == d_self && other < actor.id);
+                    if first {
+                        let l = LeaderView::virtual_obstacle(d_self.max(0.0), 0.0);
+                        best = Self::closest(best, Some(l));
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// The highest speed the vehicle should be doing now so that, braking at its
+    /// comfortable deceleration, it reaches each of the next lanes of its route at no more
+    /// than that lane's limit (or its turn speed): `sqrt(v_next² + 2·b·d)`.
+    fn anticipated_speed(&self, world: &World, actor: &Actor) -> f64 {
+        let b = actor.driver.comfort_decel_mps2.max(0.1);
+        let mut dist = world.lane(actor.lane).length_m - actor.s_m;
+        let mut best = f64::INFINITY;
+        for k in 1..=4 {
+            if dist > self.params.lookahead_m {
+                break;
+            }
+            let Some(next) = actor.route.lanes.get(actor.route_index + k).copied() else {
+                break;
+            };
+            let Some(lane) = world.try_lane(next) else {
+                break;
+            };
+            let mut cap = lane.speed_limit_mps;
+            if let Some(v) = self.turn_speed.get(&next) {
+                cap = cap.min(*v);
+            }
+            best = best.min(math::sqrt(cap * cap + 2.0 * b * dist.max(0.0)));
+            dist += lane.length_m;
+        }
+        best
+    }
+
     /// The closer of two constraints, as a virtual leader.
     fn closest(a: Option<LeaderView>, b: Option<LeaderView>) -> Option<LeaderView> {
         match (a, b) {
@@ -919,6 +1622,9 @@ struct Decision {
     accel_mps2: f64,
     v0_mps: f64,
     lane_change: LaneChangeDecision,
+    /// The junction this vehicle is committed to clearing because it chose to go on
+    /// amber, carried to the next step.
+    amber_commit: Option<JunctionId>,
 }
 
 impl v2xw_core::model::Model for NativeMobility {
@@ -949,6 +1655,13 @@ impl Mobility for NativeMobility {
         }
         if self.params.intersections == IntersectionMode::TwoColoringLegacy {
             self.two_coloring = Some(TwoColoring::new(world, TwoColoringParams::default()));
+        } else {
+            if self.params.junction_clearance {
+                self.zones = ConflictZones::build(world);
+            }
+            if self.params.turn_lateral_accel_mps2 > 0.0 {
+                self.turn_speed = turn_speeds(world, self.params.turn_lateral_accel_mps2);
+            }
         }
         self.demand = Some(demand);
         Ok(())
@@ -992,6 +1705,7 @@ impl Mobility for NativeMobility {
         let signal_states = self.signal_states(world, t0);
         // --- pass 5: claims ------------------------------------------------
         let claims = self.claims(world, &snapshot, t0);
+        let occupancy = self.occupancy(world);
 
         // --- pass 6: decide -------------------------------------------------
         // Every input is the frozen snapshot; every output is buffered. The iteration order
@@ -1013,7 +1727,12 @@ impl Mobility for NativeMobility {
             };
             let ego = actor.view(world);
             let lane = world.lane(actor.lane);
-            let lane_view = LaneView::of(lane);
+            let along = self.along_path();
+            let mut lane_view = LaneView::of(lane);
+            // A junction connector is driven no faster than its curvature allows.
+            if along && let Some(v) = self.turn_speed.get(&actor.lane) {
+                lane_view.speed_limit_mps = lane_view.speed_limit_mps.min(*v);
+            }
             let options = NeighborOptions {
                 lookahead_m: self.params.lookahead_m,
                 max_lane_hops: 8,
@@ -1025,9 +1744,39 @@ impl Mobility for NativeMobility {
                 snapshot.neighbors(world, &ego, &actor.route.lanes, actor.route_index, options);
             let mut leader = nbrs.leader;
             // The junction ahead becomes a virtual leader when it says stop or slow.
-            if let Some(junction) = self.junction_ahead(world, actor, t0) {
+            let mut amber_commit: Option<JunctionId> = None;
+            for junction in self.junctions_ahead(world, actor, t0) {
                 let conflicts = self.conflicts_for(world, &junction, &ego, &claims);
-                let decision = self.entry_decision(world, &ego, &junction, &conflicts);
+                let mut decision = self.entry_decision(world, &ego, &junction, &conflicts);
+                // A vehicle that chose to go on amber — it was inside the distance it could
+                // stop in — is committed: it does not change its mind a step later because
+                // it has slowed for the turn ahead, which is what left drivers braking into
+                // the junction on red. It keeps its speed and clears.
+                if along && matches!(junction.signal, Some(SignalState::Amber | SignalState::Red)) {
+                    if actor.amber_commit == Some(junction.id) {
+                        decision = EntryDecision::Proceed;
+                        amber_commit = Some(junction.id);
+                    } else if junction.signal == Some(SignalState::Amber)
+                        && decision == EntryDecision::Proceed
+                        && junction.stop_line_gap_m > 0.0
+                        && amber_commit.is_none()
+                    {
+                        amber_commit = Some(junction.id);
+                    }
+                }
+                if along
+                    && self.params.junction_clearance
+                    && decision == EntryDecision::Proceed
+                    && junction.stop_line_gap_m > 0.0
+                    && let Some(movement) = junction
+                        .movement_lane
+                        .filter(|l| world.lane(*l).kind == LaneKind::Internal)
+                    && self.junction_blocked(world, &snapshot, &occupancy, actor, movement)
+                {
+                    decision = EntryDecision::Stop {
+                        gap_m: (junction.stop_line_gap_m - STOP_LINE_OFFSET_M).max(0.0),
+                    };
+                }
                 let virtual_leader = decision.as_leader().map(|mut l| {
                     // The stop line is `STOP_LINE_OFFSET_M` before the junction, and the
                     // decision already accounts for it; nothing more to do but keep the
@@ -1037,6 +1786,14 @@ impl Mobility for NativeMobility {
                 });
                 leader = Self::closest(leader, virtual_leader);
             }
+            // Other vehicles inside the junction: follow one merging ahead onto the same
+            // exit, and give way at a crossing to one that reaches it first.
+            if along && self.params.junction_clearance {
+                leader = Self::closest(
+                    leader,
+                    self.junction_leader(world, &snapshot, &occupancy, actor),
+                );
+            }
             // An external stop command is a virtual leader at zero gap.
             if actor.stopped_until.is_some_and(|until| t0 < until) {
                 leader = Self::closest(leader, Some(LeaderView::virtual_obstacle(0.0, 0.0)));
@@ -1045,6 +1802,13 @@ impl Mobility for NativeMobility {
                 Some(cap) => actor.driver.desired_speed_mps.min(cap),
                 None => actor.driver.desired_speed_mps,
             };
+            // Slow down *before* a slower lane or a turn rather than at its boundary — unless
+            // committed to clearing the junction on amber.
+            let v0 = if along && amber_commit.is_none() {
+                v0.min(self.anticipated_speed(world, actor))
+            } else {
+                v0
+            };
             let ego_capped = VehicleView {
                 driver: DriverProfile {
                     desired_speed_mps: v0,
@@ -1052,15 +1816,23 @@ impl Mobility for NativeMobility {
                 },
                 ..ego
             };
-            let accel = self
+            let mut accel = self
                 .cf
                 .accel(&ego_capped, leader.as_ref(), &lane_view, &self.weather);
+            if along
+                && let Some(l) = leader.as_ref()
+                && !l.is_vehicle()
+                && l.speed_mps == 0.0
+            {
+                accel = static_obstacle_accel(accel, ego.speed_mps, l.gap_m, actor.driver.min_gap_m);
+            }
             let v0_effective = v0.min(lane_view.speed_limit_mps);
             decisions.push(Decision {
                 actor: *id,
                 accel_mps2: accel,
                 v0_mps: v0_effective,
                 lane_change: LaneChangeDecision::Stay,
+                amber_commit,
             });
             neighbours.insert(*id, (ego_capped, nbrs));
         }
@@ -1074,6 +1846,10 @@ impl Mobility for NativeMobility {
                 if actor.transition.is_some() || t0 < actor.cooldown_until {
                     continue;
                 }
+                if self.along_path() && !self.may_consider_lane_change(ctx.world(), actor, &mobil)
+                {
+                    continue;
+                }
                 let Some((ego, nbrs)) = neighbours.get(&decision.actor) else {
                     continue;
                 };
@@ -1081,21 +1857,39 @@ impl Mobility for NativeMobility {
             }
             self.lane_change = Some(mobil);
         }
+        let reroutes = if self.along_path() {
+            self.resolve_lane_changes(ctx.world(), t0, &mut decisions)
+        } else {
+            BTreeMap::new()
+        };
 
         // --- pass 7: integrate and publish ----------------------------------
         let world = ctx.world();
         let costs = self.costs(world);
         let generation = costs.generation();
         let mut despawned: Vec<(ActorId, DespawnCause)> = Vec::new();
+        let along = self.along_path();
         for decision in &decisions {
             let Some(actor) = self.actors.get_mut(&decision.actor) else {
                 continue;
             };
             // Longitudinal: the legacy integration order — the new speed carries the step,
             // which is what keeps a vehicle from rolling through a stop line.
+            //
+            // The ceiling is the desired speed, as in the reference engine — except that
+            // outside the legacy parity mode it never *cuts* a speed the vehicle already
+            // has. Entering a slower lane used to chop the speed to the new limit in one
+            // step (11.2 -> 4.5 m/s in 0.1 s on Manhattan's 10 mph lanes, a 67 m/s²
+            // deceleration); the car-following model now brakes for it instead, and the
+            // anticipation in the decision pass has it slowing before the boundary.
             actor.accel_mps2 = decision.accel_mps2;
-            actor.speed_mps =
-                (actor.speed_mps + decision.accel_mps2 * dt_s).clamp(0.0, decision.v0_mps);
+            actor.amber_commit = decision.amber_commit;
+            let ceiling = if along {
+                decision.v0_mps.max(actor.speed_mps)
+            } else {
+                decision.v0_mps
+            };
+            actor.speed_mps = (actor.speed_mps + decision.accel_mps2 * dt_s).clamp(0.0, ceiling);
             actor.s_m += actor.speed_mps * dt_s;
             if actor.stopped_until.is_some_and(|until| t0 >= until) {
                 actor.stopped_until = None;
@@ -1124,7 +1918,19 @@ impl Mobility for NativeMobility {
                     from_offset_m,
                     to_offset_m: 0.0,
                     switched: false,
+                    from_s_delta: 0.0,
                 });
+                // The route is re-planned from the lane being entered, so the vehicle's
+                // next movement is one that lane actually has. Keeping the old route
+                // left `route_index` pointing into the lane it had left: at the junction
+                // it crossed onto the *other* lane's connector — a sideways jump through
+                // the junction that ignored the signal for its own lane.
+                if let Some((route, destination)) = reroutes.get(&decision.actor) {
+                    actor.route = route.clone();
+                    actor.route_index = 0;
+                    actor.destination = *destination;
+                    actor.planned_at = t0;
+                }
                 // The rule belongs to the lane-change model, so it is asked for rather
                 // than reconstructed: `max(cooldown_factor·transition_s,
                 // cooldown_factor·duration)`. Rebuilding it here as `max(2·duration, 5 s)`
@@ -1154,7 +1960,9 @@ impl Mobility for NativeMobility {
                         let point = from_lane.offset_point(actor.s_m.min(from_lane.length_m), 0.0);
                         world.lane(target).project_point(point)
                     };
+                    transition.from_s_delta = actor.s_m - projection.s_m;
                     actor.lane = target;
+                    actor.trail.clear();
                     actor.s_m = projection.s_m;
                     actor.route_index = actor
                         .route
@@ -1182,7 +1990,32 @@ impl Mobility for NativeMobility {
                 if actor.s_m <= lane_length {
                     break;
                 }
-                match actor.route.lanes.get(actor.route_index + 1).copied() {
+                let mut next = actor.route.lanes.get(actor.route_index + 1).copied();
+                // The next lane must be one the lane graph reaches from this one. A route
+                // that has lost its place is re-planned here rather than followed onto a
+                // lane somewhere else. Not applied in the legacy parity mode.
+                if along
+                    && let Some(n) = next
+                    && !world.successor_lanes(actor.lane).contains(&n)
+                {
+                    next = self
+                        .router
+                        .replan(world, actor.lane, actor.destination, t1, &costs)
+                        .and_then(|route| {
+                            let n = route.lanes.get(1).copied();
+                            actor.route = route;
+                            actor.route_index = 0;
+                            actor.planned_at = t1;
+                            n
+                        });
+                    if next.is_none() {
+                        actor.s_m = lane_length;
+                        actor.speed_mps = 0.0;
+                        cause = Some(DespawnCause::RouteBlocked);
+                        break;
+                    }
+                }
+                match next {
                     Some(next) => {
                         if self.closed.contains(&next) {
                             actor.s_m = lane_length;
@@ -1191,6 +2024,10 @@ impl Mobility for NativeMobility {
                             break;
                         }
                         actor.s_m -= lane_length;
+                        actor.trail.push(actor.lane);
+                        if actor.trail.len() > TRAIL_LANES {
+                            actor.trail.remove(0);
+                        }
                         actor.lane = next;
                         actor.route_index += 1;
                     }
@@ -1245,7 +2082,7 @@ impl Mobility for NativeMobility {
         let mut states: Vec<(ActorId, Kinematics)> = self
             .actors
             .values()
-            .map(|a| (a.id, a.kinematics(world, t1)))
+            .map(|a| (a.id, a.kinematics(world, t1, along)))
             .collect();
 
         // VRUs read the same frozen snapshot the vehicles did.
@@ -1274,6 +2111,53 @@ impl Mobility for NativeMobility {
     fn kinematics(&self, a: ActorId) -> Option<&Kinematics> {
         self.published.get(&a)
     }
+}
+
+/// The speed each junction connector may be driven at: `sqrt(a_lat · R)` with `R` the
+/// connector's average radius (length over total heading change), which is how SUMO's
+/// `netconvert --junctions.limit-turn-speed` limits a turn. A connector that turns less
+/// than 0.1 rad is not limited.
+fn turn_speeds(world: &World, a_lat_mps2: f64) -> BTreeMap<LaneId, f64> {
+    let mut out = BTreeMap::new();
+    for lane in world.roads.lanes() {
+        if lane.kind != LaneKind::Internal || lane.length_m <= 0.0 {
+            continue;
+        }
+        let mut turned = 0.0;
+        for i in 0..lane.centreline.len().saturating_sub(2) {
+            let (a, b) = lane.segment(i);
+            let (_, c) = lane.segment(i + 1);
+            let h0 = math::atan2(b.y - a.y, b.x - a.x);
+            let h1 = math::atan2(c.y - b.y, c.x - b.x);
+            turned += v2xw_world::model::normalise_angle(h1 - h0).abs();
+        }
+        if turned < 0.1 {
+            continue;
+        }
+        let radius = lane.length_m / turned;
+        out.insert(lane.id, math::sqrt(a_lat_mps2 * radius).min(lane.speed_limit_mps));
+    }
+    out
+}
+
+/// The acceleration towards a *standing* virtual obstacle (a stop line, a give-way line)
+/// `gap_m` ahead: the car-following model's, unless that brakes harder than stopping
+/// `s0` short of the obstacle needs, in which case the kinematic deceleration
+/// `v² / (2·(gap − s0))` — the constant-acceleration heuristic of Kesting, Treiber and
+/// Helbing 2010 for a standing obstacle.
+///
+/// The IDM's interaction term reacts to an obstacle that *appears* — a light turning amber
+/// ahead of a vehicle that can still stop — with its full −6 m/s² floor in one step, which
+/// is neither what a driver does nor smooth. A driver who has decided to stop brakes just
+/// hard enough to stop at the line; that is what this returns. It never brakes *less*
+/// than stopping needs, so it cannot carry a vehicle over the line.
+pub fn static_obstacle_accel(a_model: f64, speed_mps: f64, gap_m: f64, s0_m: f64) -> f64 {
+    let room = gap_m - s0_m;
+    if room <= 0.05 || speed_mps <= 0.0 {
+        return a_model;
+    }
+    let needed = -(speed_mps * speed_mps) / (2.0 * room);
+    a_model.max(needed)
 }
 
 /// The model card.
@@ -1311,11 +2195,41 @@ pub fn card(params: &EngineParams, car_following: &str) -> ModelCard {
         },
         v2xw_core::card::Equation {
             name: "published position".to_string(),
-            latex_or_text: "pos = lane.offset_point(s − length, lateral)".to_string(),
+            latex_or_text: "pos = point on the driven path at s − length (walked back over the \
+                            lanes behind);  heading = atan2(front − rear)"
+                .to_string(),
             notes: Some(
                 "`s` is the front bumper and `Kinematics::pos` is the rear-axle centre; the \
                  class table gives no wheelbase, so the rear bumper stands in for the rear \
-                 axle"
+                 axle. The heading is the body's, from rear to front, so it turns \
+                 continuously through a junction. The legacy parity mode keeps the \
+                 reference engine's placement, clamped to the front's lane"
+                    .to_string(),
+            ),
+        },
+        v2xw_core::card::Equation {
+            name: "stop-line braking".to_string(),
+            latex_or_text: "a = max(a_IDM, −v²/(2·(s − s0)))  for a standing virtual obstacle"
+                .to_string(),
+            notes: Some(STOP_LINE_ONSET_NOTE.to_string()),
+        },
+        v2xw_core::card::Equation {
+            name: "turn speed".to_string(),
+            latex_or_text: "v_turn = min(v_limit, sqrt(a_lat · L / |Δψ|))".to_string(),
+            notes: Some(
+                "a junction connector of length L turning through Δψ, driven at an average \
+                 lateral acceleration a_lat = 5.5 m/s² (SUMO netconvert \
+                 --junctions.limit-turn-speed default)"
+                    .to_string(),
+            ),
+        },
+        v2xw_core::card::Equation {
+            name: "anticipation".to_string(),
+            latex_or_text: "v0 ← min(v0, sqrt(v_next² + 2·b·d))".to_string(),
+            notes: Some(
+                "for each lane ahead on the route within the lookahead, d metres away with \
+                 limit (or turn speed) v_next: the vehicle slows at its comfortable \
+                 deceleration b before the boundary instead of having its speed cut at it"
                     .to_string(),
             ),
         },
@@ -1389,6 +2303,45 @@ pub fn card(params: &EngineParams, car_following: &str) -> ModelCard {
             src.clone(),
         ),
         Parameter::new(
+            "no_change_zone",
+            "m",
+            serde_json::json!(params.no_change_zone_m),
+            Source {
+                kind: SourceKind::Standard,
+                reference: "MUTCD 2009 §3B.04: a solid lane line where crossing it is \
+                            discouraged, as on the approach to a junction"
+                    .to_string(),
+                accessed: Some("2026-09-23".to_string()),
+                note: Some(
+                    "the manual does not fix the length; 30 m is this crate's choice — the \
+                     2.5 s transition at 25 mph (28 m) plus margin — and the zone is \
+                     stretched to the vehicle's own speed × transition time when longer"
+                        .to_string(),
+                ),
+            },
+        ),
+        Parameter::new(
+            "turn_lateral_accel",
+            "m/s²",
+            serde_json::json!(params.turn_lateral_accel_mps2),
+            Source::new(
+                SourceKind::Code,
+                "SUMO netconvert --junctions.limit-turn-speed, default 5.5 (\"limits speed \
+                 on junctions to an average lateral acceleration of at most FLOAT m/s^2\")",
+            ),
+        ),
+        Parameter::new(
+            "junction_clearance",
+            "-",
+            serde_json::json!(params.junction_clearance),
+            Source::new(
+                SourceKind::Standard,
+                "UVC §11-202(a)1 / NY VTL §1111(a)1: a driver facing a green shall yield to \
+                 vehicles lawfully within the intersection; NY VTL §1175: no driver shall \
+                 enter an intersection unless there is space on the opposite side",
+            ),
+        ),
+        Parameter::new(
             "reverse_order",
             "-",
             serde_json::json!(params.reverse_order),
@@ -1414,6 +2367,21 @@ pub fn card(params: &EngineParams, car_following: &str) -> ModelCard {
             .to_string(),
         "The published reference point is the rear bumper, standing in for the rear-axle \
          centre."
+            .to_string(),
+        "Outside the legacy parity mode: a lane change is refused inside the no-change zone \
+         before a junction, while the body still overhangs the previous lane, when the \
+         target lane cannot make the route's next movement, and when another vehicle has \
+         already taken the same gap this step (actor-id order); the route is shifted onto \
+         the new lane movement by movement."
+            .to_string(),
+        "Outside the legacy parity mode: a vehicle holds at the stop line while a vehicle \
+         already inside the junction on a crossing movement has not cleared the shared \
+         conflict zone, or while its exit has no room behind a standing queue; inside the \
+         junction it gives way at a crossing to a vehicle that reaches it first, and \
+         follows one merging ahead onto the same exit."
+            .to_string(),
+        "A vehicle that chose to go on amber is committed to clearing the junction and does \
+         not slow for the turn ahead until it has entered."
             .to_string(),
     ];
     card.limitations = vec![
@@ -2689,7 +3657,28 @@ mod tests {
             dynamic_rerouting: false,
             ..EngineParams::default()
         };
-        let mut engine = engine_on(&world, params, &rng);
+        // Reconsideration every step, as in the two tests above, so the follower decides
+        // as soon as it is blocked. With the shipped 0.25/s rate the *leader* drew first
+        // (at 4.2 s, MOBIL's politeness term: moving over lets the follower pass), and the
+        // follower was only ever blocked again because of the defect this engine no longer
+        // has: the leader's route still named the lanes it had left, so at the next
+        // segment boundary it jumped straight back into the follower's lane, 3.5 m
+        // sideways in one step. That the test passed by that jump is why it is set up so.
+        let mut engine = NativeMobility::with_lane_change_params(
+            params,
+            Arc::new(Idm::new(IdmPreset::Kesting2010)),
+            MobilPreset::Kesting2007,
+            MobilParams {
+                reconsider_rate_per_s: 1e9,
+                ..MobilPreset::Kesting2007.params()
+            },
+        );
+        {
+            let mut ctx = MobilityCtx::new(0, &world, &rng);
+            engine
+                .init(&mut ctx, Box::new(NoDemand::new()))
+                .expect("init");
+        }
         let route: Vec<LaneId> = right
             .iter()
             .cycle()

@@ -130,11 +130,18 @@ pub fn register_all(registry: &mut Registry) -> Result<()> {
 
 /// The mobility provider the scenario names.
 pub fn build_mobility(scenario: &Scenario) -> Box<dyn Mobility> {
+    Box::new(native_mobility(scenario))
+}
+
+/// The native mobility engine exactly as [`build_mobility`] configures it, as its concrete
+/// type — what the traffic-invariant auditor (`examples/traffic_audit.rs`) steps, so the
+/// run it audits is the run the kernel would drive.
+pub fn native_mobility(scenario: &Scenario) -> NativeMobility {
     let params = v2xw_mobility::EngineParams {
         step: scenario.time.mobility_step(),
         ..v2xw_mobility::EngineParams::default()
     };
-    Box::new(NativeMobility::new(params))
+    NativeMobility::new(params)
 }
 
 /// The demand model the scenario names.
