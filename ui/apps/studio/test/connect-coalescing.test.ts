@@ -24,7 +24,7 @@
  * So the property: concurrent callers for one origin share one attempt, and a genuine change of
  * engine still supersedes.
  */
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 /** The shape under test, reduced to the decision: coalesce by origin, supersede on change. */
 class Connector {

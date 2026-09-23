@@ -49,6 +49,8 @@ export interface Transport {
   readonly speed: Control;
   readonly seek: Control;
   readonly restart: Control;
+  /** End the run now: the engine stops computing it and keeps what it produced. */
+  readonly stop: Control;
   /** Earliest simulated time the bar can reach. Non-zero only for a recording. */
   readonly minNs: number;
   /** Furthest simulated time a seek can reach — what the engine has produced. */
@@ -97,6 +99,7 @@ export function transport(input: TransportInput): Transport {
       speed: off(why),
       seek: { enabled: !busy, why: "Move to a point in the recording" },
       restart: off("Close the recording to get back to the live run."),
+      stop: off(why),
       minNs: recording.startNs,
       seekMaxNs: recording.endNs,
       spanNs: recording.endNs,
@@ -147,6 +150,11 @@ export function transport(input: TransportInput): Transport {
       busy || connection === "connecting" || connection === "handshaking"
         ? off("Waiting for the engine.")
         : { enabled: true, why: "Rewind to the beginning and run it again" },
+    // Works over HTTP as well as on the socket: stopping needs no frames back.
+    stop:
+      busy || (runState !== "running" && runState !== "paused")
+        ? off(ended ? "The run has already ended." : "Nothing is running.")
+        : { enabled: true, why: "End this run now. The engine stops computing it; what it produced stays on the timeline." },
     minNs: 0,
     seekMaxNs: produced,
     spanNs,

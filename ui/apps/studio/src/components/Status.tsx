@@ -30,6 +30,7 @@ export function useStatus(): StatusView {
   const hello = useStudio((s) => s.hello);
   const replay = useStudio((s) => s.replay);
   const target = useStudio((s) => s.target);
+  const reconnectAttempts = useStudio((s) => s.reconnectAttempts);
 
   return useMemo(() => {
     const span = tEndNs > 0 ? tEndNs : hello?.simDurationNs ?? 0;
@@ -44,8 +45,9 @@ export function useStatus(): StatusView {
       targetReachable: target.reachable,
       ...(span > 0 ? { spanText: durationNs(span) } : {}),
       clockText: simClock(tNs),
+      reconnectAttempts,
     });
-  }, [connection, runState, tEndNs, tNs, hello, replay, target]);
+  }, [connection, runState, tEndNs, tNs, hello, replay, target, reconnectAttempts]);
 }
 
 /**

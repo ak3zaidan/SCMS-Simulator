@@ -7,5 +7,5 @@
     "composite": false,
     "types": ["node"]
   },
-  "include": ["vite.config.ts", "playwright.config.ts", "e2e", "scripts"]
+  "include": ["vite.config.ts", "playwright.config.ts", "playwright.engine.config.ts", "e2e", "e2e-engine", "scripts"]
 }

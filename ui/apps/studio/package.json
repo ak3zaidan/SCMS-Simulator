@@ -13,6 +13,7 @@
     "lint": "eslint .",
     "test": "vitest run && playwright test",
     "test:e2e": "playwright test",
+    "test:engine": "playwright test -c playwright.engine.config.ts",
     "test:unit": "vitest run"
   },
   "dependencies": {
