@@ -140,7 +140,9 @@ test("every transport control does what it says, and a stopped run leaves no ker
   await page.getByTestId("run-start").click();
   await expect.poll(async () => (await status(page)).state).toBe("running");
   await expect.poll(async () => (await status(page)).t_ns, { timeout: 20_000 }).toBeGreaterThan(1_000_000_000);
-  expect((await status(page)).engine.kernel_threads).toBe(1);
+  // One kernel at most. It may already be 0: the kernel computes ahead of a stream paced to real
+  // time, and a short run can be fully computed while its first seconds are still being shown.
+  expect((await status(page)).engine.kernel_threads).toBeLessThanOrEqual(1);
 
   await page.getByTestId("pause").click();
   await expect.poll(async () => (await status(page)).state).toBe("paused");

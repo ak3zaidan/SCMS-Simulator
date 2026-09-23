@@ -106,6 +106,7 @@ export interface Status {
   generation: number;
   speed: number;
   scenario_hash: string;
+  staged_hash: string | null;
   engine: {
     kernel_threads: number;
     output_digest: string | null;
