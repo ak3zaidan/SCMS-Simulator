@@ -231,6 +231,77 @@ fn the_message_family_is_what_goes_on_the_air() {
 }
 
 #[test]
+fn the_time_keys_reach_the_run() {
+    let run = serve(&scenario("time-keys", 20, 6000));
+    let plain = run_to_end(&run);
+    assert_eq!(plain["engine"]["suppressed_frames"], 0);
+    // time.time_dilation: no radio frame inside the window.
+    patch(
+        &run,
+        json!([{"op": "add", "path": "/time/time_dilation",
+                "value": [{"from_s": 5.0, "to_s": 15.0}]}]),
+    );
+    let dilated = run_to_end(&run);
+    let suppressed = dilated["engine"]["suppressed_frames"].as_u64().expect("suppressed");
+    assert!(suppressed > 0, "frames inside the window are suppressed: {dilated}");
+    assert!(
+        stats(&dilated)["tx_frames"].as_u64() < stats(&plain)["tx_frames"].as_u64(),
+        "fewer frames go on the air with a dilation window"
+    );
+    // time.des_resolution: a promise the run must be able to keep.
+    let refused = call(
+        &run,
+        "scenario.set",
+        json!({"patch": [{"op": "replace", "path": "/time/des_resolution", "value": "1ms"}]}),
+    )
+    .expect_err("1ms with a microsecond PHY is refused");
+    assert!(refused.to_string().contains("des_resolution"), "{refused}");
+    // world.cache: the world is written once and read back identically.
+    let dir = std::env::temp_dir().join(format!("v2xw-apply-world-cache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    patch(
+        &run,
+        json!([
+            {"op": "replace", "path": "/time/time_dilation", "value": []},
+            {"op": "add", "path": "/world/cache", "value": dir.display().to_string()},
+        ]),
+    );
+    let first = run_to_end(&run);
+    let entries = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(entries, 1, "the imported world is kept in the cache directory");
+    let second = run_to_end(&run);
+    assert_eq!(digest(&first), digest(&second), "a cached world is the same world");
+    assert_eq!(digest(&first), digest(&plain), "and the same run as without the cache");
+}
+
+#[test]
+fn a_document_round_tripped_through_a_browser_is_not_an_edit() {
+    // JavaScript has one number type, so a document that went through the page comes back
+    // with every whole float written as an integer. Inside the world generator's opaque
+    // parameter block nothing re-types them, and a plain `==` reported six untouched
+    // fields as edits ("Applied 7 changes" for one).
+    let run = serve(&scenario("roundtrip", 2, 30));
+    let mut doc = ok(&run, "scenario.get", json!({}))["scenario"].clone();
+    for value in doc["world"]["source"]["params"]
+        .as_object_mut()
+        .expect("params")
+        .values_mut()
+    {
+        if let Some(f) = value.as_f64()
+            && f.fract() == 0.0
+            && value.is_f64()
+        {
+            *value = json!(f as i64);
+        }
+    }
+    let set = ok(&run, "scenario.set", json!({"scenario": doc}));
+    assert_eq!(set["requires_restart"], json!([]), "{set}");
+    doc["time"]["duration_s"] = json!(1);
+    let set = ok(&run, "scenario.set", json!({"scenario": doc}));
+    assert_eq!(set["requires_restart"], json!(["/time/duration_s"]), "{set}");
+}
+
+#[test]
 fn an_invalid_edit_is_reported_and_not_held() {
     let run = serve(&scenario("invalid", 2, 30));
     let before = ok(&run, "scenario.get", json!({}))["hash"].clone();

@@ -232,6 +232,11 @@ pub enum Status {
     /// Validated and refused: the loader rejects any value this build cannot act on, so
     /// the field exists but only its implemented values load.
     Refused,
+    /// Describes the scenario rather than configuring the run: shown in the page and kept
+    /// with the scenario in the run's record, and by design it changes nothing computed.
+    /// Distinct from [`Status::NotImplemented`], which is a setting the engine *should*
+    /// act on and does not.
+    Descriptive,
 }
 
 /// One key's implementation status.
@@ -257,9 +262,10 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     // --- the run -----------------------------------------------------------
     KeyStatus { path: "schema", status: Status::Wired,
         note: "The schema version. The loader migrates by it." },
-    KeyStatus { path: "meta", status: Status::NotImplemented,
-        note: "Documentation. It is hashed into the scenario digest and changes nothing \
-               about the run." },
+    KeyStatus { path: "meta", status: Status::Descriptive,
+        note: "Describes the scenario: shown with it in the page's scenario list and kept \
+               with the scenario in every recording and in the scenario digest. By design \
+               it changes nothing the run computes." },
     KeyStatus { path: "meta.name", status: Status::Wired,
         note: "Names the output directory, the recording's run label and the manifest." },
     KeyStatus { path: "meta.base", status: Status::Wired,
@@ -275,12 +281,15 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus { path: "time.mobility_step_ms", status: Status::Wired,
         note: "The mobility period, and the step the stream and run.seek are quantised \
                to." },
-    KeyStatus { path: "time.des_resolution", status: Status::NotImplemented,
-        note: "The kernel is always nanoseconds. This states a guarantee to models and \
-               no model reads it." },
-    KeyStatus { path: "time.time_dilation", status: Status::NotImplemented,
-        note: "Recorded in the manifest and nowhere else: no radio event is skipped \
-               inside a window and no metric is marked not-observed for one." },
+    KeyStatus { path: "time.des_resolution", status: Status::Refused,
+        note: "The resolution the run promises its models. The kernel keeps nanoseconds \
+               whatever this says; the loader refuses a resolution the run cannot keep — \
+               '1ms' with a PHY or MAC that times frames in microseconds, or a \
+               time-dilation window off the promised grid." },
+    KeyStatus { path: "time.time_dilation", status: Status::Partial,
+        note: "Inside a window no radio frame is generated: the frames are counted as \
+               suppressed in the run report and in run.status. The mobility tier is not \
+               lowered inside a window, and no metric is marked not-observed for one." },
     // --- the world ---------------------------------------------------------
     KeyStatus { path: "world.source", status: Status::Wired,
         note: "Where the world comes from. Procedural grids and OpenStreetMap XML are \
@@ -299,8 +308,10 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus { path: "world.terrain", status: Status::NotImplemented,
         note: "No terrain raster is read. The world is flat and the digital elevation \
                model named here is ignored." },
-    KeyStatus { path: "world.cache", status: Status::NotImplemented,
-        note: "No import is cached. Every run re-imports the world." },
+    KeyStatus { path: "world.cache", status: Status::Wired,
+        note: "A directory: the imported world is kept there, keyed by the world section \
+               and the source file's contents, and read back exactly on the next run \
+               instead of importing again." },
     KeyStatus { path: "world.highway_preset", status: Status::Wired,
         note: "Which jurisdiction's fallback speed limits the OpenStreetMap importer \
                uses. An OSM import is refused without it." },
@@ -697,6 +708,46 @@ fn time(s: &Scenario, e: &mut Vec<ScenarioError>) {
         &RESOLUTIONS,
         e,
     );
+    // `des_resolution` is a guarantee the run makes, not a knob on the clock: the kernel keeps
+    // nanoseconds whatever it says. A resolution is therefore accepted only when everything
+    // the run times is representable at it. The binding case is the radio: at the medium and
+    // high PHY/MAC tiers a frame is timed in microseconds — an 802.11p OFDM symbol is 8 µs and
+    // SIFS 32 µs in a 10 MHz channel (IEEE 802.11-2020 §17.4, Table 17-21) — and a millisecond
+    // grid cannot hold either.
+    if s.time.des_resolution == "1ms"
+        && (s.radio.tiers.phy != Tier::Abstract
+            || s.radio.tiers.mac != Tier::Abstract)
+    {
+        e.push(conflict(
+            "time.des_resolution",
+            "is '1ms', and the PHY/MAC tiers time frames in microseconds (an 802.11p OFDM \
+             symbol is 8 µs, SIFS 32 µs; IEEE 802.11-2020 §17.4): a run at this tier cannot \
+             promise millisecond resolution. Use '1us', or the abstract PHY and MAC"
+                .to_string(),
+        ));
+    }
+    let grid_s = match s.time.des_resolution.as_str() {
+        "1us" => Some(1e-6),
+        "1ms" => Some(1e-3),
+        _ => None,
+    };
+    if let Some(grid) = grid_s {
+        for (i, w) in s.time.time_dilation.iter().enumerate() {
+            for (name, at) in [("from_s", w.from_s), ("to_s", w.to_s)] {
+                let ticks = at / grid;
+                if (ticks - ticks.round()).abs() > 1e-6 {
+                    e.push(conflict(
+                        &format!("time.time_dilation[{i}].{name}"),
+                        format!(
+                            "is {at} s, which is not on the {} grid time.des_resolution \
+                             promises",
+                            s.time.des_resolution
+                        ),
+                    ));
+                }
+            }
+        }
+    }
 
     let horizon = s.time.duration_s;
     let mut windows: Vec<(f64, f64)> = Vec::new();

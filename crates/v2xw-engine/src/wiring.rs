@@ -54,6 +54,84 @@ pub const TX_POWER_DBM: f64 = 20.0;
 /// # Errors
 /// [`EngineError::World`] if the source cannot be built or imported.
 pub fn build_world(scenario: &Scenario) -> Result<World> {
+    match scenario.world.cache.as_deref().map(str::trim) {
+        Some(dir) if !dir.is_empty() => cached_world(scenario, std::path::Path::new(dir)),
+        _ => import_world(scenario),
+    }
+}
+
+/// The key a world is cached under: a digest of everything that decides what the import
+/// produces — the scenario's `world` section (less `cache` itself), the bytes of the source
+/// file when there is one, and the importer's version.
+///
+/// The source file's *content* is hashed, not its name or its modification time, so an
+/// edited extract is a different world and a copied one is the same world. Hashing a large
+/// extract costs a fraction of importing it, which is the whole trade.
+///
+/// # Errors
+/// [`EngineError::Io`] if the source file cannot be read.
+pub fn world_cache_key(scenario: &Scenario) -> Result<String> {
+    let mut section = serde_json::to_value(&scenario.world).map_err(|e| {
+        EngineError::Scenario(crate::ScenarioError::conflict("world", e.to_string()))
+    })?;
+    if let Some(map) = section.as_object_mut() {
+        map.remove("cache");
+    }
+    let canonical = v2xw_core::hash::canonical_json(&section).map_err(|e| {
+        EngineError::Scenario(crate::ScenarioError::conflict("world", e.to_string()))
+    })?;
+    let mut material = format!(
+        "v2xw-world-cache/1 workspace={} native=1\n",
+        env!("CARGO_PKG_VERSION")
+    )
+    .into_bytes();
+    material.extend_from_slice(&canonical);
+    if let Some(path) = section
+        .get("source")
+        .and_then(|s| s.get("path"))
+        .and_then(serde_json::Value::as_str)
+    {
+        let bytes = std::fs::read(path).map_err(|e| EngineError::Io {
+            path: path.to_string(),
+            source: e,
+        })?;
+        material.extend_from_slice(b"\nsource-sha256=");
+        material.extend_from_slice(v2xw_core::hash::sha256_hex(&bytes).as_bytes());
+    }
+    Ok(v2xw_core::hash::sha256_hex(&material))
+}
+
+/// `world.cache`: read the world from the cache directory when it is there, import it and
+/// write it there when it is not.
+///
+/// The cached form is `v2xw_world::serde_native`, whose round trip is exact — same content
+/// hash, same lane graph, same conflict matrices — so a cached run is the same run, and the
+/// determinism contract is untouched. An unreadable or corrupt cache entry is not an error:
+/// the world is imported again and the entry rewritten, because a cache must never be the
+/// reason a run does not start. The write goes to a temporary name and is renamed into
+/// place, so two runs filling the same entry cannot leave half a file behind.
+fn cached_world(scenario: &Scenario, dir: &std::path::Path) -> Result<World> {
+    let key = world_cache_key(scenario)?;
+    let entry = dir.join(format!("{key}.v2xwworld"));
+    if let Ok(bytes) = std::fs::read(&entry)
+        && let Ok(world) = v2xw_world::serde_native::from_bytes(&bytes)
+    {
+        return Ok(world);
+    }
+    let world = import_world(scenario)?;
+    if std::fs::create_dir_all(dir).is_ok()
+        && let Ok(bytes) = v2xw_world::serde_native::to_bytes(&world)
+    {
+        let partial = dir.join(format!("{key}.{}.partial", std::process::id()));
+        if std::fs::write(&partial, &bytes).is_ok() && std::fs::rename(&partial, &entry).is_err() {
+            let _ = std::fs::remove_file(&partial);
+        }
+    }
+    Ok(world)
+}
+
+/// Imports or generates the world the scenario names, with no cache.
+fn import_world(scenario: &Scenario) -> Result<World> {
     let opts = ImportOptions::default().imported_at(scenario.world.imported_at.clone());
     let opts = ImportOptions {
         keep_building_holes: scenario.world.buildings.keep_holes,

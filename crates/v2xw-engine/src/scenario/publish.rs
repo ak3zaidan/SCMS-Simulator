@@ -644,7 +644,10 @@ impl Walk<'_> {
             Some(k) => {
                 out.insert("x-status".into(), json!(k.status));
                 out.insert("x-status-note".into(), json!(k.note));
-                out.insert("x-implemented".into(), json!(k.status == Status::Wired));
+                out.insert(
+                    "x-implemented".into(),
+                    json!(matches!(k.status, Status::Wired | Status::Descriptive)),
+                );
                 out.insert("x-status-from".into(), json!(k.path));
             }
             None => {
@@ -787,6 +790,9 @@ pub fn statuses() -> Value {
         {"id": "refused", "label": "Only its implemented values load",
          "note": "The loader refuses any value this build cannot act on, so the field is \
                   real but its choices are narrower than the schema's."},
+        {"id": "descriptive", "label": "Description",
+         "note": "Describes the scenario: shown in the page and kept in the run's record. \
+                  By design it changes nothing the run computes."},
         {"id": "unknown", "label": "Unclassified",
          "note": "This build does not say whether the engine acts on it."},
     ])

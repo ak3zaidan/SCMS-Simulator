@@ -2727,6 +2727,11 @@ fn changed_pointers(a: &Value, b: &Value) -> Vec<String> {
                 }
             }
             (x, y) if x == y => {}
+            // `274` and `274.0` are one value. A document that went through a browser comes
+            // back with every whole float written as an integer (JavaScript has one number
+            // type), and inside an opaque `Value` block — a world generator's parameters —
+            // nothing re-types it, so a plain `==` reported untouched fields as edits.
+            (Some(Value::Number(x)), Some(Value::Number(y))) if x.as_f64() == y.as_f64() => {}
             _ => out.push(if at.is_empty() { "/".to_string() } else { at.to_string() }),
         }
     }
@@ -3183,6 +3188,8 @@ impl Engine for LiveEngine {
             "failure": self.failure,
             "stats": self.stats.to_json(),
             "finished": self.report.is_some(),
+            // Frames not generated because they fell in a `time.time_dilation` window.
+            "suppressed_frames": self.report.as_ref().map(|r| r.suppressed_frames),
             "retained_steps": self.timeline.len(),
             "retain_limit_steps": self.options.retain_steps,
         })

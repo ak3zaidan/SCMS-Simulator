@@ -217,7 +217,7 @@ export function groupsOf(fields: readonly FormField[]): string[] {
  * The page never decides this itself: it is read off the `x-status` the engine publishes for every
  * leaf, so a key someone wires changes what the form says the moment the engine is rebuilt.
  */
-export type FieldStatus = "wired" | "partial" | "not-implemented" | "refused" | "unknown";
+export type FieldStatus = "wired" | "partial" | "not-implemented" | "refused" | "descriptive" | "unknown";
 
 /** A form field with the engine's own statement of whether it changes the run. */
 export interface PublishedFormField extends FormField {
@@ -234,7 +234,7 @@ export interface PublishedRow {
 }
 
 function statusOf(value: unknown): FieldStatus {
-  return value === "wired" || value === "partial" || value === "not-implemented" || value === "refused"
+  return value === "wired" || value === "partial" || value === "not-implemented" || value === "refused" || value === "descriptive"
     ? value
     : "unknown";
 }

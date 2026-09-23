@@ -53,6 +53,7 @@ const STATUS_BADGE: Record<FieldStatus, { label: string; cls: string } | null> =
   partial: { label: "partly applied", cls: "warn" },
   "not-implemented": { label: "not applied", cls: "off" },
   refused: { label: "limited choices", cls: "info" },
+  descriptive: { label: "description", cls: "" },
   unknown: { label: "unclassified", cls: "off" },
 };
 
