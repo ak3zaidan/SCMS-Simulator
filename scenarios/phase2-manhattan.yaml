@@ -52,7 +52,15 @@ world:
   highway_preset: urban-us-nyc
   imported_at: "2026-09-18T00:00:00Z"
   buildings:
-    enabled: true
+    # Off, deliberately, and only for radio obstruction (the buildings are still imported
+    # and drawn). This scenario exercises the revocation *path* with one roadside unit at
+    # (900, 1000), and with building obstruction on, that one mast hears 2 of the 30
+    # reports the detectors file — the rest are behind Midtown towers — so no case
+    # resolves and nothing is revoked (measured: reports_received 2, crls_issued 0; with
+    # obstruction off, 72 and 1). That is the physically right answer for one mast in a
+    # street grid. To run the path with buildings on, put masts at the intersections the
+    # fleet actually drives through.
+    enabled: false
     keep_holes: true
   terrain:
     dem: null

@@ -17,7 +17,7 @@ document rather than like a config: each states at the top what it measures, wha
 | [`density-sweep-congestion.yaml`](density-sweep-congestion.yaml) | At what vehicle density does the channel congest, and where does the load land first? | 5 demand rates × 3 seeds | 15 |
 | [`pseudonym-privacy.yaml`](pseudonym-privacy.yaml) | What does a pseudonym-change period cost in bytes, verification and detection? | 4 periods × 3 seeds | 12 |
 | [`revocation-latency.yaml`](revocation-latency.yaml) | How long does each stage of a revocation take, and how big is the list? | 3 demand rates × 2 attacker fractions × 3 seeds | 18 |
-| [`rat-comparison.yaml`](rat-comparison.yaml) | DSRC vs LTE-V2X vs NR-V2X — **set up, axis not yet reachable**; see its header | propagation tier × 5 seeds | 10 |
+| [`rat-comparison.yaml`](rat-comparison.yaml) | DSRC vs LTE-V2X vs NR-V2X: who delivers further, and what each loses frames to | radio technology × 5 seeds | 15 |
 
 ## The vertical slices and the scaling ladder
 
@@ -94,5 +94,5 @@ Start from the study whose shape matches yours, then:
 3. **Hold everything but the swept axis fixed**, and say so where it would be tempting not
    to.
 4. **Check that your sweep can differ.** A swept field the engine does not read produces
-   identical cells and reads as a null result. `rat-comparison.yaml`'s header is that
-   failure mode, written up.
+   identical cells and reads as a null result. `rat-comparison.yaml` was that failure
+   mode until `radio.rat` was wired; the page's key-status table says which keys are.
