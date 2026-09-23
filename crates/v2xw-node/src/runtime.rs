@@ -412,6 +412,13 @@ impl ObuRuntime {
         }
     }
 
+    /// Runs this node at the abstract compute tier: every cryptographic operation its
+    /// profile costs takes [`crate::server::ProfileServiceModel::UNLIMITED_COST`], so it
+    /// is never compute-bound (`nodes.compute_tier: abstract`).
+    pub fn set_compute_unlimited(&mut self) {
+        self.service = self.service.clone().unlimited();
+    }
+
     /// The node's security stack, for a test that wants to check a signature this node
     /// produced or ask which backend is running.
     pub fn security(&self) -> &NodeSecurity {
