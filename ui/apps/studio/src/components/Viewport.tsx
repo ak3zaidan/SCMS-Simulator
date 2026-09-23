@@ -66,6 +66,7 @@ export function Viewport(): React.JSX.Element {
       let bottom = 0;
       const toolbar = host.querySelector(".viewport-toolbar");
       if (toolbar) top = Math.max(0, toolbar.getBoundingClientRect().bottom - box.top);
+      host.style.setProperty("--vp-toolbar-bottom", `${Math.round(top)}px`);
       const hud = host.querySelector('[data-testid="obu-hud"]');
       if (hud && !hud.classList.contains("docked")) {
         const r = hud.getBoundingClientRect();
