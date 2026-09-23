@@ -34,7 +34,7 @@ export type {
   ActorRendererOptions, ActorUpdateContext, ActorUpdateStats, ActorLegendEntry,
 } from "./actors.js";
 
-export { PoseInterpolator, lerpAngle, extrapolationEase } from "./interp.js";
+export { PoseInterpolator, lerpAngle, wrapAngle, extrapolationEase, HISTORY as POSE_HISTORY } from "./interp.js";
 export type { PoseInterpolatorOptions, PoseSnapshot, SampleInfo } from "./interp.js";
 
 export { CameraController, CAMERA_MODES } from "./cameras.js";
