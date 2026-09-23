@@ -69,9 +69,14 @@ const CHANNEL_VISIBILITY: &[(&str, &[Visibility])] = &[
             Visibility::Meta,
         ],
     ),
+    // `msg.latency` carries the stages of one message's journey; a trace that names its
+    // endpoints' true node ids is ground-truth tainted, one that does not is the node's own.
+    ("msg.latency", &[Visibility::Node, Visibility::NodeAndGt]),
     ("net.bytes", &[Visibility::Node]),
     ("net.frag", &[Visibility::Node]),
     ("node.neighbor", &[Visibility::Node]),
+    // Like `phy.rx`: the sender's identity and the distance are ground truth.
+    ("node.rx", &[Visibility::Node, Visibility::NodeAndGt]),
     ("node.telemetry", &[Visibility::Node]),
     ("node.tx", &[Visibility::Node]),
     ("node.verify", &[Visibility::Node]),
@@ -290,6 +295,55 @@ pub struct NodeTxView {
     /// between the two).
     #[serde(default)]
     pub t_generated: Option<SimTime>,
+    /// When the signer picked the message up — the end of the signing-queue wait.
+    #[serde(default)]
+    pub t_sign_start: Option<SimTime>,
+    /// When the signature completed and the frame was handed to the MAC.
+    #[serde(default)]
+    pub t_signed: Option<SimTime>,
+    /// How much of the channel-access delay (`t − t_signed`) was the AIFS, ns.
+    #[serde(default)]
+    pub mac_aifs_ns: Option<u64>,
+    /// How much of it was the backoff countdown the MAC reported, ns.
+    #[serde(default)]
+    pub mac_backoff_ns: Option<u64>,
+    /// The network and transport header (WSMP, or GeoNetworking plus BTP), octets.
+    #[serde(default)]
+    pub net_header_bytes: Option<u64>,
+    /// The link layer's octets: LLC/SNAP, the 802.11 MAC header and the FCS.
+    #[serde(default)]
+    pub link_bytes: Option<u64>,
+    /// A fragmentation strategy's own per-fragment header, octets.
+    #[serde(default)]
+    pub frag_header_bytes: Option<u64>,
+    /// The SPDU this frame carries (payload plus envelope, or the whole SPDU when the split
+    /// is unknown), octets.
+    #[serde(default)]
+    pub spdu_bytes: Option<u64>,
+    /// How many octets of the envelope were the signer's certificate rather than a digest:
+    /// the certificate's own encoding when one was attached, zero otherwise.
+    #[serde(default)]
+    pub cert_bytes: Option<u64>,
+}
+
+impl NodeTxView {
+    /// The frame's bytes, checked against the per-layer split when the producer gave one:
+    /// `Some(true)` when the layers add up to `bytes_on_wire`, `Some(false)` when they do
+    /// not, `None` when the split is absent.
+    #[must_use]
+    pub fn layers_consistent(&self) -> Option<bool> {
+        let (Some(spdu), Some(net), Some(link)) =
+            (self.spdu_bytes, self.net_header_bytes, self.link_bytes)
+        else {
+            return None;
+        };
+        let frag = self.frag_header_bytes.unwrap_or(0);
+        let split_ok = match (self.payload_bytes, self.envelope_bytes) {
+            (Some(p), Some(e)) => p + e == spdu,
+            _ => true,
+        };
+        Some(split_ok && spdu + net + link + frag == self.bytes_on_wire)
+    }
 }
 
 impl ChannelView for NodeTxView {
@@ -364,6 +418,248 @@ impl ChannelView for PhyRxView {
     const CHANNEL: &'static str = "phy.rx";
 }
 
+/// What finally happened to one reception attempt (`node.rx`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RxFate {
+    /// The message reached the receiver's applications (verified, or delivered unverified
+    /// by the verification policy — [`NodeRxView::verification`] says which).
+    Delivered,
+    /// The message never reached an application; [`NodeRxView::cause`] says why.
+    Lost,
+    /// The run ended with the message still between the PHY and the application: neither
+    /// delivered nor lost. Recorded so that delivered + lost + in-flight equals the
+    /// attempts on `phy.rx` exactly.
+    InFlight,
+}
+
+/// The layer that decided a loss, for the loss-cause vocabulary of `node.rx`.
+pub mod rx_cause {
+    /// Causes the physical layer decides (invariant I-R3's list, `v2xw_radio::LossCause`).
+    pub const PHY: [&str; 10] = [
+        "out-of-range",
+        "below-sensitivity",
+        "collision",
+        "preamble-missed",
+        "half-duplex",
+        "hidden-terminal",
+        "jammed",
+        "fading",
+        "in-band-emission",
+        "resource-collision",
+    ];
+    /// A fragmented SDU whose set never completed at this receiver.
+    pub const REASSEMBLY_FAILED: &str = "reassembly-failed";
+    /// The receive queue was full.
+    pub const RX_OVERFLOW: &str = "rx-overflow";
+    /// The verification policy discarded the message.
+    pub const VERIFY_POLICY_DROP: &str = "verify-policy-drop";
+    /// The verification queue was full, or the message was evicted from it.
+    pub const VERIFY_OVERFLOW: &str = "verify-overflow";
+    /// The signature did not verify (or the envelope did not parse).
+    pub const SIGNATURE_INVALID: &str = "signature-invalid";
+    /// The signer's certificate is on the receiver's revocation list.
+    pub const REVOKED: &str = "revoked";
+    /// The receiver was switched off (an outage) or retired before it processed the frame.
+    pub const RECEIVER_OFF: &str = "receiver-off";
+
+    /// The causes above the PHY, in a fixed order.
+    pub const ABOVE_PHY: [&str; 7] = [
+        REASSEMBLY_FAILED,
+        RX_OVERFLOW,
+        VERIFY_POLICY_DROP,
+        VERIFY_OVERFLOW,
+        SIGNATURE_INVALID,
+        REVOKED,
+        RECEIVER_OFF,
+    ];
+
+    /// True for a cause the PHY decided.
+    #[must_use]
+    pub fn is_phy(cause: &str) -> bool {
+        PHY.contains(&cause) || cause == "unknown"
+    }
+
+    /// True for a cause this vocabulary defines.
+    #[must_use]
+    pub fn is_known(cause: &str) -> bool {
+        is_phy(cause) || ABOVE_PHY.contains(&cause)
+    }
+}
+
+/// The stages a V2V message's end-to-end latency is decomposed into, in the order they
+/// happen. [`NodeRxView::latency_trace`] builds them; their durations sum to the
+/// end-to-end latency exactly, in integer nanoseconds.
+pub const V2V_STAGES: [&str; 10] = [
+    "sign_queue",
+    "sign",
+    "mac_aifs",
+    "mac_backoff",
+    "mac_defer",
+    "airtime",
+    "propagation",
+    "reception",
+    "verify_queue",
+    "verify",
+];
+
+/// `node.rx` — one reception attempt at one receiver, followed to its end (NODE+GT: the
+/// sender's identity and the distance are ground truth, as on `phy.rx`).
+///
+/// `phy.rx` stops at the PHY's decision. This record follows the same attempt up the
+/// stack — reassembly, the receive queue, the verification policy, the verification queue
+/// and the signature check — to the one of three fates in [`RxFate`], and it carries every
+/// timestamp of the message's journey from its generation at the sender, so the
+/// end-to-end latency of a V2V message can be decomposed stage by stage
+/// ([`NodeRxView::latency_trace`]).
+///
+/// There is one record per `phy.rx` record: the PHY-lost attempts are recorded at the
+/// PHY's decision, the rest when the receiving node resolves them. Every timestamp is on
+/// the simulation's true timeline; a node's own clock offset has already been taken out.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeRxView {
+    /// When the attempt was resolved.
+    pub t: SimTime,
+    /// The receiving node.
+    pub rx: NodeId,
+    /// The sending node (ground truth).
+    #[serde(default)]
+    pub tx: Option<NodeId>,
+    /// The message id, the same one `node.tx` carries.
+    #[serde(default)]
+    pub msg: Option<u64>,
+    /// The message type (`bsm`, `cam`, `mbr`, `crl`, …).
+    #[serde(default)]
+    pub msg_type: Option<String>,
+    /// What finally happened.
+    pub outcome: RxFate,
+    /// The single loss cause, when lost: a PHY cause ([`rx_cause::PHY`]) or one above it
+    /// ([`rx_cause::ABOVE_PHY`]).
+    #[serde(default)]
+    pub cause: Option<String>,
+    /// What the receiver concluded about the signature, when delivered: `verified` or
+    /// `unverified`.
+    #[serde(default)]
+    pub verification: Option<String>,
+    /// Received power.
+    #[serde(default)]
+    pub rssi_dbm: Option<f64>,
+    /// Mean SINR over the frame.
+    #[serde(default)]
+    pub sinr_db: Option<f64>,
+    /// Sender-to-receiver distance at the start of the frame (ground truth).
+    #[serde(default)]
+    pub dist_m: Option<f64>,
+    /// The frame's PSDU octets.
+    #[serde(default)]
+    pub bytes_on_wire: Option<u64>,
+    /// The frame's air time, µs.
+    #[serde(default)]
+    pub airtime_us: Option<u64>,
+    /// The application payload octets the message carries.
+    #[serde(default)]
+    pub payload_bytes: Option<u64>,
+    /// The message's generation at the sender.
+    #[serde(default)]
+    pub t_generated: Option<SimTime>,
+    /// The sender's signer picked it up.
+    #[serde(default)]
+    pub t_sign_start: Option<SimTime>,
+    /// The signature completed and the frame reached the MAC.
+    #[serde(default)]
+    pub t_signed: Option<SimTime>,
+    /// Of the channel-access delay, the AIFS, ns.
+    #[serde(default)]
+    pub mac_aifs_ns: Option<u64>,
+    /// Of the channel-access delay, the backoff countdown, ns.
+    #[serde(default)]
+    pub mac_backoff_ns: Option<u64>,
+    /// The preamble went on the air.
+    #[serde(default)]
+    pub t_tx_start: Option<SimTime>,
+    /// The last symbol left the transmitter.
+    #[serde(default)]
+    pub t_tx_end: Option<SimTime>,
+    /// The last symbol reached this receiver: `t_tx_end` plus the propagation delay.
+    #[serde(default)]
+    pub t_arrival: Option<SimTime>,
+    /// The receiver finished parsing the frame and applied its verification policy.
+    #[serde(default)]
+    pub t_rx_done: Option<SimTime>,
+    /// The signature check started.
+    #[serde(default)]
+    pub t_verify_start: Option<SimTime>,
+    /// The signature check finished.
+    #[serde(default)]
+    pub t_verify_done: Option<SimTime>,
+    /// The message was handed to the receiver's applications.
+    #[serde(default)]
+    pub t_delivered: Option<SimTime>,
+}
+
+impl ChannelView for NodeRxView {
+    const CHANNEL: &'static str = "node.rx";
+}
+
+impl NodeRxView {
+    /// The end-to-end latency of a delivered message, ns, when its stamps are complete.
+    #[must_use]
+    pub fn e2e_ns(&self) -> Option<u64> {
+        let (g, d) = (self.t_generated?, self.t_delivered?);
+        d.checked_sub(g)
+    }
+
+    /// The message's journey as a [`crate::latency::LatencyTrace`], stage by stage
+    /// ([`V2V_STAGES`]).
+    ///
+    /// `None` unless the message was delivered and every stamp the decomposition needs is
+    /// present. The trace is built so its spans are contiguous by construction; whether the
+    /// stamps were *monotonic* is the trace's own [`crate::latency::LatencyTrace::validate`]
+    /// to answer, and a trace that fails it is a producer defect a test can see rather than
+    /// a sample this function quietly repairs.
+    #[must_use]
+    pub fn latency_trace(&self) -> Option<crate::latency::LatencyTrace> {
+        if self.outcome != RxFate::Delivered {
+            return None;
+        }
+        let g0 = self.t_generated?;
+        let sign_start = self.t_sign_start?;
+        let signed = self.t_signed?;
+        let tx_start = self.t_tx_start?;
+        let tx_end = self.t_tx_end?;
+        let arrival = self.t_arrival?;
+        let rx_done = self.t_rx_done?;
+        let delivered = self.t_delivered?;
+        // An unverified delivery spends no time in the verification stages: they are
+        // zero-length at the instant the policy decided.
+        let verify_start = self.t_verify_start.unwrap_or(rx_done);
+        let verify_done = self.t_verify_done.unwrap_or(verify_start);
+        // The access delay is apportioned AIFS first, then backoff, then the remainder —
+        // deferral to a busy medium, including the AIFS a node repeats after each busy
+        // period. The apportionment is an accounting order, not a claim that the medium
+        // was idle for the first AIFS: `saturating_sub` keeps each part within the whole.
+        let access = tx_start.saturating_sub(signed);
+        let aifs = self.mac_aifs_ns.unwrap_or(0).min(access);
+        let backoff = self.mac_backoff_ns.unwrap_or(0).min(access - aifs);
+        let mut b = crate::latency::TraceBuilder::new("v2v", self.msg_type.clone(), self.msg, g0);
+        b.to("sign_queue", sign_start);
+        b.to("sign", signed);
+        b.to("mac_aifs", signed.saturating_add(aifs));
+        b.to("mac_backoff", signed.saturating_add(aifs + backoff));
+        b.to("mac_defer", tx_start);
+        b.to("airtime", tx_end);
+        b.to("propagation", arrival);
+        b.to("reception", rx_done);
+        b.to("verify_queue", verify_start);
+        b.to("verify", verify_done);
+        let trace = b.finish();
+        // The delivery instant closes the trace: a stamp set in which the application
+        // received the message at any other instant than the last stage ended is not a
+        // decomposition of this message's latency.
+        (trace.end() == Some(delivered)).then_some(trace)
+    }
+}
+
 /// `mac.cbr` — the channel busy ratio the MAC measured (NODE).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MacCbrView {
@@ -384,6 +680,25 @@ pub struct MacCbrView {
     /// The measurement window's length (802.11p: 100 ms).
     #[serde(default)]
     pub window_us: Option<u64>,
+    /// Frames waiting in the node's EDCA queues at the end of the window.
+    #[serde(default)]
+    pub queue_depth: Option<u64>,
+    /// Frames the MAC refused since the previous report (a full access-category queue or
+    /// a frame over the MSDU cap).
+    #[serde(default)]
+    pub mac_drops: Option<u64>,
+    /// Frames handed to the MAC since the previous report, whatever became of them.
+    #[serde(default)]
+    pub offered_frames: Option<u64>,
+    /// Their PSDU octets.
+    #[serde(default)]
+    pub offered_bytes: Option<u64>,
+    /// Their air time, had every one of them gone on the air, µs.
+    #[serde(default)]
+    pub offered_airtime_us: Option<u64>,
+    /// The span these per-report counters cover, ns — normally the metric period.
+    #[serde(default)]
+    pub span_ns: Option<u64>,
 }
 
 impl ChannelView for MacCbrView {
@@ -579,6 +894,11 @@ pub struct GtKinematicsView {
     /// The actor's class, for the per-class breakdown.
     #[serde(default)]
     pub class: Option<String>,
+    /// The node mounted on the actor, when it is equipped. Ground truth, like the rest of
+    /// the record: it is what joins a vehicle's true position to the node that names it on
+    /// `node.rx`, which the neighbour-awareness ratio needs.
+    #[serde(default)]
+    pub node: Option<NodeId>,
 }
 
 impl ChannelView for GtKinematicsView {

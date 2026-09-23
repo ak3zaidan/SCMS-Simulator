@@ -62,30 +62,81 @@ fn recording() -> Vec<OwnedRecord> {
                 "airtime_us": 600,
                 "channel": 180,
                 "signer": if node == 1 { "certificate" } else { "digest" },
-                "t_generated": u64::from(node) * 1_000_000
+                "t_generated": u64::from(node) * 1_000_000,
+                // The per-layer split: this fixture's frames carry no headers, which is
+                // unrealistic and consistent — the layers add up to the octets on the air.
+                "spdu_bytes": 400,
+                "net_header_bytes": 0,
+                "link_bytes": 0
             }),
         ));
     }
 
     // Forty candidate receptions in the first distance bin, thirty-two of them delivered,
     // so the bin has enough trials for a point estimate at the default threshold of thirty.
+    // Each attempt is its own message (a broadcast every millisecond from node 1), and each
+    // is followed to its fate on `node.rx` with the stamps of its whole journey.
     for i in 0..40u64 {
         let delivered = i % 5 != 0;
+        let msg = 1_000 + i;
+        let t0 = 9_000_000 + i * 1_000_000;
+        let t_end = 10_500_000 + i * 1_000_000;
         out.push(rec(
             "phy.rx",
             json!({
                 "t_start": 10_000_000 + i * 1_000_000,
-                "t_end": 10_500_000 + i * 1_000_000,
+                "t_end": t_end,
                 "tx": 1,
                 "rx": 2 + (i % 3) as u32,
-                "msg": 1,
+                "msg": msg,
                 "dist_m": 12.5,
                 "outcome": if delivered { "ok" } else { "lost" },
                 "cause": if delivered { serde_json::Value::Null } else { json!("collision") },
                 "payload_bytes": if delivered { json!(300) } else { serde_json::Value::Null }
             }),
         ));
+        let mut fate = json!({
+            "t": t_end + 700_000,
+            "rx": 2 + (i % 3) as u32,
+            "tx": 1,
+            "msg": msg,
+            "msg_type": "bsm",
+            "outcome": if delivered { "delivered" } else { "lost" },
+            "cause": if delivered { serde_json::Value::Null } else { json!("collision") },
+            "verification": if delivered { json!("verified") } else { serde_json::Value::Null },
+            "rssi_dbm": -60.0,
+            "dist_m": 12.5,
+            "bytes_on_wire": 400,
+            "airtime_us": 500,
+            "payload_bytes": 300,
+            "t_generated": t0,
+            "t_sign_start": t0 + 100_000,
+            "t_signed": t0 + 400_000,
+            "mac_aifs_ns": 58_000,
+            "mac_backoff_ns": 39_000,
+            "t_tx_start": 10_000_000 + i * 1_000_000,
+            "t_tx_end": t_end,
+            "t_arrival": t_end + 42
+        });
+        if delivered {
+            fate["t_rx_done"] = json!(t_end + 42);
+            fate["t_verify_start"] = json!(t_end + 200_000);
+            fate["t_verify_done"] = json!(t_end + 700_000);
+            fate["t_delivered"] = json!(t_end + 700_000);
+        }
+        out.push(rec("node.rx", fate));
     }
+
+    // A backend flow's trace: a misbehaviour report relayed over an RSU's backhaul.
+    out.push(rec(
+        "msg.latency",
+        json!({"flow": "mbr", "msg_type": "mbr", "msg": 7, "t_origin": 300_000_000,
+        "spans": [
+            {"stage": "sign", "hop": 0, "start": 300_000_000, "end": 300_900_000},
+            {"stage": "airtime", "hop": 0, "start": 300_900_000, "end": 301_400_000},
+            {"stage": "backhaul", "hop": 1, "start": 301_400_000, "end": 321_400_000}
+        ]}),
+    ));
 
     // Verifications: thirty-two valid (matching the deliveries) and one skipped.
     for i in 0..32u64 {
@@ -251,8 +302,21 @@ fn every_provider_registers_through_the_core_registry_with_a_valid_card() {
     let mut registry = Registry::new();
     let mut set = ProviderSet::new();
     v2xw_metrics::register_all(&mut registry, &mut set, 0).unwrap();
-    assert_eq!(set.len(), 5, "the five families of 08-measurement §2");
-    assert_eq!(registry.len(), 5);
+    assert_eq!(
+        set.len(),
+        9,
+        "communication, latency, awareness, load, overhead, security, detection, safety, \
+         runtime"
+    );
+    assert_eq!(registry.len(), 9);
+    // One catalogue, so one name per metric: two providers defining the same name would
+    // put two different definitions behind one series in the page and the recording.
+    let catalog = set.catalog();
+    let mut names: Vec<&str> = catalog.iter().map(|d| d.name.as_str()).collect();
+    names.sort_unstable();
+    let before = names.len();
+    names.dedup();
+    assert_eq!(before, names.len(), "a metric name is defined twice");
     for (_, registered) in registry.iter() {
         registered.card.validate().unwrap();
         registered.card.check_api_version().unwrap();
@@ -691,6 +755,43 @@ fn each_invariant_check_catches_a_violation_injected_into_the_run() {
                 ));
             }),
         ),
+        (
+            "M-RX1",
+            Box::new(|r: &mut Vec<OwnedRecord>| {
+                // One attempt's fate goes missing: delivered + lost falls short of attempts.
+                let i = r.iter().position(|x| x.channel == "node.rx").unwrap();
+                r.remove(i);
+            }),
+        ),
+        (
+            "M-LAT1",
+            Box::new(|r: &mut Vec<OwnedRecord>| {
+                // A delivery whose signature "finished" before its message was generated.
+                r.push(rec(
+                    "node.rx",
+                    json!({"t": 5, "rx": 2, "tx": 1, "msg": 5_000, "outcome": "delivered",
+                           "t_generated": 100, "t_sign_start": 50, "t_signed": 60,
+                           "t_tx_start": 70, "t_tx_end": 80, "t_arrival": 81,
+                           "t_rx_done": 82, "t_delivered": 82}),
+                ));
+                r.push(rec(
+                    "phy.rx",
+                    json!({"t_start": 70, "t_end": 80, "tx": 1, "rx": 2, "msg": 5_000,
+                           "outcome": "ok"}),
+                ));
+            }),
+        ),
+        (
+            "M-BYTE1",
+            Box::new(|r: &mut Vec<OwnedRecord>| {
+                // A frame whose layers add up to more than went on the air.
+                r.push(rec(
+                    "node.tx",
+                    json!({"t": 1, "node": 4, "msg": 44, "bytes_on_wire": 100,
+                           "spdu_bytes": 90, "net_header_bytes": 5, "link_bytes": 38}),
+                ));
+            }),
+        ),
     ];
 
     for (invariant, inject) in cases {
@@ -710,6 +811,30 @@ fn each_invariant_check_catches_a_violation_injected_into_the_run() {
         // The message carries numbers, not just a verdict.
         assert!(msg.contains('='), "{msg} has no numbers in it");
     }
+
+    let ledger = {
+        let mut l = EventLedger::new();
+        l.ingest_all(&recording());
+        l
+    };
+    // M-BYTE2 and M-SHARE are over samples: a bucket rate that no longer sums to the
+    // total, and a stage share that no longer sums to one.
+    let mut samples = run(&recording());
+    let total = samples
+        .iter_mut()
+        .find(|s| s.metric == "bytes_total")
+        .expect("bytes_total is sampled");
+    total.value =
+        v2xw_metrics::SampleValue::Scalar(v2xw_metrics::Estimate::Value { point: 1.0, n: 1 });
+    assert!(check_all(&ledger, &samples).failed().contains(&"M-BYTE2"));
+    let mut samples = run(&recording());
+    let share = samples
+        .iter_mut()
+        .find(|s| s.metric == "latency_stage_share" && !s.value.is_insufficient())
+        .expect("a stage share is sampled");
+    share.value =
+        v2xw_metrics::SampleValue::Scalar(v2xw_metrics::Estimate::Value { point: 0.9, n: 1 });
+    assert!(check_all(&ledger, &samples).failed().contains(&"M-SHARE"));
 
     // D9's scan, the seventh check, is over samples rather than records. Two injections:
     // a raw float, and — the case the check could not see before — a float quantised onto
@@ -853,4 +978,30 @@ fn the_providers_report_what_they_could_not_read_rather_than_swallowing_it() {
         "the set reported {} undecodable records",
         set.rejected_total()
     );
+}
+
+/// Every sample of the well-formed run lies in its metric's physical range, and one
+/// impossible value — a delivery ratio above one, a negative latency — fails the check.
+#[test]
+fn an_impossible_metric_value_fails_the_range_check() {
+    let mut registry = Registry::new();
+    let mut set = ProviderSet::new();
+    v2xw_metrics::register_all(&mut registry, &mut set, 0).unwrap();
+    let catalog = set.catalog();
+    let samples = run(&recording());
+    let ok = v2xw_metrics::invariants::check_metric_ranges(&samples, &catalog);
+    assert!(ok.held(), "{:?}", ok.violations);
+    assert!(ok.checked > 20, "only {} values checked", ok.checked);
+
+    for (metric, value) in [("pdr", 1.2), ("e2e_latency", -3.0), ("bytes_total", -1.0)] {
+        let mut bad = samples.clone();
+        let target = bad
+            .iter_mut()
+            .find(|s| s.metric == metric)
+            .unwrap_or_else(|| panic!("{metric} is sampled"));
+        target.value =
+            v2xw_metrics::SampleValue::Scalar(v2xw_metrics::Estimate::Value { point: value, n: 1 });
+        let o = v2xw_metrics::invariants::check_metric_ranges(&bad, &catalog);
+        assert!(!o.held(), "{metric} = {value} went undetected");
+    }
 }

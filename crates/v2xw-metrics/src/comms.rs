@@ -8,16 +8,21 @@
 //! | `pdr_by_cause` | losses with this cause / all losses | ratio | a frame lost for two reasons at once: I-R3 requires exactly one cause, and [`crate::invariants`] checks it rather than this metric papering over it |
 //! | `cbr` | busy time / window length, as the MAC measured it | ratio | what the MAC could not hear: a hidden terminal's transmission is not busy time at this receiver |
 //! | `pir` | gap between successive receptions from one transmitter at one receiver | s | the first reception from a transmitter, which has no predecessor; and a gap that spans a pseudonym change, which looks like a new transmitter to the receiver but is recorded here against the true id |
-//! | `e2e_latency` | application delivery − message generation | ms | a message that was never delivered, which contributes no latency sample; the metric therefore describes delivered messages only and must be read beside `pdr` |
-//! | `goodput` | delivered application payload bytes / window | B/s | retransmitted or duplicate deliveries are counted once per reception, so a message delivered to ten receivers counts ten times: this is receiver-side goodput, not network throughput |
+//! | `goodput` | application payload bytes delivered to applications (`node.rx`) / window | B/s | retransmitted or duplicate deliveries are counted once per reception, so a message delivered to ten receivers counts ten times: this is receiver-side goodput, not network throughput |
 //! | `bytes_*` | bytes on the wire per accounting bucket / window | B/s | bytes the producer did not attribute to a bucket, which are reported by I-N1 rather than folded into a bucket |
+//! | `bytes_total` | Σ over the five buckets | B/s | the same bytes as the buckets: it is their sum by construction, and a test holds it to that |
+//!
+//! `e2e_latency` moved to [`crate::latency`], where it is decomposed stage by stage from
+//! `node.rx`. It used to be a join of `node.tx` to `node.verify` by message id here; no
+//! receiver can put the sender's message id on `node.verify` (it is not on the air), so
+//! the join never matched a record a real run produced.
 //! | `airtime_per_node` | transmitted air time / window | ms/s | receive-side occupancy and inter-frame spacing: this is the node's own transmissions only |
 //!
 //! # Determinism
 //!
 //! Byte counts, airtime and frame counts are accumulated as **integers**, so their
 //! reductions are exact and order-independent with no floating-point question to answer.
-//! The float-valued samples (`cbr`, `pir`, `e2e_latency`) go through
+//! The float-valued samples (`cbr`, `pir`) go through
 //! [`crate::stats::Distribution`], which sorts into IEEE-754 total order before it reduces.
 //! Per-node and per-bucket tables are `BTreeMap`s, so they are written in id order.
 //!
@@ -37,8 +42,8 @@ use v2xw_core::time::{Duration, SimTime};
 use crate::bins::Bins;
 use crate::cards;
 use crate::channels::{
-    ByteBucket, ChannelView, MacCbrView, NetBytesView, NodeTxView, NodeVerifyView, PhyRxView,
-    ProtoMsgView, RxOutcome, VerifyOutcome, decode,
+    ByteBucket, ChannelView, MacCbrView, NetBytesView, NodeRxView, NodeTxView, PhyRxView,
+    ProtoMsgView, RxFate, RxOutcome, decode,
 };
 use crate::def::{Agg, DEFAULT_LEVEL, Dim, DimValue, Dims, MetricDef, MetricSample, SampleValue};
 use crate::provider::MetricProvider;
@@ -57,15 +62,12 @@ pub const UNBINNED: &str = "unbinned";
 /// The communication metric provider.
 ///
 /// Windowed: every metric here is per flush window, and [`MetricProvider::flush`] drains
-/// the accumulators. The transmission index used to join a delivery back to its generation
-/// is *not* drained at flush — a message generated in one window can be delivered in the
-/// next — but it is pruned to [`CommsProvider::join_horizon`].
+/// the accumulators.
 pub struct CommsProvider {
     card: ModelCard,
     level: ConfidenceLevel,
     min_samples: u64,
     bins: Bins,
-    join_horizon: Duration,
 
     window_start: SimTime,
 
@@ -82,8 +84,6 @@ pub struct CommsProvider {
     pir: Distribution,
     /// The last successful reception per directed link, for the next gap.
     last_rx: BTreeMap<LinkKey, SimTime>,
-    /// One-way latencies in milliseconds.
-    latency_ms: Distribution,
     /// Airtime per transmitting node, in microseconds. Integer, so exact.
     airtime_us: BTreeMap<NodeId, u64>,
     /// Bytes on the wire per accounting bucket. Integer, so exact.
@@ -93,25 +93,23 @@ pub struct CommsProvider {
     /// Deliveries behind `goodput_bytes`, so the rate carries a sample count.
     deliveries: u64,
 
-    /// Message id → (generation instant, payload bytes), for the delivery join.
-    tx_index: BTreeMap<u64, (SimTime, Option<u64>)>,
     /// Records this provider could not decode.
     rejected: u64,
 }
 
 impl CommsProvider {
-    /// A provider with the documented defaults: 25 m distance bins, a 95 % level,
-    /// [`crate::stats::DEFAULT_MIN_SAMPLES`] and a 10 s join horizon.
+    /// A provider with the documented defaults: 25 m distance bins out to 1 km — the
+    /// engine's candidate range, so no reception it evaluates lands in the open-ended bin —
+    /// a 95 % level and [`crate::stats::DEFAULT_MIN_SAMPLES`].
     ///
     /// `t0` is the start of the first window.
     ///
     /// # Panics
-    /// Never: the eight 25 m bins are a valid bin set, so the only fallible step cannot
-    /// fail. The unwrap is kept rather than propagated so the common constructor is
-    /// infallible.
+    /// Never: forty 25 m bins are a valid bin set, so the only fallible step cannot fail.
+    /// The unwrap is kept rather than propagated so the common constructor is infallible.
     #[must_use]
     pub fn new(t0: SimTime) -> Self {
-        Self::with_bins(t0, Bins::distance_25m(8).expect("25 m bins are valid"))
+        Self::with_bins(t0, Bins::distance_25m(40).expect("25 m bins are valid"))
     }
 
     /// A provider with caller-chosen distance bins.
@@ -122,7 +120,6 @@ impl CommsProvider {
             level: DEFAULT_LEVEL,
             min_samples: crate::stats::DEFAULT_MIN_SAMPLES,
             bins,
-            join_horizon: Duration::from_secs(10),
             window_start: t0,
             pdr_by_bin: BTreeMap::new(),
             pdr_unbinned: Proportion::new(),
@@ -131,12 +128,10 @@ impl CommsProvider {
             cbr: BTreeMap::new(),
             pir: Distribution::new(),
             last_rx: BTreeMap::new(),
-            latency_ms: Distribution::new(),
             airtime_us: BTreeMap::new(),
             bytes: BTreeMap::new(),
             goodput_bytes: 0,
             deliveries: 0,
-            tx_index: BTreeMap::new(),
             rejected: 0,
         }
     }
@@ -155,20 +150,6 @@ impl CommsProvider {
         self
     }
 
-    /// Sets how long a transmission stays joinable to its delivery (the card's
-    /// `join_horizon_s`).
-    #[must_use]
-    pub const fn with_join_horizon(mut self, d: Duration) -> Self {
-        self.join_horizon = d;
-        self
-    }
-
-    /// How long a transmission stays joinable to its delivery.
-    #[must_use]
-    pub const fn join_horizon(&self) -> Duration {
-        self.join_horizon
-    }
-
     /// The distance bins in use.
     #[must_use]
     pub const fn bins(&self) -> &Bins {
@@ -180,8 +161,7 @@ impl CommsProvider {
             "metric/comms/delivery-and-airtime",
             "1.0.0",
             "Packet delivery ratio by distance, packet error rate, channel busy ratio, \
-             inter-packet gap, one-way latency, goodput, byte accounting by bucket and \
-             airtime per node.",
+             inter-packet gap, goodput, byte accounting by bucket and airtime per node.",
         );
         card.equations = vec![
             v2xw_core::card::Equation::new(
@@ -204,10 +184,6 @@ impl CommsProvider {
                  receiver",
             ),
             v2xw_core::card::Equation::new(
-                "e2e_latency",
-                "latency = t_done(application delivery) − t_generated(message), in ms",
-            ),
-            v2xw_core::card::Equation::new(
                 "goodput",
                 "goodput = Σ delivered payload bytes / window length, in B/s",
             ),
@@ -223,18 +199,7 @@ impl CommsProvider {
             json!(25.0),
             json!(1.0),
             json!(1000.0),
-            cards::design("08-measurement-and-data.md §2 (dist_bin, 25 m)"),
-        ));
-        card.parameters.push(cards::param(
-            "join_horizon_s",
-            "s",
-            json!(10.0),
-            json!(0.1),
-            json!(3600.0),
-            cards::design(
-                "08-measurement-and-data.md §2.1 (e2e_latency joins node.tx to node.verify; \
-                 the horizon bounds the join index and is this crate's choice)",
-            ),
+            cards::design("08-measurement-and-data.md §2 (dist_bin, 25 m), to 1 km"),
         ));
         card.sources = vec![
             cards::design("08-measurement-and-data.md §2.1 (radio and network metric catalog)"),
@@ -251,15 +216,8 @@ impl CommsProvider {
             "pdr is measured over candidate receptions, so it says nothing about coverage: a \
              transmitter with no neighbours contributes no trials."
                 .to_string(),
-            "e2e_latency is over delivered messages only and is biased low whenever loss is \
-             correlated with delay; read it beside pdr."
-                .to_string(),
             "goodput is receiver-side: one broadcast delivered to ten receivers counts ten \
              times."
-                .to_string(),
-            "A transmission is joined to its delivery by message id within join_horizon_s; a \
-             delivery later than that is not counted, and the count of such misses is not \
-             itself reported."
                 .to_string(),
         ];
         card.ignores = vec![
@@ -294,6 +252,7 @@ impl CommsProvider {
             .with_dims([Dim::T, Dim::DistBin])
             .with_source(src.clone())
             .with_min_samples(self.min_samples)
+            .with_range(0.0, 1.0)
             .not_accounting_for("receivers outside the tier's candidate range")
             .not_accounting_for(
                 "coverage: a transmitter with no candidate receivers contributes no trials",
@@ -311,6 +270,7 @@ impl CommsProvider {
             .with_dims([Dim::T])
             .with_source(src.clone())
             .with_min_samples(self.min_samples)
+            .with_range(0.0, 1.0)
             .not_accounting_for("the same denominator as pdr")
             .not_accounting_for("bit errors within a received frame (a frame is received or not)"),
             MetricDef::new(
@@ -327,6 +287,7 @@ impl CommsProvider {
             .with_dims([Dim::T, Dim::Cause])
             .with_source(src.clone())
             .with_min_samples(self.min_samples)
+            .with_range(0.0, 1.0)
             .not_accounting_for("a frame lost for two reasons at once")
             .not_accounting_for("losses the producer recorded without a cause"),
             MetricDef::new(
@@ -343,6 +304,7 @@ impl CommsProvider {
             .with_dims([Dim::T, Dim::Channel])
             .with_source(cards::standard("3GPP TS 38.215 §5.1.27; TS 36.214"))
             .with_min_samples(self.min_samples)
+            .with_range(0.0, 1.0)
             .not_accounting_for("energy the receiver could not hear (a hidden terminal)")
             .not_accounting_for("which node measured it: this is the distribution across nodes"),
             MetricDef::new(
@@ -357,39 +319,31 @@ impl CommsProvider {
                  the same transmitter at the same receiver.",
             )
             .with_dims([Dim::T])
-            .with_source(src.clone())
+            .with_source(cards::paper(
+                "Martelli, Elena Renda, Resta, Santi, 'A measurement-based study of beaconing \
+                 performance in IEEE 802.11p vehicular networks', IEEE INFOCOM 2012 (packet \
+                 inter-reception time)",
+            ))
             .with_min_samples(self.min_samples)
+            .with_range(0.0, f64::INFINITY)
             .not_accounting_for("the first reception from a transmitter, which has no predecessor")
             .not_accounting_for(
                 "a pseudonym change, which a receiver sees as a new transmitter while this \
                  metric pairs on the true id",
             ),
             MetricDef::new(
-                "e2e_latency",
-                "ms",
-                Agg::Distribution,
-                Visibility::Node,
-                Quantum::TIME_MS,
-                "Generation time to application delivery, including queueing, air time and \
-                 verification.",
-            )
-            .with_dims([Dim::T])
-            .with_source(src.clone())
-            .with_min_samples(self.min_samples)
-            .not_accounting_for("messages that were never delivered, which contribute no sample")
-            .not_accounting_for("deliveries later than the join horizon"),
-            MetricDef::new(
                 "goodput",
                 "B/s",
                 Agg::Rate,
                 Visibility::Node,
                 Quantum::BYTES,
-                "Application payload bytes delivered to receivers, divided by the window's \
-                 length.",
+                "Application payload bytes delivered to receivers' applications (node.rx), \
+                 divided by the window's length.",
             )
             .with_dims([Dim::T])
             .with_source(src.clone())
             .with_min_samples(1)
+            .with_range(0.0, f64::INFINITY)
             .not_accounting_for("duplicate suppression: one broadcast to ten receivers counts ten times")
             .not_accounting_for("headers and the security envelope, which are in bytes_air"),
             MetricDef::new(
@@ -403,6 +357,7 @@ impl CommsProvider {
             .with_dims([Dim::T, Dim::Node])
             .with_source(src.clone())
             .with_min_samples(1)
+            .with_range(0.0, 1000.0)
             .not_accounting_for("receive-side occupancy")
             .not_accounting_for("inter-frame spacing and backoff, which are not transmitted time"),
         ]
@@ -423,9 +378,28 @@ impl CommsProvider {
             .with_dims([Dim::T, Dim::Bucket])
             .with_source(cards::design("08-measurement-and-data.md §2.1 (bytes per bucket)"))
             .with_min_samples(1)
+            .with_range(0.0, f64::INFINITY)
             .not_accounting_for("bytes the producer did not attribute to a bucket")
             .not_accounting_for("physical-layer preamble and padding, unless the producer counts them in bytes_on_wire")
         }))
+        .chain(core::iter::once(
+            MetricDef::new(
+                "bytes_total",
+                "B/s",
+                Agg::Rate,
+                Visibility::Node,
+                Quantum::BYTES,
+                "Every byte on the wire in every accounting bucket, divided by the window's \
+                 length: the sum of bytes_air, bytes_uu_ul, bytes_uu_dl, bytes_backhaul and \
+                 bytes_backend, which invariant I-N1 makes disjoint.",
+            )
+            .with_dims([Dim::T])
+            .with_source(cards::design("03-interfaces.md §5 (I-N1)"))
+            .with_min_samples(1)
+            .with_range(0.0, f64::INFINITY)
+            .not_accounting_for("bytes the producer did not attribute to a bucket")
+            .not_accounting_for("physical-layer preamble and padding"),
+        ))
         .collect()
     }
 
@@ -442,10 +416,6 @@ impl CommsProvider {
             *self.airtime_us.entry(v.node).or_insert(0) += us;
         }
         *self.bytes.entry(ByteBucket::Air).or_insert(0) += v.bytes_on_wire;
-        if let Some(id) = v.msg {
-            self.tx_index
-                .insert(id, (v.t_generated.unwrap_or(v.t), v.payload_bytes));
-        }
     }
 
     /// Records one reception attempt.
@@ -474,32 +444,17 @@ impl CommsProvider {
                         .observe(Duration::between(prev, v.t_end).as_secs_f64());
                 }
             }
-            if let Some(bytes) = v.payload_bytes {
-                self.goodput_bytes += bytes;
-                self.deliveries += 1;
-            }
         }
     }
 
-    /// Records one verification, which is where a message reaches the application.
-    fn on_verify(&mut self, v: &NodeVerifyView) {
-        let delivered = matches!(v.outcome, VerifyOutcome::Valid | VerifyOutcome::Skipped);
-        if !delivered {
+    /// Records one end-to-end outcome: a delivery to an application is goodput.
+    fn on_node_rx(&mut self, v: &NodeRxView) {
+        if v.outcome != RxFate::Delivered {
             return;
         }
-        let (Some(id), Some(t_done)) = (v.msg, v.t_done) else {
-            return;
-        };
-        let Some(&(t_gen, _payload)) = self.tx_index.get(&id) else {
-            return;
-        };
-        if t_done >= t_gen {
-            let ns = t_done - t_gen;
-            // Integer nanoseconds divided by an exact power of ten: one correctly rounded
-            // division, identical on every target. Goodput is counted on the reception
-            // (`on_rx`), not here, so a message delivered to ten receivers counts ten
-            // times and a verification that delivers nothing adds no bytes.
-            self.latency_ms.observe((ns as f64) / 1e6);
+        if let Some(bytes) = v.payload_bytes {
+            self.goodput_bytes += bytes;
+            self.deliveries += 1;
         }
     }
 
@@ -549,7 +504,7 @@ impl MetricProvider for CommsProvider {
             NodeTxView::channel_name(),
             PhyRxView::channel_name(),
             MacCbrView::channel_name(),
-            NodeVerifyView::channel_name(),
+            NodeRxView::channel_name(),
             NetBytesView::channel_name(),
             ProtoMsgView::channel_name(),
         ]
@@ -569,8 +524,8 @@ impl MetricProvider for CommsProvider {
                 Ok(v) => self.on_cbr(&v),
                 Err(_) => self.rejected += 1,
             },
-            NodeVerifyView::CHANNEL => match decode::<NodeVerifyView>(ev) {
-                Ok(v) => self.on_verify(&v),
+            NodeRxView::CHANNEL => match decode::<NodeRxView>(ev) {
+                Ok(v) => self.on_node_rx(&v),
                 Err(_) => self.rejected += 1,
             },
             NetBytesView::CHANNEL => match decode::<NetBytesView>(ev) {
@@ -664,20 +619,13 @@ impl MetricProvider for CommsProvider {
             ));
         }
 
-        // --- pir and e2e_latency ---------------------------------------------------------
+        // --- pir -------------------------------------------------------------------------
         let pir = core::mem::replace(&mut self.pir, Distribution::new());
         out.push(MetricSample::new(
             &self.def("pir"),
             at,
             Dims::new(),
             SampleValue::Distribution(pir.summary(self.min_samples)),
-        ));
-        let latency = core::mem::replace(&mut self.latency_ms, Distribution::new());
-        out.push(MetricSample::new(
-            &self.def("e2e_latency"),
-            at,
-            Dims::new(),
-            SampleValue::Distribution(latency.summary(self.min_samples)),
         ));
 
         // --- goodput ---------------------------------------------------------------------
@@ -720,8 +668,10 @@ impl MetricProvider for CommsProvider {
 
         // --- bytes per bucket ------------------------------------------------------------
         let buckets = core::mem::take(&mut self.bytes);
+        let mut all_bytes = 0u64;
         for bucket in ByteBucket::ALL {
             let bytes = buckets.get(&bucket).copied().unwrap_or(0);
+            all_bytes += bytes;
             let mut dims = Dims::new();
             dims.insert(Dim::Bucket, DimValue::label(bucket.as_str()));
             let value = match secs {
@@ -739,11 +689,22 @@ impl MetricProvider for CommsProvider {
             ));
         }
 
+        // The total is the sum of exactly the integers the five bucket samples were made
+        // from, so `bytes_total` equals their sum before quantisation by construction.
+        out.push(MetricSample::new(
+            &self.def("bytes_total"),
+            at,
+            Dims::new(),
+            SampleValue::Scalar(match secs {
+                Some(s) => Estimate::Value {
+                    point: (all_bytes as f64) / s,
+                    n: 1,
+                },
+                None => Estimate::Insufficient { n: 0, required: 1 },
+            }),
+        ));
+
         // --- window bookkeeping ----------------------------------------------------------
-        // Prune the join index: a transmission older than the horizon can no longer be
-        // matched, and keeping it would make the index grow with the run.
-        let cutoff = at.saturating_sub(self.join_horizon.as_nanos());
-        self.tx_index.retain(|_, (t_gen, _)| *t_gen >= cutoff);
         // `last_rx` is not pruned by time: it holds one instant per directed link, which is
         // bounded by the number of links the run actually used, and a gap that spans a
         // window is a real gap.
@@ -810,12 +771,7 @@ mod tests {
             .iter()
             .map(|x| x.name.as_str())
             .collect();
-        for expected in [
-            "min_samples",
-            "confidence_level",
-            "dist_bin_width_m",
-            "join_horizon_s",
-        ] {
+        for expected in ["min_samples", "confidence_level", "dist_bin_width_m"] {
             assert!(names.contains(&expected), "{expected} not declared");
         }
     }
@@ -861,7 +817,7 @@ mod tests {
     fn an_empty_window_yields_insufficient_and_never_nan() {
         let mut p = CommsProvider::new(0);
         let s = p.flush(1_000_000_000);
-        for key in ["pdr", "per", "pir", "e2e_latency"] {
+        for key in ["pdr", "per", "pir"] {
             let v = &sample(&s, key).value;
             assert!(v.is_insufficient(), "{key}: {v:?}");
             assert_eq!(v.point(), None, "{key}");
@@ -931,46 +887,6 @@ mod tests {
     }
 
     #[test]
-    fn latency_joins_generation_to_delivery() {
-        let mut p = CommsProvider::new(0).with_min_samples(1);
-        p.on_event(&rec(
-            "node.tx",
-            json!({"t":5_000_000,"node":1,"msg":42,"bytes_on_wire":400,
-                   "t_generated":1_000_000,"payload_bytes":100,"airtime_us":600}),
-        ));
-        p.on_event(&rec(
-            "node.verify",
-            json!({"t_enqueue":6_000_000,"t_done":9_000_000,"node":2,"outcome":"valid","msg":42}),
-        ));
-        let s = p.flush(1_000_000_000);
-        // 9 ms − 1 ms = 8 ms.
-        assert_eq!(sample(&s, "e2e_latency").value.point(), Some(8.0));
-        // An unmatched verification contributes nothing rather than a zero.
-        let mut p = CommsProvider::new(0).with_min_samples(1);
-        p.on_event(&rec(
-            "node.verify",
-            json!({"t_enqueue":0,"t_done":9_000_000,"node":2,"outcome":"valid","msg":7}),
-        ));
-        let s = p.flush(1_000_000_000);
-        assert!(sample(&s, "e2e_latency").value.is_insufficient());
-    }
-
-    #[test]
-    fn a_dropped_verification_is_not_a_delivery() {
-        let mut p = CommsProvider::new(0).with_min_samples(1);
-        p.on_event(&rec(
-            "node.tx",
-            json!({"t":0,"node":1,"msg":1,"bytes_on_wire":400,"t_generated":0}),
-        ));
-        p.on_event(&rec(
-            "node.verify",
-            json!({"t_enqueue":0,"t_done":5_000_000,"node":2,"outcome":"dropped","msg":1}),
-        ));
-        let s = p.flush(1_000_000_000);
-        assert!(sample(&s, "e2e_latency").value.is_insufficient());
-    }
-
-    #[test]
     fn goodput_and_bytes_are_rates_over_the_window() {
         let mut p = CommsProvider::new(0);
         // Two 400 B transmissions and two 100 B deliveries in a 2 s window.
@@ -982,8 +898,17 @@ mod tests {
             "node.tx",
             json!({"t":0,"node":1,"msg":2,"bytes_on_wire":400,"airtime_us":600}),
         ));
-        p.on_event(&rx(1, 2, 10.0, true, 1_000));
-        p.on_event(&rx(1, 3, 10.0, true, 2_000));
+        for receiver in [2, 3] {
+            p.on_event(&rec(
+                "node.rx",
+                json!({"t":1_000,"rx":receiver,"tx":1,"outcome":"delivered","payload_bytes":100}),
+            ));
+        }
+        // A loss carries no goodput, whatever its payload.
+        p.on_event(&rec(
+            "node.rx",
+            json!({"t":1_000,"rx":4,"tx":1,"outcome":"lost","cause":"fading","payload_bytes":100}),
+        ));
         p.on_event(&rec(
             "net.bytes",
             json!({"t":0,"bucket":"backhaul","bytes_on_wire":1_000,"id":5}),
@@ -1005,6 +930,8 @@ mod tests {
         );
         // 200 B delivered in 2 s.
         assert_eq!(sample(&s, "goodput").value.point(), Some(100.0));
+        // The total is the buckets' sum: 800 B of air and 1000 B of backhaul in 2 s.
+        assert_eq!(sample(&s, "bytes_total").value.point(), Some(900.0));
         // 1.2 ms of airtime in 2 s = 0.6 ms/s.
         assert_eq!(
             sample(&s, "airtime_per_node|node=1").value.point(),
@@ -1073,23 +1000,6 @@ mod tests {
     }
 
     #[test]
-    fn the_join_index_is_pruned_at_the_horizon() {
-        let mut p = CommsProvider::new(0).with_join_horizon(Duration::from_secs(1));
-        p.on_event(&rec(
-            "node.tx",
-            json!({"t":0,"node":1,"msg":1,"bytes_on_wire":400,"t_generated":0}),
-        ));
-        let _ = p.flush(5_000_000_000);
-        // The transmission is now older than the horizon, so a late delivery joins nothing.
-        p.on_event(&rec(
-            "node.verify",
-            json!({"t_enqueue":0,"t_done":6_000_000_000u64,"node":2,"outcome":"valid","msg":1}),
-        ));
-        let s = p.flush(6_000_000_000);
-        assert!(sample(&s, "e2e_latency").value.is_insufficient());
-    }
-
-    #[test]
     fn a_non_candidate_reception_is_not_a_trial() {
         let mut p = CommsProvider::new(0).with_min_samples(1);
         p.on_event(&rec(
@@ -1111,7 +1021,7 @@ mod tests {
                 "node.tx",
                 "phy.rx",
                 "mac.cbr",
-                "node.verify",
+                "node.rx",
                 "net.bytes",
                 "proto.msg"
             ]

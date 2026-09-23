@@ -17,7 +17,7 @@
 //! | [`stats`] | the honest statistics: sample counts, [`Proportion`] with the Wilson score interval, [`Distribution`] with one stated percentile rule, and insufficiency instead of a point estimate over too few samples |
 //! | [`bins`] | binning on the integer grid, so a boundary case cannot flip between platforms |
 //! | [`channels`] | reader-side views of the event channels of 03-interfaces.md §14 |
-//! | [`comms`], [`security`], [`detection`], [`safety`], [`runtime`] | the five metric families |
+//! | [`comms`], [`latency`], [`awareness`], [`load`], [`overhead`], [`security`], [`detection`], [`safety`], [`runtime`] | the metric families |
 //! | [`invariants`] | each stated invariant as a runnable check that returns which invariant failed and with what numbers |
 //! | [`gate`] | the model-card completeness gate of 10-roadmap.md Phase 6, as a function over the registry: no `todo-calibrate` on a `high`-tier default without a tracked calibration issue |
 //! | [`ledger`] | the decoded record history the invariant checks read |
@@ -32,8 +32,18 @@
 //! everything). The per-module tables hold the details:
 //!
 //! * **Communication** ([`comms`]): `pdr` by distance bin, `per`, `pdr_by_cause`, `cbr`,
-//!   `pir`, `e2e_latency`, `goodput`, `bytes_air`/`bytes_uu_ul`/`bytes_uu_dl`/
-//!   `bytes_backhaul`/`bytes_backend`, `airtime_per_node`.
+//!   `pir`, `goodput`, `bytes_air`/`bytes_uu_ul`/`bytes_uu_dl`/`bytes_backhaul`/
+//!   `bytes_backend` and their sum `bytes_total`, `airtime_per_node`.
+//! * **Latency** ([`latency`]): `e2e_latency` (p50, p95, p99) per flow and message type,
+//!   decomposed into contiguous stages — `latency_stage`, `latency_stage_share` — with the
+//!   general [`latency::LatencyTrace`] every backend or multi-hop flow plugs into.
+//! * **Awareness** ([`awareness`]): `aoi`, `aoi_peak`, `nar`, `delivery_ratio` by distance.
+//! * **Load** ([`load`]): `channel_occupancy`, `channel_load`, `offered_load`,
+//!   `carried_load`, `loss_rate` by cause, `collision_rate`, `half_duplex_rate`,
+//!   `mac_queue_depth`, `mac_drops`, `mac_access_delay`.
+//! * **Overhead** ([`overhead`]): `security_overhead`, `net_header_overhead`,
+//!   `link_overhead`, `cert_bytes_share`, `air_bytes_per_payload_byte`,
+//!   `bytes_per_vehicle_hour` per bucket.
 //! * **Security** ([`security`]): `verify_rate`, `verify_cost`, `verify_wait`,
 //!   `verify_queue_depth`, `unverified_ratio`, `full_cert_share`, `envelope_overhead`,
 //!   `revocation_latency_stage`, `crl_entries`, `crl_bytes`.
@@ -121,6 +131,7 @@
 #![forbid(unsafe_code)]
 
 pub mod arrow_out;
+pub mod awareness;
 pub mod bins;
 pub mod cards;
 pub mod channels;
@@ -130,7 +141,10 @@ pub mod detection;
 pub mod error;
 pub mod gate;
 pub mod invariants;
+pub mod latency;
 pub mod ledger;
+pub mod load;
+pub mod overhead;
 pub mod provider;
 pub mod quant;
 pub mod runtime;
@@ -156,7 +170,7 @@ pub use summary::{DigestSet, RunDiagnostics, RunSummary, metric_digest};
 
 /// The providers 08-measurement-and-data.md's catalog is covered by, registered in one call.
 ///
-/// The five families of the design's §2, in a fixed order: communication, security,
+/// In a fixed order: communication, latency, awareness, load, overhead, security,
 /// detection, mobility and safety, runtime diagnostics. `t0` is the start of the first
 /// window.
 ///
@@ -172,6 +186,10 @@ pub fn register_all(
     t0: v2xw_core::time::SimTime,
 ) -> Result<()> {
     set.register(registry, Box::new(comms::CommsProvider::new(t0)))?;
+    set.register(registry, Box::new(latency::LatencyProvider::new()))?;
+    set.register(registry, Box::new(awareness::AwarenessProvider::new(t0)))?;
+    set.register(registry, Box::new(load::LoadProvider::new(t0)))?;
+    set.register(registry, Box::new(overhead::OverheadProvider::new(t0)))?;
     set.register(registry, Box::new(security::SecurityProvider::new(t0)))?;
     set.register(registry, Box::new(detection::DetectionProvider::new()))?;
     set.register(registry, Box::new(safety::SafetyProvider::new(t0)))?;
