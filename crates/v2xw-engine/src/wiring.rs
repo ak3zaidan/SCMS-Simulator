@@ -54,6 +54,41 @@ pub const TX_POWER_DBM: f64 = 20.0;
 /// # Errors
 /// [`EngineError::World`] if the source cannot be built or imported.
 pub fn build_world(scenario: &Scenario) -> Result<World> {
+    let world = build_world_geometry(scenario)?;
+    attach_terrain(scenario, world)
+}
+
+/// Reads `world.terrain.dem`, when the scenario names one, and attaches it to the world.
+///
+/// The DEM is resampled onto the world's own frame and extent
+/// ([`v2xw_world::dem::import_terrain_for_world`]) and attached **without draping**
+/// ([`v2xw_world::DrapeOptions::none`]): lanes, junctions and buildings keep the `z` the
+/// importer gave them, and the terrain is what the radio's knife-edge diffraction reads as
+/// the ground between two antennas (`obstacle/terrain/knife-edge-p526`, composed by
+/// [`build_obstacles`]). An SRTM `.hgt` tile or an ESRI ASCII grid in geographic
+/// coordinates is read; the world's content hash then covers the grid.
+///
+/// # Errors
+/// [`EngineError::World`] if the file cannot be read or does not cover a usable grid.
+fn attach_terrain(scenario: &Scenario, world: World) -> Result<World> {
+    let Some(path) = scenario.world.terrain.dem.as_deref() else {
+        return Ok(world);
+    };
+    let (terrain, report) = v2xw_world::dem::import_terrain_for_world(
+        &world,
+        path,
+        &v2xw_world::DemOptions::default(),
+    )?;
+    let (world, _drape) = v2xw_world::dem::with_terrain(
+        &world,
+        terrain,
+        &v2xw_world::DrapeOptions::none(),
+        &report,
+    )?;
+    Ok(world)
+}
+
+fn build_world_geometry(scenario: &Scenario) -> Result<World> {
     let opts = ImportOptions::default().imported_at(scenario.world.imported_at.clone());
     let opts = ImportOptions {
         keep_building_holes: scenario.world.buildings.keep_holes,
@@ -182,29 +217,535 @@ pub fn build_gnss(_scenario: &Scenario) -> Box<dyn GnssModel> {
     ))
 }
 
+/// The radio families a scenario may name a model for in `radio.models`, and the ids
+/// each accepts. Everything else is refused by the loader.
+pub const RADIO_MODEL_FAMILIES: &[(&str, &[&str])] = &[
+    (
+        "propagation",
+        &[
+            v2xw_radio::FreeSpace::ID,
+            v2xw_radio::TwoRayGround::ID,
+            v2xw_radio::LogDistanceShadowing::ID,
+            v2xw_radio::Tr37885::ID,
+        ],
+    ),
+    ("fading", &[v2xw_radio::NoFading::ID, v2xw_radio::NakagamiFading::ID]),
+    ("per", &[v2xw_radio::PerModel::ID]),
+    ("phy", &[v2xw_radio::OfdmPhy::ID]),
+    ("obstacle", &[v2xw_radio::BuildingShadowing::ID]),
+];
+
+/// Which propagation law `radio.models.propagation` selects.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PropagationChoice {
+    /// `propagation/free-space`: Friis.
+    FreeSpace,
+    /// `propagation/two-ray-ground`: the flat-earth two-ray model.
+    TwoRayGround,
+    /// `propagation/log-distance-shadowing` with one fixed preset, or `None` for the
+    /// per-link choice from the environment and the vehicle-obstruction state.
+    LogDistance(Option<v2xw_radio::LogDistancePreset>),
+    /// `propagation/tr37885`: the 3GPP LOS/NLOS/NLOSv state model with its own shadowing.
+    Tr37885,
+}
+
+/// Which small-scale fading `radio.models.fading` selects.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FadingChoice {
+    /// `fading/none`.
+    None,
+    /// `fading/nakagami-m` with one preset.
+    Nakagami(v2xw_radio::NakagamiPreset),
+}
+
+/// The radio models a scenario named in `radio.models`, parsed. A family it did not name
+/// is `None` and gets the tier's default.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RadioModels {
+    /// The propagation law.
+    pub propagation: Option<PropagationChoice>,
+    /// The fading model.
+    pub fading: Option<FadingChoice>,
+    /// The 802.11p packet-error model's implementation-loss preset.
+    pub per: Option<v2xw_radio::PerPreset>,
+    /// The 802.11p receiver-sensitivity table.
+    pub sensitivity: Option<v2xw_radio::SensitivityPreset>,
+    /// The Sommer 2011 fitted row the building obstacle model uses.
+    pub building_fit: Option<v2xw_radio::SommerFit>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresetParam<T> {
+    #[serde(default = "none")]
+    preset: Option<T>,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PhyParams {
+    #[serde(default)]
+    sensitivity: Option<v2xw_radio::SensitivityPreset>,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildingParams {
+    #[serde(default)]
+    fit: Option<v2xw_radio::SommerFit>,
+}
+
+fn none<T>() -> Option<T> {
+    None
+}
+
+fn params_of<T: serde::de::DeserializeOwned>(
+    v: &serde_json::Value,
+) -> core::result::Result<T, String> {
+    let v = if v.is_null() {
+        serde_json::json!({})
+    } else {
+        v.clone()
+    };
+    serde_json::from_value(v).map_err(|e| e.to_string())
+}
+
+/// Parses `radio.models`, returning every problem with the dotted path it is at.
+///
+/// # Errors
+/// One `(path, reason)` per unknown family, unknown id, or parameter that does not fit
+/// the model.
+pub fn radio_models(
+    scenario: &Scenario,
+) -> core::result::Result<RadioModels, Vec<(String, String)>> {
+    let mut out = RadioModels::default();
+    let mut errors = Vec::new();
+    for (family, choice) in &scenario.radio.models {
+        let path = format!("radio.models.{family}");
+        let Some((_, ids)) = RADIO_MODEL_FAMILIES.iter().find(|(f, _)| f == family) else {
+            errors.push((
+                path,
+                format!(
+                    "'{family}' is not a radio family this build selects a model for; \
+                     selectable: {}",
+                    RADIO_MODEL_FAMILIES
+                        .iter()
+                        .map(|(f, _)| *f)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+            continue;
+        };
+        if !ids.contains(&choice.id.as_str()) {
+            errors.push((
+                format!("{path}.id"),
+                format!(
+                    "'{}' is not a {family} model this build ships; choose one of: {}",
+                    choice.id,
+                    ids.join(", ")
+                ),
+            ));
+            continue;
+        }
+        let bad = |e: String| (format!("{path}.params"), format!("do not fit {}: {e}", choice.id));
+        match family.as_str() {
+            "propagation" => {
+                let chosen = match choice.id.as_str() {
+                    v2xw_radio::FreeSpace::ID => PropagationChoice::FreeSpace,
+                    v2xw_radio::TwoRayGround::ID => PropagationChoice::TwoRayGround,
+                    v2xw_radio::Tr37885::ID => PropagationChoice::Tr37885,
+                    _ => match params_of::<PresetParam<v2xw_radio::LogDistancePreset>>(
+                        &choice.params,
+                    ) {
+                        Ok(p) => PropagationChoice::LogDistance(p.preset),
+                        Err(e) => {
+                            errors.push(bad(e));
+                            continue;
+                        }
+                    },
+                };
+                out.propagation = Some(chosen);
+            }
+            "fading" => {
+                if choice.id == v2xw_radio::NoFading::ID {
+                    out.fading = Some(FadingChoice::None);
+                } else {
+                    match params_of::<PresetParam<v2xw_radio::NakagamiPreset>>(&choice.params) {
+                        Ok(p) => {
+                            out.fading = Some(FadingChoice::Nakagami(
+                                p.preset.unwrap_or(v2xw_radio::NakagamiPreset::FixedMedium),
+                            ));
+                        }
+                        Err(e) => errors.push(bad(e)),
+                    }
+                }
+            }
+            "per" => match params_of::<PresetParam<v2xw_radio::PerPreset>>(&choice.params) {
+                Ok(p) => out.per = Some(p.preset.unwrap_or(v2xw_radio::PerPreset::Ideal)),
+                Err(e) => errors.push(bad(e)),
+            },
+            "phy" => match params_of::<PhyParams>(&choice.params) {
+                Ok(p) => out.sensitivity = p.sensitivity,
+                Err(e) => errors.push(bad(e)),
+            },
+            "obstacle" => match params_of::<BuildingParams>(&choice.params) {
+                Ok(p) => {
+                    out.building_fit = Some(p.fit.unwrap_or(v2xw_radio::SommerFit::Default));
+                }
+                Err(e) => errors.push(bad(e)),
+            },
+            _ => {}
+        }
+    }
+    if errors.is_empty() {
+        Ok(out)
+    } else {
+        Err(errors)
+    }
+}
+
 /// The propagation and fading models the scenario names.
+///
+/// `radio.models.propagation` and `radio.models.fading` choose them when present. The
+/// defaults follow the tier (04-models.md §3 tier table): free space with no fading at
+/// `abstract`; dual-slope log-distance with correlated shadowing, the preset chosen per
+/// link from the environment, and Nakagami `m = 3` fading at `medium` and `high`.
 pub fn build_radio(
     scenario: &Scenario,
     world: &World,
 ) -> (Box<dyn BoxedPropagation>, Box<dyn BoxedFading>) {
-    let tier = scenario.radio.tiers.propagation;
+    build_radio_at(scenario, world, scenario.radio.tiers.propagation)
+}
+
+/// [`build_radio`] at a caller-chosen propagation tier: the focus region's stack.
+pub fn build_radio_at(
+    scenario: &Scenario,
+    world: &World,
+    tier: v2xw_core::card::Tier,
+) -> (Box<dyn BoxedPropagation>, Box<dyn BoxedFading>) {
+    let models = radio_models(scenario).unwrap_or_default();
     let env = world.env_class_at(v2xw_core::geom::Vec3::new(
         (world.bbox.min.x + world.bbox.max.x) * 0.5,
         (world.bbox.min.y + world.bbox.max.y) * 0.5,
         0.0,
     ));
-    let propagation: Box<dyn BoxedPropagation> = match tier {
-        v2xw_core::card::Tier::Abstract => Box::new(v2xw_radio::FreeSpace::new(tier)),
-        _ => Box::new(v2xw_radio::LogDistanceShadowing::auto(tier, env)),
+    let default_propagation = match tier {
+        v2xw_core::card::Tier::Abstract => PropagationChoice::FreeSpace,
+        _ => PropagationChoice::LogDistance(None),
     };
-    let fading: Box<dyn BoxedFading> = match tier {
-        v2xw_core::card::Tier::Abstract => Box::new(v2xw_radio::NoFading::new()),
-        _ => Box::new(v2xw_radio::NakagamiFading::new(
-            v2xw_radio::NakagamiPreset::FixedMedium,
-        )),
+    let propagation: Box<dyn BoxedPropagation> =
+        match models.propagation.unwrap_or(default_propagation) {
+            PropagationChoice::FreeSpace => Box::new(v2xw_radio::FreeSpace::new(tier)),
+            PropagationChoice::TwoRayGround => Box::new(v2xw_radio::TwoRayGround::new(tier)),
+            PropagationChoice::Tr37885 => Box::new(v2xw_radio::Tr37885::new(tier, env)),
+            PropagationChoice::LogDistance(None) => {
+                Box::new(v2xw_radio::LogDistanceShadowing::auto(tier, env))
+            }
+            PropagationChoice::LogDistance(Some(preset)) => {
+                Box::new(v2xw_radio::LogDistanceShadowing::new(tier, preset, env))
+            }
+        };
+    let default_fading = match tier {
+        v2xw_core::card::Tier::Abstract => FadingChoice::None,
+        _ => FadingChoice::Nakagami(v2xw_radio::NakagamiPreset::FixedMedium),
+    };
+    let fading: Box<dyn BoxedFading> = match models.fading.unwrap_or(default_fading) {
+        FadingChoice::None => Box::new(v2xw_radio::NoFading::new()),
+        FadingChoice::Nakagami(preset) => Box::new(v2xw_radio::NakagamiFading::new(preset)),
     };
     (propagation, fading)
 }
+
+/// Registers the cards of the radio models a run composes, so the manifest pins them.
+///
+/// # Errors
+/// [`EngineError::Registry`] if a card does not validate.
+pub fn register_radio(
+    registry: &mut Registry,
+    propagation: &dyn BoxedPropagation,
+    fading: &dyn BoxedFading,
+    phy: &v2xw_radio::OfdmPhy,
+) -> Result<()> {
+    use v2xw_core::model::Model;
+    for card in [
+        propagation.card().clone(),
+        fading.card().clone(),
+        phy.card().clone(),
+    ] {
+        if !registry.contains(&card.id) {
+            registry.register(card)?;
+        }
+    }
+    Ok(())
+}
+
+/// Where each node's generator sits on the time axis.
+///
+/// The default is [`v2xw_msg::GenerationTiming::default`]: an independent uniform phase
+/// per node over the 100 ms nominal period of both the BSM (SAE J2945/1) and the CAM's
+/// `T_GenCamMin` (EN 302 637-2 §6.1.3), and ns-3's 10 ms hand-off jitter. A scenario
+/// overrides either through `messages.generator.params`:
+///
+/// ```yaml
+/// messages:
+///   generator:
+///     id: generator/timing-phase-jitter
+///     params: { phase_window_ms: 0, max_jitter_ms: 0 }   # every node on one grid
+/// ```
+///
+/// `phase_window_ms: 0, max_jitter_ms: 0` is the synchronised behaviour this engine had
+/// before the model existed, kept so the contention it causes can still be studied.
+pub fn generation_timing(scenario: &Scenario) -> v2xw_msg::GenerationTiming {
+    let mut t = v2xw_msg::GenerationTiming::default();
+    if let Some(choice) = &scenario.messages.generator {
+        let ms = |key: &str| {
+            choice
+                .params
+                .get(key)
+                .and_then(serde_json::Value::as_f64)
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .map(|v| Duration::from_nanos((v * 1e6).round() as u64))
+        };
+        if let Some(w) = ms("phase_window_ms") {
+            t.phase_window = w;
+        }
+        if let Some(j) = ms("max_jitter_ms") {
+            t.max_jitter = j;
+        }
+    }
+    t
+}
+
+/// Registers the generation-timing card in force, so the manifest pins the phase window
+/// and the jitter a run used.
+///
+/// # Errors
+/// [`EngineError::Registry`] if the card does not validate.
+pub fn register_generation_timing(
+    registry: &mut Registry,
+    timing: v2xw_msg::GenerationTiming,
+) -> Result<()> {
+    let card = timing.card();
+    if !registry.contains(&card.id) {
+        registry.register(card)?;
+    }
+    Ok(())
+}
+
+/// What obstructs a radio link: the obstacle stack of 04-models.md §3.5, as far as this
+/// build composes it.
+///
+/// * **Buildings** — `obstacle/building/sommer-2011`: `β` dB per exterior wall the
+///   straight path crosses plus `γ` dB per metre of it inside a footprint, from the
+///   world's own building footprints, with the 2.5-D refinement that a roof below both
+///   antennas does not block. On when `world.buildings.enabled` is true (the default) and
+///   the propagation tier is `medium` or `high`, which is how the §3 tier table composes
+///   it. Until this stack existed every link was evaluated as line of sight, so a signal
+///   crossed a Midtown block of 40-storey towers as though it were open road.
+/// * **Terrain** — `obstacle/terrain/knife-edge-p526`: ITU-R P.526 knife-edge diffraction
+///   over the world's terrain profile, Deygout for multiple edges. On whenever the world
+///   carries a terrain grid (`world.terrain.dem`) at the `medium` or `high` tier. The tier
+///   table puts terrain diffraction at `high` only; this build applies it at `medium` too
+///   because a scenario that loads a DEM has asked for the ground to obstruct, and a flat
+///   world makes the model a no-op anyway.
+///
+/// The abstract tier composes no obstacle: it is free-space by definition.
+#[derive(Debug, Default)]
+pub struct ObstacleStack {
+    /// Building shadowing, when composed.
+    pub buildings: Option<v2xw_radio::BuildingShadowing>,
+    /// Terrain diffraction, when composed.
+    pub terrain: Option<v2xw_radio::TerrainDiffraction>,
+    /// Whether the building model's *loss* is charged, or only its geometry classified.
+    ///
+    /// `propagation/tr37885` decides its NLOS state from the geometry ("different streets:
+    /// geometric") and prices it with its own NLOS law, so under it the buildings are
+    /// classified and not charged a second time.
+    pub building_loss: bool,
+}
+
+impl ObstacleStack {
+    /// The line-of-sight answer for one path between two antennas.
+    pub fn classify(&mut self, world: &World, a: v2xw_core::geom::Vec3, b: v2xw_core::geom::Vec3) -> v2xw_radio::LosResult {
+        let mut parts = Vec::with_capacity(2);
+        if let Some(buildings) = self.buildings.as_mut() {
+            parts.push(buildings.los_cached(world, a, b));
+        }
+        if let Some(terrain) = self.terrain.as_ref() {
+            parts.push(<v2xw_radio::TerrainDiffraction as v2xw_radio::ObstacleModel<
+                crate::ctx::EngineCtx<'_>,
+            >>::los(terrain, world, a, b, None));
+        }
+        match parts.len() {
+            0 => v2xw_radio::LosResult::clear(),
+            1 => parts.pop().expect("one part"),
+            _ => v2xw_radio::merge_los(&parts),
+        }
+    }
+
+    /// The obstacle loss for a classified path, dB, summed in the stack's fixed order.
+    ///
+    /// `los_path_db` is the line-of-sight path loss the propagation model charged, which
+    /// the building model's street-canyon ceiling is measured against
+    /// ([`v2xw_radio::BuildingShadowing::loss_for_path`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn loss_db(
+        &mut self,
+        ctx: &mut crate::ctx::EngineCtx<'_>,
+        tx: &v2xw_radio::RadioEndpoint,
+        rx: &v2xw_radio::RadioEndpoint,
+        los: &v2xw_radio::LosResult,
+        f_hz: f64,
+        los_path_db: f64,
+    ) -> f64 {
+        let mut terms = [0.0f64; 2];
+        if self.building_loss
+            && let Some(buildings) = self.buildings.as_ref()
+        {
+            terms[0] = buildings.loss_for_path(los, tx.pos.distance(rx.pos), f_hz, los_path_db);
+        }
+        if let Some(terrain) = self.terrain.as_mut() {
+            terms[1] = v2xw_radio::ObstacleModel::obstacle_loss_db(terrain, ctx, tx, rx, los, f_hz);
+        }
+        v2xw_core::math::sum_ordered(terms)
+    }
+
+    /// Registers the cards of the models in the stack, so the manifest pins them.
+    ///
+    /// # Errors
+    /// [`EngineError::Registry`] if a card does not validate.
+    pub fn register(&self, registry: &mut Registry) -> Result<()> {
+        use v2xw_core::model::Model;
+        let mut cards = Vec::new();
+        if let Some(b) = &self.buildings {
+            cards.push(b.card().clone());
+        }
+        if let Some(t) = &self.terrain {
+            cards.push(t.card().clone());
+        }
+        for card in cards {
+            if !registry.contains(&card.id) {
+                registry.register(card)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The obstacle stack the scenario selects; see [`ObstacleStack`].
+///
+/// `propagation/tr37885` decides its NLOS state from the same building geometry and
+/// prices it with its own NLOS law; charging the Sommer term on top would count every
+/// building twice, so under it the buildings are classified and not charged.
+/// `radio.models.obstacle` picks the Sommer fitted row.
+pub fn build_obstacles(scenario: &Scenario, world: &World) -> ObstacleStack {
+    let tier = scenario.radio.tiers.propagation;
+    let models = radio_models(scenario).unwrap_or_default();
+    if tier == v2xw_core::card::Tier::Abstract {
+        return ObstacleStack::default();
+    }
+    let own_nlos_law = models.propagation == Some(PropagationChoice::Tr37885);
+    let fit = models.building_fit.unwrap_or(v2xw_radio::SommerFit::Default);
+    ObstacleStack {
+        building_loss: !own_nlos_law,
+        buildings: (scenario.world.buildings.enabled && !world.buildings.is_empty())
+            .then(|| v2xw_radio::BuildingShadowing::with_fit(tier, fit)),
+        terrain: world
+            .terrain
+            .is_some()
+            .then(|| v2xw_radio::TerrainDiffraction::new(tier)),
+    }
+}
+
+/// A focus region (02-architecture.md §7.3) and the radio stack that runs inside it.
+///
+/// `v2xw_radio::FocusPlan` holds the coupling rule: a link whose receiver is inside the
+/// region is decided by the focus tier's PHY (at `high`, preamble capture and the
+/// per-window SINR); a link with both ends inside gets the focus tier's propagation (at
+/// `high`, the weather attenuation term) and fading; an inbound link — transmitter
+/// outside, receiver inside — gets the surrounding propagation **without** a fading draw
+/// (rule 3's "deterministic" crossing); an outbound link is the surrounding tier's, and
+/// is the one direction that carries the documented boundary bias.
+///
+/// Medium access stays one model for the whole world: a contention window cannot be
+/// half-modelled, and `FocusPlan::warnings` says so for a `mac: high` focus.
+pub struct FocusStack {
+    /// The region and the coupling rule.
+    pub plan: v2xw_radio::FocusPlan,
+    /// The propagation model inside the region.
+    pub propagation: Box<dyn BoxedPropagation>,
+    /// The fading model inside the region.
+    pub fading: Box<dyn BoxedFading>,
+}
+
+impl core::fmt::Debug for FocusStack {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FocusStack").field("plan", &self.plan).finish_non_exhaustive()
+    }
+}
+
+/// The focus region `radio.tiers.focus` declares, or `None`.
+///
+/// A `follow` region is a disc the engine re-centres on the followed node at every
+/// mobility step; until that node exists it sits nowhere, so no link is in focus. A `bbox`
+/// region is projected into the world's frame once.
+pub fn build_focus(scenario: &Scenario, world: &World) -> Option<FocusStack> {
+    use v2xw_core::card::Tier;
+    let focus = scenario.radio.tiers.focus.as_ref()?;
+    let t = &scenario.radio.tiers;
+    let outside = v2xw_radio::RadioTierSet {
+        propagation: t.propagation,
+        phy: t.phy,
+        mac: t.mac,
+    };
+    let inside = v2xw_radio::RadioTierSet {
+        propagation: t.propagation.max(focus.tier),
+        phy: t.phy.max(focus.tier),
+        // One MAC for the world; see the type's documentation.
+        mac: t.mac,
+    };
+    let (shape, follows) = match &focus.region {
+        crate::scenario::schema::FocusRegion::Follow { node, radius_m } => (
+            v2xw_radio::FocusShape::circle(FOCUS_NOWHERE, *radius_m),
+            Some(NodeId::new(*node)),
+        ),
+        crate::scenario::schema::FocusRegion::Bbox { bbox } => {
+            let origin: v2xw_core::geo::GeoOrigin = world.origin.into();
+            let a = origin.to_enu(bbox.min_lat_deg, bbox.min_lon_deg, 0.0);
+            let b = origin.to_enu(bbox.max_lat_deg, bbox.max_lon_deg, 0.0);
+            (
+                v2xw_radio::FocusShape::bbox(v2xw_core::geom::Bbox::new(a, b)),
+                None,
+            )
+        }
+        // `FocusRegion` is `#[non_exhaustive]`; a region added upstream is refused by the
+        // loader until this match learns it.
+        #[allow(unreachable_patterns)]
+        _ => return None,
+    };
+    let mut plan = v2xw_radio::FocusPlan::new(shape, inside, outside);
+    plan.follows = follows;
+    let crossing = if t.propagation == Tier::Abstract {
+        Tier::Medium
+    } else {
+        t.propagation
+    };
+    let plan = plan.with_crossing_propagation(crossing);
+    let (propagation, fading) = build_radio_at(scenario, world, inside.propagation);
+    Some(FocusStack {
+        plan,
+        propagation,
+        fading,
+    })
+}
+
+/// Where a `follow` region sits before its node exists: far outside any world.
+pub const FOCUS_NOWHERE: v2xw_core::geom::Vec3 = v2xw_core::geom::Vec3 {
+    x: 1.0e12,
+    y: 1.0e12,
+    z: 0.0,
+};
 
 /// The weather the run starts in.
 pub fn initial_weather(scenario: &Scenario) -> WeatherState {
@@ -449,9 +990,20 @@ pub fn build_node(
         ..NodeConfig::default()
     };
     let mut runtime = ObuRuntime::new(node, profile, policy, config, at);
+    apply_compute_tier(&mut runtime, scenario);
     apply_security_profile(&mut runtime, scenario, env);
     bootstrap_credentials(&mut runtime, scenario, node, at);
     runtime
+}
+
+/// `nodes.compute_tier`: at `abstract` the node's cryptography costs a microsecond and no
+/// node is ever compute-bound; at `medium` and `high` every operation costs its hardware
+/// profile's service time and queues behind the node's own servers. The two upper tiers
+/// are the same model: nothing in this build adds service-time variability at `high`.
+fn apply_compute_tier(runtime: &mut ObuRuntime, scenario: &Scenario) {
+    if scenario.nodes.compute_tier == v2xw_core::card::Tier::Abstract {
+        runtime.set_compute_unlimited();
+    }
 }
 
 /// Puts `security.envelope` and `security.signer_id_policy` into a fresh node's security
@@ -549,8 +1101,20 @@ pub fn bootstrap_credentials(
 /// one from a `high`-tier run — which this build has not produced, so an abstract-tier
 /// scenario runs the link-budget PHY over free-space propagation and no fading. That is a
 /// missing calibration artefact, not a missing seam.
+///
+/// `radio.models.per` selects the implementation-loss preset of the NIST error model
+/// (`ideal`, or `sjoberg-atheros`'s measured 5 dB), and `radio.models.phy` the sensitivity
+/// table (`etsi-static`, `etsi-dynamic`, `cohda-mk5`).
 pub fn build_phy(scenario: &Scenario) -> v2xw_radio::OfdmPhy {
-    v2xw_radio::OfdmPhy::new(scenario.radio.tiers.phy)
+    let models = radio_models(scenario).unwrap_or_default();
+    let mut phy = v2xw_radio::OfdmPhy::new(scenario.radio.tiers.phy);
+    if let Some(preset) = models.per {
+        phy = phy.with_per_model(v2xw_radio::PerModel::new(preset));
+    }
+    if let Some(sensitivity) = models.sensitivity {
+        phy = phy.with_sensitivity(sensitivity);
+    }
+    phy
 }
 
 /// The medium-access model the scenario names, or `None` when the tier models no access.
@@ -630,6 +1194,7 @@ pub fn build_rsu(
     // misbehaviour reports has to have verified the report it forwards, and the
     // `prioritized` policy would skip a distant sender — which is every sender, at a mast.
     let mut runtime = ObuRuntime::new(node, profile, Box::new(VerifyAll::new()), config, at);
+    apply_compute_tier(&mut runtime, scenario);
     apply_security_profile(&mut runtime, scenario, env);
     bootstrap_credentials(&mut runtime, scenario, node, at);
     runtime

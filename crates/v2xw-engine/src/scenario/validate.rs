@@ -288,17 +288,22 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus { path: "world.imported_at", status: Status::Wired,
         note: "The import date the world's provenance records. Supplied here because no \
                part of the engine may read a clock." },
-    KeyStatus { path: "world.buildings.enabled", status: Status::NotImplemented,
-        note: "The importer has no switch for this: building footprints are always \
-               imported. Use it to document intent, not to change the run." },
+    KeyStatus { path: "world.buildings.enabled", status: Status::Wired,
+        note: "Whether buildings obstruct radio links. On, a link through a building \
+               loses 9 dB per wall and 0.4 dB per metre inside (Sommer 2011), capped at \
+               the around-the-corner street-canyon loss of 3GPP TR 37.885's urban NLOS \
+               law; off, every link is line of sight. Buildings are imported and drawn \
+               either way. Applies at the medium and high propagation tiers." },
     KeyStatus { path: "world.buildings.keep_holes", status: Status::Wired,
         note: "Whether interior courtyards stay holes in a footprint." },
     KeyStatus { path: "world.buildings.metres_per_level", status: Status::Wired,
         note: "Overrides the importer's storey height for buildings tagged with levels \
                rather than a height." },
-    KeyStatus { path: "world.terrain", status: Status::NotImplemented,
-        note: "No terrain raster is read. The world is flat and the digital elevation \
-               model named here is ignored." },
+    KeyStatus { path: "world.terrain", status: Status::Wired,
+        note: "A digital elevation model (an SRTM .hgt tile or a geographic ESRI ASCII \
+               grid) is read, resampled onto the world, and obstructs radio links by \
+               ITU-R P.526 knife-edge diffraction over the ground profile. Roads and \
+               buildings are not lifted onto it. No file: the world is flat." },
     KeyStatus { path: "world.cache", status: Status::NotImplemented,
         note: "No import is cached. Every run re-imports the world." },
     KeyStatus { path: "world.highway_preset", status: Status::Wired,
@@ -350,9 +355,12 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus { path: "weather.surface", status: Status::NotImplemented,
         note: "No model that runs reads the road surface condition." },
     // --- radio -------------------------------------------------------------
-    KeyStatus { path: "radio.rat", status: Status::NotImplemented,
-        note: "The radio access technology is 802.11p whatever this says. The cellular \
-               sidelink stacks are not selectable." },
+    KeyStatus { path: "radio.rat", status: Status::Wired,
+        note: "The radio access technology. dsrc-80211p runs CSMA/CA with J2945/1 \
+               congestion control on channel 172; lte-v2x-pc5 runs Mode 4 sensing-based \
+               semi-persistent scheduling on a 10 MHz, four-sub-channel pool in channel \
+               183; nr-v2x-pc5 runs Mode 2 at 30 kHz with re-evaluation and pre-emption. \
+               'hybrid' is refused: it needs a per-message policy no key states." },
     KeyStatus { path: "radio.tiers.propagation", status: Status::Wired,
         note: "Path-loss fidelity. Abstract is free-space; medium and high are \
                log-distance with shadowing." },
@@ -360,12 +368,18 @@ pub static KEY_STATUS: &[KeyStatus] = &[
         note: "Physical-layer fidelity." },
     KeyStatus { path: "radio.tiers.mac", status: Status::Wired,
         note: "Medium-access fidelity." },
-    KeyStatus { path: "radio.tiers.focus", status: Status::Refused,
-        note: "One tier runs for the whole world. A region at a higher tier needs a \
-               per-region dispatch the run loop does not have, so naming one is refused." },
-    KeyStatus { path: "radio.models", status: Status::NotImplemented,
-        note: "The radio models are chosen from the tiers above. Naming a model per \
-               family here selects nothing." },
+    KeyStatus { path: "radio.tiers.focus", status: Status::Partial,
+        note: "A region — a disc following one node, or a map box — whose links run the \
+               propagation and the receiver at the focus tier (at high: weather \
+               attenuation and preamble capture). Links entering it use the surrounding \
+               propagation with no fading draw. Medium access stays one model for the \
+               whole world, and 802.11p only: a sidelink run ignores the region's PHY tier." },
+    KeyStatus { path: "radio.models", status: Status::Wired,
+        note: "Picks a model per radio family, overriding the tier's default: \
+               propagation (free-space, two-ray-ground, log-distance with a named preset, \
+               tr37885), fading (none, nakagami-m with a preset), per (the 802.11p error \
+               model's implementation loss), phy (the 802.11p sensitivity table) and \
+               obstacle (the Sommer building row). Unknown families and ids are refused." },
     // --- network -----------------------------------------------------------
     KeyStatus { path: "net.layer", status: Status::Refused,
         note: "No network layer is composed: a frame goes from the signer to the MAC with \
@@ -383,9 +397,11 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus { path: "messages.sets", status: Status::Refused,
         note: "Which message sets the nodes generate. Only the BSM and the CAM have a \
                generator, so anything else is refused rather than silently unsent." },
-    KeyStatus { path: "messages.generator", status: Status::NotImplemented,
-        note: "The generation rules are the node runtime's own; naming a generator model \
-               selects nothing." },
+    KeyStatus { path: "messages.generator", status: Status::Partial,
+        note: "Sets where each node's generator sits in time: params.phase_window_ms (each \
+               node's phase is uniform over it; default 100) and params.max_jitter_ms (a \
+               per-message delay before the radio; default 10). 0 and 0 put every vehicle \
+               on one grid. The generation rules themselves are fixed." },
     KeyStatus { path: "messages.codec_tier", status: Status::Refused,
         note: "The node encodes real UPER unconditionally, so the size-model tier is \
                refused rather than ignored." },
@@ -424,8 +440,11 @@ pub static KEY_STATUS: &[KeyStatus] = &[
                security module and its radio." },
     KeyStatus { path: "nodes.per_class", status: Status::Wired,
         note: "Per-vehicle-class overrides of the profile above." },
-    KeyStatus { path: "nodes.compute_tier", status: Status::NotImplemented,
-        note: "Read by nothing. Node compute cost comes from the hardware profile." },
+    KeyStatus { path: "nodes.compute_tier", status: Status::Partial,
+        note: "abstract: signing and verification cost a microsecond and no node is ever \
+               compute-bound. medium and high: every operation costs the hardware \
+               profile's service time and queues behind the node's servers; high adds \
+               nothing over medium yet." },
     KeyStatus { path: "nodes.backend_tier", status: Status::NotImplemented,
         note: "Read by nothing." },
     // --- threats and detection --------------------------------------------
@@ -434,9 +453,12 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus { path: "threats.attackers[].params", status: Status::Partial,
         note: "Only 'intensity' and 'dt_s' are read; any other key in the object is \
                silently dropped." },
-    KeyStatus { path: "threats.jammers", status: Status::NotImplemented,
-        note: "Read by nothing: a jammer named here transmits nothing and a scenario of \
-               only jammers builds no threat layer at all." },
+    KeyStatus { path: "threats.jammers", status: Status::Wired,
+        note: "Fixed-position jammers: constant, pulsed (period_ms, duty) or reactive \
+               (trigger_dbm), with position_m, power_dbm and an active window. Their \
+               energy raises the noise at every receiver in range, holds 802.11p carrier \
+               sense busy, counts as channel load, and a frame they kill is reported \
+               'jammed'." },
     KeyStatus { path: "threats.compromised_rsus", status: Status::NotImplemented,
         note: "Read by nothing." },
     KeyStatus { path: "detection.local", status: Status::Partial,
@@ -536,17 +558,6 @@ pub fn validate(s: &Scenario) -> Vec<ScenarioError> {
 /// hardware profile, and `time.t0` reaches its wall clock through
 /// [`crate::wiring::NodeEnv`].
 fn unreachable_keys(s: &Scenario, e: &mut Vec<ScenarioError>) {
-    // A mixed-tier focus region (02-architecture.md §7.3) needs a per-region tier
-    // dispatch the run loop does not have: `Engine::build` selects one propagation model,
-    // one PHY and one MAC for the whole world from `radio.tiers`.
-    if s.radio.tiers.focus.is_some() {
-        e.push(conflict(
-            "radio.tiers.focus",
-            "names a focus region, and this build runs one tier for the whole world:              `wiring::build_phy`, `build_mac` and `build_radio` each select one model from              `radio.tiers` at build time and nothing re-selects per region. Remove the key              rather than letting the run quietly ignore it (02-architecture.md §7.3)"
-                .to_string(),
-        ));
-    }
-
     // Vulnerable road users are a mobility population. `v2xw-mobility` spawns vehicles
     // from a demand model and nothing spawns a pedestrian or a cyclist, so the three
     // fields select a population that never exists.
@@ -925,6 +936,28 @@ fn weather(s: &Scenario, e: &mut Vec<ScenarioError>) {
 fn radio(s: &Scenario, e: &mut Vec<ScenarioError>) {
     let t = &s.radio.tiers;
 
+    // `radio.models`: every family and id must be one `wiring::build_radio`,
+    // `build_phy` and `build_obstacles` act on, with parameters that fit the model. The
+    // parse is the wiring's own, so the loader and the run cannot disagree about it.
+    if let Err(problems) = crate::wiring::radio_models(s) {
+        for (path, why) in problems {
+            e.push(conflict(&path, why));
+        }
+    }
+
+    // `hybrid` names two radios on one node and a policy choosing between them per
+    // message. `v2xw_radio::hybrid` has the selector; nothing states the policy, so the
+    // engine would have to invent one.
+    if s.radio.rat == crate::scenario::schema::Rat::Hybrid {
+        e.push(conflict(
+            "radio.rat",
+            "is 'hybrid', which needs a per-message arbitration policy between the \
+             802.11p and the sidelink stack that no scenario key states; choose \
+             dsrc-80211p, lte-v2x-pc5 or nr-v2x-pc5"
+                .to_string(),
+        ));
+    }
+
     // 03-interfaces.md §13's own example, and 02-architecture.md §7.1's ladder: a
     // frame-level PHY decides receptions per frame, and a MAC below `high` does not
     // produce frames at that granularity, so the PHY would be computing outcomes for
@@ -982,6 +1015,55 @@ fn net(s: &Scenario, e: &mut Vec<ScenarioError>) {
 }
 
 fn messages(s: &Scenario, e: &mut Vec<ScenarioError>) {
+    // `messages.generator` tunes the generation timing and nothing else: the generation
+    // rules themselves are the node runtime's (`v2xw_msg::generator`).
+    if let Some(g) = &s.messages.generator {
+        let known = [
+            v2xw_msg::GENERATION_TIMING_ID,
+            v2xw_msg::BSM_GENERATOR_ID,
+            v2xw_msg::CAM_GENERATOR_ID,
+        ];
+        if !known.contains(&g.id.as_str()) {
+            e.push(conflict(
+                "messages.generator.id",
+                format!(
+                    "'{}' is not a generator this build ships; choose one of: {}",
+                    g.id,
+                    known.join(", ")
+                ),
+            ));
+        }
+        if let Some(obj) = g.params.as_object() {
+            for (k, v) in obj {
+                let limit = match k.as_str() {
+                    "phase_window_ms" => 1_000.0,
+                    "max_jitter_ms" => 100.0,
+                    other => {
+                        e.push(conflict(
+                            &format!("messages.generator.params.{other}"),
+                            "is not a generation-timing parameter; the two are \
+                             phase_window_ms and max_jitter_ms"
+                                .to_string(),
+                        ));
+                        continue;
+                    }
+                };
+                match v.as_f64() {
+                    Some(x) if x.is_finite() && (0.0..=limit).contains(&x) => {}
+                    _ => e.push(conflict(
+                        &format!("messages.generator.params.{k}"),
+                        format!("is {v}, and it must be a number of milliseconds in [0, {limit}]"),
+                    )),
+                }
+            }
+        } else if !g.params.is_null() {
+            e.push(conflict(
+                "messages.generator.params",
+                "must be an object of phase_window_ms and max_jitter_ms".to_string(),
+            ));
+        }
+    }
+
     one_of(
         "messages.codec_tier",
         &s.messages.codec_tier,
@@ -1164,6 +1246,11 @@ fn nodes(s: &Scenario, e: &mut Vec<ScenarioError>) {
 }
 
 fn threats(s: &Scenario, e: &mut Vec<ScenarioError>) {
+    if let Err(problems) = crate::run::jamming::jammer_specs(s) {
+        for (path, why) in problems {
+            e.push(conflict(&path, why));
+        }
+    }
     for (i, a) in s.threats.attackers.iter().enumerate() {
         let named = u8::from(a.fraction.is_some())
             + u8::from(a.count.is_some())
