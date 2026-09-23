@@ -1130,8 +1130,7 @@ export class Viewer {
     const pxPerRad = this.#height / Math.max(1e-3, fovRad);
     const d0 = Math.round(Math.min(600, Math.max(60, (0.5 * pxPerRad) / 1.5)));
     const d1 = Math.round(Math.min(2000, Math.max(d0 + 50, (1.0 * pxPerRad) / 1.5)));
-    const cur = this.actors.lodDistancesM;
-    if (cur[0] !== d0 || cur[1] !== d1) this.actors.lodDistancesM = [d0, d1];
+    this.actors.setLodDistances(d0, d1);
   }
 
   /** Advance by an explicit `dt`, for tests and deterministic captures. */

@@ -330,6 +330,12 @@ export class ActorRenderer {
     this.#lod1 = v[1];
   }
 
+  /** Set the two LOD switch distances without allocating (the frame loop calls this every frame). */
+  setLodDistances(lod0: number, lod1: number): void {
+    this.#lod0 = lod0;
+    this.#lod1 = lod1;
+  }
+
   /** Whether the ground-truth `ATTACKER` bit colours actors (09-ui §6: GT overlays can be locked off). */
   get showGroundTruth(): boolean {
     return this.#showGroundTruth;

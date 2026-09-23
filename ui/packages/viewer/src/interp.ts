@@ -104,6 +104,11 @@ export interface PoseSnapshot {
   occupied: Uint8Array;
   /** False before the first {@link PoseInterpolator.capture}. */
   valid: boolean;
+  /** Capture sequence number; identifies a segment in the per-slot curve cache. */
+  seq: number;
+  /** `cos`/`sin` of `heading`, computed once per capture so no frame pays for trigonometry. */
+  cosH: Float32Array;
+  sinH: Float32Array;
 }
 
 /** Tuning for {@link PoseInterpolator}. */
@@ -196,6 +201,9 @@ export const ERROR_BLEND_SECONDS = 0.12;
 
 const NO_ACTOR = 0xffffffff;
 
+/** Coefficients cached per slot: x and y cubics, z linear, heading cubic. */
+const COEF = 14;
+
 function makeSnapshot(capacity: number): PoseSnapshot {
   return {
     clockSeconds: 0,
@@ -210,6 +218,9 @@ function makeSnapshot(capacity: number): PoseSnapshot {
     state: new Uint8Array(capacity),
     occupied: new Uint8Array(capacity),
     valid: false,
+    seq: -1,
+    cosH: new Float32Array(capacity),
+    sinH: new Float32Array(capacity),
   };
 }
 
@@ -231,6 +242,8 @@ function growSnapshot(s: PoseSnapshot, capacity: number): void {
   s.heading = growF32(s.heading, capacity);
   s.speed = growF32(s.speed, capacity);
   s.accel = growF32(s.accel, capacity);
+  s.cosH = growF32(s.cosH, capacity);
+  s.sinH = growF32(s.sinH, capacity);
   const id = new Uint32Array(capacity).fill(NO_ACTOR);
   id.set(s.actorId, 0);
   s.actorId = id;
@@ -398,6 +411,16 @@ export class PoseInterpolator {
   #snapAll = false;
   /** Scratch for one slot's raw pose. */
   #raw = new Float64Array(4);
+  #nextSeq = 0;
+  /**
+   * Per-slot curve cache. The cubic through a segment depends only on the two snapshots (and the
+   * neighbours' headings), so it is fitted once per slot per segment — ten times a second — and each
+   * frame only evaluates a polynomial: `COEF` numbers per slot, keyed by the newer snapshot's
+   * sequence number and whether its successor was known.
+   */
+  #cKey: Float64Array;
+  #cId: Uint32Array;
+  #coef: Float64Array;
 
   #lastInfo: SampleInfo = {
     alpha: 0, delaySeconds: 0, intervalSeconds: 0.1, stalled: false, count: 0, snapped: 0,
@@ -443,6 +466,9 @@ export class PoseInterpolator {
     this.#errPos = new Float32Array(this.#capacity * 3);
     this.#errHead = new Float32Array(this.#capacity);
     this.#errId = new Uint32Array(this.#capacity).fill(NO_ACTOR);
+    this.#cKey = new Float64Array(this.#capacity).fill(-1);
+    this.#cId = new Uint32Array(this.#capacity).fill(NO_ACTOR);
+    this.#coef = new Float64Array(this.#capacity * COEF);
   }
 
   /** Slot capacity of the interpolator's own arrays. */
@@ -552,6 +578,15 @@ export class PoseInterpolator {
     const eid = new Uint32Array(n).fill(NO_ACTOR);
     eid.set(this.#errId, 0);
     this.#errId = eid;
+    const ck = new Float64Array(n).fill(-1);
+    ck.set(this.#cKey, 0);
+    this.#cKey = ck;
+    const cid = new Uint32Array(n).fill(NO_ACTOR);
+    cid.set(this.#cId, 0);
+    this.#cId = cid;
+    const coef = new Float64Array(n * COEF);
+    coef.set(this.#coef, 0);
+    this.#coef = coef;
     this.#capacity = n;
   }
 
@@ -669,8 +704,14 @@ export class PoseInterpolator {
       s.classIdx.set(poses.classIdx.subarray(0, count), 0);
       s.state.set(poses.state.subarray(0, count), 0);
       s.occupied.set(poses.occupied.subarray(0, count), 0);
-      for (let i = 0; i < count; i++) s.accel[i] = poses.accelCq[i] / ACCEL_SCALE;
+      for (let i = 0; i < count; i++) {
+        s.accel[i] = poses.accelCq[i] / ACCEL_SCALE;
+        const h = s.heading[i];
+        s.cosH[i] = Math.cos(h);
+        s.sinH[i] = Math.sin(h);
+      }
     }
+    s.seq = this.#nextSeq++;
     // Slots above the new high-water mark are not live.
     if (s.occupied.length > count) s.occupied.fill(0, count);
   }
@@ -813,6 +854,13 @@ export class PoseInterpolator {
 
     const count = newest.count;
     this.#outCount = count;
+    // The frame-wide segment the fast path evaluates: inside the history, between `a` and `b`.
+    const inSegment = this.#size > 1 && renderSim >= a.simSeconds && renderSim <= b.simSeconds && segSpan > 1e-9;
+    const segU = inSegment ? (renderSim - a.simSeconds) / segSpan : 0;
+    const segKey = b.seq * 2 + (bk >= 1 ? 1 : 0);
+    const cKey = this.#cKey;
+    const cId = this.#cId;
+    const coef = this.#coef;
 
     // Re-base the correction blend where the underlying function changed under the picture.
     const rebaseAt = this.#rebaseAtCurrent
@@ -822,6 +870,12 @@ export class PoseInterpolator {
     this.#rebaseAtPrevious = false;
     const rebase = Number.isFinite(rebaseAt) && this.#outCount > 0;
     const rebaseBk = rebase ? this.#bracket(rebaseAt) : 0;
+    const rb = this.#at(rebaseBk);
+    const ra = this.#size > rebaseBk + 1 ? this.#at(rebaseBk + 1) : rb;
+    const rebaseIn = rebase && this.#size > 1 && rebaseAt >= ra.simSeconds && rebaseAt <= rb.simSeconds
+      && rb.simSeconds - ra.simSeconds > 1e-9;
+    const rebaseU = rebaseIn ? (rebaseAt - ra.simSeconds) / (rb.simSeconds - ra.simSeconds) : 0;
+    const rebaseKey = rb.seq * 2 + (rebaseBk >= 1 ? 1 : 0);
     const decay = frameDt > 0 ? Math.exp(-frameDt / ERROR_BLEND_SECONDS) : 1;
     const blendMax2 = this.blendMaxMetres * this.blendMaxMetres;
     const raw = this.#raw;
@@ -854,7 +908,20 @@ export class PoseInterpolator {
         const shownY = oPos[p + 1];
         const shownZ = oPos[p + 2];
         const shownH = oHead[i];
-        if (this.#evaluate(i, id, rebaseAt, rebaseBk, raw) >= 0) {
+        let got: number;
+        if (rebaseIn && ((this.#cKey[i] === rebaseKey && this.#cId[i] === id) || this.#fit(i, id, rebaseBk, rebaseKey))) {
+          const c = i * COEF;
+          const co = this.#coef;
+          const u = rebaseU;
+          raw[0] = co[c] + u * (co[c + 1] + u * (co[c + 2] + u * co[c + 3]));
+          raw[1] = co[c + 4] + u * (co[c + 5] + u * (co[c + 6] + u * co[c + 7]));
+          raw[2] = co[c + 8] + u * co[c + 9];
+          raw[3] = co[c + 10] + u * (co[c + 11] + u * (co[c + 12] + u * co[c + 13]));
+          got = 0;
+        } else {
+          got = this.#evaluate(i, id, rebaseAt, rebaseBk, raw);
+        }
+        if (got >= 0) {
           const dx = shownX - raw[0];
           const dy = shownY - raw[1];
           const dz = shownZ - raw[2];
@@ -876,7 +943,18 @@ export class PoseInterpolator {
       this.outState[i] = newest.state[i];
       this.outSpeed[i] = newest.speed[i];
 
-      let kind = this.#evaluate(i, id, renderSim, bk, raw);
+      let kind: number;
+      if (inSegment && ((cKey[i] === segKey && cId[i] === id) || this.#fit(i, id, bk, segKey))) {
+        const c = i * COEF;
+        const u = segU;
+        raw[0] = coef[c] + u * (coef[c + 1] + u * (coef[c + 2] + u * coef[c + 3]));
+        raw[1] = coef[c + 4] + u * (coef[c + 5] + u * (coef[c + 6] + u * coef[c + 7]));
+        raw[2] = coef[c + 8] + u * coef[c + 9];
+        raw[3] = coef[c + 10] + u * (coef[c + 11] + u * (coef[c + 12] + u * coef[c + 13]));
+        kind = 0;
+      } else {
+        kind = this.#evaluate(i, id, renderSim, bk, raw);
+      }
       if (snapAll) kind = 1;
       if (kind === 1) snapped++;
       let x = raw[0];
@@ -910,7 +988,7 @@ export class PoseInterpolator {
       oPos[p] = x;
       oPos[p + 1] = y;
       oPos[p + 2] = z;
-      oHead[i] = wrapAngle(h);
+      oHead[i] = h > Math.PI || h < -Math.PI ? wrapAngle(h) : h;
     }
     this.#anyError = anyError;
     this.#clearTo(count);
@@ -1014,10 +1092,10 @@ export class PoseInterpolator {
     const sa = a.speed[i] * T;
     const sb = b.speed[i] * T;
     const hb = b.heading[i];
-    limitTangent2(Math.cos(ha) * sa, Math.sin(ha) * sa, cx, cy);
+    limitTangent2(a.cosH[i] * sa, a.sinH[i] * sa, cx, cy);
     const m0x = TAN[0];
     const m0y = TAN[1];
-    limitTangent2(Math.cos(hb) * sb, Math.sin(hb) * sb, cx, cy);
+    limitTangent2(b.cosH[i] * sb, b.sinH[i] * sb, cx, cy);
     const m1x = TAN[0];
     const m1y = TAN[1];
     const u2 = u * u;
@@ -1055,6 +1133,80 @@ export class PoseInterpolator {
   }
 
   /**
+   * Fit slot `i`'s curve through the frame segment (`bk + 1`, `bk`) into the cache. Returns false —
+   * and leaves the slot to {@link #evaluate} — unless both snapshots hold this actor in this slot
+   * and it did not teleport between them.
+   */
+  #fit(i: number, id: number, bk: number, key: number): boolean {
+    if (this.#size <= bk + 1) return false;
+    const b = this.#at(bk);
+    const a = this.#at(bk + 1);
+    if (!(i < b.count && b.occupied[i] === 1 && b.actorId[i] === id)) return false;
+    if (!(i < a.count && a.occupied[i] === 1 && a.actorId[i] === id)) return false;
+    const T = b.simSeconds - a.simSeconds;
+    if (!(T > 1e-9)) return false;
+    const p = i * 3;
+    const ax = a.position[p];
+    const ay = a.position[p + 1];
+    const az = a.position[p + 2];
+    const cx = b.position[p] - ax;
+    const cy = b.position[p + 1] - ay;
+    const cz = b.position[p + 2] - az;
+    const chord2 = cx * cx + cy * cy + cz * cz;
+    const va = a.speed[i];
+    const vb = b.speed[i];
+    const vmax = Math.max(Math.abs(va), Math.abs(vb));
+    const tele = Math.max(this.teleportMetres, 1.5 * vmax * T + 2);
+    if (chord2 > tele * tele) return false;
+
+    const c = i * COEF;
+    const co = this.#coef;
+    const ha = a.heading[i];
+    const hb = b.heading[i];
+    const dh = wrapAngle(hb - ha);
+    const chord = Math.sqrt(chord2);
+    const expected = 0.5 * (Math.abs(va) + Math.abs(vb)) * T;
+    const consistent = Math.abs(chord - expected) <= Math.max(0.3, 0.35 * expected);
+    co[c + 8] = az;
+    co[c + 9] = cz;
+    if (this.curve === "linear" || !consistent) {
+      co[c] = ax; co[c + 1] = cx; co[c + 2] = 0; co[c + 3] = 0;
+      co[c + 4] = ay; co[c + 5] = cy; co[c + 6] = 0; co[c + 7] = 0;
+      co[c + 10] = ha; co[c + 11] = dh; co[c + 12] = 0; co[c + 13] = 0;
+    } else {
+      limitTangent2(a.cosH[i] * va * T, a.sinH[i] * va * T, cx, cy);
+      const m0x = TAN[0];
+      const m0y = TAN[1];
+      limitTangent2(b.cosH[i] * vb * T, b.sinH[i] * vb * T, cx, cy);
+      const m1x = TAN[0];
+      const m1y = TAN[1];
+      // p(u) = a + m0·u + (3c − 2m0 − m1)·u² + (−2c + m0 + m1)·u³, the Hermite basis expanded.
+      co[c] = ax; co[c + 1] = m0x; co[c + 2] = 3 * cx - 2 * m0x - m1x; co[c + 3] = -2 * cx + m0x + m1x;
+      co[c + 4] = ay; co[c + 5] = m0y; co[c + 6] = 3 * cy - 2 * m0y - m1y; co[c + 7] = -2 * cy + m0y + m1y;
+      let ta = dh;
+      let tb = dh;
+      if (bk + 2 < this.#size) {
+        const o = this.#at(bk + 2);
+        if (i < o.count && o.occupied[i] === 1 && o.actorId[i] === id && a.simSeconds - o.simSeconds > 1e-9) {
+          ta = 0.5 * ((wrapAngle(ha - o.heading[i]) / (a.simSeconds - o.simSeconds)) * T + dh);
+        }
+      }
+      if (bk >= 1) {
+        const nx = this.#at(bk - 1);
+        if (i < nx.count && nx.occupied[i] === 1 && nx.actorId[i] === id && nx.simSeconds - b.simSeconds > 1e-9) {
+          tb = 0.5 * (dh + (wrapAngle(nx.heading[i] - hb) / (nx.simSeconds - b.simSeconds)) * T);
+        }
+      }
+      ta = limitTangent(ta, dh);
+      tb = limitTangent(tb, dh);
+      co[c + 10] = ha; co[c + 11] = ta; co[c + 12] = 3 * dh - 2 * ta - tb; co[c + 13] = -2 * dh + ta + tb;
+    }
+    this.#cKey[i] = key;
+    this.#cId[i] = id;
+    return true;
+  }
+
+  /**
    * Index (0 = newest) of the newer snapshot of the segment that brackets `t`: the newest when `t`
    * is past it, the second oldest when `t` is before the oldest.
    */
@@ -1087,8 +1239,8 @@ export class PoseInterpolator {
     const h0 = s.heading[i];
     const turn = omega * dt;
     if (Math.abs(turn) < 1e-4) {
-      out[0] += Math.cos(h0) * v * dt;
-      out[1] += Math.sin(h0) * v * dt;
+      out[0] += s.cosH[i] * v * dt;
+      out[1] += s.sinH[i] * v * dt;
     } else {
       const r = v / omega;
       const h1 = h0 + turn;
