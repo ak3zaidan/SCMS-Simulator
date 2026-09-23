@@ -304,7 +304,7 @@ export interface OverlaySetResult {
 export interface InspectNodeParams {
   node: NodeId;
   t_ns?: SimTimeNs;
-  include?: ("telemetry" | "stores" | "queues" | "neighbors" | "certs" | "crl" | "gnss" | "clock" | "apps" | "detectors" | "provenance")[];
+  include?: ("telemetry" | "stores" | "queues" | "neighbors" | "certs" | "crl" | "gnss" | "clock" | "apps" | "detectors" | "provenance" | "messages")[];
   limit?: number;
 }
 /** §6.8 — one neighbour-table row. */
@@ -573,6 +573,8 @@ export interface MetricsQueryResult {
     visibility: Visibility;
     definition_md?: string;
     source?: Record<string, unknown>;
+    /** The metric a series is a view of: its own name for a headline, the metric's for `x.p95` or `x[label]`. */
+    base?: string;
   }[];
   provenance?: ProvenanceInfo[];
 }

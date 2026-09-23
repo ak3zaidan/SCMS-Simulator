@@ -43,6 +43,12 @@ pub struct MetricInfo {
     pub str_id: u32,
     /// §3.7's `MetricAgg` code for `agg`.
     pub agg_code: u16,
+    /// The citation for the definition: a standard, a paper or a design section.
+    pub source: String,
+    /// The metric this series is a view of: `name` itself for the headline series, the
+    /// metric's name for a percentile (`e2e_latency.p95`) or a breakdown
+    /// (`latency_stage[airtime]`).
+    pub base: String,
 }
 
 /// What [`answer`] needs from the engine that is serving the run.
@@ -292,6 +298,14 @@ pub fn answer<E: Introspect + ?Sized>(engine: &mut E, query: &Query) -> Result<V
                 "visibility": m.visibility,
                 "definition_md": m.definition_md,
                 "not_accounted": m.not_accounted,
+                // The card's `Source` shape (`{"ref": …}`), which is what
+                // `MetricsQueryResult.catalogue[].source` declares.
+                "source": if m.source.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    json!({ "ref": m.source })
+                },
+                "base": m.base,
             })).collect::<Vec<_>>(),
         })),
         Query::Metrics {

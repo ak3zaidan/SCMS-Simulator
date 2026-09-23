@@ -1050,6 +1050,8 @@ impl Engine for StubEngine {
             .iter()
             .map(
                 |(name, unit, agg, visibility)| crate::introspect::MetricInfo {
+                    source: String::new(),
+                    base: name.to_string(),
                     name: (*name).to_string(),
                     unit: (*unit).to_string(),
                     agg: (*agg).to_string(),
