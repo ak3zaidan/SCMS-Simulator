@@ -274,7 +274,24 @@ describe("Viewer — headless smoke", () => {
     const look = new (viewer.camera.position.constructor as new (x: number, y: number, z: number) => typeof viewer.camera.position)(cx + 60, cy, 1);
     const moved = viewer.cameras.keepCameraOutsideBuildings(pos, look);
     expect(moved).toBe(true);
-    expect(pos.z).toBeGreaterThanOrEqual(top);
+    // Outside every building: not inside a footprint below its roof. (This used to assert
+    // `pos.z >= top`, i.e. the mechanism — lift onto the roof — rather than the property. The lift
+    // leaves the camera 60 m from its subject looking down *through* the building's own upper
+    // floors; the ray check below is what that assertion was standing in for, and the lift fails
+    // it.)
+    const w = viewer.worldRenderer;
+    const topHere = w.buildingTopAt(pos.x, pos.y);
+    expect(topHere === -Infinity || pos.z >= topHere, `camera at ${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)} is inside a building`).toBe(true);
+    // And nothing solid between the camera and what it looks at.
+    let blocked = 0;
+    for (let i = 1; i < 100; i++) {
+      const t = i / 100;
+      const x = look.x + (pos.x - look.x) * t;
+      const y = look.y + (pos.y - look.y) * t;
+      const z = look.z + (pos.z - look.z) * t;
+      if (z < w.buildingTopAt(x, y)) blocked++;
+    }
+    expect(blocked, "samples of the line of sight inside a building").toBe(0);
     viewer.dispose();
   });
 

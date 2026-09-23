@@ -105,8 +105,8 @@ const LAMP_SPACING = 0.32;
 const LAMP_SIZE = 0.24;
 /** Stop bar depth along the lane, metres (MUTCD §3B.16: 12–24 inches). */
 const STOP_BAR_DEPTH = 0.5;
-/** Height of the stop bar above the lane centreline, metres: above lane markings (0.30). */
-const STOP_BAR_Z = 0.34;
+/** Height of the stop bar above the lane centreline, metres: just above lane markings (0.24). */
+const STOP_BAR_Z = 0.26;
 
 export class SignalRenderer {
   readonly group = new Group();

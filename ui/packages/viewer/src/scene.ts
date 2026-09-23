@@ -491,6 +491,15 @@ export class Viewer {
     // lamps showed belongs to it. The *same* Hello re-applied — the Studio re-attaching the viewer
     // — keeps them, because a paused run sends its one keyframe once and never again.
     if (hello !== this.#signalHello) {
+      // A different *run* — not a reconnect to the same one — has different vehicles under the
+      // same ids and possibly a different world: a chase camera kept on the old subject would sit
+      // wherever that id's last pose was, which in a new world can be the void.
+      const previous = this.#signalHello;
+      if (previous && !sameBytes(previous.runId, hello.runId)) {
+        this.cameras.follow(null);
+        this.select(null);
+        if (this.cameras.mode !== "map") this.cameras.setMode("map", true);
+      }
       this.#signalHello = hello;
       this.#signalQueue.length = 0;
       this.#lastSignalSim = Number.NaN;
@@ -777,6 +786,14 @@ export class Viewer {
     return id;
   }
 
+  /**
+   * Keep the part of the canvas under interface panels out of the camera's framing; see
+   * {@link CameraController.setViewInsets}. CSS pixels.
+   */
+  setViewInsets(insets: { top?: number; right?: number; bottom?: number; left?: number }): void {
+    this.cameras.setViewInsets(insets);
+  }
+
   /** Hand the controller `actorId`'s current pose if it is in the stream. */
   #seedFollowPose(actorId: number): boolean {
     const ids = this.interpolator.outActorId;
@@ -955,6 +972,7 @@ export class Viewer {
     // 2. Camera. Exponential smoothing on the true frame dt (frame-rate independent by construction).
     this.#trackTraffic(dt);
     this.#followSlot = this.#resolveFollowSlot();
+    this.#updateGhost();
     if (this.#followSlot >= 0) {
       const p = this.#followSlot * 3;
       this.cameras.setFollowPose(
@@ -970,6 +988,7 @@ export class Viewer {
     this.cameras.update(dt);
 
     // 3. Static scene follow-ups.
+    this.#syncClipPlanes();
     this.#syncDepthCueing();
     this.worldRenderer.followCamera(this.camera);
     this.worldRenderer.setShadowFocus(this.cameras.look.x, this.cameras.look.y, this.cameras.look.z);
@@ -978,6 +997,7 @@ export class Viewer {
     // 4. Actors: cull, LOD, instance write. When the camera is inside the followed car's own body,
     // that one instance is not written.
     this.actors.hiddenActorId = this.#cameraInsideFollowed() ? this.cameras.followActorId ?? -1 : -1;
+    this.#syncActorLod();
     const actorStats = this.actors.update({
       position: this.interpolator.outPosition,
       heading: this.interpolator.outHeading,
@@ -1039,6 +1059,79 @@ export class Viewer {
       stalled: sample.stalled,
     };
     return this.#lastReport;
+  }
+
+  /**
+   * Hide the building the followed vehicle is inside, if it is inside one below the roof — a road
+   * through a building. See {@link WorldRenderer.setGhostBuilding}.
+   */
+  #updateGhost(): void {
+    const slot = this.#followSlot;
+    const w = this.worldRenderer;
+    if (slot < 0 || this.cameras.mode === "map") {
+      if (w.ghostBuilding >= 0) w.setGhostBuilding(-1);
+      return;
+    }
+    const p = slot * 3;
+    const x = this.interpolator.outPosition[p];
+    const y = this.interpolator.outPosition[p + 1];
+    const z = this.interpolator.outPosition[p + 2];
+    const b = w.buildingIndexAt(x, y);
+    w.setGhostBuilding(b >= 0 && z < w.buildingTopOf(b) ? b : -1);
+  }
+
+  /**
+   * Put the near and far planes where the depth buffer can resolve the road's layers.
+   *
+   * A 24-bit depth buffer resolves `d² / (near · 2²⁴)` metres at distance `d`. With the near plane
+   * at 0.35 m that is 0.38 m at the 1.4 km the plan view looks down from — six times the 6 cm
+   * between the road, junction and crossing layers, so they z-fought across the whole map as it
+   * moved. Nothing in the world is above its bounding box (plus the selected-vehicle stem), so a
+   * camera above that can push its near plane to most of the gap: 0.2 mm at the same distance.
+   * At street level the near plane follows the camera's height, capped at a metre.
+   */
+  #syncClipPlanes(): void {
+    const cam = this.camera;
+    const world = this.worldRenderer.world;
+    const base = this.#options.nearM ?? 0.35;
+    let near = base;
+    let far = this.#options.farM ?? 12_000;
+    if (world) {
+      const look = this.cameras.look;
+      const dist = cam.position.distanceTo(look);
+      const top = Math.max(world.bbox.maxZM, look.z + dist * 0.08 + 12);
+      const above = cam.position.z - top;
+      if (above > 0) {
+        near = Math.max(base, above * 0.8);
+      } else if (this.cameras.mode !== "dashboard") {
+        const height = cam.position.z - world.bbox.minZM;
+        near = Math.min(1, Math.max(base, height * 0.2));
+      }
+      far = Math.max(far, this.worldRenderer.sky.scale.x * 1.05);
+    }
+    if (!Number.isFinite(near) || near <= 0) near = base;
+    if (Math.abs(near - cam.near) > cam.near * 0.02 || far !== cam.far) {
+      cam.near = near;
+      cam.far = Math.max(far, near * 10);
+      cam.updateProjectionMatrix();
+    }
+  }
+
+  /**
+   * Switch actor detail where the detail stops being visible, not at a fixed distance.
+   *
+   * At the old fixed 90 m a car's wheels (0.7 m, 6 px at 90 m in an 800 px, 55° view) popped in
+   * and out in the middle of an ordinary street view. Here LOD 0 holds until half a metre of detail
+   * is 1.5 px, and LOD 1 until a metre is: about 280 m and 560 m at that view, further in a taller
+   * window, nearer in a wider field.
+   */
+  #syncActorLod(): void {
+    const fovRad = (this.camera.fov * Math.PI) / 180;
+    const pxPerRad = this.#height / Math.max(1e-3, fovRad);
+    const d0 = Math.round(Math.min(600, Math.max(60, (0.5 * pxPerRad) / 1.5)));
+    const d1 = Math.round(Math.min(2000, Math.max(d0 + 50, (1.0 * pxPerRad) / 1.5)));
+    const cur = this.actors.lodDistancesM;
+    if (cur[0] !== d0 || cur[1] !== d1) this.actors.lodDistancesM = [d0, d1];
   }
 
   /** Advance by an explicit `dt`, for tests and deterministic captures. */
@@ -1134,4 +1227,10 @@ export class Viewer {
     }
     return -1;
   }
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }

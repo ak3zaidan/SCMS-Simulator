@@ -12,12 +12,14 @@
  *   and saves a material switch.
  * - **Lane markings** are a second mesh per tile (unlit, polygon-offset) so `overlay.set
  *   {lane_markings: false}` is one `visible = false` per tile and nothing else.
- * - **Buildings** go into a single `THREE.BatchedMesh` holding three geometries per building (near:
- *   walls + roof + parapet, mid: walls + roof, far: the footprint's bounding box). LOD is a
- *   `setGeometryIdAt` on the one instance, so switching LOD never moves an instance between meshes
- *   and the whole town stays one multi-draw call. If `BatchedMesh` cannot be built — the vertex
- *   budget is exceeded, or a three build without multi-draw support throws — the builder falls back
- *   to baking the mid-LOD building shells into the per-tile meshes and reports
+ * - **Buildings** go into a single `THREE.BatchedMesh`, one geometry per building: its real
+ *   footprint extruded, with a roof and a parapet. There used to be three LODs, and the far one was
+ *   the footprint's *axis-aligned bounding box* — on Manhattan's grid, which runs 29° off north, a
+ *   box that swallows half of every street around the block, so from 700 m out the traffic drove
+ *   through solid walls. The near/mid switch popped the parapet at 180 m. One exact geometry
+ *   costs fewer vertices than the three did together and cannot pop. If `BatchedMesh` cannot be
+ *   built — the vertex budget is exceeded, or a three build without multi-draw support throws —
+ *   the builder falls back to baking the shells into the per-tile meshes and reports
  *   {@link WorldRenderer.buildingBackend} as `"merged"`.
  *
  * Also here: the ground plane, the gradient sky, and a sun/hemisphere rig driven by a time-of-day
@@ -65,8 +67,8 @@ const LANE_CROSSING = 6;
 const Z_LANDUSE = 0.02;
 const Z_ROAD = 0.1;
 const Z_JUNCTION = 0.16;
-const Z_CROSSING = 0.24;
-const Z_MARKING = 0.3;
+const Z_CROSSING = 0.2;
+const Z_MARKING = 0.24;
 
 /** Tuning for {@link WorldRenderer}. */
 export interface WorldRendererOptions {
@@ -77,7 +79,11 @@ export interface WorldRendererOptions {
   readonly buildings?: boolean;
   /** Build lane markings. Default true. */
   readonly laneMarkings?: boolean;
-  /** `[near→mid, mid→far]` building LOD switch distances in metres. Default `[180, 700]`. */
+  /**
+   * `[near→mid, mid→far]` building LOD switch distances in metres. Default `[180, 700]`. Kept for
+   * compatibility: every LOD is now the same exact footprint geometry (see the file header), so
+   * these only decide which id is recorded, never what is drawn.
+   */
   readonly buildingLodDistancesM?: readonly [number, number];
   /** Refuse `BatchedMesh` above this many vertices and fall back to merged tiles. Default 1,500,000. */
   readonly maxBuildingVertices?: number;
@@ -239,6 +245,8 @@ export class WorldRenderer {
   /** Building centroid x, y, top z, and footprint radius. */
   #buildingCentroid = new Float32Array(0);
   #buildingCount = 0;
+  /** Buildings hidden this frame because the followed vehicle is inside them; see {@link setGhostBuilding}. */
+  #ghost = -1;
   #buildingBackend: BuildingBackend = "none";
   #buildError: string | null = null;
 
@@ -475,7 +483,37 @@ export class WorldRenderer {
 
   /** Where the sun's shadow frustum is centred; follow the camera focus to keep texels small. */
   setShadowFocus(x: number, y: number, z: number): void {
-    this.sun.target.position.set(x, y, z);
+    // Snap the focus to the shadow map's texel grid, in the light's own frame. A frustum that
+    // slides by a fraction of a texel every frame re-rasterises every shadow edge at a new phase,
+    // and the edges crawl and shimmer as the chase camera drives along — the classic "shadow
+    // swimming" (Dimitrov 2007, "Cascaded Shadow Maps", NVIDIA, §"Moving the light texel-sized
+    // increments"). Along the light direction nothing needs snapping.
+    const texel = (2 * this.#options.shadowExtentM) / Math.max(1, this.#options.shadowMapSize);
+    const d = this.#sunDir;
+    // Light-space basis: `u` horizontal and perpendicular to the sun, `v = d × u`.
+    let ux = -d.y;
+    let uy = d.x;
+    const ul = Math.hypot(ux, uy);
+    if (ul < 1e-6) {
+      ux = 1;
+      uy = 0;
+    } else {
+      ux /= ul;
+      uy /= ul;
+    }
+    const vx = d.y * 0 - d.z * uy;
+    const vy = d.z * ux - d.x * 0;
+    const vz = d.x * uy - d.y * ux;
+    const pu = x * ux + y * uy;
+    const pv = x * vx + y * vy + z * vz;
+    const pd = x * d.x + y * d.y + z * d.z;
+    const su = Math.round(pu / texel) * texel;
+    const sv = Math.round(pv / texel) * texel;
+    this.sun.target.position.set(
+      su * ux + sv * vx + pd * d.x,
+      su * uy + sv * vy + pd * d.y,
+      sv * vz + pd * d.z,
+    );
     this.sun.target.updateMatrixWorld();
     this.#placeSun();
   }
@@ -760,15 +798,13 @@ export class WorldRenderer {
       const n = b.ringCount[i];
       if (n < 3) continue;
       shading.tone = toneOf(i);
-      for (let lod = 0; lod < 3; lod++) {
-        probe.reset();
-        addExtrudedRing(probe, ring.x, ring.y, b.ringOff[i], n, b.baseZM[i], Math.max(1, b.heightM[i]),
-          lod as LodLevel, scratch, wr, wg, wb, rr, rg, rb, shading);
-        perLodV[i * 3 + lod] = probe.vertexCount;
-        perLodI[i * 3 + lod] = probe.indexCount;
-        totalV += probe.vertexCount;
-        totalI += probe.indexCount;
-      }
+      probe.reset();
+      addExtrudedRing(probe, ring.x, ring.y, b.ringOff[i], n, b.baseZM[i], Math.max(1, b.heightM[i]),
+        0, scratch, wr, wg, wb, rr, rg, rb, shading);
+      perLodV[i * 3] = probe.vertexCount;
+      perLodI[i * 3] = probe.indexCount;
+      totalV += probe.vertexCount;
+      totalI += probe.indexCount;
     }
 
     this.#buildingCount = B;
@@ -817,15 +853,17 @@ export class WorldRenderer {
           const n = b.ringCount[i];
           if (n < 3) continue;
           shading.tone = toneOf(i);
-          for (let lod = 0; lod < 3; lod++) {
-            builder.reset();
-            addExtrudedRing(builder, ring.x, ring.y, b.ringOff[i], n, b.baseZM[i], Math.max(1, b.heightM[i]),
-              lod as LodLevel, scratch, wr, wg, wb, rr, rg, rb, shading);
-            const g = builder.toGeometry();
-            if (!g) continue;
-            this.#buildingGeomIds[i * 3 + lod] = mesh.addGeometry(g);
-            g.dispose();
-          }
+          builder.reset();
+          addExtrudedRing(builder, ring.x, ring.y, b.ringOff[i], n, b.baseZM[i], Math.max(1, b.heightM[i]),
+            0, scratch, wr, wg, wb, rr, rg, rb, shading);
+          const g = builder.toGeometry();
+          if (!g) continue;
+          const id = mesh.addGeometry(g);
+          g.dispose();
+          // Every LOD slot names the one exact geometry; see the file header.
+          this.#buildingGeomIds[i * 3] = id;
+          this.#buildingGeomIds[i * 3 + 1] = id;
+          this.#buildingGeomIds[i * 3 + 2] = id;
           const g0 = this.#buildingGeomIds[i * 3 + 1];
           if (g0 < 0) continue;
           const inst = mesh.addInstance(g0);
@@ -863,7 +901,7 @@ export class WorldRenderer {
       const t = tileIndex(ring.x[off], ring.y[off]);
       shading.tone = toneOf(i);
       addExtrudedRing(surfaceOf(t), ring.x, ring.y, off, n, b.baseZM[i], Math.max(1, b.heightM[i]),
-        1, scratch, wr, wg, wb, rr, rg, rb, shading);
+        0, scratch, wr, wg, wb, rr, rg, rb, shading);
     }
     this.#report = { ...this.#report, buildingVertices: totalV, buildingIndices: totalI };
   }
@@ -926,29 +964,88 @@ export class WorldRenderer {
    * footprint. `cameras.ts` calls this to keep the chase camera out of geometry.
    */
   buildingTopAt(x: number, y: number): number {
+    const i = this.#buildingAt(x, y, true);
+    return i < 0 ? -Infinity : this.#buildingCentroid[i * 4 + 2];
+  }
+
+  /**
+   * Index of the tallest building whose footprint covers `(x, y)`, or −1. Unlike
+   * {@link buildingTopAt} this also reports a ghosted building.
+   */
+  buildingIndexAt(x: number, y: number): number {
+    return this.#buildingAt(x, y, false);
+  }
+
+  /** The `building_id` of building `i`, or −1. */
+  buildingIdOf(i: number): number {
+    const w = this.#world;
+    return w && i >= 0 && i < w.buildings.count ? w.buildings.buildingId[i] : -1;
+  }
+
+  /** Roof height of building `i` (base + height), or −∞. */
+  buildingTopOf(i: number): number {
+    return i >= 0 && i < this.#buildingCount ? this.#buildingCentroid[i * 4 + 2] : -Infinity;
+  }
+
+  /** The building currently ghosted, or −1. */
+  get ghostBuilding(): number {
+    return this.#ghost;
+  }
+
+  /**
+   * Hide one building — the one the followed vehicle is driving *through*.
+   *
+   * The engine's lanes pass through building footprints where the map has a road under a building
+   * (a passage, an arcade, a ramp into a terminal: measured on Manhattan, 39 of 2,406 drive lanes
+   * cross a footprint for 1.7 km in all). A chase camera behind a car in such a passage used to be
+   * thrown onto the roof — 172 m up for one of them — looking down at a roof that hid the car. The
+   * building is hidden instead, and the camera logic treats it as open space, for as long as the
+   * followed vehicle is inside it. Only the batched backend can hide one building; with the merged
+   * fallback this is a no-op and the old roof rule applies.
+   */
+  setGhostBuilding(index: number): void {
+    const i = index >= 0 && index < this.#buildingCount ? index : -1;
+    if (i === this.#ghost) return;
+    const mesh = this.#buildings;
+    if (!mesh) {
+      this.#ghost = -1;
+      return;
+    }
+    const prev = this.#ghost;
+    if (prev >= 0 && this.#buildingInstanceIds[prev] >= 0) mesh.setVisibleAt(this.#buildingInstanceIds[prev], true);
+    if (i >= 0 && this.#buildingInstanceIds[i] >= 0) mesh.setVisibleAt(this.#buildingInstanceIds[i], false);
+    this.#ghost = i >= 0 && this.#buildingInstanceIds[i] >= 0 ? i : -1;
+  }
+
+  #buildingAt(x: number, y: number, skipGhost: boolean): number {
     const world = this.#world;
-    if (!world || this.#gridItems.length === 0) return -Infinity;
+    if (!world || this.#gridItems.length === 0) return -1;
     const gx = Math.floor((x - this.#gridMinX) / this.#gridCell);
     const gy = Math.floor((y - this.#gridMinY) / this.#gridCell);
-    if (gx < 0 || gy < 0 || gx >= this.#gridW || gy >= this.#gridH) return -Infinity;
+    if (!(gx >= 0 && gy >= 0 && gx < this.#gridW && gy < this.#gridH)) return -1;
     const c = gy * this.#gridW + gx;
     const start = this.#gridStart[c];
     const end = this.#gridStart[c + 1];
     const b = world.buildings;
     const ring = world.ringPoints;
     let top = -Infinity;
+    let best = -1;
     for (let k = start; k < end; k++) {
       const i = this.#gridItems[k];
+      if (skipGhost && i === this.#ghost) continue;
       const dx = x - this.#buildingCentroid[i * 4];
       const dy = y - this.#buildingCentroid[i * 4 + 1];
       const r = this.#buildingCentroid[i * 4 + 3];
       if (dx * dx + dy * dy > r * r) continue;
       if (pointInRing(ring.x, ring.y, b.ringOff[i], b.ringCount[i], x, y)) {
         const t = this.#buildingCentroid[i * 4 + 2];
-        if (t > top) top = t;
+        if (t > top) {
+          top = t;
+          best = i;
+        }
       }
     }
-    return top;
+    return best;
   }
 
   #buildSites(world: VwpWorld): void {
@@ -1073,6 +1170,7 @@ export class WorldRenderer {
     for (const d of this.#disposables) d.dispose();
     this.#disposables = [];
     this.#buildings = null;
+    this.#ghost = -1;
     this.#buildingCount = 0;
     this.#buildingBackend = "none";
     this.#buildError = null;

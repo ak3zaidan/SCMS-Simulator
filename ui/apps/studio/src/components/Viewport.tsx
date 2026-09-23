@@ -54,11 +54,46 @@ export function Viewport(): React.JSX.Element {
     engine.attachViewer();
     const detachInput = viewer.cameras.attachInput(canvas);
 
+    // The camera frames the part of the viewport nothing floats over. The OBU HUD is anchored to
+    // the bottom and the toolbar to the top; a chase camera puts its vehicle just below the centre
+    // of the frame, which with a 760 px HUD on a 1,280 x 800 window was under the HUD's header
+    // (`subjectCoveredBy div.hud-head` in the capture tour). Their rectangles become the camera's
+    // view insets, re-measured whenever either changes size or the HUD mounts or unmounts.
+    const syncInsets = (): void => {
+      const box = host.getBoundingClientRect();
+      if (box.height <= 0) return;
+      let top = 0;
+      let bottom = 0;
+      const toolbar = host.querySelector(".viewport-toolbar");
+      if (toolbar) top = Math.max(0, toolbar.getBoundingClientRect().bottom - box.top);
+      const hud = host.querySelector('[data-testid="obu-hud"]');
+      if (hud && !hud.classList.contains("docked")) {
+        const r = hud.getBoundingClientRect();
+        // Only a panel that spans the middle of the viewport can cover a centred subject.
+        const spansCentre = r.left < box.left + box.width * 0.6 && r.right > box.left + box.width * 0.4;
+        if (r.height > 0 && spansCentre) bottom = Math.max(0, box.bottom - r.top);
+      }
+      viewer.setViewInsets({ top, bottom });
+    };
     const observer = new ResizeObserver(() => {
       viewer.resize(host.clientWidth, host.clientHeight);
+      syncInsets();
     });
     observer.observe(host);
+    const watched = new Set<Element>();
+    const watch = (): void => {
+      for (const el of host.querySelectorAll('.viewport-toolbar, [data-testid="obu-hud"]')) {
+        if (!watched.has(el)) {
+          watched.add(el);
+          observer.observe(el);
+        }
+      }
+      syncInsets();
+    };
+    const mutations = new MutationObserver(watch);
+    mutations.observe(host, { childList: true, subtree: true, attributes: true, attributeFilter: ["class"] });
     viewer.resize(host.clientWidth, host.clientHeight);
+    watch();
 
     window.__vwpStudio = {
       engine,
@@ -81,6 +116,7 @@ export function Viewport(): React.JSX.Element {
 
     return () => {
       observer.disconnect();
+      mutations.disconnect();
       detachInput();
     };
     // `theme` is applied through its own effect; re-running this one would re-create the renderer.
