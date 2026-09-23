@@ -117,6 +117,26 @@ const EXIT_QUEUE_MOVING_MPS: f64 = 2.0;
 /// than any three consecutive lanes; a connector can be shorter than a car.
 const TRAIL_LANES: usize = 3;
 
+/// How fast a braking vehicle may come off the brake, m/s³.
+///
+/// **This crate's choice, bracketed by the literature**: Bagdadi & Várhelyi (2011,
+/// *Accident Analysis & Prevention* 43(4), "Jerky driving — an indicator of accident
+/// proneness?") treat jerk beyond about 10 m/s³ as harsh; ordinary driving stays well
+/// under it. The IDM has no jerk term of its own, so a light turning green stepped a
+/// braking car to full throttle in one 0.1 s step (−3 → +1.4 m/s², 44 m/s³). Only the
+/// brake-to-throttle transition is limited: from zero upward the IDM's acceleration
+/// applies unchanged. Not applied in the legacy parity mode.
+const RELEASE_JERK_MPS3: f64 = 10.0;
+
+/// How fast a *planned* stop's deceleration may build, m/s³ — see [`RELEASE_JERK_MPS3`];
+/// a service brake application, twice the release rate.
+const PLANNED_BRAKE_JERK_MPS3: f64 = 20.0;
+
+/// Above this deceleration a stop is an emergency and its onset is not limited, m/s²:
+/// the 3.4 m/s² AASHTO *Green Book* 2018 §3.2.2 takes as the deceleration most drivers
+/// brake at when they must stop for something unexpected.
+const PLANNED_STOP_MAX_DECEL_MPS2: f64 = 3.4;
+
 /// Which intersection rule the engine applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -307,7 +327,7 @@ impl Actor {
             };
         }
         let s_front = self.s_m.clamp(0.0, lane.length_m);
-        let front = lane.offset_point(s_front, self.lateral_m);
+        let front = smooth_offset_point(lane, s_front, self.lateral_m);
         let s_rear = self.s_m - length;
         let (pos, rear_lane, rear_s) = self.rear_point(world, s_rear);
         let chord = Vec3::new(front.x - pos.x, front.y - pos.y, 0.0);
@@ -342,7 +362,7 @@ impl Actor {
     fn rear_point(&self, world: &World, s_rear: f64) -> (Vec3, LaneId, f64) {
         let lane = world.lane(self.lane);
         if s_rear >= 0.0 {
-            return (lane.offset_point(s_rear, self.lateral_m), self.lane, s_rear);
+            return (smooth_offset_point(lane, s_rear, self.lateral_m), self.lane, s_rear);
         }
         let mut behind = -s_rear;
         let mut earliest = lane;
@@ -350,7 +370,7 @@ impl Actor {
             let Some(prev) = world.try_lane(*id) else { break };
             if behind <= prev.length_m {
                 let s = prev.length_m - behind;
-                return (prev.offset_point(s, self.lateral_m), prev.id, s);
+                return (smooth_offset_point(prev, s, self.lateral_m), prev.id, s);
             }
             behind -= prev.length_m;
             earliest = prev;
@@ -1786,6 +1806,26 @@ impl Mobility for NativeMobility {
                 });
                 leader = Self::closest(leader, virtual_leader);
             }
+            // While a lane change is under way the body is still partly in the lane being
+            // left, so the vehicle ahead *there* is followed too. Following only the
+            // target lane's leader let a slow change — 8 s at 3 m/s — drive its body into
+            // the car standing ahead in the lane it was leaving.
+            if along
+                && let Some(tr) = actor.transition
+                && tr.switched
+                && actor.lateral_m.abs() + 0.5 * actor.class.spec().width_m
+                    > 0.5 * world.lane(tr.to).width_m
+            {
+                let in_from = VehicleView {
+                    lane: tr.from,
+                    s_m: actor.s_m + tr.from_s_delta,
+                    ..ego
+                };
+                leader = Self::closest(
+                    leader,
+                    snapshot.leader_on_route(world, &in_from, &[tr.from], 0, options),
+                );
+            }
             // Other vehicles inside the junction: follow one merging ahead onto the same
             // exit, and give way at a crossing to one that reaches it first.
             if along && self.params.junction_clearance {
@@ -1825,6 +1865,20 @@ impl Mobility for NativeMobility {
                 && l.speed_mps == 0.0
             {
                 accel = static_obstacle_accel(accel, ego.speed_mps, l.gap_m, actor.driver.min_gap_m);
+                // A planned stop is braked into, not stamped on: the deceleration builds
+                // at no more than `PLANNED_BRAKE_JERK_MPS3` while the stop needs no more
+                // than a firm service brake. Harder than that is an emergency and is not
+                // limited.
+                if accel < actor.accel_mps2 && -accel <= PLANNED_STOP_MAX_DECEL_MPS2 {
+                    accel = accel.max(actor.accel_mps2 - PLANNED_BRAKE_JERK_MPS3 * dt_s);
+                }
+            }
+            // Coming off the brake happens at no more than `RELEASE_JERK_MPS3`, until the
+            // brake is off; from there the car-following model's acceleration applies as
+            // it is. Limiting an *increase* in acceleration can only leave a vehicle
+            // further back than the model asked, never closer.
+            if along && actor.accel_mps2 < 0.0 {
+                accel = accel.min(actor.accel_mps2 + RELEASE_JERK_MPS3 * dt_s);
             }
             let v0_effective = v0.min(lane_view.speed_limit_mps);
             decisions.push(Decision {
@@ -1889,7 +1943,16 @@ impl Mobility for NativeMobility {
             } else {
                 decision.v0_mps
             };
+            let before = actor.speed_mps;
             actor.speed_mps = (actor.speed_mps + decision.accel_mps2 * dt_s).clamp(0.0, ceiling);
+            // What is published is the acceleration the vehicle *had*, not the one the
+            // model asked for: a car standing at a red line has a car-following
+            // acceleration of up to −6 m/s² with its speed clamped at zero, and it was
+            // publishing that — into its pose, and into every BSM it signed. Not in the
+            // legacy parity mode, which publishes the command as the reference did.
+            if along && dt_s > 0.0 {
+                actor.accel_mps2 = (actor.speed_mps - before) / dt_s;
+            }
             actor.s_m += actor.speed_mps * dt_s;
             if actor.stopped_until.is_some_and(|until| t0 >= until) {
                 actor.stopped_until = None;
@@ -2111,6 +2174,52 @@ impl Mobility for NativeMobility {
     fn kinematics(&self, a: ActorId) -> Option<&Kinematics> {
         self.published.get(&a)
     }
+}
+
+/// A point `d_m` to the left of `lane`'s centreline at arc length `s_m`, with the normal
+/// blended across each vertex instead of switching at it.
+///
+/// [`v2xw_world::Lane::offset_point`] takes the normal of the segment `s_m` falls on, so
+/// an offset point jumps by about `d·Δψ` as it passes a vertex where the polyline turns
+/// by `Δψ` — 0.4 m for a lane change 3 m out on a curved Manhattan lane, which the
+/// auditor saw as a teleport. Within `r` of a vertex (a metre, or half the shorter of
+/// its two segments) the heading the normal is taken from is interpolated linearly from
+/// one segment's to the next, so the offset curve is continuous. On the centreline
+/// (`d = 0`) it is exactly `point_at`.
+pub fn smooth_offset_point(lane: &v2xw_world::Lane, s_m: f64, d_m: f64) -> Vec3 {
+    let base = lane.point_at(s_m);
+    if d_m == 0.0 {
+        return base;
+    }
+    let n = lane.centreline.len();
+    let seg_heading = |i: usize| {
+        let (a, b) = lane.segment(i.min(n.saturating_sub(2)));
+        math::atan2(b.y - a.y, b.x - a.x)
+    };
+    let i = lane.segment_at(s_m);
+    let mut heading = seg_heading(i);
+    let seg_len = |k: usize| lane.cumulative[k + 1] - lane.cumulative[k];
+    // The vertex at the start of segment i, and the one at its end.
+    if i > 0 {
+        let r = (0.5 * seg_len(i).min(seg_len(i - 1))).min(1.0);
+        let from_vertex = s_m - lane.cumulative[i];
+        if r > 0.0 && from_vertex < r {
+            let prev = seg_heading(i - 1);
+            let turn = v2xw_world::model::normalise_angle(heading - prev);
+            heading = prev + turn * (0.5 + 0.5 * from_vertex / r);
+        }
+    }
+    if i + 2 < n {
+        let r = (0.5 * seg_len(i).min(seg_len(i + 1))).min(1.0);
+        let to_vertex = lane.cumulative[i + 1] - s_m;
+        if r > 0.0 && to_vertex < r {
+            let next = seg_heading(i + 1);
+            let turn = v2xw_world::model::normalise_angle(next - heading);
+            heading += turn * (0.5 - 0.5 * to_vertex / r);
+        }
+    }
+    let (sin_h, cos_h) = math::sin_cos(heading);
+    Vec3::new(base.x - sin_h * d_m, base.y + cos_h * d_m, base.z)
 }
 
 /// The speed each junction connector may be driven at: `sqrt(a_lat · R)` with `R` the

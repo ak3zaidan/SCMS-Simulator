@@ -61,6 +61,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         world.buildings.len(),
         built.elapsed().as_secs_f64()
     );
+    // `--describe-building N[,M...]`: print a building's footprint summary, then stop.
+    if let Some(list) = value("--describe-building") {
+        for id in list.split(',') {
+            let id: u32 = id.trim().parse()?;
+            let Some(b) = world.building(v2xw_core::ids::BuildingId::new(id)) else {
+                continue;
+            };
+            let bbox = b.bbox();
+            println!(
+                "building {id}: name {:?} height {:.1} min_height {:.1} base_z {:.1} \
+                 holes {} points {} bbox ({:.1},{:.1})-({:.1},{:.1})",
+                b.name.map(|n| world.symbols.resolve(n).to_string()),
+                b.height_m,
+                b.min_height_m,
+                b.base_z_m,
+                b.holes.len(),
+                b.footprint.len(),
+                bbox.min.x,
+                bbox.min.y,
+                bbox.max.x,
+                bbox.max.y
+            );
+        }
+        return Ok(());
+    }
     // `--describe-lane N[,M...]`: print a lane and the movements through it, then stop.
     if let Some(list) = value("--describe-lane") {
         for id in list.split(',') {

@@ -66,6 +66,10 @@ use v2xw_world::{JunctionControl, LaneKind, SignalState, World};
 use crate::intersection::zones::{ConflictZones, Zone};
 use crate::views::DespawnCause;
 
+/// How far below ground a point must be to count as underground (in a tunnel, under the
+/// buildings above it), metres: half a tunnel level.
+const UNDERGROUND_Z_M: f64 = 3.0;
+
 /// One vehicle as the auditor sees it: the engine's internal state plus the published
 /// pose.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -329,6 +333,11 @@ pub struct AuditStats {
     /// Steps at which two conflicting movements were both inside one junction (not a
     /// violation by itself: a permissive left waits inside the box).
     pub conflicting_occupancy_steps: u64,
+    /// Vehicle-steps with the body in a building while on a lane whose own centreline
+    /// runs through that building ([`Check::WorldLaneInBuilding`]): the source data puts
+    /// the road there, as a passage or a covered ramp. Not counted as
+    /// [`Check::InBuilding`], which is a vehicle off its road.
+    pub in_building_on_lanes_through_buildings: u64,
     /// Largest |jerk| seen, m/s³.
     pub max_jerk_mps3: f64,
     /// Largest deceleration seen, m/s².
@@ -376,6 +385,9 @@ pub struct TrafficAuditor {
     flagged_standing: BTreeSet<ActorId>,
     /// Every junction's conflict zones.
     zones: ConflictZones,
+    /// Lanes whose own centreline passes through a building footprint in the source
+    /// data — a tunnel under one, a passage through one.
+    lanes_through_buildings: BTreeSet<LaneId>,
 }
 
 impl TrafficAuditor {
@@ -395,6 +407,11 @@ impl TrafficAuditor {
             standing_since: BTreeMap::new(),
             flagged_standing: BTreeSet::new(),
             zones: ConflictZones::build(world),
+            lanes_through_buildings: audit_world(world)
+                .into_iter()
+                .filter(|(c, _)| *c == Check::WorldLaneInBuilding)
+                .filter_map(|(_, e)| e.lane.map(LaneId::new))
+                .collect(),
         }
     }
 
@@ -541,7 +558,9 @@ impl TrafficAuditor {
                     };
                     for &i in members {
                         for &j in others {
-                            if i < j && boxes[i].intersects(&boxes[j]) {
+                            // Two levels (a tunnel under a street) do not collide.
+                            let apart = (actors[i].pos.z - actors[j].pos.z).abs() > UNDERGROUND_Z_M;
+                            if i < j && !apart && boxes[i].intersects(&boxes[j]) {
                                 pairs.insert((i, j));
                             }
                         }
@@ -653,13 +672,30 @@ impl TrafficAuditor {
                 lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), 0.0);
                 hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), 0.0);
             }
-            let candidates = world.buildings_in_bbox(Bbox::new(lo, hi));
+            // A vehicle below ground (in a tunnel) is under the buildings, not in them.
+            let candidates = if a.pos.z < -UNDERGROUND_Z_M {
+                Vec::new()
+            } else {
+                world.buildings_in_bbox(Bbox::new(lo, hi))
+            };
             'buildings: for b in candidates {
                 let Some(building) = world.building(b) else {
                     continue;
                 };
                 for p in &points {
                     if building.contains_2d(*p) {
+                        let on_data_lane = self.lanes_through_buildings.contains(&a.lane)
+                            || a.prev_lane
+                                .is_some_and(|l| self.lanes_through_buildings.contains(&l));
+                        if on_data_lane {
+                            // The source data runs this road through (or under) the
+                            // building — the Park Avenue portals of the Helmsley
+                            // Building, a covered tunnel ramp. That is the world's fact,
+                            // reported once per lane by `WorldLaneInBuilding`, not a
+                            // vehicle leaving its lane; it is counted as a statistic.
+                            self.stats.in_building_on_lanes_through_buildings += 1;
+                            break 'buildings;
+                        }
                         let ex = Self::example(
                             Check::InBuilding,
                             t,
@@ -1292,7 +1328,7 @@ pub fn audit_world(world: &World) -> Vec<(Check, Example)> {
                     ));
                 }
             }
-            if !building_reported {
+            if !building_reported && p.z >= -UNDERGROUND_Z_M {
                 for b in world.buildings_in_bbox(Bbox::new(p, p)) {
                     if world.building(b).is_some_and(|bl| bl.contains_2d(p)) {
                         building_reported = true;
@@ -1313,9 +1349,11 @@ pub fn audit_world(world: &World) -> Vec<(Check, Example)> {
     }
     // Conflicting protected greens.
     let mut approach_of: BTreeMap<LaneId, LaneId> = BTreeMap::new();
+    let mut exit_of: BTreeMap<LaneId, LaneId> = BTreeMap::new();
     for c in world.roads.connections() {
         if let Some(via) = c.via {
             approach_of.entry(via).or_insert(c.from_lane);
+            exit_of.entry(via).or_insert(c.to_lane);
         }
     }
     for plan in &world.signals {
@@ -1331,6 +1369,16 @@ pub fn audit_world(world: &World) -> Vec<(Check, Example)> {
                     }
                     let (la, lb) = (plan.controlled[a], plan.controlled[b]);
                     if approach_of.get(&la) == approach_of.get(&lb) {
+                        continue;
+                    }
+                    // Two lanes of one road merging into one where the road narrows — a
+                    // lane drop — share a green everywhere; the engine zips them. That
+                    // is geometry, not a signal plan that lets two streams collide.
+                    let same_road = approach_of
+                        .get(&la)
+                        .zip(approach_of.get(&lb))
+                        .is_some_and(|(x, y)| world.lane(*x).edge == world.lane(*y).edge);
+                    if same_road && exit_of.get(&la) == exit_of.get(&lb) {
                         continue;
                     }
                     let (Some(ra), Some(rb)) = (row(la), row(lb)) else {

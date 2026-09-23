@@ -347,6 +347,23 @@ impl ConflictView {
             self.stop_line_gap_m.max(0.0) / self.speed_mps
         }
     }
+
+    /// Time for this claimant to reach the stop line if it accelerates at `accel_mps2`
+    /// from its current speed: `(−v + sqrt(v² + 2·a·d)) / a`, seconds.
+    ///
+    /// What a permissive (green-yield) turn must use for the opposing stream, which has
+    /// the *same* green: a queue standing at the line when the light changes is about to
+    /// move, not "never arriving", and taking it at its current speed of zero let a left
+    /// turner cut across it the moment the light went green, braking the through traffic
+    /// at −6 m/s² an instant after it had pulled away.
+    pub fn time_to_stop_line_accelerating_s(&self, accel_mps2: f64) -> f64 {
+        let d = self.stop_line_gap_m.max(0.0);
+        let v = self.speed_mps.max(0.0);
+        if accel_mps2 <= 0.0 {
+            return self.time_to_stop_line_s();
+        }
+        (-v + v2xw_core::math::sqrt(v * v + 2.0 * accel_mps2 * d)) / accel_mps2
+    }
 }
 
 /// What an [`crate::traits::IntersectionControl`] decides.

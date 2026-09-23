@@ -2336,6 +2336,13 @@ pub struct WayPlan {
     pub bridge: bool,
     /// `tunnel=*` other than `no`. Recorded, and part of the merge key.
     pub tunnel: bool,
+    /// How many levels below ground the way runs: `-layer` for a tunnel (at least 1 for
+    /// `tunnel=yes`), `0` at grade. A `tunnel=building_passage` runs *through* a building
+    /// at street level and stays at grade.
+    pub levels_below: u8,
+    /// How many levels above ground a bridge runs: its `layer` when positive, `0`
+    /// otherwise (a bridge tagged at layer 0 crosses water or a gap, not a road).
+    pub levels_above: u8,
 }
 
 impl WayPlan {
@@ -2639,6 +2646,33 @@ pub fn classify_way(
             .unwrap_or(0),
         bridge: way.tags.get("bridge").is_some_and(|v| v != "no"),
         tunnel: way.tags.get("tunnel").is_some_and(|v| v != "no"),
+        levels_below: {
+            let tunnel = way.tags.get("tunnel").map(str::trim);
+            let underground = tunnel.is_some_and(|v| v != "no" && v != "building_passage");
+            let layer = way
+                .tags
+                .get("layer")
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .unwrap_or(0);
+            if underground {
+                u8::try_from((-layer).max(1)).unwrap_or(u8::MAX)
+            } else {
+                0
+            }
+        },
+        levels_above: {
+            let bridge = way.tags.get("bridge").is_some_and(|v| v != "no");
+            let layer = way
+                .tags
+                .get("layer")
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .unwrap_or(0);
+            if bridge && layer > 0 {
+                u8::try_from(layer).unwrap_or(u8::MAX)
+            } else {
+                0
+            }
+        },
     })
 }
 
@@ -3333,6 +3367,14 @@ fn collapse_trivial_junctions(
 
 /// The shortest lane this importer will emit, metres. Below it a lane is noise.
 const MIN_LANE_LENGTH_M: f64 = 1.0;
+
+/// How far one `layer` level puts a roadway below ground (a tunnel) or above it (a
+/// bridge over a road), metres.
+///
+/// **This importer's choice**: OSM's `layer` is an ordering, not a height. 6 m is the
+/// 4.9 m (16 ft) minimum vertical clearance of a road under a structure (AASHTO Green
+/// Book 2018 §8.2) plus the structure, rounded; a second level is twice that.
+const TUNNEL_LEVEL_DEPTH_M: f64 = 6.0;
 
 /// The smallest junction trimming radius, metres.
 const MIN_JUNCTION_RADIUS_M: f64 = 1.0;
@@ -4053,7 +4095,22 @@ fn build_network(
             for k in 0..direction_lanes {
                 let offset = -(half_width - (f64::from(k) + 0.5) * plan.lane_width_m);
                 let (offset_points, repaired) = offset_polyline(geometry, offset);
-                let centreline = dedupe_points(offset_points);
+                let mut centreline = dedupe_points(offset_points);
+                // A tunnel runs below ground. Flat at z = 0 it ran *through* the buildings
+                // above it — the FDR Drive under the United Nations, the Park Avenue, 1st
+                // Avenue and Queens-Midtown tunnels — and every vehicle in one was drawn
+                // inside a building. The junction connectors at its portals interpolate
+                // z, so the descent is made there.
+                // And a bridge over a road runs above it: at z = 0 the Park Avenue
+                // Viaduct crossed the street under it at grade, and the auditor found the
+                // cars on the two "colliding".
+                if plan.levels_below > 0 || plan.levels_above > 0 {
+                    let z = TUNNEL_LEVEL_DEPTH_M
+                        * (f64::from(plan.levels_above) - f64::from(plan.levels_below));
+                    for p in &mut centreline {
+                        p.z = z;
+                    }
+                }
                 if centreline.len() < 2 || polyline_length(&centreline) < MIN_KEPT_LANE_M {
                     report.note(Anomaly::DegenerateLane, plan.osm_id);
                     continue;

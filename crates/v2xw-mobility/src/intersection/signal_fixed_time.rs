@@ -55,6 +55,12 @@ pub const MODEL_ID: &str = "mobility/intersection/signal-fixed-time";
 /// The model version.
 pub const MODEL_VERSION: &str = "1.0.0";
 
+/// The acceleration a permissive turn assumes the opposing stream — which has the same
+/// green — pulls away with, m/s²: the Kesting 2010 IDM passenger-car maximum
+/// acceleration `a` (04-models.md §2.1), the same number the car-following model drives
+/// those vehicles with.
+pub const OPPOSING_START_ACCEL_MPS2: f64 = 1.4;
+
 /// The fixed-time plan generator's parameters (§2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -368,7 +374,7 @@ impl IntersectionControl for FixedTimeSignals {
                 let closing = conflicts
                     .iter()
                     .filter(|c| c.conflicts && c.ego_must_yield)
-                    .map(ConflictView::time_to_stop_line_s)
+                    .map(|c| c.time_to_stop_line_accelerating_s(OPPOSING_START_ACCEL_MPS2))
                     .fold(f64::INFINITY, f64::min);
                 if closing >= critical {
                     EntryDecision::Proceed
@@ -670,6 +676,36 @@ mod tests {
             ),
             EntryDecision::Proceed,
             "inside the dilemma zone it clears the junction"
+        );
+    }
+
+    #[test]
+    fn a_permissive_turn_yields_to_a_queue_about_to_pull_away() {
+        // The opposing through stream has the same green. A vehicle of it standing at the
+        // line when the light changes is about to move; taken at its speed of zero it was
+        // "never arriving", and the left turner cut across it.
+        let m = FixedTimeSignals::default();
+        let mut j = junction(Some(SignalState::GreenYield), 20.0);
+        j.movement = TurnDirection::Left;
+        let opposing = |gap: f64, speed: f64| ConflictView {
+            actor: ActorId::new(9),
+            stop_line_gap_m: gap,
+            speed_mps: speed,
+            heading_rad: core::f64::consts::PI,
+            movement: TurnDirection::Straight,
+            movement_lane: Some(LaneId::new(2)),
+            conflicts: true,
+            ego_must_yield: true,
+        };
+        // Standing 3 m from the line: it reaches it in sqrt(2·3/1.4) ≈ 2.1 s < 4.1 s.
+        assert_eq!(
+            m.may_enter(&ego(5.0), &j, &[opposing(3.0, 0.0)], &WeatherState::CLEAR),
+            EntryDecision::Stop { gap_m: 18.0 }
+        );
+        // Standing 60 m back: 9.3 s away, a gap the turn can take.
+        assert_eq!(
+            m.may_enter(&ego(5.0), &j, &[opposing(60.0, 0.0)], &WeatherState::CLEAR),
+            EntryDecision::Proceed
         );
     }
 
