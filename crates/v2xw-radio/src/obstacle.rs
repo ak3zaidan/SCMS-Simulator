@@ -1136,6 +1136,12 @@ pub fn boban_vehicle_loss_db(h_m: f64, d1_m: f64, d2_m: f64, lambda_m: f64) -> f
 
 /// `obstacle/terrain/knife-edge-p526` — single or multiple knife-edge diffraction over
 /// the terrain profile.
+///
+/// The geometry — which summits diffract, how far along the path they are and how high
+/// above the *radio line* they sit — is [`crate::terrain`]'s, which is also where the
+/// shape of the world-side terrain profile query is documented. This type is the
+/// [`ObstacleModel`] wrapper: it chooses the sample count, the multiple-edge construction
+/// and the `J(ν)` form, and it reduces the edge list to decibels.
 #[derive(Debug, Clone)]
 pub struct TerrainDiffraction {
     card: ModelCard,
@@ -1144,6 +1150,8 @@ pub struct TerrainDiffraction {
     exact: bool,
     /// How many points the DEM profile is sampled at between the endpoints.
     profile_samples: usize,
+    /// How the edge list is extracted from that profile.
+    extraction: crate::terrain::EdgeExtraction,
 }
 
 impl TerrainDiffraction {
@@ -1158,8 +1166,38 @@ impl TerrainDiffraction {
             tier,
             rule: MultiEdgeRule::Deygout,
             exact: false,
-            profile_samples: 64,
+            profile_samples: crate::terrain::DEFAULT_PROFILE_SAMPLES,
+            extraction: crate::terrain::EdgeExtraction::default(),
         }
+    }
+
+    /// The model with a caller-chosen profile sample count.
+    ///
+    /// Clamped to the range the card declares, `3..=4_096`: below three there is no
+    /// interior sample for a summit to sit at, and above four thousand the profile invents
+    /// detail no DEM carries.
+    #[must_use]
+    pub fn with_profile_samples(mut self, samples: usize) -> Self {
+        self.profile_samples = samples.clamp(3, 4_096);
+        self
+    }
+
+    /// The model with a caller-chosen edge extraction.
+    ///
+    /// The card keeps declaring the *defaults* for `profile_samples`, `max_edges` and
+    /// `include_below_line`, as a card declares defaults; the resolved values come from
+    /// the scenario's parameter set the same way every other override does
+    /// (02-architecture.md §6.5).
+    #[must_use]
+    pub fn with_extraction(mut self, extraction: crate::terrain::EdgeExtraction) -> Self {
+        self.extraction = extraction;
+        self
+    }
+
+    /// How many points the profile is sampled at.
+    #[must_use]
+    pub const fn profile_samples(&self) -> usize {
+        self.profile_samples
     }
 
     /// The model using the exact Fresnel-integral form of `J(ν)`.
@@ -1178,43 +1216,38 @@ impl TerrainDiffraction {
         self
     }
 
-    /// The terrain edges along a link: every local maximum of
-    /// `ground height − line height`, in along-path order.
+    /// The terrain profile along a link, or `None` when the world has no DEM.
+    ///
+    /// Delegated to [`crate::terrain::TerrainProfile::sample`], which is the one place
+    /// that knows the shape of the world-side query.
+    #[must_use]
+    pub fn profile(&self, world: &World, a: Vec3, b: Vec3) -> Option<crate::terrain::TerrainProfile> {
+        crate::terrain::TerrainProfile::sample(world, a, b, self.profile_samples)
+    }
+
+    /// The terrain edges along a link: every local maximum of the clearance profile —
+    /// ground height minus the **radio line's** height — in along-path order.
     ///
     /// A world with no DEM has no terrain edges at all, which is the honest answer: the
     /// ground is the zero plane and a link cannot be blocked by it.
+    ///
+    /// `a.z` and `b.z` are antenna heights *above the local ground*
+    /// ([`crate::types::RadioEndpoint`]), not elevations, and
+    /// [`crate::terrain::knife_edges`] is what adds the ground under each endpoint before
+    /// interpolating the line. Comparing a DEM elevation against a bare `z` — which this
+    /// method used to do — reported every link on a world at 200 m as blocked by a 198 m
+    /// knife edge; [`crate::terrain`] documents the fix in full.
+    ///
+    /// The list can contain edges **below** the line: they may still intrude into the
+    /// first Fresnel zone, and the `ν > −0.78` filter that decides whether they cost
+    /// anything is [`knife_edge_loss_db`]'s, which is the only place that knows the
+    /// wavelength.
     #[must_use]
     pub fn terrain_edges(&self, world: &World, a: Vec3, b: Vec3) -> Vec<KnifeEdge> {
-        if world.terrain.is_none() {
+        let Some(profile) = self.profile(world, a, b) else {
             return Vec::new();
-        }
-        let total = a.distance_2d(b);
-        if total <= 0.0 || self.profile_samples < 3 {
-            return Vec::new();
-        }
-        let n = self.profile_samples;
-        let mut clearance = Vec::with_capacity(n + 1);
-        for i in 0..=n {
-            let f = i as f64 / n as f64;
-            let p = a.lerp(b, f);
-            let ground = world.ground_height_at(p.x, p.y);
-            clearance.push(ground - line_height_at(a.z, b.z, f));
-        }
-        let mut edges = Vec::new();
-        for i in 1..n {
-            let h = clearance[i];
-            if h > clearance[i - 1] && h >= clearance[i + 1] && h > 0.0 {
-                let f = i as f64 / n as f64;
-                let d1 = (total * f).max(1e-6);
-                edges.push(KnifeEdge {
-                    d1_m: d1,
-                    d2_m: (total - d1).max(1e-6),
-                    h_m: h,
-                    source: EdgeSource::Terrain,
-                });
-            }
-        }
-        edges
+        };
+        crate::terrain::knife_edges(&profile, a.z, b.z, self.extraction)
     }
 }
 
@@ -1240,8 +1273,18 @@ impl<C: Ctx + ?Sized> ObstacleModel<C> for TerrainDiffraction {
         if edges.is_empty() {
             return LosResult::clear();
         }
+        // An edge *below* the radio line diffracts — it can intrude into the first Fresnel
+        // zone — but it does not obstruct. Calling such a link NLOS-terrain would put a
+        // link with a fraction of a decibel of grazing loss into the same class as one
+        // behind a ridge, and 04-models.md §3.2's path-loss presets are selected by that
+        // class. So the edges travel in the result and the class follows the geometry.
+        let class = if crate::terrain::any_edge_obstructs(&edges) {
+            LosClass::NlosT
+        } else {
+            LosClass::Los
+        };
         LosResult {
-            class: LosClass::NlosT,
+            class,
             walls_crossed: 0,
             obstructed_len_m: 0.0,
             knife_edges: edges,
@@ -1337,7 +1380,7 @@ fn terrain_card(rule: MultiEdgeRule, exact: bool) -> ModelCard {
         Parameter {
             name: "profile_samples".to_string(),
             unit: "-".to_string(),
-            default: serde_json::json!(64),
+            default: serde_json::json!(crate::terrain::DEFAULT_PROFILE_SAMPLES),
             range: Some(vec![serde_json::json!(3), serde_json::json!(4_096)]),
             source: Source {
                 kind: SourceKind::TodoCalibrate,
@@ -1357,16 +1400,80 @@ fn terrain_card(rule: MultiEdgeRule, exact: bool) -> ModelCard {
                     .to_string(),
             ),
         },
+        Parameter {
+            name: "max_edges".to_string(),
+            unit: "-".to_string(),
+            default: serde_json::json!(crate::terrain::DEFAULT_MAX_EDGES),
+            range: Some(vec![serde_json::json!(1), serde_json::json!(64)]),
+            source: Source {
+                kind: SourceKind::TodoCalibrate,
+                reference: "how many of a profile's summits the multiple-edge \
+                            construction is applied to; ITU-R P.526 states the \
+                            constructions for the principal edges of a path without \
+                            printing a count"
+                    .to_string(),
+                accessed: None,
+                note: Some(
+                    "Eight. The Deygout construction recurses over the edge list, so an \
+                     unbounded list makes the cost quadratic in the sample count, which \
+                     is a property of the query and not of the terrain. The edges kept \
+                     are the highest, which are the ones that diffract."
+                        .to_string(),
+                ),
+            },
+            calibration: Some(
+                "Compare the full-list and capped losses over an imported DEM once the \
+                 terrain importer lands, and raise the cap if the difference exceeds the \
+                 ±3 dB tolerance 04-models.md §13 states for an obstacle row."
+                    .to_string(),
+            ),
+        },
+        Parameter {
+            name: "include_below_line".to_string(),
+            unit: "-".to_string(),
+            default: serde_json::json!(true),
+            range: Some(vec![
+                serde_json::json!(false),
+                serde_json::json!(true),
+            ]),
+            source: itu.clone(),
+            calibration: None,
+        },
     ];
     card.assumptions = vec![
         "Each local maximum of the clearance profile is an ideal knife edge.".to_string(),
         "A world with no DEM has no terrain obstruction.".to_string(),
+        "The clearance profile is measured against the radio line in absolute elevation: \
+         a RadioEndpoint's z is an antenna height above the local ground, so the ground \
+         under each endpoint is added before the line is interpolated (see \
+         crate::terrain)."
+            .to_string(),
+        "A summit below the line is still reported as an edge, because it can intrude \
+         into the first Fresnel zone; the ν > −0.78 filter of P.526 Eq. 31 is what \
+         decides whether it costs anything, and it is applied in the loss model, which is \
+         the only place that knows the wavelength."
+            .to_string(),
+        "A link whose only edges sit below the line is classified LOS, not NLOS-terrain: \
+         it diffracts but it is not obstructed, and 04-models.md §3.2's presets are \
+         selected by the class."
+            .to_string(),
     ];
     card.limitations = vec![
         "Deygout is the more pessimistic of the two multiple-edge constructions and the \
          ITU-R one the more optimistic; neither is exact for a rounded ridge."
             .to_string(),
         "No ground reflection or rounded-obstacle correction (P.526's other cases).".to_string(),
+        "At most max_edges summits enter the construction; a profile with more loses its \
+         lowest ones."
+            .to_string(),
+    ];
+    card.ignores = vec![
+        "Earth curvature: the radio line is a straight chord, not a 4/3-k-factor ray. The \
+         bulge d1·d2/(2·a_e) is about 1.5 cm at the worst case this crate models (a 1 km \
+         link with the summit at mid-path), two orders of magnitude below anything a 30 m \
+         post spacing resolves."
+            .to_string(),
+        "Foliage on the summit, which is obstacle/foliage/boban-mel's term.".to_string(),
     ];
     card.sources = vec![itu.clone()];
     card.validation = Validation {
@@ -1376,6 +1483,14 @@ fn terrain_card(rule: MultiEdgeRule, exact: bool) -> ModelCard {
             "a_grazing_knife_edge_costs_six_decibels".to_string(),
             "the_exact_and_approximate_forms_agree".to_string(),
             "deygout_is_more_pessimistic_than_a_single_edge".to_string(),
+            // crate::terrain's own tests, which cover the geometry this model reduces.
+            "a_flat_profile_at_any_elevation_has_no_edges".to_string(),
+            "a_hill_between_two_antennas_is_one_knife_edge_above_the_line".to_string(),
+            "a_taller_antenna_clears_the_hill".to_string(),
+            "a_grazing_summit_is_continuous_across_the_line".to_string(),
+            "two_hills_are_two_edges_in_along_path_order".to_string(),
+            "the_edge_cap_keeps_the_highest_and_is_order_independent".to_string(),
+            "a_plateau_yields_one_edge_not_two".to_string(),
         ],
     };
     card

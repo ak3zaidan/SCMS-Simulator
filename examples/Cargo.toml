@@ -1,0 +1,66 @@
+# The worked example plug-ins — one per major interface (10-roadmap.md Phase 4).
+#
+# # Why this is its own workspace
+#
+# `[workspace]` below, and not an entry in the root manifest's `members`, for two
+# reasons:
+#
+#  1. **An example must be built the way a contributor's crate is built.** A researcher
+#     adding a detector does not add a member to this repository's workspace; they write
+#     a crate somewhere else that depends on `v2xw-core` and one family crate. If the
+#     examples were workspace members they would inherit `[workspace.dependencies]`,
+#     `[workspace.package]` and the root lock file, and would therefore compile under
+#     conditions the reader cannot reproduce. Every dependency below is spelled out with
+#     a version, exactly as an out-of-tree crate must spell it.
+#  2. **Building the examples must not change what the engine's build does.** A package
+#     under the repository root that is neither a member nor its own workspace root is a
+#     cargo error, so the table is required either way; `docs/site/tools/cardgen` is
+#     arranged the same way and for the same reason.
+#
+# The cost is a second target directory and a second lock file. If the owner would
+# rather have one of each, adding "examples/*" to the root `[workspace] members` list
+# and deleting the `[workspace.package]`/`[workspace.dependencies]` tables below is the
+# whole change — but read reason 1 before making it.
+#
+# # Layout note, for the owner
+#
+# ADR 0010 §1 puts the worked examples at `plugins/examples/`, and a placeholder README
+# stands there saying so. This directory is `examples/` because that is the path the
+# build task assigned, and one set of examples in two places would be worse than one set
+# in the less canonical place. Reconciling it is `git mv examples plugins/examples` plus
+# the three path fixes in the tutorial; nothing in the code depends on the location.
+
+[workspace]
+resolver = "3"
+members = [
+    "propagation-log-distance",
+    "carfollowing-constant-time-gap",
+    "detector-heading-rate",
+    "metric-detector-load",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.86"
+publish = false
+authors = ["V2X World Simulator contributors"]
+repository = "https://github.com/ak3zaidan/SCMS-Simulator"
+
+# The versions an out-of-tree crate would write. The engine crates are reached by path
+# because they are not published to a registry yet; `version` is stated beside each path
+# so that the day they are, deleting the `path` key is the only change.
+[workspace.dependencies]
+v2xw-core = { path = "../crates/v2xw-core", version = "0.1.0" }
+v2xw-radio = { path = "../crates/v2xw-radio", version = "0.1.0" }
+v2xw-mobility = { path = "../crates/v2xw-mobility", version = "0.1.0" }
+v2xw-threat = { path = "../crates/v2xw-threat", version = "0.1.0" }
+v2xw-metrics = { path = "../crates/v2xw-metrics", version = "0.1.0" }
+serde_json = "1"
+
+# Optimised even in the examples' debug profile: two of the four depend on crates that
+# take a while to compile unoptimised, and a tutorial whose first `cargo test` takes
+# four minutes is a tutorial nobody finishes.
+[profile.dev]
+opt-level = 1

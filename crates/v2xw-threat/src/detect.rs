@@ -1220,8 +1220,10 @@ pub fn card(p: &DetectorParams) -> ModelCard {
          false-positives on a sustained curve."
             .to_string(),
         "Perception cross-check and CPM consistency (07-threats-and-detection.md §3.1) \
-         are not implemented: they need the perception model's Detection type, which does \
-         not exist yet. Left as a documented hook."
+         are not in THIS suite, which is the legacy twelve and must stay byte-comparable \
+         with the legacy corpus. They are class 4 and class 5 of \
+         `threat/detector/ts103759-observations` (crate::ts103759), which runs alongside \
+         and reads the node's own perception through crate::obs::LocalPerception."
             .to_string(),
         "The per-message CPU cost is a placeholder, not a measurement.".to_string(),
     ];

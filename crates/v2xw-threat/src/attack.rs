@@ -64,6 +64,14 @@ pub enum AttackFamily {
     Event,
     /// Selective non-forwarding.
     Suppression,
+    /// Raw energy on the channel rather than frames (07-threats §2.2, 04-models §12.3).
+    Jamming,
+    /// An attack mounted from infrastructure: a compromised road-side unit.
+    Infrastructure,
+    /// False misbehaviour reports: an attack on the authority rather than on the air.
+    Poisoning,
+    /// Passive tracking: an adversary that never transmits (07-threats §6).
+    Privacy,
 }
 
 impl AttackFamily {
@@ -81,7 +89,52 @@ impl AttackFamily {
             AttackFamily::Credential => "credential",
             AttackFamily::Event => "event",
             AttackFamily::Suppression => "suppression",
+            AttackFamily::Jamming => "jamming",
+            AttackFamily::Infrastructure => "infrastructure",
+            AttackFamily::Poisoning => "poisoning",
+            AttackFamily::Privacy => "privacy",
         }
+    }
+
+    /// The families the legacy feature pipeline knows, in its own order.
+    ///
+    /// The four that follow them are new with 07-threats §2.2 and §6, so a per-family
+    /// table from a ported run and one from the legacy corpus line up on the first ten
+    /// rows and the new families appear as new rows rather than displacing anything.
+    pub const LEGACY: [AttackFamily; 9] = [
+        AttackFamily::Position,
+        AttackFamily::Speed,
+        AttackFamily::Heading,
+        AttackFamily::Combined,
+        AttackFamily::Timing,
+        AttackFamily::Stealth,
+        AttackFamily::Identity,
+        AttackFamily::Credential,
+        AttackFamily::Event,
+    ];
+
+    /// Every family, legacy first.
+    pub const ALL: [AttackFamily; 14] = [
+        AttackFamily::Position,
+        AttackFamily::Speed,
+        AttackFamily::Heading,
+        AttackFamily::Combined,
+        AttackFamily::Timing,
+        AttackFamily::Stealth,
+        AttackFamily::Identity,
+        AttackFamily::Credential,
+        AttackFamily::Event,
+        AttackFamily::Suppression,
+        AttackFamily::Jamming,
+        AttackFamily::Infrastructure,
+        AttackFamily::Poisoning,
+        AttackFamily::Privacy,
+    ];
+}
+
+impl core::fmt::Display for AttackFamily {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -371,6 +424,81 @@ pub struct EventClaim {
     pub claimed_speed_mps: f64,
 }
 
+/// Raw energy an attacker puts on the channel instead of a frame (07-threats §2.2,
+/// "PHY jamming and flooding"; 04-models §12.3 for the profiles and their anchors).
+///
+/// The attacker declares it and the host applies it: a jammer is an interferer in the
+/// SINR sums (04-models §12.3), which is the radio crate's to add, so this type is the
+/// declaration and the `TransmitRaw` action is its ground-truth record. What it is *not*
+/// is a shortcut that deletes frames at the receiver — a jammer that did that would report
+/// a blind area that owed nothing to propagation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RawEnergy {
+    /// The profile: `constant`, `reactive` or `random-duty` (04-models §12.3).
+    pub profile: JamProfile,
+    /// Transmit power, dBm. Bounded by the attacker's declared
+    /// [`crate::capability::RadioCaps::max_power_dbm`]; the MAC/PHY reject more.
+    pub power_dbm: f64,
+    /// How long the burst lasts, microseconds.
+    pub duration_us: u64,
+    /// The RSSI a reactive jammer triggers on, dBm. `None` for the profiles that do not
+    /// trigger.
+    pub trigger_dbm: Option<f64>,
+}
+
+/// Which jammer profile (04-models §12.3, Puñal, Aguiar and Gross 2012).
+///
+/// The radio crate's `v2xw_radio::jamming::JammerKind` is the same three profiles seen
+/// from the PHY, spelled `Constant`, `Pulsed` and `Reactive`; the engine maps
+/// [`JamProfile::RandomDuty`] onto its `Pulsed`. Two spellings exist because the adversary
+/// declares a profile before the radio has any windows to partition, and neither crate
+/// depends on the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum JamProfile {
+    /// Continuous OFDM-like noise in the channel.
+    Constant,
+    /// Transmits only when energy above the trigger threshold is sensed.
+    Reactive,
+    /// On for a fraction of each period, off for the rest.
+    RandomDuty,
+}
+
+impl JamProfile {
+    /// The profile's name, as the `gt.attack.action` record and the model id carry it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            JamProfile::Constant => "constant",
+            JamProfile::Reactive => "reactive",
+            JamProfile::RandomDuty => "random-duty",
+        }
+    }
+}
+
+impl core::fmt::Display for JamProfile {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One infrastructure message a compromised road-side unit falsifies (07-threats §2.2,
+/// "Compromised RSU").
+///
+/// A declaration, like [`RawEnergy`]: the SPaT/MAP and CRL/CTL generators are
+/// `v2xw-msg`'s and `v2xw-proto`'s, so what this crate can do honestly is say which
+/// message was falsified, in which field, by how much — which is what the ground-truth
+/// channel needs and what a safety-application join later reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InfraClaim {
+    /// Which infrastructure message: `spat`, `map`, `crl` or `ctl`.
+    pub message: String,
+    /// The field falsified, e.g. `phase`, `lane-connection`, `entries`.
+    pub field: String,
+    /// The size of the falsification in that field's own units: seconds of fabricated
+    /// green for a `spat` phase, a count of fabricated entries for a `crl`.
+    pub magnitude: f64,
+}
+
 /// What a node is about to transmit, before signing: the attacker's canvas.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Emission {
@@ -403,6 +531,36 @@ pub struct Emission {
     pub ghosts: Vec<Emission>,
     /// Event messages this node emits alongside the beacon.
     pub events: Vec<EventClaim>,
+    /// The application payload's size in bytes, when the attacker sets it.
+    ///
+    /// `None` leaves the node's own generator in charge, which is the conforming case.
+    /// `Some` is the oversized-message flood of 07-threats §2.2: the MAC's maximum MSDU is
+    /// 2 304 B (04-models §4.6), and a sender that emits that at a high rate exhausts a
+    /// receiver's verification budget and reassembly buffers without forging anything.
+    pub payload_bytes: Option<u32>,
+    /// The region the envelope's certificate states it is valid in.
+    ///
+    /// `None` is "whatever the node's own credential says". `Some` renders the
+    /// certificate-misuse-across-regions attack (07-threats §2.2): a valid credential used
+    /// outside its `IdentifiedRegion`.
+    pub cert_region: Option<crate::obs::RegionId>,
+    /// Objects this emission claims to perceive — a collective-perception payload.
+    ///
+    /// A phantom entry here is the false-CPM attack of 07-threats §2.2, and it is the
+    /// thing the class-4 and class-5 cross-checks of [`crate::ts103759`] exist to catch.
+    pub perceived: Vec<crate::obs::PerceivedObject>,
+    /// Raw energy this node puts on the channel alongside (or instead of) the frame.
+    pub raw_energy: Option<RawEnergy>,
+    /// True when this emission is a **verbatim retransmission** of a frame this node
+    /// captured, rather than something this node signed.
+    ///
+    /// The host must put the stored frame on the air unchanged instead of re-signing:
+    /// that is what makes a replay or a relay (wormhole) verify at the receiver even
+    /// though the attacker holds none of the original signer's keys. An emission with
+    /// `replayed` set carries the *captured* signer and the *captured* generation time.
+    pub replayed: bool,
+    /// Infrastructure messages this node falsifies — a compromised road-side unit only.
+    pub infra: Vec<InfraClaim>,
 }
 
 impl Emission {
@@ -431,7 +589,26 @@ impl Emission {
             suppressed: false,
             ghosts: Vec::new(),
             events: Vec::new(),
+            payload_bytes: None,
+            cert_region: None,
+            perceived: Vec::new(),
+            raw_energy: None,
+            replayed: false,
+            infra: Vec::new(),
         }
+    }
+
+    /// How many messages this emission puts on the air, ghosts and event messages
+    /// included, before the MAC and DCC get a say.
+    ///
+    /// `repetitions` counts the copies of the beacon; a ghost carries its own.
+    #[must_use]
+    pub fn messages_on_air(&self) -> u64 {
+        let ghosts: u64 = self.ghosts.iter().map(|g| u64::from(g.repetitions)).sum();
+        if self.suppressed {
+            return 0;
+        }
+        u64::from(self.repetitions) + ghosts + self.events.len() as u64
     }
 }
 
@@ -513,6 +690,30 @@ pub enum AttackAction {
         /// Transmit power, dBm.
         power_dbm: f64,
     },
+    /// Claimed to perceive objects that are not there (a phantom CPM).
+    ForgeObject {
+        /// How many phantom objects the message carries.
+        count: u32,
+    },
+    /// Falsified an infrastructure message — a compromised road-side unit's SPaT, MAP,
+    /// CRL or CTL.
+    FalsifyInfrastructure {
+        /// Which message: `spat`, `map`, `crl`, `ctl`.
+        message: String,
+        /// The field falsified.
+        field: String,
+        /// The size of the falsification in that field's units.
+        magnitude: f64,
+    },
+    /// Dropped a misbehaviour report it was asked to forward, rather than a beacon.
+    ///
+    /// Distinct from [`AttackAction::Suppress`] because the thing suppressed is evidence
+    /// on its way to the authority, not a frame on the air: it removes no bytes from the
+    /// channel and it is the infrastructure half of report poisoning (07-threats §2.2).
+    SuppressReport {
+        /// The subject of the report that was dropped.
+        subject: String,
+    },
 }
 
 impl AttackAction {
@@ -529,6 +730,9 @@ impl AttackAction {
             AttackAction::ForgeEvent { .. } => "ForgeEvent",
             AttackAction::ForgeReport { .. } => "ForgeReport",
             AttackAction::TransmitRaw { .. } => "TransmitRaw",
+            AttackAction::ForgeObject { .. } => "ForgeObject",
+            AttackAction::FalsifyInfrastructure { .. } => "FalsifyInfrastructure",
+            AttackAction::SuppressReport { .. } => "SuppressReport",
         }
     }
 
@@ -544,8 +748,13 @@ impl AttackAction {
                 vec!["generation_time".to_string()]
             }
             AttackAction::ForgeEvent { .. } => vec!["event".to_string()],
+            AttackAction::ForgeObject { .. } => vec!["perceived".to_string()],
+            AttackAction::FalsifyInfrastructure { message, field, .. } => {
+                vec![format!("{message}.{field}")]
+            }
             AttackAction::Suppress
             | AttackAction::ForgeReport { .. }
+            | AttackAction::SuppressReport { .. }
             | AttackAction::TransmitRaw { .. } => Vec::new(),
         }
     }
@@ -558,10 +767,13 @@ impl AttackAction {
             AttackAction::Delay { seconds } => Some(*seconds),
             AttackAction::Replay { age_s } => Some(*age_s),
             AttackAction::TransmitRaw { power_dbm, .. } => Some(*power_dbm),
+            AttackAction::ForgeObject { count } => Some(f64::from(*count)),
+            AttackAction::FalsifyInfrastructure { magnitude, .. } => Some(*magnitude),
             AttackAction::UseCredential { .. }
             | AttackAction::Ghost { .. }
             | AttackAction::ForgeEvent { .. }
             | AttackAction::ForgeReport { .. }
+            | AttackAction::SuppressReport { .. }
             | AttackAction::Suppress => None,
         }
     }
@@ -569,12 +781,19 @@ impl AttackAction {
     /// Whether the action changed bytes on the air. Invariant I-T3 is about exactly
     /// these.
     ///
-    /// [`AttackAction::Suppress`] is the one that did not: it removed bytes rather than
-    /// changing them, and the record says so instead of claiming an air change that a
+    /// The two suppression actions are the ones that did not: they removed bytes rather
+    /// than changing them, and the record says so instead of claiming an air change that a
     /// byte-accounting invariant would then fail to find.
+    ///
+    /// [`AttackAction::ForgeReport`] *does* change bytes: a report is a real transmission
+    /// over the reporting transport and costs the attacker its air time and its budget,
+    /// which is what makes report flooding bounded rather than free.
     #[must_use]
     pub const fn changed_bytes_on_air(&self) -> bool {
-        !matches!(self, AttackAction::Suppress)
+        !matches!(
+            self,
+            AttackAction::Suppress | AttackAction::SuppressReport { .. }
+        )
     }
 }
 
@@ -685,7 +904,49 @@ pub fn falsified_count(
     true_station_type: StationType,
 ) -> usize {
     let beacon = usize::from(is_falsified(honest, out, now, true_station_type));
-    beacon + out.ghosts.len() + out.events.len()
+    beacon + out.ghosts.len() + out.events.len() + usize::from(!out.perceived.is_empty())
+}
+
+/// The largest conforming application payload, bytes: the 802.11 maximum MSDU.
+///
+/// 04-models.md §4.6: 2 304 B, and `Phy::begin_tx` rejects a frame above it, so a
+/// flooding attacker's largest legal SPDU is this. The value is the size cap the flood
+/// aims at, not a threshold anybody chose.
+pub const MAX_MSDU_BYTES: u32 = 2_304;
+
+/// The label rule extended to the two new families whose falsification the frozen rule of
+/// [`is_falsified`] has no term for. **Host side**, as [`is_falsified`] is.
+///
+/// 07-threats-and-detection.md §4 fixes the per-message `falsified` rule, and it was
+/// written before §2.2's certificate-misuse-across-regions and oversized-message-flooding
+/// families existed: neither edits a field the rule reads, so both would be labelled
+/// honest and both would then be scored as detector false positives when a detector
+/// caught them. [`is_falsified`] is left exactly as the legacy corpus needs it and the two
+/// extra terms live here:
+///
+/// * the certificate states a region other than the one the sender is in
+///   (IEEE 1609.2 `IdentifiedRegion`, ETSI authorization-ticket region); and
+/// * the payload exceeds `max_payload_bytes` (default [`MAX_MSDU_BYTES`]).
+///
+/// `own_region` is the region the sender is actually in, which is ground truth — which is
+/// why this function is host side and why no attacker and no detector may call it.
+#[must_use]
+pub fn is_falsified_extended(
+    honest: &HonestClaim,
+    out: &Emission,
+    now: SimTime,
+    true_station_type: StationType,
+    own_region: Option<crate::obs::RegionId>,
+    max_payload_bytes: u32,
+) -> bool {
+    let region_misuse = match (out.cert_region, own_region) {
+        (Some(stated), Some(actual)) => stated != actual,
+        // Nothing stated, or nowhere declared to compare against: no evidence either way,
+        // and an absent input is not a falsification.
+        _ => false,
+    };
+    let oversized = out.payload_bytes.is_some_and(|b| b > max_payload_bytes);
+    is_falsified(honest, out, now, true_station_type) || region_misuse || oversized
 }
 
 #[cfg(test)]
@@ -869,5 +1130,148 @@ mod tests {
             1_000_000_000,
             StationType::Vehicle
         ));
+    }
+}
+
+#[cfg(test)]
+mod extended_tests {
+    use super::*;
+    use crate::obs::{PerceivedObject, RegionId};
+
+    fn honest() -> HonestClaim {
+        HonestClaim {
+            x_m: 0.0,
+            y_m: 0.0,
+            speed_mps: 10.0,
+            heading_rad: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_conforming_emission_declares_none_of_the_new_surfaces() {
+        let e = Emission::honest([0; 8], honest(), 1_000_000_000, 0, 10_000_000_000);
+        assert_eq!(e.payload_bytes, None);
+        assert_eq!(e.cert_region, None);
+        assert!(e.perceived.is_empty());
+        assert!(e.raw_energy.is_none());
+        assert!(!e.replayed);
+        assert!(e.infra.is_empty());
+        assert_eq!(e.messages_on_air(), 1);
+    }
+
+    #[test]
+    fn the_frozen_label_rule_has_no_term_for_the_two_new_families() {
+        // The point of `is_falsified_extended`: these two would otherwise be labelled
+        // honest, and a detector that caught them would be scored a false positive.
+        let h = honest();
+        let mut region = Emission::honest([0; 8], h, 1_000_000_000, 0, 10_000_000_000);
+        region.cert_region = Some(RegionId(276));
+        assert!(!is_falsified(&h, &region, 1_000_000_000, StationType::Vehicle));
+        assert!(is_falsified_extended(
+            &h,
+            &region,
+            1_000_000_000,
+            StationType::Vehicle,
+            Some(RegionId(840)),
+            MAX_MSDU_BYTES
+        ));
+        // Same region: not a misuse.
+        assert!(!is_falsified_extended(
+            &h,
+            &region,
+            1_000_000_000,
+            StationType::Vehicle,
+            Some(RegionId(276)),
+            MAX_MSDU_BYTES
+        ));
+        // No declared own region: an absent input is not evidence.
+        assert!(!is_falsified_extended(
+            &h,
+            &region,
+            1_000_000_000,
+            StationType::Vehicle,
+            None,
+            MAX_MSDU_BYTES
+        ));
+
+        let mut big = Emission::honest([0; 8], h, 1_000_000_000, 0, 10_000_000_000);
+        big.payload_bytes = Some(MAX_MSDU_BYTES);
+        assert!(
+            !is_falsified_extended(
+                &h,
+                &big,
+                1_000_000_000,
+                StationType::Vehicle,
+                None,
+                MAX_MSDU_BYTES
+            ),
+            "the MSDU cap itself is legal"
+        );
+        big.payload_bytes = Some(MAX_MSDU_BYTES + 1);
+        assert!(is_falsified_extended(
+            &h,
+            &big,
+            1_000_000_000,
+            StationType::Vehicle,
+            None,
+            MAX_MSDU_BYTES
+        ));
+    }
+
+    #[test]
+    fn a_phantom_perception_payload_is_counted_as_a_falsified_message() {
+        let h = honest();
+        let mut e = Emission::honest([0; 8], h, 1_000_000_000, 0, 10_000_000_000);
+        assert_eq!(falsified_count(&h, &e, 1_000_000_000, StationType::Vehicle), 0);
+        e.perceived
+            .push(PerceivedObject::from_metres(1, 30.0, 0.0, 12.0, 10));
+        e.perceived
+            .push(PerceivedObject::from_metres(2, 60.0, 0.0, 12.0, 10));
+        // One CPM, however many phantom objects it carries.
+        assert_eq!(falsified_count(&h, &e, 1_000_000_000, StationType::Vehicle), 1);
+    }
+
+    #[test]
+    fn suppressing_a_report_removes_no_bytes_from_the_air() {
+        let a = AttackAction::SuppressReport {
+            subject: "aabb".to_string(),
+        };
+        assert!(!a.changed_bytes_on_air());
+        assert_eq!(a.name(), "SuppressReport");
+        assert!(a.fields().is_empty());
+        assert_eq!(a.magnitude(), None);
+        // A forged report is a real transmission and is charged as one.
+        assert!(
+            AttackAction::ForgeReport {
+                subject: "aabb".to_string()
+            }
+            .changed_bytes_on_air()
+        );
+    }
+
+    #[test]
+    fn the_new_actions_name_the_field_they_changed() {
+        let o = AttackAction::ForgeObject { count: 4 };
+        assert_eq!(o.fields(), vec!["perceived".to_string()]);
+        assert_eq!(o.magnitude(), Some(4.0));
+        let i = AttackAction::FalsifyInfrastructure {
+            message: "spat".to_string(),
+            field: "phase".to_string(),
+            magnitude: 12.0,
+        };
+        assert_eq!(i.fields(), vec!["spat.phase".to_string()]);
+        assert_eq!(i.magnitude(), Some(12.0));
+        assert!(i.changed_bytes_on_air());
+    }
+
+    #[test]
+    fn the_legacy_families_come_first_and_the_new_ones_are_appended() {
+        assert_eq!(AttackFamily::ALL.len(), 14);
+        for (i, f) in AttackFamily::LEGACY.into_iter().enumerate() {
+            assert_eq!(AttackFamily::ALL[i], f);
+        }
+        assert_eq!(AttackFamily::Jamming.to_string(), "jamming");
+        assert_eq!(AttackFamily::Privacy.as_str(), "privacy");
+        assert_eq!(JamProfile::RandomDuty.to_string(), "random-duty");
     }
 }

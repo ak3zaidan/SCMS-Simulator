@@ -113,6 +113,21 @@ pub enum ExperimentError {
         run_id: String,
     },
 
+    /// The objective a foundry search was asked for is not one this build implements.
+    ///
+    /// Refused **before** the budget is spent, not after: the legacy foundry had no such
+    /// check, so an unknown objective raised inside every candidate's evaluation, was
+    /// swallowed per candidate, and left a silently empty archive and an exit status of
+    /// zero. An hour of simulation and no result and no error is the worst of the three
+    /// possible outcomes.
+    #[error("unknown foundry objective {objective:?}: {problem}")]
+    BadObjective {
+        /// The objective as it was spelled.
+        objective: String,
+        /// What is wrong with it, including the alternatives.
+        problem: String,
+    },
+
     /// The engine refused the scenario a sweep point produced.
     #[error(transparent)]
     Engine(#[from] v2xw_engine::EngineError),

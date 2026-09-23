@@ -1,10 +1,12 @@
-//! A small, exact unaligned PER engine — only the constructs SAE J2735's BSM needs.
+//! A small, exact unaligned PER engine — only the constructs the SAE J2735 messages this
+//! crate hand-encodes actually need.
 //!
-//! Build decision D2 makes the BSM codec hand-written, which means hand-writing the
+//! Build decision D2 makes the J2735 codecs hand-written, which means hand-writing the
 //! encoding rules too. This module is that: a bit writer, a bit reader, and one function
-//! per ASN.1 construct the Basic Safety Message actually contains. It is deliberately not
-//! a general PER implementation — a general one is a year of work and `rasn` already is
-//! one for the types it can generate.
+//! per ASN.1 construct the Basic Safety Message ([`crate::j2735::bsm`]), the SPaT
+//! ([`crate::j2735::spat`]) and the MAP ([`crate::j2735::map`]) actually contain. It is
+//! deliberately not a general PER implementation — a general one is a year of work and
+//! `rasn` already is one for the types it can generate.
 //!
 //! # What is implemented, and the clause it comes from
 //!
@@ -22,21 +24,23 @@
 //! | `OCTET STRING`, fixed size | 17.4 | [`write_fixed_octet_string`], [`read_fixed_octet_string`] |
 //! | `SEQUENCE` preamble: extension bit and optional-field bit-map | 19.1–19.2 | [`write_preamble`], [`read_preamble`] |
 //! | Open type field | 11.2 | [`write_open_type`], [`read_open_type`] |
+//! | `CHOICE` index, root alternatives only | 23.5–23.7 | [`write_choice_index`], [`read_choice_index`] |
 //!
 //! # What is deliberately absent
 //!
 //! No alignment (the U in UPER: nothing is ever padded to an octet boundary except the
-//! very end of the outermost encoding and the inside of an open type), no `CHOICE`, no
-//! `REAL`, no character strings, no semi-constrained or unconstrained integers, no
-//! fragmentation of lengths at or above 16 K, and no decoding of extension additions.
-//! Every one of those either cannot occur in the BSM subset this crate emits or produces
-//! [`UperError::Unsupported`] — never a guess.
+//! very end of the outermost encoding and the inside of an open type), no `REAL`, no
+//! character strings (so every `DescriptiveName` in a SPaT or a MAP is refused rather than
+//! encoded), no semi-constrained or unconstrained integers, no fragmentation of lengths at
+//! or above 16 K, no `CHOICE` extension additions, and no decoding of `SEQUENCE` extension
+//! additions. Every one of those either cannot occur in the subset this crate emits or
+//! produces [`UperError::Unsupported`] — never a guess.
 //!
 //! # Why a bit writer at all
 //!
 //! Because UPER packs fields with no padding between them: a `Latitude` is 31 bits and the
 //! `Longitude` after it starts mid-octet. Anything that thinks in bytes gets this wrong.
-//! The whole reason this module is separated from [`crate::j2735::bsm`] is that the bit
+//! The whole reason this module is separated from the message modules is that the bit
 //! plumbing is where the defects live and it is testable in isolation, against worked
 //! examples from the standard.
 
@@ -794,6 +798,81 @@ pub fn read_open_type(
     r.read_octets(n)
 }
 
+// =========================================================================================
+// CHOICE — X.691 clause 23
+// =========================================================================================
+
+/// Encodes a `CHOICE`'s alternative selector (clauses 23.5–23.7).
+///
+/// An extensible `CHOICE` gets one bit saying whether the chosen alternative is in the
+/// extension root (clause 23.5); it is always written as *in the root*, because nothing
+/// here selects an extension addition. The root index then follows as a constrained whole
+/// number over `0..=root_count-1` (clause 23.7), which is zero bits wide when the root has
+/// a single alternative — the same clause 11.5.4 degenerate case a single-value integer
+/// range hits, and just as easy to get wrong by emitting a stray bit.
+///
+/// `index` is the alternative's position in the **canonical order** of the root
+/// alternatives, which for every `CHOICE` this codec encodes is textual declaration order:
+/// J2735 declares no `CHOICE` whose alternatives carry tags out of order, so the two
+/// coincide. The caller supplies the index rather than a name so that this stays a pure
+/// bit-level function, exactly like [`write_enumerated`].
+pub fn write_choice_index(
+    w: &mut BitWriter,
+    field: Field,
+    extensible: bool,
+    index: u64,
+    root_count: u64,
+) -> Result<(), UperError> {
+    if root_count == 0 || index >= root_count {
+        // `BadEnumIndex` rather than a CHOICE-specific variant: the fault, the fields and
+        // the sentence that describes it ("N root values, index i selected") are identical,
+        // and one variant that is always right beats two that have to be kept in step.
+        return Err(UperError::BadEnumIndex {
+            asn1_type: field.asn1_type,
+            index,
+            count: root_count,
+        });
+    }
+    if extensible {
+        w.write_bit(false);
+    }
+    w.write_bits(index, constrained_width(root_count));
+    Ok(())
+}
+
+/// Decodes a `CHOICE`'s alternative selector (clauses 23.5–23.7).
+///
+/// A set extension bit is [`UperError::Unsupported`], never a skipped value: clause 23.8
+/// encodes an extension addition as a length-prefixed open type, and while that *could* be
+/// stepped over, the value inside it would be lost and any later field of the enclosing
+/// `SEQUENCE` would then be interpreted against a `CHOICE` this codec did not understand.
+/// Refusing says so; skipping would hand back a message with a silently missing turn
+/// restriction or node offset.
+pub fn read_choice_index(
+    r: &mut BitReader<'_>,
+    field: Field,
+    construct: &'static str,
+    extensible: bool,
+    root_count: u64,
+) -> Result<u64, UperError> {
+    if extensible && r.read_bit()? {
+        return Err(UperError::Unsupported {
+            construct,
+            detail: "the CHOICE selects an extension addition from a later edition of the \
+                     standard; its open type carries a value this codec cannot interpret",
+        });
+    }
+    let index = r.read_bits(constrained_width(root_count))?;
+    if index >= root_count {
+        return Err(UperError::BadEnumIndex {
+            asn1_type: field.asn1_type,
+            index,
+            count: root_count,
+        });
+    }
+    Ok(index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1154,5 +1233,60 @@ mod tests {
         a.write_all(&b);
         assert_eq!(a.bit_len(), 9);
         assert_eq!(bits_of(&a.to_bytes(), 9), "101110011");
+    }
+
+    /// Clause 23.7's index is as wide as the *root* alternative count, and clause 23.5's
+    /// extension bit is one more bit in front of it. Both widths are checked here against
+    /// the two shapes J2735 actually uses: `NodeOffsetPointXY` (8 root alternatives, no
+    /// extension marker) and `LaneTypeAttributes` (8 root alternatives, extensible).
+    #[test]
+    fn a_choice_index_is_three_bits_for_eight_alternatives_plus_the_extension_bit() {
+        let field = Field::new("test.choice", "TestChoice");
+
+        let mut w = BitWriter::new();
+        write_choice_index(&mut w, field, false, 5, 8).expect("in the root");
+        assert_eq!(w.bit_len(), 3);
+        assert_eq!(bits_of(&w.to_bytes(), 3), "101");
+
+        let mut w = BitWriter::new();
+        write_choice_index(&mut w, field, true, 5, 8).expect("in the root");
+        assert_eq!(w.bit_len(), 4);
+        assert_eq!(bits_of(&w.to_bytes(), 4), "0101");
+
+        // A single-alternative root carries no index at all (clause 11.5.4), and an
+        // extensible one then costs exactly its extension bit.
+        let mut w = BitWriter::new();
+        write_choice_index(&mut w, field, false, 0, 1).expect("the only alternative");
+        assert_eq!(w.bit_len(), 0);
+
+        for (extensible, root, index) in [(false, 8u64, 3u64), (true, 2, 1), (true, 8, 7)] {
+            let mut w = BitWriter::new();
+            write_choice_index(&mut w, field, extensible, index, root).expect("encodes");
+            let bytes = w.into_bytes();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(
+                read_choice_index(&mut r, field, "TestChoice", extensible, root).expect("reads"),
+                index
+            );
+        }
+    }
+
+    #[test]
+    fn a_choice_extension_addition_is_refused_rather_than_skipped() {
+        let field = Field::new("test.choice", "TestChoice");
+        let mut w = BitWriter::new();
+        // An encoder from a later edition: extension bit set, then an open type.
+        w.write_bit(true);
+        write_open_type(&mut w, "TestChoice", &[0x2a]).expect("encodes");
+        let bytes = w.into_bytes();
+        let mut r = BitReader::new(&bytes);
+        let err = read_choice_index(&mut r, field, "TestChoice", true, 8)
+            .expect_err("an extension addition cannot be interpreted");
+        assert!(matches!(err, UperError::Unsupported { .. }), "{err}");
+
+        // And an index the root does not have is refused by name rather than clamped.
+        let mut w = BitWriter::new();
+        let err = write_choice_index(&mut w, field, false, 8, 8).expect_err("no such index");
+        assert!(matches!(err, UperError::BadEnumIndex { count: 8, .. }), "{err}");
     }
 }

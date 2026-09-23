@@ -36,6 +36,8 @@
 //! ground-truth value that arrived legitimately and was then used illegitimately is
 //! exactly the leak the firewall exists to stop.
 
+use std::collections::BTreeMap;
+
 use v2xw_core::belief::PositionEstimate;
 use v2xw_core::geo::GeoOrigin;
 use v2xw_core::geom::Dims;
@@ -326,6 +328,19 @@ pub struct ObuRuntime {
     /// The ETSI codec. Stateless, but it carries the model card that says *which* ASN.1
     /// modules produced these bytes, which is what a manifest pins.
     etsi: EtsiUperCodec,
+    /// Relevance scores a safety application published, by signer digest.
+    ///
+    /// 06-node-models.md §2.1 specifies the `on-demand` policy as "verify only messages
+    /// that a safety application marks relevant", and until an application existed nothing
+    /// produced a mark: every [`crate::policy::RxSummary::relevance`] was `None` and an
+    /// `on-demand` node verified only strangers. [`crate::safety::SafetyAppSet`] is the
+    /// producer and [`ObuRuntime::set_relevance`] is how the engine installs what it
+    /// produced.
+    ///
+    /// A [`BTreeMap`] keyed by the digest bytes, for the reason
+    /// [`crate::stores::NeighborTable`] is: an ordering that reaches a decision may not
+    /// come from a hash container (02-architecture.md §6.4).
+    relevance: BTreeMap<[u8; 8], f64>,
     /// The two §3.5.2 fields marked **GT**, handed in from outside the firewall by
     /// [`ObuRuntime::observe_truth`] and read by nothing but the telemetry path.
     gt_pos_error_m: f32,
@@ -388,6 +403,7 @@ impl ObuRuntime {
             window: TelemetryWindow::new(at),
             dcc: DccState::UNRESTRICTED,
             dcc_state_code: v2xw_record::wire::U16_NONE,
+            relevance: BTreeMap::new(),
             gt_pos_error_m: f32::NAN,
             security: NodeSecurity::new(config.wall, config.crypto_mode, config.psid),
             etsi: EtsiUperCodec::new(),
@@ -460,6 +476,25 @@ impl ObuRuntime {
     pub fn set_dcc(&mut self, dcc: DccState, state_code: u16) {
         self.dcc = dcc;
         self.dcc_state_code = state_code;
+    }
+
+    /// Installs the relevance scores a safety application published
+    /// ([`crate::safety::SafetyAppSet::relevance`]).
+    ///
+    /// This is what closes the `on-demand` policy's open input. The map is replaced
+    /// wholesale rather than merged, because a subject that no application scored this
+    /// step is a subject no application considers relevant now — merging would leave a
+    /// warning's score in force after the warning cleared.
+    pub fn set_relevance(&mut self, relevance: BTreeMap<[u8; 8], f64>) {
+        self.relevance = relevance;
+    }
+
+    /// The relevance score this node holds for one signer, if any.
+    #[must_use]
+    pub fn relevance_of(&self, signer: &v2xw_msg::sec_types::HashedId8) -> Option<f64> {
+        self.relevance
+            .get(&crate::safety::digest_key(signer))
+            .copied()
     }
 
     /// Hands in the two ground-truth differences §3.5.2 asks for, from outside the
@@ -537,12 +572,17 @@ impl ObuRuntime {
                 bytes: frame.bytes,
                 received_at: believed,
                 claimed_pos: frame.claimed_pos,
-                // No safety application has looked at it yet: 06-node-models §2.1 has the
-                // relevance score set by the applications, and until one runs the policy
-                // sees `None`. An `on-demand` node with no applications therefore verifies
-                // only strangers, which is the correct degenerate behaviour rather than a
-                // silent "everything is relevant".
-                relevance: None,
+                // What a safety application said about this signer, if one ran and scored
+                // it (06-node-models.md §2.1: the `on-demand` policy "verifies only
+                // messages that a safety application marks relevant"). `None` when no
+                // application is installed or none scored this signer, which makes an
+                // `on-demand` node with no applications verify only strangers — the
+                // correct degenerate behaviour rather than a silent "everything is
+                // relevant".
+                relevance: frame
+                    .signer
+                    .as_ref()
+                    .and_then(|s| self.relevance.get(&crate::safety::digest_key(s)).copied()),
             };
             let decision = {
                 let view = PolicyView {

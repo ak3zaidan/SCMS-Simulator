@@ -4,14 +4,21 @@
 //!
 //! | Tier | Implementation | `size_source` | Bytes are |
 //! |---|---|---|---|
-//! | real ASN.1 | [`EtsiUperCodec`] over `rasn`-generated ETSI bindings | [`SizeSource::Uper`] | the wire bytes |
+//! | real ASN.1 | [`EtsiUperCodec`] over `rasn`-generated ETSI bindings (CAM, DENM) | [`SizeSource::Uper`] | the wire bytes |
 //! | real ASN.1 | [`crate::sec_types::coer`] over the 1609.2 bindings | [`SizeSource::Coer`] | the wire bytes |
-//! | hand-written | the J2735 BSM codec (a later stage) | [`SizeSource::Uper`] | the wire bytes of the subset we fill |
-//! | size model | [`crate::size_model::J2735SizeCodec`] | [`SizeSource::SizeModel`] | **placeholders** of exact modelled length |
+//! | hand-written | [`crate::j2735::J2735BsmCodec`] | [`SizeSource::Uper`] | the wire bytes of the subset we fill, oracle-validated |
+//! | hand-written | [`crate::j2735::J2735InfraCodec`] (SPaT, MAP) | [`SizeSource::Uper`] | the wire bytes of the subset we fill, **not yet oracle-validated** |
+//! | size model | [`crate::size_model::J2735SizeCodec`] (PSM, SRM, SSM) | [`SizeSource::SizeModel`] | **placeholders** of exact modelled length |
+//! | size model | [`crate::etsi_size::EtsiSizeCodec`] (CPM, VAM) | [`SizeSource::SizeModel`] | **placeholders** of exact modelled length |
 //!
-//! [`Encoded::size_source`] is what tells the three apart at runtime, and nothing else in
+//! [`Encoded::size_source`] is what tells the tiers apart at runtime, and nothing else in
 //! the engine may assume the bytes mean anything: a metric that counted ones in a
 //! size-model payload would be measuring a fill pattern.
+//!
+//! `size_source` answers "are these wire bytes?" and nothing more. The finer question —
+//! whether anyone has *checked* those bytes against the standard — is
+//! [`crate::evidence`], and a report that says "byte-exact" must consult that instead: the
+//! two hand-written tiers above share one `SizeSource` and carry very different evidence.
 
 use v2xw_core::model::Model;
 
@@ -95,7 +102,12 @@ impl MsgType {
     ///
     /// Values from `ETSI-ITS-CDD.asn`, `MessageId ::= INTEGER { denm(1), cam(2), … }`.
     /// The SAE messages (BSM, PSM) have no ETSI message id: they are identified by the
-    /// `MessageFrame` `messageId` of J2735, which this crate does not encode.
+    /// J2735 `MessageFrame` `messageId` instead, which is a different number for the same
+    /// message — a SPaT is `spat(4)` here and `signalPhaseAndTimingMessage(19)` there. The
+    /// hand-written codecs encode that wrapper themselves
+    /// ([`crate::j2735::bsm::BSM_MESSAGE_ID`], [`crate::j2735::spat::SPAT_MESSAGE_ID`],
+    /// [`crate::j2735::map::MAP_MESSAGE_ID`]); this accessor is only ever about the ETSI
+    /// `ItsPduHeader`.
     pub const fn its_message_id(self) -> Option<u8> {
         match self {
             MsgType::Denm => Some(1),
@@ -319,9 +331,14 @@ impl Default for EtsiUperCodec {
 impl EtsiUperCodec {
     /// The types this codec implements today.
     ///
-    /// CPM and VAM are generated-able from the same forge modules (the asset survey
-    /// compiled both) but are not in this crate's scope yet; they arrive by adding their
-    /// modules to the `FACILITIES` unit in `build.rs` and a variant to [`Message`].
+    /// CPM and VAM are generatable from the same forge modules (the asset survey compiled
+    /// both) and are still not here, for one reason: **their modules are not in this
+    /// checkout**. `third_party/asn1/etsi/` holds the CDD, CAM, DENM, 1609.2 and
+    /// TS 103 097 modules and nothing else, and adding a missing file to the `FACILITIES`
+    /// unit would fail the build rather than generate anything. They arrive by committing
+    /// the two modules, adding them to that unit, and adding a variant to [`Message`];
+    /// until then [`crate::etsi_size`] sizes them and says so. Its module documentation
+    /// lists the steps.
     pub const TYPES: [MsgType; 2] = [MsgType::Cam, MsgType::Denm];
 
     /// Builds the codec and its card.
@@ -355,17 +372,29 @@ fn card() -> v2xw_core::card::ModelCard {
          the scenario date."
             .to_string(),
     ];
-    card.limitations = vec![
+    // The byte-exactness statement comes from crate::evidence, the one table that says
+    // which payloads are real bytes and which are not, so no two cards can describe the
+    // same message differently.
+    card.limitations = crate::evidence::card_statement(ETSI_UPER_CODEC_ID);
+    card.limitations.extend([
         "CAM special-vehicle containers and DENM a-la-carte containers are not filled by this \
          crate's builders; they encode correctly if a caller constructs them."
             .to_string(),
         "No ETSI conformance test vectors are checked yet: the evidence here is round-trip \
-         equality plus field-by-field range checks, not third-party bytes."
+         equality plus field-by-field range checks, not third-party bytes. That is why \
+         crate::evidence calls CAM and DENM `generated-from-module` rather than \
+         oracle-validated: a defect in rasn itself would not show."
             .to_string(),
-    ];
+        "CPM and VAM are generatable from the same forge modules and are NOT encoded here, \
+         because CPM-PDU-Descriptions.asn and VAM-PDU-Descriptions.asn are absent from \
+         third_party/asn1/etsi in this checkout. They are sized by codec/size-model/etsi \
+         instead, whose documentation lists the four steps that make them real."
+            .to_string(),
+    ]);
     card.ignores = vec![
         "SAE J2735 entirely. rasn-compiler cannot compile its RegionalExtension idiom \
-         (build decision D2), so BSM is hand-written and SPaT/MAP/PSM/SRM/SSM are modelled."
+         (build decision D2), so BSM, SPaT and MAP are hand-written (crate::j2735) and \
+         PSM/SRM/SSM are modelled."
             .to_string(),
     ];
     card.sources = vec![

@@ -221,3 +221,70 @@ fn etsi_flows_emit_their_declared_stages_in_order() {
     assert!(run.kernel.stages.is_ordered(auth));
     assert_eq!(run.tickets.get(&station), Some(&1));
 }
+
+/// **I-P4 for the flows build decision D5 deferred.**
+///
+/// The butterfly variant, the ticket download, the two trust lists and the reporting path,
+/// each run once and each compared against its own declaration. Without this, a flow could
+/// stop emitting a stage and only the SCMS half of the invariant would notice.
+#[test]
+fn the_deferred_etsi_flows_emit_their_declared_stages_in_order() {
+    use v2xw_proto::etsi::ts102941::{DEFERRED_FLOWS, EtsiParams, EtsiRun};
+
+    let station = NodeId::new(2_100);
+    let subject = NodeId::new(2_101);
+    let mut run = EtsiRun::new(EtsiParams::default()).expect("certificates encode");
+    run.add_station(station);
+    run.add_station(subject);
+    run.enrol(station);
+    run.run().expect("runs");
+
+    let butterfly = run.authorize_butterfly(station);
+    run.run().expect("runs");
+    let download = run.download_ats(station, run.current_i);
+    run.run().expect("runs");
+    let ctl = run.publish_ectl(station);
+    run.run().expect("runs");
+    let ca_crl = run.publish_ca_crl(station);
+    run.run().expect("runs");
+    let report = run.report(station, subject);
+    run.run().expect("runs");
+
+    let declared = |id: FlowId| {
+        DEFERRED_FLOWS
+            .iter()
+            .find(|f| f.id == id)
+            .map(|f| f.stages)
+            .unwrap_or_else(|| panic!("{id} is declared"))
+    };
+    for (flow_run, id) in [
+        (butterfly, FlowId::EtsiButterflyAuthorization),
+        (download, FlowId::EtsiAtDownload),
+        (ctl, FlowId::EtsiTrustList),
+        (ca_crl, FlowId::EtsiCaCrl),
+        (report, FlowId::EtsiMisbehaviourReport),
+    ] {
+        assert_eq!(
+            run.kernel.stages.stages(flow_run),
+            declared(id),
+            "{id} did not emit its declared stages"
+        );
+        assert!(
+            run.kernel.stages.is_ordered(flow_run),
+            "{id}: stage timestamps must be non-decreasing: {:?}",
+            run.kernel.stages.decomposition(flow_run)
+        );
+    }
+
+    // Every run is a distinct run of a distinct flow, so a decomposition grouped by run
+    // cannot mix two of them.
+    for id in [
+        FlowId::EtsiButterflyAuthorization,
+        FlowId::EtsiAtDownload,
+        FlowId::EtsiTrustList,
+        FlowId::EtsiCaCrl,
+        FlowId::EtsiMisbehaviourReport,
+    ] {
+        assert_eq!(run.kernel.stages.runs_of(id).len(), 1, "{id}");
+    }
+}

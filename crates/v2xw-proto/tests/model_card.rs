@@ -143,16 +143,61 @@ fn the_scms_plug_in_describes_itself_completely() {
 }
 
 #[test]
-fn the_etsi_skeleton_declares_passive_revocation_with_its_bound() {
+fn the_etsi_plug_in_declares_both_halves_of_its_revocation() {
     let etsi = EtsiTs102941::default();
-    assert!(matches!(
-        etsi.revocation(),
-        v2xw_proto::spec::RevocationMechanism::Passive(..)
-    ));
+    // 05-protocols.md §4.3: "`Passive` for vehicles (EA blocklist); `Active` CA-CRL only
+    // (series: CA certificates)". It used to answer `Passive` alone, which was true of the
+    // skeleton and not of the protocol.
+    let (active, passive) = match etsi.revocation() {
+        v2xw_proto::spec::RevocationMechanism::Both(a, p) => (a, p),
+        other => panic!("expected both halves, got {other:?}"),
+    };
+    assert_eq!(passive.blocklist_at, "EA");
+    // A CA-CRL entry is a HashedId8 with an expiry: twelve bytes, against the SCMS's
+    // ~40 B of linkage seeds. That asymmetry is the point of comparing the two.
+    assert_eq!(active.entry.bytes(), 12);
+    assert!(active.stages.contains(&v2xw_proto::stage::StageId::Enforced));
+    assert!(
+        passive
+            .stages
+            .contains(&v2xw_proto::stage::StageId::LastValidCredentialExpiry)
+    );
+
     // EU Certificate Policy §7.2.1: preload ≤ 3 months, AT validity ≤ 1 week, so the
     // worst-case eviction lag is 97 days.
     assert_eq!(
         etsi.passive_eviction_bound().as_nanos(),
         97 * 86_400 * 1_000_000_000
     );
+}
+
+#[test]
+fn the_etsi_plug_in_describes_all_seven_of_its_flows() {
+    let etsi = EtsiTs102941::default();
+    assert_eq!(etsi.flows().len(), 2, "the two the skeleton started with");
+    assert_eq!(etsi.deferred_flows().len(), 5);
+    assert_eq!(etsi.all_flows().len(), 7);
+    assert_eq!(etsi.roles().len(), 6);
+    assert_eq!(etsi.credential_types().len(), 2);
+    // Every framing parameter a message size rests on is on the card with a plan, which is
+    // invariant I-P8's other half: `tests/wire_sizes.rs` walks the sizes, this walks the
+    // card.
+    let card = etsi.card().clone();
+    for name in [
+        "etsi_subject_attributes_bytes",
+        "etsi_butterfly_response_bytes",
+        "etsi_ctl_framing_bytes",
+        "etsi_report_payload_bytes",
+    ] {
+        let p = card
+            .parameters
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("`{name}` backs a wire size but is not on the card"));
+        assert_eq!(p.source.kind, SourceKind::TodoCalibrate, "{name}");
+        assert!(
+            p.calibration.as_ref().is_some_and(|c| c.len() > 40),
+            "{name} has no usable plan"
+        );
+    }
 }

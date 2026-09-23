@@ -1,0 +1,62 @@
+# The `kind: vru-device` slot of the 06-node-models.md §1 schema. §7 profiles OBUs, RSUs,
+# backend servers and a base station and stops there: **no VRU-device profile is published
+# in the design set**, and no vendor datasheet for a V2X-capable handset or pedestrian
+# beacon appears in R7 or R5. So every compute field here is either not-published with the
+# measurement that would publish it, or a flagged proxy from the profile §7.4 already
+# anchors on developer-board benchmarks — exactly the pattern §7.1 uses when it proxies the
+# Cohda MK5's verify rate from a later NXP baseband.
+#
+# The three radio figures that *are* cited are 3GPP evaluation assumptions for a pedestrian
+# UE, not device data, and carry `status: evaluation-assumption` as §7's conventions
+# paragraph requires for that class of number.
+id: vru-device/handset-generic
+kind: vru-device
+version: 2026-09-22.1
+purpose: >-
+  A generic vulnerable-road-user device: a handset or a pedestrian beacon whose V2X
+  application runs in software on its own application processor. Nothing about a real
+  handset is published in the design set's hardware research, so the compute block is
+  not-published and the two software-crypto figures are flagged proxies from the
+  Cortex-A72-class benchmarks of obu/generic-automotive-soc-no-hsm. The radio block carries
+  the pedestrian-UE transmit power, antenna gain and receiver noise figure of the 3GPP
+  evaluation methodology, marked as assumptions rather than as device data. A handset with
+  a hardware-backed keystore, or a C-V2X rather than an ITS-G5 radio, is a different
+  profile and not this one.
+sources:
+  - {kind: benchmark, ref: "Raspberry Pi 4 OpenSSL 1.1.1d `openssl speed` gist (HimaJyun), via obu/generic-automotive-soc-no-hsm [R7 §D8; R5 §B.5; 06-node-models.md §7.10 #17]", accessed: 2026-09-18}
+  - {kind: spec, ref: "3GPP TR 36.885 V14.0.0 Annex A.1.1 and Table A.1.1-1 (pedestrian-UE transmit power, antenna gain, receiver noise figure) [R2 Topic A; R2c; 04-models.md §3.6]", accessed: 2026-09-18}
+  - {kind: spec, ref: "SAE J2945/9 — minimum performance requirements for PSM from VRU devices over DSRC/1609; scope VERIFIED (secondary), rate rules UNVERIFIED [R4 §A.5; 04-models.md §8.1]", accessed: 2026-09-18}
+  - {kind: spec, ref: "ETSI TS 103 300-3 V2.2.1 §6.2 (VAM generation rules) and EN 302 571 V2.1.1 §4.2.10.2 (duty-cycle limits) [R4 §A.6; R1 §D.3]", accessed: 2026-09-18}
+  - {kind: gap, ref: "No VRU-device datasheet in R7 or R5: 06-node-models.md §7 profiles no handset or beacon, and 11-open-questions proposes no reference device for one", accessed: 2026-09-22}
+cpu:
+  cores: {value: null, status: not-published, calibration: "NOT PUBLISHED: the design set names no reference VRU device, so there is no part to read a core count from. Pick the handset the study is about, read /proc/cpuinfo, and record the model in the manifest; until then the runtime charges one server (the `or(1)` fallback of ProfileServiceModel::servers)"}
+  clock_hz: {value: null, status: not-published, calibration: "NOT PUBLISHED, as cpu.cores; a handset also clocks down under thermal and battery pressure, so a single figure is the wrong shape and the calibration should record a sustained rather than a peak clock"}
+  arch: {value: null, status: not-published, calibration: "NOT PUBLISHED, as cpu.cores. The proxy below assumes a Cortex-A72-class ARMv8-A application processor; confirm the ISA of the chosen device before relying on the proxy"}
+  dmips: {value: null, status: not-published, calibration: "NOT PUBLISHED, as cpu.cores. 06-node-models.md §2.1 scales application-task costs by a DMIPS ratio, which cannot be formed until both this figure and the reference laptop's exist; measure with Dhrystone 2.1 on the device"}
+ram_bytes: {value: null, status: not-published, calibration: "NOT PUBLISHED: a handset's total RAM is published per model but nothing published says how much a V2X application is permitted, which is the number the store accounting of §2.2 needs. Measure the resident set of a reference VRU application"}
+flash_bytes: {value: null, status: not-published, calibration: "NOT PUBLISHED, as ram_bytes: the quantity that matters is the application's storage quota, not the device's capacity. Take it from the application's own allowance"}
+hsm:
+  kind: none
+  part: {value: null, status: not-applicable, calibration: "rule H2: this profile deliberately declares no security hardware, because the modelled case is a V2X application signing in software on the application processor. A handset that keeps its authorization-ticket keys in a hardware-backed keystore is a different profile; add it with hsm.kind: secure-element and the keystore's published rates"}
+  ops: {}
+  queue_depth: {value: null, status: not-applicable, calibration: "rule H2: no secure-element queue exists on this profile; the CPU queue of 06-node-models.md §2.1 carries the work"}
+  servers: {value: null, status: not-applicable, calibration: "rule H2: no secure-element server exists on this profile"}
+software_crypto:
+  ecdsa-p256-sign: {us: 244, status: proxy, ops_per_s: 4097.4, source: "PROXY, flagged: no handset ECDSA benchmark appears in R7 or R5, so the Cortex-A72-class figure obu/generic-automotive-soc-no-hsm anchors on is reused — OpenSSL 1.1.1d on a Raspberry Pi 4B, 0.0002 s/sign, 4097.4 sign/s [R7 §D8; R5 §B.5]. A handset application processor is the same class of core; the proxy is a class match, not a device match, and every run that uses it must say so"}
+  ecdsa-p256-verify: {us: 645, status: proxy, ops_per_s: 1550.7, source: "PROXY, flagged, as ecdsa-p256-sign: OpenSSL 1.1.1d on a Raspberry Pi 4B, 0.0006 s/verify, 1550.7 verify/s [R7 §D8; R5 §B.5]"}
+  ecdsa-p256-keygen: {us: null, status: not-published, calibration: "no key-generation figure for this class of core in R7 or R5. It matters for a VRU device because an authorization-ticket pool is generated on the device; measure with `openssl speed ecdsap256` on the chosen handset"}
+radio:
+  rat: [dsrc-80211p]
+  chipset: {value: null, status: not-published, calibration: "NOT PUBLISHED: no ITS-G5 handset radio is named in R7. Record the module of the device being modelled; a C-V2X VRU device is a separate profile with rat: [lte-v2x-pc5]"}
+  tx_power_dbm:
+    min: {value: null, status: not-published, calibration: "NOT PUBLISHED: no VRU-device power-control floor is cited anywhere in the design set. Take it from the module datasheet of the chosen device; the duty-cycle model does not depend on it, the link budget does"}
+    max: {value: 23.0, status: evaluation-assumption, source: "3GPP TR 36.885 V14.0.0 Annex A.1.1: 'UE Tx power: Vehicle/pedestrian UE or UE type RSU: 23 dBm. Note: 33 dBm is not precluded' [R2 Topic A, verified directly]. An evaluation assumption for a pedestrian UE, not a datasheet figure for a handset, and 06-node-models.md §7's conventions require it to be marked as such"}
+    default: {value: 23.0, status: evaluation-assumption, source: "the same pedestrian-UE assumption as tx_power_dbm.max: with no published power-control behaviour for a VRU device, the default is the assumed maximum, which is also the pessimistic reading for battery drain [R2 Topic A]"}
+  sensitivity_dbm: {value: null, status: not-published, calibration: "NOT PUBLISHED for a handset ITS-G5 receiver. The per-MCS table is what the PHY wants; take it from the module datasheet, or fall back to the SensitivityPreset the radio crate already carries and record which"}
+  noise_figure_db: {value: 9.0, status: evaluation-assumption, source: "3GPP TR 36.885 Annex A.1.1 UE receiver noise figure 9 dB [R2c] — the same figure v2xw_radio::phy::NOISE_FIGURE_3GPP_DB carries, and an evaluation assumption rather than device data"}
+  antenna:
+    gain_dbi: {value: 0.0, status: evaluation-assumption, source: "3GPP TR 36.885 Table A.1.1-1: pedestrian UE 0 dBi, against vehicle UE and UE-type RSU 3 dBi [R2c, via 04-models.md §3.6]. This is the number that makes a pedestrian harder to hear than a car, and it is an assumption, not a measurement"}
+    height_m: {value: null, status: not-published, calibration: "NOT PUBLISHED: 04-models.md §3.6 gives vehicle 1.5 m (TR 36.885) and TR 37.885's per-type UE heights of 0.75, 1.6 and 3 m, none of which is stated to be a hand-held device. Pick the TR 37.885 type the scenario means — 1.6 m is the nearest published figure for a person holding a phone — and record the choice in the scenario rather than defaulting here"}
+    pattern: {value: null, status: not-published, calibration: "NOT PUBLISHED, and a hand-held antenna's pattern is dominated by the body holding it. The calibration is a measured pattern with a phantom, or the body-loss term of a published pedestrian-UE study; 04-models.md §3.6 records that no pattern file is cached"}
+power_w: {value: null, status: not-published, calibration: "NOT PUBLISHED, and this is the field the whole VRU-device question turns on: how long a handset can transmit a personal safety message before its battery is the binding constraint. Measure the device's draw with the V2X application transmitting at a fixed rate and at a fixed power, and with it idle, and record both — the difference is what the runtime's power budget needs"}
+storage_model: inherit

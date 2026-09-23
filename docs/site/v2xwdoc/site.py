@@ -10,6 +10,7 @@ second half.
 import os
 import shutil
 
+from . import campaign as campaign_mod
 from . import cards as cards_mod
 from . import findings as findings_mod
 from . import md, render, scenario as scenario_mod
@@ -20,6 +21,9 @@ REPO_URL = "https://github.com/ak3zaidan/SCMS-Simulator/blob/main/"
 
 SCHEMA_SOURCE = "crates/v2xw-engine/src/scenario/schema.rs"
 FINDINGS_DIR = "docs/design/findings"
+# The validation suite's output, which the campaign page joins against the registry. Its
+# schema is documented in `v2xwdoc/campaign.py`; a missing file is reported, never skipped.
+VALIDATION_RUNS = os.path.join("docs", "site", "generated", "validation-runs.json")
 
 # Markdown files in the repository that the site itself renders, so a link to one of
 # them points at the page rather than at GitHub.
@@ -80,13 +84,17 @@ def _nav():
             ),
             (
                 "Extending",
-                [("Write a plug-in", "extending.html", "one interface, end to end")],
+                [
+                    ("Plug-in tutorial", "tutorial.html", "a detector, end to end"),
+                    ("Write a plug-in", "extending.html", "the propagation family"),
+                ],
             ),
             (
                 "Honesty",
                 [
                     ("Calibration debt", "calibration.html", "uncited defaults"),
                     ("Validation status", "validation.html", "what was checked"),
+                    ("Validation campaign", "campaign.html", "claims against measurements"),
                     ("Defect register", "defects.html", "what went wrong"),
                 ],
             ),
@@ -104,7 +112,7 @@ def _read_content(site_dir, name, repo_root):
     return md.expand_includes(text, repo_root)
 
 
-def build(repo_root, site_dir, out_dir, cards_path, stamp=""):
+def build(repo_root, site_dir, out_dir, cards_path, stamp="", runs_path=None):
     """Build the whole site into `out_dir`. Returns a `BuildResult`."""
     result = BuildResult()
     os.makedirs(out_dir, exist_ok=True)
@@ -143,6 +151,29 @@ def build(repo_root, site_dir, out_dir, cards_path, stamp=""):
         )
     else:
         result.warnings.append("no scenario schema source at " + SCHEMA_SOURCE)
+
+    runs_path = runs_path or os.path.join(repo_root, VALIDATION_RUNS)
+    runs = campaign_mod.load(runs_path)
+    if runs.present:
+        result.notes.append(
+            str(len(runs.cases))
+            + " validation case(s) read from "
+            + os.path.relpath(runs_path, repo_root)
+        )
+        if not runs.schema_matches:
+            result.warnings.append(
+                "the validation-run document declares schema "
+                + repr(runs.schema)
+                + " and this generator reads "
+                + repr(campaign_mod.CAMPAIGN_SCHEMA)
+            )
+    else:
+        result.warnings.append(
+            "no validation-run output at "
+            + os.path.relpath(runs_path, repo_root)
+            + ": the validation campaign page will report what the model cards claim "
+            "and nothing about whether it was measured"
+        )
 
     registers = findings_mod.load_registers(
         os.path.join(repo_root, FINDINGS_DIR), repo_root
@@ -201,6 +232,12 @@ def build(repo_root, site_dir, out_dir, cards_path, stamp=""):
             "generated_from": source_link(SCHEMA_SOURCE),
         },
         {
+            "href": "tutorial.html",
+            "title": "Plug-in tutorial: a detector, end to end",
+            "subtitle": "From an empty file to a model that passes the conformance kit.",
+            "content": "tutorial.md",
+        },
+        {
             "href": "extending.html",
             "title": "Writing a plug-in",
             "subtitle": "One interface, end to end: card, model, registration, test.",
@@ -221,6 +258,18 @@ def build(repo_root, site_dir, out_dir, cards_path, stamp=""):
             "content": "validation.md",
             "body": lambda: cards_mod.validation_page(catalogue),
             "generated_from": "the validation field of every registered model card",
+        },
+        {
+            "href": "campaign.html",
+            "title": "Validation campaign",
+            "subtitle": "Every model: what was checked, against what, and with what result.",
+            "content": "campaign.md",
+            "body": lambda: campaign_mod.page(
+                catalogue, runs, registers, REPO_URL
+            ),
+            "generated_from": "the model registry, the validation-run output ("
+            + source_link(VALIDATION_RUNS.replace(os.sep, "/"))
+            + ") and the defect registers",
         },
         {
             "href": "defects.html",
@@ -245,6 +294,30 @@ def build(repo_root, site_dir, out_dir, cards_path, stamp=""):
             "content": "building.md",
         },
     ]
+
+    if catalogue.present and runs.present:
+        disagreements = campaign_mod.contradictions(catalogue, runs)
+        refuted = [d for d in disagreements if d[1] == "claims-with-a-failing-case"]
+        unsupported = [d for d in disagreements if d[1] == "claims-without-a-case"]
+        # A refuted or unsupported claim is a warning and therefore a `--strict` failure:
+        # 04-models.md §13's rule is that a failing case blocks its models from being
+        # labelled checked, and a rule nothing enforces is a preference.
+        for model, _kind, _cases in refuted:
+            result.warnings.append(
+                "validation campaign: " + model.id + " claims " + model.status
+                + " and a validation case naming it FAILED"
+            )
+        for model, _kind, _cases in unsupported:
+            result.warnings.append(
+                "validation campaign: " + model.id + " claims " + model.status
+                + " and no validation case names it"
+            )
+        stale = [d for d in disagreements if d[1] == "measured-but-not-claimed"]
+        if stale:
+            result.notes.append(
+                str(len(stale))
+                + " model(s) have a passing case and a card that has not caught up"
+            )
 
     nav = _nav()
     for spec in pages:

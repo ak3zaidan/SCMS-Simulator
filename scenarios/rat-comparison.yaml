@@ -1,0 +1,188 @@
+# ============================================================================
+# RQ5: DSRC versus LTE-V2X versus NR-V2X, same traffic, same security.
+# ============================================================================
+#
+# ## STATUS: the radio-technology axis is not reachable from a scenario yet
+#
+# Read this before running anything. `radio.rat` is in the scenario schema, the enumeration
+# has all four values (`dsrc-80211p`, `lte-v2x-pc5`, `nr-v2x-pc5`, `hybrid`), and
+# **nothing in the engine reads the field**:
+#
+#     $ grep -rn "radio\.rat" crates/v2xw-engine/src/
+#     (no matches outside the schema definition itself)
+#
+# `v2xw_engine::wiring::build_phy` constructs an `OfdmPhy` unconditionally, `build_mac` an
+# `EdcaOcbMac`, and `build_dcc` the SAE J2945/1 controller; all three select from
+# `radio.tiers` and none of them from `radio.rat`. The LTE-V2X and NR-V2X sidelink models
+# **do exist** — `v2xw_radio::{cv2x, sidelink, sps, bler}` implement Mode 4 and Mode 2
+# PHY/MAC with semi-persistent scheduling — and no code path selects them.
+#
+# So the sweep this file is named after is **commented out below rather than active**, and
+# that is a deliberate choice: a swept axis the engine ignores produces cells with
+# identical radio behaviour and different manifests, which reads as "the three
+# technologies perform the same" and is the most dangerous kind of wrong answer. This
+# repository has a recurring defect class of checks that cannot fail, and a sweep that
+# cannot differ is one of them.
+#
+# **To turn it on**, once `build_phy`, `build_mac` and `build_dcc` branch on
+# `scenario.radio.rat`: uncomment the `radio.rat` axis in the `experiment` block and
+# delete the tier axis. Nothing else in this file changes — the traffic, the world, the
+# message set and the security stack are already held identical across cells, which is the
+# whole methodological requirement of a technology comparison.
+#
+# ## What this file measures today
+#
+# The **fidelity-tier comparison** for the one technology that is wired: 802.11p at the
+# `medium` radio tier against 802.11p at `propagation: high`. That is a real and useful
+# study — it is how the `medium` tier's claim to approximate the `high` tier is checked
+# (02-architecture.md §7.1's tier table, 04-models.md §13's calibration row) — and it uses
+# exactly the comparison discipline a RAT comparison needs:
+#
+# * identical world, identical demand, identical seed per slot (common random numbers);
+# * identical message set and generation cadence, so the offered load is the same;
+# * identical security stack, so the frame sizes are the same;
+# * `pdr` by distance bin, `cbr`, `pir` and `airtime_per_node` as the comparison metrics —
+#   which are also the right metrics for the RAT comparison, unchanged.
+#
+# ## What a RAT comparison will *still* not measure when the wiring lands
+#
+# Worth knowing now, because it shapes the study rather than the code:
+#
+# * **No hybrid RAT arbitration.** `Rat::Hybrid` needs a policy for which technology
+#   carries which message, and `v2xw_radio::hybrid` has the machinery while nothing states
+#   the policy. Leave it out of the sweep until it does.
+# * **No cellular uplink.** Mode 4 and Mode 2 are sidelink; the Uu path (`measured-lte`)
+#   is a separate family and a separate study.
+# * **The C-V2X PER curves are the WiLabV2Xsim/Todisco tables** (04-models.md §13), so a
+#   C-V2X delivery curve is only as good as that calibration and must be reported against
+#   it, not against a measurement.
+# * **Nothing about spectrum policy.** This engine transmits in the US band plan on
+#   channel 172 with J2945/1 congestion control. A European ITS-G5 comparison additionally
+#   needs the TS 102 687 DCC algorithms, which ship in `v2xw-radio` and are likewise not
+#   selected by anything.
+schema: v2xw/scenario/1
+
+meta:
+  name: rat-comparison
+  description: >-
+    The radio-technology comparison of RQ5, set up and held identical across cells in
+    everything but the radio. The technology axis is commented out because the engine does
+    not read `radio.rat` yet; the active axis is the propagation model's fidelity tier.
+  authors: [v2xw]
+  tags: [study, rq5, rat, dsrc, cv2x, blocked-on-wiring]
+  created: "2026-09-22"
+
+seed: "0xC0FFEE_5EED"
+
+time:
+  t0: "2027-03-04T08:00:00Z"
+  duration_s: 60.0
+  mobility_step_ms: 100
+  des_resolution: 1us
+
+world:
+  # The procedural grid, not the import: a technology comparison is about the radio, and a
+  # world with no external input means a difference between two cells cannot be explained
+  # by which extract was on disk. Midtown-shaped, so the link lengths and the building
+  # occlusion are a city's.
+  source:
+    kind: procedural
+    generator: world/source/procedural-grid
+    params:
+      cols: 13
+      rows: 34
+      block_x_m: 274.0
+      block_y_m: 80.0
+      lanes_per_direction: 2
+      lane_width_m: 3.5
+      sidewalk_m: 2.0
+      speed_limit_mps: 11.176
+      signalised: true
+      cycle_s: 60.0
+      amber_s: 3.0
+      crossings: true
+      block_buildings: true
+      building_height_m: 30.0
+      rsu_at_junctions: false
+  imported_at: "2026-09-18T00:00:00Z"
+  buildings:
+    enabled: true
+    keep_holes: true
+  terrain:
+    dem: null
+
+actors:
+  vehicles:
+    equipped_fraction: 1.0
+    demand:
+      kind: mobility/demand/poisson
+      # Held fixed. In a technology comparison the offered load must be identical across
+      # cells or the comparison is between two loads and not two radios; this is the one
+      # field it would be most tempting and most wrong to vary.
+      rate_veh_per_h: 15000.0
+
+weather:
+  initial: clear
+  intensity: 0.0
+
+radio:
+  # The base value, and the only one the engine can act on today. When the technology axis
+  # is turned on this field is what the sweep replaces.
+  rat: dsrc-80211p
+  tiers:
+    propagation: medium
+    phy: medium
+    mac: medium
+
+net:
+  layer: wsmp
+
+messages:
+  # One set, identical across cells: a comparison of two radios carrying different message
+  # mixes is not a comparison of two radios.
+  sets: [bsm]
+  codec_tier: uper
+
+security:
+  # Identical across cells, so the frame sizes are identical and a delivery difference is
+  # the radio's. This is the "same security" half of RQ5's "same traffic, same security".
+  envelope: ieee1609.2
+  signature: ecdsa-p256
+  crypto_mode: modeled
+  verification_policy: verify-all
+  signer_id_policy:
+    full_cert_every_ms: 1000
+    digest_otherwise: true
+  pseudonym_change:
+    strategy: time
+    period_s: 300.0
+
+nodes:
+  default_obu: obu/unex-obu-301-craton2
+  compute_tier: medium
+  backend_tier: medium
+
+metrics: [all]
+exporters: []
+
+experiment:
+  sweep:
+    # --- THE AXIS THIS FILE IS NAMED AFTER, AND WHY IT IS OFF ------------------
+    # radio.rat: ["dsrc-80211p", "lte-v2x-pc5", "nr-v2x-pc5"]
+    #
+    # Commented out, not deleted. `v2xw_engine::wiring::build_phy` returns
+    # `OfdmPhy::new(scenario.radio.tiers.phy)` whatever this field says, so the three
+    # cells would run the same radio, produce the same delivery curve and differ only in
+    # their manifests — a sweep that cannot fail, which is worse than no sweep.
+    #
+    # The day `build_phy`, `build_mac` and `build_dcc` branch on `radio.rat`: uncomment
+    # the line above, delete the tier axis below, and this file is RQ5.
+    #
+    # --- THE AXIS THAT WORKS TODAY --------------------------------------------
+    # `medium` propagation is dual-slope log-distance with spatially correlated shadowing
+    # and the Sommer building term. `high` adds Nakagami fast fading per link, terrain
+    # knife-edge diffraction and the weather term. The gap between the two delivery curves
+    # is what the tier table claims, measured with common random numbers.
+    radio.tiers.propagation: ["medium", "high"]
+  seeds: [1, 2, 3, 4, 5]
+  replications: 1

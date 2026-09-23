@@ -32,13 +32,35 @@ repository root. This directory does not edit the root justfile itself.
 | `v2xwdoc/md.py` | a Markdown subset and the `{% include %}` directive |
 | `v2xwdoc/render.py` | the page shell, navigation and table helpers |
 | `v2xwdoc/cards.py` | model reference, calibration debt and validation pages, from the card dump |
+| `v2xwdoc/campaign.py` | the validation campaign report: the registry joined against the run output and the defect registers |
 | `v2xwdoc/scenario.py` | the scenario schema reference, extracted from `schema.rs` |
 | `v2xwdoc/findings.py` | the defect register, parsed from `docs/design/findings/` |
 | `v2xwdoc/site.py` | which pages exist and what each is built from |
-| `content/*.md` | the hand-written prose: overview, architecture, methodology, tutorial, glossary, the honesty-page leads |
+| `content/*.md` | the hand-written prose: overview, architecture, methodology, the plug-in tutorial, glossary, the honesty-page leads |
+| `validation-runs.template.json` | the validation campaign's input schema, with every case `not-run` because nothing has measured them |
 | `assets/site.css` | one stylesheet; the site loads no script and no web font |
 | `tools/cardgen/` | the Rust exporter that dumps the engine's registry to JSON |
 | `build/`, `generated/` | outputs, git-ignored |
+
+## The validation campaign's second input
+
+`campaign.html` joins three things: the card dump (what the code claims), the validation
+suite's output (what was measured) and the defect registers (what was wrong anyway). The
+second of those is `docs/site/generated/validation-runs.json`, whose schema is documented
+at the top of `v2xwdoc/campaign.py` and whose shape is in
+`validation-runs.template.json` beside this file.
+
+**The template's rows are all `not-run`, and that is deliberate.** The cases are the ones
+04-models.md §13 defines, with the targets and tolerances that document states; what has
+not happened is the measurement. Putting an `observed` value in that nobody measured
+would fabricate a validation result, which is precisely what the page exists to make
+impossible.
+
+A missing run document is reported, never skipped: the page then says it is reporting
+claims and not measurements, and `--strict` fails. `--strict` **also** fails when a card
+claims `literature-checked` or `field-checked` while no validation case names the model,
+or while a case naming it failed — 04-models.md §13's rule that a failing case blocks its
+models from being labelled checked, enforced rather than stated.
 
 ## The card dump
 
@@ -76,7 +98,11 @@ actually builds.
   what CI should use.
 - **No severity filter.** The defect register ranks the severity labels it knows and
   shows the ones it does not rather than dropping them. Filtering findings against a
-  hard-coded list of labels is how a report loses rows silently.
+  hard-coded list of labels is how a report loses rows silently. The campaign page keeps
+  the same rule for its `outcome` vocabulary.
+- **Generated pages report disagreements, not summaries.** The campaign page's first
+  table is the list of models whose card and whose measurements say different things. A
+  page that only reported the cards would be true on the day it was written.
 - **Includes, not copies.** A page quotes a design document by section, spliced in at
   build time with a line saying where it came from.
 

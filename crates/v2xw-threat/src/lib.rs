@@ -8,11 +8,18 @@
 //! | What an attacker may see and do; when it acts | [`capability`] | 07-threats-and-detection.md §1 |
 //! | The attacker interface, the action vocabulary, the falsified-label rule | [`attack`] | 03-interfaces.md §9, 07-threats §2, §4 |
 //! | The 28 legacy attack renderings plus selective dropping | [`attack_legacy`] | 07-threats §2.1 |
+//! | Ghost vehicles, relay replay, oversized flooding, region misuse, phantom CPM, jamming | [`attack_ext`] | 07-threats §2.2 |
+//! | The compromised road-side unit, on the air and on the reporting path | [`attack_rsu`] | 07-threats §2.2 |
+//! | Misbehaviour-report poisoning | [`poison`] | 07-threats §2.1, §2.2 |
+//! | The passive privacy observer and its four metrics | [`privacy`] | 07-threats §6 |
+//! | The whole catalogue in one namespace | [`catalog`] | 07-threats §2 |
 //! | The belief-side inputs every model here consumes | [`obs`] | 03-interfaces.md §1, §9 |
 //! | The legacy twelve detectors, two gated checks, one soft feature | [`detect`] | 07-threats §3.1 |
+//! | The TS 103 759 classes 1–5, the F2MD checks, the perception cross-check | [`ts103759`] | 07-threats §3.1, 04-models §14 |
 //! | The misbehaviour report and its forged variant | [`report`] | 07-threats §2.1, §3.2 |
 //! | The misbehaviour-authority pipeline | [`ma`] | 07-threats §3.2 |
-//! | The records the metrics crate scores | [`records`] | 08-measurement-and-data.md §2.4 |
+//! | Two-authority identity resolution, and what it is worth | [`resolve`] | 07-threats §3.2 |
+//! | The records the metrics crate scores | [`records`] | 08-measurement-and-data.md §2.4, §2.6 |
 //! | The narrow context a node-resident plug-in gets | [`ctx`] | 03-interfaces.md §1.1 |
 //! | Citation helpers | [`cards`] | 03-interfaces.md §12 |
 //!
@@ -73,6 +80,35 @@
 //! are recorded where they belong: [`detect`]'s module documentation, under "Measured
 //! against the legacy engine".
 //!
+//! ## The four calls the Phase 4 models add
+//!
+//! The same shape: the model decides, the host applies and pays.
+//!
+//! 3. **On a frame the node captured, and on the energy it emits.**
+//!    [`attack_ext::ExtendedAttacker`] fills three more fields of the emission the host
+//!    must honour: `payload_bytes` (the oversized flood), `cert_region` (region misuse)
+//!    and `perceived` (a phantom CPM), plus `raw_energy` — a jam burst the radio has to
+//!    enter into its interference sums — and a ghost with `replayed` set, which the host
+//!    puts on the air **verbatim** rather than re-signing, because that is what makes a
+//!    relayed frame verify.
+//! 4. **On a report crossing a road-side unit.** [`attack_rsu::CompromisedRsu::on_forward`]
+//!    returns [`attack_rsu::ForwardDecision`] for each report handed to it: forward, drop,
+//!    or forward this other one instead.
+//! 5. **After an attacker acts.** [`poison::ReportPoisoner::take_reports`] hands over the
+//!    reports it filed, for the host to submit through the reporting transport with that
+//!    transport's delay and byte cost.
+//! 6. **On each reception, at an observer node.**
+//!    [`privacy::PrivacyObserver::on_message`] takes the same arguments a detector's does,
+//!    plus [`privacy::PrivacyObserver::sweep`] on a timer and
+//!    [`privacy::PrivacyObserver::finish`] at the end of the run, which is what closes the
+//!    last tracking-duration samples.
+//!
+//! Two of those need something the run declares from the ground-truth side, and neither
+//! model may infer it: [`resolve::TwoAuthorityResolution::declare_linkage`] (which
+//! authority can resolve which pseudonym) and the digest-to-actor map the metrics crate
+//! already takes through `DetectionProvider::declare_subject`, which is what turns a
+//! [`records::PrivacyLinkClaim`] into a linkability rate.
+//!
 //! # Conformance
 //!
 //! The legacy renderings and thresholds are reproduced exactly, because the legacy corpus
@@ -112,21 +148,32 @@
 #![forbid(unsafe_code)]
 
 pub mod attack;
+pub mod attack_ext;
 pub mod attack_legacy;
+pub mod attack_rsu;
 pub mod capability;
 pub mod cards;
+pub mod catalog;
 pub mod ctx;
 pub mod detect;
 pub mod ma;
 pub mod obs;
+pub mod poison;
+pub mod privacy;
 pub mod records;
 pub mod report;
+pub mod resolve;
+pub mod ts103759;
 
 pub use attack::{
     AttackAction, AttackFamily, AttackKind, Attacker, AttackerView, Emission, EventClaim,
-    HonestClaim, falsified_count, is_falsified, log_actions,
+    HonestClaim, InfraClaim, JamProfile, MAX_MSDU_BYTES, RawEnergy, falsified_count, is_falsified,
+    is_falsified_extended, log_actions,
 };
+pub use attack_ext::{ExtendedAttackKind, ExtendedAttacker, ExtendedAttackerParams, LaneHint};
 pub use attack_legacy::{LegacyAttacker, LegacyAttackerParams, Magnitudes};
+pub use attack_rsu::{CompromisedRsu, ForwardDecision, RsuAttackKind, RsuAttackParams};
+pub use catalog::CatalogEntry;
 pub use capability::{
     AttackSchedule, Capabilities, CoalitionId, CredentialAccess, Knowledge, RadioCaps,
 };
@@ -136,8 +183,19 @@ pub use detect::{
 };
 pub use ma::{LegacyWindow, MaAction, MaParams, MaPipeline};
 pub use obs::{
-    LocalEnvironment, NoMap, ObservedKind, ObservedMessage, PeerBelief, SelfBelief, StationType,
-    VerificationState,
+    DiscSensor, EnvelopeExtras, LocalEnvironment, LocalPerception, NoMap, NoPerception,
+    ObservedKind, ObservedMessage, PeerBelief, PerceivedObject, RegionId, SelfBelief, SensedObject,
+    StationType, VerificationState,
 };
-pub use records::{DetObservation, GtAttackAction, MaDecisionRecord, MaReportRecord};
+pub use poison::{PoisonParams, ReportPoisoner};
+pub use privacy::{LinkOutcome, ObserverParams, PrivacyObserver};
+pub use records::{
+    DetObservation, GtAttackAction, MaCaseRecord, MaDecisionRecord, MaReportRecord,
+    PrivacyLinkClaim, PrivacyTrackSegment,
+};
 pub use report::{CertValidity, Evidence, ForgeryProfile, MisbehaviourReport, forge};
+pub use resolve::{Authority, Case, CaseOutcome, ResolutionParams, TwoAuthorityResolution};
+pub use ts103759::{
+    CrossCheckInputs, ObservationClass, Ts103759Check, Ts103759Params, Ts103759Suite, TsObservation,
+    TsVerdict,
+};

@@ -22,12 +22,15 @@
 //! | Friis, two-ray, dual-slope log-distance with correlated shadowing, TR 37.885 | [`prop`] | 04-models.md §3.1-§3.3, §3.6 |
 //! | Nakagami-m fading, and no fading | [`fading`] | 04-models.md §3.4 |
 //! | Buildings, vehicles, terrain knife edges | [`obstacle`] | 04-models.md §3.5 |
+//! | The terrain profile query and the knife-edge extraction | [`terrain`] | 04-models.md §3.5 |
 //! | How the three compose into one link budget | [`budget`] | 04-models.md §3 tier table |
 //! | The NIST packet-error-rate model | [`per`] | 04-models.md §4.7 |
 //! | Air time, noise, SINR, capture, frame outcomes, air-time accounting | [`phy`] | 04-models.md §4.2, §4.7, §4.8 |
 //! | EDCA in OCB mode, the slotted abstraction, the CBR meter | [`mac`] | 04-models.md §4.3, §4.5 |
 //! | The ETSI adaptive and reactive algorithms, the EN 302 571 floor, SAE J2945/1 | [`dcc`] | 04-models.md §6 |
 //! | The calibrated abstract tier, the legacy models, the calibration routine | [`abstract_tier`] | 04-models.md §4.9 |
+//! | Mixed tiers: the focus region, the coupling rule, the boundary bias | [`focus`] | 02-architecture.md §7.3 |
+//! | Jammers: constant, pulsed, reactive, and the noise rise they cause | [`jamming`] | 04-models.md §12.3 |
 //! | Sidelink resource structure: numerologies, sub-channels, MCS, SCI, IBE, CBR/CR | [`sidelink`] | 04-models.md §5.1, §5.2 |
 //! | The C-V2X block-error lookups and the spectral-efficiency fit | [`bler`] | 04-models.md §5.1 |
 //! | Sensing-based semi-persistent scheduling, Mode 4 and Mode 2 | [`sps`] | 04-models.md §5.1, §5.2 |
@@ -105,7 +108,9 @@ pub mod cv2x;
 pub mod dcc;
 pub mod error;
 pub mod fading;
+pub mod focus;
 pub mod hybrid;
+pub mod jamming;
 pub mod mac;
 pub mod numeric;
 pub mod obstacle;
@@ -115,6 +120,7 @@ pub mod prop;
 pub mod sidelink;
 pub mod sps;
 pub mod sweep;
+pub mod terrain;
 pub mod traits;
 pub mod types;
 
@@ -132,11 +138,24 @@ pub use types::{
 };
 
 pub use abstract_tier::{
-    AbstractPhy, AcceptanceReport, CalibrationPlan, CalibrationRun, Cell, DistanceLoadTable,
-    LegacyAbstractPhy, LegacyKind, LegacyParams, LoadAxis, ReceptionSample, TableEnvelope,
-    calibrate,
+    AbstractPhy, AcceptanceReport, CalibratedAbstractTier, CalibrationFit, CalibrationPlan,
+    CalibrationRequest, CalibrationRun, Cell, DistanceLoadTable, LegacyAbstractPhy, LegacyKind,
+    LegacyParams, LoadAxis, ReceptionSample, TableEnvelope, calibrate,
 };
 pub use budget::{LinkBudget, classify, evaluate, merge_los};
+pub use focus::{
+    BOUNDARY_BIAS_TOLERANCE_PP, BoundaryBiasMeter, BoundaryBiasReport, BoundaryBinBias,
+    BoundaryObservation, FocusPlan, FocusShape, FocusWarning, LinkEvaluation, LinkPlacement,
+    RadioTierSet,
+};
+pub use jamming::{
+    ConstantJammer, JamArrival, JamWindow, JammerKind, JammerProfile, JammingField, PulsedJammer,
+    ReactiveJammer, SensedInterval, blind_area_radius_m, punal_rssi_to_sinr_db,
+};
+pub use terrain::{
+    EdgeExtraction, GroundProfile, ProfilePoint, TerrainProfile, any_edge_obstructs, knife_edges,
+    radio_line_height_m,
+};
 pub use dcc::{
     AdaptiveDcc, AdaptiveParams, En302571Floor, J2945Params, ReactiveDcc, ReactiveTable,
     SaeJ2945Dcc,
@@ -146,6 +165,7 @@ pub use mac::{Backoff, CbrMeter, EdcaOcbMac, SlottedMac};
 pub use obstacle::{
     BuildingIndex, BuildingShadowing, MultiEdgeRule, NlosvCase, SommerFit, TerrainDiffraction,
     VehicleBlockage, knife_edge_loss_db, knife_edge_loss_exact_db, knife_edge_parameter,
+    multi_edge_loss_db,
 };
 pub use per::{PerModel, PerPreset, coded_error_probability, data_field_bits, uncoded_ber};
 pub use phy::{
@@ -184,5 +204,5 @@ pub use sps::{
 };
 pub use sweep::{
     BinStats, ChannelModel, DsrcConfig, HighwaySweep, SweepCtx, SweepReport, molina_masegosa_sweep,
-    sweep_dsrc, sweep_sidelink,
+    sweep_dsrc, sweep_dsrc_with_samples, sweep_sidelink,
 };

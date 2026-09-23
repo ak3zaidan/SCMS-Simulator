@@ -97,6 +97,13 @@ pub enum ObservedKind {
     /// spelled as ETSI TS 102 894-2 `CauseCode` names it — e.g.
     /// `emergencyElectronicBrakeLight`, `stationaryVehicle`.
     Denm(String),
+    /// A collective-perception message, with the objects it claims to perceive.
+    ///
+    /// The objects are what the *sender says* it sees, which is why a phantom object is
+    /// an attack ([`crate::attack_ext::ExtendedAttackKind::FakeCpm`]) and why the class-4
+    /// and class-5 cross-checks of [`crate::ts103759`] compare them against the
+    /// receiver's **own** perception rather than against the world.
+    Cpm(Vec<PerceivedObject>),
 }
 
 /// One message this node received: every field a claim or an observation of its own.
@@ -223,6 +230,310 @@ impl LocalEnvironment for NoMap {
     }
 }
 
+/// An identified region, as IEEE 1609.2 `IdentifiedRegion` and the ETSI authorization
+/// ticket's region restriction carry one: an ISO 3166-1 numeric country code.
+///
+/// A certificate states the region it is valid in; using it elsewhere is the
+/// certificate-misuse attack of 07-threats-and-detection.md §2.2, and the receiver's own
+/// region is a node property (its own map and its own position), not a world one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct RegionId(pub u16);
+
+impl core::fmt::Display for RegionId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "region{}", self.0)
+    }
+}
+
+/// One object a **received** collective-perception message claims its sender perceives.
+///
+/// Wire units, not floats: ETSI TS 103 324 encodes a perceived object's offsets and speed
+/// as integers in hundredths of a metre (and of a metre per second), so an integer field
+/// here is what a receiver actually decoded rather than a float somebody rounded. It also
+/// keeps [`ObservedKind`] `Eq`, which a float field would not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct PerceivedObject {
+    /// The sender's own id for the object, as TS 103 324 `objectId` carries it.
+    pub object_id: u16,
+    /// The object's east offset from the world origin, hundredths of a metre.
+    pub x_cm: i64,
+    /// Its north offset, hundredths of a metre.
+    pub y_cm: i64,
+    /// Its speed, hundredths of a metre per second.
+    pub speed_cm_s: i64,
+    /// The sender's stated perception quality, `0..=15`
+    /// (TS 103 324 §7.1.8.6 `objectPerceptionQuality`).
+    pub quality: u8,
+}
+
+impl PerceivedObject {
+    /// An object at a metric position, converted to the wire's hundredths.
+    ///
+    /// Rounds half away from zero, which is what [`v2xw_core::math::grid_index`] does for
+    /// every other quantised field in this workspace.
+    #[must_use]
+    pub fn from_metres(object_id: u16, x_m: f64, y_m: f64, speed_mps: f64, quality: u8) -> Self {
+        Self {
+            object_id,
+            x_cm: v2xw_core::math::grid_index(x_m, 0.01),
+            y_cm: v2xw_core::math::grid_index(y_m, 0.01),
+            speed_cm_s: v2xw_core::math::grid_index(speed_mps, 0.01),
+            quality,
+        }
+    }
+
+    /// The east offset in metres.
+    #[must_use]
+    pub fn x_m(&self) -> f64 {
+        self.x_cm as f64 / 100.0
+    }
+
+    /// The north offset in metres.
+    #[must_use]
+    pub fn y_m(&self) -> f64 {
+        self.y_cm as f64 / 100.0
+    }
+
+    /// The speed in metres per second.
+    #[must_use]
+    pub fn speed_mps(&self) -> f64 {
+        self.speed_cm_s as f64 / 100.0
+    }
+}
+
+/// One object the receiving node's **own** sensors detected.
+///
+/// This is the node's perception output — a belief, with the sensor model's error already
+/// in it — and not a window on the world. A detector that compared a claim against the
+/// true object list would report a cross-check accuracy no real receiver could reach.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SensedObject {
+    /// The tracker's own id for the object.
+    pub object_id: u32,
+    /// Where this node's sensors believe the object is, east metres.
+    pub x_m: f64,
+    /// The same, north metres.
+    pub y_m: f64,
+    /// The speed its sensors estimate, m/s.
+    pub speed_mps: f64,
+    /// The detection's confidence in `[0, 1]`.
+    pub confidence: f64,
+    /// When this node's sensors last updated the object, on the node's own clock.
+    pub at: SimTime,
+}
+
+/// The node's own perception, seen from a detector — the class-4 input of
+/// ETSI TS 103 759 ("inconsistency with on-board sensors").
+///
+/// A declared capability (07-threats-and-detection.md §1, "Knowledge: sensing"), and the
+/// same shape as [`LocalEnvironment`]: what it answers is what this node's sensors
+/// believe, so the cross-check is the one a real receiver could run.
+///
+/// [`NoPerception`] is the honest answer for a node without sensors. It reports
+/// [`LocalPerception::available`] `false`, and the cross-check then **counts the message
+/// as unchecked** instead of scoring it zero — see
+/// [`crate::ts103759::Ts103759Suite::class4_skipped_no_perception`]. A check that silently
+/// cannot fire is worse than no check, because the run still reports a recall for it.
+pub trait LocalPerception {
+    /// Whether this node has a perception sensor at all.
+    fn available(&self) -> bool;
+
+    /// The sensor's maximum range, metres.
+    fn range_m(&self) -> f64;
+
+    /// Half the horizontal field of view, radians, measured about the boresight.
+    fn half_fov_rad(&self) -> f64;
+
+    /// The boresight direction, ENU radians — this node's own heading for a
+    /// forward-looking sensor.
+    fn boresight_rad(&self) -> f64;
+
+    /// The objects the node's tracker currently holds.
+    fn objects(&self) -> &[SensedObject];
+
+    /// Whether the line of sight from this node to `(x_m, y_m)` is blocked.
+    ///
+    /// The default is `false`: `perception/disc-sensor` (04-models.md §12.1, the medium
+    /// tier) models no occlusion, and `perception/occluded-sensor` (high tier) overrides
+    /// this with the obstacle model's line-of-sight answer.
+    fn occluded(&self, _x_m: f64, _y_m: f64) -> bool {
+        false
+    }
+
+    /// Whether `(x_m, y_m)` is inside this node's sensor coverage: in range, inside the
+    /// field of view, and not occluded.
+    ///
+    /// The cross-check may only conclude anything about a claim inside coverage. Outside
+    /// it, the absence of a sensed object is the sensor's blind spot rather than evidence.
+    fn covers(&self, me: &SelfBelief, x_m: f64, y_m: f64) -> bool {
+        if !self.available() {
+            return false;
+        }
+        let (dx, dy) = (x_m - me.x_m, y_m - me.y_m);
+        let d = v2xw_core::math::hypot(dx, dy);
+        if d > self.range_m() {
+            return false;
+        }
+        if d > 0.0 {
+            let bearing = v2xw_core::math::atan2(dy, dx);
+            if crate::capability::angle_diff_rad(bearing, self.boresight_rad()) > self.half_fov_rad()
+            {
+                return false;
+            }
+        }
+        !self.occluded(x_m, y_m)
+    }
+
+    /// The distance from `(x_m, y_m)` to the nearest object this node's sensors hold, or
+    /// `None` when it holds none.
+    ///
+    /// Iterated in the tracker's own order and reduced with a strict `<`, so the answer
+    /// does not depend on iteration order beyond which of two exactly equal distances is
+    /// reported — and the distance, not the object, is what the caller uses.
+    fn nearest_object_m(&self, x_m: f64, y_m: f64) -> Option<f64> {
+        let mut best: Option<f64> = None;
+        for o in self.objects() {
+            let d = v2xw_core::math::hypot(o.x_m - x_m, o.y_m - y_m);
+            if best.is_none_or(|b| d < b) {
+                best = Some(d);
+            }
+        }
+        best
+    }
+}
+
+/// A node with no perception: every cross-check is *unchecked*, not passed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoPerception;
+
+impl LocalPerception for NoPerception {
+    fn available(&self) -> bool {
+        false
+    }
+
+    fn range_m(&self) -> f64 {
+        0.0
+    }
+
+    fn half_fov_rad(&self) -> f64 {
+        0.0
+    }
+
+    fn boresight_rad(&self) -> f64 {
+        0.0
+    }
+
+    fn objects(&self) -> &[SensedObject] {
+        &[]
+    }
+}
+
+/// `perception/disc-sensor` as a detector input: a range, a field of view, no occlusion
+/// (04-models.md §12.1, the medium tier).
+///
+/// The two constructors carry the only two sensor envelopes 04-models.md §12.1 records as
+/// VERIFIED. The detection-probability curve is UNVERIFIED there for every sensor, so this
+/// type holds whatever objects the node's perception model produced and adds no curve of
+/// its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscSensor {
+    /// The maximum range, metres.
+    pub range_m: f64,
+    /// Half the horizontal field of view, radians.
+    pub half_fov_rad: f64,
+    /// The boresight, ENU radians.
+    pub boresight_rad: f64,
+    /// What the node's tracker holds.
+    pub objects: Vec<SensedObject>,
+}
+
+impl DiscSensor {
+    /// The VSC-A reference forward-looking radar: 3–150 m, ±7.5°, 10 Hz
+    /// (04-models.md §12.1, VERIFIED against VSC-A Table 3).
+    #[must_use]
+    pub fn vsc_a_flr(boresight_rad: f64, objects: Vec<SensedObject>) -> Self {
+        Self {
+            range_m: 150.0,
+            half_fov_rad: 7.5_f64.to_radians(),
+            boresight_rad,
+            objects,
+        }
+    }
+
+    /// An ARS 408-class front radar in far-range mode: 250 m, field of view
+    /// `todo-calibrate` (04-models.md §12.1 records no FOV for it on the cached page).
+    ///
+    /// `half_fov_rad` is therefore the caller's, and the card of any model that builds one
+    /// must declare it as an uncalibrated parameter.
+    #[must_use]
+    pub fn ars408_far(boresight_rad: f64, half_fov_rad: f64, objects: Vec<SensedObject>) -> Self {
+        Self {
+            range_m: 250.0,
+            half_fov_rad,
+            boresight_rad,
+            objects,
+        }
+    }
+}
+
+impl LocalPerception for DiscSensor {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn range_m(&self) -> f64 {
+        self.range_m
+    }
+
+    fn half_fov_rad(&self) -> f64 {
+        self.half_fov_rad
+    }
+
+    fn boresight_rad(&self) -> f64 {
+        self.boresight_rad
+    }
+
+    fn objects(&self) -> &[SensedObject] {
+        &self.objects
+    }
+}
+
+/// The two envelope fields a receiver reads off a frame that [`ObservedMessage`] does not
+/// carry, for the checks that need them.
+///
+/// They are separate rather than fields on [`ObservedMessage`] because that type is the
+/// frozen seam the node runtime fills in (see the module documentation): a receiver that
+/// does not record the SPDU's size or the certificate's region simply has no answer, and
+/// `None` here says exactly that. A check whose input is missing is *unchecked*, which is
+/// how [`crate::ts103759`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EnvelopeExtras {
+    /// The signed-message payload's size in bytes, as the receiver measured it.
+    pub payload_bytes: Option<u32>,
+    /// The region the signer's certificate states it is valid in.
+    pub cert_region: Option<RegionId>,
+}
+
+impl EnvelopeExtras {
+    /// Extras carrying only a measured payload size.
+    #[must_use]
+    pub const fn with_payload_bytes(payload_bytes: u32) -> Self {
+        Self {
+            payload_bytes: Some(payload_bytes),
+            cert_region: None,
+        }
+    }
+
+    /// Extras carrying only a stated certificate region.
+    #[must_use]
+    pub const fn with_region(region: RegionId) -> Self {
+        Self {
+            payload_bytes: None,
+            cert_region: Some(region),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +562,104 @@ mod tests {
         assert!(m.verification.is_valid());
         assert_eq!(StationType::Vru.as_str(), "vru");
         assert_eq!(NoMap.distance_to_road_m(1e6, -1e6), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod perception_tests {
+    use super::*;
+    use v2xw_core::ids::NodeId;
+
+    fn me() -> SelfBelief {
+        SelfBelief {
+            node: NodeId::new(1),
+            believed_time: 1_000_000_000,
+            x_m: 0.0,
+            y_m: 0.0,
+            radio_range_m: 500.0,
+        }
+    }
+
+    #[test]
+    fn a_perceived_object_round_trips_through_the_wire_hundredths() {
+        let o = PerceivedObject::from_metres(7, 12.345, -3.5, 8.9, 12);
+        assert_eq!(o.x_cm, 1235);
+        assert_eq!(o.y_cm, -350);
+        assert_eq!(o.speed_cm_s, 890);
+        assert_eq!(o.x_m(), 12.35);
+        assert_eq!(o.y_m(), -3.5);
+        assert_eq!(o.speed_mps(), 8.9);
+        assert_eq!(o.quality, 12);
+    }
+
+    #[test]
+    fn no_perception_covers_nothing_and_holds_nothing() {
+        // The honest answer for a node without sensors: not "the claim checks out".
+        assert!(!NoPerception.available());
+        assert!(!NoPerception.covers(&me(), 1.0, 0.0));
+        assert_eq!(NoPerception.nearest_object_m(0.0, 0.0), None);
+    }
+
+    #[test]
+    fn a_disc_sensor_covers_its_range_and_field_of_view_only() {
+        let s = DiscSensor::vsc_a_flr(0.0, Vec::new());
+        assert_eq!(s.range_m, 150.0);
+        // Straight ahead, in range.
+        assert!(s.covers(&me(), 100.0, 0.0));
+        // Straight ahead, beyond range.
+        assert!(!s.covers(&me(), 200.0, 0.0));
+        // In range but outside the ±7.5° field of view (45° off the boresight).
+        assert!(!s.covers(&me(), 70.0, 70.0));
+    }
+
+    #[test]
+    fn the_nearest_sensed_object_is_a_distance_from_the_claim() {
+        let s = DiscSensor::vsc_a_flr(
+            0.0,
+            vec![
+                SensedObject {
+                    object_id: 1,
+                    x_m: 50.0,
+                    y_m: 0.0,
+                    speed_mps: 10.0,
+                    confidence: 0.9,
+                    at: 1_000_000_000,
+                },
+                SensedObject {
+                    object_id: 2,
+                    x_m: 90.0,
+                    y_m: 3.0,
+                    speed_mps: 12.0,
+                    confidence: 0.8,
+                    at: 1_000_000_000,
+                },
+            ],
+        );
+        let d = s.nearest_object_m(52.0, 0.0).unwrap();
+        assert!((d - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn envelope_extras_say_none_rather_than_a_default_number() {
+        let e = EnvelopeExtras::default();
+        assert_eq!(e.payload_bytes, None);
+        assert_eq!(e.cert_region, None);
+        assert_eq!(
+            EnvelopeExtras::with_payload_bytes(2304).payload_bytes,
+            Some(2304)
+        );
+        assert_eq!(
+            EnvelopeExtras::with_region(RegionId(840)).cert_region,
+            Some(RegionId(840))
+        );
+        assert_eq!(RegionId(840).to_string(), "region840");
+    }
+
+    #[test]
+    fn a_collective_perception_message_carries_its_objects() {
+        let objects = vec![PerceivedObject::from_metres(1, 10.0, 0.0, 5.0, 10)];
+        let k = ObservedKind::Cpm(objects.clone());
+        assert_eq!(k, ObservedKind::Cpm(objects));
+        assert_ne!(k, ObservedKind::Beacon);
     }
 }

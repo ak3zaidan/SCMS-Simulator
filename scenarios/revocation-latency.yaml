@@ -1,0 +1,241 @@
+# ============================================================================
+# RQ3: How long does a revocation take to reach the vehicles that need it, and
+#      how much harm does the device do in the meantime?
+# ============================================================================
+#
+# The revocation path end to end: a liar, a detector, a report over the air, a roadside
+# unit's backhaul, the Misbehaviour Authority, two Linkage Authorities resolving two
+# pseudonyms to one device, the CRL Generator, the broadcast, and the receivers installing
+# the entry.
+#
+#     v2xw experiment run scenarios/revocation-latency.yaml --out runs/revocation
+#
+# The sweep runs through the command-line tool; the figure does not yet. `v2xw experiment
+# run` exists, and there is no `v2xw figure` subcommand — the presets are a library
+# (`v2xw_experiment::figures`) and wiring them to a subcommand is owed work in `v2xw-cli`.
+# Until then the second line is three lines of Rust:
+#
+#     let table = v2xw_experiment::rebuild_table(&scenario, &options)?;
+#     let spec = v2xw_experiment::preset("rq-revocation-latency").unwrap();
+#     v2xw_experiment::render(&spec, &table).write(Path::new("runs/revocation/figures"))?;
+#
+# **Needs `worlds/cache/manhattan.osm.xml`**, which is git-ignored: see
+# `density-sweep-congestion.yaml`'s header for where the extract comes from, or swap in the
+# procedural `world` block from `pdr-vs-distance.yaml`.
+#
+# ## What it measures
+#
+# * `revocation_latency_stage`, dimensioned by `stage` — the time between consecutive
+#   stage timestamps of 05-protocols.md §8. This is the decomposition the study exists for:
+#   a total latency of forty seconds means one thing if thirty of them are the authority's
+#   batching window and another if thirty are the CRL download.
+# * `time_to_detect` and `time_to_decision` — attack onset to the first correct report at
+#   the authority, and onset to the authority's decision.
+# * `crl_entries` and `crl_bytes` — the list's size, which is what the download time and
+#   the on-board expansion cost are functions of.
+# * `det_recall`, `det_precision`, `false_accusations` — whether the right device was
+#   revoked, and whether anybody else was.
+# * The whole air-interface and verification picture underneath, because a CRL broadcast
+#   competes for the same channel as the beacons and a CRL installation competes for the
+#   same CPU as the verifications.
+#
+# ## What it does NOT measure
+#
+# * **`t95_enforce` and `enforcement_fraction` are not in this engine's metric catalog.**
+#   08-measurement-and-data.md §2.3 defines both; `v2xw-metrics` registers neither. The
+#   stage decomposition is available and the *fraction of nodes enforcing against time* is
+#   not, so this run answers "how long did each stage take" and not "when had 95 % of the
+#   fleet installed it". The owed work is a metric provider over `proto.revocation` and the
+#   per-node CRL-store state.
+# * **`residual_harm` likewise.** The count of messages from a revoked device that were
+#   still accepted after the decision is the sharpest number in §2.3 and there is no
+#   provider for it. It is derivable from the recorded channels after the fact
+#   (`phy.rx` joined against `proto.revocation` stage timestamps), which is what
+#   `exporters: [recording, net-trace]` would be for — and this file cannot ask for those,
+#   because the engine runs no exporter stage and the validator refuses a non-empty list.
+#   Run `v2xw run --record` on a materialised cell to get the recording.
+# * **Cellular CRL distribution.** RQ3 as written sweeps `cellular.uu_model` and RSU
+#   density. This build distributes a CRL over the 5.9 GHz broadcast path from the roadside
+#   unit only; the cellular Uu models exist in `v2xw-radio` and nothing selects them
+#   (`v2xw_engine::wiring` builds no Uu link), so "RSU versus cellular" is not a sweep this
+#   file can run. The single roadside unit's position is a *proxy* for coverage and is
+#   swept as one.
+# * **A daily-versus-continuous revocation cadence.** `revocation.cadence` is not a field
+#   of the scenario schema. The authority's batching windows come from
+#   `ScmsParams::default().quick()`, which shortens the two CAMP batching windows so a
+#   short scenario can reach a revocation at all — a *cited* deployment number replaced by
+#   a run-length accommodation, and the single largest caveat on every latency figure this
+#   file produces. The stage decomposition is what makes it visible: look at the
+#   authority's stage before quoting a total.
+#
+# ## Why the sweep is traffic and attacker fraction
+#
+# Both are wired, both change the answer, and each changes a different part of it. Traffic
+# changes how quickly a report finds a roadside unit and how contended the channel is when
+# the CRL is broadcast; the attacker fraction changes how many entries the list carries
+# and therefore its size and its expansion cost. Sweeping them together is a 3x2 factorial
+# whose interaction is the interesting cell: many attackers in dense traffic.
+schema: v2xw/scenario/1
+
+meta:
+  name: revocation-latency
+  description: >-
+    The SCMS revocation path from attack onset to CRL installation, decomposed by stage,
+    over three traffic levels and two attacker fractions on the Manhattan network.
+  authors: [v2xw]
+  tags: [study, rq3, rq-revocation-latency, manhattan, osm, scms, revocation, crl]
+  created: "2026-09-22"
+
+seed: "0xC0FFEE_5EED"
+
+time:
+  t0: "2027-03-04T08:00:00Z"
+  # Six hundred seconds. The path has to fit inside the run: onset, a motion history, two
+  # pseudonyms on the air, two reports, the authority's (shortened) batching window, the
+  # issuance, the broadcast and the installation. Ten minutes is enough with the shortened
+  # windows and is not enough with the cited ones — which is the caveat in the header.
+  duration_s: 600.0
+  mobility_step_ms: 100
+  des_resolution: 1us
+
+world:
+  source:
+    kind: osm-xml
+    path: worlds/cache/manhattan.osm.xml
+    bbox:
+      min_lat_deg: 40.7440
+      min_lon_deg: -73.9900
+      max_lat_deg: 40.7620
+      max_lon_deg: -73.9680
+  highway_preset: urban-us-nyc
+  imported_at: "2026-09-18T00:00:00Z"
+  buildings:
+    enabled: true
+    keep_holes: true
+  terrain:
+    dem: null
+
+actors:
+  vehicles:
+    equipped_fraction: 1.0
+    demand:
+      kind: mobility/demand/poisson
+      rate_veh_per_h: 6000.0
+
+  # One roadside unit on a mast, 900 m east and 1,000 m north of the bounding box's
+  # south-west corner — the middle of the D7 box, 45th to 60th and 8th to Park, which puts
+  # every street in the extract inside the 1 km candidate range.
+  #
+  # `position_m` and not `site`: an OSM extract carries road geometry and buildings and
+  # **no mast inventory**, so the importer produces no infrastructure sites at all and a
+  # scenario on an imported city says where the mast stands. The 6 m antenna height is
+  # added on top of the ground height given here.
+  #
+  # One unit and not a swept density: `experiment.sweep` replaces a value at a path that
+  # already exists, so it cannot lengthen the `rsus` list. An RSU-density sweep is four
+  # sibling files with `meta.base`, the way `scenarios/scale/` does its rungs.
+  rsus:
+    - position_m: [900.0, 1000.0, 0.0]
+      # `report-forward` is what makes the unit carry a misbehaviour report over its
+      # backhaul; `crl` is what makes it broadcast the revocation. A unit with neither
+      # role hears both and does nothing, which is why the roles are named.
+      roles: [report-forward, crl]
+      profile: rsu/cohda-mk5-rsu
+
+  backend:
+    # The CAMP SCMS of 05-protocols.md: eleven entities, butterfly key expansion, two
+    # Linkage Authorities and the linkage-value CRL. The two Linkage Authorities are not
+    # decoration — resolving a device from two reports about two different pseudonyms is
+    # what they are for, and it is the step that makes the whole path more than a blocklist.
+    protocol: protocol/scms/camp
+    entities:
+      ra: {}
+      pca: {}
+      la1: {}
+      la2: {}
+      ma: {}
+      crlg: {}
+      lop: {}
+      crl_store: {}
+
+weather:
+  initial: clear
+  intensity: 0.0
+
+radio:
+  rat: dsrc-80211p
+  tiers:
+    propagation: medium
+    phy: medium
+    mac: medium
+
+net:
+  layer: wsmp
+
+messages:
+  sets: [bsm]
+  codec_tier: uper
+
+security:
+  envelope: ieee1609.2
+  signature: ecdsa-p256
+  crypto_mode: modeled
+  # `verify-all`, and this one is load-bearing rather than stylistic: a detector only sees
+  # what the node's verification policy delivered, and `prioritized` skips a sender beyond
+  # its range — so a liar 400 m away would never be checked and the run would report "no
+  # misbehaviour" for a reason that has nothing to do with misbehaviour.
+  verification_policy: verify-all
+  signer_id_policy:
+    full_cert_every_ms: 1000
+    digest_otherwise: true
+  pseudonym_change:
+    strategy: time
+    # Sixty seconds. The authority resolves a device by correlating **two** reports about
+    # **two different pseudonyms** — that is the whole reason the resolution asks two
+    # Linkage Authorities anything — so a device that keeps one pseudonym for the whole run
+    # is reported once, the authority holds one report, and no case is ever opened. Sixty
+    # seconds puts several of the device's provisioned certificates on the air inside a
+    # ten-minute run. A deployment study sets it back to 300 and runs for an hour.
+    period_s: 60.0
+
+nodes:
+  default_obu: obu/unex-obu-301-craton2
+  compute_tier: medium
+  backend_tier: medium
+
+threats:
+  attackers:
+    - id: threat/attacker/legacy/ConstPos
+      # A **fraction**, not a count, and deliberately so: the sweep writes this field, and
+      # `experiment.sweep` can only replace a value that is already in the serialised
+      # document. The validator also requires exactly one of `fraction`, `count` and
+      # `actor_ids` — two would need a rule for which wins.
+      fraction: 0.02
+      schedule:
+        from_s: 60.0
+        to_s: 600.0
+
+detection:
+  local:
+    - id: detect/legacy-12
+
+metrics: [all]
+exporters: []
+
+experiment:
+  sweep:
+    # Axis order in the plan is the sweep map's key order, which is lexicographic in the
+    # dotted path, and the **last** axis varies fastest. So consecutive runs differ in the
+    # attacker fraction within a traffic level, which is the grouping a per-traffic figure
+    # panel wants.
+    actors.vehicles.demand.rate_veh_per_h: [1500.0, 6000.0, 24000.0]
+    # 2 % is the figure RQ3 and RQ4 use for an attacker population; 10 % is the stress
+    # case, where the list is long enough for its size and its on-board expansion cost to
+    # matter (2 SHA-256 and 2*jmax AES per entry per period).
+    threats.attackers[0].fraction: [0.02, 0.10]
+  # Three seeds. The latency decomposition is a distribution over revocations, and at 2 %
+  # of a small fleet a cell may produce only one or two — so the aggregate's interval will
+  # often be `CiMethod::None`, and that is the honest report rather than a defect. The
+  # dense high-fraction cell is the one with enough revocations to have a distribution.
+  seeds: [1, 2, 3]
+  replications: 1

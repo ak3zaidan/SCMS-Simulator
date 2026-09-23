@@ -2,16 +2,25 @@
 //!
 //! # Read this first: the bytes are not all real
 //!
-//! Build decision D2 divides the message set into **three tiers**, and the whole crate is
-//! organised around that division. Anything that consumes an encoded message must branch on
-//! [`codec::Encoded::size_source`] before it treats the payload as data, because only two
-//! of the three tiers produce payloads at all.
+//! Build decision D2 divides the message set into tiers, and the whole crate is organised
+//! around that division. Anything that consumes an encoded message must branch on
+//! [`codec::Encoded::size_source`] before it treats the payload as data, because the
+//! bottom tier produces no payload at all — and anything that *reports* a size must go one
+//! step further and consult [`evidence`], because two tiers share one `size_source` and
+//! only one of them has been checked against an independent implementation.
 //!
 //! | Tier | Messages | What [`codec::Encoded::bytes`] contains | `size_source` |
 //! |---|---|---|---|
-//! | **Real ASN.1** | ETSI CAM, DENM (this crate); IEEE 1609.2 / TS 103 097 envelope and certificates (`v2xw-sec`, over [`sec_types`]) | the wire bytes, from `rasn` bindings generated at build time from the ETSI forge modules | [`codec::SizeSource::Uper`] / [`codec::SizeSource::Coer`] |
-//! | **Hand-written** | SAE J2735 BSM ([`j2735`]) | the wire bytes of the subset the simulator fills | [`codec::SizeSource::Uper`] |
-//! | **Size model** | J2735 SPaT, MAP, PSM, SRM, SSM | **a fill pattern of exactly the modelled length** | [`codec::SizeSource::SizeModel`] |
+//! | **Real ASN.1, generated** | ETSI CAM, DENM (this crate); IEEE 1609.2 / TS 103 097 envelope and certificates (`v2xw-sec`, over [`sec_types`]) | the wire bytes, from `rasn` bindings generated at build time from the ETSI forge modules | [`codec::SizeSource::Uper`] / [`codec::SizeSource::Coer`] |
+//! | **Hand-written, oracle-validated** | SAE J2735 BSM ([`j2735::bsm`]) | the wire bytes of the subset the simulator fills | [`codec::SizeSource::Uper`] |
+//! | **Hand-written, not yet validated** | SAE J2735 SPaT ([`j2735::spat`]) and MAP ([`j2735::map`]) | the wire bytes of the subset the simulator fills | [`codec::SizeSource::Uper`] |
+//! | **Size model** | J2735 PSM, SRM, SSM ([`size_model`]); ETSI CPM, VAM ([`etsi_size`]) | **a fill pattern of exactly the modelled length** | [`codec::SizeSource::SizeModel`] |
+//!
+//! [`evidence`] is the machine-readable form of that table — one row per
+//! [`codec::MsgType`], and the paragraph every model card's `limitations` starts with. A
+//! number is only "byte-exact" if [`evidence::ByteExactness::is_byte_exact`] says so:
+//! [`codec::SizeSource`] cannot tell you, because the second and third tiers share one
+//! value and carry very different evidence.
 //!
 //! ## Why the middle and bottom tiers exist
 //!
@@ -29,6 +38,20 @@
 //! generated from them compiles and round-trips. So the ETSI stack is genuinely encoded and
 //! the US stack is not — and this crate never pretends otherwise.
 //!
+//! Two gaps in that story are worth stating at the top rather than in a module nobody
+//! opens, because both are about *this checkout* rather than about the design:
+//!
+//! * `third_party/asn1/j2735/` **does not exist here** (it is git-ignored by D3), and
+//!   neither does the `pycrate` oracle environment. The BSM codec was written and
+//!   validated when both were present. The SPaT and MAP codecs were not: their structure
+//!   is corroborated where an artefact in this repository corroborates it and recalled
+//!   where nothing does, every recalled choice is a named constant, and their card says
+//!   the bytes are unvalidated.
+//! * `CPM-PDU-Descriptions.asn` and `VAM-PDU-Descriptions.asn` are **not committed**, so
+//!   the two ETSI messages that should be generated are sized instead ([`etsi_size`], which
+//!   lists the four steps that fix it). Adding a missing file to `build.rs` would fail the
+//!   build, and hand-writing an ETSI PDU from memory would be worse than sizing it.
+//!
 //! # Where to look
 //!
 //! | Concern | Module | Specification |
@@ -36,11 +59,14 @@
 //! | `MessageCodec`, `MsgType`, `Encoded`, `SizeSource` | [`codec`] | 03-interfaces.md §6 |
 //! | Generated ETSI bindings (CDD, CAM, DENM) | [`asn1`] | TS 102 894-2, TS 103 900, TS 103 831 |
 //! | Generated IEEE 1609.2 / TS 103 097 bindings, for `v2xw-sec` | [`sec_types`] | IEEE 1609.2, TS 103 097 |
+//! | Which messages are byte-exact, which are not | [`evidence`] | build decision D2 |
 //! | Building, encoding and decoding a CAM | [`cam`] | ETSI TS 103 900 |
 //! | Building a DENM and running its lifecycle | [`denm`] | ETSI TS 103 831, EN 302 637-3 |
 //! | `MessageGenerator`, the CAM trigger state machine, the BSM cadence | [`generator`] | 03-interfaces.md §6, 04-models.md §8.1 |
 //! | The hand-written J2735 BSM codec and its UPER engine | [`j2735`] | SAE J2735 2024-09, ITU-T X.691 |
-//! | The validated J2735 size model | [`size_model`] | 04-models.md §8.4 |
+//! | The hand-written J2735 SPaT and MAP codecs | [`j2735::spat`], [`j2735::map`], [`j2735::infra`] | SAE J2735 2024-09, ITU-T X.691 |
+//! | The validated J2735 size model (PSM, SRM, SSM) | [`size_model`] | 04-models.md §8.4 |
+//! | The ETSI size model (CPM, VAM), and how to retire it | [`etsi_size`] | 04-models.md §8.2, §8.4 |
 //! | Simulator quantities to CDD wire units | [`units`] | ETSI TS 102 894-2 |
 //! | Errors | [`error`] | — |
 //!
@@ -108,6 +134,8 @@ pub mod cam;
 pub mod codec;
 pub mod denm;
 pub mod error;
+pub mod etsi_size;
+pub mod evidence;
 pub mod generator;
 pub mod j2735;
 pub mod sec_types;
@@ -124,10 +152,14 @@ pub use generator::{
     CamDynamics, CamGenParams, CamGenerator, CamTriggerState, DccState, DynamicsTriggers,
     GenReason, GenRequest, MessageGenerator,
 };
+pub use etsi_size::{ETSI_SIZE_MODEL_ID, EtsiSizeCodec};
+pub use evidence::{ByteExactness, EVIDENCE, MessageEvidence, byte_exactness};
 pub use j2735::bsm::{
     BasicSafetyMessage, BsmCoreData, BsmInput, PartIIContent, PartIIValue, VehicleSafetyExtensions,
 };
-pub use j2735::{J2735_BSM_CODEC_ID, J2735BsmCodec};
+pub use j2735::map::MapData;
+pub use j2735::spat::Spat;
+pub use j2735::{J2735_BSM_CODEC_ID, J2735_INFRA_CODEC_ID, J2735BsmCodec, J2735InfraCodec};
 pub use size_model::{ContentProfile, J2735_SIZE_MODEL_ID, J2735SizeCodec, SizeRequest};
 
 /// What `build.rs` generated, for the manifest and for anyone auditing the build.
@@ -168,7 +200,20 @@ pub mod provenance {
     /// "hand-written and cross-validated against an independent implementation" are very
     /// different claims about the same bytes.
     pub const HAND_WRITTEN: &[&str] = &[
-        "SAE J2735 2024-09 BasicSafetyMessage — Part I in full, the VehicleSafetyExtensions          Part II container and the MessageFrame wrapper (crate::j2735); cross-validated          against pycrate 0.8.1 compiled from the real ASN.1, 235 vectors, byte-identical",
+        "SAE J2735 2024-09 BasicSafetyMessage — Part I in full, the VehicleSafetyExtensions          Part II container and the MessageFrame wrapper (crate::j2735::bsm); cross-validated          against pycrate 0.8.1 compiled from the real ASN.1, 235 vectors, byte-identical",
+        "SAE J2735 2024-09 SPAT — timeStamp, IntersectionState (id, revision, status, moy,          timeStamp), MovementState, MovementEvent and TimeChangeDetails, plus the          MessageFrame wrapper (crate::j2735::spat); NOT cross-validated: no oracle run, the          ASN.1 is absent from this checkout",
+        "SAE J2735 2024-09 MapData — msgIssueRevision, timeStamp, IntersectionGeometry (id,          revision, refPoint, laneWidth), GenericLane (attributes, maneuvers, node list,          connections), plus the MessageFrame wrapper (crate::j2735::map); NOT          cross-validated, and its extension markers are recalled rather than read — see          crate::j2735::map::assumptions",
+    ];
+
+    /// Message formats a **size model** stands in for, and why each is not encoded.
+    ///
+    /// The manifest needs this beside [`HAND_WRITTEN`] for one reason: a reader who sees
+    /// only the generated modules and the hand-written list would reasonably assume
+    /// everything else in the message set is encoded too. These are the ones that are not,
+    /// and a size taken from them is a table lookup.
+    pub const SIZE_MODELLED: &[&str] = &[
+        "SAE J2735 PSM, SRM, SSM (codec/size-model/j2735) — the J2735 ASN.1 cannot be          code-generated (build decision D2) and nothing in the simulator fills these three          yet",
+        "ETSI CPM, VAM (codec/size-model/etsi) — generatable from the published forge          modules, but CPM-PDU-Descriptions.asn and VAM-PDU-Descriptions.asn are not          committed to third_party/asn1/etsi in this checkout",
     ];
 }
 
@@ -218,7 +263,9 @@ mod tests {
         let cards = [
             EtsiUperCodec::new().card().clone(),
             J2735BsmCodec::new().card().clone(),
+            J2735InfraCodec::new().card().clone(),
             J2735SizeCodec::new().card().clone(),
+            EtsiSizeCodec::new().card().clone(),
             CamGenerator::default().card().clone(),
             BsmGenerator::default().card().clone(),
         ];
@@ -241,7 +288,9 @@ mod tests {
         for card in [
             EtsiUperCodec::new().card().clone(),
             J2735BsmCodec::new().card().clone(),
+            J2735InfraCodec::new().card().clone(),
             J2735SizeCodec::new().card().clone(),
+            EtsiSizeCodec::new().card().clone(),
             CamGenerator::default().card().clone(),
             BsmGenerator::default().card().clone(),
         ] {
@@ -250,6 +299,61 @@ mod tests {
             card.check_api_version()
                 .unwrap_or_else(|e| panic!("{}: {e}", card.id));
         }
+    }
+
+    /// The manifest's two prose lists must account for exactly the messages the evidence
+    /// table says they do.
+    ///
+    /// Prose lists rot. This one is what a run's manifest prints, so a message that
+    /// quietly moved tier — a size model replaced by an encoder, or the reverse — would
+    /// leave the manifest describing the previous build. The counts are checked rather
+    /// than the text, because the text is a sentence per message and the count is the part
+    /// that cannot be right by accident.
+    #[test]
+    fn the_manifest_lists_account_for_every_message_they_claim() {
+        use evidence::ByteExactness;
+
+        let hand_written_codecs = [J2735_BSM_CODEC_ID, J2735_INFRA_CODEC_ID];
+        let hand_written = EVIDENCE
+            .iter()
+            .filter(|e| e.codec.is_some_and(|id| hand_written_codecs.contains(&id)))
+            .count();
+        assert_eq!(
+            hand_written,
+            provenance::HAND_WRITTEN.len(),
+            "{hand_written} messages are hand-encoded but the manifest lists {}",
+            provenance::HAND_WRITTEN.len()
+        );
+
+        let mut modelled_codecs: Vec<&str> = EVIDENCE
+            .iter()
+            .filter(|e| e.exactness == ByteExactness::SizeModelled)
+            .filter_map(|e| e.codec)
+            .collect();
+        modelled_codecs.sort_unstable();
+        modelled_codecs.dedup();
+        assert_eq!(
+            modelled_codecs.len(),
+            provenance::SIZE_MODELLED.len(),
+            "{modelled_codecs:?} size-model the message set but the manifest lists {}",
+            provenance::SIZE_MODELLED.len()
+        );
+
+        // And the unvalidated encoders must be named as unvalidated in the manifest, not
+        // listed beside the BSM as though a pycrate run had covered them.
+        let unvalidated = provenance::HAND_WRITTEN
+            .iter()
+            .filter(|line| line.contains("NOT cross-validated"))
+            .count();
+        assert_eq!(
+            unvalidated,
+            EVIDENCE
+                .iter()
+                .filter(|e| e.exactness == ByteExactness::RealUperUnvalidated)
+                .count(),
+            "the manifest must say which hand-written encoders are unvalidated: {:?}",
+            provenance::HAND_WRITTEN
+        );
     }
 
     /// The provenance list must actually match the patches on disk, or the manifest would

@@ -1,0 +1,194 @@
+# ============================================================================
+# RQ: At what vehicle density does the 5.9 GHz channel congest, and what does
+#     congestion control do about it?
+# ============================================================================
+#
+# The second canonical air-interface study: channel busy ratio and delivery against
+# offered load, on the real Manhattan network.
+#
+#     v2xw experiment run scenarios/density-sweep-congestion.yaml \
+#         --out runs/density-sweep
+#
+# The sweep runs through the command-line tool; the figure does not yet. `v2xw experiment
+# run` exists, and there is no `v2xw figure` subcommand — the presets are a library
+# (`v2xw_experiment::figures`) and wiring them to a subcommand is owed work in `v2xw-cli`.
+# Until then the second line is three lines of Rust:
+#
+#     let table = v2xw_experiment::rebuild_table(&scenario, &options)?;
+#     let spec = v2xw_experiment::preset("rq-density-congestion").unwrap();
+#     v2xw_experiment::render(&spec, &table).write(Path::new("runs/density-sweep/figures"))?;
+#
+# **This run needs the Manhattan extract**, which is not in the repository:
+# `worlds/cache/manhattan.osm.xml` is git-ignored because it is 30 MB of OSM XML for the
+# build decision D7 bounding box (`-73.9900, 40.7440, -73.9680, 40.7620`, 13,553 ways).
+# Download that box from any OSM mirror, save it at that path, and `just
+# import-manhattan` will import it; `scenarios/scale/base.yaml` and
+# `scenarios/phase1-manhattan.yaml` use the same file. Or swap in the procedural `world`
+# block from `pdr-vs-distance.yaml` and run without it.
+#
+# ## What it measures
+#
+# * `cbr`, per node per channel — the fraction of a 100 ms window the MAC found the
+#   medium busy above −85 dBm. This is *the* congestion number: J2945/1 and ETSI DCC both
+#   act on it, and every published CBR-versus-density curve is this quantity.
+# * `pdr` and `pdr_by_cause` — where the deliveries go as the load rises, and which loss
+#   cause takes over.
+# * `airtime_per_node` and `goodput` — how much of the channel each node consumed for how
+#   much delivered payload.
+# * `verify_queue_depth`, `verify_wait`, `unverified_ratio` — the *receiver's* congestion,
+#   which is the half a pure-radio study misses. A node that hears 400 signed messages a
+#   second on a Craton2 does not verify 400 messages a second, and the queue is where the
+#   load shows up first.
+# * `flow`, `density`, `mean_speed` per lane — the traffic state the radio load is a
+#   function of, so the x axis of a figure can be a *realised* density and not the offered
+#   demand.
+#
+# ## What it does NOT measure
+#
+# * **Collisions.** `mac: medium` is CSMA/CA with a contention window and a CBR meter; it
+#   is not frame-level. Hidden terminals, capture and the `HiddenTerminal` loss cause need
+#   `phy: high` and `mac: high` together, and that pair is a Phase 3 scope item. So the
+#   CBR curve here is a *channel-occupancy* curve, and the delivery curve above it is
+#   optimistic at high load in a way that gets worse as the load rises. Read the numbers as
+#   a lower bound on congestion damage.
+# * **ETSI DCC.** The congestion control in the loop is `dcc/sae/j2945-1-rate-power`,
+#   selected because this engine transmits in the US band plan. TS 102 687's adaptive and
+#   reactive algorithms ship in `v2xw-radio` and nothing selects them yet
+#   (`v2xw_engine::wiring::build_dcc`), so "with and without ETSI DCC" is not a sweep this
+#   file can run.
+# * **The density the figure wants, directly.** There is no run-level vehicle-count or
+#   density metric: `density` is per lane, keyed by `Dim::Region`. The swept axis is
+#   therefore the *offered demand rate*, and the realised density is read off the traffic
+#   panel. Naming this is the difference between a figure that says "veh/km" and means it
+#   and one that does not.
+# * **Anything about a second radio technology.** See `rat-comparison.yaml`.
+#
+# ## Why the rungs are rates and not counts
+#
+# The demand model takes a rate. A rate over sixty seconds is a random count, so the
+# realised fleet differs between seeds — which is correct, and is why the study is
+# replicated. `scenarios/scale/` shows the other arrangement (a hard cap on trips, spawned
+# in bulk) and states what it costs in realism; that one is for wall-clock scaling, not for
+# a congestion curve, because a bulk-spawned fleet is denser and more clustered than a
+# fleet that arrived over a minute.
+schema: v2xw/scenario/1
+
+meta:
+  name: density-sweep-congestion
+  description: >-
+    Channel busy ratio, delivery and receiver queueing against offered vehicle demand on
+    the Manhattan network, five rungs from a trickle to saturation, three seeds each.
+  authors: [v2xw]
+  tags: [study, rq-density-congestion, manhattan, osm, dsrc, dcc, congestion]
+  created: "2026-09-22"
+
+seed: "0xC0FFEE_5EED"
+
+time:
+  t0: "2027-03-04T08:00:00Z"
+  # Sixty seconds at the top rung is already a substantial run (the fleet is in the
+  # hundreds and every vehicle signs ten messages a second). Raise it before drawing a
+  # conclusion about the *steady state*: sixty seconds of arrivals has not filled the
+  # network, so the realised density is still rising at the end of the run, and the
+  # traffic panel is what shows that.
+  duration_s: 60.0
+  mobility_step_ms: 100
+  des_resolution: 1us
+
+world:
+  source:
+    kind: osm-xml
+    path: worlds/cache/manhattan.osm.xml
+    bbox:
+      min_lat_deg: 40.7440
+      min_lon_deg: -73.9900
+      max_lat_deg: 40.7620
+      max_lon_deg: -73.9680
+  # An OSM extract carries no jurisdictional default speed limit, so the scenario states
+  # which class-default table applies. The importer refuses to guess.
+  highway_preset: urban-us-nyc
+  imported_at: "2026-09-18T00:00:00Z"
+  buildings:
+    enabled: true
+    keep_holes: true
+  terrain:
+    dem: null
+
+actors:
+  vehicles:
+    equipped_fraction: 1.0
+    demand:
+      kind: mobility/demand/poisson
+      # Overwritten by every cell of the sweep. The value here is the one a bare
+      # `v2xw run` on this file would use, so it is the lowest rung rather than a
+      # placeholder: a file that runs differently from the way it sweeps is a file that
+      # lies about its own base case.
+      rate_veh_per_h: 1500.0
+
+weather:
+  initial: clear
+  intensity: 0.0
+
+radio:
+  rat: dsrc-80211p
+  tiers:
+    propagation: medium
+    phy: medium
+    # `medium`, which has a CBR meter. At `abstract` there is no MAC at all
+    # (`wiring::build_mac` returns `None`), no CBR measurement and therefore no congestion
+    # control — a density sweep at the abstract tier measures nothing this file is about.
+    mac: medium
+
+net:
+  layer: wsmp
+
+messages:
+  sets: [bsm]
+  codec_tier: uper
+
+security:
+  envelope: ieee1609.2
+  signature: ecdsa-p256
+  crypto_mode: modeled
+  # `verify-all` on purpose, and it is the expensive choice. The receiver-side congestion
+  # this study is half about only exists if the node tries to verify what it hears; under
+  # `prioritized` the node drops distant senders before the queue and the verification
+  # panels go flat. Sweeping the policy is a legitimate second study and is deliberately
+  # not mixed into this one.
+  verification_policy: verify-all
+  signer_id_policy:
+    # A full certificate once a second is the J2945/1 rule and it is the dominant term in
+    # the air-time budget: a digest-signed BSM and a certificate-bearing one differ by
+    # about a hundred bytes, so this cadence is a congestion parameter and not a detail.
+    full_cert_every_ms: 1000
+    digest_otherwise: true
+  pseudonym_change:
+    strategy: time
+    period_s: 300.0
+
+nodes:
+  default_obu: obu/unex-obu-301-craton2
+  compute_tier: medium
+  backend_tier: medium
+
+metrics: [all]
+exporters: []
+
+experiment:
+  sweep:
+    # Five rungs, an order of magnitude apart at the ends. Measured on the Manhattan
+    # import: 1,500 veh/h realises a handful of vehicles over 60 s and 60,000 realises a
+    # few hundred; the thinned-Poisson acceptance and the lane-insertion gap reject
+    # roughly half the candidates, which is why the rungs are offered rates and the
+    # realised counts come from the run report.
+    #
+    # The last axis varies fastest in plan order, and this is the last (and only) axis, so
+    # consecutive runs differ in exactly this parameter — which is what makes a partial
+    # sweep still plottable.
+    actors.vehicles.demand.rate_veh_per_h: [1500.0, 6000.0, 15000.0, 30000.0, 60000.0]
+  # Three seeds. Fewer than the five of `pdr-vs-distance.yaml` because each cell here is
+  # much more expensive, and three is the smallest number from which the aggregate reports
+  # a spread at all (two replications give an interval; one gives `CiMethod::None` and
+  # says so).
+  seeds: [1, 2, 3]
+  replications: 1

@@ -27,6 +27,9 @@
 //! | [`reduce`] | pools one run's `metric.sample` windows into one value per metric per bin |
 //! | [`aggregate`] | means and intervals across replications, Wilson for proportions |
 //! | [`table`] | the results table, written through the exporters `v2xw-record` already has |
+//! | [`figures`] | the figure presets of 08-measurement-and-data.md §7: a results table in, Plotly JSON out |
+//! | [`foundry`] | the MAP-Elites misbehaviour foundry (07-threats §2.3), over the same executor seam |
+//! | [`foundry_eval`] | whether a proposed mutation operator actually beats random search |
 //!
 //! # Five properties, each of which is a test
 //!
@@ -85,6 +88,9 @@
 
 pub mod aggregate;
 pub mod error;
+pub mod figures;
+pub mod foundry;
+pub mod foundry_eval;
 pub mod journal;
 pub mod path;
 pub mod plan;
@@ -102,3 +108,10 @@ pub use runner::{
     RunnerOptions, rebuild_table, run_experiment, status,
 };
 pub use table::ResultsTable;
+
+pub use figures::{Axis, Figure, FigurePreset, FigureSet, PanelSpec, all_presets, preset, render};
+pub use foundry::{
+    Archive, Descriptor, Elite, FoundryOptions, Genome, MutationOperator, Objective,
+    RandomMutation, Signals, Validity, search,
+};
+pub use foundry_eval::{Comparison, EvalOptions, Verdict, compare_operators};

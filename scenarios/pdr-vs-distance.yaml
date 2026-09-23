@@ -1,0 +1,201 @@
+# ============================================================================
+# RQ: How does packet delivery fall off with distance, and what does the
+#     fidelity tier of the propagation model do to that curve?
+# ============================================================================
+#
+# This is the canonical air-interface study and the first row of the validation suite
+# (04-models.md §13): packet delivery ratio against transmitter-receiver distance, in
+# 25 m bins, with an error bar.
+#
+#     v2xw experiment run scenarios/pdr-vs-distance.yaml --out runs/pdr-vs-distance
+#
+# The sweep runs through the command-line tool; the figure does not yet. `v2xw experiment
+# run` exists, and there is no `v2xw figure` subcommand — the presets are a library
+# (`v2xw_experiment::figures`) and wiring them to a subcommand is owed work in `v2xw-cli`.
+# Until then the second line is three lines of Rust:
+#
+#     let table = v2xw_experiment::rebuild_table(&scenario, &options)?;
+#     let spec = v2xw_experiment::preset("rq-pdr-distance").unwrap();
+#     v2xw_experiment::render(&spec, &table).write(Path::new("runs/pdr-vs-distance/figures"))?;
+#
+# ## What it measures
+#
+# * `pdr`, dimensioned by `dist_bin` — the metric provider bins every candidate
+#   reception into a 25 m bin and reports the pooled proportion with a Wilson interval,
+#   so a bin with four attempts reports "insufficient" rather than 25 %.
+# * `per` and `pdr_by_cause` — the same losses, split by what the PHY said killed them.
+# * `pir` — the gap between successive receptions from one transmitter, which is what a
+#   safety application actually feels.
+#
+# ## What it does NOT measure, and why the distinction matters here
+#
+# * **Nothing about a real deployment's antenna.** Both ends are isotropic at the class
+#   default gain (3 dBi, TR 36.885 Table A.1.1-1). A roof-mounted shark-fin's pattern is
+#   a `high`-tier feature with no cached pattern to load, so it is absent rather than
+#   guessed (04-models.md §3.7).
+# * **Nothing about interference from other transmitters.** At the `medium` PHY tier
+#   there are no interferers in the SINR sum: a loss here is a link-budget loss or a PER
+#   draw, never a collision. The collision mechanism needs `phy: high` **and**
+#   `mac: high` together, and that is a different study — see
+#   `density-sweep-congestion.yaml`, which is the one that measures load.
+# * **The curve is not a free-space curve and must not be read as one.** Buildings are
+#   on, so the same distance bin mixes line-of-sight links along an avenue with links
+#   through a block. That is the point — a V2X range figure with no obstruction model is
+#   a figure about a field, not a city — but it means the curve is *not* monotone and its
+#   spread within a bin is larger than the interval implies.
+#
+# ## Why a procedural grid rather than the Manhattan import
+#
+# Reproducibility. A procedural world has no external input, so a difference between two
+# runs of this file cannot be explained by which OSM extract happened to be on disk, and
+# the validation suite's tolerance is then a statement about the radio stack alone. The
+# geometry is Midtown-shaped (274 m avenue spacing, 80 m street spacing) so the link
+# lengths and the building occlusion are the ones a real Manhattan run produces.
+#
+# Run it on the import by replacing the `world` block with the one in
+# `density-sweep-congestion.yaml`; nothing else changes.
+schema: v2xw/scenario/1
+
+meta:
+  name: pdr-vs-distance
+  description: >-
+    Packet delivery ratio against distance in 25 m bins, on a Midtown-shaped procedural
+    grid with buildings, swept over the propagation model's fidelity tier and replicated
+    over five seeds.
+  authors: [v2xw]
+  tags: [study, rq-pdr-distance, validation, dsrc, propagation]
+  created: "2026-09-22"
+
+# The master seed. Every run of the sweep derives its own seed from this one by a hash
+# (`v2xw_experiment::plan::derive_run_seed`), so the seeds are a function of this number
+# and not of when the sweep was started.
+seed: "0xC0FFEE_5EED"
+
+time:
+  t0: "2027-03-04T08:00:00Z"
+  # Sixty seconds. Long enough for ~113 vehicles at the rate below to disperse across the
+  # grid and produce candidate receptions at every distance out to the candidate range,
+  # and short enough that five seeds times two tiers is a coffee break rather than a day.
+  duration_s: 60.0
+  mobility_step_ms: 100
+  des_resolution: 1us
+
+world:
+  source:
+    kind: procedural
+    generator: world/source/procedural-grid
+    params:
+      # 13 x 34 junctions at Midtown spacing covers 3,288 x 2,640 m, which is the D7
+      # bounding box to within a few per cent.
+      cols: 13
+      rows: 34
+      block_x_m: 274.0
+      block_y_m: 80.0
+      lanes_per_direction: 2
+      lane_width_m: 3.5
+      sidewalk_m: 2.0
+      # 25 mph, the NYC citywide limit.
+      speed_limit_mps: 11.176
+      signalised: true
+      cycle_s: 60.0
+      amber_s: 3.0
+      crossings: true
+      # One building per block, 30 m tall. This is the line that makes the study a study
+      # of a city: without it every link in a distance bin is line-of-sight and the curve
+      # is a link budget with a PER curve on top.
+      block_buildings: true
+      building_height_m: 30.0
+      rsu_at_junctions: false
+  imported_at: "2026-09-18T00:00:00Z"
+  buildings:
+    enabled: true
+    keep_holes: true
+  terrain:
+    dem: null
+
+actors:
+  vehicles:
+    equipped_fraction: 1.0
+    demand:
+      kind: mobility/demand/poisson
+      # Measured on this world: 15,000 veh/h realises about 113 vehicles over 60 s, which
+      # is roughly 6,300 ordered pairs and therefore a few hundred candidate receptions
+      # per 25 m bin per second. The run report states the count it actually realised;
+      # this file does not claim it.
+      rate_veh_per_h: 15000.0
+
+weather:
+  # Clear. Weather attenuation is negligible at 5.9 GHz (a fraction of a decibel in a
+  # 50 mm/h downpour over 300 m, 04-models.md §3.6) and the `medium` tier ignores it
+  # entirely, so a weather sweep here would measure the mobility model's speed multipliers
+  # and nothing about the radio.
+  initial: clear
+  intensity: 0.0
+
+radio:
+  rat: dsrc-80211p
+  tiers:
+    # `propagation` is the swept axis; see the `experiment` block. The other two are held
+    # at `medium` so the sweep isolates the propagation model: a `high` PHY would need a
+    # `high` MAC (the scenario validator refuses the pair) and would bring frame-level
+    # collisions into a study that is about the link.
+    propagation: medium
+    phy: medium
+    mac: medium
+
+net:
+  layer: wsmp
+
+messages:
+  # One message set, so every frame on the air is the same size distribution and the
+  # distance curve is not a mixture of two payloads.
+  sets: [bsm]
+  codec_tier: uper
+
+security:
+  envelope: ieee1609.2
+  signature: ecdsa-p256
+  crypto_mode: modeled
+  # `verify-all`: the PDR is a PHY quantity and does not depend on the policy, but the
+  # policy decides what reaches the application, and `pir` is measured on deliveries.
+  # Stating it means the two numbers are comparable across this file's cells.
+  verification_policy: verify-all
+  signer_id_policy:
+    full_cert_every_ms: 1000
+    digest_otherwise: true
+  pseudonym_change:
+    strategy: time
+    # Five minutes, the J2945/1 figure: longer than the run, so no pseudonym change
+    # happens and the distance curve is not perturbed by a certificate-attachment burst.
+    period_s: 300.0
+
+nodes:
+  default_obu: obu/unex-obu-301-craton2
+  compute_tier: medium
+  backend_tier: medium
+
+# Everything, because the point of a validation run is the whole picture: the run summary
+# then carries `pdr`, `per`, `pdr_by_cause`, `pir`, `cbr`, `airtime_per_node` and the
+# traffic aggregates, and the figure preset picks the panels it needs.
+metrics: [all]
+
+# Empty, and it has to be: the engine runs no exporter stage, and the scenario validator
+# refuses a non-empty list rather than letting a run silently ignore it. Exporting is
+# `v2xw run --record` and `v2xw export`.
+exporters: []
+
+experiment:
+  sweep:
+    # Two tiers of the same family. `medium` is dual-slope log-distance with spatially
+    # correlated shadowing and the Sommer building term; `high` adds Nakagami fast fading
+    # per link, terrain diffraction and the (negligible) weather term. The difference
+    # between the two curves is what 02-architecture.md §7.1's tier table claims it is,
+    # and this sweep is how that claim is checked.
+    radio.tiers.propagation: ["medium", "high"]
+  # Five seed slots. The same slot is the same seed in both cells — the run seed is a
+  # function of the slot and not of the cell — which is common random numbers: the
+  # difference between the two tiers is measured on runs whose vehicle arrivals and
+  # shadowing draws came from the same streams, so it is not inflated by between-run
+  # variance.
+  seeds: [1, 2, 3, 4, 5]
+  replications: 1

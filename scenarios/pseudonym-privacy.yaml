@@ -1,0 +1,253 @@
+# ============================================================================
+# RQ: What does a pseudonym-change policy cost, and what does it buy?
+# ============================================================================
+#
+# Half of that question is answerable today and half is not, and the whole value of this
+# file is that it says which half is which before you spend a day on it.
+#
+#     v2xw experiment run scenarios/pseudonym-privacy.yaml --out runs/pseudonym
+#
+# The sweep runs through the command-line tool; the figure does not yet. `v2xw experiment
+# run` exists, and there is no `v2xw figure` subcommand — the presets are a library
+# (`v2xw_experiment::figures`) and wiring them to a subcommand is owed work in `v2xw-cli`.
+# Until then the second line is three lines of Rust:
+#
+#     let table = v2xw_experiment::rebuild_table(&scenario, &options)?;
+#     let spec = v2xw_experiment::preset("rq-pseudonym-privacy").unwrap();
+#     v2xw_experiment::render(&spec, &table).write(Path::new("runs/pseudonym/figures"))?;
+#
+# ## READ THIS FIRST: what this scenario cannot measure
+#
+# **A run of this file measures no privacy quantity.** It measures the *cost* of a
+# pseudonym policy, which is real and is below. The privacy side is half built, and the
+# halves are worth telling apart (state of the tree, 2026-09-22):
+#
+# * **The observer model exists.** `v2xw_threat::privacy` is the passive adversary
+#   07-threats-and-detection.md §6 asks for: receivers by the road, a constant-velocity
+#   tracker with a covariance that grows over a silence, best-hypothesis association by
+#   the Wiedersheim method, and records carrying `anonymity_set_size`,
+#   `degree_of_anonymity`, a tracking duration and a link claim per pseudonym change —
+#   including the claims it *declines* to make, so a linkability denominator cannot
+#   silently become its own numerator.
+# * **Nothing installs it, and nothing reduces its records.**
+#   `v2xw_metrics::register_all` installs five providers — comms, security, detection,
+#   safety, runtime — and none of them reads a privacy record, so
+#   `linkability_rate`, `anonymity_set_size`, `degree_of_anonymity` and
+#   `tracking_duration` are not in this engine's metric catalog. The scenario schema has
+#   no key that places an observer either: `threats.attackers` takes the legacy attacker
+#   ids and `v2xw_engine::phase2::Phase2::build` resolves nothing else.
+#
+# So a figure from this run cannot say "changing pseudonym every 60 s instead of every
+# 300 s reduces tracking". Anyone who reads one that way has been misled, which is why
+# this block is at the top of the file rather than in a footnote.
+#
+# Three things are owed, and none of them needs an engine change — the observer is an
+# ordinary receiving node and a metric provider is an ordinary reduction of a channel:
+#   1. a scenario key that places observers (a count, or a receiver density);
+#   2. a metric provider over the observer's records computing the four §6 quantities;
+#   3. the ground-truth digest-to-actor declaration `linkability_rate`'s correctness join
+#      needs, in the shape `DetectionProvider::declare_subject` already has.
+#
+# When those land, the sweep below is the study: the axis is already the right one.
+#
+# ## What it DOES measure: the cost side, which is real and worth having
+#
+# A pseudonym change is not free, and every cost below is measured here:
+#
+# * `full_cert_share` and `envelope_overhead` — a receiver that has never seen a
+#   certificate needs the full one, so a change forces a full-certificate attachment out
+#   of cadence. A short period therefore raises the average frame size, and these two
+#   metrics are how much.
+# * `pdr`, `per`, `airtime_per_node`, `goodput` — the air-interface consequence of those
+#   larger frames, at a fixed fleet.
+# * `verify_queue_depth`, `verify_wait`, `unverified_ratio` — the receiver consequence. A
+#   new pseudonym is a new certificate to verify and a new neighbour-table entry; under a
+#   short period a node spends its verification budget re-establishing peers it already
+#   knew.
+# * `det_recall`, `det_precision`, `time_to_detect` — **the detection consequence, which
+#   is the interesting one.** Every local detector in the suite keys its history on the
+#   signer digest, so a pseudonym change erases the sender's history and the check
+#   re-anchors. A misbehaving vehicle that changes pseudonym often is harder to catch, and
+#   this sweep measures how much harder. One attacker is therefore in the scenario: without
+#   it these three metrics have no positive class and the detection panel is empty.
+#
+# Read together, the run answers "what does a short pseudonym period cost in bytes, in
+# verification and in detection" — which is exactly the trade-off a privacy policy is
+# chosen against, with one of its two sides missing and labelled.
+#
+# ## Why 10 s is in the sweep at all
+#
+# Ten seconds is not a deployment policy; J2945/1's figure is five minutes. It is in the
+# sweep because it is the value at which the *mechanism* is visible in a one-minute run,
+# and because the SCMS resolution path needs two reports about two different pseudonyms
+# of one device before it can open a case — which is what `phase2-manhattan.yaml` uses it
+# for. Treat the 10 s cell as a mechanism check and the 300 s cell as the deployment.
+schema: v2xw/scenario/1
+
+meta:
+  name: pseudonym-privacy
+  description: >-
+    The cost of the pseudonym-change period — certificate attachment, air time,
+    verification load and detector continuity — swept over four periods with one ConstPos
+    attacker present so the detection side has a positive class. Measures no privacy
+    quantity; see the header.
+  authors: [v2xw]
+  tags: [study, rq-pseudonym, privacy, manhattan, osm, scms, detection]
+  created: "2026-09-22"
+
+seed: "0xC0FFEE_5EED"
+
+time:
+  t0: "2027-03-04T08:00:00Z"
+  # Three hundred seconds, which is five pseudonym changes at the 60 s rung and one at the
+  # 300 s rung. The 300 s cell therefore sees *no* change inside the run and is the
+  # control: its `full_cert_share` is the cadence's baseline, and every other cell is read
+  # against it.
+  duration_s: 300.0
+  mobility_step_ms: 100
+  des_resolution: 1us
+
+world:
+  source:
+    kind: osm-xml
+    path: worlds/cache/manhattan.osm.xml
+    bbox:
+      min_lat_deg: 40.7440
+      min_lon_deg: -73.9900
+      max_lat_deg: 40.7620
+      max_lon_deg: -73.9680
+  highway_preset: urban-us-nyc
+  imported_at: "2026-09-18T00:00:00Z"
+  buildings:
+    enabled: true
+    keep_holes: true
+  terrain:
+    dem: null
+
+actors:
+  vehicles:
+    equipped_fraction: 1.0
+    demand:
+      kind: mobility/demand/poisson
+      # A modest fleet held fixed across the sweep. The swept axis is the pseudonym
+      # period and nothing else, so the fleet must not vary with it — that is what makes
+      # the difference between two cells attributable.
+      rate_veh_per_h: 6000.0
+
+  # One roadside unit on a mast in the middle of the D7 box, with the report-forwarding
+  # role. It is here for the detection half of the study and not for realism: a
+  # misbehaviour report reaches the Misbehaviour Authority over a roadside unit's
+  # backhaul, so without a unit the reports go nowhere, `det_recall` at `level=report`
+  # is zero in every cell, and the pseudonym period's effect on detection — the most
+  # interesting thing this file measures — would read as "no effect" for a reason that
+  # has nothing to do with pseudonyms.
+  #
+  # `position_m` and not `site`, because an OSM extract carries no mast inventory. The
+  # coordinates are world-local ENU metres from the bounding box's south-west corner
+  # (build decision D6) and the 6 m antenna height is added on top.
+  rsus:
+    - position_m: [900.0, 1000.0, 0.0]
+      roles: [report-forward]
+      profile: rsu/cohda-mk5-rsu
+
+  # The CAMP SCMS backend. It is here because a pseudonym is a credential: the certificates
+  # a vehicle rotates through are the ones provisioning issued it, and the number it holds
+  # concurrently is a protocol parameter (SCMS: 20 per week). Without the backend the
+  # rotation would be a relabelling rather than a credential change.
+  backend:
+    protocol: protocol/scms/camp
+    entities:
+      ra: {}
+      pca: {}
+      la1: {}
+      la2: {}
+      ma: {}
+      crlg: {}
+      lop: {}
+      crl_store: {}
+
+weather:
+  initial: clear
+  intensity: 0.0
+
+radio:
+  rat: dsrc-80211p
+  tiers:
+    propagation: medium
+    phy: medium
+    mac: medium
+
+net:
+  layer: wsmp
+
+messages:
+  sets: [bsm]
+  codec_tier: uper
+
+security:
+  envelope: ieee1609.2
+  signature: ecdsa-p256
+  crypto_mode: modeled
+  # `verify-all`. A pseudonym change costs a verification, and a policy that skipped
+  # verifications would hide the cost this study is measuring.
+  verification_policy: verify-all
+  signer_id_policy:
+    # Held fixed across the sweep, and it matters: this cadence and the pseudonym period
+    # are the two things that decide `full_cert_share`, so sweeping both at once would
+    # make neither attributable.
+    full_cert_every_ms: 1000
+    digest_otherwise: true
+  pseudonym_change:
+    strategy: time
+    # Overwritten by every cell. The base value is the deployment figure, so a bare
+    # `v2xw run` on this file is the control cell and not a placeholder.
+    period_s: 300.0
+
+nodes:
+  default_obu: obu/unex-obu-301-craton2
+  compute_tier: medium
+  backend_tier: medium
+
+threats:
+  attackers:
+    # One ConstPos attacker: it freezes its claimed position at the first instant it acts
+    # and keeps broadcasting it while it drives away. The simplest falsification in the
+    # catalog, and the one the ported suite's consistency checks are calibrated on — a
+    # detector that cannot catch ConstPos cannot catch anything.
+    #
+    # Its role in *this* study is to give `det_recall` and `time_to_detect` a positive
+    # class, so that the effect of the pseudonym period on detection is measurable rather
+    # than a division by zero.
+    - id: threat/attacker/legacy/ConstPos
+      count: 1
+      schedule:
+        # Thirty seconds of honest driving first, so the detectors have a motion history
+        # to find the frozen claim inconsistent *with*. A liar that lies from its first
+        # message is a vehicle with no history, which is a different and easier problem.
+        from_s: 30.0
+        to_s: 300.0
+
+detection:
+  local:
+    # The ported twelve. Every one of them keys its per-sender state on the signer digest,
+    # which is exactly why the pseudonym period reaches this layer at all.
+    - id: detect/legacy-12
+
+metrics: [all]
+exporters: []
+
+experiment:
+  sweep:
+    # Four periods, spanning a mechanism check (10 s), two intermediate policies and the
+    # J2945/1 deployment figure (300 s). The validator constrains this field to
+    # [1, 86400] s and requires it whenever the strategy is `time`.
+    security.pseudonym_change.period_s: [10.0, 30.0, 60.0, 300.0]
+  # Three seeds. The detection metrics rest on **one** attacker per run, so the recall of
+  # a single cell is a proportion over one subject — 0 or 1, with no interval worth the
+  # name. Three seeds give three subjects per cell, which is still thin: the aggregate
+  # will report `CiMethod::None` or a wide interval, and that is the honest answer at this
+  # replication count. A conclusion about detection needs ten or more seeds (or several
+  # attackers, which changes what is being measured); the cost-side metrics, which are
+  # pooled over thousands of frames, are already well determined at three.
+  seeds: [1, 2, 3]
+  replications: 1

@@ -1,0 +1,93 @@
+{
+  "_README": [
+    "The validation campaign's input, schema v2xw/validation-campaign/1. Copy this file",
+    "to docs/site/generated/validation-runs.json and have the validation suite fill in",
+    "`observed` and `outcome`; the generator reads it and the campaign page joins it",
+    "against the model registry and the defect registers.",
+    "",
+    "EVERY ROW BELOW IS `not-run`, AND THAT IS NOT A PLACEHOLDER. The cases are the ones",
+    "04-models.md §13 defines, with the targets and tolerances that document states. What",
+    "has not happened is the measurement. Filling in an `observed` value that nobody",
+    "measured would be fabricating a validation result, which is the one thing this whole",
+    "page exists to make impossible, so the rows ship as `not-run` and the campaign page",
+    "says so.",
+    "",
+    "`outcome` is one of: pass, fail, disabled, not-run. `disabled` is for a case whose",
+    "TARGET is unverified — §13 carries those as disabled rows rather than deleting them,",
+    "so the report shows what is missing instead of showing a shorter list.",
+    "",
+    "Underscore-prefixed keys are ignored by the generator; this block is one.",
+    "Fields per case: id and models are required; statistic, scenario, target, tolerance,",
+    "tolerance_kind, observed, source, seeds, plan_digest and note are optional and the",
+    "page reports which were omitted rather than inventing them."
+  ],
+  "schema": "v2xw/validation-campaign/1",
+  "engine_version": "0.1.0",
+  "cases": [
+    {
+      "id": "pdr-vs-distance-urban-medium",
+      "models": [
+        "radio/propagation/log-distance-shadowing",
+        "phy/80211p/link-budget"
+      ],
+      "scenario": "scenarios/pdr-vs-distance.yaml",
+      "statistic": "pdr per 25 m distance bin, pooled over seeds",
+      "target": null,
+      "tolerance": 0.05,
+      "tolerance_kind": "absolute, percentage points",
+      "observed": null,
+      "outcome": "disabled",
+      "source": "Bai and Krishnan 2006 PDR curve (R3 §H.1)",
+      "seeds": 10,
+      "note": "04-models.md §13 records this target as UNVERIFIED — the full text was never retrieved — so the case is carried disabled. The +-5 percentage-point tolerance is §13's own design choice for a digitised PDR curve, recorded there rather than cited."
+    },
+    {
+      "id": "cbr-vs-density",
+      "models": ["dcc/sae/j2945-1-rate-power", "mac/80211p/edca-ocb"],
+      "scenario": "scenarios/density-sweep-congestion.yaml",
+      "statistic": "cbr against realised vehicle density",
+      "target": null,
+      "tolerance": null,
+      "observed": null,
+      "outcome": "disabled",
+      "source": "CBR versus density curve (R3 §H.2)",
+      "seeds": 3,
+      "note": "§13: no numeric table found and the secondary figure is inaccessible. The case emits the curve for later comparison, which is why it is disabled rather than absent."
+    },
+    {
+      "id": "per-vs-snr-sjoberg",
+      "models": ["phy/80211p/link-budget"],
+      "statistic": "SNR at 10 % PER, 400 B payload, 6 Mbit/s, AWGN",
+      "target": 11.5,
+      "tolerance": 0.3,
+      "tolerance_kind": "absolute, dB (the digitisation uncertainty §13 declares)",
+      "observed": null,
+      "outcome": "not-run",
+      "source": "Sjoberg et al., Atheros 802.11p chipset, cabled AWGN (R1 §C.2), via 04-models.md §4.7",
+      "note": "The model predicts 6.6 dB at 400 B against a measured 11.5, so real hardware needs about 5 dB more; the `sjoberg-atheros` preset sets rx_impl_loss_db to 5 dB for exactly this. Running the case is what decides whether the preset closes the gap."
+    },
+    {
+      "id": "fundamental-diagram-ring",
+      "models": ["mobility/carfollowing/idm"],
+      "statistic": "capacity, critical density, jam density, wave speed and capacity drop on a closed single-lane ring",
+      "target": null,
+      "tolerance": null,
+      "observed": null,
+      "outcome": "not-run",
+      "source": "04-models.md §2.9's fundamental-diagram targets; the harness is v2xw_mobility::fd",
+      "note": "The one case in this file whose harness already exists and whose targets are all cited. It is `not-run` because nothing has run it, not because anything is missing."
+    },
+    {
+      "id": "envelope-size-1609dot2",
+      "models": ["security/envelope/ieee1609dot2"],
+      "statistic": "signed SPDU size for a digest signer and for a full-certificate signer, bytes",
+      "target": 93,
+      "tolerance": 0,
+      "tolerance_kind": "absolute, bytes",
+      "observed": null,
+      "outcome": "not-run",
+      "source": "04-models.md §9.1's envelope derivation, corrected by build decision D12.1",
+      "note": "A zero tolerance, because this is an encoder against an arithmetic derivation and not a model against a measurement. D12.1 records that the PSID three-byte threshold in the derivation was wrong (256, not 128) and that the encoder was right — which is what a validation case is for."
+    }
+  ]
+}

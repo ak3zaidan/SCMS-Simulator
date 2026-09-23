@@ -1089,12 +1089,16 @@ pub fn card(params: &LegacyAttackerParams) -> ModelCard {
         "Renders one attack type per attacker. A node that switches type mid-run is a \
          scenario with two attacker instances, not a parameter here."
             .to_string(),
-        "PHY jamming (07-threats-and-detection.md §2.2) is not rendered: it needs the \
-         interferer hook in the SINR sum (04-models.md §12.3), which v2xw-radio does not \
-         expose yet. Declared as a capability, left unimplemented on purpose."
+        "PHY jamming (07-threats-and-detection.md §2.2) is not rendered HERE: it is \
+         `threat/attacker/new-families` (crate::attack_ext), which declares the burst on \
+         the emission. It still needs the interferer hook in the SINR sum \
+         (04-models.md §12.3), which v2xw-radio does not expose yet, so a jamming run \
+         produces the ground truth and no packet loss."
             .to_string(),
-        "Misbehaviour-report poisoning is rendered by the reporting path \
-         (crate::report::forge), not here."
+        "Misbehaviour-report poisoning is rendered by the reporting path: \
+         `threat/attacker/report-poisoner` (crate::poison) for a vehicle-borne insider and \
+         crate::attack_rsu::CompromisedRsu::on_forward for the infrastructure variant, both \
+         over crate::report::forge's fabricated-evidence distributions."
             .to_string(),
     ];
     card.determinism = Determinism {

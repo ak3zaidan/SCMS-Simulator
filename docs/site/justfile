@@ -19,6 +19,10 @@ python := if os_family() == "windows" { "python" } else { "python3" }
 
 out := "docs/site/build"
 cards := "docs/site/generated/cards.json"
+# The validation suite's output. The campaign page joins it against the model registry
+# and reports where the two disagree; a missing file is reported rather than skipped, so
+# every recipe below works without it.
+runs := "docs/site/generated/validation-runs.json"
 
 # Show the available recipes.
 default:
@@ -26,11 +30,11 @@ default:
 
 [doc("Build the site into docs/site/build")]
 build:
-    {{ python }} docs/site/build.py --clean --out {{ out }} --cards {{ cards }}
+    {{ python }} docs/site/build.py --clean --out {{ out }} --cards {{ cards }} --validation-runs {{ runs }}
 
 [doc("Build the site and fail if any input was missing (what CI should run)")]
 check:
-    {{ python }} docs/site/build.py --clean --strict --out {{ out }} --cards {{ cards }}
+    {{ python }} docs/site/build.py --clean --strict --out {{ out }} --cards {{ cards }} --validation-runs {{ runs }}
 
 # Export the model cards the reference pages are generated from.
 #
@@ -58,4 +62,4 @@ clean:
 [unix]
 [doc("Build with the current commit hash in the footer")]
 build-stamped:
-    {{ python }} docs/site/build.py --clean --out {{ out }} --cards {{ cards }} --stamp "$(git rev-parse --short HEAD)"
+    {{ python }} docs/site/build.py --clean --out {{ out }} --cards {{ cards }} --validation-runs {{ runs }} --stamp "$(git rev-parse --short HEAD)"

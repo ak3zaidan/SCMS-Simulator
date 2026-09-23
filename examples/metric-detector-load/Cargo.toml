@@ -1,0 +1,21 @@
+# Worked example: a `MetricProvider` plug-in.
+#
+# A metric provider is the one family that reads *recorded records* rather than engine
+# state, so its only dependencies are the contract crate and the metrics crate. It never
+# sees the world, the actors or the clock — it sees the channels, exactly as a provider
+# written in Python would.
+[package]
+name = "v2xw-example-metric"
+description = "Worked example: a metric provider over the local-detection channel."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+v2xw-core = { workspace = true }
+v2xw-metrics = { workspace = true }
+serde_json = { workspace = true }

@@ -223,6 +223,79 @@ impl MisbehaviourReport {
         })
     }
 
+    /// Builds a report from checks named by string, for a detector family whose check ids
+    /// are not [`DetectorId`]s.
+    ///
+    /// [`MisbehaviourReport::from_verdict`] takes a [`Verdict`], whose observations are
+    /// typed on the legacy [`DetectorId`] enum — which is the right type for the legacy
+    /// twelve and the wrong one for every other family, because the `detnorm_*` column
+    /// order of the legacy corpus is exactly that enum. The TS 103 759 suite
+    /// ([`crate::ts103759`]) therefore reports through here: same wire shape, same
+    /// quantisation, its own check ids.
+    ///
+    /// `reasons` are the checks that fired, highest score first; `columns` is every check
+    /// that *ran*, which for that suite is deliberately not every check that exists.
+    /// Returns `None` when nothing fired.
+    #[must_use]
+    pub fn from_named_checks(
+        report_id: impl Into<String>,
+        reporter: NodeId,
+        reporter_cert_digest: impl Into<String>,
+        subject_cert_digest: impl Into<String>,
+        reasons: &[(String, f64)],
+        columns: &[(String, f64)],
+        evidence: &Evidence,
+    ) -> Option<Self> {
+        let (_leading_id, leading_score) = reasons.first()?;
+        let Evidence {
+            subject_pos_confidence_m,
+            station_type,
+            cert_validity,
+            bbox: evidence_bbox,
+            detection_time,
+            ingest_time,
+        } = evidence.clone();
+        let report_id = report_id.into();
+        let max_score = columns
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(*leading_score, f64::max);
+        Some(Self {
+            evidence_msg_refs: vec![format!("{report_id}-m")],
+            report_id,
+            ingest_time,
+            detection_time,
+            generation_time: detection_time,
+            reporter: Some(reporter),
+            reporter_cert_digest: reporter_cert_digest.into(),
+            subject_cert_digest: subject_cert_digest.into(),
+            reason_codes: reasons.iter().map(|(id, _)| id.clone()).collect(),
+            detector_outputs: reasons
+                .iter()
+                .map(|(id, score)| DetectorOutput {
+                    check_id: id.clone(),
+                    score: q(*score),
+                    verdict: "fail".to_string(),
+                })
+                .collect(),
+            cert_validity,
+            st_bbox: [
+                q(evidence_bbox[0]),
+                q(evidence_bbox[1]),
+                q(evidence_bbox[2]),
+                q(evidence_bbox[3]),
+            ],
+            st_tstart: detection_time,
+            st_tend: detection_time,
+            duplicate_flag: false,
+            detector_score: q(*leading_score),
+            detector_score_norm: q(max_score),
+            subject_pos_confidence: q(subject_pos_confidence_m),
+            station_type,
+            detnorm: columns.iter().map(|(id, v)| (id.clone(), q(*v))).collect(),
+        })
+    }
+
     /// The leading reason: the check the authority correlates on.
     #[must_use]
     pub fn leading_reason(&self) -> Option<&str> {

@@ -99,9 +99,16 @@ fn the_stage_name_check_can_fail() {
 }
 
 /// Every stage a flow declares is in the vocabulary, and every flow's name round-trips too.
+///
+/// Both protocols, not just the SCMS: the ETSI plug-in grew five flows, and a stage one of
+/// them declares and this table does not list would mean a recording carrying a name no
+/// metric is defined over.
 #[test]
 fn every_declared_stage_is_in_the_vocabulary() {
-    for flow in v2xw_proto::scms::FLOWS {
+    let etsi = v2xw_proto::etsi::all_flows();
+    let flows = v2xw_proto::scms::FLOWS.iter().chain(etsi.iter());
+    let mut checked = 0;
+    for flow in flows {
         for stage in flow.stages {
             assert!(
                 ALL_STAGES.contains(stage),
@@ -111,7 +118,14 @@ fn every_declared_stage_is_in_the_vocabulary() {
         }
         let json = serde_json::to_string(&flow.id).expect("serialises");
         assert_eq!(json.trim_matches('"'), flow.id.as_str());
+        let back: FlowId = serde_json::from_str(&json).expect("deserialises");
+        assert_eq!(back, flow.id);
+        checked += 1;
     }
+    assert!(
+        checked >= 14,
+        "seven SCMS flows and seven ETSI ones: {checked}"
+    );
 }
 
 // -----------------------------------------------------------------------------------------

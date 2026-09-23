@@ -38,6 +38,29 @@
 //! 7. **Crossings**: by junction, then by the same direction order.
 //! 8. **Buildings**: block `(i, j)` row-major. **Sites**: by junction id. **Signal
 //!    plans**: by junction id, among signalised junctions only.
+//!
+//! # The other generators
+//!
+//! 04-models.md §1.2 lists five procedural topologies. Three of them are here:
+//!
+//! | Model id | Module | Geometry |
+//! |---|---|---|
+//! | `world/source/procedural-grid` | this module | a rectangular lattice |
+//! | `world/source/procedural-radial` | [`radial`] | the spider: spokes and ring roads |
+//! | `world/source/procedural-random` | [`random`] | random growth from one junction |
+//!
+//! The lattice computes its own geometry, because every junction in it is a right-angled
+//! crossroads. The other two cannot, so they share [`graph`], which turns a list of node
+//! positions and undirected streets — the legacy `CustomNetwork` input — into the full
+//! lane-level model with junction areas, connectors and conflict matrices.
+//!
+//! `world/source/procedural-suburban` and `world/source/procedural-highway` are not
+//! implemented; 04-models.md §1.2 records both of their parameter sets as
+//! `TODO: calibrate`, so there is nothing to build them from yet.
+
+pub mod graph;
+pub mod radial;
+pub mod random;
 
 use std::collections::BTreeMap;
 

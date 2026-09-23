@@ -2650,6 +2650,7 @@ dependencies = [
  "v2xw-engine",
  "v2xw-metrics",
  "v2xw-record",
+ "v2xw-threat",
 ]
 
 [[package]]

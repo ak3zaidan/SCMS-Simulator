@@ -46,6 +46,7 @@ use crate::numeric;
 use crate::per::PerModel;
 use crate::phy::{OfdmPhy, air_time};
 use crate::prop::{LogDistancePreset, LogDistanceShadowing};
+use crate::sweep::{ChannelModel, DsrcConfig, HighwaySweep, SweepReport, sweep_dsrc_with_samples};
 use crate::traits::{Fading, Phy, Propagation};
 use crate::types::{
     ActorClass, CcaState, ChannelId, FrameDescriptor, LosResult, LossCause, Mcs, RadioEndpoint,
@@ -586,6 +587,275 @@ pub fn calibrate(
     (table, report)
 }
 
+// =========================================================================================
+// Wiring: a scenario asks for a calibrated abstract tier (04-models.md §4.9)
+// =========================================================================================
+
+/// The fit a calibrated abstract tier carries: what the acceptance test of 04-models.md
+/// §4.9 step 5 found, in the form a model card records.
+///
+/// This is the difference between the abstract tier being *calibrated* and being *guessed*.
+/// A table built from a guess has no fit; a table built by [`CalibrationRequest::run`] has
+/// one, it names the high-tier runs it was fitted to, and it is what moves the card's
+/// [`Validation::status`] off [`ValidationStatus::Unvalidated`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalibrationFit {
+    /// Whether every compared bin and the mean CBR are inside tolerance (step 5).
+    pub accepted: bool,
+    /// The worst per-bin delivery gap, in percentage points.
+    pub worst_pdr_gap_pp: f64,
+    /// The abstract tier's mean CBR estimate.
+    pub abstract_mean_cbr: f64,
+    /// The high tier's mean CBR.
+    pub high_mean_cbr: f64,
+    /// `|abstract − high|` for the mean CBR, against the 0.05 of step 5.
+    pub mean_cbr_gap: f64,
+    /// How many `(distance, load)` cells the high-tier run actually observed, and so how
+    /// many were compared.
+    pub bins_compared: usize,
+    /// How many of them missed the tolerance.
+    pub bins_failed: usize,
+    /// How many reception samples the fit consumed.
+    pub samples: u64,
+    /// The table's content hash — the `@<hash>` suffix step 4 registers it under.
+    pub table_hash: String,
+    /// The high-tier runs it was fitted to, by their [`crate::sweep::SweepReport::label`].
+    pub high_tier_runs: Vec<String>,
+    /// The propagation stack those runs used, which the envelope also pins.
+    pub propagation_stack: String,
+    /// The engine build, as the caller supplied it.
+    pub engine_build: String,
+}
+
+impl CalibrationFit {
+    /// The fit an acceptance report and the run that produced it imply.
+    #[must_use]
+    pub fn from_report(
+        report: &AcceptanceReport,
+        table: &DistanceLoadTable,
+        samples: u64,
+        high_tier_runs: Vec<String>,
+        engine_build: impl Into<String>,
+    ) -> Self {
+        Self {
+            accepted: report.accepted,
+            worst_pdr_gap_pp: numeric::q_ratio(report.worst_pdr_gap * 100.0),
+            abstract_mean_cbr: numeric::q_ratio(report.abstract_mean_cbr),
+            high_mean_cbr: numeric::q_ratio(report.high_mean_cbr),
+            mean_cbr_gap: numeric::q_ratio(
+                (report.abstract_mean_cbr - report.high_mean_cbr).abs(),
+            ),
+            bins_compared: report.bins.len(),
+            bins_failed: report.bins.iter().filter(|b| !b.within_tolerance).count(),
+            samples,
+            table_hash: table.content_hash_hex(),
+            high_tier_runs,
+            propagation_stack: table.envelope.propagation_stack.clone(),
+            engine_build: engine_build.into(),
+        }
+    }
+
+    /// The one-line summary the card and the manifest carry.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!(
+            "fitted to {} high-tier run(s) over {} samples with {}: worst per-bin \
+             delivery gap {:.3} pp over {} compared cell(s) ({} outside tolerance), mean \
+             CBR gap {:.4} — {} the 04-models.md §4.9 step 5 tolerance of {:.0} pp and \
+             {:.2} CBR",
+            self.high_tier_runs.len(),
+            self.samples,
+            self.propagation_stack,
+            self.worst_pdr_gap_pp,
+            self.bins_compared,
+            self.bins_failed,
+            self.mean_cbr_gap,
+            if self.accepted { "within" } else { "OUTSIDE" },
+            PDR_TOLERANCE * 100.0,
+            CBR_TOLERANCE,
+        )
+    }
+}
+
+/// A calibrated abstract tier: the table, the acceptance report, the fit, and the
+/// high-tier runs it came from.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CalibratedAbstractTier {
+    /// The table. `accepted` on it is step 5's verdict.
+    pub table: DistanceLoadTable,
+    /// The bin-by-bin comparison.
+    pub report: AcceptanceReport,
+    /// The fit, for the card and the manifest.
+    pub fit: CalibrationFit,
+    /// The high-tier runs, so a reviewer can see the curves the fit came from.
+    pub high_tier_reports: Vec<SweepReport>,
+}
+
+impl CalibratedAbstractTier {
+    /// The PHY, with the fit recorded on its card.
+    #[must_use]
+    pub fn into_phy(self) -> AbstractPhy {
+        AbstractPhy::calibrated(self.table, self.fit)
+    }
+
+    /// Whether the fit passed, which is what decides between a calibrated registration and
+    /// an `uncalibrated` one (invariant I-R4).
+    #[must_use]
+    pub const fn accepted(&self) -> bool {
+        self.fit.accepted
+    }
+}
+
+/// What a scenario asks for when it asks for a **calibrated** abstract tier rather than a
+/// guessed one (04-models.md §4.9).
+///
+/// This is the wiring the scope asked for. A scenario names the abstract tier and this
+/// request; the engine runs the homogeneous high tier at each `(density, seed)` point,
+/// records every `(distance, load, decoded)` triple, bins them, fits the table, runs the
+/// acceptance test, and registers the result — calibrated if it passed, `uncalibrated`
+/// with a validator warning if it did not. Nothing downstream of
+/// [`CalibratedAbstractTier::into_phy`] can tell the difference between a fitted table and
+/// a hand-written one except by reading the card, which is the point: the tier is swapped
+/// by changing one field.
+///
+/// # What the high-tier run is, here
+///
+/// [`crate::sweep::sweep_dsrc_with_samples`] — the same harness the §13 validation curves
+/// are measured with, driving the real [`crate::phy::OfdmPhy`] at [`Tier::High`] with the
+/// real error model, real shadowing and sequential CSMA contention. Its approximations are
+/// its own card's business and are stated on it (see [`crate::sweep`]); what matters here
+/// is that the numbers come out of a run rather than out of a guess, and that the run is
+/// named in the fit so a reader can re-do it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CalibrationRequest {
+    /// The plan of step 1: loads, sizes, MCS, power, seeds.
+    pub plan: CalibrationPlan,
+    /// The channel the high-tier runs use. Pinned into the table's envelope, because step
+    /// 6 makes a table valid only for the propagation stack it was built with.
+    pub channel: ChannelModel,
+    /// The ring circumference, metres. At least twice [`CalibrationPlan::range_max_m`], or
+    /// a distance bin wraps onto itself.
+    pub ring_m: f64,
+    /// How long each high-tier run counts for.
+    pub duration: Duration,
+    /// How long each run warms up before counting.
+    pub warmup: Duration,
+    /// The engine build, recorded in the envelope and the fit.
+    pub engine_build: String,
+    /// The world content hashes, recorded in the envelope.
+    pub world_hashes: Vec<String>,
+}
+
+impl CalibrationRequest {
+    /// The request 04-models.md §4.9 step 1 states, on the `abbas-los-highway` channel —
+    /// the only measurement-fitted, fully verified highway LOS model the workspace ships
+    /// (04-models.md §3.2).
+    ///
+    /// Short runs: a second of warm-up and two seconds of counting per `(density, seed)`
+    /// point. At 10 Hz that is twenty frames per vehicle per run, which at the plan's
+    /// densities is millions of evaluated arrivals across the grid — enough for the Wilson
+    /// intervals of step 3 to be narrow in the bins that matter, and short enough that the
+    /// whole fit is a nightly job rather than a weekend one. The span is a parameter, so a
+    /// campaign that wants the published spans sets them.
+    #[must_use]
+    pub fn document_default(engine_build: impl Into<String>) -> Self {
+        Self {
+            plan: CalibrationPlan::document_default(),
+            channel: ChannelModel::AbbasLosHighway,
+            ring_m: 2_000.0,
+            duration: Duration::from_secs(2),
+            warmup: Duration::from_secs(1),
+            engine_build: engine_build.into(),
+            world_hashes: Vec::new(),
+        }
+    }
+
+    /// The `DsrcConfig` the high-tier runs use: the plan's MCS with the harness defaults.
+    #[must_use]
+    pub fn dsrc_config(&self) -> DsrcConfig {
+        DsrcConfig {
+            mcs: self.plan.mcs,
+            ..DsrcConfig::default()
+        }
+    }
+
+    /// The envelope a table fitted to this request carries (step 6).
+    #[must_use]
+    pub fn envelope(&self) -> TableEnvelope {
+        self.plan.envelope(
+            self.channel.label(),
+            self.world_hashes.clone(),
+            self.engine_build.clone(),
+        )
+    }
+
+    /// Every high-tier run this request implies: one per `(density, seed)` point of step 1,
+    /// in a fixed order.
+    ///
+    /// The seed of a point is `plan.seeds[i]` mixed with the density's index, so two
+    /// densities do not replay the same vehicle placement, and the order is
+    /// density-major so the list is a pure function of the request.
+    #[must_use]
+    pub fn sweeps(&self) -> Vec<HighwaySweep> {
+        let mut out = Vec::with_capacity(self.plan.densities_veh_km.len() * self.plan.seeds.len());
+        for (d_index, density) in self.plan.densities_veh_km.iter().enumerate() {
+            for seed in &self.plan.seeds {
+                let mut sweep = HighwaySweep::highway_slow(self.plan.rate_hz.max(1.0) as u32)
+                    .with_channel(self.channel)
+                    .with_density(*density)
+                    .with_duration(self.warmup, self.duration)
+                    // A seed per (density, seed) point. The mix is a multiply-add on the
+                    // density index, not a hash, so the list is reproducible by hand.
+                    .with_seed(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(d_index as u64));
+                sweep.ring_m = self.ring_m;
+                sweep.payload_cycle = self.plan.packet_bytes.clone();
+                sweep.tx_power_dbm = self.plan.tx_power_dbm;
+                sweep.bin_m = DISTANCE_BIN_M;
+                sweep.max_distance_m = self.plan.range_max_m;
+                sweep.sensing_range_m = self.plan.range_max_m;
+                out.push(sweep);
+            }
+        }
+        out
+    }
+
+    /// Runs the procedure end to end and returns the calibrated tier.
+    ///
+    /// Steps 2 to 5 of 04-models.md §4.9: run the homogeneous high tier at every point,
+    /// pool every `(distance, load, decoded)` triple, bin them, fit, and compare the
+    /// abstract tier's re-run against the high tier per bin.
+    ///
+    /// The comparison's own draw is seeded from the plan's first seed, so a fit is a pure
+    /// function of the request.
+    ///
+    /// # Panics
+    ///
+    /// As [`crate::sweep::sweep_dsrc_with_samples`]: if a frame exceeds the MSDU cap,
+    /// which is a configuration error in the plan's packet sizes.
+    #[must_use]
+    pub fn run(&self) -> CalibratedAbstractTier {
+        let cfg = self.dsrc_config();
+        let mut samples: Vec<ReceptionSample> = Vec::new();
+        let mut reports: Vec<SweepReport> = Vec::new();
+        for sweep in self.sweeps() {
+            let (report, mut got) = sweep_dsrc_with_samples(&sweep, cfg);
+            samples.append(&mut got);
+            reports.push(report);
+        }
+        let n = samples.len() as u64;
+        let seed = self.plan.seeds.first().copied().unwrap_or(0);
+        let (table, report) = calibrate(&self.plan, self.envelope(), samples, seed);
+        let labels = reports.iter().map(|r| r.label.clone()).collect();
+        let fit = CalibrationFit::from_report(&report, &table, n, labels, self.engine_build.clone());
+        CalibratedAbstractTier {
+            table,
+            report,
+            fit,
+            high_tier_reports: reports,
+        }
+    }
+}
+
 /// The physical half of step 2, runnable today: a synthetic homogeneous drop evaluated
 /// through the real propagation, fading and error models.
 ///
@@ -687,6 +957,10 @@ pub fn link_budget_samples<C: Ctx + ?Sized>(
 pub struct AbstractPhy {
     card: ModelCard,
     table: DistanceLoadTable,
+    /// The fit, when this table came from a high-tier run rather than from a guess
+    /// (04-models.md §4.9). `None` for a hand-written table, which is what
+    /// [`AbstractPhy::new`] builds.
+    fit: Option<CalibrationFit>,
     /// The load at each receiver, as the engine's own estimate supplies it.
     loads: BTreeMap<u32, f64>,
     /// Registered arrivals: distance and frame, by `(receiver, transmission id)`.
@@ -709,16 +983,52 @@ impl AbstractPhy {
     /// The model's id, without the table hash step 4 appends.
     pub const ID: &'static str = "phy/abstract/distance-load-table";
 
-    /// The PHY over a calibrated table.
+    /// The PHY over a table, with no fit recorded.
+    ///
+    /// The table's `accepted` flag still decides between a unit-tested registration and an
+    /// `uncalibrated` one (invariant I-R4), but nothing on the card says *what* the table
+    /// was fitted to, because nothing told it. A scenario that asks for a calibrated
+    /// abstract tier goes through [`CalibrationRequest::run`] and
+    /// [`CalibratedAbstractTier::into_phy`], which reaches
+    /// [`AbstractPhy::calibrated`] instead.
     #[must_use]
     pub fn new(table: DistanceLoadTable) -> Self {
         Self {
             card: abstract_card(&table),
             table,
+            fit: None,
             loads: BTreeMap::new(),
             arrivals: BTreeMap::new(),
             next_tx_id: 1,
         }
+    }
+
+    /// The PHY over a table fitted to a high-tier run, with the fit recorded in the
+    /// card's validation section (04-models.md §4.9 step 4).
+    ///
+    /// This is the constructor that makes the difference between a calibrated tier and a
+    /// guessed one visible: the card's `validation.status` becomes
+    /// [`ValidationStatus::LiteratureChecked`] when the fit passed — 04-models.md §13's
+    /// "Abstract radio (`abstract` versus `high`)" row *is* the acceptance test of §4.9
+    /// step 5, so a table that passed it has been compared against the reference the row
+    /// names — and stays [`ValidationStatus::Unvalidated`] when it did not, with the fit's
+    /// own summary saying which bins missed.
+    #[must_use]
+    pub fn calibrated(table: DistanceLoadTable, fit: CalibrationFit) -> Self {
+        Self {
+            card: abstract_card_with_fit(&table, Some(&fit)),
+            table,
+            fit: Some(fit),
+            loads: BTreeMap::new(),
+            arrivals: BTreeMap::new(),
+            next_tx_id: 1,
+        }
+    }
+
+    /// The fit, when there is one.
+    #[must_use]
+    pub fn fit(&self) -> Option<&CalibrationFit> {
+        self.fit.as_ref()
     }
 
     /// The id the registry stores this instance under: `id@<table hash>` (step 4).
@@ -883,6 +1193,10 @@ impl<C: Ctx + ?Sized> Phy<C> for AbstractPhy {
 }
 
 fn abstract_card(table: &DistanceLoadTable) -> ModelCard {
+    abstract_card_with_fit(table, None)
+}
+
+fn abstract_card_with_fit(table: &DistanceLoadTable, fit: Option<&CalibrationFit>) -> ModelCard {
     let doc = Source::new(
         SourceKind::Standard,
         "04-models.md §4.9 (the calibration procedure) and 02-architecture.md §7.3 (the \
@@ -970,23 +1284,65 @@ fn abstract_card(table: &DistanceLoadTable) -> ModelCard {
              (invariant I-R4)."
                 .to_string()
         },
+        match fit {
+            Some(f) => f.summary(),
+            None => "No fit is recorded: this table was supplied rather than produced by \
+                     the calibration procedure, so its parameters rest on whoever wrote \
+                     them. CalibrationRequest::run is what produces a fitted one \
+                     (04-models.md §4.9)."
+                .to_string(),
+        },
     ];
     card.ignores = vec![
         "Everything the medium tier models: SINR, interference, capture, frame timing.".to_string(),
     ];
     card.sources = vec![doc];
+    // The fit *is* the validation status. 04-models.md §13's "Abstract radio (abstract
+    // versus high)" row is the acceptance test of §4.9 step 5, so a table that passed it
+    // with a recorded fit has been compared against the reference the row names and is
+    // `literature-checked`; a table that merely exists and happens to be flagged accepted
+    // — a hand-written one, or one from this crate's own tests — is only `unit-tested`;
+    // and a table that failed, or was never fitted at all, is `unvalidated` and the
+    // scenario validator warns (invariant I-R4, registry rule R2).
+    let status = match fit {
+        Some(f) if f.accepted && table.accepted => ValidationStatus::LiteratureChecked,
+        Some(_) => ValidationStatus::Unvalidated,
+        None if table.accepted => ValidationStatus::UnitTested,
+        None => ValidationStatus::Unvalidated,
+    };
+    let mut references = Vec::new();
+    let mut tests = vec![
+        "the_calibration_routine_runs_end_to_end".to_string(),
+        "the_table_interpolates_and_stops_at_its_range".to_string(),
+        "a_frame_outside_the_envelope_is_rejected".to_string(),
+    ];
+    if let Some(f) = fit {
+        references.push(Source {
+            kind: SourceKind::Standard,
+            reference: "04-models.md §13, abstract-radio row: the §4.9 procedure per RAT, \
+                        ≤ 5 pp delivery per 25 m bin at each calibration density and the \
+                        mean CBR within 0.05 (02-architecture.md §7.3, invariant I-R4)"
+                .to_string(),
+            accessed: None,
+            note: Some(f.summary()),
+        });
+        for run in &f.high_tier_runs {
+            references.push(Source {
+                kind: SourceKind::Dataset,
+                reference: format!("high-tier run: {run}"),
+                accessed: None,
+                note: Some(format!(
+                    "engine build {}, propagation stack {}",
+                    f.engine_build, f.propagation_stack
+                )),
+            });
+        }
+        tests.push("a_fitted_table_records_its_fit_on_its_card".to_string());
+    }
     card.validation = Validation {
-        status: if table.accepted {
-            ValidationStatus::UnitTested
-        } else {
-            ValidationStatus::Unvalidated
-        },
-        references: Vec::new(),
-        tests: vec![
-            "the_calibration_routine_runs_end_to_end".to_string(),
-            "the_table_interpolates_and_stops_at_its_range".to_string(),
-            "a_frame_outside_the_envelope_is_rejected".to_string(),
-        ],
+        status,
+        references,
+        tests,
     };
     card.determinism = Determinism {
         uses_rng: true,
@@ -1399,6 +1755,155 @@ mod tests {
             Mcs::R6Qpsk12,
             SduRef::new(SduId::new(1), FrameSeq::new(1)),
         )
+    }
+
+    /// A small calibration request: one density, one seed, a short run — enough to
+    /// exercise steps 2 to 5 end to end without spending a nightly job on it.
+    fn tiny_request() -> CalibrationRequest {
+        let mut plan = CalibrationPlan::document_default();
+        plan.densities_veh_km = vec![20.0];
+        plan.seeds = vec![0xC0FF_EE01];
+        plan.packet_bytes = vec![300];
+        plan.range_max_m = 200.0;
+        CalibrationRequest {
+            plan,
+            channel: ChannelModel::AbbasLosHighway,
+            ring_m: 400.0,
+            duration: Duration::from_millis(200),
+            warmup: Duration::from_millis(100),
+            engine_build: "v2xw-radio test".to_string(),
+            world_hashes: vec!["0".repeat(64)],
+        }
+    }
+
+    /// The request's sweeps are one per `(density, seed)` point, carry the plan's own
+    /// load and distance axes, and are a pure function of the request.
+    #[test]
+    fn a_calibration_request_expands_to_one_high_tier_run_per_point() {
+        let mut req = tiny_request();
+        req.plan.densities_veh_km = vec![50.0, 100.0];
+        req.plan.seeds = vec![1, 2, 3];
+        let sweeps = req.sweeps();
+        assert_eq!(sweeps.len(), 6, "two densities times three seeds");
+        // Density-major order.
+        assert_eq!(sweeps[0].density_veh_per_km, 50.0);
+        assert_eq!(sweeps[2].density_veh_per_km, 50.0);
+        assert_eq!(sweeps[3].density_veh_per_km, 100.0);
+        // Every point has its own seed: no two runs replay the same placement.
+        let mut seeds: Vec<u64> = sweeps.iter().map(|s| s.seed).collect();
+        seeds.sort_unstable();
+        seeds.dedup();
+        assert_eq!(seeds.len(), 6);
+        // The axes come from the plan, not from the harness's defaults.
+        for sweep in &sweeps {
+            assert_eq!(sweep.bin_m, DISTANCE_BIN_M);
+            assert_eq!(sweep.max_distance_m, req.plan.range_max_m);
+            assert_eq!(sweep.tx_power_dbm, req.plan.tx_power_dbm);
+            assert_eq!(sweep.payload_cycle, req.plan.packet_bytes);
+            assert_eq!(sweep.ring_m, req.ring_m);
+            assert!(
+                sweep.ring_m >= 2.0 * sweep.max_distance_m,
+                "a distance bin must not wrap onto itself"
+            );
+        }
+        assert_eq!(req.sweeps(), sweeps, "the expansion is deterministic");
+        assert_eq!(req.dsrc_config().mcs, req.plan.mcs);
+        assert_eq!(
+            req.envelope().propagation_stack,
+            ChannelModel::AbbasLosHighway.label()
+        );
+    }
+
+    /// The whole point of the wiring: the table's parameters come out of a high-tier run,
+    /// and the fit that produced them is on the card.
+    #[test]
+    fn a_fitted_table_records_its_fit_on_its_card() {
+        let req = tiny_request();
+        let calibrated = req.run();
+        assert!(!calibrated.high_tier_reports.is_empty());
+        assert_eq!(calibrated.high_tier_reports.len(), 1);
+        let fit = calibrated.fit.clone();
+        assert!(fit.samples > 0, "the high-tier run produced samples");
+        assert_eq!(fit.bins_compared, calibrated.report.bins.len());
+        assert_eq!(fit.table_hash, calibrated.table.content_hash_hex());
+        assert_eq!(fit.propagation_stack, ChannelModel::AbbasLosHighway.label());
+        assert_eq!(fit.engine_build, "v2xw-radio test");
+        assert_eq!(fit.accepted, calibrated.accepted());
+        assert_eq!(fit.accepted, calibrated.table.accepted);
+        assert!(fit.summary().contains("high-tier run"), "{}", fit.summary());
+
+        // The card carries it, and the status follows the fit rather than the flag.
+        let phy = calibrated.into_phy();
+        let card = phy.card();
+        card.validate().expect("card validates");
+        assert!(phy.fit().is_some());
+        let expected = if fit.accepted {
+            ValidationStatus::LiteratureChecked
+        } else {
+            ValidationStatus::Unvalidated
+        };
+        assert_eq!(card.validation.status, expected, "{}", fit.summary());
+        assert!(
+            card.validation
+                .references
+                .iter()
+                .any(|r| r.reference.contains("§13")),
+            "the §13 abstract-radio row is the reference the fit was judged against"
+        );
+        assert!(
+            card.validation
+                .references
+                .iter()
+                .any(|r| r.reference.starts_with("high-tier run:")),
+            "the runs the fit came from are named"
+        );
+        assert!(
+            card.limitations.iter().any(|l| l.contains("high-tier run")),
+            "{:?}",
+            card.limitations
+        );
+        // …and the fit is reproducible.
+        let again = tiny_request().run();
+        assert_eq!(again.fit, fit);
+    }
+
+    /// A table with no fit says so, and is never dressed up as literature-checked.
+    #[test]
+    fn an_unfitted_table_is_never_literature_checked() {
+        let mut table = DistanceLoadTable::empty(envelope());
+        table.accepted = true;
+        let phy = AbstractPhy::new(table);
+        assert!(phy.fit().is_none());
+        assert_eq!(phy.card().validation.status, ValidationStatus::UnitTested);
+        assert!(
+            phy.card()
+                .limitations
+                .iter()
+                .any(|l| l.contains("No fit is recorded")),
+            "{:?}",
+            phy.card().limitations
+        );
+        // A failed fit takes the card back to unvalidated whatever the flag says.
+        let mut table = DistanceLoadTable::empty(envelope());
+        table.accepted = true;
+        let bad = CalibrationFit {
+            accepted: false,
+            worst_pdr_gap_pp: 42.0,
+            abstract_mean_cbr: 0.1,
+            high_mean_cbr: 0.4,
+            mean_cbr_gap: 0.3,
+            bins_compared: 12,
+            bins_failed: 7,
+            samples: 1_000,
+            table_hash: table.content_hash_hex(),
+            high_tier_runs: vec!["a run".to_string()],
+            propagation_stack: "abbas-los-highway".to_string(),
+            engine_build: "test".to_string(),
+        };
+        assert!(bad.summary().contains("OUTSIDE"), "{}", bad.summary());
+        let phy = AbstractPhy::calibrated(table, bad);
+        assert_eq!(phy.card().validation.status, ValidationStatus::Unvalidated);
+        phy.card().validate().expect("card validates");
     }
 
     #[test]

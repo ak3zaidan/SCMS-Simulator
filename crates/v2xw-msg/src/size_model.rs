@@ -44,6 +44,17 @@
 //! | SRM | typical | 20 B | MessageFrame 4 B + `SignalRequestMessage` timestamp/second/sequence + `RequestorDescription` id and type |
 //! | SSM | typical | 16 B | MessageFrame 4 B + `SignalStatusMessage` timestamp/second/sequence + `SignalStatusList` determinant |
 //!
+//! # Two of these rows are retired
+//!
+//! SPaT and MAP are now really encoded, by hand, in [`crate::j2735::spat`] and
+//! [`crate::j2735::map`], so [`J2735SizeCodec`] no longer claims either type — a type
+//! claimed by two codecs would make a run's sizes depend on resolution order. Their rows
+//! stay in [`TABLE`] with [`SizeEntry::superseded_by`] set: a retired model value is the
+//! only record of what runs recorded before the encoder existed were measuring, and it is
+//! a cross-check on the encoder itself. [`ContentProfile`], [`lookup`] and [`SizeEntry`]
+//! are also what [`crate::etsi_size`] builds the CPM and VAM rows from, so the two tables
+//! share one definition of a row and one anchor check.
+//!
 //! | Message | Increment | Element | Where it comes from |
 //! |---|---:|---|---|
 //! | SPaT minimal | 4 B | movement state | `MovementState` 1+3+8+4 b + `MovementEvent` 1+3+5 b = 25 b |
@@ -230,6 +241,19 @@ pub struct SizeEntry {
     pub anchors: &'static [Anchor],
     /// How well evidenced it is.
     pub status: EntryStatus,
+    /// The model id of a **real encoder** that has since replaced this row, if one has.
+    ///
+    /// A retired row is kept rather than deleted, for two reasons. It is the only record
+    /// of what the modelled size *was*, so a run recorded before the encoder existed stays
+    /// interpretable; and it is a cross-check on the encoder, because a hand-written
+    /// encoder that disagrees with a structurally derived size model by more than a few
+    /// bytes has a bug in one of them —
+    /// [`tests::the_real_spat_encoder_lands_near_the_row_it_retired`] is that check.
+    ///
+    /// [`J2735SizeCodec`] no longer *claims* a type whose rows are all superseded, so
+    /// [`assert_no_overlapping_claims`] still passes with the real codec registered. The
+    /// rows remain sizable through [`lookup`] on purpose.
+    pub superseded_by: Option<&'static str>,
 }
 
 impl SizeEntry {
@@ -322,6 +346,7 @@ pub const TABLE: &[SizeEntry] = &[
         nominal_elements: 8,
         anchors: &[],
         status: EntryStatus::DerivedNoAnchor,
+        superseded_by: Some(crate::j2735::infra::J2735_INFRA_CODEC_ID),
     },
     SizeEntry {
         ty: MsgType::Spat,
@@ -332,6 +357,7 @@ pub const TABLE: &[SizeEntry] = &[
         nominal_elements: 8,
         anchors: &[],
         status: EntryStatus::DerivedNoAnchor,
+        superseded_by: Some(crate::j2735::infra::J2735_INFRA_CODEC_ID),
     },
     SizeEntry {
         ty: MsgType::Spat,
@@ -342,6 +368,7 @@ pub const TABLE: &[SizeEntry] = &[
         nominal_elements: 12,
         anchors: &[],
         status: EntryStatus::DerivedNoAnchor,
+        superseded_by: Some(crate::j2735::infra::J2735_INFRA_CODEC_ID),
     },
     SizeEntry {
         ty: MsgType::Map,
@@ -357,6 +384,7 @@ pub const TABLE: &[SizeEntry] = &[
             source: "CTI 4501 §4.3.3.1.3.1 — MAP ceiling with signature, certificate and header",
         }],
         status: EntryStatus::SingleAnchor,
+        superseded_by: Some(crate::j2735::infra::J2735_INFRA_CODEC_ID),
     },
     SizeEntry {
         ty: MsgType::Map,
@@ -372,6 +400,7 @@ pub const TABLE: &[SizeEntry] = &[
             source: "CTI 4501 §4.3.3.1.3.1 — MAP ceiling with signature, certificate and header",
         }],
         status: EntryStatus::SingleAnchor,
+        superseded_by: Some(crate::j2735::infra::J2735_INFRA_CODEC_ID),
     },
     SizeEntry {
         ty: MsgType::Psm,
@@ -382,6 +411,7 @@ pub const TABLE: &[SizeEntry] = &[
         nominal_elements: 0,
         anchors: &[],
         status: EntryStatus::DerivedNoAnchor,
+        superseded_by: None,
     },
     SizeEntry {
         ty: MsgType::Srm,
@@ -392,6 +422,7 @@ pub const TABLE: &[SizeEntry] = &[
         nominal_elements: 1,
         anchors: &[],
         status: EntryStatus::DerivedNoAnchor,
+        superseded_by: None,
     },
     SizeEntry {
         ty: MsgType::Ssm,
@@ -402,6 +433,7 @@ pub const TABLE: &[SizeEntry] = &[
         nominal_elements: 1,
         anchors: &[],
         status: EntryStatus::DerivedNoAnchor,
+        superseded_by: None,
     },
 ];
 
@@ -422,14 +454,14 @@ pub fn lookup(ty: MsgType, profile: ContentProfile) -> Option<&'static SizeEntry
         })
 }
 
-/// The message types the size model covers.
-pub const TYPES: [MsgType; 5] = [
-    MsgType::Spat,
-    MsgType::Map,
-    MsgType::Psm,
-    MsgType::Srm,
-    MsgType::Ssm,
-];
+/// The message types this codec **claims**.
+///
+/// SPaT and MAP are no longer among them: [`crate::j2735::infra::J2735InfraCodec`] encodes
+/// both for real, and two codecs claiming one type would make a run's sizes depend on
+/// which the engine resolved first (02-architecture.md §6). Their rows stay in [`TABLE`],
+/// marked [`SizeEntry::superseded_by`] and still reachable through [`lookup`], because a
+/// retired model value is evidence about the runs that used it.
+pub const TYPES: [MsgType; 3] = [MsgType::Psm, MsgType::Srm, MsgType::Ssm];
 
 /// The size-model codec: exact sizes, placeholder bytes.
 #[derive(Debug, Clone)]
@@ -540,15 +572,30 @@ fn card() -> ModelCard {
          overheads of 04-models.md §9.1 and §9.3 before they are compared."
             .to_string(),
     ];
-    card.limitations = vec![
+    // The byte-exactness statement comes from crate::evidence, the one table that says
+    // which payloads are real bytes and which are a fill pattern, so this card cannot
+    // describe a message differently from the rest of the crate.
+    card.limitations = crate::evidence::card_statement(J2735_SIZE_MODEL_ID);
+    card.limitations.push(
         "The bytes this codec returns are a fill pattern. Anything that inspects a payload \
-         must branch on Encoded::size_source first (invariant I-S2)."
+         must branch on Encoded::size_source first (invariant I-S2), and anything that \
+         reports a size must not call it byte-exact."
             .to_string(),
+    );
+    card.limitations.push(
         "Five of the eight rows have no published anchor at all, so their tolerance is \
          undefined rather than zero, and they are marked todo-calibrate with the plan \
          04-models.md §8.4 prescribes."
             .to_string(),
-    ];
+    );
+    card.limitations.push(
+        "The spat/* and map/* rows are RETIRED: codec/uper/j2735-spat-map now encodes both \
+         messages for real, so this codec no longer claims either type. The rows are kept \
+         because a run recorded before that encoder existed has to stay interpretable, and \
+         because they cross-check the encoder — but a size taken from them today is a \
+         historical number, not this engine's answer."
+            .to_string(),
+    );
     card.ignores = vec![
         "Regional extensions entirely. They are the reason J2735 cannot be really encoded \
          here (build decision D2), and a deployment that uses them sends larger messages \
@@ -640,7 +687,9 @@ pub fn codecs() -> Vec<Box<dyn MessageCodec>> {
     vec![
         Box::new(crate::codec::EtsiUperCodec::new()),
         Box::new(crate::j2735::J2735BsmCodec::new()),
+        Box::new(crate::j2735::infra::J2735InfraCodec::new()),
         Box::new(J2735SizeCodec::new()),
+        Box::new(crate::etsi_size::EtsiSizeCodec::new()),
     ]
 }
 
@@ -773,6 +822,91 @@ mod tests {
                 previous = now;
             }
         }
+    }
+
+    /// A retired row must not be claimed, and must still be sizable.
+    ///
+    /// Both halves matter. The first is what keeps `assert_no_overlapping_claims` true
+    /// once the real encoder is registered; the second is what keeps an old run's sizes
+    /// interpretable.
+    #[test]
+    fn a_superseded_row_is_neither_claimed_nor_deleted() {
+        let codec = J2735SizeCodec::new();
+        for ty in [MsgType::Spat, MsgType::Map] {
+            assert!(
+                !codec.supports(ty),
+                "{ty} is encoded for real now and must not be claimed by the size model"
+            );
+            let entry = lookup(ty, ContentProfile::Typical)
+                .unwrap_or_else(|| panic!("{ty}'s retired row must stay in the table"));
+            assert_eq!(
+                entry.superseded_by,
+                Some(crate::j2735::infra::J2735_INFRA_CODEC_ID),
+                "{ty}"
+            );
+            assert!(entry.bytes(entry.nominal_elements) > 0, "{ty}");
+        }
+        for ty in TYPES {
+            let entry = lookup(ty, ContentProfile::Typical).expect("a claimed row");
+            assert_eq!(entry.superseded_by, None, "{ty} is still modelled");
+        }
+    }
+
+    /// The retired SPaT row and the encoder that replaced it must agree to within a few
+    /// bytes, or one of them is wrong.
+    ///
+    /// This is the only independent check the SPaT encoder has on this machine: the row's
+    /// base and increment were derived from the ASN.1 by a pass that could read it, and the
+    /// encoder was written by a pass that could not (the modules are git-ignored and absent
+    /// — build decision D3). They are two derivations of the same structure, and a gross
+    /// disagreement means a preamble or a determinant is wrong somewhere.
+    ///
+    /// Measured, for a SPaT of eight movement states each carrying one timed event: the
+    /// encoder produces 85 B of payload and 88 B inside a `MessageFrame`, against the row's
+    /// 17 + 8 x 10 = 97 B (which includes the 4 B frame). The encoder is 9 B smaller, and
+    /// the two known reasons are documented: the row counted 5 bits for `eventState` where
+    /// the encoder writes 4, and it charged a flat 4 B for the `MessageFrame` where the real
+    /// wrapper costs 3 B below 128 octets.
+    #[test]
+    fn the_real_spat_encoder_lands_near_the_row_it_retired() {
+        use crate::j2735::spat::{
+            IntersectionReferenceId, IntersectionState, IntersectionStatus, MovementEvent,
+            MovementPhaseState, MovementState, Spat, TimeChangeDetails, time_mark,
+        };
+
+        let row = lookup(MsgType::Spat, ContentProfile::Typical).expect("the retired row");
+        let elements = row.nominal_elements;
+        let states: Vec<MovementState> = (0..elements)
+            .map(|i| {
+                MovementState::current(
+                    (i + 1) as u8,
+                    MovementEvent::timed(
+                        MovementPhaseState::ProtectedMovementAllowed,
+                        TimeChangeDetails::fixed(time_mark(0.0), time_mark(27.5)),
+                    ),
+                )
+            })
+            .collect();
+        let spat = Spat::one(IntersectionState {
+            id: IntersectionReferenceId::new(1),
+            revision: 1,
+            status: IntersectionStatus::FIXED_TIME_OPERATION,
+            moy: None,
+            time_stamp: None,
+            states,
+        });
+
+        let modelled = row.bytes(elements);
+        let real = crate::j2735::spat::encode_message_frame(&spat)
+            .expect("encodes")
+            .size;
+        let difference = modelled.abs_diff(real);
+        assert!(
+            difference <= 16,
+            "the retired SPaT row says {modelled} B and the encoder says {real} B for \
+             {elements} movement states; a gap that large means one of the two readings of \
+             the ASN.1 is wrong, not that the model is coarse"
+        );
     }
 
     /// A MAP big enough to break the CTI 4501 ceiling must be caught by the row's own

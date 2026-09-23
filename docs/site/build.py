@@ -26,6 +26,7 @@ from v2xwdoc import site  # noqa: E402  (path set above)
 
 DEFAULT_OUT = os.path.join("docs", "site", "build")
 DEFAULT_CARDS = os.path.join("docs", "site", "generated", "cards.json")
+DEFAULT_RUNS = os.path.join("docs", "site", "generated", "validation-runs.json")
 
 
 def main(argv=None):
@@ -42,6 +43,14 @@ def main(argv=None):
         "--cards",
         default=None,
         help="the model-card dump to read (default: docs/site/generated/cards.json)",
+    )
+    parser.add_argument(
+        "--validation-runs",
+        default=None,
+        help="the validation suite's output, which the campaign page joins against the "
+        "model registry (default: docs/site/generated/validation-runs.json). Its schema "
+        "is documented in docs/site/v2xwdoc/campaign.py. A missing file is reported, not "
+        "skipped.",
     )
     parser.add_argument(
         "--stamp",
@@ -65,12 +74,13 @@ def main(argv=None):
     repo = os.path.abspath(args.repo)
     out = os.path.abspath(args.out or os.path.join(repo, DEFAULT_OUT))
     cards = os.path.abspath(args.cards or os.path.join(repo, DEFAULT_CARDS))
+    runs = os.path.abspath(args.validation_runs or os.path.join(repo, DEFAULT_RUNS))
 
     if args.clean and os.path.isdir(out):
         shutil.rmtree(out)
 
     try:
-        result = site.build(repo, HERE, out, cards, stamp=args.stamp)
+        result = site.build(repo, HERE, out, cards, stamp=args.stamp, runs_path=runs)
     except Exception as failure:  # noqa: BLE001 -- the message matters, not the type
         # A build that cannot read one of its inputs fails loudly and says which one.
         # Rendering the rest of the site around the hole would publish a page that

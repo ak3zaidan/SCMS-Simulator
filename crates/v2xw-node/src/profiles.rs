@@ -54,7 +54,31 @@ pub const PROFILE_SOURCES: &[(&str, &str)] = &[
         "rsu/commsignia-its-rs4",
         include_str!("../profiles/hardware/rsu-commsignia-its-rs4.yaml"),
     ),
+    // 06-node-models.md §1 names `kind: vru-device` and §7 profiles none, so this one
+    // carries no device data at all: its compute block is not-published throughout and its
+    // two software-crypto figures are flagged proxies. It ships because the schema slot
+    // exists and a scenario with pedestrians needs something to point at; the profile's own
+    // `purpose` says what it is not.
+    (
+        "vru-device/handset-generic",
+        include_str!("../profiles/hardware/vru-device-handset-generic.yaml"),
+    ),
 ];
+
+/// The id of the shipped VRU-device profile (06-node-models.md §1, `kind: vru-device`).
+///
+/// Not a *reference* device: [`REFERENCE_OBU`] names one because 11-open-questions A3
+/// proposes one, and nothing in the design set proposes a reference VRU device. This is
+/// the only profile of its kind that ships, which is a different claim.
+pub const GENERIC_VRU_DEVICE: &str = "vru-device/handset-generic";
+
+/// The id of the shipped roadside-unit profile 06-node-models.md §7.6 documents most
+/// fully.
+///
+/// The Commsignia ITS-RS4 publishes a verification rate; the Cohda MK5 RSU brief publishes
+/// radio figures only and proxies its compute block from the MK5 OBU. A scenario that does
+/// not name a profile for a roadside unit gets this one.
+pub const DEFAULT_RSU: &str = "rsu/commsignia-its-rs4";
 
 /// The id 11-open-questions A3 proposes as the default OBU.
 pub const REFERENCE_OBU: &str = "obu/unex-obu-301-craton2";

@@ -245,6 +245,71 @@ impl LegacyWindow {
     }
 }
 
+impl LegacyWindow {
+    /// Records one report's evidence and correlates it, **emitting nothing**.
+    ///
+    /// The half of [`MaPipeline::on_report`] that decides, without the half that records.
+    /// It exists so a pipeline that adds a stage *after* correlation — the two-authority
+    /// identity resolution of [`crate::resolve`] — can reuse this correlator without the
+    /// `ma.decision` record being written for a decision that stage may still refuse. A
+    /// wrapper that had to let this type emit first would put a revocation on the channel
+    /// and then not perform it.
+    pub fn ingest(&mut self, r: &MisbehaviourReport) -> Option<MaAction> {
+        *self
+            .filed_by
+            .entry(r.reporter_cert_digest.clone())
+            .or_insert(0) += 1;
+        *self
+            .reported
+            .entry(r.subject_cert_digest.clone())
+            .or_insert(0) += 1;
+        self.evidence
+            .entry(r.subject_cert_digest.clone())
+            .or_default()
+            .push((r.ingest_time, r.reporter_cert_digest.clone()));
+        self.correlate(&r.subject_cert_digest, r.ingest_time)
+    }
+
+    /// How many distinct reporter certificates the evidence about `subject` holds, and how
+    /// many of them this authority trusts.
+    ///
+    /// The second number is the collusion defence's own arithmetic, and a case record that
+    /// carries both is what makes "the gate refused this coalition" distinguishable from
+    /// "nobody reported this vehicle".
+    #[must_use]
+    pub fn evidence_reporters(&self, subject: &str) -> (u32, u32) {
+        let Some(ev) = self.evidence.get(subject) else {
+            return (0, 0);
+        };
+        let all: BTreeSet<&str> = ev.iter().map(|(_, r)| r.as_str()).collect();
+        let mut trusted = 0_usize;
+        for reporter in &all {
+            if self.trusted(reporter) {
+                trusted += 1;
+            }
+        }
+        (
+            u32::try_from(all.len()).unwrap_or(u32::MAX),
+            u32::try_from(trusted).unwrap_or(u32::MAX),
+        )
+    }
+
+    /// Correlates every subject it holds evidence about at `t`, **emitting nothing**.
+    ///
+    /// Subjects are visited in digest order, so the decision order is the same on every
+    /// run and on every thread count.
+    pub fn correlate_all(&mut self, t: SimTime) -> Vec<MaAction> {
+        let subjects: Vec<String> = self.evidence.keys().cloned().collect();
+        let mut out = Vec::new();
+        for s in subjects {
+            if let Some(a) = self.correlate(&s, t) {
+                out.push(a);
+            }
+        }
+        out
+    }
+}
+
 impl Model for LegacyWindow {
     fn card(&self) -> &ModelCard {
         &self.card
@@ -259,21 +324,9 @@ impl MaPipeline for LegacyWindow {
             subject: r.subject_cert_digest.clone(),
             detector: r.leading_reason().map(str::to_string),
         });
-        *self
-            .filed_by
-            .entry(r.reporter_cert_digest.clone())
-            .or_insert(0) += 1;
-        *self
-            .reported
-            .entry(r.subject_cert_digest.clone())
-            .or_insert(0) += 1;
-        self.evidence
-            .entry(r.subject_cert_digest.clone())
-            .or_default()
-            .push((r.ingest_time, r.reporter_cert_digest.clone()));
 
         let mut out = Vec::new();
-        if let Some(a) = self.correlate(&r.subject_cert_digest, r.ingest_time) {
+        if let Some(a) = self.ingest(r) {
             ctx.emit(MaDecisionRecord {
                 t: r.ingest_time,
                 subject: a.subject().to_string(),
@@ -286,20 +339,14 @@ impl MaPipeline for LegacyWindow {
     }
 
     fn on_tick(&mut self, ctx: &mut dyn ThreatCtx, t: SimTime) -> Vec<MaAction> {
-        // Subjects are visited in digest order, so the decision order is the same on
-        // every run and on every thread count.
-        let subjects: Vec<String> = self.evidence.keys().cloned().collect();
-        let mut out = Vec::new();
-        for s in subjects {
-            if let Some(a) = self.correlate(&s, t) {
-                ctx.emit(MaDecisionRecord {
-                    t,
-                    subject: a.subject().to_string(),
-                    decision: a.as_str().to_string(),
-                });
-                self.decisions.push(a.clone());
-                out.push(a);
-            }
+        let out = self.correlate_all(t);
+        for a in &out {
+            ctx.emit(MaDecisionRecord {
+                t,
+                subject: a.subject().to_string(),
+                decision: a.as_str().to_string(),
+            });
+            self.decisions.push(a.clone());
         }
         out
     }

@@ -52,6 +52,7 @@ use v2xw_core::rng::{EntityRef, RngDomain};
 use v2xw_core::time::{Duration, SimTime};
 
 use crate::error::{RadioError, Result};
+use crate::jamming::{JamArrival, JammingField};
 use crate::numeric;
 use crate::per::PerModel;
 use crate::traits::Phy;
@@ -389,6 +390,10 @@ pub struct OfdmPhy {
     arrivals: BTreeMap<(u32, u64), Arrival>,
     /// The interval each node is transmitting for, for the half-duplex test.
     tx_intervals: BTreeMap<u32, Vec<BusyInterval>>,
+    /// Deliberate interference, per receiver, as the engine declares it
+    /// ([`crate::jamming`]). Empty in every run without a jammer, and every jamming query
+    /// short-circuits on that, so an unjammed run pays nothing for this field.
+    jamming: JammingField,
     /// The air-time ledger.
     ledger: AirtimeLedger,
 }
@@ -413,6 +418,7 @@ impl OfdmPhy {
             transmissions: BTreeMap::new(),
             arrivals: BTreeMap::new(),
             tx_intervals: BTreeMap::new(),
+            jamming: JammingField::new(),
             ledger: AirtimeLedger::new(),
         }
     }
@@ -489,6 +495,86 @@ impl OfdmPhy {
         THERMAL_NOISE_10MHZ_DBM + self.noise_figure_db
     }
 
+    /// The deliberate interference declared at this PHY's receivers ([`crate::jamming`]).
+    #[must_use]
+    pub fn jamming(&self) -> &JammingField {
+        &self.jamming
+    }
+
+    /// The jamming field, to declare a jammer's energy at a receiver.
+    ///
+    /// The engine owns the jammer's link budget — it computes a jammer's received power
+    /// the same way it computes a frame's — so the field is filled from outside, exactly
+    /// as [`InterferenceSource`]s are.
+    pub fn jamming_mut(&mut self) -> &mut JammingField {
+        &mut self.jamming
+    }
+
+    /// Declares one jamming arrival at one receiver.
+    ///
+    /// Shorthand for `self.jamming_mut().insert(rx, arrival)`.
+    pub fn note_jamming(&mut self, rx: NodeId, arrival: JamArrival) {
+        self.jamming.insert(rx, arrival);
+    }
+
+    /// The noise power at a receiver over one window, milliwatts: the thermal floor plus
+    /// whatever jamming is present.
+    ///
+    /// This is 04-models.md §12.3's whole mechanism — "jammers ... enter the interference
+    /// sums of §4-5 as transmitters" — in one function. With no jammer in range it is the
+    /// plain noise floor, bit for bit, which is why an unjammed run's outcomes are
+    /// unchanged by the existence of this path.
+    #[must_use]
+    pub fn noise_mw_during(&self, rx: NodeId, ch: ChannelId, from: SimTime, to: SimTime) -> f64 {
+        let thermal = numeric::dbm_to_mw(self.noise_floor());
+        if self.jamming.is_empty() {
+            return thermal;
+        }
+        thermal + self.jamming.power_mw(rx, ch, from, to)
+    }
+
+    /// The noise power at a receiver over one window, dBm — the effective noise floor the
+    /// SINR of that window is computed against.
+    ///
+    /// Returns [`OfdmPhy::noise_floor`] **exactly**, bit for bit, when no jamming overlaps
+    /// the window. That is not an optimisation: `mw_to_dbm(dbm_to_mw(x))` is not the
+    /// identity in floating point, and a round trip through it on every window would move
+    /// every SINR in the workspace by a fraction of a last bit — enough to shift a frame
+    /// across a PER threshold and to change every golden digest in a run that has no
+    /// jammer in it.
+    #[must_use]
+    pub fn noise_dbm_during(&self, rx: NodeId, ch: ChannelId, from: SimTime, to: SimTime) -> f64 {
+        let floor = self.noise_floor();
+        if self.jamming.is_empty() {
+            return floor;
+        }
+        let jam_mw = self.jamming.power_mw(rx, ch, from, to);
+        if jam_mw <= 0.0 {
+            return floor;
+        }
+        numeric::mw_to_dbm(numeric::dbm_to_mw(floor) + jam_mw)
+    }
+
+    /// How many decibels of noise rise the jamming at a receiver accounts for over a
+    /// window: `noise_with − noise_without`, non-negative.
+    ///
+    /// For the inspector and for the `phy.rx` breakdown: it is the number that tells a
+    /// reader whether a loss was a jammer's doing, and it is reported rather than used —
+    /// the loss *cause* is decided by the counterfactual in [`OfdmPhy::finish_rx`], not by
+    /// a threshold on this.
+    #[must_use]
+    pub fn jamming_rise_db(&self, rx: NodeId, ch: ChannelId, from: SimTime, to: SimTime) -> f64 {
+        if self.jamming.is_empty() {
+            return 0.0;
+        }
+        let with = self.noise_mw_during(rx, ch, from, to);
+        let without = numeric::dbm_to_mw(self.noise_floor());
+        if without <= 0.0 || with <= without {
+            return 0.0;
+        }
+        numeric::mw_to_dbm(with) - numeric::mw_to_dbm(without)
+    }
+
     /// Registers an arrival at a receiver and returns its handle.
     ///
     /// The engine calls this after it has computed the received power with the
@@ -539,10 +625,26 @@ impl OfdmPhy {
             .filter(|a| a.rx == node && a.frame.channel == ch && a.start <= at && at < a.end)
             .map(|a| (a.tx, numeric::dbm_to_mw(a.power_dbm)))
             .collect();
+        // A jammer's energy is energy: it makes carrier sense report a busy medium and it
+        // shows up in the channel busy ratio, which is exactly why telling a jammed frame
+        // from a congested one needs the loss cause rather than the CBR
+        // (04-models.md §12.3).
+        let jam_mw = if self.jamming.is_empty() {
+            0.0
+        } else {
+            self.jamming.power_mw(node, ch, at, at.saturating_add(1))
+        };
         if contributors.is_empty() {
-            return f64::NEG_INFINITY;
+            if jam_mw <= 0.0 {
+                return f64::NEG_INFINITY;
+            }
+            return numeric::mw_to_dbm(jam_mw);
         }
-        numeric::mw_to_dbm(numeric::sum_powers_mw(&contributors))
+        let arrivals_mw = numeric::sum_powers_mw(&contributors);
+        if jam_mw <= 0.0 {
+            return numeric::mw_to_dbm(arrivals_mw);
+        }
+        numeric::mw_to_dbm(arrivals_mw + jam_mw)
     }
 
     /// How many transmit intervals are currently retained for a node.
@@ -577,7 +679,27 @@ impl OfdmPhy {
     /// integer nanoseconds, so the partition is exact and identical on every platform.
     #[must_use]
     pub fn sinr_windows(&self, arrival: &Arrival) -> Vec<(SimTime, SimTime, f64)> {
-        let noise = self.noise_floor();
+        self.sinr_windows_with(arrival, true)
+    }
+
+    /// The SINR windows of one arrival, with the declared jamming either counted or
+    /// removed.
+    ///
+    /// `with_jamming = false` is the **counterfactual** the jamming loss cause is decided
+    /// on (see [`crate::jamming`]): the same arrival, the same interferers, the same
+    /// window partition, and the thermal noise floor alone in the denominator. Comparing
+    /// the two against one uniform draw is what makes
+    /// [`crate::types::LossCause::Jammed`] exact rather than a heuristic, and is why the
+    /// window boundaries are computed from the union of the interferer *and* jamming edges
+    /// in both cases: the partition has to be the same one, or the two evaluations would
+    /// not be comparable.
+    #[must_use]
+    pub fn sinr_windows_with(
+        &self,
+        arrival: &Arrival,
+        with_jamming: bool,
+    ) -> Vec<(SimTime, SimTime, f64)> {
+        let floor = self.noise_floor();
         let mut bounds: Vec<SimTime> = vec![arrival.start, arrival.end];
         for i in &arrival.interferers {
             for t in [i.start, i.end] {
@@ -585,6 +707,17 @@ impl OfdmPhy {
                     bounds.push(t);
                 }
             }
+        }
+        // A jammer that switches on or off inside the frame splits it exactly as a
+        // mid-frame interferer does. Included whatever `with_jamming` says, so that the
+        // counterfactual is evaluated over the same partition.
+        if !self.jamming.is_empty() {
+            bounds.extend(self.jamming.boundaries_in(
+                arrival.rx,
+                arrival.frame.channel,
+                arrival.start,
+                arrival.end,
+            ));
         }
         bounds.sort_unstable();
         bounds.dedup();
@@ -600,6 +733,11 @@ impl OfdmPhy {
                 .filter(|i| i.start < to && from < i.end)
                 .map(|i| (i.node, numeric::dbm_to_mw(i.power_dbm)))
                 .collect();
+            let noise = if with_jamming {
+                self.noise_dbm_during(arrival.rx, arrival.frame.channel, from, to)
+            } else {
+                floor
+            };
             windows.push((from, to, sinr_db(arrival.power_dbm, &active, noise)));
         }
         windows
@@ -614,7 +752,14 @@ impl OfdmPhy {
     /// §4.7 exactly when the interferer set does not change during the frame.
     #[must_use]
     pub fn success_probability(&self, arrival: &Arrival) -> f64 {
-        let windows = self.sinr_windows(arrival);
+        self.success_probability_with(arrival, true)
+    }
+
+    /// The probability that an arrival is decoded, with the declared jamming either
+    /// counted or removed — the counterfactual of [`OfdmPhy::sinr_windows_with`].
+    #[must_use]
+    pub fn success_probability_with(&self, arrival: &Arrival, with_jamming: bool) -> f64 {
+        let windows = self.sinr_windows_with(arrival, with_jamming);
         if windows.is_empty() {
             return 0.0;
         }
@@ -897,10 +1042,30 @@ impl OfdmPhy {
             math::sum_ordered(windows.iter().map(|(_, _, s)| *s)) / windows.len() as f64
         };
         let has_interference = !arrival.interferers.is_empty();
+        let jammed = !self.jamming.is_empty()
+            && self.jamming.overlaps(
+                arrival.rx,
+                arrival.frame.channel,
+                arrival.start,
+                arrival.end,
+            );
 
         // The hard-threshold shortcut of 04-models.md §4.8, when a scenario asks for it.
         if let CaptureRule::Threshold { cp_th_db } = self.capture {
             if worst_sinr < cp_th_db {
+                // The same counterfactual as the error-model path below, in the form this
+                // rule admits: would the frame have cleared the threshold without the
+                // jammer?
+                if jammed
+                    && self
+                        .sinr_windows_with(arrival, false)
+                        .iter()
+                        .map(|(_, _, s)| *s)
+                        .fold(f64::INFINITY, f64::min)
+                        >= cp_th_db
+                {
+                    return RxOutcome::Lost(LossCause::Jammed);
+                }
                 return RxOutcome::Lost(if has_interference {
                     self.interference_cause(arrival)
                 } else {
@@ -914,10 +1079,16 @@ impl OfdmPhy {
         }
 
         let psr = self.success_probability(arrival);
-        // One Bernoulli draw per arrival, keyed by (link, frame): see the module docs on
+        // One uniform draw per arrival, keyed by (link, frame): see the module docs on
         // the plug-in domain. The domain is derived once (it is SHA-256 over a constant
         // string) rather than per arrival per receiver.
-        let error = ctx
+        //
+        // `f64()` and not `bool(1.0 - psr)`, and the two are the same draw:
+        // `RngStream::bool(p)` *is* `self.f64() < p`, consuming exactly one 64-bit draw
+        // whatever `p` is. Keeping the uniform is what lets the jamming counterfactual be
+        // exact — the same realisation is compared against two probabilities — without
+        // consuming a second draw and shifting every stream after it.
+        let draw = ctx
             .rng(
                 *FRAME_ERROR_DOMAIN,
                 EntityRef::LinkFrame {
@@ -925,8 +1096,22 @@ impl OfdmPhy {
                     frame: arrival.start,
                 },
             )
-            .bool(1.0 - psr);
+            .f64();
+        let error = draw < 1.0 - psr;
         if error {
+            // Jamming attribution (04-models.md §12.3). The frame failed because the draw
+            // landed below its error probability. Evaluate the *same* draw against the
+            // *same* frame with the jamming power taken out of the noise term: if it would
+            // have survived, the jammer is what killed it and nothing else is. This is the
+            // distinction 04-models.md §12.3 exists to preserve — a reactive jammer
+            // "produces PDR = 0 dropouts uncorrelated with SINR dips", and a frame
+            // reported `collision` would have erased it.
+            if jammed {
+                let psr_clean = self.success_probability_with(arrival, false);
+                if draw >= 1.0 - psr_clean {
+                    return RxOutcome::Lost(LossCause::Jammed);
+                }
+            }
             return RxOutcome::Lost(if has_interference {
                 self.interference_cause(arrival)
             } else {
@@ -1135,6 +1320,15 @@ fn phy_card(sensitivity: SensitivityPreset, rx_impl_loss_db: f64) -> ModelCard {
         "The frame-error draw comes from the plug-in RNG domain derived from this model's \
          id, keyed by (link, frame): the core's built-in domain list has no frame-error \
          domain."
+            .to_string(),
+        "Declared jamming (crate::jamming) enters the noise term of each SINR window, \
+         which is 04-models.md §12.3's whole mechanism; the jammer's own power and duty \
+         cycle are its model's parameters, not this one's."
+            .to_string(),
+        "A frame lost to a jammer is reported LossCause::Jammed on a counterfactual: the \
+         same uniform draw evaluated against the same frame with the jamming power taken \
+         out of the noise. A frame that would have failed anyway keeps its congestion \
+         cause, so the two are never confused."
             .to_string(),
     ];
     card.limitations = vec![
@@ -1921,6 +2115,238 @@ mod tests {
                 .validate()
                 .expect("card validates");
         }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Jamming (04-models.md §12.3)
+    // ---------------------------------------------------------------------------------
+
+    /// A jammer raises the noise floor at a receiver in range, and nowhere else.
+    #[test]
+    fn a_jammer_raises_the_noise_floor_of_the_receivers_in_range() {
+        use crate::jamming::{JamArrival, JamWindow, JammerKind};
+
+        let mut phy = OfdmPhy::new(Tier::High);
+        let victim = NodeId::new(1);
+        let elsewhere = NodeId::new(2);
+        assert_eq!(phy.noise_floor(), -98.0);
+        assert_eq!(
+            phy.noise_dbm_during(victim, ChannelId::CCH, 0, 1_000),
+            -98.0,
+            "with no jammer the effective floor is the thermal one, bit for bit"
+        );
+        assert_eq!(phy.jamming_rise_db(victim, ChannelId::CCH, 0, 1_000), 0.0);
+
+        // A jammer arriving at exactly the noise floor doubles the noise: +3.01 dB.
+        phy.note_jamming(
+            victim,
+            JamArrival::new(
+                NodeId::new(9),
+                -98.0,
+                ChannelId::CCH,
+                JamWindow::new(0, 1_000_000),
+                JammerKind::Constant,
+            ),
+        );
+        let raised = phy.noise_dbm_during(victim, ChannelId::CCH, 0, 1_000);
+        assert!((raised - (-94.989_700_043_360_2)).abs() < 1e-6, "{raised}");
+        let rise = phy.jamming_rise_db(victim, ChannelId::CCH, 0, 1_000);
+        assert!((rise - 3.010_299_956_639_812).abs() < 1e-9, "{rise}");
+        // A receiver out of range is untouched, and so is another channel.
+        assert_eq!(
+            phy.noise_dbm_during(elsewhere, ChannelId::CCH, 0, 1_000),
+            -98.0
+        );
+        assert_eq!(
+            phy.noise_dbm_during(victim, ChannelId::SCH1, 0, 1_000),
+            -98.0
+        );
+        // …and after the window, nothing.
+        assert_eq!(
+            phy.noise_dbm_during(victim, ChannelId::CCH, 2_000_000, 2_000_001),
+            -98.0
+        );
+    }
+
+    /// The point of modelling jamming: the loss cause distinguishes it from congestion.
+    ///
+    /// Three arrivals, identical but for what else is on the air:
+    ///
+    /// 1. clean — decoded;
+    /// 2. jammed by a strong constant jammer and nothing else — `jammed`, never `fading`;
+    /// 3. an ordinary interferer and no jammer — `collision`, as before.
+    #[test]
+    fn a_jammed_frame_is_reported_jammed_and_not_as_a_collision() {
+        use crate::jamming::{JamArrival, JamWindow, JammerKind};
+
+        let f = frame(300, Mcs::R6Qpsk12);
+        // Far above the −88 dBm sensitivity for this MCS, so the sensitivity gate never
+        // fires and the error model decides — and with a 28 dB SNR the clean frame's
+        // survival probability is one to within a last bit, which is what makes the
+        // counterfactual's verdict certain rather than probable.
+        let power = -70.0;
+
+        // 1. Clean.
+        let mut ctx = TestCtx::new(31);
+        let mut phy = OfdmPhy::new(Tier::High);
+        let a = arrival(0, 1, power, 0, f);
+        let h = phy.register_arrival(a);
+        let clean = Phy::finish_rx(&mut phy, &mut ctx, NodeId::new(1), h);
+        assert!(
+            matches!(clean, RxOutcome::Received { .. }),
+            "a clean −70 dBm frame decodes: {clean:?}"
+        );
+
+        // 2. Jammed. The jammer arrives 30 dB above the wanted signal for the whole
+        //    frame, so the SINR is deeply negative and the frame cannot survive.
+        let mut ctx = TestCtx::new(31);
+        let mut phy = OfdmPhy::new(Tier::High);
+        let a = arrival(0, 1, power, 0, f);
+        let end = a.end;
+        phy.note_jamming(
+            NodeId::new(1),
+            JamArrival::new(
+                NodeId::new(9),
+                power + 30.0,
+                ChannelId::CCH,
+                JamWindow::new(0, end + 1),
+                JammerKind::Constant,
+            ),
+        );
+        let h = phy.register_arrival(a);
+        let jammed = Phy::finish_rx(&mut phy, &mut ctx, NodeId::new(1), h);
+        assert_eq!(
+            jammed,
+            RxOutcome::Lost(LossCause::Jammed),
+            "a frame killed by a jammer and by nothing else must say so, not 'fading'"
+        );
+
+        // 3. Congested, not jammed: an ordinary interferer 30 dB up.
+        let mut ctx = TestCtx::new(31);
+        let mut phy = OfdmPhy::new(Tier::High);
+        let mut a = arrival(0, 1, power, 0, f);
+        let end = a.end;
+        a.interferers
+            .push(InterferenceSource::new(NodeId::new(4), power + 30.0, 0, end));
+        let h = phy.register_arrival(a);
+        let congested = Phy::finish_rx(&mut phy, &mut ctx, NodeId::new(1), h);
+        assert_eq!(
+            congested,
+            RxOutcome::Lost(LossCause::Collision),
+            "an interferer is congestion, whatever a jammer would have done"
+        );
+
+        // The two are different buckets in the ledger, which is what a detector reads.
+        assert_eq!(
+            phy.ledger()
+                .lost_ns
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["collision"]
+        );
+    }
+
+    /// A frame that would have failed anyway keeps its congestion cause: the jammer gets
+    /// the blame only when it is to blame.
+    #[test]
+    fn a_frame_that_would_have_failed_anyway_is_not_blamed_on_the_jammer() {
+        use crate::jamming::{JamArrival, JamWindow, JammerKind};
+
+        let f = frame(300, Mcs::R6Qpsk12);
+        let power = -70.0;
+        let mut ctx = TestCtx::new(31);
+        let mut phy = OfdmPhy::new(Tier::High);
+        let mut a = arrival(0, 1, power, 0, f);
+        let end = a.end;
+        // An interferer that already destroys the frame on its own…
+        a.interferers
+            .push(InterferenceSource::new(NodeId::new(4), power + 30.0, 0, end));
+        // …plus a jammer far too weak to matter.
+        phy.note_jamming(
+            NodeId::new(1),
+            JamArrival::new(
+                NodeId::new(9),
+                -130.0,
+                ChannelId::CCH,
+                JamWindow::new(0, end + 1),
+                JammerKind::Constant,
+            ),
+        );
+        let h = phy.register_arrival(a);
+        let outcome = Phy::finish_rx(&mut phy, &mut ctx, NodeId::new(1), h);
+        assert_eq!(
+            outcome,
+            RxOutcome::Lost(LossCause::Collision),
+            "the counterfactual says the frame died of congestion: {outcome:?}"
+        );
+    }
+
+    /// Adding the jamming path must not perturb a run that has no jammer in it: the same
+    /// arrival gets the same outcome, the same SINR windows and the same draw.
+    #[test]
+    fn the_jamming_path_does_not_change_an_unjammed_run() {
+        let f = frame(300, Mcs::R6Qpsk12);
+        let phy = OfdmPhy::new(Tier::High);
+        let mut a = arrival(0, 1, -85.0, 0, f);
+        let end = a.end;
+        a.interferers
+            .push(InterferenceSource::new(NodeId::new(4), -95.0, 1_000, end));
+        // With no jamming declared, the two evaluations are identical — bit for bit,
+        // because `noise_dbm_during` returns the floor itself rather than a round trip
+        // through milliwatts.
+        let with = phy.sinr_windows_with(&a, true);
+        let without = phy.sinr_windows_with(&a, false);
+        assert_eq!(with.len(), 2, "one boundary at the interferer's start");
+        for (x, y) in with.iter().zip(without.iter()) {
+            assert_eq!(x.0, y.0);
+            assert_eq!(x.1, y.1);
+            assert_eq!(x.2.to_bits(), y.2.to_bits(), "{x:?} vs {y:?}");
+        }
+        assert_eq!(
+            phy.success_probability(&a).to_bits(),
+            phy.success_probability_with(&a, false).to_bits()
+        );
+        assert!(phy.jamming().is_empty());
+    }
+
+    /// A jammer that switches on mid-frame splits the frame into windows exactly as a
+    /// mid-frame interferer does, and the counterfactual uses the same partition.
+    #[test]
+    fn a_mid_frame_jammer_splits_the_frame_into_windows() {
+        use crate::jamming::{JamArrival, JamWindow, JammerKind};
+
+        let f = frame(300, Mcs::R6Qpsk12);
+        let mut phy = OfdmPhy::new(Tier::High);
+        let a = arrival(0, 1, -80.0, 0, f);
+        let mid = a.start + (a.end - a.start) / 2;
+        phy.note_jamming(
+            NodeId::new(1),
+            JamArrival::new(
+                NodeId::new(9),
+                -60.0,
+                ChannelId::CCH,
+                JamWindow::new(mid, a.end + 1),
+                JammerKind::Reactive,
+            ),
+        );
+        let windows = phy.sinr_windows(&a);
+        assert_eq!(windows.len(), 2, "{windows:?}");
+        assert_eq!(windows[0].1, mid);
+        assert!(
+            windows[0].2 > windows[1].2 + 10.0,
+            "the second half is far worse: {windows:?}"
+        );
+        // The counterfactual keeps the partition and removes only the noise rise.
+        let clean = phy.sinr_windows_with(&a, false);
+        assert_eq!(clean.len(), 2);
+        assert_eq!(clean[0].0, windows[0].0);
+        assert_eq!(clean[1].0, windows[1].0);
+        assert_eq!(clean[0].2.to_bits(), clean[1].2.to_bits(), "no jammer, one SNR");
+        // And the jammer's energy makes carrier sense report a busy medium, which is why
+        // the loss cause and not the CBR is what distinguishes jamming from congestion.
+        let energy = phy.energy_dbm(NodeId::new(1), ChannelId::CCH, mid + 1);
+        assert!(energy > CBR_BUSY_THRESHOLD_DBM, "energy = {energy} dBm");
     }
 
     #[test]

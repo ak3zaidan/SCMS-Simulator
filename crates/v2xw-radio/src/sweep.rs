@@ -45,6 +45,7 @@ use v2xw_core::rng::{EntityRef, RngDomain, RngGuard, RngRegistry};
 use v2xw_core::time::{Duration, SimTime};
 use v2xw_world::model::World;
 
+use crate::abstract_tier::ReceptionSample;
 use crate::bler::SidelinkErrorModel;
 use crate::cv2x::{SidelinkPhy, SlArrival, SlInterferer};
 use crate::numeric;
@@ -1184,6 +1185,45 @@ struct DsrcTx {
 /// If the frame exceeds the MSDU cap, which is a configuration error.
 #[must_use]
 pub fn sweep_dsrc(sweep: &HighwaySweep, cfg: DsrcConfig) -> SweepReport {
+    sweep_dsrc_inner(sweep, cfg, false).0
+}
+
+/// The same sweep, also returning one [`ReceptionSample`] per evaluated arrival — step 2
+/// of the abstract-tier calibration procedure (04-models.md §4.9).
+///
+/// Step 2 asks for, "for every (transmitter, receiver, frame), the distance and the
+/// receiver's local load (number of distinct transmitters heard in the last `T_CBR`, or
+/// the measured CBR)". This is that record, taken from a homogeneous high-tier run of the
+/// same harness the §13 curves are measured with, which is what makes the calibrated
+/// abstract tier a fit rather than a guess.
+///
+/// The load reported per sample is the receiver's **run-average CBR**: busy time at that
+/// receiver over the whole run, which is what [`SweepReport::mean_cbr`] is averaged from.
+/// It is a run average and not a windowed `T_CBR` measurement, which matters and is
+/// stated on the calibrated table's card: on a homogeneous ring at a constant density the
+/// two agree to the sampling noise of one window, and the calibration densities of §4.9
+/// step 1 are all homogeneous. A scenario whose load varies in time needs the windowed
+/// form, and the table's envelope is what stops it being used there.
+///
+/// Collecting costs one `(u32, f64, bool)` per evaluated arrival, so it is a separate
+/// entry point rather than something [`sweep_dsrc`] always pays for.
+///
+/// # Panics
+///
+/// As [`sweep_dsrc`]: if a frame exceeds the MSDU cap.
+#[must_use]
+pub fn sweep_dsrc_with_samples(
+    sweep: &HighwaySweep,
+    cfg: DsrcConfig,
+) -> (SweepReport, Vec<ReceptionSample>) {
+    sweep_dsrc_inner(sweep, cfg, true)
+}
+
+fn sweep_dsrc_inner(
+    sweep: &HighwaySweep,
+    cfg: DsrcConfig,
+    collect: bool,
+) -> (SweepReport, Vec<ReceptionSample>) {
     use crate::phy::{Arrival, InterferenceSource, OfdmPhy};
     use crate::traits::Phy;
     use crate::types::{ChannelId as Ch, RxHandle};
@@ -1326,6 +1366,12 @@ pub fn sweep_dsrc(sweep: &HighwaySweep, cfg: DsrcConfig) -> SweepReport {
     let mut collided = 0u64;
     let warm = sweep.warmup.as_nanos();
     let mut busy_ns = vec![0u64; n];
+    // `(receiver, distance, decoded)` per evaluated arrival. The load is filled in
+    // afterwards from the receiver's own busy time, because that total is only complete
+    // once the whole run has been walked: attaching the running value would make a
+    // sample's load depend on how far through the run it happened to fall, which is a
+    // different quantity from the one 04-models.md §4.9 step 2 asks for.
+    let mut raw_samples: Vec<(usize, f64, bool)> = Vec::new();
 
     for (k, tx) in committed.iter().enumerate() {
         // Channel busy time at every station that could hear it, for the CBR statistic.
@@ -1423,11 +1469,15 @@ pub fn sweep_dsrc(sweep: &HighwaySweep, cfg: DsrcConfig) -> SweepReport {
                 rx: handle.rx,
             };
             bins[bin].evaluated += 1;
+            let decoded = matches!(outcome, RxOutcome::Received { .. });
             match outcome {
                 RxOutcome::Received { .. } => bins[bin].received += 1,
                 RxOutcome::Lost(cause) => {
                     *losses.entry(cause.label().to_string()).or_insert(0) += 1;
                 }
+            }
+            if collect {
+                raw_samples.push((rx, d, decoded));
             }
         }
     }
@@ -1442,8 +1492,18 @@ pub fn sweep_dsrc(sweep: &HighwaySweep, cfg: DsrcConfig) -> SweepReport {
         math::sum_ordered(busy_ns.iter().map(|b| (*b as f64 / span).min(1.0))) / n as f64
     };
     let offered_air = math::sum_ordered(committed.iter().map(|c| (c.end - c.start) as f64)) / span;
+    // The per-receiver run-average CBR, which is the load axis of the calibrated table.
+    let per_rx_cbr: Vec<f64> = busy_ns.iter().map(|b| (*b as f64 / span).min(1.0)).collect();
+    let samples: Vec<ReceptionSample> = raw_samples
+        .into_iter()
+        .map(|(rx, distance_m, received)| ReceptionSample {
+            distance_m,
+            load: per_rx_cbr.get(rx).copied().unwrap_or(0.0),
+            received,
+        })
+        .collect();
 
-    SweepReport {
+    let report = SweepReport {
         label: format!(
             "its-g5 {} at {} pps, {} veh/km",
             cfg.mcs.label(),
@@ -1470,7 +1530,8 @@ pub fn sweep_dsrc(sweep: &HighwaySweep, cfg: DsrcConfig) -> SweepReport {
             0.0
         },
         mean_cbr,
-    }
+    };
+    (report, samples)
 }
 
 /// The error model a sweep's pool resolves to, for a report that wants to state it.

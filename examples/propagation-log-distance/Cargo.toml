@@ -1,0 +1,20 @@
+# Worked example: a `Propagation` plug-in.
+#
+# Three dependencies, which is what a propagation plug-in needs and no more:
+# the contract crate, the family crate that declares the trait, and `serde_json`
+# because a model card's defaults are JSON values.
+[package]
+name = "v2xw-example-propagation"
+description = "Worked example: a log-distance path-loss plug-in with log-normal shadowing."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+v2xw-core = { workspace = true }
+v2xw-radio = { workspace = true }
+serde_json = { workspace = true }

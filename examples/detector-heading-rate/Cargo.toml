@@ -1,0 +1,25 @@
+# Worked example: a `Detector` plug-in — the one the tutorial walks end to end.
+#
+# `v2xw-conformance` is a dev-dependency, so `cargo test` runs the plug-in conformance
+# suite of 03-interfaces.md §17 against this model. It is the heaviest dependency in this
+# workspace (it pins the engine, the node runtime and the server so it can police them),
+# which is why only this example takes it: the tutorial's reader runs the suite once, on
+# the example the tutorial is about, and then on their own model.
+[package]
+name = "v2xw-example-detector"
+description = "Worked example: a heading-rate plausibility detector plug-in."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+v2xw-core = { workspace = true }
+v2xw-threat = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+v2xw-conformance = { path = "../../tests/conformance" }

@@ -16,7 +16,7 @@
 //! | Module | What it is | Status |
 //! |---|---|---|
 //! | [`scms`] | `protocol/scms/camp` — the CAMP SCMS / IEEE 1609.2.1 | complete for the seven flows of 05-protocols §3.2 |
-//! | [`etsi`] | `protocol/etsi/ts102941` — the ETSI ITS PKI | skeleton: enrolment and standard authorization, hand-written structures (build decision D5) |
+//! | [`etsi`] | `protocol/etsi/ts102941` — the ETSI ITS PKI | enrolment, standard and butterfly authorization, ticket download, ECTL and CA-CRL distribution, TS 103 759 reporting; hand-written framing around real encoder certificate sizes (build decision D5) |
 //! | [`threshold`] | the surface an interactive threshold/umbrella protocol needs | trait surface plus one shape proof; the owner's scheme is pending |
 //!
 //! # The invariants this crate is responsible for

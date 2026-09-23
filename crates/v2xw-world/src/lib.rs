@@ -13,8 +13,11 @@
 //! | The engine's own binary and JSON format | [`serde_native`] | 04-models.md §1.1 |
 //! | The UI's `vwp-world/1` payload | [`serde_vwp`] | docs/protocol/vwp-v1.md §4 |
 //! | The content hash (invariant I-W2) | [`hash`] | 03-interfaces.md §2 |
-//! | The procedural grid generator | [`procedural`] | 04-models.md §1.2 |
+//! | The procedural generators: grid, radial, random | [`procedural`] | 04-models.md §1.2 |
 //! | The OpenStreetMap importer | [`osm`] | 04-models.md §1.2, §1.3 |
+//! | The SUMO `net.xml` and OpenDRIVE importers | [`sumo`] | 04-models.md §1.1, §1.2 |
+//! | The DEM importers, and draping geometry onto one | [`dem`] | 04-models.md §1.4 |
+//! | Line of sight over terrain | [`los`] | 04-models.md §1.4, §3.5 |
 //! | Errors | [`error`] | — |
 //!
 //! # Getting one
@@ -52,25 +55,36 @@
 //!    [`v2xw_core::math`], which is the pure-Rust `libm` port, because the standard
 //!    library's delegate to a platform libm whose results differ between platforms
 //!    (ADR 0003).
+//! 5. **One generator draws random numbers, from one declared stream.**
+//!    [`procedural::random`] grows an irregular network, and every draw comes from an
+//!    [`RngRegistry`](v2xw_core::RngRegistry) stream keyed by
+//!    `(RngDomain::plugin(model id), EntityRef::custom(model id, 0))` and seeded from its
+//!    own `seed` parameter. Everything else in the crate — every importer, the grid, the
+//!    spider, the DEM resampler — is a pure function of its input.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod dem;
 pub mod error;
 pub mod hash;
 pub mod index;
+pub mod los;
 pub mod model;
 pub mod osm;
 pub mod procedural;
 pub mod quant;
 pub mod serde_native;
 pub mod serde_vwp;
+pub mod sumo;
 
 use serde::{Deserialize, Serialize};
 use v2xw_core::card::ModelCard;
 
+pub use dem::{DemAnomaly, DemFormat, DemOptions, DemRaster, DemReport, DemSource, DrapeOptions};
 pub use error::{Result, WorldError};
 pub use index::{IndexOptions, IndexStats, LaneMatch};
+pub use los::{ProfileParams, TerrainEdge, TerrainLos, TerrainProfile};
 pub use model::{
     Building, ClassMask, ConflictMatrix, Connection, Crossing, CrossingId, Edge, EnvClass, GeoBbox,
     GeoOrigin, HeightSource, Interpolation, Junction, JunctionControl, LanduseClass, LanduseZone,
@@ -81,13 +95,18 @@ pub use model::{
     convex_hull_ring, point_in_ring, ring_distance_sq_2d, ring_signed_area_2x, simplify_rdp,
 };
 pub use serde_vwp::WorldPayload;
+pub use sumo::{SumoAnomaly, SumoImportReport, SumoOptions};
 
 /// Where a world is to be built from (03-interfaces.md §2, 04-models.md §1.2).
 ///
-/// Only [`WorldSourceSpec::Procedural`] has an implementation in this crate today; the
-/// other variants are the seam the OSM, SUMO, OpenDRIVE and legacy-JSON importers plug
-/// into, and a [`WorldSource`] that does not implement one returns
-/// [`WorldError::UnsupportedSource`] rather than pretending.
+/// [`WorldSourceSpec::Procedural`] is implemented by [`procedural::GridSource`],
+/// [`procedural::radial::RadialSource`] and [`procedural::random::RandomSource`], each
+/// answering to its own generator id; [`WorldSourceSpec::OsmXml`] by [`osm::OsmSource`];
+/// [`WorldSourceSpec::SumoNet`] by [`sumo::SumoSource`] and [`WorldSourceSpec::OpenDrive`]
+/// by [`sumo::OpenDriveSource`]. [`WorldSourceSpec::OsmBbox`] (the Overpass fetch) and
+/// [`WorldSourceSpec::LegacyJson`] have none yet, and a [`WorldSource`] that does not
+/// implement the specification it is handed returns [`WorldError::UnsupportedSource`]
+/// rather than pretending.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -245,4 +264,30 @@ pub trait WorldSource {
     /// specification, [`WorldError::InvalidParameter`] for parameters it cannot satisfy,
     /// and whatever the geometry itself rejects.
     fn build(&self, src: &WorldSourceSpec, opts: &ImportOptions) -> Result<World>;
+}
+
+/// Every model card this crate publishes, in model-id order.
+///
+/// The registry (03-interfaces.md §12, ADR 0007) must hold a card for every model a run
+/// can select, and the manifest pins their versions. Gathering them here means the engine
+/// registers the world's models with one call and cannot forget one when a new importer or
+/// generator lands: the list is next to the modules it names.
+///
+/// ```
+/// let cards = v2xw_world::model_cards();
+/// assert!(cards.iter().any(|c| c.id == "world/source/procedural-radial"));
+/// assert!(cards.iter().all(|c| c.validate().is_ok()));
+/// ```
+pub fn model_cards() -> Vec<ModelCard> {
+    let mut cards = vec![
+        procedural::card(),
+        procedural::radial::card(),
+        procedural::random::card(),
+        osm::card(),
+        los::card(),
+    ];
+    cards.extend(sumo::model_cards());
+    cards.extend(dem::model_cards());
+    cards.sort_by(|a, b| a.id.cmp(&b.id));
+    cards
 }

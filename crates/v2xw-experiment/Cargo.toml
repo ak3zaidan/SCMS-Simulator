@@ -24,8 +24,15 @@ v2xw-engine = { path = "../v2xw-engine", version = "0.1.0" }
 # samples. This crate computes no interval of its own for a proportion.
 v2xw-metrics = { workspace = true }
 # The exporters the results table is written through: Parquet, Arrow IPC and JSONL, each
-# quantising every float to its column's declared grid (D9).
+# quantising every float to its column's declared grid (D9). Also `grid::Q_METRIC_VALUE`,
+# which the figure presets and the foundry archive declare as their own float grid rather
+# than inventing a second one.
 v2xw-record = { workspace = true }
+# `AttackKind` and `AttackFamily`, for the foundry's attack-family descriptor axis and its
+# attacker-id mutation operator. The family axis is *derived* from `AttackKind::ALL` rather
+# than written out here, so a kind added upstream widens the axis without an edit — which
+# is the reason to depend on the crate rather than to copy its nine family names.
+v2xw-threat = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

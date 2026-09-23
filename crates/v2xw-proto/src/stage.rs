@@ -49,6 +49,19 @@ pub enum FlowId {
     EtsiEnrolment,
     /// ETSI TS 102 941 authorization (standard variant).
     EtsiAuthorization,
+    /// ETSI TS 102 941 §6.2.3.5 authorization by butterfly expansion: one
+    /// `ButterflyAuthorizationRequest`, the EA's expansion, and the AA's batch.
+    EtsiButterflyAuthorization,
+    /// ETSI TS 102 941 §6.2.3.5 authorization-ticket batch download.
+    EtsiAtDownload,
+    /// ETSI TS 102 941 §6.3 trust-list distribution: the TLM signs the ECTL, the CPOC
+    /// publishes it, a station downloads and installs it.
+    EtsiTrustList,
+    /// ETSI TS 102 941 §6.3 CA-only certificate revocation list, signed by the Root CA.
+    EtsiCaCrl,
+    /// ETSI TS 103 759 misbehaviour reporting, station → (pre-processing) → MA → EA
+    /// blocklist.
+    EtsiMisbehaviourReport,
     /// Distributed key generation for an interactive threshold protocol.
     ThresholdDkg,
     /// A t-of-n signing session.
@@ -70,6 +83,11 @@ impl FlowId {
             FlowId::CrlDistribution => "crl-distribution",
             FlowId::EtsiEnrolment => "etsi-enrolment",
             FlowId::EtsiAuthorization => "etsi-authorization",
+            FlowId::EtsiButterflyAuthorization => "etsi-butterfly-authorization",
+            FlowId::EtsiAtDownload => "etsi-at-download",
+            FlowId::EtsiTrustList => "etsi-trust-list",
+            FlowId::EtsiCaCrl => "etsi-ca-crl",
+            FlowId::EtsiMisbehaviourReport => "etsi-misbehaviour-report",
             FlowId::ThresholdDkg => "threshold-dkg",
             FlowId::ThresholdSign => "threshold-sign",
             FlowId::ThresholdRefresh => "threshold-refresh",

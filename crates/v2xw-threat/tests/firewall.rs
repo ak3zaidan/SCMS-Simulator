@@ -219,6 +219,29 @@ fn every_model_in_the_crate_has_a_card_that_validates() {
             &v2xw_threat::attack_legacy::LegacyAttackerParams::new(k),
         ));
     }
+    // The Phase 4 models, so "every model in the crate" keeps meaning that.
+    for k in v2xw_threat::ExtendedAttackKind::ALL {
+        cards.push(v2xw_threat::attack_ext::card(
+            &v2xw_threat::ExtendedAttackerParams::new(k),
+        ));
+    }
+    for k in v2xw_threat::RsuAttackKind::ALL {
+        cards.push(v2xw_threat::attack_rsu::card(
+            &v2xw_threat::RsuAttackParams::new(k, "rsu0"),
+        ));
+    }
+    cards.push(v2xw_threat::poison::card(
+        &v2xw_threat::PoisonParams::new("cafe"),
+    ));
+    cards.push(v2xw_threat::privacy::card(
+        &v2xw_threat::ObserverParams::default(),
+    ));
+    cards.push(v2xw_threat::ts103759::card(
+        &v2xw_threat::Ts103759Params::default(),
+    ));
+    cards.push(v2xw_threat::resolve::card(
+        &v2xw_threat::ResolutionParams::default(),
+    ));
     cards.push(Legacy12::legacy_defaults().card().clone());
     cards.push(LegacyWindow::legacy_defaults().card().clone());
     for c in &cards {

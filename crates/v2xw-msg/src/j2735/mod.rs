@@ -1,29 +1,41 @@
-//! SAE J2735: a hand-written UPER codec for the Basic Safety Message.
+//! SAE J2735: hand-written UPER codecs for the messages the simulator puts on the wire.
 //!
 //! The middle tier of build decision D2. The ETSI stack is generated from committed
-//! BSD-3-Clause modules and the rest of J2735 is a size model; the BSM sits between them,
-//! with genuinely real bytes produced by code written against the 2024-09 ASN.1 rather than
-//! by a code generator that cannot compile it.
+//! BSD-3-Clause modules and the rest of J2735 is a size model; these messages sit between
+//! them, with genuinely real bytes produced by code written against the 2024-09 ASN.1
+//! rather than by a code generator that cannot compile it.
 //!
 //! | Module | What it holds |
 //! |---|---|
-//! | [`uper`] | the bit-level engine: a bit writer and reader, and one function per X.691 construct the BSM needs |
-//! | [`bsm`] | the message: `BSMcoreData` field for field, the `VehicleSafetyExtensions` Part II container, the `MessageFrame` wrapper, and the builder from a node's belief |
+//! | [`uper`] | the bit-level engine: a bit writer and reader, and one function per X.691 construct these messages need |
+//! | [`bsm`] | the Basic Safety Message: `BSMcoreData` field for field, the `VehicleSafetyExtensions` Part II container, the `MessageFrame` wrapper, and the builder from a node's belief |
+//! | [`spat`] | `SPAT`: intersection states, movement states, movement events and their timing |
+//! | [`map`] | `MapData`: intersection geometry, lanes, node lists and connections |
+//! | [`infra`] | the [`crate::MessageCodec`] seam for SPaT and MAP, and the card that states how well evidenced they are |
 //!
-//! # Trusting the bytes
+//! # Trusting the bytes — and the two codecs are not equally trustworthy
 //!
 //! A hand-written encoder that only ever round-trips against itself proves nothing: a
 //! consistent misreading of a constraint — the asymmetric `Longitude` lower bound is the
 //! standing example — round-trips perfectly and is wrong on the wire. So the evidence for
-//! this codec is an **oracle**: `tests/j2735_oracle.rs` generates pseudo-random but valid
-//! BSMs from a fixed seed, encodes them here, and has `pycrate` (which compiles the real
-//! ASN.1 at run time) decode them and compare field for field — then encode from the same
-//! field values and compare bytes, and finally hand its own bytes back for this codec to
-//! decode. Three directions, because each catches a different class of defect.
+//! the BSM codec is an **oracle**: `tests/j2735_oracle.rs` generates pseudo-random but
+//! valid BSMs from a fixed seed, encodes them here, and has `pycrate` (which compiles the
+//! real ASN.1 at run time) decode them and compare field for field — then encode from the
+//! same field values and compare bytes, and finally hand its own bytes back for this codec
+//! to decode. Three directions, because each catches a different class of defect. That run
+//! happened: 235 vectors, byte-identical.
 //!
-//! The oracle skips with a clear message when the Python environment or the J2735 modules
-//! are absent, which is how it behaves in CI; it is not skipped when they are present, and
-//! the codec's model card records the pass count from the run that validated it.
+//! **The SPaT and MAP codecs have had no such run.** `third_party/asn1/j2735/` is
+//! git-ignored (build decision D3) and is absent from this checkout, and the oracle's
+//! Python environment is not on this machine either, so their ASN.1 could not even be
+//! re-read while they were written. `tests/j2735_infra_oracle.rs` holds their harness and
+//! skips with a message saying so. Until it runs, [`crate::evidence`] calls their bytes
+//! *real UPER, not yet oracle-validated*, which is a weaker claim than the BSM's and is
+//! never to be reported as the same one.
+//!
+//! The BSM oracle skips the same way when its environment is absent, which is how it
+//! behaves in CI; it is not skipped when the environment is present, and the codec's model
+//! card records the pass count from the run that validated it.
 //!
 //! # Where the message type is claimed
 //!
@@ -39,7 +51,12 @@
 //! consumer of that enum depend on J2735's field layout.
 
 pub mod bsm;
+pub mod infra;
+pub mod map;
+pub mod spat;
 pub mod uper;
+
+pub use infra::{J2735_INFRA_CODEC_ID, J2735InfraCodec};
 
 use v2xw_core::card::{Family, ModelCard, Source, SourceKind, Tier, Validation, ValidationStatus};
 use v2xw_core::model::Model;
@@ -171,7 +188,9 @@ fn card() -> ModelCard {
             .to_string(),
     ];
 
-    card.limitations = vec![
+    // The byte-exactness statement, from the crate's one evidence table.
+    card.limitations = crate::evidence::card_statement(J2735_BSM_CODEC_ID);
+    card.limitations.extend([
         // The fields that are real, named exhaustively. A card that said "most of Part I" \
         // would be useless to anyone auditing a run.
         "Real fields — BSMcoreData: msgCnt, id, secMark, lat, long, elev, \
@@ -204,11 +223,12 @@ fn card() -> ModelCard {
         "YawRate declares no unavailable value, so a missing yaw rate is indistinguishable \
          from a genuine zero. That is a property of the standard, not of this codec."
             .to_string(),
-    ];
+    ]);
 
     card.ignores = vec![
-        "Every other J2735 message. SPaT, MAP, PSM, SRM and SSM are sized by \
-         codec/size-model/j2735 and carry placeholder bytes."
+        "Every other J2735 message. SPaT and MAP are hand-encoded by \
+         codec/uper/j2735-spat-map, whose bytes are real but not yet oracle-validated; \
+         PSM, SRM and SSM are sized by codec/size-model/j2735 and carry placeholder bytes."
             .to_string(),
         "The IEEE 1609.2 security envelope, which v2xw-sec puts around this payload over \
          the COER bindings in crate::sec_types."
