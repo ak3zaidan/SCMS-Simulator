@@ -462,9 +462,11 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     // --- measurement -------------------------------------------------------
     KeyStatus { path: "metrics", status: Status::Wired,
         note: "Which metric providers to install; 'all' selects every registered one." },
-    KeyStatus { path: "exporters", status: Status::Refused,
-        note: "The engine runs no exporter stage. Exporting is the command line's job, so \
-               a non-empty list is refused rather than ignored." },
+    KeyStatus { path: "exporters", status: Status::Wired,
+        note: "Written after the run, over its recording: 'recording' keeps the MCAP, \
+               'jsonl', 'parquet' and 'arrow' write one table per recorded channel. \
+               opts.profile 'node' drops every ground-truth channel and column. Naming \
+               any exporter makes the run record." },
     KeyStatus { path: "events", status: Status::Partial,
         note: "Timeline items are scheduled and fire. Only 'outage' and 'weather.front' \
                do anything; a demand multiplier, an attack wave, a parameter change and a \
@@ -572,16 +574,28 @@ fn unreachable_keys(s: &Scenario, e: &mut Vec<ScenarioError>) {
         ));
     }
 
-    // Exporters run after a run, from the command-line tool's own options; the engine has
-    // no exporter stage and `Scenario::exporters` reaches nothing.
-    if !s.exporters.is_empty() {
-        e.push(conflict(
-            "exporters",
-            format!(
-                "lists {} exporter(s), and the engine runs none: exporting is the                  command-line tool's stage (`v2xw run --record`, `v2xw export`) and this                  list is not read by `Engine::run`. Drive the exporter from the tool                  instead of from the scenario",
-                s.exporters.len()
-            ),
-        ));
+    // Exporters run after the run, over its recording (`crate::export`). An id this build
+    // does not implement is refused rather than skipped, so a list never promises a file
+    // that will not be written.
+    for (i, x) in s.exporters.iter().enumerate() {
+        if !crate::export::EXPORTERS.contains(&x.id.as_str()) && !x.id.trim().is_empty() {
+            e.push(conflict(
+                &format!("exporters[{i}].id"),
+                format!(
+                    "'{}' is not an exporter this build has; one of {}",
+                    x.id,
+                    crate::export::EXPORTERS.join(", ")
+                ),
+            ));
+        }
+        if let Err(ScenarioError::Conflict { field, conflict: why }) =
+            crate::export::profile_of(x, i).map_err(|err| match err {
+                crate::EngineError::Scenario(inner) => inner,
+                other => ScenarioError::conflict("exporters", other.to_string()),
+            })
+        {
+            e.push(conflict(&field, why));
+        }
     }
 
     // The network layer. `v2xw-net` implements both, and the engine composes neither:

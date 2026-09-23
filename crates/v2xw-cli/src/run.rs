@@ -103,6 +103,9 @@ pub struct RunOutcome {
     pub container: Option<ContainerSummary>,
     /// Timings, which are wall-clock measurements of the tool and reach no digest.
     pub timing: Timing,
+    /// What the scenario's `exporters` wrote, over the recording (`v2xw_engine::export`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exports: Vec<v2xw_engine::export::Exported>,
 }
 
 /// What reading the recording back found.
@@ -176,6 +179,17 @@ pub fn run(opts: &RunOptions) -> Result<RunOutcome> {
         .build_utc
         .clone()
         .unwrap_or_else(|| now_iso8601_utc().to_string());
+
+    // Every exporter reads the recording, so a run that names one must record.
+    let exporters = scenario.exporters.clone();
+    if !exporters.is_empty() && !opts.record {
+        return Err(v2xw_engine::EngineError::Scenario(v2xw_engine::ScenarioError::conflict(
+            "exporters",
+            "names exporters, and every exporter reads the recording, which --no-recording \
+             turns off",
+        ))
+        .into());
+    }
 
     let build = Stopwatch::start();
     let mut engine = Engine::build(scenario, &build_utc)?;
@@ -265,6 +279,7 @@ pub fn run(opts: &RunOptions) -> Result<RunOutcome> {
         verified: None,
         container,
         timing: Timing::default(),
+        exports: Vec::new(),
     };
 
     let mut verify_s = 0.0;
@@ -288,6 +303,10 @@ pub fn run(opts: &RunOptions) -> Result<RunOutcome> {
             });
             verify_s = v.elapsed_s();
         }
+    }
+
+    if !exporters.is_empty() {
+        outcome.exports = v2xw_engine::export::run_exporters(&exporters, &recording_path, &out_dir)?;
     }
 
     // The deterministic artefacts are written before the manifest, because the manifest

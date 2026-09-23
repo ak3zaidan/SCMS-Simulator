@@ -196,6 +196,8 @@ enum HostMsg {
     Done(Box<RunReport>),
     /// The run aborted.
     Failed(String),
+    /// What the scenario's exporters wrote, or why they could not.
+    Exported(std::result::Result<Vec<v2xw_engine::export::Exported>, String>),
 }
 
 /// Everything about the run the kernel knows before its first step.
@@ -507,8 +509,19 @@ fn spawn_host(
     let actor_capacity = options.actor_capacity.max(1);
     let label = options.label.clone();
     let token = options.session_token.clone();
-    let recording = options.recording.clone();
+    // Naming an exporter makes the run record: every exporter reads the recording, so the
+    // recording is written to `runs/<meta.name>/` (the command line's convention) when the
+    // server was not given a path of its own.
+    let exporters = scenario.exporters.clone();
+    let recording = options.recording.clone().or_else(|| {
+        (!exporters.is_empty()).then(|| {
+            std::path::PathBuf::from("runs")
+                .join(&scenario.meta.name)
+                .join("recording.mcap")
+        })
+    });
     let host_stop = Arc::clone(&stop);
+    let export_stop = Arc::clone(&stop);
     let join = std::thread::Builder::new()
         .name("v2xw-engine".to_string())
         .stack_size(16 * 1024 * 1024)
@@ -555,6 +568,18 @@ fn spawn_host(
             };
             let outcome = engine.run(&mut recorder);
             recorder.finish();
+            // The exporters, on this thread so the transport stays responsive, and only for a
+            // run that reached its end: a stopped run's recording is a fragment.
+            if outcome.is_ok()
+                && !exporters.is_empty()
+                && !export_stop.load(Ordering::SeqCst)
+                && let Some(path) = recording.as_deref()
+            {
+                let out_dir = path.parent().unwrap_or(std::path::Path::new("."));
+                let result = v2xw_engine::export::run_exporters(&exporters, path, out_dir)
+                    .map_err(|e| e.to_string());
+                let _ = step_tx.send(HostMsg::Exported(result));
+            }
             let _ = match outcome {
                 Ok(report) => step_tx.send(HostMsg::Done(Box::new(report))),
                 Err(e) => step_tx.send(HostMsg::Failed(e.to_string())),
@@ -2141,6 +2166,8 @@ pub struct LiveEngine {
     runs_started: u64,
     /// Whole-run totals, accumulated as the kernel produces steps.
     stats: RunStats,
+    /// What the scenario's exporters wrote after the run, or why they could not.
+    exports: Option<std::result::Result<Vec<v2xw_engine::export::Exported>, String>>,
 }
 
 /// Whole-run totals, read off the steps the kernel produced — not off what a connection
@@ -2295,6 +2322,7 @@ impl LiveEngine {
             digest_final: None,
             runs_started: 1,
             stats: RunStats::default(),
+            exports: None,
         })
     }
 
@@ -2479,6 +2507,10 @@ impl LiveEngine {
                 self.report = Some(*report);
                 false
             }
+            HostMsg::Exported(result) => {
+                self.exports = Some(result);
+                true
+            }
             HostMsg::Failed(message) => {
                 self.failure = Some(message);
                 self.state = RunState::Error;
@@ -2577,6 +2609,7 @@ impl LiveEngine {
         self.digest_steps = 0;
         self.digest_final = None;
         self.stats = RunStats::default();
+        self.exports = None;
         self.runs_started += 1;
         Ok(())
     }
@@ -3190,6 +3223,11 @@ impl Engine for LiveEngine {
             "finished": self.report.is_some(),
             // Frames not generated because they fell in a `time.time_dilation` window.
             "suppressed_frames": self.report.as_ref().map(|r| r.suppressed_frames),
+            "exports": match &self.exports {
+                None => Value::Null,
+                Some(Ok(done)) => json!(done),
+                Some(Err(why)) => json!({"error": why}),
+            },
             "retained_steps": self.timeline.len(),
             "retain_limit_steps": self.options.retain_steps,
         })

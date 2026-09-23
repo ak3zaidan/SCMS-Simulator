@@ -231,6 +231,66 @@ fn the_message_family_is_what_goes_on_the_air() {
 }
 
 #[test]
+fn the_exporters_write_their_files_after_the_run() {
+    let path = scenario("exporters", 3, 3000);
+    let out = std::env::temp_dir().join(format!("v2xw-apply-exports-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    let engine = LiveEngine::open(
+        &path,
+        LiveOptions {
+            build_utc: "2026-09-22T00:00:00Z".to_string(),
+            paused: true,
+            speed: 0.0,
+            recording: Some(out.join("recording.mcap")),
+            ..LiveOptions::default()
+        },
+    )
+    .expect("build");
+    let world_json = engine.world_json().to_string();
+    let run = Run::new(Box::new(engine), world_json).expect("run");
+
+    // An id this build does not have is refused, not skipped.
+    let refused = call(
+        &run,
+        "scenario.set",
+        json!({"patch": [{"op": "add", "path": "/exporters", "value": [{"id": "ma-dataset-v9"}]}]}),
+    )
+    .expect_err("an unknown exporter is refused");
+    assert!(refused.to_string().contains("not an exporter this build has"), "{refused}");
+
+    patch(
+        &run,
+        json!([{"op": "add", "path": "/exporters",
+                "value": [{"id": "recording"}, {"id": "jsonl", "opts": {"profile": "node"}}]}]),
+    );
+    let done = run_to_end(&run);
+    // The exporters run on the kernel's thread after the last step; give them a moment.
+    let mut exports = done["engine"]["exports"].clone();
+    for _ in 0..200 {
+        if !exports.is_null() {
+            break;
+        }
+        let _ = run.tick();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        exports = ok(&run, "run.status", json!({}))["engine"]["exports"].clone();
+    }
+    let list = exports.as_array().unwrap_or_else(|| panic!("exports reported: {exports}"));
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0]["exporter"], "recording");
+    let tables = list[1]["files"].as_array().expect("files");
+    assert!(
+        tables.iter().any(|f| f["path"].as_str().is_some_and(|p| p.ends_with("node_tx.jsonl"))
+            && f["rows"].as_u64().unwrap_or(0) > 0),
+        "a node.tx table with rows: {exports}"
+    );
+    assert!(
+        !tables.iter().any(|f| f["path"].as_str().is_some_and(|p| p.contains("gt_"))),
+        "the node profile drops ground-truth channels: {exports}"
+    );
+    assert!(out.join("jsonl").is_dir());
+}
+
+#[test]
 fn the_time_keys_reach_the_run() {
     let run = serve(&scenario("time-keys", 20, 6000));
     let plain = run_to_end(&run);

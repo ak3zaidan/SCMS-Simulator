@@ -251,7 +251,10 @@ fn a_key_the_engine_cannot_act_on_is_refused_and_names_itself() {
             }),
         ),
         (
-            "exporters",
+            // The engine now has an exporter stage (`v2xw_engine::export`), so the list is no
+            // longer refused as a whole: an id it does not implement is, and the error names
+            // the element.
+            "exporters[0].id",
             Box::new(|s: &mut Scenario| {
                 s.exporters = vec![v2xw_engine::scenario::ExporterSpec {
                     id: "ma-dataset-v2".to_string(),
