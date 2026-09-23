@@ -444,3 +444,74 @@ fn the_abstract_compute_tier_removes_the_signing_time() {
         m - f
     );
 }
+
+// -----------------------------------------------------------------------------------------
+// world.terrain
+// -----------------------------------------------------------------------------------------
+
+/// A DEM named in `world.terrain.dem` is read and attached, and a ridge in it obstructs a
+/// link across it by knife-edge diffraction while a link beside it stays clear. The
+/// counterexample is the same world without the file, where the ground is flat and the
+/// link across the ridge's line is line of sight.
+#[test]
+fn a_dem_ridge_obstructs_a_link_across_it() {
+    let mut scenario = rooted(
+        Scenario::load(scenarios().join("phase1-grid.yaml")).expect("the shipped scenario loads"),
+    );
+    // The ground is what is under test: building obstruction off, so a class is terrain's.
+    scenario.world.buildings.enabled = false;
+    let flat = v2xw_engine::wiring::build_world(&scenario).expect("the flat world builds");
+    assert!(flat.terrain.is_none());
+    let origin: v2xw_core::geo::GeoOrigin = flat.origin.into();
+    let mid_x = (flat.bbox.min.x + flat.bbox.max.x) * 0.5;
+    let mid_y = (flat.bbox.min.y + flat.bbox.max.y) * 0.5;
+
+    // A geographic ESRI ASCII grid over the world with a margin, 0.0005 degrees a cell,
+    // flat except for a 150 m ridge running north-south through the middle.
+    let (lat0, lon0, _) = origin.to_geodetic(flat.bbox.min);
+    let (lat1, lon1, _) = origin.to_geodetic(flat.bbox.max);
+    let cell = 0.0005_f64;
+    let (lat0, lon0) = (lat0 - 0.01, lon0 - 0.01);
+    let ncols = (((lon1 + 0.01) - lon0) / cell).ceil() as usize + 1;
+    let nrows = (((lat1 + 0.01) - lat0) / cell).ceil() as usize + 1;
+    let (_, ridge_lon, _) = origin.to_geodetic(v2xw_core::geom::Vec3::new(mid_x, mid_y, 0.0));
+    let ridge_col = ((ridge_lon - lon0) / cell).round() as usize;
+    let mut text = format!(
+        "ncols {ncols}\nnrows {nrows}\nxllcorner {lon0}\nyllcorner {lat0}\ncellsize {cell}\nNODATA_value -9999\n"
+    );
+    for _ in 0..nrows {
+        let row: Vec<&str> = (0..ncols)
+            .map(|c| if c.abs_diff(ridge_col) <= 1 { "150" } else { "0" })
+            .collect();
+        text.push_str(&row.join(" "));
+        text.push('\n');
+    }
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("radio-access-dem");
+    std::fs::create_dir_all(&dir).expect("a temp dir");
+    let path = dir.join("ridge.asc");
+    std::fs::write(&path, text).expect("the DEM is written");
+
+    scenario.world.terrain.dem = Some(path.to_string_lossy().into_owned());
+    let world = v2xw_engine::wiring::build_world(&scenario).expect("the world with a DEM builds");
+    assert!(world.terrain.is_some(), "the DEM was not attached");
+    let mut stack = v2xw_engine::wiring::build_obstacles(&scenario, &world);
+    assert!(stack.terrain.is_some(), "no terrain model was composed over the DEM");
+
+    let at = |dx: f64, dy: f64| v2xw_core::geom::Vec3::new(mid_x + dx, mid_y + dy, 1.5);
+    let across = stack.classify(&world, at(-400.0, 0.0), at(400.0, 0.0));
+    assert_eq!(across.class, v2xw_radio::LosClass::NlosT, "{across:?}");
+    let loss = v2xw_radio::multi_edge_loss_db(
+        &across.knife_edges,
+        v2xw_radio::numeric::wavelength_m(5.86e9),
+        v2xw_radio::MultiEdgeRule::Deygout,
+        false,
+    );
+    assert!(loss > 20.0, "a 150 m ridge between the antennas costs only {loss:.1} dB");
+    let beside = stack.classify(&world, at(-400.0, -200.0), at(-400.0, 200.0));
+    assert_eq!(beside.class, v2xw_radio::LosClass::Los);
+
+    // Without the file the same link is clear.
+    let mut flat_stack = v2xw_engine::wiring::build_obstacles(&scenario, &flat);
+    let flat_across = flat_stack.classify(&flat, at(-400.0, 0.0), at(400.0, 0.0));
+    assert!(flat_across.knife_edges.is_empty());
+}
