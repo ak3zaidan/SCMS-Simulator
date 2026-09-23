@@ -36,7 +36,7 @@
 //! ground-truth value that arrived legitimately and was then used illegitimately is
 //! exactly the leak the firewall exists to stop.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use v2xw_core::belief::PositionEstimate;
 use v2xw_core::geo::GeoOrigin;
@@ -57,8 +57,8 @@ use crate::ctx::{NodeCtx, NodeCtxExt};
 use crate::generate::{MessageSchedule, ServiceSet};
 use crate::secure::{CryptoMode, NodeSecurity, PSID_SAFETY, SignedFrame, SpduVerdict};
 use crate::policy::{
-    PolicyView, Prioritized, RxSummary, SkipReason, VerificationPolicy, VerifyDecision,
-    VerifyDecisionRecord, VerifyReason,
+    PolicyView, Prioritized, RxSummary, VerificationPolicy, VerifyDecision,
+    VerifyDecisionRecord,
 };
 use crate::profile::{HardwareProfile, RunsOn};
 use crate::queue::{Admission, DropCause, DropLedger, NodeQueue, QueueKind, Queued};
@@ -135,6 +135,65 @@ pub struct VerifiedMessage {
     pub verification: VerificationState,
 }
 
+/// When and how a frame reached this node, handed in by the engine beside the frame.
+///
+/// Neither field is on the air and neither names the sender. `token` is an opaque handle
+/// the engine uses to join this node's [`RxReport`] back to the reception attempt it is
+/// about; `arrived_at` is the instant the last symbol reached this radio, which a real
+/// receiver observes with its own clock. Passing them beside [`RxFrame`] rather than inside
+/// it keeps every existing constructor of a frame valid.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RxStamp {
+    /// The engine's reception-attempt id, echoed back in the report.
+    pub token: u64,
+    /// When the frame finished arriving, on the simulation's timeline. `None` means "at
+    /// the instant of the step that delivers it", which is how a harness that has no
+    /// radio feeds a node.
+    pub arrived_at: Option<SimTime>,
+}
+
+/// What finally became of one received frame at this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RxDisposition {
+    /// Handed to the applications, with what the node concluded about the signature.
+    /// `Invalid` and `Revoked` are delivered as such (a detector wants to see them) and
+    /// are *losses* to anything measuring delivery.
+    Delivered(VerificationState),
+    /// Discarded, for this reason.
+    Dropped(DropCause),
+    /// The node was switched off when the frame reached it.
+    NodeOff,
+}
+
+/// One received frame's journey through this node, reported so the engine can record it on
+/// `node.rx`. Every instant is on the node's **own clock**; the engine converts them to the
+/// simulation's timeline with the arrival instant it handed in, so the durations between
+/// them — which is what a latency decomposition needs — are exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RxReport {
+    /// The engine's token, from [`RxStamp::token`].
+    pub token: u64,
+    /// What became of it.
+    pub disposition: RxDisposition,
+    /// When it finished arriving.
+    pub arrived: SimTime,
+    /// When it was parsed and the verification policy decided.
+    pub parsed: SimTime,
+    /// When its signature check started, if it had one.
+    pub verify_start: Option<SimTime>,
+    /// When its signature check finished, if it had one.
+    pub verify_done: Option<SimTime>,
+}
+
+/// What the verification queue holds beside each waiting frame.
+#[derive(Debug, Clone, Copy)]
+struct Waiting {
+    token: u64,
+    arrived: SimTime,
+    parsed: SimTime,
+    depth: u64,
+}
+
 /// One message this node wants transmitted.
 ///
 /// # The bytes, not a count
@@ -162,6 +221,9 @@ pub struct Transmission {
     pub ready_at: SimTime,
     /// The instant the payload claims, on this node's own clock.
     pub generation_time: SimTime,
+    /// When the signer picked the message up, on this node's own clock: the end of its
+    /// wait for the signing server, and the start of the signature.
+    pub sign_start: SimTime,
     /// The real bytes: the encoded payload and the signed SPDU.
     ///
     /// `None` only for a frame the *engine* synthesised on a node's behalf — the
@@ -181,6 +243,12 @@ impl Transmission {
     /// The security envelope's length, for the `node.tx` record's `envelope_bytes`.
     pub fn envelope_bytes(&self) -> Option<u32> {
         self.signed.as_ref().map(SignedFrame::envelope_bytes)
+    }
+
+    /// The attached certificate's octets inside the envelope (zero for a digest signer),
+    /// for the `node.tx` record's `cert_bytes`.
+    pub fn cert_bytes(&self) -> Option<u32> {
+        self.signed.as_ref().map(|f| f.cert_bytes)
     }
 
     /// A transmission whose size is known but whose bytes are not — the shape the engine's
@@ -203,6 +271,9 @@ impl Transmission {
             full_certificate,
             ready_at,
             generation_time,
+            // A frame sized from a table is signed by the engine on the node's behalf with
+            // no queue in front of the signer, so the signature starts at generation.
+            sign_start: generation_time,
             signed: None,
         }
     }
@@ -217,6 +288,9 @@ pub struct StepOutcome {
     pub delivered: Vec<VerifiedMessage>,
     /// The telemetry record, when this step closed a window.
     pub telemetry: Option<NodeTelemetry>,
+    /// Every received frame whose fate was settled in this step, with the instants of its
+    /// journey through the node.
+    pub rx_reports: Vec<RxReport>,
 }
 
 /// How a node is configured.
@@ -311,6 +385,12 @@ pub struct ObuRuntime {
     /// and not a property of the part.
     accel: ServerBank,
     queues: [NodeQueue<Queued<RxFrame>>; 5],
+    /// Beside every frame in the verification queue (`queues[1]`), in the same order: the
+    /// token and the instants its report needs.
+    verify_meta: VecDeque<Waiting>,
+    /// When each frame still waiting to be parsed will start its parse, on the node's
+    /// clock — the receive queue's occupancy, when parsing has a cost.
+    parse_starts: VecDeque<SimTime>,
     drops: DropLedger,
     clock: ClockModel,
     belief: PositionEstimate,
@@ -391,6 +471,8 @@ impl ObuRuntime {
                 NodeQueue::new(QueueKind::Tx, config.queue_capacity[3]),
                 NodeQueue::new(QueueKind::Crl, config.queue_capacity[4]),
             ],
+            verify_meta: VecDeque::new(),
+            parse_starts: VecDeque::new(),
             drops: DropLedger::new(),
             clock: ClockModel::new(0.0),
             belief: PositionEstimate::no_fix(at),
@@ -410,6 +492,16 @@ impl ObuRuntime {
             service,
             config,
         }
+    }
+
+    /// Sets the cost of a parse, a detector pass or a neighbour-table task on this node's
+    /// CPU — the `app_task_us` every shipped profile carries as uncalibrated.
+    ///
+    /// With no cost (the default) a received frame is parsed the instant it arrives and the
+    /// receive queue never holds anything; with one, frames wait for the CPU and the queue
+    /// can overflow.
+    pub fn set_app_task_cost(&mut self, cost: Duration) {
+        self.service = self.service.clone().with_app_task_cost(cost);
     }
 
     /// The node's security stack, for a test that wants to check a signature this node
@@ -520,12 +612,58 @@ impl ObuRuntime {
         inbox: Vec<RxFrame>,
         distance_travelled_m: f64,
     ) -> StepOutcome {
+        let stamped = inbox
+            .into_iter()
+            .map(|f| (f, RxStamp::default()))
+            .collect();
+        self.step_timed(ctx, stamped, distance_travelled_m)
+    }
+
+    /// [`ObuRuntime::step`], with each frame's arrival instant and the engine's token for
+    /// it.
+    ///
+    /// # Reception in continuous time
+    ///
+    /// The step runs at the engine's tick, but a radio receives whenever a frame ends, and
+    /// the verification queue is a queue in continuous time. So the frames are taken in
+    /// arrival order and each is placed at the instant it arrived: the verification server
+    /// is advanced to that instant first — every waiting check that would have started by
+    /// then starts, at the instant it would have — and only then is the frame parsed,
+    /// offered to the policy (which sees the queue as it was at that instant) and queued.
+    /// At the end of the step the server is advanced to the step's own instant.
+    ///
+    /// What is still waiting stays in the queue across steps, so a node that cannot keep up
+    /// carries a real backlog, its queue-overflow drops happen at the instant the queue was
+    /// full, and a verification's wait is the wait it would have had. A check that has
+    /// *started* by the end of the step is delivered to the applications at this step; its
+    /// report carries the instant it truly finishes, which may be up to one service time
+    /// after the step. The applications run at the tick, so that is the one approximation,
+    /// and it is bounded by a single verification's cost.
+    pub fn step_timed(
+        &mut self,
+        ctx: &mut dyn NodeCtx,
+        inbox: Vec<(RxFrame, RxStamp)>,
+        distance_travelled_m: f64,
+    ) -> StepOutcome {
         let now = ctx.now();
         self.clock.advance(now, self.belief.fix.has_position());
         let believed = self.clock.believed_time(now);
 
         let mut out = StepOutcome::default();
         if self.state == NodeState::Off {
+            // A switched-off radio hears nothing; the frames it was handed are reported as
+            // such rather than vanishing.
+            for (_, stamp) in inbox {
+                let at = stamp.arrived_at.map_or(believed, |t| self.clock.believed_time(t));
+                out.rx_reports.push(RxReport {
+                    token: stamp.token,
+                    disposition: RxDisposition::NodeOff,
+                    arrived: at,
+                    parsed: at,
+                    verify_start: None,
+                    verify_done: None,
+                });
+            }
             return out;
         }
 
@@ -549,28 +687,70 @@ impl ObuRuntime {
         &mut self,
         ctx: &mut dyn NodeCtx,
         believed: SimTime,
-        inbox: Vec<RxFrame>,
+        inbox: Vec<(RxFrame, RxStamp)>,
         out: &mut StepOutcome,
     ) {
-        for frame in inbox {
-            self.window.message_in();
-            if let Admission::Refused(_) = self.queues[0].push(Queued {
-                item: frame,
-                enqueued_at: believed,
-            }) {
-                self.drops.record(DropCause::RxOverflow);
-            }
-        }
+        // Each frame at the instant it arrived, on this node's clock, in arrival order.
+        // The engine hands frames over in arrival order already; the stable sort makes that
+        // a property of this function rather than of its caller.
+        let mut frames: Vec<(RxFrame, RxStamp, SimTime)> = inbox
+            .into_iter()
+            .map(|(f, stamp)| {
+                let at = stamp
+                    .arrived_at
+                    .map_or(believed, |t| self.clock.believed_time(t))
+                    .min(believed);
+                (f, stamp, at)
+            })
+            .collect();
+        frames.sort_by_key(|(_, _, at)| *at);
 
-        let pending = self.queues[0].drain();
-        for q in pending {
-            let frame = q.item;
+        let parse_op = OpDescriptor::task("spdu-parse", crate::server::OpClass::Parse);
+        let parse_cost = self.service.service_time(ctx, &parse_op);
+
+        for (frame, stamp, arrived) in frames {
+            self.window.message_in();
+
+            // 1. The receive queue and the parse. With no parse cost in the profile (every
+            //    shipped profile carries it as uncalibrated) parsing is instantaneous and
+            //    the receive queue is always empty; with one, frames wait for the CPU and
+            //    the queue can overflow.
+            let parsed = match parse_cost {
+                None => arrived,
+                Some(cost) => {
+                    while self.parse_starts.front().is_some_and(|&t| t <= arrived) {
+                        self.parse_starts.pop_front();
+                    }
+                    if self.parse_starts.len() >= self.queues[0].capacity() {
+                        self.drops.record(DropCause::RxOverflow);
+                        out.rx_reports.push(RxReport {
+                            token: stamp.token,
+                            disposition: RxDisposition::Dropped(DropCause::RxOverflow),
+                            arrived,
+                            parsed: arrived,
+                            verify_start: None,
+                            verify_done: None,
+                        });
+                        continue;
+                    }
+                    let sched = self.cpu.submit(arrived, cost);
+                    if sched.start > arrived {
+                        self.parse_starts.push_back(sched.start);
+                    }
+                    sched.finish
+                }
+            };
+
+            // 2. Everything the verifier would have started by the time the policy looks.
+            self.advance_verifications(ctx, parsed, out);
+
+            // 3. The policy, over the queue as it is at this instant.
             self.learn_or_request(&frame);
             let summary = RxSummary {
                 signer: frame.signer.clone(),
                 msg_type: frame.msg_type,
                 bytes: frame.bytes,
-                received_at: believed,
+                received_at: arrived,
                 claimed_pos: frame.claimed_pos,
                 // What a safety application said about this signer, if one ran and scored
                 // it (06-node-models.md §2.1: the `on-demand` policy "verifies only
@@ -593,41 +773,103 @@ impl ObuRuntime {
                 };
                 self.policy.decide(&summary, &view)
             };
-            self.log_decision(ctx, believed, frame.msg_type, &decision);
+            if let Some(rec) = VerifyDecisionRecord::decided(
+                self.node,
+                parsed,
+                policy_id(self.policy.code()),
+                msg_type_name(frame.msg_type),
+                &decision,
+            ) {
+                ctx.emit(rec);
+            }
 
             match decision {
                 VerifyDecision::Drop { cause } => {
                     self.drops.record(cause);
+                    out.rx_reports.push(RxReport {
+                        token: stamp.token,
+                        disposition: RxDisposition::Dropped(cause),
+                        arrived,
+                        parsed,
+                        verify_start: None,
+                        verify_done: None,
+                    });
                 }
                 VerifyDecision::DeliverUnverified { reason } => {
                     let _ = reason;
                     self.drops.record(DropCause::VerifyPolicySkip);
-                    let m = self.to_message(&frame, believed, VerificationState::Unverified);
+                    let m = self.to_message(&frame, arrived, VerificationState::Unverified);
                     self.deliver(m, out);
+                    out.rx_reports.push(RxReport {
+                        token: stamp.token,
+                        disposition: RxDisposition::Delivered(VerificationState::Unverified),
+                        arrived,
+                        parsed,
+                        verify_start: None,
+                        verify_done: None,
+                    });
                 }
                 VerifyDecision::Verify { .. } => {
+                    let depth = self.queues[1].len() as u64;
+                    let queued = Queued {
+                        item: frame,
+                        enqueued_at: parsed,
+                    };
                     let admitted = if self.policy.oldest_drop() {
-                        self.queues[1].push_evicting(Queued {
-                            item: frame,
-                            enqueued_at: believed,
-                        })
+                        self.queues[1].push_evicting(queued)
                     } else {
-                        self.queues[1].push(Queued {
-                            item: frame,
-                            enqueued_at: believed,
-                        })
+                        self.queues[1].push(queued)
+                    };
+                    let waiting = Waiting {
+                        token: stamp.token,
+                        arrived,
+                        parsed,
+                        depth,
                     };
                     match admitted {
-                        Admission::Queued => {}
-                        Admission::Refused(_) | Admission::Evicted(_) => {
-                            self.drops.record(DropCause::VerifyOverflow);
+                        Admission::Queued => self.verify_meta.push_back(waiting),
+                        Admission::Refused(refused) => {
+                            self.overflow(ctx, &refused, waiting, out);
+                        }
+                        Admission::Evicted(evicted) => {
+                            // The oldest waiting frame made room for this one: its report
+                            // is the overflow, and this frame joins the back of the line.
+                            if let Some(old) = self.verify_meta.pop_front() {
+                                self.overflow(ctx, &evicted, old, out);
+                            }
+                            self.verify_meta.push_back(waiting);
                         }
                     }
                 }
             }
         }
 
-        self.run_verifications(ctx, believed, out);
+        self.advance_verifications(ctx, believed, out);
+    }
+
+    /// Reports one frame the verification queue refused or evicted.
+    fn overflow(
+        &mut self,
+        ctx: &mut dyn NodeCtx,
+        refused: &Queued<RxFrame>,
+        waiting: Waiting,
+        out: &mut StepOutcome,
+    ) {
+        self.drops.record(DropCause::VerifyOverflow);
+        ctx.emit(VerifyDecisionRecord::overflowed(
+            self.node,
+            waiting.parsed,
+            policy_id(self.policy.code()),
+            msg_type_name(refused.item.msg_type),
+        ));
+        out.rx_reports.push(RxReport {
+            token: waiting.token,
+            disposition: RxDisposition::Dropped(DropCause::VerifyOverflow),
+            arrived: waiting.arrived,
+            parsed: waiting.parsed,
+            verify_start: None,
+            verify_done: None,
+        });
     }
 
     /// The peer-to-peer certificate distribution path (IEEE 1609.2 clause 8).
@@ -649,12 +891,13 @@ impl ObuRuntime {
         }
     }
 
-    fn run_verifications(
-        &mut self,
-        ctx: &mut dyn NodeCtx,
-        believed: SimTime,
-        out: &mut StepOutcome,
-    ) {
+    /// Starts every waiting signature check whose start instant is no later than `until`.
+    ///
+    /// The head of the line starts at `max(when it was queued, when a server frees up)`;
+    /// if that is after `until` it is still waiting and so is everything behind it. A check
+    /// that starts is charged to its server, classified, delivered, and reported with the
+    /// instants it really started and finished.
+    fn advance_verifications(&mut self, ctx: &mut dyn NodeCtx, until: SimTime, out: &mut StepOutcome) {
         let probe = OpDescriptor::verify(self.config.verify_op, 0);
         if self.service.service_time(ctx, &probe).is_none() {
             // The profile costs no verification. Nothing is verified and nothing is
@@ -663,8 +906,27 @@ impl ObuRuntime {
             return;
         }
         let where_ = self.service.runs_on(&probe);
-
-        for q in self.queues[1].drain() {
+        loop {
+            let Some(head) = self.queues[1].iter().next() else {
+                break;
+            };
+            let free = match where_ {
+                RunsOn::Hsm => self.hsm.earliest_free(),
+                RunsOn::Accelerator => self.accel.earliest_free(),
+                RunsOn::Cpu => self.cpu.earliest_free(),
+            };
+            if head.enqueued_at.max(free) > until {
+                break;
+            }
+            let Some(q) = self.queues[1].pop() else {
+                break;
+            };
+            let meta = self.verify_meta.pop_front().unwrap_or(Waiting {
+                token: 0,
+                arrived: q.enqueued_at,
+                parsed: q.enqueued_at,
+                depth: 0,
+            });
             let frame = q.item;
             // Charged over the bytes actually checked, as signing is over the bytes
             // actually signed.
@@ -680,8 +942,32 @@ impl ObuRuntime {
             self.window.verification(sched.wait);
 
             let verdict = self.classify(ctx, &frame);
-            let m = self.to_message(&frame, believed, verdict);
+            ctx.emit(VerifyDecisionRecord::verified(
+                self.node,
+                q.enqueued_at,
+                sched.start,
+                sched.finish,
+                policy_id(self.policy.code()),
+                msg_type_name(frame.msg_type),
+                self.config.verify_op,
+                match verdict {
+                    VerificationState::Verified | VerificationState::Revoked => "valid",
+                    VerificationState::Invalid => "invalid",
+                    // No certificate to check against: the node concluded nothing.
+                    _ => "skipped",
+                },
+                meta.depth,
+            ));
+            let m = self.to_message(&frame, meta.arrived, verdict);
             self.deliver(m, out);
+            out.rx_reports.push(RxReport {
+                token: meta.token,
+                disposition: RxDisposition::Delivered(verdict),
+                arrived: meta.arrived,
+                parsed: meta.parsed,
+                verify_start: Some(sched.start),
+                verify_done: Some(sched.finish),
+            });
         }
     }
 
@@ -944,6 +1230,7 @@ impl ObuRuntime {
                 full_certificate,
                 ready_at: sched.finish,
                 generation_time: r.at,
+                sign_start: sched.start,
                 signed: Some(frame),
             };
             if let Admission::Refused(_) = self.queues[3].push(Queued {
@@ -1078,45 +1365,6 @@ impl ObuRuntime {
             // CRL or a report is the engine's; none of them arrives through the schedule.
             _ => None,
         }
-    }
-
-    fn log_decision(
-        &self,
-        ctx: &mut dyn NodeCtx,
-        believed: SimTime,
-        msg_type: MsgType,
-        d: &VerifyDecision,
-    ) {
-        let (outcome, reason, priority) = match d {
-            VerifyDecision::Verify { priority, reason } => (
-                "verify",
-                match reason {
-                    VerifyReason::PolicyVerifiesAll => "policy-verifies-all",
-                    VerifyReason::ApplicationRelevant => "application-relevant",
-                    VerifyReason::Proximate => "proximate",
-                    VerifyReason::UnknownSigner => "unknown-signer",
-                },
-                *priority,
-            ),
-            VerifyDecision::DeliverUnverified { reason } => (
-                "unverified",
-                match reason {
-                    SkipReason::NotRelevant => "not-relevant",
-                    SkipReason::KnownVerifiedSigner => "known-verified-signer",
-                },
-                0,
-            ),
-            VerifyDecision::Drop { cause } => ("drop", cause.as_str(), 0),
-        };
-        ctx.emit(VerifyDecisionRecord {
-            node: self.node,
-            t_ns: believed,
-            policy: policy_id(self.policy.code()),
-            msg_type: msg_type_name(msg_type),
-            outcome,
-            reason,
-            priority,
-        });
     }
 
     fn close_window(&mut self, _ctx: &mut dyn NodeCtx, now: SimTime) -> NodeTelemetry {

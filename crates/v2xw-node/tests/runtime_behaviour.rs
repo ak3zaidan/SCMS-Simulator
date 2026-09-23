@@ -23,7 +23,8 @@ use v2xw_node::ctx::NodeRuntimeCtx;
 use v2xw_node::generate::ServiceSet;
 use v2xw_node::policy::{OnDemand, Prioritized, VerifyAll};
 use v2xw_node::profile::HardwareProfile;
-use v2xw_node::runtime::{NodeConfig, ObuRuntime, RxFrame, StepOutcome};
+use v2xw_node::queue::DropCause;
+use v2xw_node::runtime::{NodeConfig, ObuRuntime, RxDisposition, RxFrame, RxStamp, StepOutcome};
 use v2xw_node::stores::{CredState, CredentialHandle, VerificationState, pseudo_signer};
 use v2xw_node::telemetry::NodeState;
 
@@ -300,13 +301,23 @@ fn a_node_that_cannot_keep_up_falls_behind() {
         "and it is bounded by the queue depth, 64 x 400 us = 25.6 ms; was {} ms",
         heavy.verify_wait_p95_ms
     );
-    // Which counter moves is itself the finding: the receive queue fills before the
-    // verify queue does, so the node is deaf at the front door and the verification
-    // engine never even sees the excess. Six counters exist precisely so that this is
-    // visible rather than collapsed into one "dropped" number.
+    // Which counter moves is itself the finding, and it is the verification queue's. The
+    // receive queue has no server in front of it — parsing costs nothing in any shipped
+    // profile (`app_task_us` is uncalibrated) — so no frame ever waits in it, and the
+    // backlog forms where the work is: in front of the verification engine, which sheds
+    // the excess at the instant it is full. (This used to assert the opposite: a tick's
+    // arrivals were pushed into the receive queue in one burst before any was processed,
+    // so it "overflowed" whatever the parse cost. `the_receive_queue_overflows_only_when_
+    // parsing_costs_time` is where the receive queue earns its drops.) Six counters exist
+    // precisely so that which queue overflowed is visible rather than collapsed into one
+    // "dropped" number.
     assert!(
-        heavy.drop_rx_overflow > 0,
+        heavy.drop_verify_overflow > 0,
         "an overloaded node must drop somewhere"
+    );
+    assert_eq!(
+        heavy.drop_rx_overflow, 0,
+        "a queue with no server in front of it cannot back up"
     );
     assert!(heavy.q_verify_p95 > light.q_verify_p95);
     // Most of what this node heard never reached an application.
@@ -629,7 +640,9 @@ fn a_stepped_clock_is_visible_in_what_the_node_claims() {
     assert_eq!(attacked.clock().offset_ns(), NS_PER_S as i64);
 }
 
-/// A node that is off does nothing at all.
+/// A node that is off does nothing at all — and says, of every frame it was handed, that
+/// it was off, so a reception attempt at a dead radio is accounted for rather than lost
+/// between the PHY and the application.
 #[test]
 fn an_off_node_does_nothing() {
     let mut rt = node_on(v2xw_node::profiles::REFERENCE_OBU, ServiceSet::BOTH);
@@ -637,8 +650,101 @@ fn an_off_node_does_nothing() {
     let outcomes = run(&mut rt, 20, 100 * NS_PER_MS, |k| {
         vec![frame(9, Vec3::ZERO, k * 100 * NS_PER_MS, true)]
     });
-    assert!(outcomes.iter().all(|o| *o == StepOutcome::default()));
+    for o in &outcomes {
+        assert!(o.transmissions.is_empty());
+        assert!(o.delivered.is_empty());
+        assert!(o.telemetry.is_none());
+        assert_eq!(o.rx_reports.len(), 1);
+        assert_eq!(o.rx_reports[0].disposition, RxDisposition::NodeOff);
+    }
     assert_eq!(rt.neighbors().len(), 0);
+}
+
+/// The receive queue backs up only when parsing takes time: 300 frames arriving in one
+/// instant at a node that spends 1 ms parsing each fill its 64 slots, while the same 300
+/// spread over a tenth of a second at 0.2 ms each never wait at all.
+#[test]
+fn the_receive_queue_overflows_only_when_parsing_costs_time() {
+    let run_with = |parse: Duration, spread: bool| {
+        let mut rt = node_on(v2xw_node::profiles::REFERENCE_OBU, ServiceSet::SAE);
+        rt.set_app_task_cost(parse);
+        let reg = RngRegistry::new(7);
+        let now = 100 * NS_PER_MS;
+        let inbox: Vec<(RxFrame, RxStamp)> = (0..300u64)
+            .map(|n| {
+                let at = if spread { n * 300_000 } else { 50 * NS_PER_MS };
+                (
+                    frame(n as u32 + 100, Vec3::new(n as f64, 0.0, 0.0), at, true),
+                    RxStamp {
+                        token: n,
+                        arrived_at: Some(at),
+                    },
+                )
+            })
+            .collect();
+        let mut ctx = NodeRuntimeCtx::new(now, &reg);
+        let out = rt.step_timed(&mut ctx, inbox, 0.0);
+        out.rx_reports
+            .iter()
+            .filter(|r| r.disposition == RxDisposition::Dropped(DropCause::RxOverflow))
+            .count()
+    };
+    assert!(run_with(Duration::from_millis(1), false) > 200);
+    assert_eq!(run_with(Duration::from_micros(200), true), 0);
+}
+
+/// Every frame handed to a node comes back as exactly one report, with its instants in
+/// order: arrived ≤ parsed ≤ verification start ≤ verification done.
+#[test]
+fn every_received_frame_is_reported_once_with_ordered_instants() {
+    let mut rt = node_on(v2xw_node::profiles::REFERENCE_OBU, ServiceSet::SAE);
+    let reg = RngRegistry::new(7);
+    let mut reports = Vec::new();
+    let mut handed = 0u64;
+    for k in 1..=10u64 {
+        let now = k * 100 * NS_PER_MS;
+        let inbox: Vec<(RxFrame, RxStamp)> = (0..150u64)
+            .map(|n| {
+                // In pairs: two frames end at the same instant every 1.2 ms, so the second
+                // of each pair waits for the first's check.
+                let at = now - 100 * NS_PER_MS + (n / 2) * 1_200_000;
+                handed += 1;
+                (
+                    frame(n as u32 + 100, Vec3::new(n as f64, 0.0, 0.0), at, true),
+                    RxStamp {
+                        token: k * 1_000 + n,
+                        arrived_at: Some(at),
+                    },
+                )
+            })
+            .collect();
+        let mut ctx = NodeRuntimeCtx::new(now, &reg);
+        reports.extend(rt.step_timed(&mut ctx, inbox, 0.0).rx_reports);
+    }
+    let mut tokens: Vec<u64> = reports.iter().map(|r| r.token).collect();
+    tokens.sort_unstable();
+    let before = tokens.len();
+    tokens.dedup();
+    assert_eq!(before, tokens.len(), "a frame reported twice");
+    // What is not reported is still waiting in the verification queue, never lost.
+    assert!(reports.len() as u64 <= handed);
+    assert!(
+        handed - reports.len() as u64 <= 64,
+        "more missing than the queue holds"
+    );
+    for r in &reports {
+        assert!(r.arrived <= r.parsed, "{r:?}");
+        if let (Some(s), Some(d)) = (r.verify_start, r.verify_done) {
+            assert!(r.parsed <= s && s < d, "{r:?}");
+        }
+    }
+    // 1,500 frames a second against a 2,500/s engine: the queue waits are real but short.
+    let waits: Vec<u64> = reports
+        .iter()
+        .filter_map(|r| r.verify_start.map(|s| s - r.parsed))
+        .collect();
+    assert!(!waits.is_empty());
+    assert!(waits.iter().any(|w| *w > 0), "no check ever waited");
 }
 
 /// Two identical runs produce identical output, which is the determinism contract for
