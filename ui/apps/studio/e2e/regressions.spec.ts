@@ -56,7 +56,7 @@ async function instrument(page: Page): Promise<void> {
 
 async function streaming(page: Page): Promise<void> {
   await page.goto("/");
-  await expect(page.getByTestId("connection-state")).toHaveText("streaming", { timeout: 60_000 });
+  await expect(page.getByTestId("connection-state")).toHaveAttribute("data-state", "streaming", { timeout: 60_000 });
   await expect(page.getByTestId("scrub-range")).toBeEnabled({ timeout: 30_000 });
   // Each test starts from a running run at t = 0, whatever the previous one left behind: a seek
   // with `pause_after` stops the stream, and a stopped stream sends no Telemetry.

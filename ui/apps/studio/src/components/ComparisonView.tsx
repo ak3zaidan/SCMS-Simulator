@@ -198,13 +198,13 @@ export function ComparisonView(): React.JSX.Element {
         <h3>Side B</h3>
         {side === null ? (
           <p className="dim">
-            Nothing to compare against yet. Open a second engine, or a recording — a recording opens with no
-            engine at all, which is the path a reviewer uses to check somebody else&rsquo;s result (09-ui §7).
+            Nothing to compare against yet. Open a second engine, or a recording — a recording needs no
+            engine at all, which is how one checks somebody else&rsquo;s result without running their code.
           </p>
         ) : (
           <dl className="kv">
             <dt>source</dt>
-            <dd>{side.source === "engine" ? "second VWP connection" : "local recording (WebAssembly)"}</dd>
+            <dd>{side.source === "engine" ? "a second engine" : "a recording, read in this page"}</dd>
             <dt>label</dt>
             <dd>{side.label}</dd>
             <dt>state</dt>
@@ -228,8 +228,12 @@ export function ComparisonView(): React.JSX.Element {
               close side B
             </button>
             {compare.source === "replay" ? (
-              <button type="button" onClick={() => compare.adoptWorldFromA()} title="Draw side A's world geometry in side B (§7.1: a recording carries none)">
-                borrow A&rsquo;s world
+              <button
+                type="button"
+                onClick={() => compare.adoptWorldFromA()}
+                title="A recording does not contain streets. Draw the ones from the run on the left under it."
+              >
+                borrow A&rsquo;s streets
               </button>
             ) : null}
           </div>
@@ -296,8 +300,8 @@ export function ComparisonView(): React.JSX.Element {
             </button>
           </div>
           <p className="help">
-            Range-read, so only the chunks a seek touches are fetched (§7.3). The server must answer{" "}
-            <code>Range</code> requests.
+            Only the parts of the file a seek actually needs are downloaded, so a large recording opens
+            quickly — but the server hosting it has to support partial downloads.
           </p>
         </div>
       </div>
@@ -360,17 +364,17 @@ export function ComparisonView(): React.JSX.Element {
           </div>
 
           <div className="section">
-            <h3>Manifest</h3>
+            <h3>Are these two runs comparable?</h3>
             {worldMatch === false ? (
               <div className="note err" data-testid="world-mismatch">
-                The two sides report different <code>world_hash</code> values, so this is not one change to one
-                world: every position difference below includes a geometry difference.
+                <strong>The two runs are not on the same streets.</strong> Whatever you change between them,
+                every difference below also contains a difference in the map itself.
               </div>
             ) : null}
             {worldMatch === null && side.source === "replay" ? (
               <div className="note">
-                A recording carries no <code>Hello</code> (§7.1), so there is no world hash to compare. That the
-                two runs share a world is your assertion, not a checked fact.
+                A recording does not say which world it was computed on, so nothing can confirm that these two
+                runs share one. That they do is your assertion, not a checked fact.
               </div>
             ) : null}
             <table className="table" data-testid="manifest-diff">
@@ -395,18 +399,18 @@ export function ComparisonView(): React.JSX.Element {
           </div>
 
           <div className="section">
-            <h3>Metric difference</h3>
+            <h3>Measurement by measurement</h3>
             {!side.hasMetrics ? (
               <div className="note" data-testid="no-b-metrics">
-                Side B reports no <code>MetricSample</code> frames.{" "}
+                Side B reports no measurements.{" "}
                 {side.source === "replay"
-                  ? "The WebAssembly reader resolves poses and signals (crates/v2xw-wasm), not metric frames, so a recording opened here can be compared by pose and by manifest but not by metric. A second engine serving that recording would difference metrics — which needs a `--replay` flag on `v2xw-server` that does not exist yet."
-                  : "Nothing has been sampled on that connection yet."}
+                  ? "A recording opened here gives positions and signals, not measurements, so these two runs can be compared by what happened on the map and by their settings — but not number for number. Measuring a recording needs an engine to replay it, which this build cannot yet do."
+                  : "Nothing has been measured on that connection yet."}
               </div>
             ) : null}
             <p className="faint">
-              Read at {simClock(aTNs)} on A and {simClock(aTNs + sync.offsetNs)} on B — the last sample at or
-              before each instant, which is how a binned metric is read (§3.7).
+              Read at {simClock(aTNs)} on A and {simClock(aTNs + sync.offsetNs)} on B, each taking the most
+              recent measurement at or before that instant — a measurement covers an interval, not a moment.
             </p>
             <table className="table" data-testid="metric-diff">
               <thead>

@@ -107,12 +107,15 @@ describe("overlayProvenance", () => {
     const prov = overlayProvenance("tx_pulses");
     expect(prov.inputs).toContain("node.tx");
     // The reason an enabled overlay can be empty; without this the pane just looks broken.
-    expect(prov.inputs).toContain("§6.12");
+    // Asserted on the rule rather than on the section number that used to state it: the section
+    // number is no longer interface copy, and the rule is what a reader needs.
+    expect(prov.inputs).toContain("not subscribed");
   });
 
   it("says a world-fed overlay needs no subscription", () => {
     const prov = overlayProvenance("lane_markings");
-    expect(prov.inputs).toContain("no event subscription");
+    // Case-insensitive: the sentence now leads with this clause, so it is capitalised.
+    expect(prov.inputs.toLowerCase()).toContain("no event subscription");
   });
 
   it("carries the blind-evaluation caveat for a ground-truth overlay, and only for those", () => {
@@ -181,9 +184,10 @@ describe("the subject builders", () => {
   it("builds a world subject that cites the section that counted the figure", () => {
     const subject = worldSubject("lanes", "4,312");
     expect(subject.kind).toBe("world");
-    expect(subject.client?.computation).toContain("§4.3");
-    // §10.5 W3 is what makes the figure trustworthy at all, so the card names it.
-    expect(subject.client?.inputs).toContain("W3");
+    // Which part of the world file was counted — named in words now rather than by section number.
+    expect(subject.client?.computation).toContain("lane geometry");
+    // The digest check is what makes the figure trustworthy at all, so the card still names it.
+    expect(subject.client?.inputs).toContain("digest the run promised");
   });
 
   it("builds a channel subject", () => {

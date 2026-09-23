@@ -57,6 +57,12 @@ export interface CameraControllerOptions {
    * {@link CameraController.keepCameraOutsideBuildings}.
    */
   readonly occlusionRangeM?: number;
+  /**
+   * Called when the user presses `f` over the element {@link CameraController.attachInput} is bound
+   * to: "frame what is live". The controller has no idea where the actors are, so the owner — the
+   * {@link WorldRenderer}'s viewer — supplies the action.
+   */
+  readonly onFrameActors?: () => void;
   /** Field of view per mode, degrees. */
   readonly fovMapDeg?: number;
   readonly fovChaseDeg?: number;
@@ -130,6 +136,7 @@ export class CameraController {
   #fovDashboard: number;
   #desiredFov: number;
 
+  #onFrameActors: (() => void) | null;
   #viewportW = 1280;
   #viewportH = 720;
   #detach: (() => void) | null = null;
@@ -155,6 +162,7 @@ export class CameraController {
     this.#fovMap = options.fovMapDeg ?? 45;
     this.#fovChase = options.fovChaseDeg ?? 55;
     this.#fovDashboard = options.fovDashboardDeg ?? 68;
+    this.#onFrameActors = options.onFrameActors ?? null;
     this.#desiredFov = this.#fovMap;
     this.camera.fov = this.#fovMap;
     this.camera.updateProjectionMatrix();
@@ -577,6 +585,16 @@ export class CameraController {
       else this.distanceM = this.#chaseDistance * k;
     };
 
+    const onKeyDown = (e: Event): void => {
+      const ev = e as KeyboardEvent;
+      if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+      // `f` for "frame": the one keystroke that answers "where is the vehicle?" when a single
+      // actor is loose in a square kilometre of city.
+      // Registered passively with the pointer listeners, so no `preventDefault` here — `f` has no
+      // default action on a canvas to cancel, and calling it on a passive listener is a warning.
+      if (ev.key === "f" || ev.key === "F") this.#onFrameActors?.();
+    };
+
     // `pointerleave` is deliberately *not* bound: with pointer capture a drag survives leaving the
     // element, and treating leave as pointer-up would end it mid-gesture.
     const passive: readonly (readonly [string, (e: Event) => void])[] = [
@@ -584,6 +602,7 @@ export class CameraController {
       ["pointermove", onPointerMove],
       ["pointerup", onPointerUp],
       ["pointercancel", onPointerUp],
+      ["keydown", onKeyDown],
     ];
     for (const [type, fn] of passive) element.addEventListener(type, fn, { passive: true });
     element.addEventListener("wheel", onWheel, { passive: false });
@@ -607,5 +626,6 @@ export class CameraController {
   dispose(): void {
     this.detachInput();
     this.#world = null;
+    this.#onFrameActors = null;
   }
 }

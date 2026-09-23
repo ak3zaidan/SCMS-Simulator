@@ -127,6 +127,17 @@ const SPARK_KEYS = SPARKLINE_SERIES.map((s) => s.key);
 const STORE_HZ = 5;
 
 /**
+ * The methods that act on a connection's own view and are refused over `POST /rpc` (§6.2, −32009).
+ *
+ * The list is `crates/v2xw-server`'s `rpc::CONNECTION_SCOPED`, and it is short for a reason: every
+ * other method is answerable without a socket, which is what {@link StudioEngine.request}'s HTTP
+ * fallback relies on. `run.seek` is the near miss — it is not on this list, but it streams its
+ * frames on the connection and the server refuses it over HTTP with a message saying so, so the
+ * interface treats a scrub as needing an open stream.
+ */
+const CONNECTION_SCOPED: readonly VwpMethodName[] = ["view.follow", "view.camera", "overlay.set"];
+
+/**
  * How many metric names the store projection keeps.
  *
  * `MetricSample.str_metric` (§3.7) is a wire-supplied string id, so the name set is engine- and
@@ -254,6 +265,13 @@ export class StudioEngine {
       useStudio.getState().setValidation({ valid: (p.errors ?? []).length === 0, errors: p.errors ?? [], warnings: p.warnings ?? [] });
     });
 
+    // Both timers start *before* the handshake is awaited, and both survive it failing. A page
+    // whose socket will not open can still reach the engine over HTTP, and the 2 s `run.status`
+    // poll is what turns that into a sentence the user can act on instead of a dead Connect button.
+    this.#storeTimer = setInterval(() => this.flushProjection(), 1000 / STORE_HZ);
+    this.#statusTimer = setInterval(() => void this.refreshStatus(), 2000);
+    void this.refreshStatus();
+
     const hello = await client.connect();
 
     // §6.12 — nothing is emitted on a channel until it is subscribed.
@@ -268,9 +286,6 @@ export class StudioEngine {
     void this.refreshRpcMethods();
     void this.refreshScenario();
     void this.refreshOverlayCatalogue();
-
-    this.#storeTimer = setInterval(() => this.flushProjection(), 1000 / STORE_HZ);
-    this.#statusTimer = setInterval(() => void this.refreshStatus(), 2000);
     return hello;
   }
 
@@ -450,17 +465,54 @@ export class StudioEngine {
     this.#pendingLinkCount = 0;
   }
 
-  /** Typed JSON-RPC (§6), with a log line on failure so every panel does not need its own. */
+  /**
+   * Typed JSON-RPC (§6), over whichever transport is up.
+   *
+   * Two transports, one method surface. §6.2 serves the same methods over `POST /rpc`, and routing
+   * *every* call that way when the socket is down is not a convenience, it is what makes a finished
+   * run legible: the server hangs up on a run that has ended, so by the time the page renders, the
+   * socket each panel's call went through is gone. That is why the Studio showed a scenario form
+   * with sixteen empty fields, no metric catalogue, no overlay catalogue and no run status — five
+   * separate "the engine published nothing" messages for one closed socket, when every one of those
+   * answers was available over HTTP the whole time.
+   *
+   * {@link CONNECTION_SCOPED} is the exception, and it is the whole exception: those three act on a
+   * connection's own view and are refused over HTTP with −32009. Rather than send a call that
+   * cannot succeed, this says what is missing.
+   */
   async request<M extends VwpMethodName>(method: M, params: ParamsOf<M>): Promise<ResultOf<M>> {
     const client = this.client;
-    if (!client) throw new Error("not connected");
-    useStudio.getState().noteRpcCall(method);
-    try {
-      return await client.request(method, params);
-    } catch (err) {
-      this.#log("error", "rpc", `${method}: ${errText(err)}`);
+    if (this.streaming && client) {
+      useStudio.getState().noteRpcCall(method);
+      try {
+        return await client.request(method, params);
+      } catch (err) {
+        this.#log("error", "rpc", `${method}: ${errText(err)}`);
+        throw err;
+      }
+    }
+    if (CONNECTION_SCOPED.includes(method)) {
+      const err = new Error(`${method} needs an open stream — press Connect first`);
+      this.#log("warn", "rpc", err.message);
       throw err;
     }
+    try {
+      return await this.requestHttp(method, params);
+    } catch (err) {
+      this.#log("error", "rpc", `${method} over HTTP: ${errText(err)}`);
+      throw err;
+    }
+  }
+
+  /**
+   * Reopen the stream on the target this engine last connected to.
+   *
+   * Separate from {@link connect} so a panel can reconnect without re-resolving the target: the
+   * probe belongs to the app shell, which owns `?engine=` and the candidate list.
+   */
+  async reopenStream(): Promise<void> {
+    await this.connect(this.#baseUrl === "" ? window.location.origin : this.#baseUrl);
+    this.attachViewer();
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -661,11 +713,88 @@ export class StudioEngine {
   // Run control (§6.6)
   // ---------------------------------------------------------------------------------------------
 
-  /** `run.status`, polled so the scrub bar has a bound even while paused. */
+  /**
+   * One JSON-RPC call over HTTP `POST /rpc`, for when there is no stream to carry it.
+   *
+   * The engine answers the same method set over HTTP as over the socket, and that is the whole
+   * point of this method: after a run ends the engine closes the stream, and a page that could only
+   * talk over the socket had no way to ask what had happened or to start another run. It showed the
+   * word "closed" and a Connect button instead. With this, "Run again" works from a closed page.
+   */
+  async requestHttp<M extends VwpMethodName>(
+    method: M,
+    params: ParamsOf<M>,
+    options: { readonly quiet?: boolean } = {},
+  ): Promise<ResultOf<M>> {
+    const base = this.#baseUrl === "" ? window.location.origin : this.#baseUrl;
+    // The 2 s status poll runs through here whenever the socket is down, and a poll is not a call
+    // the user made: logging it would bury every real call in the Calls-made list.
+    if (options.quiet !== true) useStudio.getState().noteRpcCall(method);
+    const res = await fetch(`${base}/rpc`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params }),
+    });
+    if (!res.ok) throw new Error(`the engine answered ${res.status} for ${method}`);
+    const body = (await res.json()) as { result?: unknown; error?: { code?: number; message?: string } };
+    if (body.error) throw new Error(body.error.message ?? `error ${String(body.error.code)} from ${method}`);
+    return body.result as ResultOf<M>;
+  }
+
+  /**
+   * Whether the socket is up and carrying frames.
+   *
+   * The distinction the interface hangs on: a client object exists long after its socket has gone,
+   * so `this.client !== null` is not "connected".
+   */
+  get streaming(): boolean {
+    return this.client !== null && this.client.state === "streaming";
+  }
+
+  /**
+   * Start, or rewind and start again — one coherent action whatever state the run is in.
+   *
+   * `run.start` on its own is not enough, because each of the engine's refusals is a state check
+   * and the sequence has to satisfy all of them:
+   *
+   *  1. **Pause first if the run is going.** `run.start` on a running run is refused outright
+   *     (`RunAlreadyRunning`), so "Run again" mid-run would fail with a JSON-RPC error.
+   *  2. **`run.start {paused: true}`**, which rewinds — `LiveEngine::restart` clears the timeline,
+   *     the history and the cursor, and deliberately keeps the run id and the symbol table — and
+   *     leaves the clock at zero rather than moving.
+   *  3. **Reopen the stream if it is down**, which it is in the case this exists for: a run that
+   *     ended closed its socket. Asking for `paused` in step 2 is what makes this safe. Started
+   *     running, a run at high speed (or at `speed: 0`, unthrottled) can reach its end before the
+   *     socket is back, and the user would press "Run again" and be handed another finished run —
+   *     the original complaint, reproduced by its own fix.
+   *  4. **`run.resume`**, legal now because the run is paused, and only now with a viewer attached
+   *     to receive the first keyframe.
+   *
+   * Returns the state the engine reports at the end, so a caller can say what happened.
+   */
+  async startRun(): Promise<string> {
+    if (useStudio.getState().run.state === "running") await this.request("run.pause", {});
+    const speed = useStudio.getState().run.speed;
+    await this.request("run.start", { paused: true, ...(Number.isFinite(speed) ? { speed } : {}) });
+    if (!this.streaming) await this.reopenStream();
+    const res = await this.request("run.resume", {});
+    await this.refreshStatus();
+    return res.state;
+  }
+
+  /**
+   * `run.status`, polled so the scrub bar has a bound even while paused.
+   *
+   * Falls back to HTTP whenever the socket is not streaming. Without that fallback the run state
+   * froze at whatever it was when the stream died, which is how a finished run came to be reported
+   * as a closed socket and nothing else: the engine was answering `state: "finished"` the whole
+   * time, over a transport the page was not using.
+   */
   async refreshStatus(): Promise<void> {
-    if (!this.client) return;
     try {
-      const s = await this.client.request("run.status", {});
+      const s = this.streaming && this.client
+        ? await this.client.request("run.status", {})
+        : await this.requestHttp("run.status", {}, { quiet: true });
       useStudio.getState().setRun({
         state: s.state,
         tNs: s.t_ns,
@@ -684,9 +813,8 @@ export class StudioEngine {
 
   /** §6.15 — the tool surface for the copilot panel, straight from the engine. */
   async refreshRpcMethods(): Promise<void> {
-    if (!this.client) return;
     try {
-      const doc = await this.client.request("rpc.discover", {});
+      const doc = await this.request("rpc.discover", {});
       const methods = (doc.methods ?? [])
         .map((m) => ({
           name: String((m as { name?: unknown }).name ?? ""),
@@ -701,15 +829,14 @@ export class StudioEngine {
 
   /** §6.10 — the scenario document and, when the engine publishes one, its JSON Schema. */
   async refreshScenario(): Promise<void> {
-    if (!this.client) return;
     try {
-      const res = await this.client.request("scenario.get", { with_schema: true, resolved: true });
+      const res = await this.request("scenario.get", { with_schema: true, resolved: true });
       useStudio.getState().setScenario(res.scenario, res.hash, res.schema ?? null);
     } catch (err) {
       this.#log("warn", "scenario", `scenario.get failed: ${errText(err)}`);
     }
     try {
-      const list = await this.client.request("scenario.list", { kind: "all", limit: 100 });
+      const list = await this.request("scenario.list", { kind: "all", limit: 100 });
       useStudio.getState().setScenarioList(list.items ?? []);
     } catch {
       useStudio.getState().setScenarioList([]);
@@ -1128,7 +1255,11 @@ export class StudioEngine {
   }
 
   #onBye(msg: ByeMessage): void {
-    const reasons = ["error", "client requested stop", "server shutdown", "run complete", "superseded"];
+    // Appendix A's order, which is not the order this line used to assume: reason 0 is
+    // RUN_COMPLETE and reason 3 is ERROR. Reversed, the log said "Bye: error" every time a run
+    // ended normally — the one line that could have explained the closed stream, saying the
+    // opposite of what happened.
+    const reasons = ["run complete", "client requested stop", "server shutdown", "error", "superseded"];
     this.#log("info", "vwp", `Bye: ${reasons[msg.reason] ?? `reason ${msg.reason}`}${msg.detail ? ` — ${msg.detail}` : ""}`);
   }
 

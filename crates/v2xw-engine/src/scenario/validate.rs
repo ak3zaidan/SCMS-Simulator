@@ -48,6 +48,453 @@ const MESSAGE_SETS: [&str; 8] = ["bsm", "cam", "denm", "spat", "map", "psm", "va
 /// mathematics, and P-256 is the one `v2xw-sec` implements (the post-quantum primitives of
 /// 05-protocols.md are sized, not computed).
 const REAL_SIGNATURES: [&str; 1] = ["ecdsa-p256"];
+/// The pseudonym-change strategies 05-protocols.md §2.6 names.
+const STRATEGIES: [&str; 4] = ["time", "distance", "mix-zone", "silent"];
+
+/// The on-board-unit hardware profiles that ship with `v2xw-node`.
+///
+/// Built from [`v2xw_node::profiles::PROFILE_SOURCES`] rather than listed, so a profile
+/// added to that crate becomes selectable without an edit here. The filter is the id
+/// prefix, which is how 06-node-models.md §7 spells a device's kind.
+pub fn obu_profile_ids() -> Vec<&'static str> {
+    v2xw_node::profiles::PROFILE_SOURCES
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| id.starts_with("obu/"))
+        .collect()
+}
+
+/// Every hardware profile id that ships, for the roadside and backend slots.
+pub fn all_profile_ids() -> Vec<&'static str> {
+    v2xw_node::profiles::PROFILE_SOURCES
+        .iter()
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// The machine-readable half of this module (13-product-direction.md §2)
+// ---------------------------------------------------------------------------
+//
+// The page's settings form is generated, and its inline validation has to be the same
+// validation the loader performs or the two disagree about what is valid. The three
+// tables below are how: every numeric range and every closed value set is stated once,
+// the rules further down read them, and `crate::scenario::publish` publishes them. A
+// number that appears in a form and a different number in the loader is not possible,
+// because there is only one number.
+
+/// One numeric range the loader enforces and the published schema states.
+#[derive(Debug, Clone, Copy)]
+pub struct Bound {
+    /// The dotted scenario path, with `[]` for a list element and `*` for a map key.
+    pub path: &'static str,
+    /// The lower limit.
+    pub lo: f64,
+    /// The upper limit; [`f64::INFINITY`] for "no upper limit", which publishes none.
+    pub hi: f64,
+    /// Whether `lo` itself is excluded.
+    pub exclusive_lo: bool,
+    /// What the quantity is, for the error message: "the equipped fraction is 1.5, …".
+    pub what: &'static str,
+}
+
+impl Bound {
+    /// The interval in mathematical notation, for an error message.
+    pub fn describe(&self) -> String {
+        let open = if self.exclusive_lo { '(' } else { '[' };
+        if self.hi.is_infinite() {
+            format!("{open}{}, ∞)", self.lo)
+        } else {
+            format!("{open}{}, {}]", self.lo, self.hi)
+        }
+    }
+
+    /// Whether `value` satisfies it.
+    pub fn admits(&self, value: f64) -> bool {
+        let low = if self.exclusive_lo {
+            value > self.lo
+        } else {
+            value >= self.lo
+        };
+        value.is_finite() && low && value <= self.hi
+    }
+}
+
+/// Every numeric range in the schema.
+///
+/// A number that belongs in a range belongs here and nowhere else. `world.imported_at`,
+/// `time.t0` and the cross-field rules are not ranges and stay as rules below.
+pub static BOUNDS: &[Bound] = &[
+    Bound { path: "time.duration_s", lo: 0.0, hi: f64::INFINITY, exclusive_lo: true,
+            what: "the run length" },
+    // ADR 0004 decision 2: below 10 ms no mobility provider is calibrated for the step,
+    // and above 100 ms the constant-velocity extrapolation between steps stops being
+    // accurate enough for frame-level radio.
+    Bound { path: "time.mobility_step_ms", lo: 10.0, hi: 100.0, exclusive_lo: false,
+            what: "the mobility period" },
+    Bound { path: "world.buildings.metres_per_level", lo: 1.5, hi: 10.0,
+            exclusive_lo: false, what: "the storey height" },
+    Bound { path: "actors.vehicles.equipped_fraction", lo: 0.0, hi: 1.0,
+            exclusive_lo: false, what: "the equipped fraction" },
+    Bound { path: "actors.vehicles.classes.*.fraction", lo: 0.0, hi: 1.0,
+            exclusive_lo: false, what: "the class share" },
+    Bound { path: "actors.vehicles.demand.rate_veh_per_h", lo: 0.0, hi: f64::INFINITY,
+            exclusive_lo: false, what: "the arrival rate" },
+    Bound { path: "actors.vru.device_fraction", lo: 0.0, hi: 1.0, exclusive_lo: false,
+            what: "the device fraction" },
+    Bound { path: "actors.backend.links[].latency_ms", lo: 0.0, hi: f64::INFINITY,
+            exclusive_lo: false, what: "the one-way latency" },
+    Bound { path: "actors.backend.links[].capacity_mbps", lo: 0.0, hi: f64::INFINITY,
+            exclusive_lo: true, what: "the link capacity" },
+    // The same `[0, 1]` scale `v2xw_core::WeatherState::intensity` uses; each model's
+    // card declares what its own 1.0 means.
+    Bound { path: "weather.intensity", lo: 0.0, hi: 1.0, exclusive_lo: false,
+            what: "the weather intensity" },
+    Bound { path: "weather.visibility_m", lo: 0.0, hi: f64::INFINITY, exclusive_lo: true,
+            what: "the meteorological visibility" },
+    Bound { path: "radio.tiers.focus.region.radius_m", lo: 0.0, hi: f64::INFINITY,
+            exclusive_lo: true, what: "the follow radius" },
+    Bound { path: "security.pseudonym_change.period_s", lo: 1.0, hi: 86_400.0,
+            exclusive_lo: false, what: "the rotation period" },
+    // A rotation distance below a metre is not a distance and above a hundred kilometres
+    // is longer than any trip this simulator places, so either is an author error rather
+    // than a study.
+    Bound { path: "security.pseudonym_change.distance_m", lo: 1.0, hi: 100_000.0,
+            exclusive_lo: false, what: "the rotation distance" },
+    Bound { path: "threats.attackers[].fraction", lo: 0.0, hi: 1.0, exclusive_lo: false,
+            what: "the attacker fraction" },
+];
+
+/// One closed set of values the loader accepts and the published schema offers.
+#[derive(Debug, Clone, Copy)]
+pub struct Choices {
+    /// The dotted scenario path.
+    pub path: &'static str,
+    /// The accepted values, in a stable order.
+    pub values: &'static [&'static str],
+    /// A path whose value narrows this set further, and the narrowing value; empty when
+    /// the set is unconditional.
+    ///
+    /// `security.signature` is the case: `modeled` cryptography costs any primitive the
+    /// hardware profile prices, and `real` has to do the mathematics. A form can offer
+    /// the wide set and grey out what the current mode cannot do, which is what the
+    /// loader enforces.
+    pub narrowed_by: &'static str,
+    /// The value of `narrowed_by` that applies the narrowing.
+    pub narrowed_when: &'static str,
+    /// The narrower set, when `narrowed_by` is set.
+    pub narrowed_to: &'static [&'static str],
+}
+
+/// A choice set with no conditional narrowing.
+const fn choices(path: &'static str, values: &'static [&'static str]) -> Choices {
+    Choices { path, values, narrowed_by: "", narrowed_when: "", narrowed_to: &[] }
+}
+
+/// Every closed value set in the schema whose members are fixed strings.
+///
+/// Sets whose members come from a registry — model ids, hardware profile ids — are
+/// published as slots by `crate::scenario::publish` instead, because their membership is
+/// a property of the build rather than a constant.
+pub static CHOICES: &[Choices] = &[
+    choices("time.des_resolution", &RESOLUTIONS),
+    choices("net.layer", &NET_LAYERS),
+    choices("messages.codec_tier", &CODEC_TIERS),
+    choices("messages.sets[]", &MESSAGE_SETS),
+    choices("security.envelope", &ENVELOPES),
+    choices("security.verification_policy", &POLICIES),
+    choices("security.pseudonym_change.strategy", &STRATEGIES),
+    Choices {
+        path: "security.signature",
+        values: &["ecdsa-p256"],
+        narrowed_by: "security.crypto_mode",
+        narrowed_when: "real",
+        narrowed_to: &REAL_SIGNATURES,
+    },
+];
+
+/// How much of a scenario key this build actually acts on.
+///
+/// The distinction the page needs is not "valid or invalid" — the loader answers that —
+/// but "will editing this change the run". 13-product-direction.md §2 is explicit that a
+/// field the engine does not act on must not be offered as though it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Status {
+    /// The engine reads it and it changes the run.
+    Wired,
+    /// The engine reads it and acts on part of it, or acts on it only under conditions
+    /// the note states. Editing it may do less than it appears to.
+    Partial,
+    /// Validated, hashed, and read by nothing. Editing it changes the scenario hash and
+    /// nothing else.
+    NotImplemented,
+    /// Validated and refused: the loader rejects any value this build cannot act on, so
+    /// the field exists but only its implemented values load.
+    Refused,
+}
+
+/// One key's implementation status.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyStatus {
+    /// The dotted path, or a prefix of one. The longest matching entry wins, so a
+    /// section can be classified once and an exception stated beneath it.
+    pub path: &'static str,
+    /// How much of it is real.
+    pub status: Status,
+    /// One line a non-specialist can read, saying what happens if they edit it.
+    pub note: &'static str,
+}
+
+/// The implementation status of every scenario key.
+///
+/// Written from the 2026-09-22 wiring audit, which traced every leaf of the schema to
+/// the code that reads it. Entries are prefixes, longest match wins, and
+/// `crate::scenario::publish`'s `every_leaf_has_a_status` test fails the build if a leaf
+/// of the reflected schema matches none of them — so a field added to the schema cannot
+/// reach the page unclassified.
+pub static KEY_STATUS: &[KeyStatus] = &[
+    // --- the run -----------------------------------------------------------
+    KeyStatus { path: "schema", status: Status::Wired,
+        note: "The schema version. The loader migrates by it." },
+    KeyStatus { path: "meta", status: Status::NotImplemented,
+        note: "Documentation. It is hashed into the scenario digest and changes nothing \
+               about the run." },
+    KeyStatus { path: "meta.name", status: Status::Wired,
+        note: "Names the output directory, the recording's run label and the manifest." },
+    KeyStatus { path: "meta.base", status: Status::Wired,
+        note: "The scenario this one overlays; resolved by the loader before anything \
+               else." },
+    KeyStatus { path: "seed", status: Status::Wired,
+        note: "The master seed. Every random draw in the run derives from it." },
+    KeyStatus { path: "time.t0", status: Status::Wired,
+        note: "The civil instant simulated time zero is; every 1609.2 generationTime is \
+               stamped from it." },
+    KeyStatus { path: "time.duration_s", status: Status::Wired,
+        note: "The run horizon." },
+    KeyStatus { path: "time.mobility_step_ms", status: Status::Wired,
+        note: "The mobility period, and the step the stream and run.seek are quantised \
+               to." },
+    KeyStatus { path: "time.des_resolution", status: Status::NotImplemented,
+        note: "The kernel is always nanoseconds. This states a guarantee to models and \
+               no model reads it." },
+    KeyStatus { path: "time.time_dilation", status: Status::NotImplemented,
+        note: "Recorded in the manifest and nowhere else: no radio event is skipped \
+               inside a window and no metric is marked not-observed for one." },
+    // --- the world ---------------------------------------------------------
+    KeyStatus { path: "world.source", status: Status::Wired,
+        note: "Where the world comes from. Procedural grids and OpenStreetMap XML are \
+               built; the other source kinds return an unsupported-source error." },
+    KeyStatus { path: "world.imported_at", status: Status::Wired,
+        note: "The import date the world's provenance records. Supplied here because no \
+               part of the engine may read a clock." },
+    KeyStatus { path: "world.buildings.enabled", status: Status::NotImplemented,
+        note: "The importer has no switch for this: building footprints are always \
+               imported. Use it to document intent, not to change the run." },
+    KeyStatus { path: "world.buildings.keep_holes", status: Status::Wired,
+        note: "Whether interior courtyards stay holes in a footprint." },
+    KeyStatus { path: "world.buildings.metres_per_level", status: Status::Wired,
+        note: "Overrides the importer's storey height for buildings tagged with levels \
+               rather than a height." },
+    KeyStatus { path: "world.terrain", status: Status::NotImplemented,
+        note: "No terrain raster is read. The world is flat and the digital elevation \
+               model named here is ignored." },
+    KeyStatus { path: "world.cache", status: Status::NotImplemented,
+        note: "No import is cached. Every run re-imports the world." },
+    KeyStatus { path: "world.highway_preset", status: Status::Wired,
+        note: "Which jurisdiction's fallback speed limits the OpenStreetMap importer \
+               uses. An OSM import is refused without it." },
+    // --- what moves --------------------------------------------------------
+    KeyStatus { path: "actors.vehicles.demand.kind", status: Status::Partial,
+        note: "Only 'mobility/demand/none' is distinguished. Every other id runs the \
+               thinned-Poisson model, so naming another demand model selects Poisson." },
+    KeyStatus { path: "actors.vehicles.demand.rate_veh_per_h", status: Status::Wired,
+        note: "Vehicles per hour offered to the network." },
+    KeyStatus { path: "actors.vehicles.demand.params", status: Status::Partial,
+        note: "Deserialised as the thinned-Poisson model's parameters and nothing else. \
+               'max_total_vehicles' is the only way to ask for an exact fleet size." },
+    KeyStatus { path: "actors.vehicles.equipped_fraction", status: Status::Wired,
+        note: "What share of vehicles carry a radio. 0 is a legal pure-traffic run." },
+    KeyStatus { path: "actors.vehicles.classes", status: Status::NotImplemented,
+        note: "The shares are validated to sum to 1 and then ignored: the fleet mix comes \
+               from the demand model's own 'fleet' parameter, which defaults to cars \
+               only." },
+    KeyStatus { path: "actors.vru", status: Status::Refused,
+        note: "Nothing in this build spawns a pedestrian or a cyclist, so the loader \
+               refuses any value above zero rather than reporting no VRU traffic without \
+               saying why." },
+    KeyStatus { path: "actors.rsus", status: Status::Wired,
+        note: "Roadside units. Placed, given a profile and a role set, and they transmit." },
+    KeyStatus { path: "actors.rsus[].backhaul", status: Status::NotImplemented,
+        note: "The backhaul latency in force is a fixed constant from the SCMS \
+               parameters; this id is read by nothing." },
+    KeyStatus { path: "actors.backend.protocol", status: Status::Wired,
+        note: "The credential-management protocol. Naming the CAMP SCMS is what turns the \
+               whole backend on." },
+    KeyStatus { path: "actors.backend.entities", status: Status::NotImplemented,
+        note: "The backend runs on fixed built-in parameters. Per-entity profiles, \
+               service models and network models are read by nothing." },
+    KeyStatus { path: "actors.backend.links", status: Status::NotImplemented,
+        note: "Validated as a topology and then ignored: every backend hop uses one \
+               constant latency and no capacity limit." },
+    // --- environment -------------------------------------------------------
+    KeyStatus { path: "weather.initial", status: Status::Partial,
+        note: "Reaches the propagation model and the GNSS error model. It changes no \
+               driving behaviour, because the mobility provider is never told the \
+               weather." },
+    KeyStatus { path: "weather.intensity", status: Status::Partial,
+        note: "Only the high-tier propagation model reads it, and only for rain and \
+               sleet. At the default medium tier it changes nothing." },
+    KeyStatus { path: "weather.visibility_m", status: Status::NotImplemented,
+        note: "Carried into the weather state and read by no model that runs." },
+    KeyStatus { path: "weather.surface", status: Status::NotImplemented,
+        note: "No model that runs reads the road surface condition." },
+    // --- radio -------------------------------------------------------------
+    KeyStatus { path: "radio.rat", status: Status::NotImplemented,
+        note: "The radio access technology is 802.11p whatever this says. The cellular \
+               sidelink stacks are not selectable." },
+    KeyStatus { path: "radio.tiers.propagation", status: Status::Wired,
+        note: "Path-loss fidelity. Abstract is free-space; medium and high are \
+               log-distance with shadowing." },
+    KeyStatus { path: "radio.tiers.phy", status: Status::Wired,
+        note: "Physical-layer fidelity." },
+    KeyStatus { path: "radio.tiers.mac", status: Status::Wired,
+        note: "Medium-access fidelity." },
+    KeyStatus { path: "radio.tiers.focus", status: Status::Refused,
+        note: "One tier runs for the whole world. A region at a higher tier needs a \
+               per-region dispatch the run loop does not have, so naming one is refused." },
+    KeyStatus { path: "radio.models", status: Status::NotImplemented,
+        note: "The radio models are chosen from the tiers above. Naming a model per \
+               family here selects nothing." },
+    // --- network -----------------------------------------------------------
+    KeyStatus { path: "net.layer", status: Status::Refused,
+        note: "No network layer is composed: a frame goes from the signer to the MAC with \
+               no header between them. Only 'wsmp' loads, and even that is a declaration." },
+    KeyStatus { path: "net.fragmenter", status: Status::NotImplemented,
+        note: "No fragmenter is wired in; a frame over the MSDU cap is dropped rather \
+               than split." },
+    KeyStatus { path: "net.backhaul", status: Status::NotImplemented,
+        note: "Read by nothing." },
+    KeyStatus { path: "net.uu", status: Status::NotImplemented,
+        note: "Read by nothing: there is no cellular uplink in this build." },
+    KeyStatus { path: "net.backend_net", status: Status::NotImplemented,
+        note: "Read by nothing." },
+    // --- messages ----------------------------------------------------------
+    KeyStatus { path: "messages.sets", status: Status::Refused,
+        note: "Which message sets the nodes generate. Only the BSM and the CAM have a \
+               generator, so anything else is refused rather than silently unsent." },
+    KeyStatus { path: "messages.generator", status: Status::NotImplemented,
+        note: "The generation rules are the node runtime's own; naming a generator model \
+               selects nothing." },
+    KeyStatus { path: "messages.codec_tier", status: Status::Refused,
+        note: "The node encodes real UPER unconditionally, so the size-model tier is \
+               refused rather than ignored." },
+    // --- security ----------------------------------------------------------
+    KeyStatus { path: "security.envelope", status: Status::Wired,
+        note: "Which secured-message envelope the nodes use." },
+    KeyStatus { path: "security.protocol", status: Status::NotImplemented,
+        note: "The credential protocol is selected by actors.backend.protocol. This key \
+               is read by nothing." },
+    KeyStatus { path: "security.signature", status: Status::NotImplemented,
+        note: "Cross-checked against the crypto mode and then ignored: the primitive is \
+               fixed in the security crate." },
+    KeyStatus { path: "security.crypto_mode", status: Status::Wired,
+        note: "Whether signing and verification are costed or actually computed. Both \
+               produce the same event log; only the manifest and the timing differ." },
+    KeyStatus { path: "security.verification_policy", status: Status::Partial,
+        note: "The policy is selected, but its threshold is a fixed number: there is no \
+               scenario key for the on-demand relevance threshold or the prioritised \
+               range." },
+    KeyStatus { path: "security.signer_id_policy", status: Status::Wired,
+        note: "How often a full certificate is attached instead of an eight-byte digest." },
+    KeyStatus { path: "security.pseudonym_change.strategy", status: Status::NotImplemented,
+        note: "The engine's rotation rule is built from the period and the distance below; \
+               the strategy name is validated and then not read, so 'silent' still \
+               rotates." },
+    KeyStatus { path: "security.pseudonym_change.period_s", status: Status::Partial,
+        note: "Sets the minimum age before a node may change pseudonym. A change also \
+               needs a credential to change to, and without a backend protocol each node \
+               holds exactly one." },
+    KeyStatus { path: "security.pseudonym_change.distance_m", status: Status::Partial,
+        note: "Sets the minimum distance before a node may change pseudonym, with the \
+               same caveat about the credential pool." },
+    // --- nodes -------------------------------------------------------------
+    KeyStatus { path: "nodes.default_obu", status: Status::Wired,
+        note: "The hardware profile every equipped vehicle runs on: its compute, its \
+               security module and its radio." },
+    KeyStatus { path: "nodes.per_class", status: Status::Wired,
+        note: "Per-vehicle-class overrides of the profile above." },
+    KeyStatus { path: "nodes.compute_tier", status: Status::NotImplemented,
+        note: "Read by nothing. Node compute cost comes from the hardware profile." },
+    KeyStatus { path: "nodes.backend_tier", status: Status::NotImplemented,
+        note: "Read by nothing." },
+    // --- threats and detection --------------------------------------------
+    KeyStatus { path: "threats.attackers", status: Status::Wired,
+        note: "Attacker populations: which model, how many, and when they are active." },
+    KeyStatus { path: "threats.attackers[].params", status: Status::Partial,
+        note: "Only 'intensity' and 'dt_s' are read; any other key in the object is \
+               silently dropped." },
+    KeyStatus { path: "threats.jammers", status: Status::NotImplemented,
+        note: "Read by nothing: a jammer named here transmits nothing and a scenario of \
+               only jammers builds no threat layer at all." },
+    KeyStatus { path: "threats.compromised_rsus", status: Status::NotImplemented,
+        note: "Read by nothing." },
+    KeyStatus { path: "detection.local", status: Status::Partial,
+        note: "The detector suite is installed by id. Its parameters are not read." },
+    KeyStatus { path: "detection.ma", status: Status::NotImplemented,
+        note: "The misbehaviour authority runs on built-in parameters; naming a pipeline \
+               model selects nothing." },
+    KeyStatus { path: "detection.responder", status: Status::NotImplemented,
+        note: "Read by nothing." },
+    KeyStatus { path: "detection.perception_tier", status: Status::NotImplemented,
+        note: "Read by nothing: there is no perception model in this build." },
+    // --- measurement -------------------------------------------------------
+    KeyStatus { path: "metrics", status: Status::Wired,
+        note: "Which metric providers to install; 'all' selects every registered one." },
+    KeyStatus { path: "exporters", status: Status::Refused,
+        note: "The engine runs no exporter stage. Exporting is the command line's job, so \
+               a non-empty list is refused rather than ignored." },
+    KeyStatus { path: "events", status: Status::Partial,
+        note: "Timeline items are scheduled and fire. Only 'outage' and 'weather.front' \
+               do anything; a demand multiplier, an attack wave, a parameter change and a \
+               closure are counted and change nothing." },
+    KeyStatus { path: "experiment", status: Status::Wired,
+        note: "The parameter sweep. Expanded by the experiment runner, not by a single \
+               run: the engine clears it before running a cell." },
+];
+
+/// The status entry that governs `path`: the longest matching prefix.
+pub fn status_of(path: &str) -> Option<&'static KeyStatus> {
+    KEY_STATUS
+        .iter()
+        .filter(|k| covers(k.path, path))
+        .max_by_key(|k| k.path.len())
+}
+
+/// Whether the status entry `entry` governs the leaf `path`.
+///
+/// A prefix match is on a path segment boundary, so `net.layer` does not govern
+/// `net.layerx` and `meta` governs `meta.tags`.
+fn covers(entry: &str, path: &str) -> bool {
+    if path == entry {
+        return true;
+    }
+    let Some(rest) = path.strip_prefix(entry) else {
+        return false;
+    };
+    rest.starts_with('.') || rest.starts_with('[')
+}
+
+/// The bound declared for `path`, if there is one.
+pub fn bound_of(path: &str) -> Option<&'static Bound> {
+    BOUNDS.iter().find(|b| b.path == path)
+}
+
+/// The choice set declared for `path`, if there is one.
+pub fn choices_of(path: &str) -> Option<&'static Choices> {
+    CHOICES.iter().find(|c| c.path == path)
+}
+
 
 /// Every problem with `s`, in schema order. Empty means the scenario is loadable.
 pub fn validate(s: &Scenario) -> Vec<ScenarioError> {
@@ -55,6 +502,7 @@ pub fn validate(s: &Scenario) -> Vec<ScenarioError> {
     time(s, &mut e);
     world(s, &mut e);
     actors(s, &mut e);
+    weather(s, &mut e);
     radio(s, &mut e);
     net(s, &mut e);
     messages(s, &mut e);
@@ -170,12 +618,33 @@ fn conflict(field: &str, conflict: String) -> ScenarioError {
     ScenarioError::conflict(field, conflict)
 }
 
-/// `value` is in `[lo, hi]`, or an error saying so.
-fn in_range(field: &str, what: &str, value: f64, lo: f64, hi: f64, e: &mut Vec<ScenarioError>) {
-    if !value.is_finite() || value < lo || value > hi {
+/// `value` satisfies the bound [`BOUNDS`] declares for `path`, or an error saying so.
+///
+/// `path` is the *canonical* path — `threats.attackers[].fraction` — and `field` is the
+/// concrete one the author wrote — `threats.attackers[2].fraction` — so the table has one
+/// row per rule and the message names the author's own field.
+fn bounded_at(path: &str, field: &str, value: f64, e: &mut Vec<ScenarioError>) {
+    let Some(b) = bound_of(path) else {
+        // A field checked through this helper with no row in the table is a defect in
+        // this module: the page would offer an unbounded control for a bounded field.
+        // It is reported rather than skipped, because a check that cannot fail is the
+        // defect class this project has already found four times.
         e.push(conflict(
             field,
-            format!("{what} is {value}, which is outside the allowed range [{lo}, {hi}]"),
+            format!(
+                "cannot be range-checked: `{path}` has no row in `validate::BOUNDS`, which                  is a defect in the engine rather than in this scenario"
+            ),
+        ));
+        return;
+    };
+    if !b.admits(value) {
+        e.push(conflict(
+            field,
+            format!(
+                "{} is {value}, which is outside the allowed range {}",
+                b.what,
+                b.describe()
+            ),
         ));
     }
 }
@@ -204,25 +673,21 @@ fn time(s: &Scenario, e: &mut Vec<ScenarioError>) {
             ),
         ));
     }
-    if !(s.time.duration_s.is_finite() && s.time.duration_s > 0.0) {
-        e.push(conflict(
-            "time.duration_s",
-            format!(
-                "is {}, and a run has to last a positive number of seconds",
-                s.time.duration_s
-            ),
-        ));
-    }
-    // ADR 0004 decision 2: 10–100 ms, SUMO tier ≥ 10 ms.
-    if !(10..=100).contains(&s.time.mobility_step_ms) {
+    bounded_at("time.duration_s", "time.duration_s", s.time.duration_s, e);
+    // ADR 0004 decision 2's window, read from `BOUNDS` so the page's slider and this
+    // check cannot disagree about it.
+    if let Some(b) = bound_of("time.mobility_step_ms")
+        && !b.admits(s.time.mobility_step_ms as f64)
+    {
         e.push(conflict(
             "time.mobility_step_ms",
             format!(
-                "is {}, and ADR 0004 decision 2 allows 10–100 ms: below 10 ms no mobility \
-                 provider is calibrated for the step, and above 100 ms the published \
+                "is {}, and ADR 0004 decision 2 allows {} ms: below the floor no mobility \
+                 provider is calibrated for the step, and above the ceiling the published \
                  constant-velocity extrapolation between steps stops being accurate enough \
                  for frame-level radio",
-                s.time.mobility_step_ms
+                s.time.mobility_step_ms,
+                b.describe()
             ),
         ));
     }
@@ -293,44 +758,36 @@ fn world(s: &Scenario, e: &mut Vec<ScenarioError>) {
         ));
     }
     if let Some(mpl) = s.world.buildings.metres_per_level {
-        in_range(
+        bounded_at(
             "world.buildings.metres_per_level",
-            "the storey height",
+            "world.buildings.metres_per_level",
             mpl,
-            1.5,
-            10.0,
             e,
         );
     }
 }
 
 fn actors(s: &Scenario, e: &mut Vec<ScenarioError>) {
-    in_range(
+    bounded_at(
         "actors.vehicles.equipped_fraction",
-        "the equipped fraction",
+        "actors.vehicles.equipped_fraction",
         s.actors.vehicles.equipped_fraction,
-        0.0,
-        1.0,
         e,
     );
-    in_range(
+    bounded_at(
         "actors.vru.device_fraction",
-        "the device fraction",
+        "actors.vru.device_fraction",
         s.actors.vru.device_fraction,
-        0.0,
-        1.0,
         e,
     );
 
     if !s.actors.vehicles.classes.is_empty() {
         let mut total = 0.0;
         for (name, c) in &s.actors.vehicles.classes {
-            in_range(
+            bounded_at(
+                "actors.vehicles.classes.*.fraction",
                 &format!("actors.vehicles.classes.{name}.fraction"),
-                "the class share",
                 c.fraction,
-                0.0,
-                1.0,
                 e,
             );
             total += c.fraction;
@@ -358,8 +815,22 @@ fn actors(s: &Scenario, e: &mut Vec<ScenarioError>) {
         ));
     }
 
+    let profiles = all_profile_ids();
     let mut seen_sites = BTreeSet::new();
     for (i, r) in s.actors.rsus.iter().enumerate() {
+        if let Some(profile) = &r.profile
+            && !profiles.contains(&profile.as_str())
+        {
+            e.push(conflict(
+                &format!("actors.rsus[{i}].profile"),
+                format!(
+                    "'{profile}' is not a hardware profile this build ships, and an \
+                     unknown one silently becomes the reference on-board unit; shipped \
+                     profiles: {}",
+                    profiles.join(", ")
+                ),
+            ));
+        }
         match (r.site, r.position_m) {
             (Some(site), None) => {
                 if !seen_sites.insert(site) {
@@ -404,6 +875,22 @@ fn actors(s: &Scenario, e: &mut Vec<ScenarioError>) {
         .map(String::as_str)
         .collect();
     for (i, l) in s.actors.backend.links.iter().enumerate() {
+        if let Some(latency) = l.latency_ms {
+            bounded_at(
+                "actors.backend.links[].latency_ms",
+                &format!("actors.backend.links[{i}].latency_ms"),
+                latency,
+                e,
+            );
+        }
+        if let Some(capacity) = l.capacity_mbps {
+            bounded_at(
+                "actors.backend.links[].capacity_mbps",
+                &format!("actors.backend.links[{i}].capacity_mbps"),
+                capacity,
+                e,
+            );
+        }
         for (end, name) in [("from", &l.from), ("to", &l.to)] {
             if !entities.contains(name.as_str()) {
                 e.push(conflict(
@@ -419,6 +906,19 @@ fn actors(s: &Scenario, e: &mut Vec<ScenarioError>) {
                 ));
             }
         }
+    }
+}
+
+/// Weather at `t0`.
+///
+/// The two ranges here were the gap the schema's own header forbids: `intensity` and
+/// `visibility_m` were defaulted and unchecked, so a scenario could state an intensity of
+/// 40 and the propagation model would be handed it. A generated form would have offered
+/// an unbounded number box for a `[0, 1]` quantity.
+fn weather(s: &Scenario, e: &mut Vec<ScenarioError>) {
+    bounded_at("weather.intensity", "weather.intensity", s.weather.intensity, e);
+    if let Some(v) = s.weather.visibility_m {
+        bounded_at("weather.visibility_m", "weather.visibility_m", v, e);
     }
 }
 
@@ -466,12 +966,13 @@ fn radio(s: &Scenario, e: &mut Vec<ScenarioError>) {
             ));
         }
         if let crate::scenario::schema::FocusRegion::Follow { radius_m, .. } = f.region
-            && !(radius_m.is_finite() && radius_m > 0.0)
         {
-            e.push(conflict(
+            bounded_at(
                 "radio.tiers.focus.region.radius_m",
-                format!("is {radius_m}, and a follow radius is a positive number of metres"),
-            ));
+                "radio.tiers.focus.region.radius_m",
+                radius_m,
+                e,
+            );
         }
     }
 }
@@ -586,12 +1087,18 @@ fn security(s: &Scenario, e: &mut Vec<ScenarioError>) {
         )),
     }
     if let Some(period) = p.period_s {
-        in_range(
+        bounded_at(
             "security.pseudonym_change.period_s",
-            "the period",
+            "security.pseudonym_change.period_s",
             period,
-            1.0,
-            86_400.0,
+            e,
+        );
+    }
+    if let Some(distance) = p.distance_m {
+        bounded_at(
+            "security.pseudonym_change.distance_m",
+            "security.pseudonym_change.distance_m",
+            distance,
             e,
         );
     }
@@ -606,6 +1113,35 @@ fn nodes(s: &Scenario, e: &mut Vec<ScenarioError>) {
              service times of a whole run invisibly (06-node-models.md §1)"
                 .to_string(),
         ));
+    }
+    let obus = obu_profile_ids();
+    if !s.nodes.default_obu.trim().is_empty() && !obus.contains(&s.nodes.default_obu.as_str()) {
+        // Until this rule existed an unknown id fell through to the reference profile
+        // without a word, so a scenario could name a device that does not ship and get a
+        // different one's service times. The shipped default was itself such an id.
+        e.push(conflict(
+            "nodes.default_obu",
+            format!(
+                "'{}' is not a hardware profile this build ships, and an unknown profile \
+                 silently becomes the reference on-board unit — which would set the \
+                 service times of the whole run to a device the scenario did not name. \
+                 Shipped on-board units: {}",
+                s.nodes.default_obu,
+                obus.join(", ")
+            ),
+        ));
+    }
+    for (name, profile) in &s.nodes.per_class {
+        if !obus.contains(&profile.as_str()) {
+            e.push(conflict(
+                &format!("nodes.per_class.{name}"),
+                format!(
+                    "'{profile}' is not a hardware profile this build ships; shipped \
+                     on-board units: {}",
+                    obus.join(", ")
+                ),
+            ));
+        }
     }
     for name in s.nodes.per_class.keys() {
         if !s.actors.vehicles.classes.is_empty() && !s.actors.vehicles.classes.contains_key(name) {
@@ -647,12 +1183,10 @@ fn threats(s: &Scenario, e: &mut Vec<ScenarioError>) {
             ));
         }
         if let Some(f) = a.fraction {
-            in_range(
+            bounded_at(
+                "threats.attackers[].fraction",
                 &format!("threats.attackers[{i}].fraction"),
-                "the attacker fraction",
                 f,
-                0.0,
-                1.0,
                 e,
             );
         }

@@ -93,8 +93,11 @@ export function ComparePane(): React.JSX.Element | null {
         </button>
         <span className="chip">{side.actors} actors</span>
         {compare.worldBorrowed ? (
-          <span className="chip warn-chip" title="§7.1 keeps the world out of a recording, so side A's geometry is drawn here.">
-            world from A
+          <span
+            className="chip warn-chip"
+            title="A recording does not contain the streets, so the ones from the run on the left are drawn here."
+          >
+            streets from A
           </span>
         ) : null}
       </div>

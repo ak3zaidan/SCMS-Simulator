@@ -37,7 +37,6 @@ export function Viewport(): React.JSX.Element {
   const cameraMode = useStudio((s) => s.cameraMode);
   const selectedActor = useStudio((s) => s.selectedActor);
   const selectedNode = useStudio((s) => s.selectedNode);
-  const connection = useStudio((s) => s.connection);
   const world = useStudio((s) => s.world);
   const hudDocked = useStudio((s) => s.hudDocked);
   const setHudDocked = useStudio((s) => s.setHudDocked);
@@ -166,11 +165,12 @@ export function Viewport(): React.JSX.Element {
         </button>
       </div>
 
-      {connection === "streaming" ? null : (
-        <div className="note info" style={{ position: "absolute", top: 48, left: 8 }}>
-          Stream is {connection}. The viewport shows the last decoded state.
-        </div>
-      )}
+      {/*
+        There is no status note floating here any more. It said "Stream is closed. The viewport
+        shows the last decoded state." — the connection token, with no reason and no action, over
+        the picture. The same state is now one sentence with its button in `StatusBanner`, in the
+        flow above the viewport where it does not cover anything.
+      */}
 
       <StateLegend />
       {hudDocked ? null : <ObuHud />}

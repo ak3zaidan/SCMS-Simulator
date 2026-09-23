@@ -22,9 +22,9 @@
  */
 
 import {
-  ACESFilmicToneMapping,
   Color,
   Fog,
+  NeutralToneMapping,
   PCFSoftShadowMap,
   PerspectiveCamera,
   SRGBColorSpace,
@@ -78,12 +78,37 @@ export interface ViewerOptions {
   readonly nearM?: number;
   /** Camera far plane, metres. Default 12,000. */
   readonly farM?: number;
+  /**
+   * Fade the far distance into the sky colour in the street-level camera modes. Default true.
+   *
+   * Fog is what gives a street view a horizon and a sense of scale. It is deliberately *not*
+   * applied in `map`, where it would grey out the plan view — which is why it used to be off
+   * everywhere, and why a chase camera had 3 km of city in perfect focus and no depth at all.
+   * {@link Viewer.setFog} takes over from this permanently; {@link Viewer.setDepthCueing} hands it
+   * back.
+   */
+  readonly depthCueing?: boolean;
+  /** Distance at which street-level fog begins, metres. Default 140. */
+  readonly depthCueNearM?: number;
+  /** Distance at which street-level fog is total, metres. Default 1,200. */
+  readonly depthCueFarM?: number;
   /** Start the rAF loop on mount. Default true. */
   readonly autoStart?: boolean;
   /** Called after each fixed step; for deterministic per-step work. */
   readonly onFixedStep?: (stepSeconds: number, clockSeconds: number) => void;
   /** Called after each rendered frame. */
   readonly onFrame?: (dtSeconds: number, clockSeconds: number) => void;
+}
+
+/** Where the live actors are, returned by {@link Viewer.liveActorFraming}. */
+export interface ActorFraming {
+  /** How many live actors the box covers. */
+  readonly count: number;
+  readonly centerX: number;
+  readonly centerY: number;
+  readonly centerZ: number;
+  /** The larger horizontal span of the box, metres. */
+  readonly extentM: number;
 }
 
 /** What one frame did, returned by {@link Viewer.renderFrame}. */
@@ -122,8 +147,14 @@ function defaultCreateRenderer(canvas: ViewerCanvas, options: ViewerOptions): Vi
     stencil: false,
   });
   renderer.outputColorSpace = SRGBColorSpace;
-  renderer.toneMapping = ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.05;
+  // Khronos PBR Neutral rather than ACES filmic. ACES has a heavy toe: a lit surface at 0.017 in
+  // linear space came out at 0.008, so the dark theme's road and ground — authored as display
+  // values and consumed as albedo — landed at about #141414 and the plan view read as a black void
+  // with a few white strips in it. Neutral is near-identity through the midtones and only rolls off
+  // the highlights, so a surface displays roughly the colour the theme asked for, which is the
+  // right contract for an instrument. The bright crossings still do not clip.
+  renderer.toneMapping = NeutralToneMapping;
+  renderer.toneMappingExposure = 1;
   renderer.shadowMap.enabled = options.shadows ?? true;
   renderer.shadowMap.type = PCFSoftShadowMap;
   const dpr = typeof devicePixelRatio === "number" ? devicePixelRatio : 1;
@@ -167,6 +198,15 @@ export class Viewer {
   #height = 720;
   #selectedActorId: number | null = null;
   #followSlot = -1;
+  /** One reused `Fog`; toggling it is a reference swap, never an allocation in the render loop. */
+  #fog: Fog | null = null;
+  #depthCueing: boolean;
+  #depthCueNear: number;
+  #depthCueFar: number;
+  /** The camera mode the fog state was last computed for; `null` forces a recompute. */
+  #cuedMode: CameraMode | null = null;
+  /** Set by {@link setFog}, after which the mode stops driving the fog. */
+  #fogUserSet = false;
   #detachClient: (() => void) | null = null;
   #lastReport: FrameReport = {
     dtSeconds: 0, clockSeconds: 0, fixedSteps: 0, actorsDrawn: 0, actorsCulled: 0,
@@ -183,6 +223,9 @@ export class Viewer {
     this.#maxSubSteps = Math.max(1, options.maxSubSteps ?? 6);
     this.#maxFrame = options.maxFrameSeconds ?? 0.25;
     this.#pixelRatioCap = options.pixelRatioCap ?? 1.5;
+    this.#depthCueing = options.depthCueing ?? true;
+    this.#depthCueNear = options.depthCueNearM ?? 140;
+    this.#depthCueFar = options.depthCueFarM ?? 1200;
 
     this.scene.name = "vwp";
     this.scene.background = new Color(this.#theme.background);
@@ -204,7 +247,11 @@ export class Viewer {
       maxActors: options.maxActors ?? 20_000,
     });
     this.overlays = new OverlayManager({ theme: this.#theme, world: this.worldRenderer });
-    this.cameras = new CameraController({ camera: this.camera, world: this.worldRenderer });
+    this.cameras = new CameraController({
+      camera: this.camera,
+      world: this.worldRenderer,
+      onFrameActors: () => { this.frameActors(); },
+    });
     this.picker = new Picker({
       camera: this.camera,
       classes: this.actors.classes,
@@ -348,6 +395,8 @@ export class Viewer {
     // references this viewer created and nothing else owns (Q8).
     this.scene.background = null;
     this.scene.fog = null;
+    this.#fog = null;
+    this.#cuedMode = null;
   }
 
   // -------------------------------------------------------------------------------------------
@@ -438,6 +487,10 @@ export class Viewer {
     this.worldRenderer.setTheme(this.#theme);
     this.actors.setTheme(this.#theme);
     this.overlays.setTheme(this.#theme);
+    // The fog is a theme colour, so a swap has to repaint it or a light world fades into a dark sky.
+    this.#cuedMode = null;
+    if (this.#fogUserSet && this.#fog) this.#fog.color.setHex(this.#theme.fogColor);
+    this.#syncDepthCueing();
   }
 
   /** Hours in `[0, 24)`; drives the sun, the sky gradient and the fill light. */
@@ -445,13 +498,69 @@ export class Viewer {
     this.worldRenderer.setTimeOfDay(hours);
   }
 
-  /** Distance fog, off by default: at map altitudes it would grey out the whole plan view. */
+  /**
+   * Set the fog by hand, and stop the camera mode driving it.
+   *
+   * Calling this is a statement that the caller wants a particular fog, so
+   * {@link ViewerOptions.depthCueing} steps aside until {@link setDepthCueing} hands control back —
+   * the same rule the Studio uses for the buildings overlay.
+   */
   setFog(enabled: boolean, nearM?: number, farM?: number): void {
+    this.#fogUserSet = true;
+    this.#applyFog(enabled, this.#theme.fogColor, nearM ?? this.#theme.fogNear, farM ?? this.#theme.fogFar);
+  }
+
+  /**
+   * Hand the fog back to the camera mode (see {@link ViewerOptions.depthCueing}), or turn automatic
+   * depth cueing off entirely.
+   */
+  setDepthCueing(enabled: boolean, nearM?: number, farM?: number): void {
+    this.#depthCueing = enabled;
+    this.#fogUserSet = false;
+    if (nearM !== undefined) this.#depthCueNear = Math.max(1, nearM);
+    if (farM !== undefined) this.#depthCueFar = Math.max(this.#depthCueNear + 1, farM);
+    this.#cuedMode = null;
+    this.#syncDepthCueing();
+  }
+
+  /** Whether the camera mode is currently driving the fog. */
+  get depthCueing(): boolean {
+    return this.#depthCueing && !this.#fogUserSet;
+  }
+
+  /**
+   * Put the fog where the camera mode wants it. O(1), and a no-op unless the mode changed, so
+   * calling it every frame costs one comparison and never recompiles a shader.
+   *
+   * Toggling `scene.fog` between null and non-null *does* recompile every material that reads it,
+   * which is why this is gated on the mode rather than on the camera's altitude: an altitude
+   * threshold would recompile the world twice per wheel-click near the boundary.
+   */
+  #syncDepthCueing(): void {
+    if (this.#fogUserSet || !this.#depthCueing) return;
+    const mode = this.cameras.mode;
+    if (mode === this.#cuedMode) return;
+    this.#cuedMode = mode;
+    // The plan view keeps its clarity; every ground-level mode gets aerial perspective.
+    this.#applyFog(mode !== "map", this.#theme.skyHorizon, this.#depthCueNear, this.#depthCueFar);
+  }
+
+  /** Reuse the one `Fog` instance; only the reference on the scene moves. */
+  #applyFog(enabled: boolean, colorHex: number, nearM: number, farM: number): void {
     if (!enabled) {
       this.scene.fog = null;
       return;
     }
-    this.scene.fog = new Fog(this.#theme.fogColor, nearM ?? this.#theme.fogNear, farM ?? this.#theme.fogFar);
+    let fog = this.#fog;
+    if (!fog) {
+      fog = new Fog(colorHex, nearM, farM);
+      this.#fog = fog;
+    } else {
+      fog.color.setHex(colorHex);
+      fog.near = nearM;
+      fog.far = farM;
+    }
+    this.scene.fog = fog;
   }
 
   // -------------------------------------------------------------------------------------------
@@ -481,6 +590,99 @@ export class Viewer {
   /** Change camera mode, keeping whatever is being followed. */
   setCameraMode(mode: CameraMode, instant = false): void {
     this.cameras.setMode(mode, instant);
+    this.#syncDepthCueing();
+  }
+
+  /**
+   * Where the live actors are, or null when the stream has none.
+   *
+   * `extentM` is the larger horizontal span of their bounding box, so it can go straight into
+   * {@link CameraController.fitExtent}.
+   */
+  liveActorFraming(): ActorFraming | null {
+    const pos = this.interpolator.outPosition;
+    const occ = this.interpolator.outOccupied;
+    const n = this.interpolator.count;
+    let count = 0;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    let sumZ = 0;
+    for (let slot = 0; slot < n; slot++) {
+      if (occ[slot] !== 1) continue;
+      const p = slot * 3;
+      const x = pos[p];
+      const y = pos[p + 1];
+      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      sumZ += pos[p + 2];
+      count++;
+    }
+    if (count === 0) return null;
+    return {
+      count,
+      centerX: (minX + maxX) / 2,
+      centerY: (minY + maxY) / 2,
+      centerZ: sumZ / count,
+      extentM: Math.max(maxX - minX, maxY - minY),
+    };
+  }
+
+  /**
+   * Frame the camera on the live actors and return how many it framed; 0 means there were none and
+   * the camera did not move.
+   *
+   * This is the answer to the review's "with one actor in a square kilometre of city the user
+   * cannot see it": the plan view opens on the whole world, a single vehicle is a few pixels
+   * somewhere in it, and there is no way to ask where. The camera flies rather than cuts, so the
+   * user keeps their bearings — and `minExtentM` stops a lone vehicle from zooming the map to a
+   * 4 m window around its own roof.
+   *
+   * It does not change the camera mode. In the street-level modes the camera is already on an
+   * actor, and the one thing a "show me the vehicles" control must not do is throw away the view
+   * the user chose.
+   */
+  frameActors(paddingM = 90, minExtentM = 240): number {
+    const f = this.liveActorFraming();
+    if (!f) return 0;
+    this.cameras.focusOn(f.centerX, f.centerY, f.centerZ);
+    this.cameras.fitExtent(Math.max(minExtentM, f.extentM + paddingM * 2));
+    // Nothing followed yet: adopt one, so the chase and dashboard modes and the follow chip have a
+    // subject the moment the user asks for them.
+    if (this.cameras.followActorId === null) {
+      const slot = this.#nearestLiveSlot(f.centerX, f.centerY);
+      if (slot >= 0) {
+        const id = this.interpolator.outActorId[slot];
+        this.select(id);
+        this.cameras.follow(id);
+      }
+    }
+    return f.count;
+  }
+
+  /** Slot of the live actor nearest `(x, y)`, or −1. */
+  #nearestLiveSlot(x: number, y: number): number {
+    const pos = this.interpolator.outPosition;
+    const occ = this.interpolator.outOccupied;
+    const n = this.interpolator.count;
+    let best = -1;
+    let bestD = Infinity;
+    for (let slot = 0; slot < n; slot++) {
+      if (occ[slot] !== 1) continue;
+      const p = slot * 3;
+      const dx = pos[p] - x;
+      const dy = pos[p + 1] - y;
+      const d = dx * dx + dy * dy;
+      if (d < bestD) {
+        bestD = d;
+        best = slot;
+      }
+    }
+    return best;
   }
 
   /** Pick whatever is under a canvas pixel. `(0, 0)` is the top-left corner. */
@@ -555,11 +757,16 @@ export class Viewer {
     this.cameras.update(dt);
 
     // 3. Static scene follow-ups.
+    this.#syncDepthCueing();
     this.worldRenderer.followCamera(this.camera);
     this.worldRenderer.setShadowFocus(this.cameras.look.x, this.cameras.look.y, this.cameras.look.z);
     this.worldRenderer.updateLod(this.camera);
 
-    // 4. Actors: cull, LOD, instance write.
+    // 4. Actors: cull, LOD, instance write. From the driver's seat the camera is inside the
+    // followed car's own body, so that one instance is not written.
+    this.actors.hiddenActorId = this.cameras.mode === "dashboard"
+      ? this.cameras.followActorId ?? -1
+      : -1;
     const actorStats = this.actors.update({
       position: this.interpolator.outPosition,
       heading: this.interpolator.outHeading,
@@ -582,6 +789,9 @@ export class Viewer {
       count: this.interpolator.count,
       visibleSlots: this.actors.visibleSlots,
       visibleCount: this.actors.visibleCount,
+      actorId: this.interpolator.outActorId,
+      selectedActorId: this.#selectedActorId,
+      liveCount: actorStats.live,
     });
 
     // 6. Picking data: O(1), the grid is only built if somebody clicks.

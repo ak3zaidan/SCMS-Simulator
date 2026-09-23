@@ -89,11 +89,46 @@ clean-incremental:
 
 # --- run and serve ------------------------------------------------------------
 
-# Run a scenario through the engine. TODO (Phase 1): awaiting v2xw-engine (D8).
+[doc("Run a scenario end to end, writing its recording, metrics and manifest")]
 run SCENARIO:
-    @echo "TODO (Phase 1): 'cargo run -p v2xw-cli -- run {{SCENARIO}}' once v2xw-engine exists (build-decision D8)."
+    cargo run --release --quiet -p v2xw-cli -- run {{SCENARIO}}
 
-# Serve the Studio UI in development mode.
+[doc("Check a scenario without running it; prints the field-level errors")]
+validate SCENARIO:
+    cargo run --release --quiet -p v2xw-cli -- validate {{SCENARIO}}
+
+[doc("Print a recording's manifest, channels and verification report")]
+inspect RECORDING:
+    cargo run --release --quiet -p v2xw-cli -- info {{RECORDING}}
+
+[doc("Expand a scenario's experiment block into runs and aggregate them")]
+experiment SCENARIO:
+    cargo run --release --quiet -p v2xw-cli -- experiment run {{SCENARIO}}
+
+# On a small machine keep this serial: the release build of the whole workspace
+# with parallel jobs is what exhausted 8 GB and killed a whole wave of work.
+[doc("Build the command-line tool in release, one compile job at a time")]
+build-cli:
+    cargo build --release -j 1 -p v2xw-cli
+
+# The two processes the browser interface needs, in two terminals.
+#
+# `just serve <scenario>` is the engine behind a WebSocket on port 8787, and
+# `just studio` is the page. Start the server first; the page connects to it.
+
+[doc("Serve a real run over the wire protocol on port 8787")]
+serve SCENARIO:
+    cargo run --release --quiet -p v2xw-server -- --scenario {{SCENARIO}} --port 8787
+
+[doc("Serve the synthetic fixture stream — no map import, for browser work")]
+serve-fixture ACTORS="200":
+    cargo run --release --quiet -p v2xw-server -- --actors {{ACTORS}} --port 8787
+
+[doc("Build the server in release, one compile job at a time")]
+build-server:
+    cargo build --release -j 1 -p v2xw-server
+
+# Serve the Studio UI in development mode. Needs `just serve` in another terminal.
 studio:
     pnpm --dir ui dev
 

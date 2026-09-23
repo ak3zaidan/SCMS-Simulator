@@ -1,15 +1,22 @@
 /**
- * The inspector's "why" tab (09-ui §5, protocol §3.8 and §6.9).
+ * The inspector's "why" tab: where a number came from.
+ *
+ * This is the most valuable panel in the Studio and the cleanup had to make it clearer, not
+ * quieter. What changed is the wording, not the chain: the section numbers and wire field names
+ * moved behind the developer-details toggle, and what is left says the same things in the language
+ * of someone studying vehicle communication.
  *
  * Resolution order, and it matters:
- *  1. If the displayed value carries a `prov_id` on the wire — metric samples (§3.7) and several
- *     event payloads do — it is resolved locally out of the `Provenance` frames (§3.8) into
- *     (model id, model version, parameter-set id) with a link to the model card. No round trip.
- *  2. Otherwise the tab says so, in those words, and offers `explain` (§6.9), which resolves the
- *     same thing server-side for values the binary stream does not tag.
+ *  1. If the value arrived with a model reference attached — measurement samples and several event
+ *     payloads do — the model, its version and its parameter set are resolved out of what the
+ *     engine already sent. No round trip.
+ *  2. Otherwise the tab says so plainly and offers to ask the engine, which answers the same
+ *     question for values the binary stream does not label.
+ *  3. If the browser computed the number — a frame rate, an overlay, a difference between two runs
+ *     — there is no model to name, and the panel says what did compute it, from what.
  *
- * `NodeTelemetry` fields are case 2: §3.5.2 has no `prov_id` column, so every HUD value lands here
- * with "no provenance id is carried for this value" rather than a blank panel.
+ * Telemetry fields are case 2: the stream's telemetry record has no room for a model reference, so
+ * every HUD value lands here with "the stream does not say" rather than a blank panel.
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -20,18 +27,16 @@ import { useStudio, type ProvEntry } from "../state/store.js";
 import { PROV_SUBJECT_KINDS } from "../lib/format.js";
 import type { ClientProvenance } from "../lib/provenance.js";
 
-/** The model-card families of 03-interfaces §12, in the order the schema lists them. */
+/** The families a model can belong to, in the order the interface schema lists them. */
 const FAMILIES = [
   "radio", "mobility", "network", "security", "protocol", "detection", "node", "backend", "world",
   "weather", "metric", "other",
 ] as const;
 
-function ProvCard({ entry }: { entry: ProvEntry }): React.JSX.Element {
+function ProvCard({ entry, dev }: { entry: ProvEntry; dev: boolean }): React.JSX.Element {
   return (
     <div className="section" data-testid="prov-card">
       <dl className="kv">
-        <dt>prov_id</dt>
-        <dd>{entry.provId}</dd>
         <dt>model</dt>
         <dd data-testid="prov-model-id">{entry.modelId || "—"}</dd>
         <dt>version</dt>
@@ -52,6 +57,12 @@ function ProvCard({ entry }: { entry: ProvEntry }): React.JSX.Element {
             <span className="faint">not published by this engine</span>
           )}
         </dd>
+        {dev ? (
+          <>
+            <dt>reference id</dt>
+            <dd>{entry.provId}</dd>
+          </>
+        ) : null}
       </dl>
     </div>
   );
@@ -65,7 +76,7 @@ function ProvCard({ entry }: { entry: ProvEntry }): React.JSX.Element {
  * client-side number starts looking like a simulation result. What it does carry is the thing that
  * makes the value checkable: what computed it, from which inputs, under which rule.
  */
-function ClientCard({ info }: { info: ClientProvenance }): React.JSX.Element {
+function ClientCard({ info, dev }: { info: ClientProvenance; dev: boolean }): React.JSX.Element {
   return (
     <div className="section" data-testid="client-prov-card">
       <dl className="kv">
@@ -77,8 +88,14 @@ function ClientCard({ info }: { info: ClientProvenance }): React.JSX.Element {
         <dd>{info.inputs}</dd>
         {info.reference ? (
           <>
-            <dt>follows</dt>
+            <dt>the rule it follows</dt>
             <dd>{info.reference}</dd>
+          </>
+        ) : null}
+        {dev && info.specRef ? (
+          <>
+            <dt>written down in</dt>
+            <dd>{info.specRef}</dd>
           </>
         ) : null}
         {info.quantisation ? (
@@ -140,6 +157,7 @@ export function WhyTab(): React.JSX.Element {
   const metricProvenance = useStudio((s) => s.metricProvenance);
   const metricDims = useStudio((s) => s.metricDims);
   const provenanceCount = useStudio((s) => s.provenanceCount);
+  const devDetails = useStudio((s) => s.devDetails);
   const [explain, setExplain] = useState<ExplainResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -183,7 +201,9 @@ export function WhyTab(): React.JSX.Element {
           it, or, when the browser computed it, with the computation and its inputs.
         </p>
         <p className="faint">
-          {provenanceCount} provenance entries received on this connection (§3.8).
+          {provenanceCount === 0
+            ? "No models described yet on this connection. They arrive with the first measurements."
+            : `${provenanceCount} model${provenanceCount === 1 ? "" : "s"} described so far on this connection.`}
         </p>
       </div>
     );
@@ -202,11 +222,20 @@ export function WhyTab(): React.JSX.Element {
             {why.label}
             {why.value !== undefined ? ` = ${why.value}` : ""}
           </dd>
-          <dt>ref</dt>
-          <dd>
-            {why.kind} · {why.id}
-            {why.node !== undefined ? ` · node ${why.node}` : ""}
-          </dd>
+          {why.node !== undefined ? (
+            <>
+              <dt>measured at</dt>
+              <dd>radio {why.node}</dd>
+            </>
+          ) : null}
+          {devDetails ? (
+            <>
+              <dt>wire reference</dt>
+              <dd>
+                {why.kind} · {why.id}
+              </dd>
+            </>
+          ) : null}
           {why.unit ? (
             <>
               <dt>unit</dt>
@@ -216,7 +245,9 @@ export function WhyTab(): React.JSX.Element {
           {why.kind === "metric" && metricDims[why.id] ? (
             <>
               <dt>dimensions</dt>
-              <dd title="§3.8 dimension dictionary, resolved from MetricSample.dim_key">{metricDims[why.id]}</dd>
+              <dd title="The conditions this measurement was taken under, as the engine labelled them">
+                {metricDims[why.id]}
+              </dd>
             </>
           ) : null}
         </dl>
@@ -228,28 +259,42 @@ export function WhyTab(): React.JSX.Element {
             Computed in the browser, not by the engine. There is no model card for this number because there
             is no model behind it; what produced it is below.
           </div>
-          <ClientCard info={why.client} />
+          <ClientCard info={why.client} dev={devDetails} />
         </>
       ) : null}
 
       {local ? (
         <>
           <div className="note info">
-            Resolved locally from a <code>Provenance</code> frame (§3.8) — <code>prov_id {wireProvId}</code>.
+            The engine named the model behind this number as part of the stream, so this is its own account
+            of it — nothing here was inferred by the page.
           </div>
-          <ProvCard entry={local} />
+          <ProvCard entry={local} dev={devDetails} />
         </>
       ) : wireProvId !== undefined ? (
         <div className="note" data-testid="why-unresolved">
-          This value carries <code>prov_id {wireProvId}</code>, but no <code>Provenance</code> frame has
-          defined it yet. §3.8 requires the server to send one covering every id it references before the
-          next keyframe; until then the model behind this value is unknown.
+          This number points at a model the engine has not described yet. It is required to send the
+          description before the next full snapshot, so this should resolve itself within a second; if it
+          does not, the engine is referring to a model it never defined.
+          {devDetails ? (
+            <span className="faint">
+              {" "}
+              Unresolved reference id {wireProvId}.
+            </span>
+          ) : null}
         </div>
       ) : why.client ? null : (
         <div className="note" data-testid="why-absent">
-          <strong>No provenance id is carried for this value.</strong> The §3.5.2 <code>NodeTelemetry</code>{" "}
-          record has no <code>prov_id</code> column, so the binary stream cannot say which model produced it.
-          Ask the engine with <code>explain</code> (§6.9) instead.
+          <strong>The stream does not say which model produced this number.</strong> Telemetry travels as a
+          compact record with no room for a model reference, so the answer has to be asked for. Press the
+          button below and the engine will give the model, its version and its parameters.
+          {devDetails ? (
+            <span className="faint">
+              {" "}
+              The telemetry record carries no <code>prov_id</code> column; <code>explain</code> resolves it
+              server-side.
+            </span>
+          ) : null}
         </div>
       )}
 
@@ -263,16 +308,20 @@ export function WhyTab(): React.JSX.Element {
         */}
         {why.client === undefined || wireProvId !== undefined ? (
           <button type="button" onClick={() => void ask()} disabled={busy} data-testid="why-explain">
-            {busy ? "asking…" : "Ask the engine (explain)"}
+            {busy ? "asking…" : "Ask the engine why"}
           </button>
         ) : (
           <span className="faint" data-testid="why-no-explain">
-            <code>explain</code> (§6.9) is not offered: the engine never saw this value.
+            There is nothing to ask the engine: it never saw this number. What computed it is above.
           </span>
         )}
       </div>
 
-      {error ? <div className="note err">explain failed: {error}</div> : null}
+      {error ? (
+        <div className="note err">
+          The engine could not explain this one: {error}
+        </div>
+      ) : null}
 
       {explain ? (
         <div style={{ marginTop: 8 }} data-testid="why-explain-result">
@@ -284,7 +333,7 @@ export function WhyTab(): React.JSX.Element {
               </dd>
             </dl>
           ) : null}
-          <h3>Model chain ({explain.chain.length})</h3>
+          <h3>What produced it, step by step ({explain.chain.length})</h3>
           {explain.chain.map((info, i) => (
             <ExplainCard key={`${info.model_id}-${i}`} info={info} />
           ))}

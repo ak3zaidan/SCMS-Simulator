@@ -232,6 +232,31 @@ export interface ReplayView {
   readonly worldUnverified: boolean;
 }
 
+/**
+ * One recording this page has opened, kept so it can be opened again without the file picker.
+ *
+ * §6.15 has no method that lists recordings — there is no `runs.list` — so the Runs tab could only
+ * ever show the one live run and whichever file was open at that instant. Someone who had produced
+ * four recordings and wanted to look from one to the next had to find each file again, every time,
+ * and nothing on the page remembered that the others existed.
+ *
+ * The `File` handle is held, which is what makes reopening free: a `File` from an `<input>` stays
+ * readable for the life of the document, so switching between recordings is a seek and not an
+ * upload. It does not survive a reload — the browser will not let a page keep a file handle across
+ * one — so this list is honestly scoped to the session, and the panel says so rather than looking
+ * like a library that lost its contents.
+ */
+export interface RecordingEntry {
+  readonly id: string;
+  readonly name: string;
+  readonly bytes: number;
+  readonly startNs: number;
+  readonly endNs: number;
+  /** `Date.now()` when it was opened, for the ordering. */
+  readonly openedAt: number;
+  readonly file: File;
+}
+
 /** What comparison side B is, and where it is (09-ui §6). */
 export interface CompareSideView {
   /** `"engine"` — a second VWP connection; `"replay"` — a local recording read by WebAssembly. */
@@ -327,9 +352,23 @@ interface StudioState {
   why: WhySubject | null;
   inspectorTab: "state" | "why" | "log";
   hudDocked: boolean;
+  /**
+   * Whether the interface shows protocol internals: wire field names, method names, frame counts
+   * and the specification sections behind each model.
+   *
+   * Off by default. The audience is a researcher studying vehicle communication, and for them a
+   * sentence about a document section is noise standing where an explanation should be. For the
+   * person debugging the engine it is the most useful text on the page, so it is one checkbox away
+   * and nothing is deleted — every value keeps its explanation either way.
+   */
+  devDetails: boolean;
   seriesTick: number;
   target: EngineTargetView;
   replay: ReplayView | null;
+  /** Every recording opened in this page, newest first. */
+  recordings: readonly RecordingEntry[];
+  /** Which of them is driving the viewport, or `null` when the live run is. */
+  currentRecording: string | null;
   compare: CompareSideView | null;
   compareSync: CompareSync;
   compareDiffs: readonly MetricDiff[];
@@ -370,11 +409,21 @@ interface StudioState {
   setMetricProjection: (provenance: Readonly<Record<string, number>>, dims: Readonly<Record<string, string>>) => void;
   setWhy: (w: WhySubject | null) => void;
   setInspectorTab: (t: "state" | "why" | "log") => void;
+  setDevDetails: (v: boolean) => void;
   setHudDocked: (v: boolean) => void;
   bumpSeries: () => void;
   setTarget: (t: EngineTargetView) => void;
   /** Publish (or clear) the local recording's state; `null` means no recording is open. */
   setReplay: (r: ReplayView | null) => void;
+  /**
+   * Remember a recording, or refresh what is known about one already remembered.
+   *
+   * Keyed on name and size rather than on an incrementing id, so opening the same file twice from
+   * the picker updates one row instead of growing the list.
+   */
+  noteRecording: (r: RecordingEntry) => void;
+  forgetRecording: (id: string) => void;
+  setCurrentRecording: (id: string | null) => void;
   /**
    * Publish side B's summary. Driven by the compare controller's own tick, so it keeps the previous
    * object when nothing moved — the same rule the 5 Hz setters follow.
@@ -385,8 +434,29 @@ interface StudioState {
   setCompareMetrics: (names: readonly string[]) => void;
 }
 
+const DEV_DETAILS_KEY = "vwp.studio.devDetails";
+
+/** The developer-details preference, which survives a reload. Storage can throw; that is not fatal. */
+function readDevDetails(): boolean {
+  try {
+    return typeof localStorage !== "undefined" && localStorage.getItem(DEV_DETAILS_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeDevDetails(v: boolean): void {
+  try {
+    if (typeof localStorage !== "undefined") localStorage.setItem(DEV_DETAILS_KEY, v ? "1" : "0");
+  } catch {
+    /* a browser with storage denied still gets the toggle, just not the memory of it */
+  }
+}
+
 const MAX_LOGS = 300;
 export const MAX_MARKS = 600;
+/** How many recordings the Runs tab remembers. Each row holds a `File`, so the list is bounded. */
+const MAX_RECORDINGS = 24;
 
 /**
  * Whether two `StatsView`s carry the same numbers.
@@ -486,9 +556,12 @@ export const useStudio = create<StudioState>((set) => ({
   why: null,
   inspectorTab: "state",
   hudDocked: false,
+  devDetails: readDevDetails(),
   seriesTick: 0,
   target: UNRESOLVED_TARGET,
   replay: null,
+  recordings: [],
+  currentRecording: null,
   compare: null,
   compareSync: DEFAULT_SYNC,
   compareDiffs: [],
@@ -538,10 +611,24 @@ export const useStudio = create<StudioState>((set) => ({
     ),
   setWhy: (w) => set({ why: w, inspectorTab: w ? "why" : "state" }),
   setInspectorTab: (t) => set({ inspectorTab: t }),
+  setDevDetails: (v) => {
+    writeDevDetails(v);
+    set({ devDetails: v });
+  },
   setHudDocked: (v) => set({ hudDocked: v }),
   bumpSeries: () => set((state) => ({ seriesTick: state.seriesTick + 1 })),
   setTarget: (t) => set({ target: t }),
   setReplay: (r) => set({ replay: r }),
+  noteRecording: (r) =>
+    set((state) => ({
+      recordings: [r, ...state.recordings.filter((x) => x.id !== r.id)].slice(0, MAX_RECORDINGS),
+    })),
+  forgetRecording: (id) =>
+    set((state) => ({
+      recordings: state.recordings.filter((r) => r.id !== id),
+      currentRecording: state.currentRecording === id ? null : state.currentRecording,
+    })),
+  setCurrentRecording: (id) => set({ currentRecording: id }),
   setCompare: (c) => set((state) => (sameCompare(state.compare, c) ? state : { compare: c })),
   setCompareSync: (patch) => set((state) => ({ compareSync: { ...state.compareSync, ...patch } })),
   setCompareDiffs: (d) => set((state) => (sameDiffs(state.compareDiffs, d) ? state : { compareDiffs: d })),

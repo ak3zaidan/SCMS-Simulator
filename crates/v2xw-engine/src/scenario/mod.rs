@@ -31,6 +31,7 @@
 
 pub mod merge;
 pub mod migrate;
+pub mod publish;
 pub mod schema;
 pub mod validate;
 
@@ -46,9 +47,10 @@ pub use schema::{
     Actors, Attacker, Backend, BackendEntity, BackendLink, BuildingOptions, CURRENT_SCHEMA,
     CryptoModeSpec, DemandSpec, Detection, DilationWindow, Experiment, ExporterSpec, Focus,
     FocusRegion, Messages, Meta, ModelChoice, Net, Nodes, Radio, RadioTiers, Rat, Rsu, Scenario,
-    Security, SignerIdPolicySpec, TerrainOptions, Threats, Time, TimelineItem, TimelineKind,
-    VehicleClassSpec, Vehicles, Vru, Weather, WorldSpec,
+    PseudonymChangeSpec, Security, SignerIdPolicySpec, TerrainOptions, Threats, Time,
+    TimelineItem, TimelineKind, VehicleClassSpec, Vehicles, Vru, Weather, WorldSpec,
 };
+pub use publish::{surface as scenario_surface, schema as scenario_schema};
 pub use validate::{resolve_path, validate};
 
 /// How many `meta.base` references may chain before the loader gives up.

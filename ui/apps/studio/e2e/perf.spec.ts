@@ -15,7 +15,7 @@ const mode = process.env.VWP_HEADED === "1" ? "headed-gpu" : "headless-swiftshad
 
 test(`frame rate with ${actors} actors`, async ({ page }) => {
   await page.goto("/");
-  await expect(page.getByTestId("connection-state")).toHaveText("streaming", { timeout: 60_000 });
+  await expect(page.getByTestId("connection-state")).toHaveAttribute("data-state", "streaming", { timeout: 60_000 });
 
   // Wait until the pose buffer holds roughly the requested traffic and the world is built.
   await expect

@@ -484,6 +484,8 @@ pub const MIN_PLAUSIBLE_ELEVATION_M: f64 = -500.0;
 /// The highest elevation a terrestrial DEM sample can plausibly hold, metres.
 ///
 /// Everest is 8 849 m; 9 000 m leaves headroom and still rejects a byte-order mistake.
+/// Like [`MIN_PLAUSIBLE_ELEVATION_M`], the bound is this module's own choice and is on the
+/// model card with its calibration plan.
 pub const MAX_PLAUSIBLE_ELEVATION_M: f64 = 9_000.0;
 
 impl DemRaster {
@@ -1791,7 +1793,11 @@ fn dem_card(id: &str, dataset: Source, what: &str) -> ModelCard {
             "max_plausible_elevation_m",
             "m",
             MAX_PLAUSIBLE_ELEVATION_M.into(),
-            "as min_plausible_elevation_m",
+            "the upper half of the same range check: Everest is 8 849 m, so 9 000 m leaves \
+             headroom over any terrestrial sample while still rejecting a byte-order \
+             mistake, which turns a 100 m hill into tens of thousands of metres. Replace \
+             it with the published maximum of whichever DEM is in use, taken from the \
+             dataset's own statistics rather than from this module",
         ),
     ];
     ModelCard {

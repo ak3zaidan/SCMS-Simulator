@@ -498,7 +498,8 @@ fn card() -> ModelCard {
         Family::Codec,
         "1.0.0",
         "Validated size model for the SAE J2735 messages the engine does not really \
-         encode (SPaT, MAP, PSM, SRM, SSM): exact modelled size, placeholder bytes.",
+         encode (PSM, SRM, SSM): exact modelled size, placeholder bytes. The SPaT and MAP \
+         rows are retired and no longer claimed; see the limitations.",
     );
     card.tier = vec![Tier::Abstract, Tier::Medium, Tier::High];
     card.equations = vec![v2xw_core::card::Equation {
@@ -583,9 +584,10 @@ fn card() -> ModelCard {
             .to_string(),
     );
     card.limitations.push(
-        "Five of the eight rows have no published anchor at all, so their tolerance is \
+        "Six of the eight rows have no published anchor at all, so their tolerance is \
          undefined rather than zero, and they are marked todo-calibrate with the plan \
-         04-models.md §8.4 prescribes."
+         04-models.md §8.4 prescribes. The two that do are the MAP rows, against the \
+         CTI 4501 ceiling."
             .to_string(),
     );
     card.limitations.push(
@@ -783,19 +785,33 @@ mod tests {
         assert_eq!(a.payload_bytes(), 2_302 - (87 + 80) - 5);
     }
 
+    /// The claimed types size exactly and refuse to decode; a retired type is not claimed
+    /// at all.
+    ///
+    /// PSM is the example rather than SPaT because SPaT is encoded for real now
+    /// (`codec/uper/j2735-spat-map`, evidence `RealUperUnvalidated`) and this codec must
+    /// not claim it — build decision D2 allows exactly one tier per message type. A
+    /// retired type therefore comes back `Unsupported`, not `PlaceholderBytes`, and that
+    /// half is asserted here too so the retirement cannot quietly unwind.
     #[test]
     fn the_codec_produces_exact_sizes_and_refuses_to_decode_them() {
         let codec = J2735SizeCodec::new();
-        let request = SizeRequest::typical(MsgType::Spat, 8);
+        let request = SizeRequest::typical(MsgType::Psm, 8);
         let encoded = codec.encode(&Message::Modeled(request)).expect("encodes");
-        assert_eq!(encoded.size, 17 + 8 * 10);
+        assert_eq!(encoded.size, 27 + 8 * 8);
         assert_eq!(encoded.size_source, SizeSource::SizeModel(VERSION));
         assert!(!encoded.is_real());
 
-        let err = codec.decode(&encoded.bytes, MsgType::Spat).unwrap_err();
+        let err = codec.decode(&encoded.bytes, MsgType::Psm).unwrap_err();
         assert!(
             matches!(err, CodecError::PlaceholderBytes { .. }),
             "decoding a placeholder must say so: {err}"
+        );
+
+        let err = codec.decode(&encoded.bytes, MsgType::Spat).unwrap_err();
+        assert!(
+            matches!(err, CodecError::Unsupported { .. }),
+            "a retired type is not this codec's to decode: {err}"
         );
     }
 

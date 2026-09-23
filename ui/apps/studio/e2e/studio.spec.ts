@@ -77,11 +77,18 @@ test("the Studio streams VWP v1, renders actors, flies down on a click and fills
   await page.goto("/");
 
   // 1. The canvas mounts and the connection reaches `streaming` (§1.3).
+  //     The chip's *text* is now a sentence-case phrase for the reader ("Running", "Run finished");
+  //     the protocol token it used to print lives in `data-state`, which is what a test wants.
   await expect(page.getByTestId("viewer-canvas")).toBeVisible();
-  await expect(page.getByTestId("connection-state")).toHaveText("streaming", { timeout: 30_000 });
+  await expect(page.getByTestId("connection-state")).toHaveAttribute("data-state", "streaming", { timeout: 30_000 });
 
-  // 2. `Hello` arrived with an engine version (§3.1.1 str_engine_version).
+  // 2. `Hello` arrived with an engine version (§3.1.1 str_engine_version). The build string is no
+  //    longer in the header — eleven facts on one line was the defect — so it is read where it now
+  //    lives, in the header's Details disclosure.
+  await page.getByTestId("run-details-button").click();
   await expect(page.getByTestId("engine-version")).toContainText("vwp-mock-server");
+  await page.keyboard.press("Escape");
+  await page.mouse.click(700, 500);
 
   // 3. The world decoded and actors are in the pose buffer (§3.3/§3.4).
   await expect.poll(async () => (await probe(page)).worldLanes, { timeout: 30_000 }).toBeGreaterThan(0);
@@ -150,7 +157,9 @@ test("the Studio streams VWP v1, renders actors, flies down on a click and fills
   // 9. The "why" tab resolves (or explicitly does not resolve) provenance for a HUD value.
   await page.getByTestId("hud-cpu_util_pm").click();
   await expect(page.getByTestId("why-tab")).toBeVisible();
-  await expect(page.getByTestId("why-absent")).toContainText("No provenance id is carried");
+  // The same fact, said in the language of someone who has not read the protocol: the stream does
+  // not label this number with a model, so the engine has to be asked.
+  await expect(page.getByTestId("why-absent")).toContainText("does not say which model produced");
   await page.getByTestId("why-explain").click();
   await expect(page.getByTestId("why-explain-result")).toBeVisible({ timeout: 20_000 });
   await page.screenshot({ path: `${SHOTS}/03-why-tab.png` });
@@ -177,7 +186,10 @@ test("the Studio streams VWP v1, renders actors, flies down on a click and fills
     page.evaluate(() =>
       Array.from(document.querySelectorAll('[data-testid="copilot-panel"] .m .name')).map((e) => e.textContent ?? ""),
     );
-  await page.getByRole("button", { name: "Copilot" }).click();
+  // The tab is named "Commands" rather than "Copilot": the panel says in its own first line that
+  // no assistant is connected in this build, so naming it after one was the interface promising
+  // something the build does not have.
+  await page.getByRole("button", { name: "Commands" }).click();
   await expect(page.getByTestId("rpc-methods")).toBeVisible();
   const methodCount = await page.locator('[data-testid="rpc-methods"] .m').count();
   expect(methodCount).toBeGreaterThanOrEqual(32);
@@ -236,7 +248,7 @@ test("the Studio streams VWP v1, renders actors, flies down on a click and fills
 
 test("light theme renders and the actor-state legend keeps shape redundancy", async ({ page }) => {
   await page.goto("/");
-  await expect(page.getByTestId("connection-state")).toHaveText("streaming", { timeout: 30_000 });
+  await expect(page.getByTestId("connection-state")).toHaveAttribute("data-state", "streaming", { timeout: 30_000 });
   // The previous test leaves the run paused at t = 0; resume so this one sees moving traffic.
   const playing = await page.getByTestId("play").count();
   if (playing > 0) await page.getByTestId("play").click();

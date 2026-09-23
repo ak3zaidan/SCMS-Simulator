@@ -17,7 +17,6 @@ import { useStudio } from "../state/store.js";
 
 export function CopilotPanel(): React.JSX.Element {
   const methods = useStudio((s) => s.rpcMethods);
-  const title = useStudio((s) => s.rpcTitle);
   const calls = useStudio((s) => s.rpcCalls);
   const [filter, setFilter] = useState("");
   const [draft, setDraft] = useState("");
@@ -33,9 +32,9 @@ export function CopilotPanel(): React.JSX.Element {
     <>
       <div className="panel-body" data-testid="copilot-panel">
         <div className="note info">
-          <strong>Tool surface, not a chat yet.</strong> The {methods.length} methods below come from{" "}
-          <code>rpc.discover</code> ({title || "not answered"}), so the copilot&rsquo;s registry cannot drift
-          from the engine&rsquo;s. No model is connected.
+          <strong>No assistant is connected in this build.</strong> What is here is the list of everything
+          this engine can be asked to do — {methods.length} commands, published by the engine itself, so the
+          list cannot fall out of date — and a record of every command this page has sent.
         </div>
 
         <div className="field">
@@ -44,7 +43,7 @@ export function CopilotPanel(): React.JSX.Element {
         </div>
 
         <div className="section">
-          <h3>Tools ({shown.length})</h3>
+          <h3>What this engine accepts ({shown.length})</h3>
           <div className="method-list" data-testid="rpc-methods">
             {shown.map((m) => (
               <div className="m" key={m.name}>
@@ -54,13 +53,19 @@ export function CopilotPanel(): React.JSX.Element {
                 </span>
               </div>
             ))}
-            {shown.length === 0 ? <p className="dim">No methods — is the engine answering rpc.discover?</p> : null}
+            {shown.length === 0 ? (
+              <p className="dim">
+                {filter === ""
+                  ? "This engine did not publish a list of what it accepts. Press refresh below to ask again."
+                  : `Nothing matches “${filter}”.`}
+              </p>
+            ) : null}
           </div>
         </div>
 
         {missing.length > 0 ? (
           <div className="section">
-            <h3>In §6.15 but not advertised</h3>
+            <h3>Commands this page knows but this engine does not offer</h3>
             <div className="method-list">
               {missing.map((m) => (
                 <div className="m" key={m}>
@@ -72,7 +77,7 @@ export function CopilotPanel(): React.JSX.Element {
         ) : null}
 
         <div className="section">
-          <h3>Calls made ({calls.length})</h3>
+          <h3>Commands sent from this page ({calls.length})</h3>
           <div className="method-list">
             {calls.map((c, i) => (
               <div className="m" key={`${c.method}-${c.at}-${i}`}>
@@ -80,7 +85,12 @@ export function CopilotPanel(): React.JSX.Element {
                 <span className="sum">{new Date(c.at).toLocaleTimeString()}</span>
               </div>
             ))}
-            {calls.length === 0 ? <p className="dim">Nothing called yet.</p> : null}
+            {calls.length === 0 ? (
+              <p className="dim">
+                Nothing sent yet. Every button in the interface sends one of the commands above, and each
+                one appears here as it goes out.
+              </p>
+            ) : null}
           </div>
         </div>
       </div>
@@ -88,18 +98,18 @@ export function CopilotPanel(): React.JSX.Element {
       <div className="panel-foot">
         <input
           type="text"
-          placeholder="ask… (not wired to a model)"
+          placeholder="ask… (no assistant in this build)"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           aria-label="Copilot prompt"
           disabled
         />
-        <button type="button" disabled title="No model is connected in this build">
+        <button type="button" disabled title="No assistant is connected in this build">
           send
         </button>
         <button
           type="button"
-          title="Re-fetch the tool registry from rpc.discover"
+          title="Ask the engine again for the list of what it accepts"
           onClick={() => void engine.refreshRpcMethods()}
         >
           refresh

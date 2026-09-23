@@ -1,10 +1,15 @@
 /**
- * The right-hand inspector of 09-ui §6: `state · why · log`, with the neighbour table, the
- * certificate store, the CRL and the verify queue underneath, and the docked OBU HUD when the
- * viewport HUD is floated away.
+ * The right-hand inspector: what one radio is doing, why a number is what it is, and the log.
  *
- * The "state" tab is the §3.5.2 record in full — the same numbers the HUD condenses into six lines —
- * plus whatever `inspect.node` (§6.8) adds on top of the binary stream (neighbours, stores, certs).
+ * The "state" tab is the followed node's telemetry record in full — the same numbers the HUD
+ * condenses into six lines — plus the neighbour table, certificate store and queues the engine adds
+ * when asked about that node directly.
+ *
+ * Its empty state used to read "Nothing followed. Click an actor or an RSU in the viewport", which
+ * was an instruction to click something that, on a run with no vehicles on screen, was not there;
+ * and underneath it printed a 64-character world digest wrapped across two lines. It now says
+ * whether there is anything to click, and the identity of the run lives in the header's Details
+ * panel where one can copy it.
  */
 
 import { Fragment } from "react";
@@ -22,33 +27,41 @@ function StateTab(): React.JSX.Element {
   const inspect = useStudio((s) => s.inspect);
   const hello = useStudio((s) => s.hello);
   const setWhy = useStudio((s) => s.setWhy);
+  const actors = useStudio((s) => s.run.actors);
+  const devDetails = useStudio((s) => s.devDetails);
   const info = telemetryNode !== null ? engine.nodes.get(telemetryNode) : undefined;
 
   if (telemetryNode === null) {
     return (
-      <div className="panel-body">
-        <p className="dim">Nothing followed. Click an actor or an RSU in the viewport.</p>
+      <div className="panel-body" data-testid="inspector-empty">
+        <p className="dim" data-testid="inspector-empty-message">
+          {!hello
+            ? "Nothing to inspect yet — no run has been loaded."
+            : actors === 1
+              ? "Select the vehicle in the viewport and everything it knows appears here: what it is receiving, which certificates it holds, who its neighbours are."
+              : actors > 1
+                ? `Select any of the ${actors} vehicles or roadside units in the viewport and everything it knows appears here: what it is receiving, which certificates it holds, who its neighbours are.`
+                : "There is nothing on the map to select yet. Once the run has vehicles in it, choose one and everything it knows appears here."}
+        </p>
         {hello ? (
           <div className="section">
-            <h3>Connection</h3>
+            <h3>This run</h3>
             <dl className="kv">
-              <dt>run</dt>
-              <dd>{hello.runId}</dd>
-              <dt>engine</dt>
-              <dd>{hello.engineVersion}</dd>
               <dt>scenario</dt>
               <dd>{hello.scenarioName}</dd>
-              <dt>world hash</dt>
-              <dd style={{ fontSize: 10 }}>{hello.worldHash}</dd>
-              <dt>nodes</dt>
-              <dd>{hello.nodeCount}</dd>
-              <dt>classes</dt>
-              <dd>{hello.classNames.join(", ")}</dd>
-              <dt>origin</dt>
+              <dt>radios</dt>
+              <dd>{int(hello.nodeCount)}</dd>
+              <dt>vehicle types</dt>
+              <dd>{hello.classNames.join(", ") || "—"}</dd>
+              <dt>map centre</dt>
               <dd>
                 {hello.origin.lat.toFixed(5)}, {hello.origin.lon.toFixed(5)}
               </dd>
             </dl>
+            <p className="help">
+              The run&rsquo;s identity — its id and the digests of the world and the settings it was computed
+              from — is under <b>Details</b> in the header, where each one copies in full.
+            </p>
           </div>
         ) : null}
       </div>
@@ -79,7 +92,7 @@ function StateTab(): React.JSX.Element {
 
       {queues.length > 0 ? (
         <div className="section">
-          <h3>Queues (§3.5.2)</h3>
+          <h3>Queues</h3>
           <table className="table">
             <thead>
               <tr>
@@ -177,15 +190,22 @@ function StateTab(): React.JSX.Element {
 
       {inspect?.stores ? (
         <div className="section">
-          <h3>Stores (inspect.node)</h3>
+          <h3>Stored on this radio</h3>
           <pre className="mono" style={{ fontSize: 10, whiteSpace: "pre-wrap", margin: 0 }}>
             {JSON.stringify(inspect.stores, null, 1)}
           </pre>
         </div>
       ) : (
         <div className="note">
-          <code>inspect.node</code> returned no <code>stores</code> section, so the evidence buffer and the
-          trust store are unknown for this node (§6.8 lists them as optional).
+          This engine does not report what this radio has stored — its evidence buffer and its trust store
+          are not modelled at this level of detail, so they are unknown rather than empty.
+          {devDetails ? (
+            <span className="faint">
+              {" "}
+              <code>inspect.node</code> returned no <code>stores</code> section, which the interface
+              specification allows.
+            </span>
+          ) : null}
         </div>
       )}
     </div>
@@ -196,7 +216,12 @@ function LogTab(): React.JSX.Element {
   const logs = useStudio((s) => s.logs);
   return (
     <div className="panel-body log" data-testid="inspector-log">
-      {logs.length === 0 ? <p className="dim">No events yet.</p> : null}
+      {logs.length === 0 ? (
+        <p className="dim">
+          Nothing to report. Anything the engine or this page has to say about a run — a refused frame, a
+          failed command, a world that did not match — appears here as it happens.
+        </p>
+      ) : null}
       {logs.map((l, i) => (
         <div className="line" key={`${l.at}-${i}`}>
           <span className={`lvl ${l.level}`}>{l.level}</span>
@@ -219,7 +244,12 @@ export function Inspector(): React.JSX.Element {
     <>
       <div className="panel-head tabs">
         <span style={{ marginRight: 8, color: "var(--text)" }}>{label}</span>
-        <button type="button" className={tab === "state" ? "active" : ""} onClick={() => setTab("state")}>
+        <button
+          type="button"
+          className={tab === "state" ? "active" : ""}
+          onClick={() => setTab("state")}
+          title="Everything the selected radio is doing right now"
+        >
           state
         </button>
         <button
@@ -227,10 +257,16 @@ export function Inspector(): React.JSX.Element {
           className={tab === "why" ? "active" : ""}
           onClick={() => setTab("why")}
           data-testid="tab-why"
+          title="Where the last number you clicked came from"
         >
           why
         </button>
-        <button type="button" className={tab === "log" ? "active" : ""} onClick={() => setTab("log")}>
+        <button
+          type="button"
+          className={tab === "log" ? "active" : ""}
+          onClick={() => setTab("log")}
+          title="What the engine and this page have reported during this session"
+        >
           log
         </button>
       </div>

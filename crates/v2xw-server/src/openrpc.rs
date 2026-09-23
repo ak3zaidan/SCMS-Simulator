@@ -455,7 +455,41 @@ fn all_methods() -> Vec<Value> {
             ),
             object(
                 &["scenario", "hash"],
-                json!({"scenario": {}, "hash": sha, "schema": {"type": "object"}}),
+                json!({"scenario": {}, "hash": sha, "schema": {"type": "object"},
+                       "fields": {"type": "array", "items": {"type": "object"}},
+                       "groups": {"type": "array", "items": {"type": "object"}},
+                       "slots": {"type": "array", "items": {"type": "object"}},
+                       "statuses": {"type": "array", "items": {"type": "object"}},
+                       "models": {"type": "object"},
+                       "validator": {"type": "object"}}),
+            ),
+            &[-32602],
+        ),
+        method(
+            "scenario.schema",
+            "The generated settings surface: every scenario field with its unit, default, \
+             range, description and implementation status, every swappable model slot with \
+             what is selectable in it, and every registered model's parameters with their \
+             sources. A property of the build, not of the run.",
+            object(
+                &[],
+                json!({"sections": {"type": "array",
+                                    "items": {"enum": ["version", "engine",
+                                                       "generated_from", "validator",
+                                                       "groups", "statuses", "schema",
+                                                       "fields", "slots", "models"]}}}),
+            ),
+            object(
+                &["version", "engine"],
+                json!({"version": {"type": "string"}, "engine": {"type": "object"},
+                       "generated_from": {"type": "array", "items": {"type": "string"}},
+                       "validator": {"type": "object"},
+                       "groups": {"type": "array", "items": {"type": "object"}},
+                       "statuses": {"type": "array", "items": {"type": "object"}},
+                       "schema": {"type": "object"},
+                       "fields": {"type": "array", "items": {"type": "object"}},
+                       "slots": {"type": "array", "items": {"type": "object"}},
+                       "models": {"type": "object"}}),
             ),
             &[-32602],
         ),

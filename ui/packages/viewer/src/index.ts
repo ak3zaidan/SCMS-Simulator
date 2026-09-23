@@ -21,7 +21,7 @@
  */
 
 export { Viewer } from "./scene.js";
-export type { ViewerOptions, FrameReport } from "./scene.js";
+export type { ViewerOptions, FrameReport, ActorFraming } from "./scene.js";
 
 export { WorldRenderer, pointInRing } from "./world-render.js";
 export type { WorldRendererOptions, WorldBuildReport, BuildingBackend } from "./world-render.js";
@@ -41,7 +41,7 @@ export type { CameraControllerOptions, CameraState, CameraMode, InputTarget } fr
 
 export {
   OverlayManager, TxPulseOverlay, LinkOverlay, HeatmapOverlay, CoverageOverlay, StateMarkerOverlay,
-  GROUND_TRUTH_OVERLAYS, isGroundTruthOverlay, overlayLabel,
+  ActorLocatorOverlay, GROUND_TRUTH_OVERLAYS, isGroundTruthOverlay, overlayLabel,
 } from "./overlays.js";
 export type {
   OverlayManagerOptions, OverlayEntry, OverlayUpdateContext, MarkerChannel,
@@ -60,7 +60,7 @@ export {
   MeshBuilder, addRibbon, addPolygon, addDisc, addBox, addCylinder, addExtrudedRing, earClip,
   ringSignedArea, buildActorGeometry, ringGeometry, markerGeometry,
 } from "./geometry.js";
-export type { MeshBuilderOptions, MarkerShape } from "./geometry.js";
+export type { MeshBuilderOptions, MarkerShape, RingShading } from "./geometry.js";
 
 export { ENU_UP, LOD_LEVELS, vecToPlain } from "./types.js";
 export type {

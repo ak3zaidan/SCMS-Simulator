@@ -838,8 +838,15 @@ impl OfdmPhy {
             if other.node == arrival.tx {
                 continue;
             }
-            // Live when this arrival's preamble begins, and started before it.
-            if other.start > arrival.start || other.end <= arrival.start {
+            // Live when this arrival's preamble begins, and started *strictly* before it.
+            //
+            // The strictness is the whole rule: capture is about a receiver that is
+            // already locked to something when this preamble arrives, and at the same
+            // instant it is locked to nothing. Treating a simultaneous arrival as an
+            // incumbent reported every co-starting overlap as `preamble-missed`, which
+            // erased the congestion causes — two frames that start together and destroy
+            // each other are a collision, and the error model is what says so.
+            if other.start >= arrival.start || other.end <= arrival.start {
                 continue;
             }
             // Never detected, so never locked.

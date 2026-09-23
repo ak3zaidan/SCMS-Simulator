@@ -43,8 +43,16 @@ export interface ClientProvenance {
   readonly computation: string;
   /** Where the inputs came from — a wire field, an RPC result, or the renderer itself. */
   readonly inputs: string;
-  /** The specification section or design document the computation follows, when there is one. */
+  /**
+   * The rule the computation follows, in words.
+   *
+   * Plain language on purpose: this row is read by someone studying vehicle communication, and
+   * "09-ui §4" tells them nothing. The document and section live in {@link specRef}, which the
+   * interface shows only with developer details switched on.
+   */
   readonly reference?: string;
+  /** Where that rule is written down: a document and a section, for whoever is checking it. */
+  readonly specRef?: string;
   /** What is rounded or quantised on the way to the screen, if anything. */
   readonly quantisation?: string;
   /** What the number does **not** mean; the caveat a reader would otherwise have to guess. */
@@ -63,32 +71,37 @@ export const CLIENT_PROVENANCE: Readonly<Record<string, ClientProvenance>> = {
     producer: "@vwp/viewer · FrameStats",
     computation: "Presented frames divided by the wall-clock span of the ring's samples.",
     inputs: "The renderer's own frame callbacks; no engine value is involved.",
-    reference: "09-ui §4 (60 fps presentation budget)",
+    reference: "The Studio's budget of 60 drawn frames a second.",
+    specRef: "09-ui §4",
     caveat: "A presentation rate, not a simulation rate: a paused run still renders at full speed.",
   },
   fpsAverage: {
     producer: "@vwp/viewer · FrameStats",
     computation: "Mean of the frame rate over the retained window (240 frames).",
     inputs: "The renderer's frame callbacks.",
-    reference: "09-ui §4",
+    reference: "The Studio's budget of 60 drawn frames a second.",
+    specRef: "09-ui §4",
   },
   frameMs: {
     producer: "@vwp/viewer · FrameStats",
     computation: "Wall-clock milliseconds between the last two presented frames.",
     inputs: "The renderer's frame callbacks.",
-    reference: "09-ui §4",
+    reference: "The Studio's budget of 60 drawn frames a second, which is 16.7 ms a frame.",
+    specRef: "09-ui §4",
   },
   p95Ms: {
     producer: "@vwp/viewer · FrameStats",
     computation: "95th percentile of the retained frame times, by rank on the sorted window.",
     inputs: "The renderer's frame callbacks.",
-    reference: "09-ui §4 (the budget is stated as a p95, not a mean)",
+    reference: "The drawing budget is stated as a 95th percentile, not an average: the worst frames are what a viewer notices.",
+    specRef: "09-ui §4",
   },
   cpuMs: {
     producer: "@vwp/viewer · FrameStats",
     computation: "Milliseconds spent inside the viewer's own update and draw, excluding GPU time.",
     inputs: "Timestamps taken around the viewer's frame body.",
-    reference: "09-ui §4",
+    reference: "The Studio's drawing budget, of which this is the part spent on the processor.",
+    specRef: "09-ui §4",
     caveat: "Not GPU time; a frame can be slow with this number small.",
   },
   drawCalls: {
@@ -104,8 +117,9 @@ export const CLIENT_PROVENANCE: Readonly<Record<string, ClientProvenance>> = {
   actorInstances: {
     producer: "@vwp/viewer · ActorRenderer",
     computation: "Instances written to the instanced mesh this frame, after frustum and LOD culling.",
-    inputs: "The pose buffer of §3.3/§3.4 and the camera.",
-    reference: "09-ui §3 (instanced actors, LOD ladder)",
+    inputs: "The positions the stream sends — full snapshots, and the incremental updates between them — and the camera.",
+    reference: "Vehicles are drawn from one instanced mesh, with simpler shapes further from the camera.",
+    specRef: "09-ui §3",
     caveat: "Fewer than the live actors is culling, not actors leaving the run.",
   },
   actorCulled: {
@@ -116,50 +130,55 @@ export const CLIENT_PROVENANCE: Readonly<Record<string, ClientProvenance>> = {
   actorLive: {
     producer: "@vwp/viewer · ActorRenderer",
     computation: "Occupied slots in the pose buffer — actors the stream says exist.",
-    inputs: "`PoseBuffer.occupied`, seeded by §3.3 keyframes and advanced by §3.4 deltas.",
+    inputs: "The occupied slots of the position buffer: seeded by each full snapshot and advanced by the incremental updates between them.",
   },
   buildingsVisible: {
     producer: "@vwp/viewer · WorldRenderer",
     computation: "Building volumes inside the frustum after the per-tile cull.",
-    inputs: "The `vwp-world/1` building section (§4.4).",
+    inputs: "The building outlines in the world file.",
   },
   interpolationAlpha: {
     producer: "@vwp/viewer · PoseInterpolator",
     computation:
       "Fraction between the two most recent pose snapshots the on-screen position is drawn at.",
-    inputs: "The arrival clock of §3.3/§3.4 frames and the nominal `mobility_step_ns` of §3.1.1.",
-    reference: "09-ui §3 (interpolate, never extrapolate past one step)",
+    inputs: "When each position update arrived, and the interval the run says one movement step covers.",
+    reference: "Positions are interpolated between two updates and never extrapolated past one step.",
+    specRef: "09-ui §3",
     caveat: "Positions on screen between two deltas are interpolated, not simulated.",
   },
   frames_received: {
     producer: "@vwp/studio · StudioEngine",
-    computation: "A count of decoded frames, by §2.4 message type, since the connection opened.",
-    inputs: "The VWP frame headers themselves.",
-    reference: "vwp-v1 §2.4",
-    caveat: "Counts what this client decoded, which after a §1.5 drop is fewer than what was produced.",
+    computation: "A count of frames this page decoded, by kind, since the connection opened.",
+    inputs: "The frame headers of the stream itself.",
+    reference: "The stream's own frame kinds: full snapshot, incremental update, radio telemetry, event, measurement.",
+    specRef: "vwp-v1 §2.4",
+    caveat: "Counts what this page received. When the engine drops frames to keep up, it produced more than this.",
   },
   replay_position: {
     producer: "v2xw-wasm · ReplaySession (compiled to WebAssembly)",
     computation:
       "The recorded keyframe at or before the seek target, with every recorded delta up to the target applied.",
     inputs: "The recording's chunk index and its `Keyframe`/`Delta` frames, byte for byte.",
-    reference: "vwp-v1 §7.3, 09-ui §7 (one reader, two targets)",
-    caveat: "A recording carries no world payload (§7.1); geometry must come from elsewhere.",
+    reference: "The recording is read by the same code the engine uses, compiled to run in the browser, so the positions it resolves are the recorded ones.",
+    specRef: "vwp-v1 §7.3, 09-ui §7",
+    caveat: "A recording does not contain the streets. The geometry on screen has to come from a world file or from a connection.",
   },
   compare_time: {
     producer: "@vwp/studio · CompareController",
     computation:
       "Side B's simulated time after the last seek, which is side A's time plus the alignment offset, clamped to B's own span.",
-    inputs: "`run.seek`'s reply (§6.6) for a second engine, or the WebAssembly reader's resolved position (§7.3).",
-    reference: "09-ui §6 (synchronised time)",
+    inputs: "The second engine's answer to a seek, or the position the in-browser reader resolved.",
+    reference: "Two runs scrubbed on one simulated clock.",
+    specRef: "09-ui §6",
     caveat: "A non-zero offset is an alignment the researcher asserted, not one the two runs agreed on.",
   },
   compare_delta: {
     producer: "@vwp/studio · CompareController",
     computation:
       "Side B's value minus side A's, both read at the same simulated time from each side's own metric history.",
-    inputs: "`MetricSample` frames (§3.7) from each side's connection.",
-    reference: "09-ui §6 (difference overlays for metrics)",
+    inputs: "The measurement samples each side's engine sent.",
+    reference: "Two runs compared measurement by measurement, at the same simulated time.",
+    specRef: "09-ui §6",
     caveat:
       "A difference is only meaningful when the two runs share a metric definition; the definition is not compared, only the name.",
   },
@@ -182,20 +201,20 @@ export const OVERLAY_SOURCES: Readonly<Record<OverlayName, { readonly channels: 
   tx_pulses: { channels: ["node.tx"], summary: "One expanding ring per sampled transmission, at the transmitting node's position." },
   links: { channels: ["phy.rx"], summary: "A segment per delivered reception, between the transmitting and receiving nodes." },
   cbr_heatmap: { channels: ["mac.cbr"], summary: "Channel-busy ratio per node, splatted onto the ground plane." },
-  coverage: { channels: [], summary: "Modelled reception probability around each roadside site, from the site table of §4.5." },
+  coverage: { channels: [], summary: "Modelled reception probability around each roadside unit, from the units listed in the world file." },
   attackers_gt: { channels: ["gt.kinematics"], summary: "Ground-truth attacker identity, straight from the run's own knowledge." },
   revoked: { channels: ["proto.revocation"], summary: "A marker on each node a revocation event has named." },
   reported: { channels: ["proto.revocation"], summary: "A marker on each node a misbehaviour report has named — a belief, not ground truth." },
   detections: { channels: ["det.observation"], summary: "A marker per detector observation, at the observed node." },
   backend_flows: { channels: [], summary: "Backend message flows between SCMS entities, from the entity table." },
   focus_region: { channels: [], summary: "The fidelity-ladder region boundary the scenario declared." },
-  lane_markings: { channels: [], summary: "Lane centre lines and edges from the `vwp-world/1` lane section (§4.3)." },
-  buildings: { channels: [], summary: "Extruded building volumes from the `vwp-world/1` building section (§4.4)." },
+  lane_markings: { channels: [], summary: "Lane centre lines and edges, from the lane geometry in the world file." },
+  buildings: { channels: [], summary: "Extruded building volumes, from the building outlines in the world file." },
   labels: { channels: [], summary: "Text labels for actors and sites, positioned from the pose buffer." },
   trajectories_gt: { channels: ["gt.kinematics"], summary: "Ground-truth path history per actor." },
   belief_vs_truth_gt: { channels: ["gt.kinematics"], summary: "A segment from each node's believed position to its true one." },
-  signal_state: { channels: [], summary: "Signal phase and time-to-change from the §3.3.3 signal block of each keyframe." },
-  rsu_range: { channels: [], summary: "A nominal range ring per roadside site, from the site table of §4.5." },
+  signal_state: { channels: [], summary: "Signal phase and time to the next change, from the signal state in each full snapshot." },
+  rsu_range: { channels: [], summary: "A nominal range ring per roadside unit, from the units listed in the world file." },
   density: { channels: [], summary: "Actor density per ground cell, counted from the pose buffer." },
 };
 
@@ -216,29 +235,30 @@ export function overlayProvenance(name: string): ClientProvenance {
   const channels = known?.channels ?? [];
   const inputs =
     channels.length > 0
-      ? `\`Event\` frames on ${channels.join(", ")} (§3.6); nothing is drawn while those channels are unsubscribed (§6.12).`
-      : "The decoded world payload (§4) and the pose buffer (§3.3/§3.4); no event subscription is needed.";
+      ? `Event frames on ${channels.join(", ")}. Nothing is drawn while the page is not subscribed to those, which is why this overlay can be on and empty at the same time.`
+      : "The world file and the positions the stream sends. No event subscription is needed, so this overlay is never empty for want of one.";
   return {
     producer: "@vwp/viewer · OverlayManager",
     computation: known?.summary ?? `The \`${name}\` overlay; this build has no description for it.`,
     inputs,
-    reference: "vwp-v1 §6.7, 09-ui §6",
+    reference: "The engine publishes what it can offer to draw; this build draws what it can. An overlay either side lacks is shown as unavailable rather than quietly missing.",
+    specRef: "vwp-v1 §6.7, 09-ui §6",
     ...(isGroundTruthOverlayName(name)
-      ? { caveat: "Ground truth: a node cannot see this, so it must be off for a blind evaluation (09-ui §6)." }
+      ? { caveat: "Ground truth: no radio in the simulation can see this, so it has to be switched off for an evaluation that must not cheat." }
       : {}),
   };
 }
 
 /** What each `vwp-world/1` summary figure counts, by the key the world summary uses (§4). */
 export const WORLD_FIELDS: Readonly<Record<string, { readonly label: string; readonly section: string }>> = {
-  lanes: { label: "lanes", section: "§4.3 lane section" },
-  buildings: { label: "buildings", section: "§4.4 building section" },
-  junctions: { label: "junctions", section: "§4.5 junction section" },
-  signals: { label: "signal heads", section: "§4.5 signal section" },
-  sites: { label: "roadside sites", section: "§4.5 site section" },
-  crossings: { label: "crossings", section: "§4.5 crossing section" },
-  landuse: { label: "land-use polygons", section: "§4.5 land-use section" },
-  bytes: { label: "payload size", section: "§4.1 file header" },
+  lanes: { label: "lanes", section: "lane geometry" },
+  buildings: { label: "buildings", section: "building outlines" },
+  junctions: { label: "junctions", section: "junction table" },
+  signals: { label: "signal heads", section: "signal table" },
+  sites: { label: "roadside units", section: "roadside-unit table" },
+  crossings: { label: "crossings", section: "crossing table" },
+  landuse: { label: "land-use polygons", section: "land-use table" },
+  bytes: { label: "payload size", section: "file header" },
   buildMs: { label: "scene build time", section: "@vwp/viewer WorldRenderer" },
   drawables: { label: "drawables", section: "@vwp/viewer WorldRenderer" },
 };
@@ -298,9 +318,10 @@ export function worldSubject(field: string, value: string): WhySubject {
     value,
     client: {
       producer: "@vwp/protocol · decodeWorld",
-      computation: `Counted from the ${known?.section ?? "world payload"} of the decoded \`vwp-world/1\` payload.`,
-      inputs: "The payload fetched from `/world/{hash}.vwb`, verified against `Hello.world_hash` (§10.5 W3).",
-      reference: "vwp-v1 §4",
+      computation: `Counted from the ${known?.section ?? "contents"} of the world file this run is drawn from.`,
+      inputs: "The world file the engine served, checked against the digest the run promised before anything was drawn from it.",
+      reference: "The world file format: one section per kind of geometry, each with its own count.",
+      specRef: "vwp-v1 §4",
     },
   };
 }
@@ -315,8 +336,9 @@ export function channelSubject(name: string, note: string): WhySubject {
     client: {
       producer: "@vwp/studio · StudioEngine",
       computation: `Frames decoded on the \`${name}\` channel since the connection opened.`,
-      inputs: "The §3.6.1 event index's `channel_id` column, resolved through the §3.1.5 channel table.",
-      reference: "vwp-v1 §3.6, §6.12",
+      inputs: "The channel each event frame names, resolved through the channel list the run published when it opened.",
+      reference: "Events travel on named channels, and a channel delivers nothing until the page subscribes to it.",
+      specRef: "vwp-v1 §3.6, §6.12",
     },
   };
 }

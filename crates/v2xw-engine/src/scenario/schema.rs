@@ -862,8 +862,17 @@ pub struct Nodes {
 }
 
 impl Nodes {
+    /// The reference on-board unit `v2xw-node` ships.
+    ///
+    /// It was the string `node/obu/reference` until the 2026-09-22 audit, which is not a
+    /// profile id any build has ever shipped: `v2xw_node::profiles::get` returned nothing
+    /// for it and `wiring::build_node` fell through to the reference profile without a
+    /// word. So the default *behaved* correctly and *documented* a device that does not
+    /// exist, which is the kind of gap a generated settings form turns into a
+    /// free-text box offering nonsense. It is now the id itself, and
+    /// `crate::scenario::validate` refuses any id that does not ship.
     fn default_obu() -> String {
-        "node/obu/reference".to_string()
+        v2xw_node::profiles::REFERENCE_OBU.to_string()
     }
 }
 

@@ -20,8 +20,8 @@ import { clearOverride, describeProbe, normaliseBase, writeOverride } from "../l
 const FLAVOUR_CLASS: Record<string, string> = { real: "ok", mock: "warn", unknown: "" };
 
 const FLAVOUR_LABEL: Record<string, string> = {
-  real: "v2xw-server",
-  mock: "fixture engine",
+  real: "simulator",
+  mock: "test fixture",
   unknown: "unidentified engine",
 };
 
@@ -74,28 +74,28 @@ export function EngineTargetChip({ onRetarget }: { onRetarget: () => void }): Re
         <div className="menu-pop wide" data-testid="engine-target-menu">
           <div className="sec">Target</div>
           <dl className="kv">
-            <dt>base URL</dt>
+            <dt>address</dt>
             <dd>{target.baseUrl === "" ? window.location.origin : target.baseUrl}</dd>
-            <dt>banner</dt>
+            <dt>it calls itself</dt>
             <dd>{target.engine}</dd>
-            <dt>reachable</dt>
+            <dt>answering</dt>
             <dd>{target.reachable ? "yes" : "no"}</dd>
           </dl>
           {target.flavour === "mock" ? (
             <div className="note">
-              This is <code>@vwp/mock-server</code>. Every telemetry and metric value it reports is a
-              deterministic fixture, not a simulation result.
+              This is the test fixture, not the simulator. Every number it reports is a fixed synthetic
+              value — useful for checking that the interface works, never a result to quote.
             </div>
           ) : null}
           {target.worldBlocked ? (
             <div className="note err">
-              The engine is on another origin, and §1.1 makes both servers set{" "}
-              <code>cross-origin-resource-policy: same-origin</code>, so the world payload cannot be fetched
-              from this page. The stream still works; put the engine behind the dev proxy
-              (<code>VWP_ENGINE</code>) or serve the Studio from the engine.
+              The engine is at a different address from this page, and it will not serve its map file across
+              addresses. Vehicles will stream, but there will be no streets under them. Either open this
+              page from the engine&rsquo;s own address, or point the development server at the engine with{" "}
+              <code>VWP_ENGINE</code>.
             </div>
           ) : null}
-          <div className="sec">Probed</div>
+          <div className="sec">Looked here</div>
           {target.tried.map((probe) => (
             <div className="row" key={probe.baseUrl === "" ? "origin" : probe.baseUrl}>
               <button type="button" className="linklike" onClick={() => pin(probe.baseUrl)}>
@@ -106,7 +106,7 @@ export function EngineTargetChip({ onRetarget }: { onRetarget: () => void }): Re
               </span>
             </div>
           ))}
-          <div className="sec">Pin another</div>
+          <div className="sec">Use a different address</div>
           <div className="row">
             <input
               type="text"
@@ -125,8 +125,8 @@ export function EngineTargetChip({ onRetarget }: { onRetarget: () => void }): Re
             ) : null}
           </div>
           <div className="row">
-            <button type="button" onClick={() => void engine.refreshStatus()}>
-              refresh status
+            <button type="button" onClick={() => void engine.refreshStatus()} title="Ask the engine what it is doing right now">
+              Check again
             </button>
           </div>
         </div>

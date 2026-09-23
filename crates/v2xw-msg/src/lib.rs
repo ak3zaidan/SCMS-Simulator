@@ -195,14 +195,25 @@ pub mod provenance {
     /// Message formats this crate encodes **by hand**, and what each was validated against.
     ///
     /// A manifest that only listed the generated modules would imply that everything else
-    /// was generated too. Build decision D2 makes exactly one format hand-written, and a
-    /// run's record has to say so — together with the evidence, because "hand-written" and
+    /// was generated too. Build decision D2 leaves the J2735 messages to hand-written
+    /// encoders, and a run's record has to say which ones exist and what each was checked
+    /// against — together with the evidence, because "hand-written" and
     /// "hand-written and cross-validated against an independent implementation" are very
     /// different claims about the same bytes.
     pub const HAND_WRITTEN: &[&str] = &[
-        "SAE J2735 2024-09 BasicSafetyMessage — Part I in full, the VehicleSafetyExtensions          Part II container and the MessageFrame wrapper (crate::j2735::bsm); cross-validated          against pycrate 0.8.1 compiled from the real ASN.1, 235 vectors, byte-identical",
-        "SAE J2735 2024-09 SPAT — timeStamp, IntersectionState (id, revision, status, moy,          timeStamp), MovementState, MovementEvent and TimeChangeDetails, plus the          MessageFrame wrapper (crate::j2735::spat); NOT cross-validated: no oracle run, the          ASN.1 is absent from this checkout",
-        "SAE J2735 2024-09 MapData — msgIssueRevision, timeStamp, IntersectionGeometry (id,          revision, refPoint, laneWidth), GenericLane (attributes, maneuvers, node list,          connections), plus the MessageFrame wrapper (crate::j2735::map); NOT          cross-validated, and its extension markers are recalled rather than read — see          crate::j2735::map::assumptions",
+        "SAE J2735 2024-09 BasicSafetyMessage — Part I in full, the \
+         VehicleSafetyExtensions Part II container and the MessageFrame wrapper \
+         (crate::j2735::bsm); cross-validated against pycrate 0.8.1 compiled from the real \
+         ASN.1, 235 vectors, byte-identical",
+        "SAE J2735 2024-09 SPAT — timeStamp, IntersectionState (id, revision, status, \
+         moy, timeStamp), MovementState, MovementEvent and TimeChangeDetails, plus the \
+         MessageFrame wrapper (crate::j2735::spat); NOT cross-validated: no oracle run, the \
+         ASN.1 is absent from this checkout",
+        "SAE J2735 2024-09 MapData — msgIssueRevision, timeStamp, IntersectionGeometry \
+         (id, revision, refPoint, laneWidth), GenericLane (attributes, maneuvers, node list, \
+         connections), plus the MessageFrame wrapper (crate::j2735::map); NOT \
+         cross-validated, and its extension markers are recalled rather than read — see \
+         crate::j2735::map::assumptions",
     ];
 
     /// Message formats a **size model** stands in for, and why each is not encoded.
@@ -212,8 +223,12 @@ pub mod provenance {
     /// everything else in the message set is encoded too. These are the ones that are not,
     /// and a size taken from them is a table lookup.
     pub const SIZE_MODELLED: &[&str] = &[
-        "SAE J2735 PSM, SRM, SSM (codec/size-model/j2735) — the J2735 ASN.1 cannot be          code-generated (build decision D2) and nothing in the simulator fills these three          yet",
-        "ETSI CPM, VAM (codec/size-model/etsi) — generatable from the published forge          modules, but CPM-PDU-Descriptions.asn and VAM-PDU-Descriptions.asn are not          committed to third_party/asn1/etsi in this checkout",
+        "SAE J2735 PSM, SRM, SSM (codec/size-model/j2735) — the J2735 ASN.1 cannot be \
+         code-generated (build decision D2) and nothing in the simulator fills these three \
+         yet",
+        "ETSI CPM, VAM (codec/size-model/etsi) — generatable from the published forge \
+         modules, but CPM-PDU-Descriptions.asn and VAM-PDU-Descriptions.asn are not \
+         committed to third_party/asn1/etsi in this checkout",
     ];
 }
 

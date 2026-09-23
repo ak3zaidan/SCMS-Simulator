@@ -23,7 +23,7 @@ use crate::run::Run;
 use crate::session::{CameraState, OVERLAYS, Session, overlay_is_gt};
 
 /// Every method name of §6.15, in the order the inventory lists them.
-pub const METHODS: [&str; 32] = [
+pub const METHODS: [&str; 33] = [
     "run.start",
     "run.pause",
     "run.resume",
@@ -40,6 +40,7 @@ pub const METHODS: [&str; 32] = [
     "inspect.entity",
     "explain",
     "scenario.get",
+    "scenario.schema",
     "scenario.set",
     "scenario.validate",
     "scenario.save",
@@ -289,6 +290,7 @@ pub fn dispatch(ctx: &mut Context<'_>, request: &Request) -> Result<Outcome> {
         "inspect.entity" => inspect_entity(ctx, p),
         "explain" => explain(ctx, p),
         "scenario.get" => scenario_get(ctx, p),
+        "scenario.schema" => scenario_schema(ctx, p),
         "scenario.set" => scenario_set(ctx, p),
         "scenario.validate" => scenario_validate(ctx, p),
         "scenario.save" => scenario_save(ctx, p),
@@ -840,14 +842,62 @@ fn scenario_get(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome
     }
     let mut result = json!({"scenario": scenario, "hash": d.scenario_hash_hex});
     if flag(p, "with_schema", false) {
-        result["schema"] = json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "$id": "v2xw/scenario/1",
-            "type": "object",
-            "required": ["schema", "seed", "time"],
-        });
+        // The published surface, not a hand-written stub. §13 of 03-interfaces requires
+        // the schema to carry help text and units for every field, and
+        // 13-product-direction.md §2 makes the page's settings form generated from it —
+        // so the whole bundle is served here, and `scenario.schema` serves it without
+        // the document for a client that only wants the form.
+        let surface = v2xw_engine::scenario::publish::surface();
+        result["schema"] = surface["schema"].clone();
+        for key in ["fields", "groups", "slots", "models", "statuses", "validator"] {
+            result[key] = surface[key].clone();
+        }
     }
     Ok(Outcome::of(result))
+}
+
+/// `scenario.schema` (§6.10): the generated settings surface, without the document.
+///
+/// Separate from `scenario.get` because the two have different lifetimes. The document
+/// changes whenever the scenario is edited; the surface is a property of the *build* — the
+/// schema is reflected from the types, the ranges come from the loader's own validator and
+/// the model parameters from the registry — so a page fetches it once per connection and a
+/// run's scenario as often as it likes.
+///
+/// `sections` selects parts of it, because the whole bundle is a few hundred kilobytes and
+/// a page that only wants the model catalogue should not carry the field index with it.
+fn scenario_schema(_ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
+    let surface = v2xw_engine::scenario::publish::surface();
+    let wanted: Vec<String> = match p.get("sections") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    if wanted.is_empty() {
+        return Ok(Outcome::of(surface));
+    }
+    let known = [
+        "version", "engine", "generated_from", "validator", "groups", "statuses", "schema",
+        "fields", "slots", "models",
+    ];
+    if let Some(bad) = wanted.iter().find(|w| !known.contains(&w.as_str())) {
+        return Err(ServerError::param(
+            "/sections",
+            &format!("`{bad}` is not a section of the scenario surface"),
+            &format!("one of: {}", known.join(", ")),
+        ));
+    }
+    let mut out = Map::new();
+    // The version and the engine identity always come back: a cached surface that cannot
+    // say which build produced it is a cache a page cannot invalidate.
+    out.insert("version".into(), surface["version"].clone());
+    out.insert("engine".into(), surface["engine"].clone());
+    for section in wanted {
+        out.insert(section.clone(), surface[section.as_str()].clone());
+    }
+    Ok(Outcome::of(Value::Object(out)))
 }
 
 fn scenario_set(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {

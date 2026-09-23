@@ -413,13 +413,23 @@ impl DutyCycle {
         v2xw_radio::air_time(bytes, self.mcs)
     }
 
+    /// Whether a transmission at `then` is inside the one-second window ending at `now`.
+    ///
+    /// Written as an age test rather than as a comparison against `now − WINDOW`, because
+    /// the subtraction saturates at zero: with a cutoff of `now.saturating_sub(WINDOW)` and
+    /// a strict `>`, every send at `t = 0` fell out of the window for the whole first
+    /// second of a run, so the very first frame of a burst was never counted against the
+    /// 3 % cap and `ratio` under-reported by one frame.
+    fn in_window(now: SimTime, then: SimTime) -> bool {
+        now.saturating_sub(then) < DutyCycle::WINDOW.as_nanos()
+    }
+
     /// The air time used inside the window ending at `now`, nanoseconds.
     #[must_use]
     pub fn used_ns(&self, now: SimTime) -> u64 {
-        let cutoff = now.saturating_sub(DutyCycle::WINDOW.as_nanos());
         self.sends
             .iter()
-            .filter(|(t, _)| *t > cutoff)
+            .filter(|(t, _)| DutyCycle::in_window(now, *t))
             .map(|(_, d)| *d)
             .sum()
     }
@@ -502,8 +512,7 @@ impl DutyCycle {
     /// Records a transmission the caller went ahead with.
     fn note(&mut self, at: SimTime, airtime: Duration) {
         self.sends.push((at, airtime.as_nanos()));
-        let cutoff = at.saturating_sub(DutyCycle::WINDOW.as_nanos());
-        self.sends.retain(|(t, _)| *t > cutoff);
+        self.sends.retain(|(t, _)| DutyCycle::in_window(at, *t));
         self.last_send = Some(at);
         self.airtime_ns = self.airtime_ns.saturating_add(airtime.as_nanos());
         self.allowed = self.allowed.saturating_add(1);

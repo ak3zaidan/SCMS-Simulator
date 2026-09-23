@@ -87,10 +87,10 @@ export function ObuHud({ docked = false }: { docked?: boolean }): React.JSX.Elem
     return (
       <div className={`hud${docked ? " docked" : ""}`} data-testid="obu-hud">
         <div className="hud-head">
-          <span className="id">OBU HUD</span>
+          <span className="id">No radio selected</span>
           <span className="dim">
-            click a vehicle in the viewport — that issues <code>view.follow</code> (§6.7), which is what
-            subscribes its node to <code>Telemetry</code> frames
+            Select a vehicle or a roadside unit on the map and its radio appears here: what it is sending
+            and receiving, what it has verified, who it can hear.
           </span>
         </div>
       </div>
@@ -103,7 +103,7 @@ export function ObuHud({ docked = false }: { docked?: boolean }): React.JSX.Elem
       <div className={`hud${docked ? " docked" : ""}`} data-testid="obu-hud">
         <div className="hud-head">
           <span className="id">{info?.label || `node ${telemetryNode}`}</span>
-          <span className="dim">subscribed; waiting for the first Telemetry frame…</span>
+          <span className="dim">Selected. Waiting for its first report from the engine…</span>
         </div>
       </div>
     );
@@ -131,7 +131,7 @@ export function ObuHud({ docked = false }: { docked?: boolean }): React.JSX.Elem
               </span>
             </>
           ) : (
-            <span className="hud-na">awaiting a sec.cert or node.tx event</span>
+            <span className="hud-na">not yet seen transmitting</span>
           )}
         </span>
         <span className="dim">profile: {info?.profileId || NA}</span>
@@ -209,7 +209,7 @@ export function ObuHud({ docked = false }: { docked?: boolean }): React.JSX.Elem
           <Value field={byKey.get("outbox_msgs")} label="report outbox" node={telemetryNode} />
           <Value field={byKey.get("outbox_bytes")} label="outbox bytes" node={telemetryNode} />
           <Value field={byKey.get("full_cert_msgs")} label="full-cert msgs" node={telemetryNode} />
-          <span className="hud-field" title="Telemetry sampling window (§3.5.1 window_ns)">
+          <span className="hud-field" title="The period each of these figures was measured over">
             <span className="k">window</span>
             <span className="v">{durationNs(hello?.telemetryPeriodNs ?? 0)}</span>
           </span>

@@ -47,6 +47,7 @@ import {
 } from "three";
 import type { SignalBlock, VwpWorld } from "@vwp/protocol";
 import { MeshBuilder, addBox, addCylinder, addDisc, addExtrudedRing, addPolygon, addRibbon } from "./geometry.js";
+import type { RingShading } from "./geometry.js";
 import type { ViewerTheme } from "./theme.js";
 import type { LodLevel } from "./types.js";
 
@@ -85,8 +86,39 @@ export interface WorldRendererOptions {
   readonly shadowExtentM?: number;
   /** Shadow map edge in texels. Default 2048 (09-ui §4). */
   readonly shadowMapSize?: number;
+  /**
+   * How dark a cast shadow gets, `[0, 1]`. Default 0.55.
+   *
+   * A Midtown street at 11:00 is *correctly* in the shadow of its own buildings — that shadowing is
+   * the physics the simulator models, so hiding it would be wrong. At full strength, though, a
+   * shadowed road received only the sky and the fill, about a quarter of the sunlit irradiance, and
+   * landed near #1f1f1f on a #0b0f14 background: the street was legible only where the sun happened
+   * to reach down it. Compressing the shadow keeps it plainly visible as a shadow and keeps the
+   * surface under it readable, which is the trade an instrument should make.
+   */
+  readonly shadowStrength?: number;
   /** Hours in `[0, 24)`. Default 11. */
   readonly timeOfDay?: number;
+  /**
+   * How much of a wall's colour is removed at its foot, `[0, 1)`. Default 0.45.
+   *
+   * See {@link RingShading}: a directional sun 57° up gives a vertical wall almost nothing, so
+   * without these three terms a city of prisms renders as one flat silhouette. They are baked into
+   * the vertex colours and cost nothing per frame.
+   */
+  readonly buildingBaseOcclusion?: number;
+  /** Value swing applied by wall azimuth, `[0, 1)`. Default 0.2. */
+  readonly buildingFaceRelief?: number;
+  /** Peak per-building tone deviation, `[0, 1)`. Default 0.11. */
+  readonly buildingToneVariation?: number;
+  /**
+   * Dim light from the anti-sun azimuth, as a fraction of the sun's intensity. Default 0.3.
+   *
+   * A single directional light plus a hemisphere fill leaves every wall facing away from the sun at
+   * the hemisphere term alone, which is the same value for all of them: adjacent buildings merge.
+   * This is the bounce off the opposite façade, and it is what separates them. It never casts.
+   */
+  readonly fillLightFraction?: number;
 }
 
 /** Which building path was taken. */
@@ -130,6 +162,14 @@ function phaseBucket(phase: number): 0 | 1 | 2 | 3 {
   }
 }
 
+/**
+ * How far up-sun of its target the `DirectionalLight` is placed, metres.
+ *
+ * Only the direction matters to the shading; this is chosen to sit comfortably inside the light's
+ * own `shadow.camera.far` of 2,500 m with the whole city in front of it.
+ */
+const SUN_DISTANCE_M = 900;
+
 const SUN_NOON = new Color(0xfff4e4);
 const SUN_LOW = new Color(0xff9a52);
 const NIGHT_TOP = new Color(0x05070f);
@@ -154,7 +194,13 @@ varying vec3 vWorld;
 void main() {
   vec3 dir = normalize(vWorld);
   float h = clamp(dir.z, -1.0, 1.0);
-  vec3 sky = h >= 0.0 ? mix(uHorizon, uTop, pow(h, 0.55)) : mix(uHorizon, uBottom, pow(-h, 0.5));
+  // pow(h, 0.35) rather than 0.55: the gradient then spends most of its range in the first few
+  // degrees above the horizon, which is the only part of the sky a street-level camera sees. With
+  // the flatter curve the whole upper hemisphere was one value and there was no horizon at all.
+  vec3 sky = h >= 0.0 ? mix(uHorizon, uTop, pow(h, 0.35)) : mix(uHorizon, uBottom, pow(-h, 0.7));
+  // A narrow brightening either side of h = 0. This is the line the buildings are read against;
+  // without it the roofline has nothing to be a silhouette of.
+  sky += uHorizon * 0.42 * exp(-abs(h) * 26.0);
   float sun = max(dot(dir, normalize(uSun)), 0.0);
   sky += uSunIntensity * vec3(1.0, 0.86, 0.66) * (pow(sun, 620.0) * 1.6 + pow(sun, 12.0) * 0.16);
   gl_FragColor = vec4(sky, 1.0);
@@ -178,6 +224,8 @@ export class WorldRenderer {
   readonly lights = new Group();
 
   readonly sun: DirectionalLight;
+  /** Dim, shadowless bounce from the anti-sun side; see {@link WorldRendererOptions.fillLightFraction}. */
+  readonly fill: DirectionalLight;
   readonly hemisphere: HemisphereLight;
   readonly sky: Mesh<SphereGeometry, ShaderMaterial>;
   readonly ground: Mesh<PlaneGeometry, MeshLambertMaterial>;
@@ -237,6 +285,7 @@ export class WorldRenderer {
   #lodCamPos = new Vector3(NaN, NaN, NaN);
   #scratchMatrix = new Matrix4();
   #scratchColor = new Color();
+  #sunDir = new Vector3(0, 0, 1);
   #buildingsVisible = 0;
 
   constructor(options: WorldRendererOptions) {
@@ -250,7 +299,12 @@ export class WorldRenderer {
       shadows: options.shadows ?? true,
       shadowExtentM: options.shadowExtentM ?? 260,
       shadowMapSize: options.shadowMapSize ?? 2048,
+      shadowStrength: options.shadowStrength ?? 0.55,
       timeOfDay: options.timeOfDay ?? 11,
+      buildingBaseOcclusion: options.buildingBaseOcclusion ?? 0.45,
+      buildingFaceRelief: options.buildingFaceRelief ?? 0.2,
+      buildingToneVariation: options.buildingToneVariation ?? 0.11,
+      fillLightFraction: options.fillLightFraction ?? 0.3,
     };
     this.#timeOfDay = this.#options.timeOfDay;
 
@@ -310,8 +364,15 @@ export class WorldRenderer {
     this.sun.shadow.camera.far = 2500;
     this.sun.shadow.bias = -0.0005;
     this.sun.shadow.normalBias = 0.05;
+    this.sun.shadow.intensity = Math.max(0, Math.min(1, this.#options.shadowStrength));
     this.#applyShadowExtent();
     this.lights.add(this.sun, this.sun.target);
+
+    this.fill = new DirectionalLight(0xdfe9ff, 0.7);
+    this.fill.name = "world/fill";
+    this.fill.up.set(0, 0, 1);
+    this.fill.castShadow = false;
+    this.lights.add(this.fill, this.fill.target);
 
     this.hemisphere = new HemisphereLight(this.#theme.skyHorizon, this.#theme.ground, 0.9);
     this.hemisphere.name = "world/hemisphere";
@@ -396,14 +457,21 @@ export class WorldRenderer {
     const dirZ = Math.sin(elevation);
     const daylight = Math.max(0, dirZ);
 
-    this.sun.position.set(dirX, dirY, Math.max(0.03, dirZ)).multiplyScalar(900);
+    this.#sunDir.set(dirX, dirY, Math.max(0.03, dirZ)).normalize();
+    this.#placeSun();
     this.sun.intensity = 0.15 + daylight * 2.6;
     // Warm near the horizon, neutral at noon.
     const warmth = 1 - Math.min(1, daylight * 2.4);
     this.sun.color.copy(SUN_NOON).lerp(SUN_LOW, warmth);
     this.sun.castShadow = this.#options.shadows && daylight > 0.05;
 
-    this.hemisphere.intensity = 0.22 + daylight * 0.85;
+    // The fill comes from the opposite azimuth at a low elevation — the bounce off the façade
+    // across the street. Low, because a high fill washes the vertical relief back out.
+    this.fill.position.set(-dirX, -dirY, 0.34).multiplyScalar(700);
+    this.fill.intensity = this.sun.intensity * this.#options.fillLightFraction;
+
+    // The sky is the only light a shadowed surface gets besides the fill, so it carries the shade.
+    this.hemisphere.intensity = 0.45 + daylight * 1.35;
 
     const u = this.sky.material.uniforms;
     const night = 1 - Math.min(1, daylight * 3);
@@ -434,6 +502,34 @@ export class WorldRenderer {
   setShadowFocus(x: number, y: number, z: number): void {
     this.sun.target.position.set(x, y, z);
     this.sun.target.updateMatrixWorld();
+    this.#placeSun();
+  }
+
+  /**
+   * Put the sun `SUN_DISTANCE_M` up-sun of its own target.
+   *
+   * A `DirectionalLight` shines along `position − target.position`, and `setShadowFocus` moves the
+   * target to whatever the camera is looking at. The position used to be set in absolute world
+   * coordinates — `direction × 900` — which made the light's *direction* a function of where in the
+   * world the camera was pointed. In a world whose ENU origin is a kilometre or two from the
+   * streets, an 11:00 sun computed at 57° elevation arrived at the geometry at about 15°, so
+   * horizontal surfaces got a grazing light, vertical walls got almost none, and the whole scene
+   * rendered three to four times too dark — the black void the review saw. It also meant the
+   * lighting shifted as the user panned. Offsetting from the target fixes the direction and keeps
+   * the shadow frustum, which is sized in the light's own space, centred on the same point.
+   */
+  #placeSun(): void {
+    const t = this.sun.target.position;
+    this.sun.position.set(
+      t.x + this.#sunDir.x * SUN_DISTANCE_M,
+      t.y + this.#sunDir.y * SUN_DISTANCE_M,
+      t.z + this.#sunDir.z * SUN_DISTANCE_M,
+    );
+  }
+
+  /** The sun's unit direction, `position − target`, normalised. */
+  get sunDirection(): Vector3 {
+    return this.#sunDir;
   }
 
   #applyShadowExtent(): void {
@@ -447,7 +543,10 @@ export class WorldRenderer {
   }
 
   #resizeGround(radiusM: number): void {
-    const size = Math.max(200, radiusM * 4);
+    // ×6 rather than ×4: at a 1.25 m eye height the geometric horizon is about 4 km out, and at ×4
+    // a 2 km world's ground plane ended at almost exactly that distance, so the edge of the world
+    // was on the skyline. It is one quad either way.
+    const size = Math.max(200, radiusM * 6);
     this.ground.geometry.dispose();
     this.ground.geometry = new PlaneGeometry(size, size);
     this.ground.updateMatrix();
@@ -664,6 +763,17 @@ export class WorldRenderer {
     const [wr, wg, wb] = colorTriple(this.#theme.building);
     const [rr, rg, rb] = colorTriple(this.#theme.buildingRoof);
     const scratch: number[] = [];
+    // One mutable shading record, rewritten per building: 3,024 buildings × 3 LODs would otherwise
+    // be 9,072 short-lived objects during a world build.
+    const shading: { tone: number; baseOcclusion: number; faceRelief: number; parapetGain: number } = {
+      tone: 1,
+      baseOcclusion: this.#options.buildingBaseOcclusion,
+      faceRelief: this.#options.buildingFaceRelief,
+      parapetGain: 1.16,
+    };
+    const toneAmp = this.#options.buildingToneVariation;
+    /** Deterministic per-building tone, so a rebuild or a theme swap never reshuffles the city. */
+    const toneOf = (i: number): number => 1 + toneAmp * (hash01(b.buildingId[i], i) * 2 - 1);
 
     // Pass 1: measure, so the BatchedMesh can be sized exactly.
     const probe = new MeshBuilder({ color: true, vertexCapacity: 512, indexCapacity: 1024 });
@@ -674,10 +784,11 @@ export class WorldRenderer {
     for (let i = 0; i < B; i++) {
       const n = b.ringCount[i];
       if (n < 3) continue;
+      shading.tone = toneOf(i);
       for (let lod = 0; lod < 3; lod++) {
         probe.reset();
         addExtrudedRing(probe, ring.x, ring.y, b.ringOff[i], n, b.baseZM[i], Math.max(1, b.heightM[i]),
-          lod as LodLevel, scratch, wr, wg, wb, rr, rg, rb);
+          lod as LodLevel, scratch, wr, wg, wb, rr, rg, rb, shading);
         perLodV[i * 3 + lod] = probe.vertexCount;
         perLodI[i * 3 + lod] = probe.indexCount;
         totalV += probe.vertexCount;
@@ -730,10 +841,11 @@ export class WorldRenderer {
         for (let i = 0; i < B; i++) {
           const n = b.ringCount[i];
           if (n < 3) continue;
+          shading.tone = toneOf(i);
           for (let lod = 0; lod < 3; lod++) {
             builder.reset();
             addExtrudedRing(builder, ring.x, ring.y, b.ringOff[i], n, b.baseZM[i], Math.max(1, b.heightM[i]),
-              lod as LodLevel, scratch, wr, wg, wb, rr, rg, rb);
+              lod as LodLevel, scratch, wr, wg, wb, rr, rg, rb, shading);
             const g = builder.toGeometry();
             if (!g) continue;
             this.#buildingGeomIds[i * 3 + lod] = mesh.addGeometry(g);
@@ -774,8 +886,9 @@ export class WorldRenderer {
       if (n < 3) continue;
       const off = b.ringOff[i];
       const t = tileIndex(ring.x[off], ring.y[off]);
+      shading.tone = toneOf(i);
       addExtrudedRing(surfaceOf(t), ring.x, ring.y, off, n, b.baseZM[i], Math.max(1, b.heightM[i]),
-        1, scratch, wr, wg, wb, rr, rg, rb);
+        1, scratch, wr, wg, wb, rr, rg, rb, shading);
     }
     this.#report = { ...this.#report, buildingVertices: totalV, buildingIndices: totalI };
   }
@@ -1064,6 +1177,20 @@ function nowMs(): number {
 
 const TRIPLE_COLOR = new Color();
 const TRIPLE_OUT: [number, number, number] = [0, 0, 0];
+
+/**
+ * A stable `[0, 1)` from two integers — the per-building tone variation's only source of randomness.
+ *
+ * Deterministic on purpose: the tone has to survive a theme swap, a reconnect and a second
+ * `setWorld` of the same payload, or the city reshuffles itself under the user while they watch.
+ */
+function hash01(a: number, b: number): number {
+  let h = (a | 0) * 0x27d4eb2d ^ (b | 0) * 0x165667b1;
+  h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d);
+  h = Math.imul(h ^ (h >>> 12), 0x297a2d39);
+  h ^= h >>> 15;
+  return (h >>> 8) / 0x1000000;
+}
 
 /** Convert a packed sRGB hex to a linear working-space triple. Returns a shared array — copy it. */
 function colorTriple(hex: number): [number, number, number] {

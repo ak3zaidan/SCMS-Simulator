@@ -16,6 +16,10 @@
 //! 5. The verification test in `run_verifications`'s report-forwarding branch relaxed to
 //!    accept `Unverified` — `an_unverified_report_is_not_forwarded` fails, which is the
 //!    check that stops the infrastructure being used as an amplifier.
+//! 6. The `install_crl` call on the repeating unit removed —
+//!    `an_installed_list_goes_out_once_and_then_on_a_repeat_period` fails with zero
+//!    broadcasts, because a repeat period is a cadence for a list the backend installed
+//!    and not a licence to put an invented one on the air.
 
 use v2xw_core::belief::{FixQuality, PositionEstimate};
 use v2xw_core::geom::Vec3;
@@ -221,6 +225,9 @@ fn an_installed_list_goes_out_once_and_then_on_a_repeat_period() {
     repeating.stores_mut().crl.set_period(100);
     repeating.stores_mut().certs.insert(credential(UNIT, 0));
     repeating.set_belief(surveyed(Vec3::new(100.0, 100.0, 6.0)));
+    // The list still has to be installed: its length is the backend's, and a unit with a
+    // repeat period but no installed list has nothing to re-broadcast.
+    repeating.install_crl(4_000, 0);
     let outcomes = run(&mut repeating, 60);
     assert!(
         count(&outcomes, MsgType::Crl) >= 3,

@@ -31,7 +31,11 @@ function OverlayWhy({ name, enabled }: { name: string; enabled: boolean }): Reac
       className="linklike why-dot"
       data-testid={`overlay-why-${name}`}
       aria-label={`What draws the ${name} overlay${channels.length > 0 ? `, from ${channels.join(", ")}` : ""}`}
-      title={channels.length > 0 ? `drawn from ${channels.join(", ")} (§3.6)` : "drawn from the world payload (§4)"}
+      title={
+        channels.length > 0
+          ? `Drawn from the ${channels.join(", ")} event stream`
+          : "Drawn from the world file, so it needs no event subscription"
+      }
       onClick={(e) => {
         // The label wraps a checkbox, so a click here would otherwise toggle the overlay as well.
         e.preventDefault();
@@ -94,7 +98,7 @@ export function OverlayMenu(): React.JSX.Element {
           ))}
           {notDrawable.length > 0 ? (
             <>
-              <div className="sec">Not implemented in this build</div>
+              <div className="sec">Not available in this build</div>
               {notDrawable.map((entry) => (
                 <label key={entry.name} className="disabled">
                   <input type="checkbox" checked={false} disabled readOnly />
@@ -105,18 +109,16 @@ export function OverlayMenu(): React.JSX.Element {
               ))}
             </>
           ) : null}
-          <div className="sec">Subscriptions</div>
+          <div className="sec">Why three of these look empty</div>
           <div className="note" style={{ margin: "2px 6px 6px" }}>
-            <code>tx_pulses</code>, <code>links</code> and <code>cbr_heatmap</code> are fed by{" "}
-            <code>node.tx</code>, <code>phy.rx</code> and <code>mac.cbr</code>, which §6.12 subscribes only
-            while a node is followed — those three carry millions of records a simulated second otherwise.
-            Click a vehicle and they fill; clear the selection and they stop. Every row&rsquo;s{" "}
-            <em>why</em> names its channel.
+            Transmissions, links and channel load are only streamed while a vehicle is selected — at full
+            scale they are millions of records a simulated second. Select one and they fill; clear the
+            selection and they stop. Each row&rsquo;s <em>why</em> says what feeds it.
           </div>
 
           {serverOnly.length > 0 ? (
             <>
-              <div className="sec">Engine offers, viewer cannot draw</div>
+              <div className="sec">The engine offers these, but this build cannot draw them</div>
               {serverOnly.map((entry) => (
                 <label key={entry.name} className="disabled" title={entry.description}>
                   <input type="checkbox" checked={false} disabled readOnly />

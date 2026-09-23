@@ -50,7 +50,7 @@ import {
   type Camera,
 } from "three";
 import { ActorState, OVERLAY_NAMES, type OverlayName } from "@vwp/protocol";
-import { markerGeometry, ringGeometry } from "./geometry.js";
+import { MeshBuilder, addBox, markerGeometry, ringGeometry } from "./geometry.js";
 import type { ViewerTheme } from "./theme.js";
 import type { WorldRenderer } from "./world-render.js";
 
@@ -163,6 +163,12 @@ export interface OverlayUpdateContext {
   readonly visibleCount: number;
   /** Height above the actor origin to float a marker, metres. */
   readonly markerHeightM?: number;
+  /** `actor_id` per slot, for matching the selection. Omitted, nothing counts as selected. */
+  readonly actorId?: Uint32Array;
+  /** The selected actor's id, or null. */
+  readonly selectedActorId?: number | null;
+  /** Live actors in the stream. Omitted, {@link count} stands in. */
+  readonly liveCount?: number;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -888,6 +894,218 @@ export class StateMarkerOverlay {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Actor locators
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Beacons that say *where* an actor is, from any distance.
+ *
+ * The problem this exists for: the plan view opens on the whole world, and one vehicle in a square
+ * kilometre of Midtown is a sub-pixel speck. The interface then says "click an actor" over a
+ * viewport with no actor you can see. A beacon is a vertical stem and a ground ring whose size is
+ * set in *screen* terms — the stem is scaled by camera distance so it keeps a roughly constant
+ * angular width — so a single vehicle is findable at 700 m without being a billboard at 20 m.
+ *
+ * Three rules keep it from becoming clutter:
+ *
+ * 1. **Nothing within {@link nearRangeM}.** At chase and dashboard distances the vehicle is already
+ *    the largest thing on screen and a pillar over its roof is in the way. The beacon is for range.
+ * 2. **All of them only while they are few.** Above {@link capacity} live actors a crowd needs no
+ *    finding aid and 5,000 pillars would be a wall; only the selected actor keeps its beacon.
+ * 3. **One neutral colour, never a state colour.** The beacon carries location, and the
+ *    colour-blind-safe palette carries state (09-ui §10). Painting a beacon `attacker` vermillion
+ *    would put a fifth meaning on a four-colour legend. The selected actor's beacon is the one
+ *    exception, and it uses the legend's own `selected` colour.
+ */
+export class ActorLocatorOverlay {
+  readonly group = new Group();
+  readonly capacity: number;
+
+  /** Below this camera distance an actor gets no beacon, metres. */
+  nearRangeM = 45;
+  /** Stem height as a fraction of camera distance, clamped by {@link minHeightM}. */
+  heightPerDistance = 0.055;
+  minHeightM = 7;
+  /** Stem width as a fraction of camera distance — a roughly constant angular width. */
+  widthPerDistance = 0.0035;
+  minWidthM = 0.35;
+  /** Ground-ring outer radius as a fraction of camera distance. */
+  ringPerDistance = 0.013;
+  minRingM = 2.6;
+
+  #stemAll: InstancedMesh<BufferGeometry, MeshBasicMaterial>;
+  #ringAll: InstancedMesh<BufferGeometry, MeshBasicMaterial>;
+  #stemSel: InstancedMesh<BufferGeometry, MeshBasicMaterial>;
+  #ringSel: InstancedMesh<BufferGeometry, MeshBasicMaterial>;
+  #geometries: BufferGeometry[] = [];
+  #enabled = true;
+  #matrix = new Matrix4();
+  #camPos = new Vector3();
+  #ranges = makeRanges(4);
+  #drawn = 0;
+
+  constructor(theme: ViewerTheme, capacity = 64) {
+    this.capacity = Math.max(1, capacity);
+    this.group.name = "overlay/actor-locators";
+
+    // A unit stem: 1 m square, base at z = 0, top at z = 1, so the instance matrix is a pure
+    // scale-and-translate and the writer never has to build a rotation.
+    const stemBuilder = new MeshBuilder({ vertexCapacity: 24, indexCapacity: 36 });
+    addBox(stemBuilder, 0, 0, 0.5, 1, 1, 1);
+    const stemGeom = stemBuilder.toGeometry();
+    if (!stemGeom) throw new Error("locator stem geometry is empty");
+    const ringGeom = ringGeometry(0.74, 28);
+    this.#geometries.push(stemGeom, ringGeom);
+
+    const make = (
+      geom: BufferGeometry, name: string, n: number, opacity: number,
+    ): InstancedMesh<BufferGeometry, MeshBasicMaterial> => {
+      const material = new MeshBasicMaterial({
+        name, transparent: true, opacity, side: DoubleSide, toneMapped: false,
+        // No depth test: a beacon that a building hides is a beacon that has failed at the one job
+        // it has. No depth *write* either, so it never occludes the city behind it.
+        depthTest: false, depthWrite: false, fog: false,
+      });
+      const mesh = new InstancedMesh<BufferGeometry, MeshBasicMaterial>(geom, material, n);
+      mesh.name = `overlay/${name}`;
+      mesh.frustumCulled = false;
+      mesh.renderOrder = 12;
+      mesh.count = 0;
+      mesh.visible = false;
+      this.group.add(mesh);
+      return mesh;
+    };
+
+    this.#stemAll = make(stemGeom, "locator-stem", this.capacity, 0.3);
+    this.#ringAll = make(ringGeom, "locator-ring", this.capacity, 0.55);
+    this.#stemSel = make(stemGeom, "locator-stem-selected", 1, 0.5);
+    this.#ringSel = make(ringGeom, "locator-ring-selected", 1, 0.85);
+    this.setTheme(theme);
+  }
+
+  /** Beacons drawn on the last {@link update}. */
+  get drawn(): number {
+    return this.#drawn;
+  }
+
+  get enabled(): boolean {
+    return this.#enabled;
+  }
+
+  set enabled(v: boolean) {
+    this.#enabled = v;
+    if (!v) this.#hide();
+  }
+
+  setTheme(theme: ViewerTheme): void {
+    // A neutral, deliberately non-categorical colour: the state palette owns the four hues, and
+    // this channel must not look like a fifth state. `laneMarking` is the theme's neutral paint.
+    this.#stemAll.material.color.setHex(theme.laneMarking);
+    this.#ringAll.material.color.setHex(theme.laneMarking);
+    this.#stemSel.material.color.setHex(theme.actorState.selected);
+    this.#ringSel.material.color.setHex(theme.actorState.selected);
+  }
+
+  setOpacity(v: number): void {
+    const k = Math.max(0, Math.min(1, v));
+    this.#stemAll.material.opacity = 0.3 * k;
+    this.#ringAll.material.opacity = 0.55 * k;
+    this.#stemSel.material.opacity = 0.5 * k;
+    this.#ringSel.material.opacity = 0.85 * k;
+  }
+
+  /** Rewrite the beacons from this frame's visible slots. */
+  update(ctx: OverlayUpdateContext): void {
+    this.#drawn = 0;
+    if (!this.#enabled) {
+      this.#hide();
+      return;
+    }
+    const selected = ctx.selectedActorId ?? null;
+    const live = ctx.liveCount ?? ctx.count;
+    const markAll = live > 0 && live <= this.capacity;
+    if (!markAll && selected === null) {
+      this.#hide();
+      return;
+    }
+    const ids = ctx.actorId;
+
+    const e = ctx.camera.matrixWorld.elements;
+    this.#camPos.set(e[12], e[13], e[14]);
+    const m = this.#matrix;
+    const me = m.elements;
+    // A pure scale-and-translate: the off-diagonal terms stay zero for the whole frame.
+    me[1] = 0; me[2] = 0; me[3] = 0;
+    me[4] = 0; me[6] = 0; me[7] = 0;
+    me[8] = 0; me[9] = 0; me[11] = 0;
+    me[15] = 1;
+
+    let nAll = 0;
+    let nSel = 0;
+    const near2 = this.nearRangeM * this.nearRangeM;
+    for (let k = 0; k < ctx.visibleCount; k++) {
+      const slot = ctx.visibleSlots[k];
+      const isSelected = selected !== null && ids !== undefined && ids[slot] === selected;
+      if (!markAll && !isSelected) continue;
+      if (!isSelected && nAll >= this.capacity) continue;
+      const p = slot * 3;
+      const x = ctx.position[p];
+      const y = ctx.position[p + 1];
+      const z = ctx.position[p + 2];
+      const dx = x - this.#camPos.x;
+      const dy = y - this.#camPos.y;
+      const dz = z - this.#camPos.z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < near2) continue;
+      const dist = Math.sqrt(d2);
+      const w = Math.max(this.minWidthM, dist * this.widthPerDistance);
+      const h = Math.max(this.minHeightM, dist * this.heightPerDistance);
+      const r = Math.max(this.minRingM, dist * this.ringPerDistance);
+
+      me[0] = w; me[5] = w; me[10] = h;
+      me[12] = x; me[13] = y; me[14] = z + 0.6;
+      (isSelected ? this.#stemSel : this.#stemAll).setMatrixAt(isSelected ? nSel : nAll, m);
+
+      me[0] = r; me[5] = r; me[10] = 1;
+      me[14] = z + 0.12;
+      (isSelected ? this.#ringSel : this.#ringAll).setMatrixAt(isSelected ? nSel : nAll, m);
+
+      if (isSelected) nSel = 1;
+      else nAll++;
+      this.#drawn++;
+    }
+
+    this.#publish(this.#stemAll, nAll, 0);
+    this.#publish(this.#ringAll, nAll, 1);
+    this.#publish(this.#stemSel, nSel, 2);
+    this.#publish(this.#ringSel, nSel, 3);
+  }
+
+  #publish(mesh: InstancedMesh<BufferGeometry, MeshBasicMaterial>, n: number, rangeIndex: number): void {
+    mesh.count = n;
+    mesh.visible = n > 0;
+    if (n > 0) publishRange(mesh.instanceMatrix, n * 16, this.#ranges[rangeIndex]);
+  }
+
+  #hide(): void {
+    for (const mesh of [this.#stemAll, this.#ringAll, this.#stemSel, this.#ringSel]) {
+      mesh.count = 0;
+      mesh.visible = false;
+    }
+  }
+
+  dispose(): void {
+    for (const mesh of [this.#stemAll, this.#ringAll, this.#stemSel, this.#ringSel]) {
+      mesh.dispose();
+      mesh.material.dispose();
+    }
+    for (const g of this.#geometries) g.dispose();
+    this.#geometries = [];
+    this.group.removeFromParent();
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Manager
 // ---------------------------------------------------------------------------------------------
 
@@ -901,6 +1119,8 @@ export interface OverlayManagerOptions {
   readonly heatmapSize?: number;
   /** Nominal RSU coverage radius in metres for the `coverage`/`rsu_range` overlays. Default 350. */
   readonly coverageRadiusM?: number;
+  /** Most locator beacons drawn at once, and the live-actor count above which only the selected one keeps its beacon. Default 64. */
+  readonly locatorCapacity?: number;
 }
 
 /**
@@ -936,6 +1156,8 @@ export class OverlayManager {
   readonly heatmap: HeatmapOverlay;
   readonly coverage: CoverageOverlay;
   readonly markers: StateMarkerOverlay;
+  /** Locator beacons; see {@link ActorLocatorOverlay}. Not a catalogue entry — it is always on. */
+  readonly locators: ActorLocatorOverlay;
 
   #theme: ViewerTheme;
   #world: WorldRenderer | null;
@@ -955,9 +1177,10 @@ export class OverlayManager {
     this.heatmap = new HeatmapOverlay(options.heatmapSize ?? 128, options.heatmapSize ?? 128);
     this.coverage = new CoverageOverlay(this.#theme, 512);
     this.markers = new StateMarkerOverlay(this.#theme, options.markerCapacity ?? 4096);
+    this.locators = new ActorLocatorOverlay(this.#theme, options.locatorCapacity ?? 64);
 
     this.group.add(this.heatmap.object, this.coverage.object, this.links.object,
-      this.pulses.object, this.markers.group);
+      this.pulses.object, this.markers.group, this.locators.group);
 
     for (const name of OVERLAY_NAMES) {
       this.#enabled.set(name, false);
@@ -999,6 +1222,7 @@ export class OverlayManager {
     this.links.setTheme(theme);
     this.coverage.setTheme(theme);
     this.markers.setTheme(theme);
+    this.locators.setTheme(theme);
   }
 
   /**
@@ -1108,6 +1332,7 @@ export class OverlayManager {
   update(ctx: OverlayUpdateContext): void {
     this.pulses.update(ctx.timeSeconds);
     if (this.markers.group.visible) this.markers.update(ctx, defaultMarkerPredicate);
+    this.locators.update(ctx);
   }
 
   dispose(): void {
@@ -1116,6 +1341,7 @@ export class OverlayManager {
     this.heatmap.dispose();
     this.coverage.dispose();
     this.markers.dispose();
+    this.locators.dispose();
     this.group.removeFromParent();
   }
 }

@@ -26,7 +26,7 @@ export function Sparkline({
   label: string;
   unit: string;
   tick: number;
-  /** The §3.5.2 wire field this series is sampled from — the `ValueRef.id` `explain` takes. */
+  /** The telemetry field this series is sampled from, which is what the engine is asked to explain. */
   fieldKey?: string;
   /** The followed node, so the provenance question is about a node and not about "a vehicle". */
   node?: number | null;
@@ -89,14 +89,14 @@ export function Sparkline({
     <div className="spark">
       <div className="label">
         {/*
-          The sparkline is the same §3.5.2 field the HUD shows, plotted over the retained window, so
-          it resolves to the same provenance — and it has to be reachable here too, because this row
-          is where the shape of the value is read rather than its latest number (09-ui §5, §10).
+          The sparkline is the same telemetry field the HUD shows, plotted over the retained window,
+          so it resolves to the same provenance — and it has to be reachable here too, because this
+          row is where the shape of a value is read rather than its latest number.
         */}
         <button
           type="button"
           className="linklike"
-          title={`${unit} — explain`}
+          title={`${label} in ${unit} — where does this come from?`}
           data-testid={`spark-why-${seriesIndex}`}
           aria-label={`${label} in ${unit} — explain`}
           onClick={() =>

@@ -332,10 +332,60 @@ export function addDisc(
 }
 
 /**
+ * View-independent shading baked into an extruded ring's vertex colours.
+ *
+ * At street level a directional sun gives a vertical wall almost nothing: at the default 11:00 the
+ * sun sits 57° up, so `N·L` on a wall is small, and on a wall facing away it is zero. A city of
+ * prisms then renders as one flat silhouette with no edges — which is exactly the "no buildings, no
+ * sense of a street, no depth" the review saw. These three terms fix that in the vertex buffer, so
+ * they cost nothing per frame and survive any sun position:
+ *
+ * - **tone** separates neighbours. One value per building, so two adjacent façades never share an
+ *   edge you cannot see.
+ * - **baseOcclusion** darkens the foot of every wall. This is a real effect — the sky is occluded
+ *   at the bottom of a street canyon — and it is what makes a wall read as standing on a road
+ *   rather than floating over it.
+ * - **faceRelief** gives each face of a prism its own value from the face's azimuth alone, so the
+ *   corner between two walls is always visible even when the sun lights neither.
+ *
+ * All three default to a no-op, so a caller that wants flat vertex colours gets byte-identical
+ * geometry to before.
+ */
+export interface RingShading {
+  /** Multiplies the whole building's colour. Default 1. */
+  readonly tone?: number;
+  /** Fraction of the wall colour removed at the base, `[0, 1)`. Default 0. */
+  readonly baseOcclusion?: number;
+  /** Value swing applied by wall azimuth, `[0, 1)`. Default 0. */
+  readonly faceRelief?: number;
+  /** Multiplies the near-LOD parapet band, which is what draws a roofline. Default 1. */
+  readonly parapetGain?: number;
+}
+
+/**
+ * The fixed relief direction, a unit vector in the ground plane.
+ *
+ * Deliberately *not* the sun: the sun moves with the time of day and goes below the horizon, and
+ * the point of the relief term is that the corners of a building stay visible when it does. North
+ * north-east is chosen so it disagrees with the 11:00 sun azimuth and therefore adds information
+ * rather than doubling what the light already says.
+ */
+const RELIEF_X = 0.44;
+const RELIEF_Y = 0.9;
+
+/** `1 + faceRelief · relief(n)` for a wall whose outward normal is `(nx, ny)`. */
+function reliefGain(nx: number, ny: number, amount: number): number {
+  return amount <= 0 ? 1 : 1 + amount * (nx * RELIEF_X + ny * RELIEF_Y);
+}
+
+/**
  * Extrude a footprint ring into a closed solid: walls with outward normals plus a roof cap.
  *
  * `lod` 0 gives walls, a cap and a small parapet band; 1 gives walls and a flat cap; 2 replaces the
  * ring by its axis-aligned bounding box (the "box" LOD of 09-ui §4).
+ *
+ * `shading` bakes the view-independent form shading described on {@link RingShading}; omitting it
+ * reproduces the flat-coloured geometry exactly.
  */
 export function addExtrudedRing(
   b: MeshBuilder,
@@ -345,11 +395,21 @@ export function addExtrudedRing(
   scratch: number[],
   wallR = 1, wallG = 1, wallB = 1,
   roofR = 1, roofG = 1, roofB = 1,
+  shading?: RingShading,
 ): void {
   if (count < 3 || height <= 0) return;
   const topZ = baseZ + height;
+  const tone = shading?.tone ?? 1;
+  const occl = Math.max(0, Math.min(0.95, shading?.baseOcclusion ?? 0));
+  const relief = Math.max(0, Math.min(0.95, shading?.faceRelief ?? 0));
+  const parapet = shading?.parapetGain ?? 1;
+  // The base band keeps the *relative* colour of the three surface classes; it only lowers value.
+  const footGain = tone * (1 - occl);
 
   if (lod === 2) {
+    // One box, one colour: the relief term needs per-face normals it does not have. Split the
+    // difference between the wall top and its shaded foot so an LOD switch is not a step change.
+    const flat = tone * (1 - occl * 0.5);
     let minX = Infinity;
     let minY = Infinity;
     let maxX = -Infinity;
@@ -363,7 +423,7 @@ export function addExtrudedRing(
       if (y > maxY) maxY = y;
     }
     addBox(b, (minX + maxX) / 2, (minY + maxY) / 2, (baseZ + topZ) / 2,
-      maxX - minX, maxY - minY, height, 0, wallR, wallG, wallB);
+      maxX - minX, maxY - minY, height, 0, wallR * flat, wallG * flat, wallB * flat);
     return;
   }
 
@@ -384,14 +444,23 @@ export function addExtrudedRing(
     if (el < 1e-6) continue;
     const nx = ey / el;
     const ny = -ex / el;
-    const v0 = b.addVertex(x0, y0, baseZ, nx, ny, 0, 0, 0, wallR, wallG, wallB);
-    const v1 = b.addVertex(x1, y1, baseZ, nx, ny, 0, 1, 0, wallR, wallG, wallB);
-    const v2 = b.addVertex(x1, y1, topZ, nx, ny, 0, 1, 1, wallR, wallG, wallB);
-    const v3 = b.addVertex(x0, y0, topZ, nx, ny, 0, 0, 1, wallR, wallG, wallB);
+    const g = reliefGain(nx, ny, relief);
+    // Top of the wall at full value, foot of it darkened: the gradient is what gives the wall
+    // height and the road a shadow line to sit against.
+    const tr = wallR * tone * g;
+    const tg = wallG * tone * g;
+    const tb = wallB * tone * g;
+    const br = wallR * footGain * g;
+    const bg = wallG * footGain * g;
+    const bb = wallB * footGain * g;
+    const v0 = b.addVertex(x0, y0, baseZ, nx, ny, 0, 0, 0, br, bg, bb);
+    const v1 = b.addVertex(x1, y1, baseZ, nx, ny, 0, 1, 0, br, bg, bb);
+    const v2 = b.addVertex(x1, y1, topZ, nx, ny, 0, 1, 1, tr, tg, tb);
+    const v3 = b.addVertex(x0, y0, topZ, nx, ny, 0, 0, 1, tr, tg, tb);
     b.addQuad(v0, v1, v2, v3);
   }
   // Roof.
-  addPolygon(b, xs, ys, off, count, topZ, scratch, roofR, roofG, roofB);
+  addPolygon(b, xs, ys, off, count, topZ, scratch, roofR * tone, roofG * tone, roofB * tone);
   if (lod === 0) {
     // A 0.4 m parapet band so near buildings do not read as untextured prisms.
     const bandZ = topZ + 0.4;
@@ -409,10 +478,16 @@ export function addExtrudedRing(
       if (el < 1e-6) continue;
       const nx = ey / el;
       const ny = -ex / el;
-      const v0 = b.addVertex(x0, y0, topZ, nx, ny, 0, 0, 0, roofR, roofG, roofB);
-      const v1 = b.addVertex(x1, y1, topZ, nx, ny, 0, 1, 0, roofR, roofG, roofB);
-      const v2 = b.addVertex(x1, y1, bandZ, nx, ny, 0, 1, 1, roofR, roofG, roofB);
-      const v3 = b.addVertex(x0, y0, bandZ, nx, ny, 0, 0, 1, roofR, roofG, roofB);
+      // The parapet is the one band that always catches light, so it is what draws the roofline
+      // against the sky. Gaining it slightly is the cheapest silhouette there is.
+      const k = tone * parapet * reliefGain(nx, ny, relief);
+      const pr = roofR * k;
+      const pg = roofG * k;
+      const pb = roofB * k;
+      const v0 = b.addVertex(x0, y0, topZ, nx, ny, 0, 0, 0, pr, pg, pb);
+      const v1 = b.addVertex(x1, y1, topZ, nx, ny, 0, 1, 0, pr, pg, pb);
+      const v2 = b.addVertex(x1, y1, bandZ, nx, ny, 0, 1, 1, pr, pg, pb);
+      const v3 = b.addVertex(x0, y0, bandZ, nx, ny, 0, 0, 1, pr, pg, pb);
       b.addQuad(v0, v1, v2, v3);
     }
   }

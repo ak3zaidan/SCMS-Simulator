@@ -244,6 +244,7 @@ export class ActorRenderer {
   #showGroundTruth: boolean;
   #benignByClass: boolean;
   #selectedActorId = -1;
+  #hiddenActorId = -1;
   #color = new Color();
   #stats: ActorUpdateStats = {
     live: 0, drawn: 0, culled: 0, dropped: 0, buckets: 0, lod0: 0, lod1: 0, lod2: 0,
@@ -325,6 +326,22 @@ export class ActorRenderer {
   /** Actor id drawn in the selection colour, or −1. */
   get selectedActorId(): number {
     return this.#selectedActorId;
+  }
+
+  /**
+   * One actor whose instance is not written this frame, or −1.
+   *
+   * This exists for the dashboard camera. The driver's eye sits 0.6 m ahead of the actor's origin
+   * and a car is four metres long, so the camera is *inside* its own body: the view was a slab of
+   * vehicle paint with the city visible above it. Culling the followed actor is what a driver's-eye
+   * view means, and it is a slot skipped in a loop rather than a second pass.
+   */
+  get hiddenActorId(): number {
+    return this.#hiddenActorId;
+  }
+
+  set hiddenActorId(id: number) {
+    this.#hiddenActorId = id;
   }
 
   set selectedActorId(id: number) {
@@ -544,6 +561,8 @@ export class ActorRenderer {
     const classColor = this.#classColor;
     const selected = this.#selectedActorId;
     const selectedU = selected >>> 0;
+    const hidden = this.#hiddenActorId;
+    const hiddenU = hidden >>> 0;
     const gt = this.#showGroundTruth;
     const benignByClass = this.#benignByClass;
     const col = this.#color;
@@ -559,6 +578,8 @@ export class ActorRenderer {
     for (let s = 0; s < ctx.count; s++) {
       if (occ[s] === 0) continue;
       live++;
+      // Still live and still pickable; just not drawn. See `hiddenActorId`.
+      if (hidden >= 0 && ids[s] === hiddenU) continue;
       let c = cls[s];
       if (c >= nClasses) c = 0;
       const p = s * 3;

@@ -95,28 +95,46 @@ const OKABE_ITO_DARK = {
   reddishPurple13: 0x4f2c3f,
 } as const;
 
-/** The default dark theme. */
+/**
+ * The default dark theme.
+ *
+ * ## Why the surfaces are lighter than a dark basemap would paint them
+ *
+ * These values are consumed as *albedo*, not as pixels: the renderer converts each one to linear
+ * space, multiplies by the light rig and tone-maps the result, so a surface authored at 0x2a3138
+ * left the screen at roughly 0x2b2b2b. That is a fine road on a plan view, where the only job is to
+ * sit behind a bright lane marking. At street level it was the whole lower half of the frame, and a
+ * building wall at 0x39424d beside it was indistinguishable from the sky — the review's "a few
+ * white strips in a black void". The street-level surfaces (`ground`, `road`, `sidewalk`,
+ * `junction`, `parking`, `building`, `buildingRoof`) are therefore authored for how they *render*
+ * under the rig rather than for how they look in a swatch.
+ *
+ * `background`, `actorState` and `actorCategory` are unchanged and deliberately so: the first is
+ * what `test/theme.test.ts` measures the palette's 3:1 non-text contrast against, and the second
+ * two are the colour-blind-safe categorical palette the same test measures under all three
+ * dichromacies. Nothing here may move them.
+ */
 export const DARK_THEME: ViewerTheme = {
   name: "dark",
   background: 0x0b0f14,
   fogColor: 0x0b0f14,
   fogNear: 400,
   fogFar: 3200,
-  ground: 0x141a21,
-  road: 0x2a3138,
-  sidewalk: 0x343b43,
-  bikeLane: 0x2b3a33,
-  busLane: 0x3a3126,
-  parking: 0x262c33,
-  junction: 0x313941,
+  ground: 0x28323d,
+  road: 0x3d454f,
+  sidewalk: 0x4d5560,
+  bikeLane: 0x33473d,
+  busLane: 0x4a3f30,
+  parking: 0x353c45,
+  junction: 0x454e59,
   laneMarking: 0xb9c2cc,
   laneMarkingCentre: 0xd8c46a,
-  crossing: 0xdfe6ee,
-  building: 0x39424d,
-  buildingRoof: 0x2c343d,
+  crossing: 0xcdd6e0,
+  building: 0x5b6674,
+  buildingRoof: 0x424c58,
   water: 0x16374f,
-  park: 0x1d3325,
-  industrial: 0x35322c,
+  park: 0x24402e,
+  industrial: 0x3f3b33,
   rsu: OKABE_ITO.skyBlue,
   signalRed: 0xff4d4d,
   signalAmber: 0xffb000,
@@ -139,9 +157,12 @@ export const DARK_THEME: ViewerTheme = {
     selected: 0xffffff,
   },
   actorCategory: [0x8fa6bd, OKABE_ITO.orange, OKABE_ITO.blue, 0x7a8894],
-  skyTop: 0x0a1b33,
-  skyHorizon: 0x24405e,
-  skyBottom: 0x0b0f14,
+  // A daylight sky, not a night one. At the default 11:00 the old values put a near-black dome
+  // over a lit city: there was no horizon for a roofline to be read against, and the fog the
+  // street views blend into had nothing to blend to.
+  skyTop: 0x16375f,
+  skyHorizon: 0x53789c,
+  skyBottom: 0x121820,
 };
 
 /** The light theme, for figure export and bright rooms. */

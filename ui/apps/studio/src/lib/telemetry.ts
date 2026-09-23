@@ -32,12 +32,18 @@ import {
   verifyPolicy,
 } from "./format.js";
 
-/** §6.5 `Visibility`, as the §3.5.2 `Vis` column tags each field. */
+/**
+ * Who is allowed to see a value.
+ *
+ * `GT` is ground truth: something the run knows and no radio in it could. It is withheld from a
+ * detector under evaluation, and the interface tags it so a reader never mistakes it for something
+ * a vehicle observed.
+ */
 export type FieldVisibility = "GT" | "NODE" | "PUBLIC";
 
 /** One value on the HUD, carrying enough to explain itself in the "why" tab. */
 export interface HudField {
-  /** The §3.5.2 wire field name — also the `ValueRef.id` used for `explain` (§6.9). */
+  /** The telemetry field's own name, which is what the engine is asked about when explaining it. */
   readonly key: string;
   readonly label: string;
   /** Already formatted, sentinels resolved to `n/a`. */
@@ -68,21 +74,23 @@ export interface QueueRow {
 }
 
 /**
- * Values the HUD of 09-ui §5 draws that the VWP v1 `NodeTelemetry` record does not carry.
- * They are rendered as explicit gaps with the reason, and fetched from `inspect.node` when the
- * engine offers them there (the `stores` section of §6.8).
+ * Values the HUD has a place for that a radio's regular report does not carry.
+ *
+ * Rendered as explicit gaps with the reason, and filled from a direct question to the engine about
+ * that one radio when it answers. A blank would read as zero; this reads as unknown, which is what
+ * it is.
  */
 export const MISSING_FROM_WIRE = [
   {
     key: "evidence_buffer",
     label: "Evidence buffer",
-    reason: "§3.5.2 carries no evidence-buffer field; the count comes from inspect.node stores.evidence_buffer (§6.8).",
+    reason: "The radio's regular report does not include this, so it has to be asked for separately — and not every engine answers.",
     inspectPath: ["stores", "evidence_buffer"],
   },
   {
     key: "last_crl_fetch",
     label: "Last CRL fetch",
-    reason: "§3.5.2 carries no last-CRL-fetch timestamp; it comes from inspect.node crl (§6.8).",
+    reason: "The radio's regular report does not include when it last fetched the revocation list, so it has to be asked for separately.",
     inspectPath: ["crl", "last_fetch_ns"],
   },
 ] as const;
@@ -103,7 +111,7 @@ function ratioPct(used: number, total: number): number | null {
   return (used / total) * 100;
 }
 
-/** The five queues of §3.5.2 with their drop causes. */
+/** The five queues a radio reports, with what it dropped from each and why. */
 export function queueRows(t: NodeTelemetry): QueueRow[] {
   return [
     {
@@ -158,7 +166,7 @@ export function hudGroups(t: NodeTelemetry): HudGroup[] {
         { key: "hsm_util_pm", label: "HSM", value: permillePct(t.hsmUtilPm), raw: u16v(t.hsmUtilPm), unit: "per-mille", visibility: "NODE" },
         { key: "ram_used_kib", label: "RAM", value: `${kib(t.ramUsedKib)} / ${kib(t.ramTotalKib)}`, raw: ratioPct(t.ramUsedKib, t.ramTotalKib), unit: "KiB", visibility: "NODE", help: "Stores + queues + the hardware profile's baseline." },
         { key: "storage_used_b", label: "Flash", value: `${bytes(t.storageUsedB)} / ${bytes(t.storageTotalB)}`, raw: ratioPct(Number(t.storageUsedB), Number(t.storageTotalB)), unit: "bytes", visibility: "NODE" },
-        { key: "node_state", label: "Node state", value: nodeState(t.nodeState), raw: t.nodeState, unit: "enum", visibility: t.nodeState === 6 ? "GT" : "NODE", help: "State 6 (compromised) is ground truth and is withheld in the node profile (§5.2)." },
+        { key: "node_state", label: "Node state", value: nodeState(t.nodeState), raw: t.nodeState, unit: "enum", visibility: t.nodeState === 6 ? "GT" : "NODE", help: "What the radio is doing. \"Compromised\" is something only the run itself knows, so it is withheld from anything being evaluated." },
       ],
     },
     {
@@ -195,8 +203,8 @@ export function hudGroups(t: NodeTelemetry): HudGroup[] {
         { key: "gnss_sigma_m", label: "σ horizontal", value: `${num(t.gnssSigmaM, 2)} m`, raw: f32v(t.gnssSigmaM), unit: "m", visibility: "NODE", help: "1σ horizontal error from the GNSS model's own noise parameters." },
         { key: "gnss_hdop", label: "HDOP", value: num(t.gnssHdop, 2), raw: f32v(t.gnssHdop), unit: "1", visibility: "NODE" },
         { key: "clock_drift_ppm", label: "Clock drift", value: `${num(t.clockDriftPpm, 2)} ppm`, raw: f32v(t.clockDriftPpm), unit: "ppm", visibility: "NODE" },
-        { key: "clock_offset_ns", label: "Clock offset", value: signedNs(t.clockOffsetNs), raw: isU64Sentinel(t.clockOffsetNs) ? null : Number(t.clockOffsetNs), unit: "ns", visibility: "GT", help: "believed − true time. Ground truth (§5.2): absent in the node profile." },
-        { key: "pos_error_m", label: "Belief vs truth", value: `${num(t.posErrorM, 2)} m`, raw: f32v(t.posErrorM), unit: "m", visibility: "GT", help: "‖belief − truth‖ horizontal. Ground truth (§5.2)." },
+        { key: "clock_offset_ns", label: "Clock offset", value: signedNs(t.clockOffsetNs), raw: isU64Sentinel(t.clockOffsetNs) ? null : Number(t.clockOffsetNs), unit: "ns", visibility: "GT", help: "How far this radio's clock is from the true time. Only the run knows this, so it is withheld from anything being evaluated." },
+        { key: "pos_error_m", label: "Belief vs truth", value: `${num(t.posErrorM, 2)} m`, raw: f32v(t.posErrorM), unit: "m", visibility: "GT", help: "How far this radio thinks it is from where it actually is, horizontally. Only the run knows this." },
       ],
     },
     {
@@ -222,7 +230,7 @@ export function hudGroups(t: NodeTelemetry): HudGroup[] {
   ];
 }
 
-/** Total drops across the six §3.5.2 causes, for the one-line summary. */
+/** Total messages dropped, across all six reported causes, for the one-line summary. */
 export function totalDrops(t: NodeTelemetry): number {
   const parts = [t.dropRxOverflow, t.dropVerifyOverflow, t.dropVerifyPolicySkip, t.dropTxOverflow, t.dropReassemblyTimeout, t.dropCrlBacklog];
   let sum = 0;

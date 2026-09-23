@@ -1,11 +1,14 @@
 /**
- * The plots strip of the 09-ui §6 wireframe: "Plots: [PDR vs distance] [CBR vs time] …".
+ * The measurements strip: whatever the engine is measuring, plotted as it arrives.
  *
- * Series come from the `MetricSample` frames (§3.7) as they arrive — the same samples the engine
- * would return from `metrics.query` — so the strip is live with no polling. The catalogue behind
- * the `+` button is `metrics.query` with no `metrics` argument (§6.12), which returns the metric
- * definitions with their units and visibility. Clicking a plot's title opens the "why" tab for that
- * metric, resolving its `prov_id` through the `Provenance` frames (§3.8).
+ * Series come from the engine's own metric samples as they stream in, so the strip is live with no
+ * polling. The list behind the `+` button is the engine's catalogue of measurements, which carries
+ * each one's unit — and the unit is part of the number: a delivery ratio on a 0–1 scale and one in
+ * per cent are different values. When the engine publishes no catalogue the axes say so rather than
+ * inventing a unit.
+ *
+ * Clicking a plot's title, its value or its unit opens the "why" tab for that measurement, with the
+ * model, version and parameter set that produced it.
  */
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -18,7 +21,7 @@ import { metricSubject } from "../lib/provenance.js";
 const PLOT_W = 250;
 const PLOT_H = 86;
 
-/** One catalogue row of `metrics.query` with no `metrics` argument (§6.12). */
+/** One row of the engine's catalogue of measurements: a name, a unit, and whether it is ground truth. */
 interface MetricDefinition {
   readonly name: string;
   readonly unit: string;
@@ -96,7 +99,7 @@ function MetricPlot({
         <button
           type="button"
           className="linklike"
-          title="Explain this metric (§3.8, §6.9)"
+          title="Where this measurement comes from: the model, its version and its parameters"
           data-testid={`plot-title-${name}`}
           aria-label={`${name}${definition?.unit ? ` in ${definition.unit}` : ""} — explain`}
           onClick={() => setWhy(subject)}
@@ -133,9 +136,13 @@ function MetricPlot({
           aria-label={`Unit of ${name}: ${definition?.unit ?? "not published by this engine"} — explain`}
           onClick={() => setWhy(subject)}
         >
-          {definition?.unit ?? "unit not published"}
+          {definition?.unit ?? "unit not stated by this engine"}
         </button>
-        {dims[name] ? <span className="faint" title="§3.8 dimension dictionary">{dims[name]}</span> : null}
+        {dims[name] ? (
+          <span className="faint" title="The conditions this measurement was taken under">
+            {dims[name]}
+          </span>
+        ) : null}
       </div>
       <div ref={hostRef} data-testid={`plot-${name}`} />
     </div>
@@ -145,6 +152,7 @@ function MetricPlot({
 export function PlotsStrip(): React.JSX.Element {
   const tick = useStudio((s) => s.seriesTick);
   const connection = useStudio((s) => s.connection);
+  const running = useStudio((s) => s.run.state === "running");
   const [selected, setSelected] = useState<string[]>([]);
   const [available, setAvailable] = useState<readonly string[]>([]);
   const [catalogue, setCatalogue] = useState<MetricDefinition[]>([]);
@@ -187,7 +195,10 @@ export function PlotsStrip(): React.JSX.Element {
    * was being read. One call per connection (§6.12 `metrics.query` with no `metrics` argument).
    */
   useEffect(() => {
-    if (connection !== "streaming") return;
+    // Not gated on the stream being up. `metrics.query` is answered over HTTP as well as over the
+    // socket (`StudioEngine.request` picks), so the units and the GT tags are available on a page
+    // whose run has finished — which is exactly when someone is reading the plots rather than
+    // watching them.
     void fetchCatalogue();
   }, [connection, fetchCatalogue]);
 
@@ -200,7 +211,7 @@ export function PlotsStrip(): React.JSX.Element {
   return (
     <section className="plots" data-testid="plots-strip">
       <div className="plots-head">
-        <span className="dim">Plots</span>
+        <span className="dim">Measurements</span>
         {available.map((name) => (
           <button
             key={name}
@@ -218,22 +229,32 @@ export function PlotsStrip(): React.JSX.Element {
             if (catalogue.length === 0) void fetchCatalogue();
           }}
           data-testid="metric-catalogue"
+          title="What this engine can measure, and in what units"
         >
           +
         </button>
         {open ? (
-          <span className="dim mono" style={{ whiteSpace: "nowrap" }}>
-            {catalogue.length > 0
-              ? catalogue.map((c) => `${c.name} [${c.unit}${c.visibility === "GT" ? " · GT" : ""}]`).join("  ·  ")
-              : "metrics.query returned no catalogue"}
+          <span className="dim" style={{ whiteSpace: "nowrap" }} data-testid="metric-catalogue-list">
+            {catalogue.length > 0 ? (
+              <span className="mono">
+                {catalogue.map((c) => `${c.name} [${c.unit}${c.visibility === "GT" ? " · ground truth" : ""}]`).join("  ·  ")}
+              </span>
+            ) : (
+              "This engine does not publish a list of what it measures. Whatever it sends is still plotted, but without units."
+            )}
           </span>
         ) : null}
       </div>
       <div className="plots-body">
         {selected.length === 0 ? (
-          <p className="dim" style={{ margin: 4 }}>
-            No <code>MetricSample</code> frames yet (§3.7). They arrive every{" "}
-            <code>metric_period_ns</code> once the run is streaming.
+          <p className="dim" style={{ margin: 4 }} data-testid="plots-empty">
+            {available.length > 0
+              ? "Nothing chosen to plot. Pick a measurement from the row above."
+              : connection !== "streaming"
+                ? "No measurements have reached this page. They arrive over the stream, so nothing will appear here until it is open again."
+                : running
+                  ? "No measurements have arrived yet. The engine sends them at its own interval, usually within the first simulated second — they will appear here on their own."
+                  : "No measurements yet. They arrive while a run is playing; press Run to start one."}
           </p>
         ) : null}
         {selected.map((name) => (

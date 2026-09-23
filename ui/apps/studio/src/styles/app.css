@@ -134,6 +134,63 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
 .topbar .spacer { flex: 1; }
 .topbar .meta { color: var(--text-dim); font-family: var(--mono); font-size: 11px; }
 
+/* The scenario's name: the second thing a reader looks for, after "is it running?". */
+.topbar-scenario {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 28ch;
+}
+.headline-clock { font-size: 12px; color: var(--text-dim); }
+.headline-clock .mono { color: var(--text); font-size: 13px; }
+
+/* ------------------------------------------------------------- the status sentence */
+
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+  font-size: 12px;
+  border-left: 3px solid var(--border-strong);
+}
+.statusbar.ok { border-left-color: var(--ok); }
+.statusbar.busy { border-left-color: var(--accent); }
+.statusbar.warn { border-left-color: var(--warn); }
+.statusbar.err { border-left-color: var(--err); }
+.statusbar.idle { border-left-color: var(--border-strong); }
+.statusbar-text { flex: 1; min-width: 0; }
+.statusbar-text strong { font-weight: 600; }
+.statusbar-error { color: var(--err); }
+
+/*
+ * A long identifier, shown short and copied in full.
+ *
+ * The `copy` hint is text rather than an icon so it is legible at 10px and readable by a screen
+ * reader without an extra label, and it only colours up on hover so a panel of these does not read
+ * as a row of buttons.
+ */
+.ident {
+  all: unset;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  border-radius: 2px;
+}
+.ident .ident-hint {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+.ident:hover .mono, .ident:focus-visible .mono { color: var(--accent); text-decoration: underline; }
+.ident:hover .ident-hint, .ident:focus-visible .ident-hint { color: var(--accent); }
+.ident:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 .body {
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr) 360px;
@@ -165,9 +222,15 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
 .panel-body { overflow: auto; padding: 8px 10px; flex: 1; min-height: 0; }
 .panel-foot { border-top: 1px solid var(--border); padding: 6px 10px; display: flex; gap: 6px; flex: none; }
 
+/*
+ * Three rows: the status sentence (absent most of the time and 0px then), the viewport, the time
+ * controls. The sentence is in the flow rather than floating over the picture — a message that
+ * covers the thing it is describing is a message people learn to dismiss, and this one is
+ * frequently the only text on the page worth reading.
+ */
 .centre {
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
 }
@@ -481,10 +544,18 @@ button.hud-field:focus-visible {
 .pill.warn { border-color: var(--warn); color: var(--warn); }
 .pill.err { border-color: var(--err); color: var(--err); }
 
+/*
+ * There is no `.right` text-alignment utility here, and there must not be one.
+ *
+ * `.right` existed as `text-align: right` and was used by nothing — except that the inspector is
+ * `<aside class="panel right">`, where `right` names the side of the window. The utility matched it
+ * and right-aligned the entire inspector: its prose, its key/value pairs and the 64-character world
+ * digest it used to print, which is a large part of why that digest read as unreadable texture.
+ * Anything that needs right alignment now says so in its own rule, by its own name.
+ */
 .mono { font-family: var(--mono); }
 .dim { color: var(--text-dim); }
 .faint { color: var(--text-faint); }
-.right { text-align: right; }
 .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .grow { flex: 1; }
 .scroll-y { overflow-y: auto; }
@@ -574,6 +645,116 @@ button.stat:focus-visible { outline: 2px solid var(--accent); outline-offset: 1p
 
 /* A menu that has to open upwards, because it is anchored to the bottom bar. */
 .menu-pop.up { bottom: calc(100% + 4px); top: auto; }
+
+/*
+ * A menu anchored near the right edge of the window, which opens leftwards so it stays on screen.
+ *
+ * Named `anchor-right`, not `right`: `right` is also how the inspector names its side of the
+ * window, and a utility by that name is what right-aligned that whole panel for however long.
+ */
+.menu-pop.anchor-right { left: auto; right: 0; }
+
+/* Identifiers in a header disclosure: the labels are short, so the value column can start early. */
+.menu-pop .kv { grid-template-columns: minmax(64px, max-content) 1fr; }
 .menu-pop.wide { min-width: 340px; max-width: 460px; }
 
 .note.warn-note { border-left-color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+
+/* ---------------------------------------------- the transport bar (state/transport.ts) */
+
+/*
+ * How much of the span exists.
+ *
+ * Between the empty track and the accent fill: the run's intended duration is the whole track, the
+ * part the engine has simulated is this region, and the position is the fill. Without the middle
+ * region, four fifths of the bar on a run three seconds in was time nothing had simulated, drawn
+ * exactly like time that had, and a drag into it came back "seek out of range".
+ */
+.scrub .produced {
+  position: absolute;
+  top: 11px;
+  height: 4px;
+  left: 0;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/* What a control said when it could not do what was asked. Takes the full width of the bar's
+ * wrapped row rather than squeezing between the clock and the event list. */
+.timebar-notice {
+  flex-basis: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--warn);
+  border-left: 2px solid var(--warn);
+  padding: 2px 8px;
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+.timebar-notice button { margin-left: auto; }
+
+/* ---------------------------------------------- the left-hand tabs */
+
+/*
+ * The four tabs did not say which to use first: same size, same weight, same colour, in an order
+ * nothing motivated. They are now ordered by when you need them and the first one is marked as the
+ * place to start, with the secondary two set off by a rule.
+ */
+.tabs .tab-count {
+  font-size: 9px;
+  font-family: var(--mono);
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+.tabs button.active .tab-count { color: var(--text); border-color: var(--border-strong); }
+.tabs .tab-rule {
+  align-self: stretch;
+  width: 1px;
+  margin: 4px 5px;
+  background: var(--border);
+  flex: none;
+}
+
+/* ---------------------------------------------- progressive disclosure inside a panel */
+
+/*
+ * The identifiers, digests and frame counters a panel used to print in full.
+ *
+ * They are worth keeping — a run id that cannot be copied cannot be cited — and they are noise
+ * until the moment they are needed, so each group sits behind one of these. Closed by default,
+ * copyable when open.
+ */
+.disclose { margin: 6px 0; }
+.disclose > summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 2px 0;
+  list-style: none;
+}
+.disclose > summary::-webkit-details-marker { display: none; }
+.disclose > summary::before { content: "▸ "; color: var(--text-faint); }
+.disclose[open] > summary::before { content: "▾ "; }
+.disclose > summary:hover { color: var(--text); }
+.disclose-body { padding: 2px 0 4px 12px; }
+
+/* An identifier shown short, with the whole of it one click away. */
+.idline { display: flex; align-items: baseline; gap: 6px; }
+.idline code { font-size: 10px; overflow-wrap: anywhere; }
+
+/* ---------------------------------------------- the recordings list (Runs tab) */
+
+.runrow {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 0;
+  border-bottom: 1px dotted var(--border);
+}
+.runrow.current { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.runrow .name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.runrow .meta { font-size: 10px; color: var(--text-dim); font-family: var(--mono); }

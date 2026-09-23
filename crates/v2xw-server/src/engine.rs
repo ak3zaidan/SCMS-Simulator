@@ -160,6 +160,75 @@ pub struct StepOutput {
     pub recorded: Vec<v2xw_record::wire::Frame>,
 }
 
+impl StepOutput {
+    /// Roughly how much memory this step occupies, in bytes.
+    ///
+    /// An estimate, and it says so: it counts the fixed size of every row plus the length
+    /// of every variable-length payload, and it does not count an allocator's slack or a
+    /// `Vec`'s spare capacity. It exists because the retained-history window has to be
+    /// bounded in **bytes** and not only in steps — a step is one scene plus that step's
+    /// events, so its size scales with the fleet, and 36 000 steps of a thousand vehicles
+    /// is not the same quantity of memory as 36 000 steps of ten. Under-counting by a
+    /// constant factor is acceptable for a budget; not counting at all is not.
+    pub fn approx_bytes(&self) -> usize {
+        use core::mem::size_of;
+        let poses = self.snapshot.actors.len() * size_of::<v2xw_record::encoder::ActorPose>();
+        let signals =
+            self.snapshot.signals.len() * size_of::<v2xw_record::encoder::SignalState>();
+        // A `BTreeMap` node is bigger than its entries, so a per-entry estimate of the
+        // key, the value and two pointers is a floor rather than a figure.
+        let causes = (self.snapshot.spawn_causes.len() + self.snapshot.despawn_causes.len())
+            * (size_of::<u32>() + size_of::<u16>() + 2 * size_of::<usize>());
+        let telemetry = self.telemetry.len() * size_of::<NodeTelemetry>();
+        let events: usize = self
+            .events
+            .iter()
+            .map(|e| size_of::<EventEntry>() + e.payload.len())
+            .sum();
+        let metrics = self.metrics.len() * size_of::<MetricRow>();
+        let recorded: usize = self
+            .recorded
+            .iter()
+            .map(|f| size_of::<v2xw_record::wire::Frame>() + f.as_bytes().len())
+            .sum();
+        size_of::<StepOutput>()
+            + poses
+            + signals
+            + causes
+            + telemetry
+            + events
+            + metrics
+            + recorded
+    }
+}
+
+/// What history a run is keeping, and what it has already let go of.
+///
+/// `run.status` publishes this because 13-product-direction.md §3 asks for a retention
+/// policy that "does not silently discard what the user wants to seek to". It cannot be
+/// unbounded — a run of minutes at a useful fleet size would fill the machine — so the
+/// honest alternative is that it is bounded and the bound is *visible*: the page can show
+/// how far back the run is still scrubbable, and it can tell the difference between "that
+/// instant was never produced" and "that instant has been dropped".
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct Retention {
+    /// Steps currently held.
+    pub retained_steps: u64,
+    /// Roughly how many bytes they occupy; see [`StepOutput::approx_bytes`].
+    pub retained_bytes: u64,
+    /// The step-count ceiling (`--retain`).
+    pub limit_steps: u64,
+    /// The byte ceiling (`--retain-bytes`); `0` for no byte ceiling.
+    pub limit_bytes: u64,
+    /// Steps dropped from the back of the window since the run started.
+    ///
+    /// Non-zero means the seekable floor has moved: an instant the page could once seek
+    /// to is gone. It is a count rather than a flag so the page can say how much.
+    pub dropped_steps: u64,
+    /// Which ceiling the window is against now: `"steps"`, `"bytes"` or `""`.
+    pub binding: &'static str,
+}
+
 /// One node as the engine knows it *now*, with its strings unresolved.
 ///
 /// §3.1.3's node table is "the set known at connect time", and for a live run that set
@@ -419,6 +488,15 @@ pub trait Engine: Send + std::fmt::Debug {
 
     /// The seekable sim-time range, `(min_ns, max_ns)`, for `-32003`'s `data`.
     fn seek_range(&self) -> (u64, u64);
+
+    /// What history this run is keeping (§6.5's `retention`).
+    ///
+    /// The default is "keeps everything", which is true of a replay — the recording is on
+    /// disk and nothing is evicted — and of the synthetic fixture, which recomputes rather
+    /// than retains. Only a live run has a window to report.
+    fn retention(&self) -> Retention {
+        Retention::default()
+    }
 
     /// Answers an introspection query (§6.8–§6.13) as the JSON its result schema names.
     ///
