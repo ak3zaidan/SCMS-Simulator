@@ -46,6 +46,7 @@ import {
   type Material,
 } from "three";
 import type { SignalBlock, VwpWorld } from "@vwp/protocol";
+import { SignalRenderer } from "./signals.js";
 import { MeshBuilder, addBox, addCylinder, addDisc, addExtrudedRing, addPolygon, addRibbon } from "./geometry.js";
 import type { RingShading } from "./geometry.js";
 import type { ViewerTheme } from "./theme.js";
@@ -143,25 +144,6 @@ export interface WorldBuildReport {
   readonly buildMs: number;
 }
 
-/** SAE J2735 `MovementPhaseState` → a colour bucket. */
-function phaseBucket(phase: number): 0 | 1 | 2 | 3 {
-  switch (phase) {
-    case 2:
-    case 3:
-      return 1; // red
-    case 4:
-    case 7:
-    case 8:
-    case 9:
-      return 2; // amber
-    case 5:
-    case 6:
-      return 3; // green
-    default:
-      return 0; // dark / unavailable
-  }
-}
-
 /**
  * How far up-sun of its target the `DirectionalLight` is placed, metres.
  *
@@ -219,7 +201,9 @@ export class WorldRenderer {
   readonly tiles = new Group();
   readonly markings = new Group();
   readonly buildingsGroup = new Group();
-  readonly signalsGroup = new Group();
+  /** Signal lanterns and stop bars; see `signals.ts`. */
+  readonly signals: SignalRenderer;
+  readonly signalsGroup: Group;
   readonly sitesGroup = new Group();
   readonly lights = new Group();
 
@@ -242,7 +226,6 @@ export class WorldRenderer {
   #surfaceMaterial: MeshLambertMaterial;
   #markingMaterial: MeshBasicMaterial;
   #buildingMaterial: MeshLambertMaterial;
-  #signalMaterial: MeshLambertMaterial;
   #siteMaterial: MeshLambertMaterial;
   #disposables: (BufferGeometry | Material)[] = [];
 
@@ -268,11 +251,6 @@ export class WorldRenderer {
   #gridStart = new Int32Array(0);
   #gridItems = new Int32Array(0);
 
-  #signals: InstancedMesh<BufferGeometry, Material> | null = null;
-  #signalIndexById = new Map<number, number>();
-  #signalPhase = new Uint8Array(0);
-  #signalColors = new Float32Array(4 * 3);
-  #signalColor = new Color();
 
   /** Site positions, three floats each, at antenna height. */
   #sitePos = new Float32Array(0);
@@ -312,7 +290,8 @@ export class WorldRenderer {
     this.tiles.name = "world/tiles";
     this.markings.name = "world/lane-markings";
     this.buildingsGroup.name = "world/buildings";
-    this.signalsGroup.name = "world/signals";
+    this.signals = new SignalRenderer(options.theme);
+    this.signalsGroup = this.signals.group;
     this.sitesGroup.name = "world/sites";
     this.lights.name = "world/lights";
 
@@ -322,7 +301,6 @@ export class WorldRenderer {
       toneMapped: false,
     });
     this.#buildingMaterial = new MeshLambertMaterial({ vertexColors: true, name: "buildings" });
-    this.#signalMaterial = new MeshLambertMaterial({ vertexColors: true, name: "signal-heads", toneMapped: false });
     this.#siteMaterial = new MeshLambertMaterial({ vertexColors: true, name: "sites" });
 
     const groundGeom = new PlaneGeometry(1, 1);
@@ -490,10 +468,7 @@ export class WorldRenderer {
     this.ground.material.color.setHex(theme.ground);
     this.hemisphere.color.setHex(theme.skyHorizon);
     this.hemisphere.groundColor.setHex(theme.ground);
-    this.#signalColors.set([
-      ...colorTriple(theme.signalDark), ...colorTriple(theme.signalRed),
-      ...colorTriple(theme.signalAmber), ...colorTriple(theme.signalGreen),
-    ]);
+    this.signals.setTheme(theme);
     this.setTimeOfDay(this.#timeOfDay);
     if (this.#world) this.setWorld(this.#world);
   }
@@ -727,10 +702,10 @@ export class WorldRenderer {
       }
     }
 
-    this.#buildSignals(world);
+    this.signals.build(world);
     this.#buildSites(world);
     if (this.#buildings) drawables++;
-    if (this.#signals) drawables++;
+    if (this.signals.count > 0) drawables += 3;
     drawables += this.sitesGroup.children.length + 2; // ground and sky
 
     this.#report = {
@@ -976,45 +951,6 @@ export class WorldRenderer {
     return top;
   }
 
-  #buildSignals(world: VwpWorld): void {
-    const n = world.signals.count;
-    this.#signalIndexById.clear();
-    this.#signalPhase = new Uint8Array(n);
-    if (n === 0) {
-      this.#signals = null;
-      return;
-    }
-    const builder = new MeshBuilder({ color: true, vertexCapacity: 64, indexCapacity: 128 });
-    // A head: a dark housing with a bright lens facing -x. The lens is what instanceColor tints.
-    addBox(builder, 0, 0, 0, 0.34, 0.34, 0.95, 0, 0.16, 0.17, 0.19);
-    addBox(builder, -0.19, 0, 0, 0.06, 0.26, 0.82, 0, 1, 1, 1);
-    const geom = builder.toGeometry();
-    if (!geom) {
-      this.#signals = null;
-      return;
-    }
-    this.#disposables.push(geom);
-    const mesh = new InstancedMesh<BufferGeometry, Material>(geom, this.#signalMaterial, n);
-    mesh.name = "world/signal-heads";
-    mesh.castShadow = false;
-    mesh.frustumCulled = true;
-    const m = this.#scratchMatrix;
-    this.#scratchColor.setRGB(1, 1, 1);
-    for (let i = 0; i < n; i++) {
-      const s = world.signals.at(i);
-      m.identity().setPosition(s.xM, s.yM, s.zM);
-      mesh.setMatrixAt(i, m);
-      mesh.setColorAt(i, this.#scratchColor);
-      this.#signalIndexById.set(s.signalId, i);
-      this.#signalPhase[i] = 0;
-    }
-    mesh.instanceMatrix.needsUpdate = true;
-    mesh.computeBoundingSphere();
-    this.#signals = mesh;
-    this.signalsGroup.add(mesh);
-    this.updateSignalPhases(null);
-  }
-
   #buildSites(world: VwpWorld): void {
     const n = world.sites.count;
     this.#siteCount = n;
@@ -1048,28 +984,24 @@ export class WorldRenderer {
   }
 
   /**
-   * Apply a keyframe's signal block (§3.3.3). Pass `null` to reset every head to dark.
-   * Signals not present in the block keep their last phase.
+   * Apply signal rows on top of the current state, keyed by controller (`signal_id`), to every head
+   * of that controller. Pass `null` to forget every state. Kept for callers that hold a lone block
+   * (the replay path); a stream should use {@link applySignalKeyframe} and {@link applySignalDelta},
+   * which is what makes a seek or a reconnect come out right.
    */
   updateSignalPhases(block: SignalBlock | null): void {
-    const mesh = this.#signals;
-    if (!mesh) return;
-    if (block) {
-      for (let i = 0; i < block.count; i++) {
-        const idx = this.#signalIndexById.get(block.signalId[i]);
-        if (idx === undefined) continue;
-        this.#signalPhase[idx] = block.phase[i];
-      }
-    } else {
-      this.#signalPhase.fill(0);
-    }
-    const c = this.#signalColor;
-    for (let i = 0; i < this.#signalPhase.length; i++) {
-      const bucket = phaseBucket(this.#signalPhase[i]);
-      c.setRGB(this.#signalColors[bucket * 3], this.#signalColors[bucket * 3 + 1], this.#signalColors[bucket * 3 + 2]);
-      mesh.setColorAt(i, c);
-    }
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    if (block) this.signals.applyDelta(block);
+    else this.signals.resetStates();
+  }
+
+  /** A keyframe's signal block: the complete state (§3.3.3); unmentioned heads have no data. */
+  applySignalKeyframe(block: SignalBlock | null): void {
+    this.signals.applyKeyframe(block);
+  }
+
+  /** A delta's signal block: only the rows that changed (§3.4.7). */
+  applySignalDelta(block: SignalBlock | null): void {
+    this.signals.applyDelta(block);
   }
 
   /** Convenience alias matching the message name. */
@@ -1129,7 +1061,9 @@ export class WorldRenderer {
   }
 
   #clearWorld(): void {
-    for (const g of [this.tiles, this.markings, this.buildingsGroup, this.signalsGroup, this.sitesGroup]) {
+    // The signal renderer rebuilds itself in `setWorld`, keeping what the lamps showed when the
+    // world is the same one (a theme swap).
+    for (const g of [this.tiles, this.markings, this.buildingsGroup, this.sitesGroup]) {
       for (let i = g.children.length - 1; i >= 0; i--) {
         const child = g.children[i];
         g.remove(child);
@@ -1139,7 +1073,6 @@ export class WorldRenderer {
     for (const d of this.#disposables) d.dispose();
     this.#disposables = [];
     this.#buildings = null;
-    this.#signals = null;
     this.#buildingCount = 0;
     this.#buildingBackend = "none";
     this.#buildError = null;
@@ -1165,7 +1098,7 @@ export class WorldRenderer {
     this.#surfaceMaterial.dispose();
     this.#markingMaterial.dispose();
     this.#buildingMaterial.dispose();
-    this.#signalMaterial.dispose();
+    this.signals.dispose();
     this.#siteMaterial.dispose();
     this.group.removeFromParent();
   }

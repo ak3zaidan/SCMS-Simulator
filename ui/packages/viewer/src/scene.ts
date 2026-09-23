@@ -31,7 +31,9 @@ import {
   Scene,
   WebGLRenderer,
 } from "three";
-import type { HelloMessage, KeyframeMessage, PoseBuffer, VwpClientApi, VwpWorld } from "@vwp/protocol";
+import type {
+  DeltaMessage, HelloMessage, KeyframeMessage, PoseBuffer, SignalBlock, VwpClientApi, VwpWorld,
+} from "@vwp/protocol";
 import { ActorRenderer, DEFAULT_ACTOR_CLASSES, classesFromHello } from "./actors.js";
 import { CameraController, type CameraMode } from "./cameras.js";
 import { PoseInterpolator, type PoseInterpolatorOptions } from "./interp.js";
@@ -247,6 +249,16 @@ export class Viewer {
   /** Set by {@link setFog}, after which the mode stops driving the fog. */
   #fogUserSet = false;
   #detachClient: (() => void) | null = null;
+  /**
+   * Signal blocks waiting for the render clock to reach their sim time. Poses are drawn about one
+   * mobility step in the past (`interp.ts`); a lamp applied the moment its frame arrives would
+   * change colour a step before the vehicles it controls reach the instant it changed at, which on
+   * a stop line is the difference between a car crossing on green and on red.
+   */
+  #signalQueue: { simSeconds: number; keyframe: boolean; block: SignalBlock }[] = [];
+  #lastSignalSim = Number.NaN;
+  /** The `Hello` whose run the signal state belongs to; a re-attach with the same one keeps it. */
+  #signalHello: HelloMessage | null = null;
   #lastReport: FrameReport = {
     dtSeconds: 0, clockSeconds: 0, fixedSteps: 0, actorsDrawn: 0, actorsCulled: 0,
     interpolationAlpha: 0, stalled: true,
@@ -475,11 +487,78 @@ export class Viewer {
     const stepSeconds = Number(hello.mobilityStepNs) / 1e9;
     if (stepSeconds > 0) this.interpolator.setNominalIntervalSeconds(stepSeconds);
     this.interpolator.reset();
+    // A different Hello is a different run (or a non-resumed reconnect, §1.4 case 2): nothing the
+    // lamps showed belongs to it. The *same* Hello re-applied — the Studio re-attaching the viewer
+    // — keeps them, because a paused run sends its one keyframe once and never again.
+    if (hello !== this.#signalHello) {
+      this.#signalHello = hello;
+      this.#signalQueue.length = 0;
+      this.#lastSignalSim = Number.NaN;
+      this.worldRenderer.signals.resetStates();
+    }
   }
 
-  /** Apply a keyframe's signal block; poses come through {@link capture}. */
+  /** Apply a keyframe's signal block, at the sim time the scene is drawn at; poses come through {@link capture}. */
   applyKeyframe(kf: KeyframeMessage): void {
-    this.worldRenderer.updateSignalPhases(kf.signals);
+    this.#queueSignals(Number(kf.simTimeNs) / 1e9, kf.signals, true);
+  }
+
+  /** Apply a delta's signal rows (§3.4.7: only the ones that changed), time-aligned like the poses. */
+  applyDelta(delta: DeltaMessage): void {
+    if (delta.signals.count === 0) return;
+    this.#queueSignals(Number(delta.simTimeNs) / 1e9, delta.signals, false);
+  }
+
+  /**
+   * Hold the scene at the newest snapshot (the run is paused, finished or stopped) or release it.
+   * See {@link PoseInterpolator.setHeld}.
+   */
+  setStreamHeld(held: boolean): void {
+    this.interpolator.setHeld(held);
+  }
+
+  #queueSignals(simSeconds: number, block: SignalBlock, keyframe: boolean): void {
+    const copy: SignalBlock = {
+      count: block.count,
+      signalId: block.signalId.slice(0, block.count),
+      timeToChangeDs: block.timeToChangeDs.slice(0, block.count),
+      phase: block.phase.slice(0, block.count),
+      reserved: block.reserved.slice(0, block.count),
+    };
+    const last = this.#lastSignalSim;
+    // Earlier than what came before, or far later: a seek, a rewind or a new run. What is queued
+    // belongs to a stretch of the run that will not be drawn, and a keyframe is the whole state.
+    const discontinuous = Number.isFinite(last) && (simSeconds < last - 1e-6 || simSeconds > last + 5);
+    this.#lastSignalSim = simSeconds;
+    if (discontinuous) {
+      this.#signalQueue.length = 0;
+      if (keyframe) this.worldRenderer.applySignalKeyframe(copy);
+      else this.worldRenderer.applySignalDelta(copy);
+      return;
+    }
+    this.#signalQueue.push({ simSeconds, keyframe, block: copy });
+    // A stalled render clock must not let the queue grow without bound.
+    while (this.#signalQueue.length > 256) this.#applyQueuedSignal();
+  }
+
+  #applyQueuedSignal(): void {
+    const q = this.#signalQueue.shift();
+    if (!q) return;
+    if (q.keyframe) this.worldRenderer.applySignalKeyframe(q.block);
+    else this.worldRenderer.applySignalDelta(q.block);
+  }
+
+  /** Apply every queued signal block the render clock has reached. */
+  #flushSignals(): void {
+    const q = this.#signalQueue;
+    if (q.length === 0) return;
+    const at = this.interpolator.renderSimSeconds;
+    // No render time yet (no poses): the lamps are all there is to draw, so draw them now.
+    if (!Number.isFinite(at)) {
+      while (q.length > 0) this.#applyQueuedSignal();
+      return;
+    }
+    while (q.length > 0 && q[0].simSeconds <= at + 1e-6) this.#applyQueuedSignal();
   }
 
   /**
@@ -508,7 +587,10 @@ export class Viewer {
       this.applyKeyframe(kf);
       this.capture(client.poses);
     });
-    const offDelta = client.onDelta(() => this.capture(client.poses));
+    const offDelta = client.onDelta((delta) => {
+      this.applyDelta(delta);
+      this.capture(client.poses);
+    });
     const detach = (): void => {
       offHello();
       offKeyframe();
@@ -865,8 +947,10 @@ export class Viewer {
     }
     const renderClock = this.#fixedClock + this.#accumulator;
 
-    // 1. Poses.
+    // 1. Poses, and the signal states for the instant they are drawn at.
     const sample = this.interpolator.sample(renderClock);
+    this.#flushSignals();
+    this.worldRenderer.signals.update(renderClock);
 
     // 2. Camera. Exponential smoothing on the true frame dt (frame-rate independent by construction).
     this.#trackTraffic(dt);

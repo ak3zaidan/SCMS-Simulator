@@ -40,6 +40,7 @@ export function Viewport(): React.JSX.Element {
   const world = useStudio((s) => s.world);
   const hudDocked = useStudio((s) => s.hudDocked);
   const setHudDocked = useStudio((s) => s.setHudDocked);
+  const runState = useStudio((s) => s.run.state);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -89,6 +90,12 @@ export function Viewport(): React.JSX.Element {
   useEffect(() => {
     engine.viewer?.setTheme(theme);
   }, [theme]);
+
+  // A paused, finished or stopped run is *in* its newest state: hold the scene there instead of
+  // letting the interpolator glide every vehicle a step past it (measured 1.34 m on Manhattan).
+  useEffect(() => {
+    engine.viewer?.setStreamHeld(runState !== "running" && runState !== "seeking" && runState !== "loading");
+  }, [runState]);
 
   const onClick = useCallback((ev: React.MouseEvent<HTMLCanvasElement>) => {
     const viewer = engine.viewer;
