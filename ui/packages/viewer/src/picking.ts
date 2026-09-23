@@ -18,6 +18,7 @@
 
 import { Vector3 } from "three";
 import type { PerspectiveCamera } from "three";
+import { VEHICLE_MARK_ANGULAR_RADIUS } from "./types.js";
 import type { ActorClassDef, PickResult } from "./types.js";
 import type { WorldRenderer } from "./world-render.js";
 
@@ -33,6 +34,12 @@ export interface PickerOptions {
   readonly maxDistanceM?: number;
   /** Pick radius around an RSU mast head, metres. Default 3. */
   readonly siteRadiusM?: number;
+  /**
+   * Angular radius the actor hit box is grown to, radians. Defaults to
+   * {@link VEHICLE_MARK_ANGULAR_RADIUS}, which is also what the aerial vehicle mark is drawn at.
+   * See {@link Picker.pickAngularRadius}.
+   */
+  readonly pickAngularRadius?: number;
 }
 
 /** The pose columns the picker tests against. */
@@ -63,6 +70,7 @@ export class Picker {
   #cell: number;
   #maxDistance: number;
   #siteRadius: number;
+  #pickAngularRadius: number;
 
   #pos: Float32Array = new Float32Array(0);
   #head: Float32Array = new Float32Array(0);
@@ -85,6 +93,10 @@ export class Picker {
   #origin = new Vector3();
   #dir = new Vector3();
   #scratch = new Vector3();
+  /** Narrow-phase results, set by {@link Picker.#rayBox}; see {@link Picker.pickAngularRadius}. */
+  #hitT = 0;
+  #hitPerpSq = 0;
+  #hitBody = false;
 
   constructor(options: PickerOptions) {
     this.#camera = options.camera;
@@ -93,6 +105,37 @@ export class Picker {
     this.#cell = Math.max(2, options.cellSizeM ?? 24);
     this.#maxDistance = options.maxDistanceM ?? 5000;
     this.#siteRadius = options.siteRadiusM ?? 3;
+    this.#pickAngularRadius = Math.max(0, options.pickAngularRadius ?? VEHICLE_MARK_ANGULAR_RADIUS);
+  }
+
+  /**
+   * Angular radius the actor hit box is grown to, radians — **what you can see is what you can
+   * click**.
+   *
+   * The narrow phase below is an exact ray/OBB test against the real body: 5.0 × 1.8 m for a car.
+   * That is the right box at street level and an unusable one from above. Driving the page with
+   * Playwright at the map altitude the Studio opens on — 1,690 m, one pixel to 1.55 m of street —
+   * the car's box was **3 × 1 pixels**, and a scan of the pick result over a ±30 px grid around its
+   * own projected centre came back with exactly one hit, at dead centre: every offset of three
+   * pixels missed. Two runs of the same click script, one hit and one miss. That is not a pointing
+   * problem, it is a target-size problem.
+   *
+   * So the box is grown to the same constant solid angle `overlays.ts` draws the vehicle mark at.
+   * A mark you can see but cannot hit is as broken as a car you cannot see, and one constant shared
+   * between the two is what keeps the promise the mark makes. At street level the term is a
+   * fraction of a metre and the exact body box still decides the hit; at map altitude it is the
+   * ~11 m the mark is drawn at.
+   *
+   * It is clamped to the broad-phase cell size, because the grid walk only tests the cells within
+   * one cell of the ray's path: slack wider than a cell could name an actor the broad phase never
+   * offered, which would make the pick silently depend on the grid rather than on the geometry.
+   */
+  get pickAngularRadius(): number {
+    return this.#pickAngularRadius;
+  }
+
+  set pickAngularRadius(v: number) {
+    this.#pickAngularRadius = Math.max(0, v);
   }
 
   /** Replace the class table (a new `Hello`). */
@@ -285,7 +328,27 @@ export class Picker {
 
     let best = -1;
     let bestT = Infinity;
+    let bestPerpSq = Infinity;
+    let bestBody = false;
 
+    /**
+     * Which of two candidates the user meant.
+     *
+     * A hit on the vehicle's **real body** always wins, and between two of those the nearer along
+     * the ray wins — that is occlusion, and it is the whole of the street-level behaviour, unchanged.
+     *
+     * The tie-break only matters for hits that exist because of the screen-space slack
+     * ({@link pickAngularRadius}), and there "nearest along the ray" is the wrong question. At map
+     * altitude the slack is ~12 m, so neighbouring vehicles' hit boxes overlap and the ray enters
+     * several of them; the one it enters first is whichever box happens to present a face soonest,
+     * which is close to arbitrary and biased towards the larger vehicle. Measured on the real page
+     * at 200 vehicles from 1,860 m: clicking each vehicle's own projected centre resolved to a
+     * *different* vehicle, 5–14 m away, **38 times out of 200**. Following the wrong car is a worse
+     * failure than following none, because nothing on screen says it happened.
+     *
+     * The slack is a tolerance around a *point*, so the right question is which centre is nearest
+     * to the ray — the perpendicular distance. That is what the user is pointing at.
+     */
     const test = (ix: number, iy: number): void => {
       if (ix < 0 || iy < 0 || ix >= this.#gridW || iy >= this.#gridH) return;
       const c = iy * this.#gridW + ix;
@@ -293,9 +356,17 @@ export class Picker {
       const to = this.#gridStart[c + 1];
       for (let k = from; k < to; k++) {
         const slot = this.#gridItems[k];
-        const t = this.#rayBox(slot);
-        if (t >= 0 && t < bestT) {
-          bestT = t;
+        if (!this.#rayBox(slot)) continue;
+        const body = this.#hitBody;
+        let better: boolean;
+        if (best < 0) better = true;
+        else if (body !== bestBody) better = body;
+        else if (body) better = this.#hitT < bestT;
+        else better = this.#hitPerpSq < bestPerpSq;
+        if (better) {
+          bestT = this.#hitT;
+          bestPerpSq = this.#hitPerpSq;
+          bestBody = body;
           best = slot;
         }
       }
@@ -351,24 +422,78 @@ export class Picker {
   }
 
   /**
-   * Exact ray/oriented-box test for one slot. The box is the class's `length × width × height`,
-   * centred half a height above the pose origin and yawed by the heading — the same box the
-   * instanced mesh draws into. Returns the entry distance, or −1 for a miss.
+   * Narrow phase for one slot: does the ray hit this vehicle, and how?
+   *
+   * The box is the class's `length × width × height`, centred half a height above the pose origin
+   * and yawed by the heading — the same box the instanced mesh draws into, and more accurate than a
+   * triangle hit on the LOD-2 box the renderer may actually be showing.
+   *
+   * It is tried **twice**: first at the true body size, and only if that misses, again widened to
+   * the screen-space slack of {@link pickAngularRadius}. Which of the two answered is the thing the
+   * caller's tie-break needs, because a real hit and a within-a-few-pixels hit are different
+   * claims and must not be ranked against each other by distance.
+   *
+   * Returns whether there was a hit, and sets `#hitT` (entry distance), `#hitBody` (the real body,
+   * not the slack) and `#hitPerpSq` (squared perpendicular distance from the ray to the box
+   * centre). Fields rather than an object, so a pick over a few hundred candidates allocates
+   * nothing.
    */
-  #rayBox(slot: number): number {
+  #rayBox(slot: number): boolean {
     let ci = this.#cls[slot];
     if (ci >= this.#classes.length) ci = 0;
     const def = this.#classes[ci];
-    if (!def) return -1;
+    if (!def) return false;
     const p = slot * 3;
     const cx = this.#pos[p];
     const cy = this.#pos[p + 1];
     const cz = this.#pos[p + 2] + def.heightM / 2;
-    const h = this.#head[slot];
-    const c = Math.cos(h);
-    const s = Math.sin(h);
 
-    // Ray into the box's local frame: translate then rotate by −h about +z.
+    // Perpendicular distance from the ray to the box centre: |v|² − (v·d)², with d a unit vector.
+    const vx = cx - this.#origin.x;
+    const vy = cy - this.#origin.y;
+    const vz = cz - this.#origin.z;
+    const along = vx * this.#dir.x + vy * this.#dir.y + vz * this.#dir.z;
+    this.#hitPerpSq = Math.max(0, vx * vx + vy * vy + vz * vz - along * along);
+
+    // A little slack so a thin pedestrian is still clickable at street level.
+    const hx = Math.max(0.4, def.lengthM / 2);
+    const hy = Math.max(0.4, def.widthM / 2);
+    const hz = Math.max(0.4, def.heightM / 2);
+
+    const body = this.#slabs(cx, cy, cz, this.#head[slot], hx, hy, hz);
+    if (body >= 0) {
+      this.#hitT = body;
+      this.#hitBody = true;
+      return true;
+    }
+
+    // …and then the screen-space slack, which is what makes a sub-pixel vehicle clickable at all.
+    // `Math.hypot` of the centre offset is the distance from the eye to the box centre, which is
+    // what the mark's radius is a constant fraction of — so the hit box and the mark drawn over it
+    // grow together with no shared state, only the shared constant. Clamped to the broad-phase
+    // cell, because the grid walk only offers candidates within one cell of the ray's path.
+    const slack = Math.min(this.#cell, Math.hypot(vx, vy, vz) * this.#pickAngularRadius);
+    if (slack <= hx && slack <= hy) return false;
+    const grown = this.#slabs(
+      cx, cy, cz, this.#head[slot], Math.max(hx, slack), Math.max(hy, slack), hz,
+    );
+    if (grown < 0) return false;
+    this.#hitT = grown;
+    this.#hitBody = false;
+    return true;
+  }
+
+  /**
+   * Ray against one oriented box: the three-slab test, in the box's own frame. Returns the entry
+   * distance, or −1 for a miss.
+   */
+  #slabs(
+    cx: number, cy: number, cz: number, heading: number, hx: number, hy: number, hz: number,
+  ): number {
+    const c = Math.cos(heading);
+    const s = Math.sin(heading);
+
+    // Ray into the box's local frame: translate then rotate by −heading about +z.
     const ox = this.#origin.x - cx;
     const oy = this.#origin.y - cy;
     const oz = this.#origin.z - cz;
@@ -377,11 +502,6 @@ export class Picker {
     const ldx = this.#dir.x * c + this.#dir.y * s;
     const ldy = -this.#dir.x * s + this.#dir.y * c;
     const ldz = this.#dir.z;
-
-    // A little slack so a thin pedestrian is still clickable.
-    const hx = Math.max(0.4, def.lengthM / 2);
-    const hy = Math.max(0.4, def.widthM / 2);
-    const hz = Math.max(0.4, def.heightM / 2);
 
     let tMin = 0;
     let tMax = this.#maxDistance;

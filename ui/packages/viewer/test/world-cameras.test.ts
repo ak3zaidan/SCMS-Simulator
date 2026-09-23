@@ -116,8 +116,11 @@ describe("CameraController", () => {
     ctl.altitudeM = 500;
     ctl.setMode("map", true);
     expect(camera.position.z).toBeCloseTo(500, 3);
-    expect(Math.hypot(camera.position.x - 100, camera.position.y + 50)).toBeLessThan(0.2);
+    // Above whatever focus survived the world clamp — the plan view is not allowed to point
+    // somewhere that puts part of the frame outside the world. `ctl.target` is that focus.
+    expect(Math.hypot(camera.position.x - ctl.target.x, camera.position.y - ctl.target.y)).toBeLessThan(0.2);
 
+    ctl.follow(7);
     ctl.setFollowPose(0, 0, 0, 0, 12);
     ctl.setMode("chase", true);
     // Heading 0 is +x, so the chase camera sits at negative x, above the vehicle.
@@ -186,7 +189,9 @@ describe("CameraController", () => {
 
   it("does not run the occlusion march at fly-down range", () => {
     const { ctl, world } = make();
-    ctl.setMode("chase", true);
+    ctl.follow(7);
+    ctl.setFollowPose(0, 0, 0, 0, 0);
+    expect(ctl.setMode("chase", true)).toBe("chase");
     const b = grid.world.buildings;
     const ring = grid.world.ringPoints;
     const off = b.ringOff[0];

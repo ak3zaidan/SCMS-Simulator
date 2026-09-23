@@ -265,7 +265,11 @@ describe("Viewer — headless smoke", () => {
     const top = b.baseZM[0] + b.heightM[0];
     expect(viewer.worldRenderer.buildingTopAt(cx, cy)).toBeCloseTo(top, 3);
 
-    viewer.cameras.setMode("chase", true);
+    // `chase` is refused with nothing to sit behind, and the occlusion march does not run in
+    // `map`, so the mode needs a subject before this asks anything of it.
+    viewer.cameras.follow(1);
+    viewer.cameras.setFollowPose(cx + 60, cy, 0, 0, 0);
+    expect(viewer.cameras.setMode("chase", true)).toBe("chase");
     const pos = new (viewer.camera.position.constructor as new (x: number, y: number, z: number) => typeof viewer.camera.position)(cx, cy, 1);
     const look = new (viewer.camera.position.constructor as new (x: number, y: number, z: number) => typeof viewer.camera.position)(cx + 60, cy, 1);
     const moved = viewer.cameras.keepCameraOutsideBuildings(pos, look);

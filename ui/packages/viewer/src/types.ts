@@ -18,6 +18,24 @@ import type { Camera, Scene, Vector3 } from "three";
 /** The ENU up axis, `(0, 0, 1)`. Cloned on use; never handed out for mutation. */
 export const ENU_UP: readonly [number, number, number] = [0, 0, 1];
 
+/**
+ * Angular radius, in radians, of the mark that stands in for a vehicle too small to see — and of
+ * the hit box that lets you click it. **What you can see is what you can click.**
+ *
+ * It lives here, in the module with no dependencies, because two otherwise unrelated files must
+ * agree on it exactly: `overlays.ts` draws the aerial vehicle mark at this solid angle, and
+ * `picking.ts` grows the actor hit box to it. A second copy would let the drawn mark and the
+ * clickable target drift apart, which is the same class of defect as a legend that disagrees with
+ * the scene — and it would drift silently, because nothing would be wrong with either half on its
+ * own.
+ *
+ * 0.0067 rad is about a 10-pixel disc in a 900 px viewport at the map camera's 45° field of view:
+ * a dot rather than a blob, and a comfortable click target. The measurement that set it: at the
+ * 1,690 m altitude the Studio opens its map on, one pixel is 1.55 m of street, so a 5.0 × 1.8 m car
+ * draws and picks as 3 × 1 pixels.
+ */
+export const VEHICLE_MARK_ANGULAR_RADIUS = 0.0067;
+
 /** The subset of `THREE.WebGLInfo` the viewer reads. `WebGLInfo` is assignable to it. */
 export interface RendererInfoLike {
   readonly render: {

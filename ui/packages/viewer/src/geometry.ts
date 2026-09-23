@@ -669,6 +669,50 @@ export function ringGeometry(innerRadius: number, segments: number): BufferGeome
   return g;
 }
 
+/**
+ * A filled unit-radius disc in the xy plane, for a mark whose instance matrix is a pure
+ * scale-and-translate.
+ *
+ * The companion to {@link ringGeometry}, which is the same circle with its middle taken out: the
+ * aerial vehicle mark switches between the two as a vehicle grows past its own mark, so the pair
+ * has to share a radius convention — both are one metre across before the instance scale.
+ *
+ * `perInstanceColor` is not a style choice; see {@link withUnitVertexColors}.
+ */
+export function discGeometry(segments: number, perInstanceColor = false): BufferGeometry {
+  const n = Math.max(6, segments | 0);
+  const b = new MeshBuilder({ uv: true, color: perInstanceColor, vertexCapacity: n + 1, indexCapacity: n * 3 });
+  addDisc(b, 0, 0, 0, 1, n);
+  const g = b.toGeometry();
+  if (!g) throw new Error("disc geometry is empty");
+  return g;
+}
+
+/**
+ * Give a geometry the unit-white `color` attribute that `InstancedMesh.setColorAt` needs to have
+ * any effect — the trap this function exists to name.
+ *
+ * three applies an instance colour only inside `#ifdef USE_COLOR`, and `USE_COLOR` comes from
+ * `material.vertexColors` (three 0.186.0, `color_vertex.glsl.js` and `color_fragment.glsl.js`:
+ * `vColor` is declared and multiplied into `diffuseColor` only under `USE_COLOR`, and
+ * `USE_INSTANCING_COLOR` on its own multiplies a varying nothing ever reads). So per-instance
+ * colour requires `vertexColors: true`, and `vertexColors: true` requires a `color` attribute —
+ * without one WebGL supplies the missing attribute as `(0, 0, 0, 1)` and `vColor.rgb *= color`
+ * zeroes it. The failure is silent and total: the mesh draws, at the right size, in the right
+ * place, **black**. That is exactly how the first version of the aerial vehicle mark shipped, and
+ * on a dark basemap a black dot is indistinguishable from no dot at all.
+ *
+ * `buildActorGeometry` avoids it by building with `color: true`; anything reused from a geometry
+ * that was not needs this.
+ */
+export function withUnitVertexColors(geometry: BufferGeometry): BufferGeometry {
+  if (geometry.getAttribute("color")) return geometry;
+  const n = geometry.getAttribute("position").count;
+  const colors = new Float32Array(n * 3).fill(1);
+  geometry.setAttribute("color", new BufferAttribute(colors, 3));
+  return geometry;
+}
+
 /** Marker shapes for the state overlay; shape redundancy for the colour-blind palette (09-ui §10). */
 export type MarkerShape = "triangle" | "square" | "diamond" | "cross";
 

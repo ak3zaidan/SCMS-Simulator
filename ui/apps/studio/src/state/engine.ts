@@ -601,15 +601,37 @@ export class StudioEngine {
     useStudio.getState().setGroundTruthLocked(locked);
   }
 
-  /** Camera mode, mirrored to the engine so a copilot sees it (§6.7 `view.camera`). */
+  /**
+   * Camera mode, mirrored to the engine so a copilot sees it (§6.7 `view.camera`).
+   *
+   * The viewer refuses a street-level mode it cannot draw — `chase` and `dashboard` need a vehicle
+   * to sit behind, and with none in the stream they used to give a view of an arbitrary city block
+   * with no car in it. It adopts the nearest vehicle where it can; where it cannot, the mode it
+   * applied is not the one that was asked for, and the chip, the overlays and the engine are all
+   * told the truth rather than the request.
+   */
   setCameraMode(mode: CameraMode): void {
-    this.viewer?.setCameraMode(mode);
-    this.#applyModeOverlays(mode);
-    useStudio.getState().setCameraMode(mode);
+    const applied = this.viewer?.setCameraMode(mode) ?? mode;
+    if (applied !== mode) {
+      this.#log(
+        "warn",
+        "camera",
+        `${mode} needs a vehicle to follow and the stream has none, so the view stayed on the ${applied}. Click a vehicle first.`,
+      );
+    }
+    this.#applyModeOverlays(applied);
+    useStudio.getState().setCameraMode(applied);
+    // The viewer may have adopted a vehicle to make the mode possible; keep the follow chip and
+    // the telemetry subscription in step with what the camera is actually on.
+    const adopted = this.viewer?.cameras.followActorId ?? null;
+    if (adopted !== null && useStudio.getState().selectedActor !== adopted) {
+      void this.selectActor(adopted, applied);
+      return;
+    }
     const state = this.viewer?.cameras.state();
     if (!this.client || !state) return;
     void this.request("view.camera", {
-      mode,
+      mode: applied,
       position: state.position,
       target: state.target,
       fov_deg: state.fovDeg,
@@ -631,9 +653,9 @@ export class StudioEngine {
       await this.setFollowChannels(false);
       return;
     }
-    this.viewer?.flyTo(actorId, mode);
-    this.#applyModeOverlays(mode);
-    useStudio.getState().setCameraMode(mode);
+    const applied = this.viewer?.flyTo(actorId, mode) ?? mode;
+    this.#applyModeOverlays(applied);
+    useStudio.getState().setCameraMode(applied);
     const nodeId = this.nodeByActor.get(actorId) ?? null;
     this.#followedNode = nodeId;
     this.spark.reset();

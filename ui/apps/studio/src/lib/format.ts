@@ -13,6 +13,35 @@ import { SENTINEL_U8, SENTINEL_U16, SENTINEL_U32, SENTINEL_U64 } from "@vwp/prot
 /** What the UI prints where the engine said "not modelled at this tier". */
 export const NA = "n/a";
 
+/**
+ * How many radios the run has — the live count, not the one the connection opened on.
+ *
+ * ## The defect this replaces
+ *
+ * This line used to print `hello.nodeCount`, which is the length of the node table in the `Hello`
+ * frame. `Hello` is sent **once, when the socket opens** (vwp-v1 §3.1), and it is a snapshot of the
+ * run at that instant. Start the engine the way its own banner suggests —
+ * `--scenario phase1-manhattan.yaml --paused --speed 0` — and connect: `run.status` answers
+ * `actors: 0, nodes: 0`, because the scenario's vehicle has not spawned yet. The node table is
+ * empty, and **nothing ever revises it**. Press play and the vehicle appears, telemetry starts
+ * flowing and `bytes_air` climbs to 1,468 B/s, while this line still reads `0`.
+ *
+ * Measured in the browser, on that exact command line: `helloNodes 0`, `poses 1`, `live 1`,
+ * `bytes_air 1468.000`, `radios 0`. A count that contradicts the panel next to it is worse than a
+ * blank, because a blank is not a claim.
+ *
+ * It was counting the right *kind* of thing at the wrong *time*. `run.status` reports `nodes` on
+ * every poll and is the run's own live answer, so that is what this reads; `Hello`'s table is the
+ * fallback for the moment before the first poll lands. And `0` on a run that has not started is
+ * not a number worth printing at all — "none yet" says the same thing without looking like a
+ * measurement of a running system.
+ */
+export function radioCount(liveNodes: number, helloNodes: number, runState: string): string {
+  const n = liveNodes > 0 ? liveNodes : helloNodes;
+  if (n > 0) return int(n);
+  return runState === "idle" || runState === "paused" ? "none yet" : int(0);
+}
+
 /** §3.5.2 — `u16` at `0xFFFF` means unknown; at `0xFFFE`… it is a real value. */
 export function isU16Sentinel(v: number): boolean {
   return v === SENTINEL_U16;

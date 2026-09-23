@@ -84,6 +84,31 @@ export const ACTOR_STATE_COLOR_KEYS: readonly ActorStateColorKey[] = [
 const CLASS_COLOR_KEY = ACTOR_STATE_COLOR_KEYS.length;
 
 /**
+ * Which colour bucket an actor falls into, as an index into {@link ACTOR_STATE_COLOR_KEYS}:
+ * §3.3.4 bits 0–2, selection first, and `benign` when no bit is set.
+ *
+ * This is the single decision every place that paints an actor shares — {@link ActorRenderer.update}
+ * writing instance colours, {@link ActorRenderer.legend} describing them, and the aerial vehicle
+ * mark in `overlays.ts`, which is the *only* thing on screen at map altitude and would otherwise
+ * have to re-derive the state colour for itself. A second copy of these four lines is how the
+ * legend and the scene come to disagree, so there is one.
+ *
+ * It returns a number rather than a key because the callers index packed colour tables with it;
+ * {@link actorColorKey} is the same answer named.
+ */
+export function actorStateColorIndex(
+  state: number,
+  selected: boolean,
+  showGroundTruth = true,
+): number {
+  if (selected) return 4;
+  if (state & ActorState.REVOKED) return 3;
+  if (showGroundTruth && (state & ActorState.ATTACKER)) return 1;
+  if (state & ActorState.REPORTED) return 2;
+  return 0;
+}
+
+/**
  * Which colour bucket an actor falls into: §3.3.4 bits 0–2, selection first, and `benign` when no
  * bit is set. This is the single decision {@link ActorRenderer.update} and
  * {@link ActorRenderer.legend} share; nothing else may re-implement it.
@@ -93,11 +118,7 @@ export function actorColorKey(
   selected: boolean,
   showGroundTruth = true,
 ): ActorStateColorKey {
-  if (selected) return "selected";
-  if (state & ActorState.REVOKED) return "revoked";
-  if (showGroundTruth && (state & ActorState.ATTACKER)) return "attacker";
-  if (state & ActorState.REPORTED) return "reported";
-  return "benign";
+  return ACTOR_STATE_COLOR_KEYS[actorStateColorIndex(state, selected, showGroundTruth)];
 }
 
 /** One row of {@link ActorRenderer.legend}: a colour the scene really draws, and what it means. */
@@ -644,12 +665,8 @@ export class ActorRenderer {
       // `legend()` reports from — keep the two in step. Written, and uploaded, only on a change:
       // the matrices move every frame but a colour is a function of selection and state bits.
       const state = st[s];
-      let ci: number;
-      if (selected >= 0 && ids[s] === selectedU) ci = 4;
-      else if (state & ActorState.REVOKED) ci = 3;
-      else if (gt && state & ActorState.ATTACKER) ci = 1;
-      else if (state & ActorState.REPORTED) ci = 2;
-      else ci = benignByClass ? CLASS_COLOR_KEY : 0;
+      let ci = actorStateColorIndex(state, selected >= 0 && ids[s] === selectedU, gt);
+      if (ci === 0 && benignByClass) ci = CLASS_COLOR_KEY;
       if (b.colorKey[i] !== ci) {
         b.colorKey[i] = ci;
         b.colorDirty = true;

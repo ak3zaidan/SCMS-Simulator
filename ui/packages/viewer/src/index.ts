@@ -28,6 +28,7 @@ export type { WorldRendererOptions, WorldBuildReport, BuildingBackend } from "./
 
 export {
   ActorRenderer, classesFromHello, DEFAULT_ACTOR_CLASSES, ACTOR_STATE_COLOR_KEYS, actorColorKey,
+  actorStateColorIndex,
 } from "./actors.js";
 export type {
   ActorRendererOptions, ActorUpdateContext, ActorUpdateStats, ActorLegendEntry,
@@ -58,11 +59,12 @@ export type { ViewerTheme, ActorStateColorKey } from "./theme.js";
 
 export {
   MeshBuilder, addRibbon, addPolygon, addDisc, addBox, addCylinder, addExtrudedRing, earClip,
-  ringSignedArea, buildActorGeometry, ringGeometry, markerGeometry,
+  ringSignedArea, buildActorGeometry, discGeometry, ringGeometry, markerGeometry,
+  withUnitVertexColors,
 } from "./geometry.js";
 export type { MeshBuilderOptions, MarkerShape, RingShading } from "./geometry.js";
 
-export { ENU_UP, LOD_LEVELS, vecToPlain } from "./types.js";
+export { ENU_UP, LOD_LEVELS, VEHICLE_MARK_ANGULAR_RADIUS, vecToPlain } from "./types.js";
 export type {
   ActorClassDef, LodLevel, PickResult, Vec3Like, ViewerCanvas, ViewerRenderer, RendererInfoLike,
   FrameScheduler,

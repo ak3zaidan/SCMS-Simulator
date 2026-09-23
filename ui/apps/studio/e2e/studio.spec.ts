@@ -216,7 +216,11 @@ test("the Studio streams VWP v1, renders actors, flies down on a click and fills
   }, { timeout: 20_000 }).toBe(true);
 
   // 12. The calls actually went out over JSON-RPC.
-  await page.getByRole("button", { name: "Copilot" }).click();
+  //     The tab is named "Commands", not "Copilot" — the panel says in its own first line that no
+  //     assistant is connected in this build, so naming it after one was the interface promising
+  //     something the build does not have (see step 10). This locator was left behind by that
+  //     rename and had been costing the suite a two-minute timeout and a red result ever since.
+  await page.getByRole("button", { name: "Commands" }).click();
   const made = await page.evaluate(() =>
     Array.from(document.querySelectorAll('[data-testid="copilot-panel"] .method-list')).pop()?.textContent ?? "",
   );

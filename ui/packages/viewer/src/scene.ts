@@ -92,6 +92,25 @@ export interface ViewerOptions {
   readonly depthCueNearM?: number;
   /** Distance at which street-level fog is total, metres. Default 1,200. */
   readonly depthCueFarM?: number;
+  /**
+   * Keep the plan view centred on the traffic while nothing is followed and the user has not moved
+   * the camera. Default true.
+   *
+   * The map opens on the *world*, and the world is usually far larger than the traffic in it. On
+   * `scenarios/phase1-manhattan.yaml` the one vehicle starts at (1306, 2036) while the opening
+   * window covers y ∈ [300, 1700] — the vehicle is 336 m off the top of the frame, which is why
+   * "I don't really see any cars" is the correct reading of a correctly rendered picture. Only the
+   * centre moves; the zoom the opening view chose is left alone.
+   *
+   * This is a standing rule rather than a one-shot because a one-shot does not survive the app:
+   * a stream resync re-adopts the world, and `setWorld` puts the focus back on the world's centre.
+   * Measured on a mid-run reconnect, that left the only vehicle 200 m off the top of the frame
+   * again with nothing left to correct it. It stands down the moment the user pans or zooms
+   * ({@link CameraController.userHasMoved}), which is a better answer to "where should the plan
+   * view point" than a bounding box is. A followed vehicle takes precedence too, though there it
+   * is the ordering inside the frame loop that decides it — see `#trackTraffic`.
+   */
+  readonly autoFrameActors?: boolean;
   /** Start the rAF loop on mount. Default true. */
   readonly autoStart?: boolean;
   /** Called after each fixed step; for deterministic per-step work. */
@@ -133,6 +152,17 @@ const DEFAULT_SCHEDULER: FrameScheduler = {
   },
   now: () => nowMs(),
 };
+
+/**
+ * Camera-to-subject distance the authored depth-cue distances belong to, metres.
+ *
+ * The chase camera sits about 9 m behind and 4 m above a vehicle, so ~10 m is "street level" and
+ * the fog is used exactly as authored there. See `Viewer#syncDepthCueing`.
+ */
+const DEPTH_CUE_REFERENCE_M = 10;
+
+/** How often the traffic's centre is recomputed for the plan view, hertz. See `Viewer#trackTraffic`. */
+const AUTO_FRAME_HZ = 5;
 
 function nowMs(): number {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
@@ -205,6 +235,15 @@ export class Viewer {
   #depthCueFar: number;
   /** The camera mode the fog state was last computed for; `null` forces a recompute. */
   #cuedMode: CameraMode | null = null;
+  /** The depth-cue scale the fog distances were last written for; see `#syncDepthCueing`. */
+  #cuedScale = 0;
+  #autoFrameActors: boolean;
+  /** Set until the plan view has been centred on the traffic once, which is done with a cut. */
+  #autoFramePending = true;
+  /** Seconds since the traffic centre was last recomputed; see `#trackTraffic`. */
+  #autoFrameAccum = 0;
+  /** Scratch table of per-class bounding radii, rebuilt on each `Hello`. */
+  #classRadii = new Float32Array(0);
   /** Set by {@link setFog}, after which the mode stops driving the fog. */
   #fogUserSet = false;
   #detachClient: (() => void) | null = null;
@@ -226,6 +265,7 @@ export class Viewer {
     this.#depthCueing = options.depthCueing ?? true;
     this.#depthCueNear = options.depthCueNearM ?? 140;
     this.#depthCueFar = options.depthCueFarM ?? 1200;
+    this.#autoFrameActors = options.autoFrameActors ?? true;
 
     this.scene.name = "vwp";
     this.scene.background = new Color(this.#theme.background);
@@ -258,6 +298,9 @@ export class Viewer {
       world: this.worldRenderer,
     });
     this.interpolator = new PoseInterpolator(options.interpolation);
+    // Before any `Hello`: the mark needs body sizes from the first frame, not from the first
+    // connection, or a viewer opened on a recording would size every mark as a generic car.
+    this.#publishClassRadii(this.actors.classes);
 
     this.scene.add(this.worldRenderer.group, this.actors.group, this.overlays.group);
     this.#startMs = this.#scheduler.now();
@@ -413,6 +456,9 @@ export class Viewer {
     this.cameras.focusOn((b.minXM + b.maxXM) / 2, (b.minYM + b.maxYM) / 2, b.minZM);
     this.cameras.fitExtent(Math.max(b.maxXM - b.minXM, b.maxYM - b.minYM) * 1.05);
     if (this.cameras.mode === "map") this.cameras.snap();
+    // The opening framing is the world's, not the traffic's, so ask for the first recentre to be a
+    // cut rather than a drift. `#trackTraffic` keeps it there afterwards.
+    if (!this.cameras.userHasMoved) this.#autoFramePending = true;
   }
 
   /** Adopt the class table, capacities and world origin a `Hello` announces (§3.1). */
@@ -421,6 +467,7 @@ export class Viewer {
     if (classes.length > 0) {
       this.actors.setClasses(classes);
       this.picker.setClasses(classes);
+      this.#publishClassRadii(classes);
     }
     if (hello.actorCapacity > 0) this.interpolator.ensureCapacity(hello.actorCapacity);
     // §3.1: the mobility step is the cadence deltas arrive at, so it is the interval the sampler
@@ -539,10 +586,28 @@ export class Viewer {
   #syncDepthCueing(): void {
     if (this.#fogUserSet || !this.#depthCueing) return;
     const mode = this.cameras.mode;
-    if (mode === this.#cuedMode) return;
+    const enabled = mode !== "map";
+    // Aerial perspective is authored for a street-level camera, so its distances are scaled by how
+    // far the camera actually is from what it is looking at. Without this the fly-down turned into
+    // a grey wipe: the mode becomes `chase` on the first frame of the transition, the camera is
+    // still 1,400 m up, and a fog that is total at 1,200 m erases the entire city for the middle
+    // second of the signature interaction — measured, and visible in the captured frames.
+    //
+    // Only `near` and `far` move, which is a pair of float writes on the existing `Fog`. The
+    // null/non-null toggle — the one thing that recompiles every material that reads fog — is
+    // still gated on the mode, which is what the note above is really protecting.
+    const dist = enabled ? this.cameras.look.distanceTo(this.camera.position) : 0;
+    const scale = enabled ? Math.max(1, dist / DEPTH_CUE_REFERENCE_M) : 0;
+    // `<=` and a floor, not `<` and a bare ratio: in `map` the scale is 0, so a bare
+    // `|0 − 0| < 0 × 0.02` is false and this re-applied the fog on every single frame, breaking the
+    // "no-op unless the mode changed" promise the note above makes. Caught by the heap delta in
+    // `test/budget.test.ts`, not by reading it.
+    const settled = mode === this.#cuedMode
+      && Math.abs(scale - this.#cuedScale) <= Math.max(1e-6, this.#cuedScale * 0.02);
+    if (settled) return;
     this.#cuedMode = mode;
-    // The plan view keeps its clarity; every ground-level mode gets aerial perspective.
-    this.#applyFog(mode !== "map", this.#theme.skyHorizon, this.#depthCueNear, this.#depthCueFar);
+    this.#cuedScale = scale;
+    this.#applyFog(enabled, this.#theme.skyHorizon, this.#depthCueNear * scale, this.#depthCueFar * scale);
   }
 
   /** Reuse the one `Fog` instance; only the reference on the scene moves. */
@@ -582,15 +647,78 @@ export class Viewer {
    * The signature interaction: from the top-down map, click a vehicle and the camera flies down
    * into a chase view of it — one scene, one camera, no cut (09-ui §1.2, §3).
    */
-  flyTo(actorId: number, mode: CameraMode = "chase", instant = false): void {
+  flyTo(actorId: number, mode: CameraMode = "chase", instant = false): CameraMode {
     this.select(actorId);
-    this.cameras.flyTo(actorId, mode, instant);
+    this.cameras.follow(actorId);
+    // Seed the controller with this actor's *actual* pose before the mode changes, so the first
+    // frame of the fly-down is aimed at the vehicle rather than at wherever the plan view was
+    // pointing. Without it the street-level modes are refused for a frame, or aimed at the map
+    // focus for one.
+    this.#seedFollowPose(actorId);
+    const applied = this.cameras.flyTo(actorId, mode, instant);
+    this.#syncDepthCueing();
+    return applied;
   }
 
-  /** Change camera mode, keeping whatever is being followed. */
-  setCameraMode(mode: CameraMode, instant = false): void {
-    this.cameras.setMode(mode, instant);
+  /**
+   * Change camera mode, keeping whatever is being followed. Returns the mode actually applied.
+   *
+   * Asking for `chase` or `dashboard` with nothing followed used to give a street-level view of a
+   * random city block — the camera fell back to the plan view's focus, which at start-up is the
+   * centre of the *world*, a kilometre from the traffic. Two dark planes and one lane marking, no
+   * vehicle. Since choosing `chase` says plainly what the user wants, the vehicle nearest the plan
+   * view's focus is adopted; only when there is no live vehicle at all is the mode refused, and
+   * then the returned mode differs from the requested one and
+   * {@link CameraController.rejectedMode} says which was refused, so the caller can say why
+   * instead of showing a meaningless frame.
+   */
+  setCameraMode(mode: CameraMode, instant = false): CameraMode {
+    if (CameraController.needsFollowSubject(mode) && !this.cameras.hasFollowSubject) {
+      const id = this.#adoptFollowSubject();
+      if (id !== null) this.select(id);
+    }
+    const applied = this.cameras.setMode(mode, instant);
     this.#syncDepthCueing();
+    return applied;
+  }
+
+  /**
+   * Follow the live vehicle nearest the plan view's focus and seed its pose. Returns its id, or
+   * null when the stream has no live actor to adopt.
+   */
+  #adoptFollowSubject(): number | null {
+    const slot = this.#nearestLiveSlot(this.cameras.target.x, this.cameras.target.y);
+    if (slot < 0) return null;
+    const id = this.interpolator.outActorId[slot];
+    this.cameras.follow(id);
+    this.#pushFollowPose(slot);
+    return id;
+  }
+
+  /** Hand the controller `actorId`'s current pose if it is in the stream. */
+  #seedFollowPose(actorId: number): boolean {
+    const ids = this.interpolator.outActorId;
+    const occ = this.interpolator.outOccupied;
+    const target = actorId >>> 0;
+    for (let i = 0; i < this.interpolator.count; i++) {
+      if (occ[i] === 1 && ids[i] === target) {
+        this.#pushFollowPose(i);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Copy one slot's interpolated pose into the camera controller. */
+  #pushFollowPose(slot: number): void {
+    const p = slot * 3;
+    this.cameras.setFollowPose(
+      this.interpolator.outPosition[p],
+      this.interpolator.outPosition[p + 1],
+      this.interpolator.outPosition[p + 2],
+      this.interpolator.outHeading[slot],
+      this.interpolator.outSpeed[slot],
+    );
   }
 
   /**
@@ -741,6 +869,7 @@ export class Viewer {
     const sample = this.interpolator.sample(renderClock);
 
     // 2. Camera. Exponential smoothing on the true frame dt (frame-rate independent by construction).
+    this.#trackTraffic(dt);
     this.#followSlot = this.#resolveFollowSlot();
     if (this.#followSlot >= 0) {
       const p = this.#followSlot * 3;
@@ -762,11 +891,9 @@ export class Viewer {
     this.worldRenderer.setShadowFocus(this.cameras.look.x, this.cameras.look.y, this.cameras.look.z);
     this.worldRenderer.updateLod(this.camera);
 
-    // 4. Actors: cull, LOD, instance write. From the driver's seat the camera is inside the
-    // followed car's own body, so that one instance is not written.
-    this.actors.hiddenActorId = this.cameras.mode === "dashboard"
-      ? this.cameras.followActorId ?? -1
-      : -1;
+    // 4. Actors: cull, LOD, instance write. When the camera is inside the followed car's own body,
+    // that one instance is not written.
+    this.actors.hiddenActorId = this.#cameraInsideFollowed() ? this.cameras.followActorId ?? -1 : -1;
     const actorStats = this.actors.update({
       position: this.interpolator.outPosition,
       heading: this.interpolator.outHeading,
@@ -792,6 +919,10 @@ export class Viewer {
       actorId: this.interpolator.outActorId,
       selectedActorId: this.#selectedActorId,
       liveCount: actorStats.live,
+      // The aerial vehicle mark paints state, so it has to honour the same ground-truth lock the
+      // instances do (09-ui §6). Read from the renderer rather than mirrored, so the two cannot
+      // drift.
+      showGroundTruth: this.actors.showGroundTruth,
     });
 
     // 6. Picking data: O(1), the grid is only built if somebody clicks.
@@ -829,6 +960,79 @@ export class Viewer {
   /** Advance by an explicit `dt`, for tests and deterministic captures. */
   step(dtSeconds: number): FrameReport {
     return this.renderFrame(this.#lastMs + dtSeconds * 1000);
+  }
+
+  /**
+   * Whether the camera is inside the followed vehicle's body, so that one instance must be skipped.
+   *
+   * This used to be `mode === "dashboard"`. That is the *usual* way to end up inside a car, not the
+   * only one: `free` seeds itself from wherever the camera already is, so stepping from the
+   * driver's seat into the free camera left the camera inside the body with the body still drawn —
+   * a pale slab filling the lower half of the frame, captured from the running Studio and looked
+   * at. Winding the chase distance down to its 2 m minimum does the same. A geometric test covers
+   * all of them and costs one distance comparison per frame.
+   */
+  #cameraInsideFollowed(): boolean {
+    const slot = this.#followSlot;
+    if (slot < 0 || this.cameras.followActorId === null) return false;
+    const p = slot * 3;
+    const dx = this.camera.position.x - this.interpolator.outPosition[p];
+    const dy = this.camera.position.y - this.interpolator.outPosition[p + 1];
+    const dz = this.camera.position.z - this.interpolator.outPosition[p + 2];
+    const def = this.actors.classes[this.interpolator.outClassIdx[slot]];
+    // A camera on the skin of the body still sees its inside face, hence the margin.
+    const reach = (def ? Math.max(def.lengthM, def.widthM) / 2 : 2.5) + 0.35;
+    const height = (def ? def.heightM : 1.6) + 0.5;
+    return dx * dx + dy * dy < reach * reach && dz > -0.5 && dz < height;
+  }
+
+  /**
+   * Keep the plan view centred on the traffic (see {@link ViewerOptions.autoFrameActors}).
+   *
+   * Recomputed at {@link AUTO_FRAME_HZ}, not every frame: {@link liveActorFraming} is an O(n) pass
+   * over the pose buffer and allocates its result, and the traffic's centre of mass does not move
+   * fast enough to need 60 Hz. The first one cuts, so the opening picture is right rather than
+   * drifting into place; after that the camera's own smoothing carries it.
+   */
+  #trackTraffic(dt: number): void {
+    if (!this.#autoFrameActors || this.cameras.userHasMoved) return;
+    // Following something, or not being in the plan view, means this cannot change the outcome:
+    // `setFollowPose` runs later in the same frame and puts the focus on the followed vehicle, and
+    // the other modes do not use the focus at all. So this is a cost guard, not a behaviour guard —
+    // it is here to skip the O(n) `liveActorFraming` pass, which at 5,000 actors is not free.
+    if (this.cameras.followActorId !== null || this.cameras.mode !== "map") return;
+    if (!this.worldRenderer.world) return;
+    this.#autoFrameAccum += dt;
+    if (!this.#autoFramePending && this.#autoFrameAccum < 1 / AUTO_FRAME_HZ) return;
+    this.#autoFrameAccum = 0;
+    const f = this.liveActorFraming();
+    if (!f) return; // no traffic yet — nothing to centre on
+    // Only the centre moves. Widening to fit the traffic would override the zoom the opening view
+    // chose and, with traffic spread over a whole city, make every vehicle smaller — the opposite
+    // of the complaint this answers.
+    this.cameras.focusOn(f.centerX, f.centerY, f.centerZ);
+    if (this.#autoFramePending) {
+      // A snap mid-flight is a cut, and coming back from chase to the map *is* a flight.
+      if (!this.cameras.isFlying) this.cameras.snap();
+      this.#autoFramePending = false;
+    }
+  }
+
+  /**
+   * Hand the per-class bounding radii to the aerial vehicle mark.
+   *
+   * The mark decides between a dot, a ring and nothing by comparing the vehicle's own angular size
+   * with its own, so it needs the body sizes `Hello` declares. Same radius the actor renderer culls
+   * with — half the body diagonal — because the question both are asking is "how big does this
+   * thing look".
+   */
+  #publishClassRadii(classes: readonly ActorClassDef[]): void {
+    if (this.#classRadii.length !== classes.length) this.#classRadii = new Float32Array(classes.length);
+    for (let i = 0; i < classes.length; i++) {
+      const d = classes[i];
+      this.#classRadii[i] = Math.hypot(d.lengthM, d.widthM, d.heightM) * 0.5;
+    }
+    this.overlays.locators.setClassRadii(this.#classRadii);
   }
 
   #resolveFollowSlot(): number {

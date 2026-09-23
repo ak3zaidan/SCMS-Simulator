@@ -18,7 +18,7 @@ import { ObuHud } from "./ObuHud.js";
 import { WhyTab } from "./WhyTab.js";
 import { engine } from "../state/engine.js";
 import { useStudio } from "../state/store.js";
-import { NA, int, simClock } from "../lib/format.js";
+import { NA, int, radioCount, simClock } from "../lib/format.js";
 import { hudGroups, queueRows } from "../lib/telemetry.js";
 
 function StateTab(): React.JSX.Element {
@@ -28,6 +28,8 @@ function StateTab(): React.JSX.Element {
   const hello = useStudio((s) => s.hello);
   const setWhy = useStudio((s) => s.setWhy);
   const actors = useStudio((s) => s.run.actors);
+  const nodes = useStudio((s) => s.run.nodes);
+  const runState = useStudio((s) => s.run.state);
   const devDetails = useStudio((s) => s.devDetails);
   const info = telemetryNode !== null ? engine.nodes.get(telemetryNode) : undefined;
 
@@ -50,7 +52,7 @@ function StateTab(): React.JSX.Element {
               <dt>scenario</dt>
               <dd>{hello.scenarioName}</dd>
               <dt>radios</dt>
-              <dd>{int(hello.nodeCount)}</dd>
+              <dd data-testid="inspector-radios">{radioCount(nodes, hello.nodeCount, runState)}</dd>
               <dt>vehicle types</dt>
               <dd>{hello.classNames.join(", ") || "—"}</dd>
               <dt>map centre</dt>

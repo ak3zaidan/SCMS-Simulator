@@ -50,7 +50,11 @@ import {
   type Camera,
 } from "three";
 import { ActorState, OVERLAY_NAMES, type OverlayName } from "@vwp/protocol";
-import { MeshBuilder, addBox, markerGeometry, ringGeometry } from "./geometry.js";
+import { ACTOR_STATE_COLOR_KEYS, actorStateColorIndex } from "./actors.js";
+import { VEHICLE_MARK_ANGULAR_RADIUS } from "./types.js";
+import {
+  MeshBuilder, addBox, discGeometry, markerGeometry, ringGeometry, withUnitVertexColors,
+} from "./geometry.js";
 import type { ViewerTheme } from "./theme.js";
 import type { WorldRenderer } from "./world-render.js";
 
@@ -169,6 +173,15 @@ export interface OverlayUpdateContext {
   readonly selectedActorId?: number | null;
   /** Live actors in the stream. Omitted, {@link count} stands in. */
   readonly liveCount?: number;
+  /**
+   * Whether the ground-truth `ATTACKER` bit may colour a vehicle mark. Omitted, it may.
+   *
+   * It is passed per frame rather than stored because the authority is
+   * `ActorRenderer.showGroundTruth` — 09-ui §6 lets a blind evaluation lock ground truth off, and
+   * a mark that kept its own copy of that switch could paint an attacker vermillion on a map whose
+   * legend has no attacker row.
+   */
+  readonly showGroundTruth?: boolean;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -894,98 +907,177 @@ export class StateMarkerOverlay {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Actor locators
+// Actor locators — the aerial vehicle mark
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Beacons that say *where* an actor is, from any distance.
+ * Bounding radius assumed for a vehicle when no `Hello` class table has arrived, metres.
  *
- * The problem this exists for: the plan view opens on the whole world, and one vehicle in a square
- * kilometre of Midtown is a sub-pixel speck. The interface then says "click an actor" over a
- * viewport with no actor you can see. A beacon is a vertical stem and a ground ring whose size is
- * set in *screen* terms — the stem is scaled by camera distance so it keeps a roughly constant
- * angular width — so a single vehicle is findable at 700 m without being a billboard at 20 m.
+ * Half the body diagonal of the 5.0 × 1.8 × 1.5 m passenger car that every class table so far
+ * opens with, which is the right thing to be wrong about: it is what the ratio rule compares the
+ * mark against, and guessing "car" keeps a mark on screen until the real table replaces the guess.
+ */
+const DEFAULT_VEHICLE_RADIUS_M = 2.75;
+
+/**
+ * The mark that makes a vehicle visible — and clickable — from map altitude.
  *
- * Three rules keep it from becoming clutter:
+ * ## The measurement this exists for
  *
- * 1. **Nothing within {@link nearRangeM}.** At chase and dashboard distances the vehicle is already
- *    the largest thing on screen and a pillar over its roof is in the way. The beacon is for range.
- * 2. **All of them only while they are few.** Above {@link capacity} live actors a crowd needs no
- *    finding aid and 5,000 pillars would be a wall; only the selected actor keeps its beacon.
- * 3. **One neutral colour, never a state colour.** The beacon carries location, and the
- *    colour-blind-safe palette carries state (09-ui §10). Painting a beacon `attacker` vermillion
- *    would put a fifth meaning on a four-colour legend. The selected actor's beacon is the one
- *    exception, and it uses the legend's own `selected` colour.
+ * `scenarios/phase1-manhattan.yaml` has one equipped vehicle in a two-kilometre world. Opened on
+ * the map the Studio sits 1,690 m up, where one screen pixel is 1.55 m of street, so a 5.0 × 1.8 m
+ * car covers **3 × 1 pixels**. Driving the page with Playwright and projecting the pose by hand
+ * gave the numbers: the vehicle rendered as a sub-pixel smear, and a click within three pixels of
+ * its own centre missed it, because {@link Picker} tests the true 5 × 1.8 m box. "I don't really
+ * see any cars moving" was not a rendering fault at all — it was a scale fault, and no amount of
+ * colour or shading fixes a shape that is smaller than a pixel.
+ *
+ * ## The rule: one constant solid angle
+ *
+ * The mark's radius is a fixed **angular** size — {@link angularRadius} radians, scaled by camera
+ * distance — so it occupies the same patch of screen at 40 m and at 4 km. That is what stops it
+ * both from vanishing when you zoom out and from swamping the street when you zoom in, and it is
+ * the same number {@link Picker} grows its hit box to, so **what you can see is what you can
+ * click**. One constant, two users: a mark you cannot hit is as useless as a car you cannot see.
+ *
+ * ## What it draws, and why it changes shape
+ *
+ * Comparing the vehicle's own angular radius with the mark's decides the form, so the mark is
+ * always the thing the vehicle is not:
+ *
+ * | vehicle radius ÷ mark radius | drawn                            | because                                  |
+ * | ---------------------------- | -------------------------------- | ---------------------------------------- |
+ * | below {@link ringRatio}      | filled dot over a contrast halo  | the vehicle is sub-pixel; the dot **is** the vehicle |
+ * | up to {@link hideRatio}      | a ring around the vehicle        | the vehicle is legible — do not cover it |
+ * | above {@link hideRatio}      | nothing (unless it is selected)  | the vehicle is the largest thing in frame |
+ *
+ * So a dot at map altitude, a ring at the street corner, and a bare car from the chase camera —
+ * with no distance threshold anywhere in it, which is what made the previous version fail: it
+ * suppressed every mark below 45 m *and* above 64 live actors, and the two rules between them meant
+ * a 200-vehicle run drew no marks at all at any zoom (`drawn: 16, culled: 184`, `locators: 0`).
+ *
+ * ## Colour
+ *
+ * The dot and the ring carry **state**, through {@link actorStateColorIndex} — the same decision
+ * {@link ActorRenderer} paints instances with and {@link ActorRenderer.legend} publishes. At map
+ * altitude the mark is the only thing on screen, so a neutral mark would mean the legend describes
+ * colours the aerial view never shows. The halo behind the dot is the theme background, which is
+ * what keeps a dark dot legible on the light theme and a bright one from glaring on the dark theme;
+ * it carries no meaning and so takes no palette entry.
+ *
+ * The selected vehicle additionally keeps a ring and a vertical stem at every distance, because
+ * "which one am I following" has to be answerable from anywhere, and there is only ever one of it.
  */
 export class ActorLocatorOverlay {
   readonly group = new Group();
-  readonly capacity: number;
 
-  /** Below this camera distance an actor gets no beacon, metres. */
-  nearRangeM = 45;
-  /** Stem height as a fraction of camera distance, clamped by {@link minHeightM}. */
-  heightPerDistance = 0.055;
-  minHeightM = 7;
-  /** Stem width as a fraction of camera distance — a roughly constant angular width. */
-  widthPerDistance = 0.0035;
-  minWidthM = 0.35;
-  /** Ground-ring outer radius as a fraction of camera distance. */
-  ringPerDistance = 0.013;
-  minRingM = 2.6;
+  /**
+   * Angular radius of the mark, radians — {@link VEHICLE_MARK_ANGULAR_RADIUS}, which is the same
+   * constant {@link Picker} grows its actor hit box to. Change it here and the target moves with
+   * it only if you change it there too, which is why the default is shared rather than repeated.
+   */
+  angularRadius = VEHICLE_MARK_ANGULAR_RADIUS;
+  /** Floor on the mark's *drawn* world radius, metres, so a drawn mark cannot collapse. */
+  minRadiusM = 1.1;
+  /**
+   * Vehicle-to-mark radius ratio at which the filled dot opens into a ring.
+   *
+   * For the 2.8 m radius of a passenger car this puts the changeover at about 460 m of camera
+   * distance, where the dot is ~10 px across and the car itself ~11 px long: the mark opens up
+   * exactly as the thing underneath it becomes worth looking at.
+   */
+  ringRatio = 0.9;
+  /**
+   * …and at which the mark gives up, the vehicle being plainly visible by itself. About 130 m for a
+   * car, where its 5 m body is some 26 px long.
+   */
+  hideRatio = 3.2;
+  /** Stem height for the selected vehicle, as a fraction of camera distance. */
+  selectedStemPerDistance = 0.055;
+  selectedStemMinM = 6;
+  /**
+   * Most contrast halos drawn at once. Default 2,048.
+   *
+   * The halo is legibility, not information: it is what keeps a lone dot readable against a pale
+   * road or a dark one. Past a couple of thousand dots they are packed tightly enough to define
+   * each other's edges, and every halo is a second instance to write — measured at 5,000 vehicles,
+   * halos were a third of the mark's whole per-frame cost. So the *marks* are never capped, only
+   * their halos, and the cap is on the cosmetic half alone.
+   */
+  haloLimit = 2048;
 
-  #stemAll: InstancedMesh<BufferGeometry, MeshBasicMaterial>;
-  #ringAll: InstancedMesh<BufferGeometry, MeshBasicMaterial>;
-  #stemSel: InstancedMesh<BufferGeometry, MeshBasicMaterial>;
-  #ringSel: InstancedMesh<BufferGeometry, MeshBasicMaterial>;
-  #geometries: BufferGeometry[] = [];
+  #capacity: number;
+  #maxCapacity: number;
+  #halo: InstancedMesh<BufferGeometry, MeshBasicMaterial>;
+  #dot: InstancedMesh<BufferGeometry, MeshBasicMaterial>;
+  #ring: InstancedMesh<BufferGeometry, MeshBasicMaterial>;
+  #stem: InstancedMesh<BufferGeometry, MeshBasicMaterial>;
+  #discGeom: BufferGeometry;
+  #ringGeom: BufferGeometry;
+  #stemGeom: BufferGeometry;
+  #theme: ViewerTheme;
   #enabled = true;
-  #matrix = new Matrix4();
-  #camPos = new Vector3();
-  #ranges = makeRanges(4);
+  #opacity = 1;
+  #color = new Color();
+  /** Packed state colours, in {@link ACTOR_STATE_COLOR_KEYS} order. */
+  #stateColor = new Float32Array(5 * 3);
+  /** Per-class bounding radius in metres, from `Hello`; empty means "assume a car". */
+  #classRadius = new Float32Array(0);
+  /** Colour index last written into each dot/ring instance slot; `0xff` means "never written". */
+  #dotKey: Uint8Array;
+  #ringKey: Uint8Array;
+  #dotColorDirty = true;
+  #ringColorDirty = true;
+  #ranges = makeRanges(8);
   #drawn = 0;
+  #dots = 0;
+  #rings = 0;
 
-  constructor(theme: ViewerTheme, capacity = 64) {
-    this.capacity = Math.max(1, capacity);
+  constructor(theme: ViewerTheme, capacity = 256, maxCapacity = 20_000) {
+    this.#theme = theme;
+    this.#capacity = Math.max(1, Math.min(capacity, maxCapacity));
+    this.#maxCapacity = Math.max(this.#capacity, maxCapacity);
     this.group.name = "overlay/actor-locators";
 
-    // A unit stem: 1 m square, base at z = 0, top at z = 1, so the instance matrix is a pure
+    // Both carry a unit `color` attribute: `withUnitVertexColors` explains why nothing per-instance
+    // colour is written reaches the screen without one.
+    this.#discGeom = discGeometry(28, true);
+    this.#ringGeom = withUnitVertexColors(ringGeometry(0.66, 28));
+    // A unit stem: 1 m square, base at z = 0, top at z = 1, so its instance matrix is a pure
     // scale-and-translate and the writer never has to build a rotation.
     const stemBuilder = new MeshBuilder({ vertexCapacity: 24, indexCapacity: 36 });
     addBox(stemBuilder, 0, 0, 0.5, 1, 1, 1);
     const stemGeom = stemBuilder.toGeometry();
     if (!stemGeom) throw new Error("locator stem geometry is empty");
-    const ringGeom = ringGeometry(0.74, 28);
-    this.#geometries.push(stemGeom, ringGeom);
+    this.#stemGeom = stemGeom;
 
-    const make = (
-      geom: BufferGeometry, name: string, n: number, opacity: number,
-    ): InstancedMesh<BufferGeometry, MeshBasicMaterial> => {
-      const material = new MeshBasicMaterial({
-        name, transparent: true, opacity, side: DoubleSide, toneMapped: false,
-        // No depth test: a beacon that a building hides is a beacon that has failed at the one job
-        // it has. No depth *write* either, so it never occludes the city behind it.
-        depthTest: false, depthWrite: false, fog: false,
-      });
-      const mesh = new InstancedMesh<BufferGeometry, MeshBasicMaterial>(geom, material, n);
-      mesh.name = `overlay/${name}`;
-      mesh.frustumCulled = false;
-      mesh.renderOrder = 12;
-      mesh.count = 0;
-      mesh.visible = false;
-      this.group.add(mesh);
-      return mesh;
-    };
-
-    this.#stemAll = make(stemGeom, "locator-stem", this.capacity, 0.3);
-    this.#ringAll = make(ringGeom, "locator-ring", this.capacity, 0.55);
-    this.#stemSel = make(stemGeom, "locator-stem-selected", 1, 0.5);
-    this.#ringSel = make(ringGeom, "locator-ring-selected", 1, 0.85);
+    this.#halo = this.#makeMesh(this.#discGeom, "locator-halo", this.#capacity, 0.85, 10, false);
+    this.#dot = this.#makeMesh(this.#discGeom, "locator-dot", this.#capacity, 0.95, 11, true);
+    this.#ring = this.#makeMesh(this.#ringGeom, "locator-ring", this.#capacity, 0.9, 12, true);
+    this.#stem = this.#makeMesh(this.#stemGeom, "locator-stem-selected", 1, 0.45, 13, false);
+    this.#dotKey = new Uint8Array(this.#capacity).fill(0xff);
+    this.#ringKey = new Uint8Array(this.#capacity).fill(0xff);
     this.setTheme(theme);
   }
 
-  /** Beacons drawn on the last {@link update}. */
+  /** Marks drawn on the last {@link update} — dots plus rings, the selected stem excluded. */
   get drawn(): number {
     return this.#drawn;
+  }
+
+  /** Filled dots on the last {@link update}: vehicles that are sub-pixel without the mark. */
+  get dots(): number {
+    return this.#dots;
+  }
+
+  /** Rings on the last {@link update}: vehicles legible enough not to be covered up. */
+  get rings(): number {
+    return this.#rings;
+  }
+
+  /** Instances each of the dot, halo and ring meshes can hold before the next growth. */
+  get capacity(): number {
+    return this.#capacity;
   }
 
   get enabled(): boolean {
@@ -997,88 +1089,252 @@ export class ActorLocatorOverlay {
     if (!v) this.#hide();
   }
 
+  /**
+   * Per-class bounding radii in metres, which decide when a vehicle has outgrown its mark.
+   *
+   * Without them every actor is assumed to be a car, and a pedestrian then loses its dot at the
+   * distance a bus would — the opposite of what the ratio rule is for.
+   */
+  setClassRadii(radii: readonly number[] | Float32Array): void {
+    if (this.#classRadius.length !== radii.length) this.#classRadius = new Float32Array(radii.length);
+    for (let i = 0; i < radii.length; i++) this.#classRadius[i] = radii[i];
+  }
+
   setTheme(theme: ViewerTheme): void {
-    // A neutral, deliberately non-categorical colour: the state palette owns the four hues, and
-    // this channel must not look like a fifth state. `laneMarking` is the theme's neutral paint.
-    this.#stemAll.material.color.setHex(theme.laneMarking);
-    this.#ringAll.material.color.setHex(theme.laneMarking);
-    this.#stemSel.material.color.setHex(theme.actorState.selected);
-    this.#ringSel.material.color.setHex(theme.actorState.selected);
+    this.#theme = theme;
+    const s = theme.actorState;
+    for (let i = 0; i < ACTOR_STATE_COLOR_KEYS.length; i++) {
+      this.#color.setHex(s[ACTOR_STATE_COLOR_KEYS[i]]);
+      this.#stateColor[i * 3] = this.#color.r;
+      this.#stateColor[i * 3 + 1] = this.#color.g;
+      this.#stateColor[i * 3 + 2] = this.#color.b;
+    }
+    // The halo is the page behind the mark, not a fifth state: it is there so a dot painted in a
+    // palette colour clears its background in both themes.
+    this.#halo.material.color.setHex(theme.background);
+    this.#stem.material.color.setHex(s.selected);
+    this.#invalidateColors();
   }
 
   setOpacity(v: number): void {
-    const k = Math.max(0, Math.min(1, v));
-    this.#stemAll.material.opacity = 0.3 * k;
-    this.#ringAll.material.opacity = 0.55 * k;
-    this.#stemSel.material.opacity = 0.5 * k;
-    this.#ringSel.material.opacity = 0.85 * k;
+    this.#opacity = Math.max(0, Math.min(1, v));
+    this.#halo.material.opacity = 0.85 * this.#opacity;
+    this.#dot.material.opacity = 0.95 * this.#opacity;
+    this.#ring.material.opacity = 0.9 * this.#opacity;
+    this.#stem.material.opacity = 0.45 * this.#opacity;
   }
 
-  /** Rewrite the beacons from this frame's visible slots. */
+  #invalidateColors(): void {
+    this.#dotKey.fill(0xff);
+    this.#ringKey.fill(0xff);
+    this.#dotColorDirty = true;
+    this.#ringColorDirty = true;
+  }
+
+  #makeMesh(
+    geom: BufferGeometry, name: string, n: number, opacity: number, order: number, perInstance: boolean,
+  ): InstancedMesh<BufferGeometry, MeshBasicMaterial> {
+    const material = new MeshBasicMaterial({
+      name, transparent: true, opacity: opacity * this.#opacity, side: DoubleSide, toneMapped: false,
+      vertexColors: perInstance,
+      // No depth test: a mark a building hides is a mark that has failed at the one job it has. No
+      // depth *write* either, so it never occludes the city behind it.
+      depthTest: false, depthWrite: false, fog: false,
+    });
+    const mesh = new InstancedMesh<BufferGeometry, MeshBasicMaterial>(geom, material, n);
+    mesh.name = `overlay/${name}`;
+    mesh.frustumCulled = false;
+    mesh.renderOrder = order;
+    mesh.count = 0;
+    mesh.visible = false;
+    mesh.matrixAutoUpdate = false;
+    mesh.instanceMatrix.setUsage(DynamicDrawUsage);
+    // Every one of these marks is a pure scale-and-translate about +z, so twelve of the sixteen
+    // matrix elements are the same on every instance for the life of the mesh. Writing them once
+    // here leaves the per-frame loop five stores per instance instead of `setMatrixAt`'s sixteen —
+    // the same reason `actors.ts` writes `instanceMatrix.array` by hand instead of composing a
+    // `Matrix4`. `zScale` is 1 for the flat discs and rings; the stem overwrites element 10.
+    const m = mesh.instanceMatrix.array as Float32Array;
+    for (let i = 0; i < n; i++) {
+      m[i * 16 + 10] = 1;
+      m[i * 16 + 15] = 1;
+    }
+    if (perInstance) {
+      // Touch the colour attribute once so it exists and `setColorAt` never allocates in the loop.
+      this.#color.setRGB(1, 1, 1);
+      mesh.setColorAt(0, this.#color);
+      if (mesh.instanceColor) mesh.instanceColor.setUsage(DynamicDrawUsage);
+    }
+    this.group.add(mesh);
+    return mesh;
+  }
+
+  /**
+   * Double the capacity of the three per-actor meshes.
+   *
+   * `InstancedMesh` cannot be resized, so fresh ones replace them. Unlike the actor renderer's
+   * growth nothing has to be copied across: this runs *before* the write loop, from
+   * {@link update}'s own count of the slots it is about to draw, so there are no written instances
+   * to lose. Doubling makes it amortised — a stream that settles at a stable vehicle count stops
+   * growing after the first few frames, which is what keeps the per-frame allocation budget.
+   */
+  #ensureCapacity(needed: number): void {
+    if (needed <= this.#capacity || this.#capacity >= this.#maxCapacity) return;
+    let next = this.#capacity;
+    while (next < needed && next < this.#maxCapacity) next *= 2;
+    next = Math.min(next, this.#maxCapacity);
+    for (const mesh of [this.#halo, this.#dot, this.#ring]) {
+      this.group.remove(mesh);
+      mesh.dispose();
+      mesh.material.dispose();
+    }
+    this.#capacity = next;
+    this.#halo = this.#makeMesh(this.#discGeom, "locator-halo", next, 0.85, 10, false);
+    this.#dot = this.#makeMesh(this.#discGeom, "locator-dot", next, 0.95, 11, true);
+    this.#ring = this.#makeMesh(this.#ringGeom, "locator-ring", next, 0.9, 12, true);
+    this.#dotKey = new Uint8Array(next).fill(0xff);
+    this.#ringKey = new Uint8Array(next).fill(0xff);
+    this.#dotColorDirty = true;
+    this.#ringColorDirty = true;
+    this.#halo.material.color.setHex(this.#theme.background);
+  }
+
+  /** Rewrite the marks from this frame's visible slots. */
   update(ctx: OverlayUpdateContext): void {
     this.#drawn = 0;
-    if (!this.#enabled) {
+    this.#dots = 0;
+    this.#rings = 0;
+    if (!this.#enabled || ctx.visibleCount === 0) {
       this.#hide();
       return;
     }
-    const selected = ctx.selectedActorId ?? null;
-    const live = ctx.liveCount ?? ctx.count;
-    const markAll = live > 0 && live <= this.capacity;
-    if (!markAll && selected === null) {
-      this.#hide();
-      return;
-    }
+    this.#ensureCapacity(ctx.visibleCount);
+
     const ids = ctx.actorId;
+    const selected = ctx.selectedActorId ?? null;
+    const gt = ctx.showGroundTruth !== false;
+    const cls = ctx.classIdx;
+    const st = ctx.state;
+    const radii = this.#classRadius;
+    const nRadii = radii.length;
+    const stateColor = this.#stateColor;
+    const col = this.#color;
+    const cap = this.#capacity;
 
     const e = ctx.camera.matrixWorld.elements;
-    this.#camPos.set(e[12], e[13], e[14]);
-    const m = this.#matrix;
-    const me = m.elements;
-    // A pure scale-and-translate: the off-diagonal terms stay zero for the whole frame.
-    me[1] = 0; me[2] = 0; me[3] = 0;
-    me[4] = 0; me[6] = 0; me[7] = 0;
-    me[8] = 0; me[9] = 0; me[11] = 0;
-    me[15] = 1;
+    const camX = e[12];
+    const camY = e[13];
+    const camZ = e[14];
 
-    let nAll = 0;
-    let nSel = 0;
-    const near2 = this.nearRangeM * this.nearRangeM;
+    // The three raw instance-matrix buffers. Only elements 0, 5, 12, 13 and 14 are ever written
+    // per frame; `#makeMesh` set 10 and 15 to 1 for every instance when the mesh was built.
+    const haloM = this.#halo.instanceMatrix.array as Float32Array;
+    const dotM = this.#dot.instanceMatrix.array as Float32Array;
+    const ringM = this.#ring.instanceMatrix.array as Float32Array;
+    const haloLimit = this.haloLimit;
+
+    let nDot = 0;
+    let nRing = 0;
+    let nHalo = 0;
+    let nStem = 0;
+
     for (let k = 0; k < ctx.visibleCount; k++) {
       const slot = ctx.visibleSlots[k];
-      const isSelected = selected !== null && ids !== undefined && ids[slot] === selected;
-      if (!markAll && !isSelected) continue;
-      if (!isSelected && nAll >= this.capacity) continue;
       const p = slot * 3;
       const x = ctx.position[p];
       const y = ctx.position[p + 1];
       const z = ctx.position[p + 2];
-      const dx = x - this.#camPos.x;
-      const dy = y - this.#camPos.y;
-      const dz = z - this.#camPos.z;
-      const d2 = dx * dx + dy * dy + dz * dz;
-      if (d2 < near2) continue;
-      const dist = Math.sqrt(d2);
-      const w = Math.max(this.minWidthM, dist * this.widthPerDistance);
-      const h = Math.max(this.minHeightM, dist * this.heightPerDistance);
-      const r = Math.max(this.minRingM, dist * this.ringPerDistance);
+      const dx = x - camX;
+      const dy = y - camY;
+      const dz = z - camZ;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      let c = cls[slot];
+      if (c >= nRadii) c = 0;
+      const vehicleR = nRadii > 0 ? radii[c] : DEFAULT_VEHICLE_RADIUS_M;
+      // The *unclamped* angular radius decides the form, and the clamped one decides what is drawn.
+      // Using the clamped radius for both was a real bug: `minRadiusM` of 1.1 m holds the ratio for
+      // a 2.8 m car below 2.6 however close the camera gets, so `hideRatio` could never fire and
+      // every nearby vehicle kept a ring — clutter at street level, which is the opposite of what
+      // the rule is for. The floor exists so a drawn mark cannot collapse; it must not also decide
+      // whether there is one.
+      const angularR = dist * this.angularRadius;
+      const markR = Math.max(this.minRadiusM, angularR);
+      const ratio = angularR > 0 ? vehicleR / angularR : Infinity;
+      const isSelected = selected !== null && ids !== undefined && ids[slot] === (selected >>> 0);
 
-      me[0] = w; me[5] = w; me[10] = h;
-      me[12] = x; me[13] = y; me[14] = z + 0.6;
-      (isSelected ? this.#stemSel : this.#stemAll).setMatrixAt(isSelected ? nSel : nAll, m);
+      // The vehicle is already the biggest thing in the frame; a mark over it would hide what the
+      // viewer came to look at. This is the one rule, and the selected vehicle obeys it too: from
+      // the chase camera you are looking straight at the car you are following, so "which one is
+      // it" is not a question, and a 6 m pillar on its roof is just something in the way.
+      if (ratio >= this.hideRatio) continue;
 
-      me[0] = r; me[5] = r; me[10] = 1;
-      me[14] = z + 0.12;
-      (isSelected ? this.#ringSel : this.#ringAll).setMatrixAt(isSelected ? nSel : nAll, m);
+      if (isSelected && nStem === 0) {
+        const w = Math.max(0.3, markR * 0.28);
+        const h = Math.max(this.selectedStemMinM, dist * this.selectedStemPerDistance);
+        const sm = this.#stem.instanceMatrix.array as Float32Array;
+        sm[0] = w; sm[5] = w; sm[10] = h;
+        sm[12] = x; sm[13] = y; sm[14] = z + 0.6;
+        nStem = 1;
+      }
 
-      if (isSelected) nSel = 1;
-      else nAll++;
+      const ci = actorStateColorIndex(st[slot], isSelected, gt);
+
+      if (ratio < this.ringRatio) {
+        if (nDot >= cap) continue;
+        const i = nDot++;
+        const o = i * 16;
+        dotM[o] = markR; dotM[o + 5] = markR;
+        dotM[o + 12] = x; dotM[o + 13] = y; dotM[o + 14] = z + 0.14;
+        if (nHalo < haloLimit) {
+          // A little wider and behind, so the dot clears whatever is under it in either theme.
+          const h = nHalo++ * 16;
+          const r = markR * 1.55;
+          haloM[h] = r; haloM[h + 5] = r;
+          haloM[h + 12] = x; haloM[h + 13] = y; haloM[h + 14] = z + 0.10;
+        }
+        if (this.#dotKey[i] !== ci) {
+          this.#dotKey[i] = ci;
+          this.#dotColorDirty = true;
+          col.setRGB(stateColor[ci * 3], stateColor[ci * 3 + 1], stateColor[ci * 3 + 2]);
+          this.#dot.setColorAt(i, col);
+        }
+        this.#dots++;
+      }
+
+      if (ratio >= this.ringRatio || isSelected) {
+        if (nRing >= cap) continue;
+        const i = nRing++;
+        const o = i * 16;
+        // Around the vehicle, never over it: at least a third wider than the body it encircles.
+        const r = isSelected
+          ? Math.max(markR * 1.5, vehicleR * 1.6)
+          : Math.max(markR, vehicleR * 1.35);
+        ringM[o] = r; ringM[o + 5] = r;
+        ringM[o + 12] = x; ringM[o + 13] = y; ringM[o + 14] = z + 0.16;
+        if (this.#ringKey[i] !== ci) {
+          this.#ringKey[i] = ci;
+          this.#ringColorDirty = true;
+          col.setRGB(stateColor[ci * 3], stateColor[ci * 3 + 1], stateColor[ci * 3 + 2]);
+          this.#ring.setColorAt(i, col);
+        }
+        this.#rings++;
+      }
+
       this.#drawn++;
     }
 
-    this.#publish(this.#stemAll, nAll, 0);
-    this.#publish(this.#ringAll, nAll, 1);
-    this.#publish(this.#stemSel, nSel, 2);
-    this.#publish(this.#ringSel, nSel, 3);
+    this.#publish(this.#halo, nHalo, 0);
+    this.#publish(this.#dot, nDot, 1);
+    this.#publish(this.#ring, nRing, 2);
+    this.#publish(this.#stem, nStem, 3);
+    if (this.#dotColorDirty && nDot > 0 && this.#dot.instanceColor) {
+      publishRange(this.#dot.instanceColor, nDot * 3, this.#ranges[4]);
+      this.#dotColorDirty = false;
+    }
+    if (this.#ringColorDirty && nRing > 0 && this.#ring.instanceColor) {
+      publishRange(this.#ring.instanceColor, nRing * 3, this.#ranges[5]);
+      this.#ringColorDirty = false;
+    }
   }
 
   #publish(mesh: InstancedMesh<BufferGeometry, MeshBasicMaterial>, n: number, rangeIndex: number): void {
@@ -1088,19 +1344,20 @@ export class ActorLocatorOverlay {
   }
 
   #hide(): void {
-    for (const mesh of [this.#stemAll, this.#ringAll, this.#stemSel, this.#ringSel]) {
+    for (const mesh of [this.#halo, this.#dot, this.#ring, this.#stem]) {
       mesh.count = 0;
       mesh.visible = false;
     }
   }
 
   dispose(): void {
-    for (const mesh of [this.#stemAll, this.#ringAll, this.#stemSel, this.#ringSel]) {
+    for (const mesh of [this.#halo, this.#dot, this.#ring, this.#stem]) {
       mesh.dispose();
       mesh.material.dispose();
     }
-    for (const g of this.#geometries) g.dispose();
-    this.#geometries = [];
+    this.#discGeom.dispose();
+    this.#ringGeom.dispose();
+    this.#stemGeom.dispose();
     this.group.removeFromParent();
   }
 }
@@ -1119,8 +1376,17 @@ export interface OverlayManagerOptions {
   readonly heatmapSize?: number;
   /** Nominal RSU coverage radius in metres for the `coverage`/`rsu_range` overlays. Default 350. */
   readonly coverageRadiusM?: number;
-  /** Most locator beacons drawn at once, and the live-actor count above which only the selected one keeps its beacon. Default 64. */
+  /**
+   * Starting instance capacity of the aerial vehicle mark. Default 256, doubling as needed.
+   *
+   * It is a *starting* capacity, not a ceiling: the previous fixed 64 doubled as a suppression rule
+   * — above 64 live vehicles no mark was drawn at all — and a 200-vehicle run therefore showed
+   * nothing anywhere on the map. Every drawn vehicle now gets a mark; this only decides how many
+   * frames of doubling it takes to get there.
+   */
   readonly locatorCapacity?: number;
+  /** Hard ceiling on marks, matching the actor renderer's `maxActors`. Default 20,000. */
+  readonly locatorMaxCapacity?: number;
 }
 
 /**
@@ -1177,7 +1443,8 @@ export class OverlayManager {
     this.heatmap = new HeatmapOverlay(options.heatmapSize ?? 128, options.heatmapSize ?? 128);
     this.coverage = new CoverageOverlay(this.#theme, 512);
     this.markers = new StateMarkerOverlay(this.#theme, options.markerCapacity ?? 4096);
-    this.locators = new ActorLocatorOverlay(this.#theme, options.locatorCapacity ?? 64);
+    this.locators = new ActorLocatorOverlay(
+      this.#theme, options.locatorCapacity ?? 256, options.locatorMaxCapacity ?? 20_000);
 
     this.group.add(this.heatmap.object, this.coverage.object, this.links.object,
       this.pulses.object, this.markers.group, this.locators.group);

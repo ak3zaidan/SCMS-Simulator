@@ -64,20 +64,13 @@ export interface CameraControllerOptions {
    */
   readonly onFrameActors?: () => void;
   /**
-   * Travel distance at and below which {@link CameraControllerOptions.positionLambda} applies in
-   * full, metres. Default 120.
+   * Longest a mode change's camera flight may take, seconds. Default 2.4.
    *
-   * Above it the smoothing rate is stretched so a long move takes longer, which is what turns the
-   * map-to-chase fly-down into a flight instead of a snap. A bare `1 − exp(−4·dt)` covers 90 % of
-   * *any* distance in 0.58 s, so a 1.7 km descent starts at 6,800 m/s and then crawls the last
-   * 30 m — measured on `scenarios/phase1-manhattan.yaml`, where frame 3 of the fly-down was
-   * already 305 m below frame 0. See {@link CameraController.update}.
+   * A mode change flies the camera along a duration-bounded eased path rather than leaving it to
+   * the exponential tracking law, which travels any distance in the same 0.58 s. See
+   * `CameraController#beginFlight`.
    */
-  readonly flyReferenceM?: number;
-  /** Slowest rate a very long move is stretched to. Default 1.1 (90 % in about 2.1 s). */
-  readonly flyMinLambda?: number;
-  /** Seconds a newly started move eases in over, so it begins from rest. Default 0.4. */
-  readonly flyEaseSeconds?: number;
+  readonly flyMaxSeconds?: number;
   /** Field of view per mode, degrees. */
   readonly fovMapDeg?: number;
   readonly fovChaseDeg?: number;
@@ -100,6 +93,14 @@ export interface CameraState {
 export type InputTarget = Pick<EventTarget, "addEventListener" | "removeEventListener">;
 
 const DEG = Math.PI / 180;
+
+/**
+ * Keep `v` such that `[v − half, v + half]` stays inside `[lo, hi]`; centre it when it cannot fit.
+ */
+function clampSpan(v: number, lo: number, hi: number, half: number): number {
+  if (hi - lo <= 2 * half) return (lo + hi) / 2;
+  return MathUtils.clamp(v, lo + half, hi - half);
+}
 
 /**
  * Drives one `PerspectiveCamera` through every viewer mode.
@@ -160,11 +161,12 @@ export class CameraController {
   readonly positionLambda: number;
   readonly lookLambda: number;
   readonly fovLambda: number;
-  #flyReference: number;
-  #flyMinLambda: number;
-  #flyEase: number;
-  /** Seconds since the current move began; drives the ease-in. */
-  #travelT = Infinity;
+  #flyMaxSeconds: number;
+  /** Seconds elapsed in the current flight, and its total; equal means "not flying". */
+  #flyT = 0;
+  #flyDuration = 0;
+  #flyStart = new Vector3();
+  #flyStartLook = new Vector3();
   #fovMap: number;
   #fovChase: number;
   #fovDashboard: number;
@@ -193,9 +195,7 @@ export class CameraController {
     this.#maxAltitude = options.maxAltitudeM ?? 20_000;
     this.#clearance = options.buildingClearanceM ?? 3;
     this.#occlusionRange = options.occlusionRangeM ?? 60;
-    this.#flyReference = Math.max(1, options.flyReferenceM ?? 120);
-    this.#flyMinLambda = Math.max(0.05, options.flyMinLambda ?? 1.1);
-    this.#flyEase = Math.max(0, options.flyEaseSeconds ?? 0.4);
+    this.#flyMaxSeconds = Math.max(0.05, options.flyMaxSeconds ?? 2.4);
     this.#fovMap = options.fovMapDeg ?? 45;
     this.#fovChase = options.fovChaseDeg ?? 55;
     this.#fovDashboard = options.fovDashboardDeg ?? 68;
@@ -215,6 +215,40 @@ export class CameraController {
   /** Actor the camera follows, or null. */
   get followActorId(): number | null {
     return this.#followActorId;
+  }
+
+  /**
+   * Whether the camera has a vehicle to sit behind — a followed actor with at least one known
+   * pose, live or last-seen. The street-level modes are meaningless without one.
+   */
+  get hasFollowSubject(): boolean {
+    return this.#followActorId !== null && this.#followPosKnown;
+  }
+
+  /** Which modes are only meaningful with a followed vehicle. */
+  static needsFollowSubject(mode: CameraMode): boolean {
+    return mode === "chase" || mode === "dashboard";
+  }
+
+  /**
+   * The street-level mode most recently asked for and refused for want of a vehicle, or null.
+   *
+   * {@link setMode} returns the mode it actually applied; this says which one it would not give.
+   * The caller owns the sentence shown to the user — the controller only refuses to draw a frame
+   * that means nothing.
+   */
+  get rejectedMode(): CameraMode | null {
+    return this.#rejectedMode;
+  }
+
+  /** Whether a mode-change flight is in progress. A snap during one is a visible cut. */
+  get isFlying(): boolean {
+    return this.#flyT < this.#flyDuration;
+  }
+
+  /** Whether the user has panned, orbited or zoomed. Automatic framing must not override them. */
+  get userHasMoved(): boolean {
+    return this.#userMoved;
   }
 
   /** Map altitude in metres. */
@@ -263,13 +297,33 @@ export class CameraController {
    * `"jump"` is treated as "snap to the target, then chase", matching 09-ui §3's description of it as
    * an action rather than a persistent mode.
    */
-  setMode(mode: CameraMode, instant = false): void {
+  setMode(mode: CameraMode, instant = false): CameraMode {
     if (mode === "jump") {
+      if (!this.hasFollowSubject) {
+        this.#rejectedMode = "chase";
+        return this.#mode;
+      }
       this.#mode = "chase";
       this.#computeDesired();
       this.snap();
-      return;
+      return this.#mode;
     }
+    // A street-level mode with nothing to sit behind used to fall back to the map focus, which at
+    // start-up is the *world's centre*. On phase1-manhattan that put the chase camera 1,050 m from
+    // the only vehicle, at 20 m up inside a city block, looking at a point 8 m away: two dark
+    // planes, one lane marking, no car. That frame is not a chase view of anything, so it is not
+    // drawn. The caller is told which mode was refused and decides what to say.
+    if (CameraController.needsFollowSubject(mode) && !this.hasFollowSubject) {
+      this.#rejectedMode = mode;
+      return this.#mode;
+    }
+    // `rsu` is the same shape of claim about a mast that may not exist.
+    if (mode === "rsu" && (this.#world === null || this.#world.siteCount === 0)) {
+      this.#rejectedMode = mode;
+      return this.#mode;
+    }
+    this.#rejectedMode = null;
+    const changed = mode !== this.#mode;
     this.#mode = mode;
     this.#desiredFov = mode === "dashboard" ? this.#fovDashboard : mode === "map" ? this.#fovMap : this.#fovChase;
     if (mode === "free") {
@@ -285,10 +339,15 @@ export class CameraController {
     }
     this.#computeDesired();
     if (instant) this.snap();
+    else if (changed) this.#beginFlight();
+    return this.#mode;
   }
 
   /** Follow an actor (or nothing). Does not change the mode. */
   follow(actorId: number | null): void {
+    // A different subject invalidates the remembered pose; re-following the same one keeps it, so
+    // re-selecting a parked vehicle does not throw away the only place the camera can stand.
+    if (actorId !== this.#followActorId) this.#followPosKnown = false;
     this.#followActorId = actorId;
     this.#followValid = false;
   }
@@ -298,9 +357,18 @@ export class CameraController {
    * flies down into a chase view of it. One call, no scene switch — the mode change re-aims the
    * desired pose and the exponential smoothing in {@link update} does the rest.
    */
-  flyTo(actorId: number, mode: CameraMode = "chase", instant = false): void {
+  flyTo(actorId: number, mode: CameraMode = "chase", instant = false): CameraMode {
     this.follow(actorId);
-    this.setMode(mode, instant);
+    // `follow` cleared the remembered pose for a new subject, so `setMode` would refuse a
+    // street-level mode on the very frame the user clicked a vehicle. Seeding the pose here is
+    // what {@link setFollowPose} would do a few milliseconds later anyway; the owner supplies the
+    // real one on the next frame.
+    if (CameraController.needsFollowSubject(mode) && !this.#followPosKnown) {
+      this.#followPos.copy(this.target);
+      this.#followPosKnown = true;
+      this.#followValid = false;
+    }
+    return this.setMode(mode, instant);
   }
 
   /** Watch from an RSU mast. `siteIndex` indexes {@link WorldRenderer.sitePositions}. */
@@ -331,10 +399,18 @@ export class CameraController {
     this.#followHeading = headingRad;
     this.#followSpeed = speedMps;
     this.#followValid = true;
+    this.#followPosKnown = true;
     if (this.#mode !== "free" && this.#mode !== "rsu") this.target.set(x, y, z);
   }
 
-  /** The followed actor left the stream; the camera holds its last position instead of snapping. */
+  /**
+   * The followed actor left the stream; the camera holds its last position instead of snapping.
+   *
+   * `#followPos` is deliberately left alone. This method used only to clear `#followValid`, which
+   * sent `#computeDesired` to the *map focus* instead — the opposite of what this comment promised
+   * — so a run ending, or a vehicle despawning, teleported the chase camera to wherever the plan
+   * view happened to be pointing.
+   */
   clearFollowPose(): void {
     this.#followValid = false;
   }
@@ -346,6 +422,7 @@ export class CameraController {
 
   /** Cut to the desired pose with no animation. */
   snap(): void {
+    this.#flyT = this.#flyDuration; // a cut is not a flight
     this.#computeDesired();
     this.camera.position.copy(this.#desiredPosition);
     this.look.copy(this.#desiredLook);
@@ -367,11 +444,15 @@ export class CameraController {
     this.#computeDesired();
     this.keepCameraOutsideBuildings(this.#desiredPosition, this.#desiredLook);
 
-    const kp = 1 - Math.exp(-step * this.positionLambda);
-    const kl = 1 - Math.exp(-step * this.lookLambda);
+    if (this.#flyT < this.#flyDuration) {
+      this.#advanceFlight(step);
+    } else {
+      const kp = 1 - Math.exp(-step * this.positionLambda);
+      const kl = 1 - Math.exp(-step * this.lookLambda);
+      this.camera.position.lerp(this.#desiredPosition, kp);
+      this.look.lerp(this.#desiredLook, kl);
+    }
     const kf = 1 - Math.exp(-step * this.fovLambda);
-    this.camera.position.lerp(this.#desiredPosition, kp);
-    this.look.lerp(this.#desiredLook, kl);
 
     // The smoothed position can still clip a roof on the way down; fix it after the lerp too.
     this.keepCameraOutsideBuildings(this.camera.position, this.look);
@@ -383,6 +464,46 @@ export class CameraController {
     }
     this.camera.lookAt(this.look);
     this.camera.updateMatrixWorld();
+  }
+
+  /**
+   * Start a timed flight from wherever the camera is to wherever the new mode wants it.
+   *
+   * 09-ui §3's exponential lerp is the right *tracking* law and the wrong *travel* law.
+   * `1 − exp(−λ·dt)` covers 90 % of the remaining distance in `2.3/λ` seconds whatever the
+   * distance is, so at λ = 4 a 10 m correction and a 1.7 km descent both take 0.58 s and both
+   * begin at their maximum speed, `λ · distance`. Measured on the real fly-down over
+   * `scenarios/phase1-manhattan.yaml`: frame 3, fifty milliseconds after the click, was already
+   * 305 m below the start; 0.4 s in, 80 % of a 1,690 m drop was done; the remaining 30 m took
+   * another 1.5 s. A snap followed by a crawl — the cut the design says this must not be.
+   *
+   * So a mode change hands the camera to a duration-bounded path: `lerp(start, desired, e(t/T))`
+   * with a smootherstep `e`, which starts and ends at zero velocity and lands exactly on the
+   * desired pose, from where the exponential tracking law takes over with no error and therefore
+   * no discontinuity. `T` grows with the square root of the distance, so a 1.7 km descent takes
+   * 2.4 s and a chase-to-dashboard hop takes half a second.
+   *
+   * The path is written *absolutely* from the stored start pose rather than accumulated frame by
+   * frame, which is what keeps it frame-rate independent in the strict sense the smoothing law is:
+   * one 0.2 s step lands exactly where two 0.1 s steps do.
+   */
+  #beginFlight(): void {
+    this.#computeDesired();
+    this.#flyStart.copy(this.camera.position);
+    this.#flyStartLook.copy(this.look);
+    const dist = this.#flyStart.distanceTo(this.#desiredPosition);
+    this.#flyDuration = MathUtils.clamp(0.35 + 0.055 * Math.sqrt(dist), 0.35, this.#flyMaxSeconds);
+    this.#flyT = 0;
+  }
+
+  /** One step of the flight begun by {@link #beginFlight}. */
+  #advanceFlight(step: number): void {
+    this.#flyT += step;
+    const u = MathUtils.clamp(this.#flyT / this.#flyDuration, 0, 1);
+    // Smootherstep: zero velocity *and* zero acceleration at both ends.
+    const e = u * u * u * (u * (u * 6 - 15) + 10);
+    this.camera.position.lerpVectors(this.#flyStart, this.#desiredPosition, e);
+    this.look.lerpVectors(this.#flyStartLook, this.#desiredLook, e);
   }
 
   /**
@@ -474,6 +595,7 @@ export class CameraController {
     const l = this.#desiredLook;
     switch (this.#mode) {
       case "map": {
+        this.#clampMapTarget();
         // Nearly straight down; see the header note on `lookAt` degeneracy.
         const horizontal = Math.max(this.#altitude * 1e-4, 1e-3);
         d.set(
@@ -485,7 +607,9 @@ export class CameraController {
         break;
       }
       case "chase": {
-        const base = this.#followValid ? this.#followPos : this.target;
+        // `#followPos`, not the map focus: see `clearFollowPose`. `setMode` guarantees a subject
+        // exists before this mode can be entered, so the pose is always one of this vehicle's.
+        const base = this.#followPos;
         const yaw = this.#followHeading + Math.PI + this.#orbitYaw;
         // A little extra trail at speed; 0 at rest, +40 % at 30 m/s.
         const dist = this.#chaseDistance * (1 + Math.min(0.4, this.#followSpeed / 75));
@@ -500,7 +624,7 @@ export class CameraController {
         break;
       }
       case "dashboard": {
-        const base = this.#followValid ? this.#followPos : this.target;
+        const base = this.#followPos;
         const h = this.#followHeading + this.#orbitYaw;
         const fx = Math.cos(h);
         const fy = Math.sin(h);
@@ -518,7 +642,7 @@ export class CameraController {
         } else {
           d.set(this.target.x, this.target.y, this.target.z + 25);
         }
-        if (this.#followValid) l.copy(this.#followPos);
+        if (this.#followPosKnown) l.copy(this.#followPos);
         else l.set(this.target.x, this.target.y, this.target.z);
         if (l.distanceToSquared(d) < 1) l.set(d.x + 30, d.y, d.z - 8);
         break;
@@ -536,6 +660,32 @@ export class CameraController {
         break;
       }
     }
+  }
+
+  /**
+   * Keep the plan view's window inside the world, so the aerial view never shows void.
+   *
+   * In `map` mode {@link setFollowPose} moves the focus onto the followed vehicle every frame. On
+   * phase1-manhattan the vehicle drives to within 20 m of the world's north edge, which put about
+   * 40 % of the frame outside the city — a black band with nothing in it. The same happens when a
+   * drag reaches the edge.
+   *
+   * The window is the vertical extent by the horizontal extent, rotated by the bearing; its
+   * axis-aligned span is what has to fit. When the world is *narrower* than the window on an axis
+   * the focus is centred on that axis instead, which is the only framing that can be right.
+   */
+  #clampMapTarget(): void {
+    const world = this.#world?.world;
+    if (!world) return;
+    const b = world.bbox;
+    const halfV = this.extentM / 2;
+    const halfH = halfV * Math.max(0.01, this.camera.aspect);
+    const ab = Math.abs(Math.cos(this.#bearing));
+    const sb = Math.abs(Math.sin(this.#bearing));
+    const spanX = halfH * sb + halfV * ab;
+    const spanY = halfH * ab + halfV * sb;
+    this.target.x = clampSpan(this.target.x, b.minXM, b.maxXM, spanX);
+    this.target.y = clampSpan(this.target.y, b.minYM, b.maxYM, spanY);
   }
 
   /** A plain snapshot, shaped for §6.7 `view.camera`. */
@@ -567,6 +717,7 @@ export class CameraController {
     const onPointerDown = (e: Event): void => {
       const ev = e as PointerEvent;
       dragging = true;
+      this.#userMoved = true;
       lastX = ev.clientX;
       lastY = ev.clientY;
       shift = ev.shiftKey || ev.button === 2;
@@ -617,6 +768,7 @@ export class CameraController {
       // possible on a listener registered non-passively (finding Q20): the Studio happens to set
       // `body { overflow: hidden }`, but `attachInput` is a library surface and cannot assume it.
       if (typeof ev.preventDefault === "function" && ev.cancelable !== false) ev.preventDefault();
+      this.#userMoved = true;
       const k = Math.exp(ev.deltaY * 0.0012);
       if (this.#mode === "map") this.altitudeM = this.#altitude * k;
       else this.distanceM = this.#chaseDistance * k;
