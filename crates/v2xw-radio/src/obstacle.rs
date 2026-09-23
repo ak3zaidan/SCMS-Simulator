@@ -448,6 +448,9 @@ pub struct BuildingShadowing {
     /// light construction.
     material_overrides: BTreeMap<u8, SommerFit>,
     index: Option<BuildingIndex>,
+    /// Whether [`BuildingShadowing::loss_for_path`] caps the through-building loss at the
+    /// TR 37.885 around-the-corner NLOS excess.
+    street_canyon_ceiling: bool,
 }
 
 impl BuildingShadowing {
@@ -457,24 +460,19 @@ impl BuildingShadowing {
     /// The model at `tier` with the default fitted row.
     #[must_use]
     pub fn new(tier: Tier) -> Self {
-        Self {
-            card: building_card(SommerFit::Default),
-            tier,
-            fit: SommerFit::Default,
-            material_overrides: BTreeMap::new(),
-            index: None,
-        }
+        Self::with_fit(tier, SommerFit::Default)
     }
 
     /// The model with one of the per-class fitted rows.
     #[must_use]
     pub fn with_fit(tier: Tier, fit: SommerFit) -> Self {
         Self {
-            card: building_card(fit),
+            card: building_card(fit, true),
             tier,
             fit,
             material_overrides: BTreeMap::new(),
             index: None,
+            street_canyon_ceiling: true,
         }
     }
 
@@ -573,6 +571,51 @@ impl BuildingShadowing {
         }
     }
 
+    /// The obstacle loss of a building-blocked link, dB, with the street-canyon ceiling.
+    ///
+    /// The Sommer term is the loss *through* the buildings on the straight path. In a
+    /// street grid a blocked link is also reached *around* them — along the street canyon
+    /// and round the corner — and the receiver sees the stronger of the two. 3GPP
+    /// TR 37.885 Table 6.2.1-1 gives that around-the-corner path for urban V2V links
+    /// "blocked by buildings" as its NLOS law, `36.85 + 30·log10(d3D) + 18.9·log10(fc)`,
+    /// fitted (through WINNER+ B1) on Manhattan-grid street-canyon measurements. So the
+    /// obstacle loss is the smaller of the Sommer term and the excess of that NLOS law over
+    /// the line-of-sight path loss `los_path_db` the propagation model already charged:
+    ///
+    /// `L_obs = min(β·n + γ·d_in, max(0, PL_NLOS(d3D, fc) − PL_LOS))`
+    ///
+    /// Without the ceiling a link across four Midtown blocks paid several hundred decibels
+    /// — every wall of every tower on the straight line — where a receiver actually
+    /// hears the corner-diffracted path at a few tens of decibels below line of sight.
+    /// Below the sensitivity floor the difference changes no outcome, but it is what makes
+    /// a car round the corner of an intersection audible at 60-100 m as measured, rather
+    /// than silent at 20 m.
+    #[must_use]
+    pub fn loss_for_path(&self, los: &LosResult, d3d_m: f64, f_hz: f64, los_path_db: f64) -> f64 {
+        let through = self.loss_for(los);
+        if through <= 0.0 || !self.street_canyon_ceiling {
+            return through;
+        }
+        let around = crate::prop::tr37885_nlos_db(d3d_m, f_hz / 1e9) - los_path_db;
+        through.min(around.max(0.0))
+    }
+
+    /// The model with the street-canyon ceiling of [`BuildingShadowing::loss_for_path`]
+    /// switched on or off. On by default; off is the bare Sommer 2011 model, which its
+    /// authors fitted in a suburban town where going round a block is not a shorter path.
+    #[must_use]
+    pub fn with_street_canyon_ceiling(mut self, on: bool) -> Self {
+        self.street_canyon_ceiling = on;
+        self.card = building_card(self.fit, on);
+        self
+    }
+
+    /// Whether the street-canyon ceiling is on.
+    #[must_use]
+    pub const fn street_canyon_ceiling(&self) -> bool {
+        self.street_canyon_ceiling
+    }
+
     /// The Sommer loss for a classified link, dB. Deterministic: no draw.
     #[must_use]
     pub fn loss_for(&self, los: &LosResult) -> f64 {
@@ -641,7 +684,7 @@ fn sommer_source() -> Source {
     }
 }
 
-fn building_card(fit: SommerFit) -> ModelCard {
+fn building_card(fit: SommerFit, ceiling: bool) -> ModelCard {
     let c = fit.coefficients();
     let mut card = ModelCard::new(
         BuildingShadowing::ID,
@@ -652,6 +695,17 @@ fn building_card(fit: SommerFit) -> ModelCard {
     );
     card.tier = vec![Tier::Medium, Tier::High];
     card.equations = vec![Equation {
+        name: "street-canyon ceiling".to_string(),
+        latex_or_text: "L_obs = min(β·n + γ·d_m, max(0, PL_NLOS(d3D, fc) − PL_LOS)), \
+                        PL_NLOS = 36.85 + 30·log10(d3D) + 18.9·log10(fc_GHz)"
+            .to_string(),
+        notes: Some(
+            "3GPP TR 37.885 Table 6.2.1-1 urban NLOS ('blocked by buildings'): the \
+             around-the-corner path a receiver hears when the straight one runs through \
+             buildings. Applied when the ceiling is on."
+                .to_string(),
+        ),
+    }, Equation {
         name: "obstacle loss".to_string(),
         latex_or_text: "L_obs[dB] = β·n + γ·d_m".to_string(),
         notes: Some(
@@ -719,7 +773,23 @@ fn building_card(fit: SommerFit) -> ModelCard {
             ),
         },
     ];
+    card.parameters.push(Parameter {
+        name: "street_canyon_ceiling".to_string(),
+        unit: "-".to_string(),
+        default: serde_json::json!(ceiling),
+        range: Some(vec![serde_json::json!(true), serde_json::json!(false)]),
+        source: Source::new(
+            SourceKind::Standard,
+            "3GPP TR 37.885 V15.3.0 Table 6.2.1-1, urban V2V NLOS (blocked by buildings), \
+             via 04-models.md §3.3",
+        ),
+        calibration: None,
+    });
     card.assumptions = vec![
+        "The receiver hears the stronger of the straight path through the buildings and the \
+         around-the-corner street-canyon path; the latter is TR 37.885's urban NLOS law, \
+         which is distance-only and does not trace the actual corner."
+            .to_string(),
         "The path is the straight line between the two antenna phase centres.".to_string(),
         "A building whose roof is below both antennas does not block the path (a 2.5-D \
          refinement of the cited 2-D model, recorded as a design choice)."
@@ -1500,6 +1570,43 @@ fn terrain_card(rule: MultiEdgeRule, exact: bool) -> ModelCard {
 mod tests {
     use super::*;
     use crate::testctx::{TestCtx, tiny_world, world_with_building};
+
+    /// A link through a whole row of towers is charged the around-the-corner excess of
+    /// TR 37.885's NLOS law, not every wall on the straight line; a thin building is
+    /// cheaper to go through than round, and keeps the Sommer term; and the bare model is
+    /// one switch away.
+    #[test]
+    fn the_street_canyon_ceiling_caps_a_link_through_many_buildings() {
+        let m = BuildingShadowing::new(Tier::Medium);
+        let blocked = LosResult {
+            class: LosClass::NlosB,
+            walls_crossed: 20,
+            obstructed_len_m: 250.0,
+            knife_edges: Vec::new(),
+        };
+        let through = m.loss_for(&blocked);
+        assert!((through - (20.0 * 9.0 + 250.0 * 0.4)).abs() < 1e-9);
+        let los_path_db = 90.0;
+        let capped = m.loss_for_path(&blocked, 300.0, 5.9e9, los_path_db);
+        let want = crate::prop::tr37885_nlos_db(300.0, 5.9) - los_path_db;
+        assert!((capped - want).abs() < 1e-9, "capped {capped}, want {want}");
+        assert!(capped < 0.2 * through);
+
+        let thin = LosResult {
+            walls_crossed: 2,
+            obstructed_len_m: 10.0,
+            ..blocked.clone()
+        };
+        assert_eq!(
+            m.loss_for_path(&thin, 300.0, 5.9e9, los_path_db),
+            m.loss_for(&thin),
+            "22 dB through beats 36 dB round"
+        );
+
+        let bare = BuildingShadowing::new(Tier::Medium).with_street_canyon_ceiling(false);
+        assert_eq!(bare.loss_for_path(&blocked, 300.0, 5.9e9, los_path_db), through);
+        assert_eq!(m.loss_for_path(&LosResult::clear(), 300.0, 5.9e9, los_path_db), 0.0);
+    }
     use crate::types::ActorClass;
     use v2xw_core::geom::Dims;
     use v2xw_core::ids::{ActorId, NodeId};
@@ -1901,7 +2008,7 @@ mod tests {
     fn the_cards_validate_and_register() {
         let mut registry = v2xw_core::registry::Registry::new();
         for card in [
-            building_card(SommerFit::Default),
+            building_card(SommerFit::Default, true),
             vehicle_card(),
             terrain_card(MultiEdgeRule::Deygout, false),
         ] {
@@ -1914,11 +2021,11 @@ mod tests {
         assert!(registry.contains(TerrainDiffraction::ID));
         // Every fitted row produces a valid card.
         for fit in SommerFit::ALL {
-            building_card(fit).validate().expect("card validates");
+            building_card(fit, true).validate().expect("card validates");
         }
         // The material map is empty by default and is a todo-calibrate parameter, so it
         // must carry a plan (registry rule R1) — which `validate` checks.
-        let card = building_card(SommerFit::Default);
+        let card = building_card(SommerFit::Default, true);
         let p = card
             .parameters
             .iter()
