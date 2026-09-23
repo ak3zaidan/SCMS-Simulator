@@ -131,6 +131,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some((it.next()?, it.next()?))
         })
         .unwrap_or((0.0, f64::INFINITY));
+    // `--near X,Y,R`: every actor within R metres of (X, Y) in the window.
+    let near: Option<(f64, f64, f64)> = value("--near").and_then(|v| {
+        let mut it = v.split(',').filter_map(|x| x.trim().parse::<f64>().ok());
+        Some((it.next()?, it.next()?, it.next()?))
+    });
     let step = scenario.time.mobility_step();
     let horizon = (scenario.time.duration_s * 1e9) as u64;
     let started = Instant::now();
@@ -141,10 +146,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t1 = update.t;
         let actors = mobility.audit_actors(&world, t1);
         // `--trace A,B --window T0,T1`: every state of the named actors in the window.
-        if let Some(list) = trace.as_ref() {
+        if trace.is_some() || near.is_some() {
             let ts = t1 as f64 * 1e-9;
             if ts >= window.0 && ts <= window.1 {
-                for a in actors.iter().filter(|a| list.contains(&a.actor.index())) {
+                let wanted = |a: &v2xw_mobility::audit::AuditActor| {
+                    trace.as_ref().is_some_and(|l| l.contains(&a.actor.index()))
+                        || near.is_some_and(|(x, y, r)| {
+                            (a.pos.x - x).hypot(a.pos.y - y) <= r
+                        })
+                };
+                for a in actors.iter().filter(|a| wanted(a)) {
                     println!(
                         "t={ts:.1} actor={} lane={} prev={:?} s={:.2} lat={:.2} v={:.2} \
                          a={:.2} len={:.1} next={:?} chg={:?} pos=({:.2},{:.2}) h={:.1}°",

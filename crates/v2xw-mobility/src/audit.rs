@@ -350,6 +350,16 @@ pub struct AuditStats {
     pub max_standstill_s: f64,
     /// Vehicles that finished their trip.
     pub trips_completed: u64,
+    /// Mean speed over every vehicle-step, m/s.
+    pub mean_speed_mps: f64,
+    /// Share of vehicle-steps at a standstill (speed ≤ 0.1 m/s).
+    pub stopped_fraction: f64,
+    /// Sum of speeds, for the mean.
+    #[serde(skip)]
+    speed_sum: f64,
+    /// Vehicle-steps at a standstill, for the share.
+    #[serde(skip)]
+    stopped_steps: u64,
 }
 
 /// What an audit found.
@@ -468,6 +478,10 @@ impl TrafficAuditor {
             if self.seen.insert(a.actor) {
                 self.stats.vehicles += 1;
             }
+            self.stats.speed_sum += a.speed_mps;
+            if a.speed_mps <= 0.1 {
+                self.stats.stopped_steps += 1;
+            }
         }
 
         self.check_amber_onsets(world, t0);
@@ -501,6 +515,10 @@ impl TrafficAuditor {
         let mut stats = self.stats.clone();
         if !stats.min_gap_m.is_finite() {
             stats.min_gap_m = 0.0;
+        }
+        if stats.vehicle_steps > 0 {
+            stats.mean_speed_mps = stats.speed_sum / stats.vehicle_steps as f64;
+            stats.stopped_fraction = stats.stopped_steps as f64 / stats.vehicle_steps as f64;
         }
         AuditReport {
             counts,

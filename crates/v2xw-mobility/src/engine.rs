@@ -326,6 +326,11 @@ impl Actor {
                 dims: self.class.dims(),
             };
         }
+        // The lateral speed the smoothstep actually has now — zero at both ends — rather
+        // than its peak: publishing the peak for the whole change left a 19° heading
+        // offset standing at the last step, which vanished in one step when the change
+        // ended.
+        let lateral_rate = self.lateral_rate_at(t);
         let s_front = self.s_m.clamp(0.0, lane.length_m);
         let front = smooth_offset_point(lane, s_front, self.lateral_m);
         let s_rear = self.s_m - length;
@@ -415,6 +420,19 @@ impl Actor {
         out
     }
 
+    /// The lateral velocity the smoothstep transition has at `t`, m/s:
+    /// `Δ · 6p(1 − p) / T` with `p` the elapsed fraction.
+    fn lateral_rate_at(&self, t: SimTime) -> f64 {
+        self.transition.map_or(0.0, |tr| {
+            let dur = tr.duration.as_secs_f64();
+            if dur <= 0.0 {
+                return 0.0;
+            }
+            let p = (ns_to_secs(t.saturating_sub(tr.started)) / dur).clamp(0.0, 1.0);
+            (tr.to_offset_m - tr.from_offset_m) * 6.0 * p * (1.0 - p) / dur
+        })
+    }
+
     /// The lateral velocity the transition is producing, m/s.
     fn lateral_rate(&self) -> f64 {
         self.transition.map_or(0.0, |t| {
@@ -455,6 +473,9 @@ pub struct NativeMobility {
     published: BTreeMap<ActorId, Kinematics>,
     closed: BTreeSet<LaneId>,
     pending: Vec<MobilityCommand>,
+    /// Trips whose origin had no room when they arrived, with the instant they first
+    /// asked, oldest first (not in the legacy parity mode).
+    waiting: Vec<(TripRequest, SimTime, Option<ActorId>)>,
     weather: WeatherState,
     /// Every junction's conflict zones, built at `init` (not in the legacy parity mode).
     zones: ConflictZones,
@@ -546,6 +567,7 @@ impl NativeMobility {
             published: BTreeMap::new(),
             closed: BTreeSet::new(),
             pending: Vec::new(),
+            waiting: Vec::new(),
             weather: WeatherState::CLEAR,
             zones: ConflictZones::default(),
             turn_speed: BTreeMap::new(),
@@ -813,10 +835,31 @@ impl NativeMobility {
 
     /// Pass 2: routes a trip and puts it on the road, or drops it.
     fn insert_trip(&mut self, world: &World, trip: &TripRequest, now: SimTime) -> Option<ActorId> {
+        match self.try_insert(world, trip, now, None) {
+            Insertion::Placed(id) => Some(id),
+            Insertion::Occupied | Insertion::Unroutable => {
+                self.dropped_trips += 1;
+                None
+            }
+        }
+    }
+
+    /// Routes a trip and puts it on the road if its origin has room now, as actor
+    /// `reserved` if the trip already holds an id, else as the next one.
+    fn try_insert(
+        &mut self,
+        world: &World,
+        trip: &TripRequest,
+        now: SimTime,
+        reserved: Option<ActorId>,
+    ) -> Insertion {
         let costs = self.costs(world);
-        let route = self
+        let Some(route) = self
             .router
-            .replan(world, trip.origin, trip.destination, trip.t, &costs)?;
+            .replan(world, trip.origin, trip.destination, trip.t, &costs)
+        else {
+            return Insertion::Unroutable;
+        };
         // An occupied origin: drop the trip rather than overlap two vehicles.
         //
         // `s_m` is a front bumper, so `s_m - length` is a rear bumper. For a vehicle
@@ -829,6 +872,28 @@ impl NativeMobility {
         // however far away.
         let length = trip.class.spec().length_m;
         let front = trip.origin_s_m.max(length);
+        if self.along_path() {
+            // The body has to fit on the origin lane: inserted on a 1 m lane (Manhattan
+            // has them between close junctions) a 5 m car was placed straight across the
+            // next lanes, on top of whoever was there.
+            let Some(origin) = world.try_lane(trip.origin) else {
+                return Insertion::Unroutable;
+            };
+            if front > origin.length_m {
+                return Insertion::Unroutable;
+            }
+            // Nor may it land on a vehicle whose body still overhangs the origin lane from
+            // the lane after it.
+            for c in world.successors(trip.origin) {
+                let next = c.via.unwrap_or(c.to_lane);
+                for a in self.actors.values().filter(|a| a.lane == next) {
+                    let rear_on_origin = origin.length_m + a.s_m - a.class.spec().length_m;
+                    if rear_on_origin - front < self.params.insertion_gap_m {
+                        return Insertion::Occupied;
+                    }
+                }
+            }
+        }
         for a in self.actors.values() {
             if a.lane != trip.origin {
                 continue;
@@ -836,8 +901,7 @@ impl NativeMobility {
             let ahead = (a.s_m - a.class.spec().length_m) - front;
             let behind = (front - length) - a.s_m;
             if ahead.max(behind) < self.params.insertion_gap_m {
-                self.dropped_trips += 1;
-                return None;
+                return Insertion::Occupied;
             }
             // A vehicle behind the insertion point must be able to follow the newcomer
             // without an emergency stop: its standstill gap plus its time headway at its
@@ -847,8 +911,7 @@ impl NativeMobility {
             if self.along_path() && behind >= 0.0 {
                 let need = a.driver.min_gap_m + a.speed_mps * a.driver.time_headway_s;
                 if behind < need {
-                    self.dropped_trips += 1;
-                    return None;
+                    return Insertion::Occupied;
                 }
             }
         }
@@ -861,14 +924,16 @@ impl NativeMobility {
                     let gap = (up.length_m - a.s_m) + (front - length);
                     let need = a.driver.min_gap_m + a.speed_mps * a.driver.time_headway_s;
                     if gap < need {
-                        self.dropped_trips += 1;
-                        return None;
+                        return Insertion::Occupied;
                     }
                 }
             }
         }
-        let id = ActorId::new(self.next_actor);
-        self.next_actor += 1;
+        let id = reserved.unwrap_or_else(|| {
+            let id = ActorId::new(self.next_actor);
+            self.next_actor += 1;
+            id
+        });
         let driver = DriverProfile {
             desired_speed_mps: trip.desired_speed_mps,
             ..self.driver_for(trip.class)
@@ -900,7 +965,7 @@ impl NativeMobility {
             },
         );
         self.next_seq = self.next_seq.max(trip.seq + 1);
-        Some(id)
+        Insertion::Placed(id)
     }
 
     /// The [`ActorSpawn`] announcing an actor this engine has just inserted.
@@ -1155,6 +1220,7 @@ impl NativeMobility {
         junction: &JunctionView,
         ego: &VehicleView,
         claims: &BTreeMap<JunctionId, Vec<ConflictView>>,
+        t: SimTime,
     ) -> Vec<ConflictView> {
         let Some(all) = claims.get(&junction.id) else {
             return Vec::new();
@@ -1206,13 +1272,42 @@ impl NativeMobility {
                         (conflicts, conflicts && !ego_closer)
                     }
                 };
+                // A claimant held by a red is not coming. Counting it had a left turner on
+                // a permissive green wait for the cross street's car standing at *its* red
+                // — which in turn waited for the left turner — for good.
+                let held = self.along_path() && self.held_by_signal(world, junction.id, c, t);
                 ConflictView {
-                    conflicts,
-                    ego_must_yield,
+                    conflicts: conflicts && !held,
+                    ego_must_yield: ego_must_yield && !held,
                     ..*c
                 }
             })
             .collect()
+    }
+
+    /// True if the claimant's own movement is showing red (or red-amber) at `t`.
+    fn held_by_signal(
+        &self,
+        world: &World,
+        junction: JunctionId,
+        c: &ConflictView,
+        t: SimTime,
+    ) -> bool {
+        let Some(lane) = c.movement_lane else {
+            return false;
+        };
+        let Some(JunctionControl::Signalised { plan }) =
+            world.roads.try_junction(junction).map(|j| j.control)
+        else {
+            return false;
+        };
+        let Some(plan) = world.signal_plan(plan) else {
+            return false;
+        };
+        matches!(
+            self.signals.state_for(plan, lane, ns_to_secs(t)),
+            Some(SignalState::Red | SignalState::RedAmber)
+        )
     }
 
     /// The intersection decision for one actor.
@@ -1536,7 +1631,9 @@ impl NativeMobility {
         world: &World,
         snapshot: &ActorSnapshot,
         occupancy: &BTreeMap<LaneId, Vec<(ActorId, f64, f64)>>,
+        claims: &BTreeMap<JunctionId, Vec<ConflictView>>,
         actor: &Actor,
+        t: SimTime,
     ) -> Option<LeaderView> {
         let lane = world.lane(actor.lane);
         // The connector the actor is on or about to take, and its front's arc length
@@ -1557,6 +1654,37 @@ impl NativeMobility {
         let inside = pos >= 0.0;
         let len_m = world.lane(movement).length_m;
         let mut best: Option<LeaderView> = None;
+        // Vehicles still approaching on a movement that merges with ours are in the
+        // order too: two that entered a short merge in the same step — each judging the
+        // other not yet inside — could not sort themselves out in a 4 m connector.
+        let approaching: &[ConflictView] = world
+            .lane(movement)
+            .junction
+            .and_then(|j| claims.get(&j))
+            .map_or(&[], Vec::as_slice);
+        for z in self.zones.of(movement).iter().filter(|z| z.merge) {
+            let len_o = world.lane(z.other).length_m;
+            for c in approaching.iter().filter(|c| c.movement_lane == Some(z.other)) {
+                if c.actor == actor.id {
+                    continue;
+                }
+                // One held at a red is not merging yet.
+                if let Some(j) = world.lane(movement).junction
+                    && self.held_by_signal(world, j, c, t)
+                {
+                    continue;
+                }
+                let Some(view) = snapshot.view(c.actor) else {
+                    continue;
+                };
+                let d_self = len_m - pos;
+                let d_other = len_o + c.stop_line_gap_m;
+                if d_other < d_self || (d_other == d_self && c.actor < actor.id) {
+                    let gap = d_self - d_other - view.dims.length_m;
+                    best = Self::closest(best, Some(LeaderView::of(*view, gap.max(0.0))));
+                }
+            }
+        }
         for z in self.zones.of(movement) {
             let Some(list) = occupancy.get(&z.other) else {
                 continue;
@@ -1635,6 +1763,24 @@ impl NativeMobility {
     }
 }
 
+/// What happened to a trip offered for insertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Insertion {
+    /// On the road, as this actor.
+    Placed(ActorId),
+    /// Its origin has no room for it now.
+    Occupied,
+    /// No route, or an origin it cannot stand on at all.
+    Unroutable,
+}
+
+/// How long a trip may wait for room at its origin before it is dropped: 120 s.
+///
+/// **This crate's choice.** SUMO's `--max-depart-delay` defaults to unlimited; a bound
+/// keeps a gridlocked origin from accumulating demand without end, and two minutes is
+/// longer than any signal cycle a queue could be waiting on.
+const MAX_DEPART_DELAY: Duration = Duration::from_secs(120);
+
 /// One actor's buffered decision, the output of pass 6.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Decision {
@@ -1711,9 +1857,38 @@ impl Mobility for NativeMobility {
             let trips = demand.spawns_in(ctx, t0, t1);
             self.demand = Some(demand);
             let world = ctx.world();
-            for trip in trips {
-                if let Some(id) = self.insert_trip(world, &trip, t0) {
-                    spawned.push(self.actor_spawn(world, id, t0));
+            if self.along_path() {
+                // Trips whose origin has no room *now* wait for it, oldest first, as
+                // SUMO's insertion queue does (`--max-depart-delay`), rather than being
+                // lost: the safe-insertion gap the follower needs refuses more trips than
+                // the old 2 m test did, and a refusal must delay demand, not delete it.
+                // One that has waited `MAX_DEPART_DELAY` is dropped and counted.
+                //
+                // A trip that has to wait reserves its actor id at once, so ids stay in
+                // demand-stream order (invariant I-M2) however long it waits.
+                let mut queue = core::mem::take(&mut self.waiting);
+                queue.extend(trips.into_iter().map(|trip| (trip, t0, None)));
+                for (trip, since, reserved) in queue {
+                    match self.try_insert(world, &trip, t0, reserved) {
+                        Insertion::Placed(id) => spawned.push(self.actor_spawn(world, id, t0)),
+                        Insertion::Occupied
+                            if t0.saturating_sub(since) < MAX_DEPART_DELAY.as_nanos() =>
+                        {
+                            let id = reserved.unwrap_or_else(|| {
+                                let id = ActorId::new(self.next_actor);
+                                self.next_actor += 1;
+                                id
+                            });
+                            self.waiting.push((trip, since, Some(id)));
+                        }
+                        Insertion::Occupied | Insertion::Unroutable => self.dropped_trips += 1,
+                    }
+                }
+            } else {
+                for trip in trips {
+                    if let Some(id) = self.insert_trip(world, &trip, t0) {
+                        spawned.push(self.actor_spawn(world, id, t0));
+                    }
                 }
             }
         }
@@ -1765,8 +1940,11 @@ impl Mobility for NativeMobility {
             let mut leader = nbrs.leader;
             // The junction ahead becomes a virtual leader when it says stop or slow.
             let mut amber_commit: Option<JunctionId> = None;
+            // The stop line behind the binding virtual obstacle, when a junction's "stop"
+            // is what binds: how much room there is up to the line itself.
+            let mut binding_stop_line: Option<f64> = None;
             for junction in self.junctions_ahead(world, actor, t0) {
-                let conflicts = self.conflicts_for(world, &junction, &ego, &claims);
+                let conflicts = self.conflicts_for(world, &junction, &ego, &claims, t0);
                 let mut decision = self.entry_decision(world, &ego, &junction, &conflicts);
                 // A vehicle that chose to go on amber — it was inside the distance it could
                 // stop in — is committed: it does not change its mind a step later because
@@ -1797,6 +1975,28 @@ impl Mobility for NativeMobility {
                         gap_m: (junction.stop_line_gap_m - STOP_LINE_OFFSET_M).max(0.0),
                     };
                 }
+                // Committed: a give-way decision that turns to "stop" when the vehicle is
+                // already too close to stop without an emergency brake is not taken. A
+                // left turner on a permissive green was 2 m from the line at 6.8 m/s when
+                // an opposing car came inside the critical gap; it braked at −6 m/s²,
+                // could not stop, and rolled in anyway. It now clears the junction, and
+                // the traffic it crosses holds for a vehicle already within it (the entry
+                // rule of `junction_blocked`) and, inside, `junction_leader` settles the
+                // crossing. Signals keep their own rules: red has no commitment, and amber
+                // has its own (above).
+                if along
+                    && let EntryDecision::Stop { gap_m } = decision
+                    && !matches!(
+                        junction.signal,
+                        Some(SignalState::Red | SignalState::RedAmber | SignalState::Amber)
+                    )
+                    && ego.speed_mps > 0.0
+                    && ego.speed_mps * ego.speed_mps
+                        / (2.0 * (gap_m - actor.driver.min_gap_m).max(0.1))
+                        > PLANNED_STOP_MAX_DECEL_MPS2
+                {
+                    decision = EntryDecision::Proceed;
+                }
                 let virtual_leader = decision.as_leader().map(|mut l| {
                     // The stop line is `STOP_LINE_OFFSET_M` before the junction, and the
                     // decision already accounts for it; nothing more to do but keep the
@@ -1804,7 +2004,11 @@ impl Mobility for NativeMobility {
                     l.gap_m = l.gap_m.max(0.0);
                     l
                 });
+                let before = leader;
                 leader = Self::closest(leader, virtual_leader);
+                if leader != before {
+                    binding_stop_line = Some(junction.stop_line_gap_m);
+                }
             }
             // While a lane change is under way the body is still partly in the lane being
             // left, so the vehicle ahead *there* is followed too. Following only the
@@ -1821,22 +2025,31 @@ impl Mobility for NativeMobility {
                     s_m: actor.s_m + tr.from_s_delta,
                     ..ego
                 };
+                let before = leader;
                 leader = Self::closest(
                     leader,
                     snapshot.leader_on_route(world, &in_from, &[tr.from], 0, options),
                 );
+                if leader != before {
+                    binding_stop_line = None;
+                }
             }
             // Other vehicles inside the junction: follow one merging ahead onto the same
             // exit, and give way at a crossing to one that reaches it first.
             if along && self.params.junction_clearance {
+                let before = leader;
                 leader = Self::closest(
                     leader,
-                    self.junction_leader(world, &snapshot, &occupancy, actor),
+                    self.junction_leader(world, &snapshot, &occupancy, &claims, actor, t0),
                 );
+                if leader != before {
+                    binding_stop_line = None;
+                }
             }
             // An external stop command is a virtual leader at zero gap.
             if actor.stopped_until.is_some_and(|until| t0 < until) {
                 leader = Self::closest(leader, Some(LeaderView::virtual_obstacle(0.0, 0.0)));
+                binding_stop_line = None;
             }
             let v0 = match actor.speed_cap_mps {
                 Some(cap) => actor.driver.desired_speed_mps.min(cap),
@@ -1864,7 +2077,15 @@ impl Mobility for NativeMobility {
                 && !l.is_vehicle()
                 && l.speed_mps == 0.0
             {
-                accel = static_obstacle_accel(accel, ego.speed_mps, l.gap_m, actor.driver.min_gap_m);
+                // Up to half a metre short of the line itself, never past it.
+                let slack = binding_stop_line.map_or(0.0, |line| (line - l.gap_m - 0.5).max(0.0));
+                accel = static_obstacle_accel(
+                    accel,
+                    ego.speed_mps,
+                    l.gap_m,
+                    actor.driver.min_gap_m,
+                    slack,
+                );
                 // A planned stop is braked into, not stamped on: the deceleration builds
                 // at no more than `PLANNED_BRAKE_JERK_MPS3` while the stop needs no more
                 // than a firm service brake. Harder than that is an emergency and is not
@@ -2260,13 +2481,34 @@ fn turn_speeds(world: &World, a_lat_mps2: f64) -> BTreeMap<LaneId, f64> {
 /// is neither what a driver does nor smooth. A driver who has decided to stop brakes just
 /// hard enough to stop at the line; that is what this returns. It never brakes *less*
 /// than stopping needs, so it cannot carry a vehicle over the line.
-pub fn static_obstacle_accel(a_model: f64, speed_mps: f64, gap_m: f64, s0_m: f64) -> f64 {
-    let room = gap_m - s0_m;
-    if room <= 0.05 || speed_mps <= 0.0 {
+///
+/// `slack_m` is how far past the obstacle the vehicle may still stop without crossing
+/// anything: for a stop line's virtual obstacle, the stop-line offset. When stopping
+/// `s0` short of the obstacle would take more than a planned stop's deceleration
+/// ([`PLANNED_STOP_MAX_DECEL_MPS2`]), the driver uses the room up to the line itself —
+/// the amber rule decided "stop" by the distance to the *line* (ITE), so the stop it
+/// decided on is one the vehicle can make there.
+pub fn static_obstacle_accel(
+    a_model: f64,
+    speed_mps: f64,
+    gap_m: f64,
+    s0_m: f64,
+    slack_m: f64,
+) -> f64 {
+    if speed_mps <= 0.0 {
         return a_model;
     }
-    let needed = -(speed_mps * speed_mps) / (2.0 * room);
-    a_model.max(needed)
+    let need = |room: f64| -(speed_mps * speed_mps) / (2.0 * room);
+    let room = gap_m - s0_m;
+    if room > 0.05 && -need(room) <= PLANNED_STOP_MAX_DECEL_MPS2 {
+        return a_model.max(need(room));
+    }
+    let to_line = gap_m + slack_m;
+    if to_line <= 0.05 {
+        return a_model;
+    }
+    let tight = if room > 0.05 { need(room) } else { f64::NEG_INFINITY };
+    a_model.max(tight.max(need(to_line)))
 }
 
 /// The model card.
