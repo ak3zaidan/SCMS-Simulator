@@ -23,6 +23,8 @@ import type {
   RunState,
 } from "@vwp/protocol";
 import type { CameraMode } from "@vwp/viewer";
+import type { ClientProvenance } from "../lib/provenance.js";
+import type { EngineFlavour, EngineProbe } from "../lib/target.js";
 import type { ThemeName } from "../lib/theme.js";
 
 /** §3.1.3 — one row of the `Hello` node table. */
@@ -186,11 +188,109 @@ export interface WhySubject {
   readonly provId?: number;
   readonly value?: string;
   readonly unit?: string;
+  /**
+   * Set when the value was computed in the browser rather than by the engine (frame rate, overlay
+   * geometry, a side-by-side difference). `WhyTab` renders this instead of pretending a model card
+   * exists, and does not offer `explain` — the engine has never seen the number.
+   */
+  readonly client?: ClientProvenance;
+}
+
+/** Which engine the Studio resolved, and how (`lib/target.ts`). */
+export interface EngineTargetView {
+  /** `""` is the page's own origin, which the Vite proxy and the deployed build both serve. */
+  readonly baseUrl: string;
+  readonly flavour: EngineFlavour;
+  /** The `/healthz` banner, or the reason the probe failed. */
+  readonly engine: string;
+  readonly reachable: boolean;
+  /** True when the user named this target explicitly (`?engine=`), which skips the preference. */
+  readonly pinned: boolean;
+  /** Every candidate that was probed, in order. */
+  readonly tried: readonly EngineProbe[];
+  /** True when the world payload cannot be fetched cross-origin (§1.1 sets CORP `same-origin`). */
+  readonly worldBlocked: boolean;
+}
+
+/**
+ * A recording open in this page with no engine behind it (09-ui §7).
+ *
+ * Separate from {@link RunInfo} because it is not a run: there is nothing to resume, nothing to
+ * step and no `run_id` — only a span and a seek. The time controls read this to decide whether a
+ * scrub is a `run.seek` (§6.6) or a WebAssembly seek (§7.3).
+ */
+export interface ReplayView {
+  readonly label: string;
+  readonly startNs: number;
+  readonly endNs: number;
+  /** Simulated time the pose buffer is resolved to. */
+  readonly tNs: number;
+  /** Container chunks the last seek read, and range requests so far — §7.4's seek budget. */
+  readonly chunksRead: number;
+  readonly requests: number;
+  /** True when the geometry on screen came from a `.vwb` file rather than from a verified `Hello`. */
+  readonly worldUnverified: boolean;
+}
+
+/** What comparison side B is, and where it is (09-ui §6). */
+export interface CompareSideView {
+  /** `"engine"` — a second VWP connection; `"replay"` — a local recording read by WebAssembly. */
+  readonly source: "engine" | "replay";
+  readonly label: string;
+  readonly state: "idle" | "opening" | "ready" | "failed";
+  readonly detail: string;
+  /** Simulated time side B is resolved to. */
+  readonly tNs: number;
+  /** The span side B can be scrubbed over. */
+  readonly startNs: number;
+  readonly endNs: number;
+  /** Actors resolved at `tNs`. */
+  readonly actors: number;
+  /** Whether B has metric samples to difference against A. */
+  readonly hasMetrics: boolean;
+}
+
+/** One row of the metric difference view. */
+export interface MetricDiff {
+  readonly metric: string;
+  readonly a: number | null;
+  readonly b: number | null;
+  /** `b − a`, or `null` when either side has no value at this time. */
+  readonly delta: number | null;
+  /** `delta / |a|`, or `null` when `a` is zero or missing. */
+  readonly relative: number | null;
+  readonly unit: string;
+  /** True when only one side reports the metric at all — a shape difference, not a value one. */
+  readonly oneSided: boolean;
+}
+
+/** How the two sides are tied together. */
+export interface CompareSync {
+  /** Scrub both sides on one simulated clock. */
+  readonly time: boolean;
+  /** Mirror side A's camera onto side B. */
+  readonly camera: boolean;
+  /**
+   * B's simulated time minus A's, in nanoseconds.
+   *
+   * Two runs of the same scenario share `t0` and the offset is 0. Two runs that do not — a
+   * recording of a different campaign — are aligned by hand, and the offset is what makes "the
+   * same simulated time" mean something.
+   */
+  readonly offsetNs: number;
 }
 
 const EMPTY_RUN: RunInfo = {
   state: "idle", tNs: 0, tEndNs: 0, speed: 1, actors: 0, nodes: 0, runId: "", profile: "full", live: true,
 };
+
+/** Before the first probe: the page's own origin, unresolved. */
+const UNRESOLVED_TARGET: EngineTargetView = {
+  baseUrl: "", flavour: "unknown", engine: "not probed yet", reachable: false, pinned: false, tried: [],
+  worldBlocked: false,
+};
+
+const DEFAULT_SYNC: CompareSync = { time: true, camera: true, offsetNs: 0 };
 
 interface StudioState {
   connection: VwpConnectionState;
@@ -228,6 +328,13 @@ interface StudioState {
   inspectorTab: "state" | "why" | "log";
   hudDocked: boolean;
   seriesTick: number;
+  target: EngineTargetView;
+  replay: ReplayView | null;
+  compare: CompareSideView | null;
+  compareSync: CompareSync;
+  compareDiffs: readonly MetricDiff[];
+  /** Metrics the difference view shows; empty means "every metric both sides report". */
+  compareMetrics: readonly string[];
 
   setConnection: (s: VwpConnectionState) => void;
   setHello: (h: HelloSummary) => void;
@@ -265,6 +372,17 @@ interface StudioState {
   setInspectorTab: (t: "state" | "why" | "log") => void;
   setHudDocked: (v: boolean) => void;
   bumpSeries: () => void;
+  setTarget: (t: EngineTargetView) => void;
+  /** Publish (or clear) the local recording's state; `null` means no recording is open. */
+  setReplay: (r: ReplayView | null) => void;
+  /**
+   * Publish side B's summary. Driven by the compare controller's own tick, so it keeps the previous
+   * object when nothing moved — the same rule the 5 Hz setters follow.
+   */
+  setCompare: (c: CompareSideView | null) => void;
+  setCompareSync: (patch: Partial<CompareSync>) => void;
+  setCompareDiffs: (d: readonly MetricDiff[]) => void;
+  setCompareMetrics: (names: readonly string[]) => void;
 }
 
 const MAX_LOGS = 300;
@@ -291,6 +409,38 @@ function sameStats(a: StatsView | null, b: StatsView): boolean {
 function sameFrames(a: FrameCounts, b: FrameCounts): boolean {
   return a.keyframe === b.keyframe && a.delta === b.delta && a.telemetry === b.telemetry &&
     a.event === b.event && a.metric === b.metric;
+}
+
+/**
+ * Whether two comparison summaries carry the same content.
+ *
+ * `CompareController` republishes on its own tick whether or not side B moved, for the same reason
+ * `flushProjection` does, so the same "return the previous state" rule applies: a paused
+ * side-by-side must not re-render both viewport chips five times a second.
+ */
+function sameCompare(a: CompareSideView | null, b: CompareSideView | null): boolean {
+  if (a === null || b === null) return a === b;
+  return (
+    a.source === b.source && a.label === b.label && a.state === b.state && a.detail === b.detail &&
+    a.tNs === b.tNs && a.startNs === b.startNs && a.endNs === b.endNs && a.actors === b.actors &&
+    a.hasMetrics === b.hasMetrics
+  );
+}
+
+/** Whether two difference tables carry the same rows, in the same order. */
+function sameDiffs(a: readonly MetricDiff[], b: readonly MetricDiff[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (
+      x.metric !== y.metric || x.a !== y.a || x.b !== y.b || x.delta !== y.delta ||
+      x.relative !== y.relative || x.unit !== y.unit || x.oneSided !== y.oneSided
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** Whether `run` would be unchanged by `patch` — `run.status` is polled every 2 s (§6.6). */
@@ -337,6 +487,12 @@ export const useStudio = create<StudioState>((set) => ({
   inspectorTab: "state",
   hudDocked: false,
   seriesTick: 0,
+  target: UNRESOLVED_TARGET,
+  replay: null,
+  compare: null,
+  compareSync: DEFAULT_SYNC,
+  compareDiffs: [],
+  compareMetrics: [],
 
   setConnection: (s) => set({ connection: s }),
   setHello: (h) => set({ hello: h, timeline: [] }),
@@ -384,4 +540,10 @@ export const useStudio = create<StudioState>((set) => ({
   setInspectorTab: (t) => set({ inspectorTab: t }),
   setHudDocked: (v) => set({ hudDocked: v }),
   bumpSeries: () => set((state) => ({ seriesTick: state.seriesTick + 1 })),
+  setTarget: (t) => set({ target: t }),
+  setReplay: (r) => set({ replay: r }),
+  setCompare: (c) => set((state) => (sameCompare(state.compare, c) ? state : { compare: c })),
+  setCompareSync: (patch) => set((state) => ({ compareSync: { ...state.compareSync, ...patch } })),
+  setCompareDiffs: (d) => set((state) => (sameDiffs(state.compareDiffs, d) ? state : { compareDiffs: d })),
+  setCompareMetrics: (names) => set({ compareMetrics: names }),
 }));

@@ -590,10 +590,13 @@ pub fn build_dcc(scenario: &Scenario) -> Option<v2xw_radio::SaeJ2945Dcc> {
 ///
 /// An [`ObuRuntime`] on an RSU hardware profile with **no message services**: 06-node-
 /// models.md §3 describes an RSU as "the same queue/server structure as the OBU with a
-/// larger profile" plus roles and failure states, and the roles and failure states are
-/// what does not ship. A unit that generated CAMs or BSMs would be a vehicle with a mast,
-/// so the service set is empty and what it puts on the air is what the engine's Phase 2
-/// path hands it.
+/// larger profile" plus roles and failure states. A unit that generated CAMs or BSMs would
+/// be a vehicle with a mast, so the service set is empty and what it puts on the air is
+/// what the engine's Phase 2 path hands it.
+///
+/// The roles and failure states now ship, as [`v2xw_node::RsuRuntime`]; this function has
+/// not been moved onto it. See `crate::phase2`'s "What is not here" for what that move
+/// costs and why it is owed rather than missing.
 pub fn build_rsu(
     scenario: &Scenario,
     env: NodeEnv,

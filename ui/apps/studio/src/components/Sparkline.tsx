@@ -19,16 +19,23 @@ export function Sparkline({
   label,
   unit,
   tick,
+  fieldKey,
+  node,
 }: {
   seriesIndex: number;
   label: string;
   unit: string;
   tick: number;
+  /** The §3.5.2 wire field this series is sampled from — the `ValueRef.id` `explain` takes. */
+  fieldKey?: string;
+  /** The followed node, so the provenance question is about a node and not about "a vehicle". */
+  node?: number | null;
 }): React.JSX.Element {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const plotRef = useRef<uPlot | null>(null);
   const valueRef = useRef<HTMLElement | null>(null);
   const theme = useStudio((s) => s.theme);
+  const setWhy = useStudio((s) => s.setWhy);
 
   useLayoutEffect(() => {
     const host = hostRef.current;
@@ -81,7 +88,29 @@ export function Sparkline({
   return (
     <div className="spark">
       <div className="label">
-        <span title={unit}>{label}</span>
+        {/*
+          The sparkline is the same §3.5.2 field the HUD shows, plotted over the retained window, so
+          it resolves to the same provenance — and it has to be reachable here too, because this row
+          is where the shape of the value is read rather than its latest number (09-ui §5, §10).
+        */}
+        <button
+          type="button"
+          className="linklike"
+          title={`${unit} — explain`}
+          data-testid={`spark-why-${seriesIndex}`}
+          aria-label={`${label} in ${unit} — explain`}
+          onClick={() =>
+            setWhy({
+              kind: "node_field",
+              id: fieldKey ?? label,
+              label,
+              ...(node === null || node === undefined ? {} : { node }),
+              unit,
+            })
+          }
+        >
+          {label}
+        </button>
         <b ref={valueRef} data-testid={`spark-value-${seriesIndex}`}>
           —
         </b>

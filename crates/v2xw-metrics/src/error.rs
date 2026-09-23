@@ -90,6 +90,20 @@ pub enum MetricError {
         detail: String,
     },
 
+    /// The model-card completeness gate failed (10-roadmap.md Phase 6).
+    ///
+    /// The message names every uncalibrated `high`-tier default that no tracked
+    /// calibration issue covers, one per line, because "the gate failed" is not a work
+    /// list and "`obu/cohda-mk5::hsm.ops.ecdsa-p256-sign.latency_us` has no issue" is.
+    /// The structured form is [`crate::gate::GateReport`], which the caller still holds.
+    #[error("{count} model-card completeness failure(s):\n{detail}")]
+    GateFailed {
+        /// How many failures there were, malformed register patterns included.
+        count: usize,
+        /// The failures, one per line.
+        detail: String,
+    },
+
     /// Arrow schema or array construction failed.
     #[error("arrow: {0}")]
     Arrow(#[from] arrow::error::ArrowError),

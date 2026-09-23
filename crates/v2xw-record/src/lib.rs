@@ -31,6 +31,7 @@
 //! | Replay, `verify` and `seek` | [`reader`] | vwp-v1 §7.2, §7.3 |
 //! | Parquet, Arrow IPC and JSONL exporters | [`export`] | 08-measurement §5 |
 //! | Dataset profiles, datasheet and leakage linter | [`dataset`] | 08-measurement §5, §6 |
+//! | Which byte counts are real bytes and which are a size model | [`dataset::bytes`] | 08-measurement §6, 04-models §8.4 |
 //! | A deterministic synthetic run to record | [`fixture`] | — |
 //!
 //! # Two encodings, and why they are not unified
@@ -113,8 +114,9 @@ pub mod writer;
 
 pub use channels::{CHANNELS, ChannelSpec};
 pub use dataset::{
-    DatasetAssembler, DatasetManifest, DatasetProfile, DatasetWriter, LeakageReport, LogProfile,
-    MaDataset, RunProvenance, WrittenDataset,
+    ByteProvenance, ByteProvenanceReport, DatasetAssembler, DatasetManifest, DatasetProfile,
+    DatasetWriter, LeakageReport, LogProfile, MaDataset, MessageBytes, ModelProvenance,
+    RunProvenance, TxTally, WrittenDataset,
 };
 pub use encoder::{
     ActorPose, Cadence, SignalState, SlotAllocator, Snapshot, SnapshotEncoder, SnapshotFrame,

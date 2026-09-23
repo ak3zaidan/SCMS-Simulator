@@ -23,6 +23,9 @@ cards := "docs/site/generated/cards.json"
 # and reports where the two disagree; a missing file is reported rather than skipped, so
 # every recipe below works without it.
 runs := "docs/site/generated/validation-runs.json"
+# The calibration-issue register the Phase 6 model-card completeness gate reads. See
+# docs/calibration/README.md; `issues: []` today, which is why the gate is red.
+issues := "docs/calibration/issues.json"
 
 # Show the available recipes.
 default:
@@ -43,7 +46,16 @@ check:
 # under a second.
 [doc("Regenerate the model-card dump from the engine's registry")]
 cards:
-    cargo run --release --manifest-path docs/site/tools/cardgen/Cargo.toml -- --out {{ cards }}
+    cargo run --release --manifest-path docs/site/tools/cardgen/Cargo.toml -- --out {{ cards }} --issues {{ issues }}
+
+# The Phase 6 model-card completeness gate, as a command that fails.
+#
+# Same exporter, same registry, `--gate` added: the dump is still written, and the exit
+# status is non-zero when an uncalibrated high-tier default has no tracked calibration
+# issue. This is the recipe a release check runs, and it is red today on purpose.
+[doc("Run the model-card completeness gate and fail if it does not pass")]
+gate:
+    cargo run --release --manifest-path docs/site/tools/cardgen/Cargo.toml -- --out {{ cards }} --issues {{ issues }} --gate
 
 [doc("Regenerate the cards, then the site")]
 all: cards build

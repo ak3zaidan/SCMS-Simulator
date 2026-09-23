@@ -8,19 +8,38 @@
  * metric, resolving its `prov_id` through the `Provenance` frames (§3.8).
  */
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import uPlot from "uplot";
 
 import { engine } from "../state/engine.js";
 import { useStudio } from "../state/store.js";
+import { metricSubject } from "../lib/provenance.js";
 
 const PLOT_W = 250;
 const PLOT_H = 86;
 
-function MetricPlot({ name, tick }: { name: string; tick: number }): React.JSX.Element {
+/** One catalogue row of `metrics.query` with no `metrics` argument (§6.12). */
+interface MetricDefinition {
+  readonly name: string;
+  readonly unit: string;
+  readonly visibility: string;
+  readonly definition_md?: string;
+}
+
+function MetricPlot({
+  name,
+  tick,
+  definition,
+}: {
+  name: string;
+  tick: number;
+  definition: MetricDefinition | undefined;
+}): React.JSX.Element {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const plotRef = useRef<uPlot | null>(null);
   const setWhy = useStudio((s) => s.setWhy);
+  const provenance = useStudio((s) => s.metricProvenance);
+  const dims = useStudio((s) => s.metricDims);
   const theme = useStudio((s) => s.theme);
   const [latest, setLatest] = useState<number | null>(null);
 
@@ -61,19 +80,62 @@ function MetricPlot({ name, tick }: { name: string; tick: number }): React.JSX.E
     setLatest(engine.metrics.latest(name));
   }, [tick, name]);
 
+  /**
+   * The subject both the title and the value open.
+   *
+   * Built in one place so the two controls cannot disagree, and carrying the `prov_id` the metric's
+   * own samples reported (§3.7) plus the unit from the catalogue — which is what turns the "why" tab
+   * from a round trip into a local resolve (§3.8).
+   */
+  const subject = metricSubject(name, latest, definition?.unit, provenance[name]);
+  const groundTruth = definition?.visibility === "GT";
+
   return (
     <div className="plot-card">
       <div className="title">
         <button
           type="button"
           className="linklike"
-          title="Explain this metric (§6.9)"
+          title="Explain this metric (§3.8, §6.9)"
           data-testid={`plot-title-${name}`}
-          onClick={() => setWhy({ kind: "metric", id: name, label: name, value: latest === null ? undefined : String(latest) })}
+          aria-label={`${name}${definition?.unit ? ` in ${definition.unit}` : ""} — explain`}
+          onClick={() => setWhy(subject)}
         >
           {name}
         </button>
-        <span className="mono">{latest === null ? "—" : latest.toFixed(3)}</span>
+        {groundTruth ? <span className="gt-tag">GT</span> : null}
+        {/*
+          The value is its own control. The title was already explainable, but the number beside it
+          is the thing a reader quotes, and a number that cannot say where it came from is the rule
+          this project puts first.
+        */}
+        <button
+          type="button"
+          className="linklike mono"
+          data-testid={`plot-value-${name}`}
+          aria-label={`${name} latest value ${latest === null ? "none" : String(latest)} — explain`}
+          onClick={() => setWhy(subject)}
+        >
+          {latest === null ? "—" : latest.toFixed(3)}
+        </button>
+      </div>
+      {/*
+        The axes carry units, and the unit is part of the provenance: a `pdr` on a 0–1 scale and a
+        `pdr` in per cent are different numbers. The catalogue's unit is shown when the engine
+        published one, and its absence is shown as an absence.
+      */}
+      <div className="axis-note">
+        <span className="faint">t (s)</span>
+        <button
+          type="button"
+          className="linklike faint"
+          data-testid={`plot-unit-${name}`}
+          aria-label={`Unit of ${name}: ${definition?.unit ?? "not published by this engine"} — explain`}
+          onClick={() => setWhy(subject)}
+        >
+          {definition?.unit ?? "unit not published"}
+        </button>
+        {dims[name] ? <span className="faint" title="§3.8 dimension dictionary">{dims[name]}</span> : null}
       </div>
       <div ref={hostRef} data-testid={`plot-${name}`} />
     </div>
@@ -82,9 +144,10 @@ function MetricPlot({ name, tick }: { name: string; tick: number }): React.JSX.E
 
 export function PlotsStrip(): React.JSX.Element {
   const tick = useStudio((s) => s.seriesTick);
+  const connection = useStudio((s) => s.connection);
   const [selected, setSelected] = useState<string[]>([]);
   const [available, setAvailable] = useState<readonly string[]>([]);
-  const [catalogue, setCatalogue] = useState<{ name: string; unit: string; visibility: string; definition_md?: string }[]>([]);
+  const [catalogue, setCatalogue] = useState<MetricDefinition[]>([]);
   const [open, setOpen] = useState(false);
   const seenVersion = useRef(-1);
 
@@ -100,9 +163,7 @@ export function PlotsStrip(): React.JSX.Element {
     if (selected.length === 0 && names.length > 0) setSelected(names.slice(0, 5));
   }, [tick, selected.length]);
 
-  const loadCatalogue = useCallback(async () => {
-    setOpen((v) => !v);
-    if (catalogue.length > 0) return;
+  const fetchCatalogue = useCallback(async () => {
     try {
       const res = await engine.request("metrics.query", {});
       setCatalogue(
@@ -116,7 +177,25 @@ export function PlotsStrip(): React.JSX.Element {
     } catch {
       setCatalogue([]);
     }
-  }, [catalogue.length]);
+  }, []);
+
+  /**
+   * Fetch the catalogue as soon as the stream is up, not when the user opens the `+` menu.
+   *
+   * The units and the `GT` tags come from it, and those belong on the axes from the first frame: a
+   * plot whose unit appears only after someone opens a menu is a plot that was unlabelled while it
+   * was being read. One call per connection (§6.12 `metrics.query` with no `metrics` argument).
+   */
+  useEffect(() => {
+    if (connection !== "streaming") return;
+    void fetchCatalogue();
+  }, [connection, fetchCatalogue]);
+
+  const byName = useMemo(() => {
+    const map = new Map<string, MetricDefinition>();
+    for (const row of catalogue) map.set(row.name, row);
+    return map;
+  }, [catalogue]);
 
   return (
     <section className="plots" data-testid="plots-strip">
@@ -132,7 +211,14 @@ export function PlotsStrip(): React.JSX.Element {
             {name}
           </button>
         ))}
-        <button type="button" onClick={() => void loadCatalogue()} data-testid="metric-catalogue">
+        <button
+          type="button"
+          onClick={() => {
+            setOpen((v) => !v);
+            if (catalogue.length === 0) void fetchCatalogue();
+          }}
+          data-testid="metric-catalogue"
+        >
           +
         </button>
         {open ? (
@@ -151,7 +237,7 @@ export function PlotsStrip(): React.JSX.Element {
           </p>
         ) : null}
         {selected.map((name) => (
-          <MetricPlot key={name} name={name} tick={tick} />
+          <MetricPlot key={name} name={name} tick={tick} definition={byName.get(name)} />
         ))}
       </div>
     </section>

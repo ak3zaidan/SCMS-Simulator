@@ -7,6 +7,7 @@ nothing about a model can drift.
 
 ```sh
 just --justfile docs/site/justfile cards    # export the model cards (compiles Rust)
+just --justfile docs/site/justfile gate     # run the completeness gate and fail on it
 just --justfile docs/site/justfile build    # generate the site into docs/site/build/
 just --justfile docs/site/justfile serve    # http://localhost:8000
 ```
@@ -32,12 +33,14 @@ repository root. This directory does not edit the root justfile itself.
 | `v2xwdoc/md.py` | a Markdown subset and the `{% include %}` directive |
 | `v2xwdoc/render.py` | the page shell, navigation and table helpers |
 | `v2xwdoc/cards.py` | model reference, calibration debt and validation pages, from the card dump |
-| `v2xwdoc/campaign.py` | the validation campaign report: the registry joined against the run output and the defect registers |
+| `v2xwdoc/campaign.py` | the validation campaign report: the registry joined against the run output and the defect registers, plus the verdict sentences harvested out of those registers |
+| `v2xwdoc/gate.py` | the model-card completeness gate page: it renders the gate's verdict out of the card dump and computes nothing |
 | `v2xwdoc/scenario.py` | the scenario schema reference, extracted from `schema.rs` |
 | `v2xwdoc/findings.py` | the defect register, parsed from `docs/design/findings/` |
 | `v2xwdoc/site.py` | which pages exist and what each is built from |
 | `content/*.md` | the hand-written prose: overview, architecture, methodology, the plug-in tutorial, glossary, the honesty-page leads |
 | `validation-runs.template.json` | the validation campaign's input schema, with every case `not-run` because nothing has measured them |
+| `content/release.md` | the release-readiness page: a lead plus `docs/RELEASE-CHECKLIST.md` included verbatim |
 | `assets/site.css` | one stylesheet; the site loads no script and no web font |
 | `tools/cardgen/` | the Rust exporter that dumps the engine's registry to JSON |
 | `build/`, `generated/` | outputs, git-ignored |
@@ -61,6 +64,25 @@ claims and not measurements, and `--strict` fails. `--strict` **also** fails whe
 claims `literature-checked` or `field-checked` while no validation case names the model,
 or while a case naming it failed — 04-models.md §13's rule that a failing case blocks its
 models from being labelled checked, enforced rather than stated.
+
+## The completeness gate
+
+`gate.html` is the Phase 6 release gate of `docs/design/10-roadmap.md`: *no
+`todo-calibrate` on a `high`-tier default without a calibration issue*. The gate is
+implemented **once**, in Rust, over the registry the engine actually builds
+(`crates/v2xw-metrics/src/gate.rs`); `tools/cardgen` runs it, writes the verdict into the
+card dump under `gate`, and with `--gate` exits non-zero when it fails.
+
+`v2xwdoc/gate.py` renders that verdict and derives nothing from the cards itself. Two
+implementations of one rule drift, and the one that drifts is always the one in the
+documentation, because nothing fails when it is wrong. A dump with no `gate` object
+therefore makes the page say the dump is too old — not "the gate passes" and not "the gate
+fails", because this build does not know.
+
+The gate's register is `docs/calibration/issues.json`, documented in
+`docs/calibration/README.md`. It is empty today, so the page is red and `--strict` fails on
+it, which is the intended behaviour: a release gate that appears only on a page nobody
+fails on is a preference.
 
 ## The card dump
 
@@ -104,7 +126,14 @@ actually builds.
   table is the list of models whose card and whose measurements say different things. A
   page that only reported the cards would be true on the day it was written.
 - **Includes, not copies.** A page quotes a design document by section, spliced in at
-  build time with a line saying where it came from.
+  build time with a line saying where it came from. A directive that looks like an include
+  and does not parse now raises `IncludeError` instead of being printed as prose — the
+  failure it used to have was exactly the silent drop this rule exists to prevent, and it
+  bit the release page's whole-file include on the first attempt.
+- **A verdict is rendered, never recomputed.** The gate page prints the Rust gate's
+  verdict; the campaign page prints the validation suite's outcome beside the observed
+  value rather than re-deriving the comparison. A generated page that re-derived a verdict
+  could disagree with the run that produced it, which is worse than either answer alone.
 
 ## Known issue found while writing this
 

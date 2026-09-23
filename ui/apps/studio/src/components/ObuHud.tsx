@@ -218,7 +218,15 @@ export function ObuHud({ docked = false }: { docked?: boolean }): React.JSX.Elem
 
       <div className="sparkrow" data-testid="hud-sparklines">
         {SPARKLINE_SERIES.map((s, i) => (
-          <Sparkline key={s.key} seriesIndex={i} label={s.label} unit={s.unit} tick={seriesTick} />
+          <Sparkline
+            key={s.key}
+            seriesIndex={i}
+            label={s.label}
+            unit={s.unit}
+            tick={seriesTick}
+            fieldKey={s.key}
+            node={telemetryNode}
+          />
         ))}
       </div>
     </div>

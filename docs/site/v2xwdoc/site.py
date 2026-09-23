@@ -13,6 +13,7 @@ import shutil
 from . import campaign as campaign_mod
 from . import cards as cards_mod
 from . import findings as findings_mod
+from . import gate as gate_mod
 from . import md, render, scenario as scenario_mod
 
 __all__ = ["build", "BuildResult"]
@@ -93,9 +94,11 @@ def _nav():
                 "Honesty",
                 [
                     ("Calibration debt", "calibration.html", "uncited defaults"),
+                    ("Completeness gate", "gate.html", "the Phase 6 release gate"),
                     ("Validation status", "validation.html", "what was checked"),
                     ("Validation campaign", "campaign.html", "claims against measurements"),
                     ("Defect register", "defects.html", "what went wrong"),
+                    ("Release readiness", "release.html", "what is not ready"),
                 ],
             ),
             ("About", [("Building this site", "building.html", "")]),
@@ -252,6 +255,18 @@ def build(repo_root, site_dir, out_dir, cards_path, stamp="", runs_path=None):
             "generated_from": "the model registry's <code>todo-calibrate</code> report",
         },
         {
+            "href": "gate.html",
+            "title": "Model-card completeness gate",
+            "subtitle": "No uncited high-tier default without somebody measuring it.",
+            "content": "gate.md",
+            "body": lambda: gate_mod.page(
+                catalogue, cards_mod.coverage_note(catalogue)
+            ),
+            "generated_from": "the gate's own verdict, computed by "
+            + source_link("crates/v2xw-metrics/src/gate.rs")
+            + " and carried in the card dump",
+        },
+        {
             "href": "validation.html",
             "title": "Validation status",
             "subtitle": "What has been checked against the world, and what has not.",
@@ -282,6 +297,14 @@ def build(repo_root, site_dir, out_dir, cards_path, stamp="", runs_path=None):
             "generated_from": source_link(FINDINGS_DIR + "/"),
         },
         {
+            "href": "release.html",
+            "title": "Release readiness",
+            "subtitle": "What must be true for a 1.0 tag, and what is not true yet.",
+            "content": "release.md",
+            "generated_from": source_link("docs/RELEASE-CHECKLIST.md")
+            + ", included verbatim at build time",
+        },
+        {
             "href": "glossary.html",
             "title": "Glossary",
             "subtitle": "The terms this project uses, in the sense it uses them.",
@@ -294,6 +317,26 @@ def build(repo_root, site_dir, out_dir, cards_path, stamp="", runs_path=None):
             "content": "building.md",
         },
     ]
+
+    if catalogue.present:
+        if not gate_mod.present(catalogue):
+            result.warnings.append(
+                "the card dump carries no gate verdict: rebuild it with "
+                "`just --justfile docs/site/justfile cards` so the completeness gate page "
+                "can say whether the gate passes"
+            )
+        elif gate_mod.failing(catalogue):
+            # A warning, and therefore a `--strict` failure, for the same reason the
+            # campaign's contradictions are: the roadmap states this as a release gate,
+            # and a gate that only appears on a page nobody fails on is a preference.
+            gate = catalogue.data["gate"]
+            result.warnings.append(
+                "model-card completeness gate: " + str(gate.get("summary") or "failed")
+            )
+        else:
+            result.notes.append(
+                "model-card completeness gate: " + str(catalogue.data["gate"].get("summary") or "passed")
+            )
 
     if catalogue.present and runs.present:
         disagreements = campaign_mod.contradictions(catalogue, runs)

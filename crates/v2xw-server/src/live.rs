@@ -40,14 +40,27 @@
 //!
 //! **Which actor a node is mounted on.** `gt.kinematics` names an actor; `node.tx` names a
 //! node; no channel joins them, and `v2xw_engine::Engine` exposes no accessor for the map
-//! it keeps internally. [`Projector::equip`] reconstructs it from the two published facts
-//! that decide it — the equipped draw is
-//! `RngRegistry::checkout(RngDomain::Spawn, EntityRef::Actor(a)).bool(equipped_fraction)`,
-//! and node ids are handed out in spawn order — and [`Projector::mapping_is_consistent`]
-//! reports whether every node the run actually transmitted from was one the
-//! reconstruction predicted. That check is the reason the coupling is tolerable and not
-//! the reason it is a good idea: the engine should publish the map, and this module says
-//! so in one place rather than being quietly wrong in many.
+//! it keeps internally. [`Projector::equip`] reconstructs it from the three published
+//! facts that decide it, and [`Projector::mapping_is_consistent`] reports whether every
+//! node the run actually named was one the reconstruction accounted for. That check is the
+//! reason the coupling is tolerable and not the reason it is a good idea: the engine should
+//! publish the map, and this module says so in one place rather than being quietly wrong
+//! in many.
+//!
+//! The three facts, each of which the reconstruction got wrong at least once:
+//!
+//! 1. **The draw.** `RngRegistry::checkout(RngDomain::Spawn, EntityRef::Actor(a))
+//!    .bool(equipped_fraction)` — keyed by the actor, so it does not depend on how many
+//!    spawned before it.
+//! 2. **The counter starts after the masts.** One counter serves both minting sites, and
+//!    `Engine::create_rsus` runs first, at build. A scenario with `n` roadside units puts
+//!    them at `0..n` and its first vehicle at `n`; a reconstruction counting from zero
+//!    shifts every vehicle's node id by `n`. See [`roadside_node_count`].
+//! 3. **A node is named before its actor is.** The mobility phase publishes the state of
+//!    the instant it is *dispatched* at, and a spawn's state belongs to the next instant,
+//!    so an equipped vehicle's first frame lands one mobility step before its first
+//!    `gt.kinematics` row. An id named ahead of its actor is held, not condemned: see
+//!    [`Projector::unmapped_nodes`].
 //!
 //! # No wall clock
 //!
@@ -206,6 +219,12 @@ struct Setup {
     /// Signal plans as `(signal id, phase boundaries)`, evaluated by the projector.
     signals: Vec<SignalPlan>,
     equipped_fraction: f64,
+    /// How many node ids the kernel mints before the first vehicle's.
+    ///
+    /// `v2xw_engine::Engine::build` calls `create_rsus` before it seeds the timeline, and
+    /// that site and vehicle spawn take ids from **one** counter, so the first vehicle's
+    /// node id is the roadside count rather than zero. See [`roadside_node_count`].
+    roadside_nodes: u32,
     actor_capacity: u32,
     seed: u64,
     run_id_bytes: [u8; 16],
@@ -831,6 +850,7 @@ fn assemble_setup(
         class_names,
         signals,
         equipped_fraction: scenario.actors.vehicles.equipped_fraction,
+        roadside_nodes: roadside_node_count(scenario),
         actor_capacity,
         seed: scenario.seed,
         run_id_bytes,
@@ -838,6 +858,21 @@ fn assemble_setup(
         recording_path: recording.map(|p| p.display().to_string()),
         metric_prov,
     }))
+}
+
+/// How many node ids the kernel hands out before the first vehicle's.
+///
+/// A roadside unit is a node and **not** an actor: `v2xw_engine::Engine::create_rsus` runs
+/// at build time, before the timeline is seeded, and it takes its ids from the same counter
+/// vehicle spawn takes them from. So a scenario with `n` roadside units puts them at
+/// `0..n` and its first vehicle at `n`.
+///
+/// This is the second published fact the actor→node reconstruction rests on, and it was
+/// the one the projector did not model: counting from zero shifted every vehicle's node id
+/// by the roadside count, which made the whole mapping wrong for any scenario with a mast
+/// in it — silently, because the node ids still existed and still looked dense.
+fn roadside_node_count(scenario: &Scenario) -> u32 {
+    u32::try_from(scenario.actors.rsus.len()).unwrap_or(u32::MAX)
 }
 
 /// The 16 run-id bytes, stamped with the UUIDv7 version and variant nibbles (RFC 9562).
@@ -970,7 +1005,18 @@ struct Projector {
     nodes: BTreeMap<NodeId, ActorId>,
     rng: v2xw_core::rng::RngRegistry,
     equipped_fraction: f64,
+    /// The node ids `0..roadside_nodes`, which the kernel gave to masts and not to actors.
+    /// No reconstruction is owed for them and none is possible: a roadside unit has no
+    /// `gt.kinematics` record because it has no actor.
+    roadside_nodes: u32,
     next_node: u32,
+    /// Every node id the reconstruction has assigned, kept after the actor retires.
+    ///
+    /// Separate from `nodes`, which is dropped on retirement so that a pose or an
+    /// `inspect` lookup answers about live actors only. A node id the kernel never reuses
+    /// stays explained here, so a record that trails its actor's last kinematics row is
+    /// not reported as an unreconstructed node.
+    assigned_nodes: BTreeSet<u32>,
     signals: Vec<SignalPlan>,
     /// Interned strings from the `Hello` table, for the payloads that carry a string id.
     str_ids: BTreeMap<String, u32>,
@@ -982,7 +1028,16 @@ struct Projector {
     actor_capacity: u32,
     /// Actors refused a slot because the run is at `actor_capacity`.
     over_capacity: BTreeSet<u32>,
-    /// Node ids the records named that the reconstruction did not predict.
+    /// Node ids the records named that the reconstruction has not accounted for.
+    ///
+    /// An id is *removed* again when the reconstruction reaches it, because a node
+    /// transmits in the same mobility step it spawns in while its actor's first
+    /// `gt.kinematics` row is stamped one step later — the mobility phase publishes the
+    /// state of the instant it is dispatched at, and a spawn's state is the state of the
+    /// *next* instant. So the first frame of every equipped vehicle names a node whose
+    /// actor the projector has not seen yet, and treating that as a disagreement reported
+    /// every run as inconsistent. What is left here at the end of a run is what the
+    /// reconstruction never explained, which is the disagreement worth reporting.
     unmapped_nodes: BTreeSet<u32>,
     /// Metric names the stream carried that the symbol table does not hold.
     unnamed_metrics: BTreeSet<String>,
@@ -1039,7 +1094,10 @@ impl Projector {
             nodes: BTreeMap::new(),
             rng: v2xw_core::rng::RngRegistry::new(setup.seed),
             equipped_fraction: setup.equipped_fraction,
-            next_node: 0,
+            roadside_nodes: setup.roadside_nodes,
+            // Not zero: the masts hold `0..roadside_nodes` (see `roadside_node_count`).
+            next_node: setup.roadside_nodes,
+            assigned_nodes: BTreeSet::new(),
             signals: setup.signals.clone(),
             str_ids,
             metric_ids,
@@ -1063,11 +1121,13 @@ impl Projector {
 
     /// Assigns the node the kernel would have given this actor, if it equips it.
     ///
-    /// **This is the reconstruction the module header names.** Two published facts decide
-    /// it: the draw is keyed by `(RngDomain::Spawn, EntityRef::Actor)` so it does not
-    /// depend on spawn order, and node ids are dense and ascending in spawn order. The
-    /// caller equips a step's new actors in `ActorId` order, which is spawn order, because
-    /// the kernel assigns `ActorId`s ascending at spawn.
+    /// **This is the reconstruction the module header names**, and all three of its facts
+    /// are here: the draw is keyed by `(RngDomain::Spawn, EntityRef::Actor)` so it does not
+    /// depend on spawn order; node ids are dense and ascending in spawn order *from
+    /// `roadside_nodes`*, because the masts took the counter's first values at build time;
+    /// and the id counts as accounted for the moment it is handed out, even if a record
+    /// named it a step earlier. The caller equips a step's new actors in `ActorId` order,
+    /// which is spawn order, because the kernel assigns `ActorId`s ascending at spawn.
     fn equip(&mut self, actor: ActorId) -> Option<NodeId> {
         let equipped = self
             .rng
@@ -1082,10 +1142,19 @@ impl Projector {
         let node = NodeId::new(self.next_node);
         self.next_node += 1;
         self.nodes.insert(node, actor);
+        // The id is now explained, whether or not a record has already named it: see
+        // `unmapped_nodes` for why a record can arrive one step ahead of the actor.
+        self.assigned_nodes.insert(node.index());
+        self.unmapped_nodes.remove(&node.index());
         Some(node)
     }
 
-    /// True if every node the records named was one the reconstruction predicted.
+    /// True if every node the records named is one the reconstruction accounted for.
+    ///
+    /// Asked at the end of a run this is the question it reads as. Asked in the middle it
+    /// may also be answering "not yet", because an equipped vehicle's first frame precedes
+    /// its first `gt.kinematics` row by one mobility step; `explain`'s caveat says so with
+    /// the ids, which is the honest form of a mid-run answer.
     fn mapping_is_consistent(&self) -> bool {
         self.unmapped_nodes.is_empty()
     }
@@ -1334,9 +1403,15 @@ impl Projector {
 
     /// Records that a node id appeared in the stream, and whether it was predicted.
     fn note_node(&mut self, node: NodeId) {
-        if !self.nodes.contains_key(&node) {
-            self.unmapped_nodes.insert(node.index());
+        // A mast is a node the kernel minted at build time and no actor carries, so there
+        // is nothing to reconstruct and nothing to disagree about.
+        if node.index() < self.roadside_nodes {
+            return;
         }
+        if self.assigned_nodes.contains(&node.index()) {
+            return;
+        }
+        self.unmapped_nodes.insert(node.index());
     }
 
     /// Takes the step's kinematics as the authoritative actor set.
@@ -2795,5 +2870,49 @@ impl Introspect for LiveEngine {
                 "not an export query".to_string(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::roadside_node_count;
+    use v2xw_engine::Scenario;
+
+    /// A scenario's path, from the repository root.
+    fn scenario_path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("scenarios")
+            .join(name)
+    }
+
+    /// The roadside count the node-id reconstruction offsets by is the scenario's own,
+    /// and it is zero exactly when the scenario declares no mast.
+    ///
+    /// Both cases are asserted, because a function that returned zero unconditionally
+    /// would satisfy the grid case on its own and that is the case every other live test
+    /// runs on.
+    #[test]
+    fn the_roadside_offset_is_the_number_of_units_the_scenario_declares() {
+        let grid = Scenario::load(scenario_path("phase1-grid.yaml")).expect("the grid loads");
+        assert!(
+            grid.actors.rsus.is_empty(),
+            "phase1-grid declares no mast, which is what makes it the zero case"
+        );
+        assert_eq!(roadside_node_count(&grid), 0);
+
+        let phase2 =
+            Scenario::load(scenario_path("phase2-manhattan.yaml")).expect("the phase 2 loads");
+        assert_eq!(
+            phase2.actors.rsus.len(),
+            1,
+            "phase2-manhattan declares the one mast this offset exists for"
+        );
+        assert_eq!(
+            roadside_node_count(&phase2),
+            1,
+            "with one mast the first vehicle's node id is 1, not 0"
+        );
     }
 }

@@ -196,6 +196,39 @@ export class MetricHistory {
     return s.ys[(s.start + s.count - 1) % this.capacity];
   }
 
+  /** Whether `name` has ever been sampled — a metric one run reports and another does not. */
+  has(name: string): boolean {
+    return this.#series.has(name);
+  }
+
+  /**
+   * The value of `name` at or before `tSeconds`, or `null` when the series starts later.
+   *
+   * This is what the side-by-side difference view reads: "the same simulated time" has to mean the
+   * same instant in both runs, and a metric sampled once a second is almost never sampled at the
+   * instant a scrub lands on. Taking the last sample at or before *t* is a step interpolation,
+   * which is the honest reading of a binned metric (§3.7 samples carry the bin's end time), and
+   * deliberately not a linear one: interpolating between two bins would invent a value.
+   *
+   * Binary search over the ring's logical index: the buffer is written in ascending time and a
+   * repeat overwrites in place, so the logical order is sorted.
+   */
+  at(name: string, tSeconds: number): number | null {
+    const s = this.#series.get(name);
+    if (!s || s.count === 0 || !Number.isFinite(tSeconds)) return null;
+    const xAt = (j: number): number => s.xs[(s.start + j) % this.capacity];
+    if (xAt(0) > tSeconds) return null;
+    let lo = 0;
+    let hi = s.count - 1;
+    // Invariant: xAt(lo) <= t. Find the greatest index whose x is <= t.
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (xAt(mid) <= tSeconds) lo = mid;
+      else hi = mid - 1;
+    }
+    return s.ys[(s.start + lo) % this.capacity];
+  }
+
   /** Forget everything (a new run, or a seek). */
   reset(): void {
     if (this.#series.size === 0) return;

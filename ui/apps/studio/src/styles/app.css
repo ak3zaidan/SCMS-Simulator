@@ -496,3 +496,84 @@ button.hud-field:focus-visible {
 
 .uplot { font-family: var(--sans) !important; }
 .u-legend { font-size: 10px !important; }
+
+/* ------------------------------------------------- the side-by-side (09-ui §6) */
+
+/*
+ * The centre column holds one viewport, or two.
+ *
+ * `grid` rather than `flex` so the two panes are exactly half each whatever the aspect ratio: a
+ * comparison in which one pane is wider than the other is a comparison of two different framings,
+ * and the eye reads the difference in the framing rather than in the runs. The 1px gap is the
+ * divider; a border would be inside one pane's box and belong to it.
+ */
+.viewstack {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  gap: 1px;
+  background: var(--border);
+}
+.viewstack.split { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.compare-pane { border-left: none; }
+
+/* A chip that has something to say rather than something to report. */
+.chip.warn-chip { border-color: var(--warn); color: var(--warn); }
+
+/* The provenance trigger beside an overlay row or a legend swatch: present, never loud. */
+.why-dot {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+  flex: none;
+  padding: 0 2px;
+}
+.why-dot:hover, .why-dot:focus-visible { color: var(--accent); }
+
+/*
+ * A client-measured figure in a text run (the frame-rate strip, the world summary).
+ *
+ * Styled as text, not as a button, because there are a dozen of them inside one sentence and a
+ * dozen buttons there would read as a toolbar. The underline on hover and the focus ring are what
+ * say it is activatable, and both are required: the focus ring is the only one a keyboard user
+ * gets (WCAG 2.1 SC 2.4.7).
+ */
+button.stat {
+  all: unset;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  border-radius: 2px;
+}
+button.stat:hover { color: var(--accent); text-decoration: underline; }
+button.stat:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* The unit line under a plot: the axis label as a control (§6.12 catalogue unit). */
+.axis-note {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 9px;
+  padding: 0 2px 1px;
+}
+.plot-card.wide { min-width: 320px; }
+
+/* A checkbox row in a panel body. */
+.check { display: flex; gap: 6px; align-items: center; font-size: 12px; padding: 2px 0; }
+.check input { flex: none; }
+
+/* A wrapping row of toggle chips: the metric picker. */
+.chips { display: flex; flex-wrap: wrap; gap: 3px; }
+.chips button { font-size: 10px; padding: 1px 5px; }
+
+/* Difference tables: a row that differs, and a row only one side has. */
+.row-differs td { color: var(--warn); }
+.row-one-sided td { color: var(--text-faint); font-style: italic; }
+
+/* A menu that has to open upwards, because it is anchored to the bottom bar. */
+.menu-pop.up { bottom: calc(100% + 4px); top: auto; }
+.menu-pop.wide { min-width: 340px; max-width: 460px; }
+
+.note.warn-note { border-left-color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }

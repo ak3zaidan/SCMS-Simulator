@@ -29,6 +29,25 @@
 //! on the model reference. A documentation build that dies because one crate's card
 //! stopped validating tells the reader nothing; one that publishes "this stage failed,
 //! here is why" tells them exactly what is missing.
+//!
+//! # The completeness gate
+//!
+//! The same registry is the input to the Phase 6 model-card completeness gate
+//! ([`v2xw_metrics::gate`]): no `todo-calibrate` on a `high`-tier default without a
+//! tracked calibration issue. This program reads the calibration-issue register
+//! (`docs/calibration/issues.json`, `--issues`), runs the gate and writes the verdict into
+//! the dump under `gate`, so the documentation site renders the work list rather than only
+//! a pass or a fail. `--gate` additionally makes the exit status non-zero when the gate
+//! fails, which is what a release check runs.
+//!
+//! The verdict is computed whether or not `--gate` was passed. A gate that only spoke
+//! through an exit status would hide the list of uncalibrated numbers from exactly the
+//! people who have to calibrate them.
+//!
+//! A **missing** register is not an empty one: `gate.register_present` says which it was,
+//! and a missing file is reported rather than silently treated as "no issues", because the
+//! two differ in what they say about the repository even though the gate's arithmetic over
+//! them is identical.
 
 use std::path::{Path, PathBuf};
 
@@ -61,15 +80,24 @@ const HELP: &str = "\
 v2xw-cardgen — serialise the engine's model registry for the documentation site
 
 USAGE:
-    v2xw-cardgen [--out <PATH>]
+    v2xw-cardgen [--out <PATH>] [--issues <PATH>] [--gate]
 
 OPTIONS:
-    --out <PATH>    where to write the dump [default: docs/site/generated/cards.json]
-    -h, --help      print this message
+    --out <PATH>     where to write the dump [default: docs/site/generated/cards.json]
+    --issues <PATH>  the calibration-issue register the completeness gate reads
+                     [default: docs/calibration/issues.json]
+    --gate           exit non-zero if the model-card completeness gate fails. The verdict
+                     is computed and written into the dump either way.
+    -h, --help       print this message
 ";
+
+/// Where the calibration-issue register lives by default.
+const DEFAULT_ISSUES: &str = "docs/calibration/issues.json";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut out = PathBuf::from("docs/site/generated/cards.json");
+    let mut issues_path = PathBuf::from(DEFAULT_ISSUES);
+    let mut enforce_gate = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -77,6 +105,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let value = args.next().ok_or("--out needs a path")?;
                 out = PathBuf::from(value);
             }
+            "--issues" => {
+                let value = args.next().ok_or("--issues needs a path")?;
+                issues_path = PathBuf::from(value);
+            }
+            "--gate" => enforce_gate = true,
             "-h" | "--help" => {
                 print!("{HELP}");
                 return Ok(());
@@ -155,6 +188,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Value::Array(UNCOVERED.iter().map(|c| Value::String((*c).to_string())).collect()),
     );
 
+    // ---- the completeness gate ---------------------------------------------------
+    // Run over the registry that was just built, with the register read from disk. A
+    // missing register is carried as an empty one *and said to be missing*: the gate's
+    // arithmetic is the same either way, but "nobody has opened an issue" and "the file
+    // this build was pointed at does not exist" are different statements about the
+    // repository and the site must not print the first when it means the second.
+    let (register, register_present, register_error) = match std::fs::read_to_string(&issues_path)
+    {
+        Ok(text) => match v2xw_metrics::gate::IssueRegister::from_json(&text) {
+            Ok(register) => (register, true, None),
+            // A register that does not parse is not treated as an empty one silently: the
+            // dump carries the parse error and the gate reports every parameter as
+            // untracked, which is the conservative direction.
+            Err(e) => (
+                v2xw_metrics::gate::IssueRegister::default(),
+                true,
+                Some(e.to_string()),
+            ),
+        },
+        Err(e) => (
+            v2xw_metrics::gate::IssueRegister::default(),
+            false,
+            Some(e.to_string()),
+        ),
+    };
+    let gate = v2xw_metrics::gate::run(&registry, &register);
+    let mut gate_value = serde_json::to_value(&gate)?;
+    if let Value::Object(map) = &mut gate_value {
+        map.insert(
+            "register_path".to_string(),
+            Value::String(issues_path.display().to_string()),
+        );
+        map.insert(
+            "register_present".to_string(),
+            Value::Bool(register_present),
+        );
+        map.insert(
+            "register_error".to_string(),
+            match &register_error {
+                Some(message) => Value::String(message.clone()),
+                None => Value::Null,
+            },
+        );
+        map.insert("passed".to_string(), Value::Bool(gate.passed()));
+        map.insert("summary".to_string(), Value::String(gate.summary()));
+        map.insert("enforced".to_string(), Value::Bool(enforce_gate));
+    }
+
     let mut root = Map::new();
     root.insert("schema".to_string(), Value::String(DUMP_SCHEMA.to_string()));
     root.insert(
@@ -168,12 +249,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     root.insert("stages".to_string(), Value::Array(stages));
     root.insert("coverage".to_string(), Value::Object(coverage));
     root.insert("model_count".to_string(), Value::from(models.len()));
+    root.insert("gate".to_string(), gate_value);
     root.insert("models".to_string(), Value::Array(models));
 
     write(&out, &Value::Object(root))?;
     println!(">> wrote {} models to {}", registry.len(), out.display());
+    if let Some(message) = &register_error {
+        println!("!! calibration-issue register {}: {message}", issues_path.display());
+    }
+    println!(">> completeness gate: {}", gate.summary());
+    for line in gate.lines() {
+        println!("   {line}");
+    }
+    if !gate.outside_gate.is_empty() {
+        println!(
+            "   ({} further uncalibrated default(s) sit on cards that do not declare the \
+             high tier and are outside the roadmap's rule; they are listed in the dump)",
+            gate.outside_gate.len()
+        );
+    }
+    if enforce_gate && !gate.passed() {
+        // The dump is written first, on purpose. A release check that failed without
+        // leaving the work list behind would make the gate harder to satisfy, not easier.
+        return Err(Box::new(GateFailure(gate.summary())));
+    }
     Ok(())
 }
+
+/// The error `--gate` exits with. A newtype so the message is the gate's summary and
+/// nothing else: the failures themselves are already on stdout and in the dump.
+#[derive(Debug)]
+struct GateFailure(String);
+
+impl std::fmt::Display for GateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for GateFailure {}
 
 /// One registration stage's outcome, as the site reads it.
 fn stage(name: &str, what: &str, registered: usize, error: Option<String>) -> Value {

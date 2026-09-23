@@ -49,11 +49,22 @@
 //! # What is not here
 //!
 //! The RSU is an [`v2xw_node::ObuRuntime`] with an RSU hardware profile and no message
-//! services, because 06-node-models.md §3's RSU runtime — roles, failure states, a
-//! store-and-forward queue — does not ship in `v2xw-node`. So the RSU receives, its
-//! backhaul costs a stated latency, and the two application messages this path needs (the
-//! report and the CRL broadcast) are put on the air by this module rather than by an
-//! application layer inside the node. That is one missing runtime, not six missing models.
+//! services: it receives, its backhaul costs a stated latency, and the two application
+//! messages this path needs (the report and the CRL broadcast) are put on the air by this
+//! module rather than by an application layer inside the node.
+//!
+//! **That is now owed work and no longer a missing model.** 06-node-models.md §3's
+//! roadside runtime — roles, failure states, a store-and-forward queue, a backhaul with
+//! its own model card — ships in `v2xw-node` as [`v2xw_node::RsuRuntime`], with
+//! `RsuRuntime::install_crl` as the custody this module fakes and `RsuStepOutcome` as the
+//! transmissions and forwards it would return. What has not happened is moving the engine
+//! onto it: [`crate::run::Engine`] holds one `BTreeMap<NodeId, ObuRuntime>` and steps it
+//! in one parallel phase, and a second runtime type with a different `step` signature and
+//! a different outcome is a change to that phase and to every `self.nodes.get` on this
+//! path. Until then the role decisions here are this module's
+//! ([`Phase2::rsu_has_role`]) rather than [`v2xw_node::RsuRoles`]'s, and the two agree on
+//! the spellings on purpose — `RsuRole::as_str` produces `"crl"` and `"report-forward"`
+//! precisely so that a scenario written against this wiring keeps working across the move.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -169,6 +180,12 @@ pub struct HeldReport {
     pub subject_i: u32,
     /// The subject's linkage value.
     pub subject_lv: LinkageValue,
+    /// The backend flow run **this** report's submission stamped its stages under.
+    ///
+    /// Per report and not one for the whole path: the decomposition 05-protocols §8 asks
+    /// for starts at a `detect` stamp, and which report's `detect` that is decides the
+    /// number. See [`Phase2::on_report_received`].
+    pub run: FlowRun,
 }
 
 /// The revocation, once the backend has issued and broadcast it.
@@ -230,6 +247,15 @@ pub struct Phase2Report {
     pub crls_issued: u64,
     /// How many CRL broadcasts the roadside put on the air.
     pub crl_broadcasts: u64,
+    /// How many issued revocations could not be broadcast because the backend's own
+    /// latency put the broadcast past the run horizon.
+    ///
+    /// Counted rather than silent, because it is the one way this path can produce a
+    /// revocation that never reaches a vehicle for a reason that is not a modelling
+    /// choice: a run too short for the deployment's reporting latency. A reader seeing
+    /// `crls_issued` without `crl_broadcasts` needs this number to tell "the roadside is
+    /// not wired up" from "the scenario ends before the CRL would have been issued".
+    pub crl_past_horizon: u64,
     /// How many nodes installed the CRL entry.
     pub crls_installed: u64,
     /// How many receptions the installed CRL caused to be classified revoked.
@@ -272,7 +298,6 @@ pub struct Phase2 {
     /// file the same subject every tenth of a second.
     filed: BTreeSet<(NodeId, String)>,
     held: Vec<HeldReport>,
-    report_run: Option<FlowRun>,
     revocation: Option<Revocation>,
     report: Phase2Report,
 }
@@ -445,7 +470,6 @@ impl Phase2 {
             vehicles: 0,
             filed: BTreeSet::new(),
             held: Vec::new(),
-            report_run: None,
             revocation: None,
             report: Phase2Report::default(),
         }))
@@ -465,6 +489,43 @@ impl Phase2 {
     /// The roadside units' node ids.
     pub fn rsu_nodes(&self) -> &[NodeId] {
         &self.rsu_nodes
+    }
+
+    /// The unit `node` is, if it is one.
+    ///
+    /// `rsu_nodes` is filled by [`Phase2::note_rsu`] in the order
+    /// [`Phase2::rsu_specs`] yields, because [`crate::run::Engine`]'s `create_rsus` walks
+    /// the specs once and creates one node per spec, so index `k` of the one is index `k`
+    /// of the other. Pairing them here is what makes a role a property of a *unit*: the two
+    /// role decisions on this path used to ask whether **any** declared unit carried the
+    /// role, so with two masts the one without it broadcast too, and the counterexample
+    /// test that says a unit with no `crl` role broadcasts nothing only held because the
+    /// scenario declares exactly one.
+    #[must_use]
+    pub fn rsu_spec_of(&self, node: NodeId) -> Option<&RsuSpec> {
+        let index = self.rsu_nodes.iter().position(|n| *n == node)?;
+        self.rsus.get(index)
+    }
+
+    /// Whether `node` is a roadside unit that carries `role`.
+    ///
+    /// A unit that declares no role at all carries every one of them: the scenario schema
+    /// defaults `roles` to empty, and a unit that did nothing would be a unit an author
+    /// has to remember to configure before anything works.
+    #[must_use]
+    pub fn rsu_has_role(&self, node: NodeId, role: &str) -> bool {
+        self.rsu_spec_of(node)
+            .is_some_and(|s| s.has_role(role) || s.roles.is_empty())
+    }
+
+    /// The roadside units that carry `role`, in declaration order.
+    #[must_use]
+    pub fn rsus_with_role(&self, role: &str) -> Vec<NodeId> {
+        self.rsu_nodes
+            .iter()
+            .copied()
+            .filter(|n| self.rsu_has_role(*n, role))
+            .collect()
     }
 
     /// The counters for the run report.
@@ -819,13 +880,11 @@ impl Phase2 {
         self.report.reports_received += 1;
         let (subject, i, lv) = self.resolve_subject(&report.subject_cert_digest)?;
         let run = self.scms.submit_report(device_of(reporter), i, lv);
-        if self.report_run.is_none() {
-            self.report_run = Some(run);
-        }
         self.held.push(HeldReport {
             report,
             subject_i: i,
             subject_lv: lv,
+            run,
         });
         if self.scms.run().is_err() || self.held.len() < 2 || self.revocation.is_some() {
             return None;
@@ -864,11 +923,31 @@ impl Phase2 {
                 continue;
             }
             let entry = (*self.scms.crl_entry()?).clone();
+            // The decomposition is over the report that **completed the case** — this
+            // one — and not over the first report the authority ever received.
+            //
+            // This is a joint-3 consequence and it is the reason the distribution half of
+            // the path never happened. The backend keeps its own clock and every call into
+            // it here runs it to quiescence, so the stage log's instants are contiguous
+            // only *within* one of those calls: the report shuffle window alone is a
+            // minute of backend time per submission, and provisioning a vehicle that
+            // spawned in between is two more. Measuring from the first report's `detect`
+            // therefore charged the revocation for every submission and every provisioning
+            // that happened before it — an interval that grows with the false-positive
+            // rate and quickly exceeds the whole run. The engine then applied that
+            // interval on its own timeline, the broadcast landed past the horizon, and
+            // nothing was ever put on the air.
+            //
+            // This report's submission, the resolution it triggered, the issuance and the
+            // distribution all happen inside this one call, so `detect` to `enforced` over
+            // its run is a contiguous span of backend time and is the latency of *this*
+            // revocation. The earlier report is the authority's prior evidence; it is what
+            // made the case possible and it is not on the path being measured.
             let latency = RevocationLatency::assemble(
                 &self.scms.kernel.stages,
                 victim,
                 Transport::V2xAir,
-                self.report_run?,
+                self.held[last].run,
                 resolution,
                 issuance,
                 distribution,
@@ -898,6 +977,11 @@ impl Phase2 {
     /// Notes that the roadside put a CRL on the air.
     pub fn note_crl_broadcast(&mut self) {
         self.report.crl_broadcasts += 1;
+    }
+
+    /// Notes a revocation whose broadcast instant fell past the run horizon.
+    pub fn note_crl_past_horizon(&mut self) {
+        self.report.crl_past_horizon += 1;
     }
 
     /// Notes that a node installed the CRL entry.

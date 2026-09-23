@@ -17,7 +17,7 @@ import os
 from . import render
 from .render import escape
 
-__all__ = ["Catalogue", "load", "MISSING_HELP"]
+__all__ = ["Catalogue", "load", "coverage_note", "MISSING_HELP"]
 
 MISSING_HELP = (
     "No card dump was found. Build it with <code>just --justfile docs/site/justfile "
@@ -239,6 +239,15 @@ def _coverage_note(catalogue):
             "pins it at run time.</p></div>"
         )
     return "".join(parts)
+
+
+def coverage_note(catalogue):
+    """The dump's own statement of which crates it reaches, for another page to reuse.
+
+    The gate page needs the same note, and recomputing it there would let the two pages
+    disagree about what the dump covers.
+    """
+    return _coverage_note(catalogue)
 
 
 def model_reference(catalogue):

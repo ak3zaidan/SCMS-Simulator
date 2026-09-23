@@ -98,6 +98,13 @@ pub struct MaDataset {
     /// The last simulated instant any channel carried, which the v1 `valid_to` defect
     /// writes into every certificate row.
     pub run_duration_s: f64,
+    /// What the run transmitted, per message type: message and byte counts.
+    ///
+    /// Not a dataset table — no `ma/` or `ground_truth/` file carries it — but the input to
+    /// the datasheet's byte-provenance section ([`super::bytes`]), which is what says
+    /// whether a byte-count result from this dataset is a measurement of an encoding or a
+    /// prediction of a size model.
+    pub tx: super::bytes::TxTally,
 }
 
 impl MaDataset {
@@ -863,6 +870,7 @@ impl DatasetAssembler {
             gt_revocation_stages,
             rsu_count,
             run_duration_s,
+            tx: super::bytes::TxTally::of(&self.transmissions),
         })
     }
 }

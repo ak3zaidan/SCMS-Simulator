@@ -15,6 +15,7 @@ import {
   ChannelId,
   VwpClient,
   bytesToHex,
+  computeWorldContentHash,
   decodeWorld,
   formatUuid,
   verifyWorldPayload,
@@ -38,8 +39,15 @@ import { CAMERA_MODES, Viewer, type CameraMode, type OverlayEntry } from "@vwp/v
 import type { OverlayName } from "@vwp/protocol";
 
 import { MetricHistory, SeriesRing } from "../lib/history.js";
+import {
+  LocalReplay,
+  loadReplayBindings,
+  type ReplayBindings,
+  type ReplayModuleLocation,
+} from "../lib/replay.js";
 import { SPARKLINE_SERIES } from "../lib/telemetry.js";
 import { hex, shortDigest } from "../lib/format.js";
+import { resolveEngineUrl } from "../lib/target.js";
 import { studioTheme, type ThemeName } from "../lib/theme.js";
 import {
   MAX_MARKS,
@@ -51,16 +59,32 @@ import {
   type TimelineMark,
 } from "./store.js";
 
-/** Channels the Studio subscribes to on connect (§6.12 `events.set`). */
+/**
+ * Channels the Studio subscribes to on connect (§6.12 `events.set`).
+ *
+ * Exactly the four §6.12 names: "The Studio subscribes `app.warning`, `det.observation`,
+ * `proto.revocation` and `sec.cert` at start-up, and subscribes the high-rate channels only for the
+ * followed node." The three high-rate ones — `node.tx`, `phy.rx`, `mac.cbr` — used to be in this
+ * list, which against the fixture engine cost a readable pulse overlay and against a real engine is
+ * the "millions of `phy.rx` records per simulated second" §6.12 warns about. They are now
+ * subscribed by {@link StudioEngine.setFollowChannels} when something is followed and dropped when
+ * the selection is cleared; see that method for why the node restriction is not applied with them.
+ */
 const DEFAULT_CHANNELS = [
-  "node.tx",
-  "phy.rx",
-  "mac.cbr",
   "sec.cert",
   "det.observation",
   "app.warning",
   "proto.revocation",
 ] as const;
+
+/**
+ * Channels subscribed only while a node is followed (§6.12).
+ *
+ * `node.tx` is also where the followed node's pseudonym digest comes from (§3.6.4), so following a
+ * node is what makes the HUD's pseudonym line work — the subscription and the HUD field arrive
+ * together rather than one being useful without the other.
+ */
+const FOLLOW_CHANNELS = ["node.tx", "phy.rx", "mac.cbr"] as const;
 
 /**
  * Overlays enabled the moment a world is on screen.
@@ -151,6 +175,8 @@ export class StudioEngine {
   #worldChunkBytes = 0;
   /** §3.1.1 — the §4.2 payload digest this run promised, lower-case hex; what §10.5 W3 checks. */
   #promisedWorldHash: string | null = null;
+  /** The base URL the current connection was opened against; `""` before the first connect. */
+  #baseUrl = "";
   #dirty = true;
   /** Set once the user touches the buildings toggle, after which the camera stops driving it. */
   #buildingsUserSet = false;
@@ -179,11 +205,19 @@ export class StudioEngine {
   // Connection
   // ---------------------------------------------------------------------------------------------
 
-  /** Open the VWP connection (§1.3) and bring the whole app up behind it. */
+  /**
+   * Open the VWP connection (§1.3) and bring the whole app up behind it.
+   *
+   * `baseUrl` is whatever `lib/target.ts` resolved — the page's own origin behind the Vite proxy and
+   * in the deployed build, or an absolute origin when the user pinned one with `?engine=`. It is
+   * remembered because `Hello.world_ref.str_url` is root-relative (§3.1.6): a pinned engine's world
+   * has to be fetched from *that* origin, not from the page's.
+   */
   async connect(baseUrl = window.location.origin): Promise<HelloMessage> {
     this.disconnect();
     const store = useStudio.getState();
     store.setConnection("connecting");
+    this.#baseUrl = baseUrl;
 
     const client = new VwpClient({ url: baseUrl, compress: "none", autoReconnect: true });
     this.client = client;
@@ -238,6 +272,156 @@ export class StudioEngine {
     this.#storeTimer = setInterval(() => this.flushProjection(), 1000 / STORE_HZ);
     this.#statusTimer = setInterval(() => void this.refreshStatus(), 2000);
     return hello;
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // The no-engine replay path (09-ui §7)
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * A recording open in this page, read by `crates/v2xw-wasm`, with no engine behind it.
+   *
+   * This is the path a reviewer uses to check somebody else's result: open the `.mcap`, scrub it,
+   * read the poses. It drives the *main* viewport, not the comparison pane — a reviewer with a
+   * recording and no server should get the Studio, not half of it.
+   *
+   * It coexists with a connection rather than replacing it: a connection can be open at the same
+   * time (that is how a recording is compared against a live run), and the replay's poses are what
+   * the viewer shows only while no stream is feeding it.
+   */
+  replay: LocalReplay | null = null;
+
+  #replayBindings: ReplayBindings | null = null;
+  /** True once a world has been adopted from a file rather than verified against a `Hello`. */
+  #worldUnverified = false;
+
+  /** Whether a local recording is open and indexed. */
+  get replayOpen(): boolean {
+    return this.replay !== null && this.replay.isOpen;
+  }
+
+  /**
+   * Open a recording from a local file and show its first frame.
+   *
+   * Nothing is uploaded and nothing is started: the file is read into WebAssembly memory and the
+   * chunk index is read from its footer (§7.3). The world is a separate question — §7.1 keeps it
+   * out of a recording — so the scene stays empty until one is supplied by
+   * {@link openLocalWorld} or by a connection.
+   */
+  async openLocalRecording(
+    file: { name?: string; arrayBuffer(): Promise<ArrayBuffer> },
+    location?: ReplayModuleLocation,
+  ): Promise<void> {
+    this.#log("info", "replay", `opening ${file.name ?? "recording"} with the WebAssembly reader`);
+    // Held in a local: the `new LocalReplay()` between the `??=` and the use invalidates the
+    // narrowing TypeScript would otherwise carry on the private field.
+    const bindings = (this.#replayBindings ??= await loadReplayBindings(location));
+    const replay = new LocalReplay();
+    const span = await replay.openBlob(file, bindings);
+    this.replay?.close();
+    this.replay = replay;
+    this.#log(
+      "info",
+      "replay",
+      `${file.name ?? "recording"}: ${span.startNs} … ${span.endNs} ns of simulated time`,
+    );
+    // The viewer is fed from the replay's own pose buffer while a recording drives the view, so the
+    // live stream must not also be writing into the interpolator.
+    this.#detachViewer?.();
+    this.#detachViewer = null;
+    await this.seekLocalReplay(span.startNs);
+  }
+
+  /**
+   * Adopt a `vwp-world/1` payload from a local file, for a recording that has no engine to serve
+   * one.
+   *
+   * There is no `Hello.world_hash` to check this against — §7.1 keeps `Hello` out of a recording —
+   * so the §10.5 W3 comparison that {@link loadWorldPayload} performs has nothing to compare with.
+   * Rather than skip the digest, it is computed and logged: the reviewer can check it against the
+   * run manifest by eye, and the log line says in those words that the check was not automatic.
+   */
+  async openLocalWorld(file: { name?: string; arrayBuffer(): Promise<ArrayBuffer> }): Promise<boolean> {
+    try {
+      const payload = await file.arrayBuffer();
+      const digest = await computeWorldContentHash(payload);
+      const world = decodeWorld(payload);
+      this.#adoptWorld(world, payload.byteLength);
+      this.#worldUnverified = true;
+      this.#log(
+        "warn",
+        "world",
+        `adopted ${file.name ?? "world"} with payload digest ${digest} — a recording carries no ` +
+          `Hello.world_hash (§7.1), so nothing verified this is the world the run was computed on`,
+      );
+      const replay = useStudio.getState().replay;
+      if (replay !== null) useStudio.getState().setReplay({ ...replay, worldUnverified: true });
+      return true;
+    } catch (err) {
+      this.#log("error", "world", `world file refused: ${errText(err)}`);
+      return false;
+    }
+  }
+
+  /**
+   * Seek the local recording and put its state on screen.
+   *
+   * §7.3's seek reads one chunk and one keyframe period of deltas, which is why the scrub bar can
+   * drive this directly rather than debouncing to a coarse grid.
+   */
+  async seekLocalReplay(tNs: number): Promise<void> {
+    const replay = this.replay;
+    if (replay === null || !replay.isOpen) return;
+    const position = await replay.seekToNs(tNs);
+    const viewer = this.viewer;
+    if (viewer) {
+      viewer.interpolator.reset();
+      if (replay.signals) viewer.worldRenderer.updateSignalPhases(replay.signals);
+      // Twice: the interpolator samples between two snapshots, and one leaves it nothing to
+      // interpolate from, so a seeked recording would render an empty scene until the next seek.
+      viewer.capture(replay.poses);
+      viewer.capture(replay.poses);
+    }
+    let live = 0;
+    for (let slot = 0; slot < replay.poses.count; slot++) if (replay.poses.occupied[slot] === 1) live++;
+    const span = replay.span;
+    const store = useStudio.getState();
+    store.setRun({
+      state: "paused",
+      tNs: position.tNs,
+      tEndNs: span?.endNs ?? position.tNs,
+      actors: live,
+      runId: replay.label,
+      live: false,
+    });
+    store.setTelemetry(null, null, position.tNs);
+    store.setReplay({
+      label: replay.label,
+      startNs: span?.startNs ?? 0,
+      endNs: span?.endNs ?? position.tNs,
+      tNs: position.tNs,
+      chunksRead: position.chunksRead,
+      requests: position.requests,
+      worldUnverified: this.#worldUnverified,
+    });
+    if (position.refused.length > 0) {
+      this.#log(
+        "warn",
+        "replay",
+        `${position.refused.length} of ${position.deltas} recorded deltas were refused: ` +
+          `${position.refused.map((r) => (r.applied ? "applied" : r.reason)).join(", ")}`,
+      );
+    }
+    this.#dirty = true;
+  }
+
+  /** Close the local recording. The last frame stays on screen. */
+  closeLocalReplay(): void {
+    this.replay?.close();
+    this.replay = null;
+    useStudio.getState().setReplay(null);
+    // Hand the viewer back to the stream, if one is open.
+    this.attachViewer();
   }
 
   /** Tear the connection down; the viewer stays mounted. */
@@ -392,6 +576,7 @@ export class StudioEngine {
       this.#followedNode = null;
       store.setSelection(null, null);
       if (this.client) await this.request("view.follow", { clear: true }).catch(() => undefined);
+      await this.setFollowChannels(false);
       return;
     }
     this.viewer?.flyTo(actorId, mode);
@@ -411,7 +596,35 @@ export class StudioEngine {
     } catch {
       /* logged by request() */
     }
+    await this.setFollowChannels(true);
     void this.inspectFollowed();
+  }
+
+  /**
+   * Subscribe or drop the high-rate event channels of §6.12.
+   *
+   * §6.12's decision note says the Studio "subscribes the high-rate channels only for the followed
+   * node", and this is as close to that as VWP v1 lets a client get: the *channels* are subscribed
+   * only while something is followed, but the node restriction is deliberately **not** applied.
+   * `events.set`'s `filter.nodes` is connection-scoped, not per-channel — `Session::set_events` in
+   * `crates/v2xw-server` keeps one `event_nodes` set for the whole connection — so filtering to the
+   * followed node would also silence `det.observation`, `proto.revocation` and `app.warning` for
+   * every other node, and those three are what the scrub bar's event markers are made of. The rate
+   * is bounded by `max_events_per_step` instead, which §6.12 defines as a deterministic sample and
+   * is the mechanism that actually protects the connection.
+   */
+  async setFollowChannels(enabled: boolean): Promise<void> {
+    if (!this.client) return;
+    try {
+      await this.request(
+        "events.set",
+        enabled
+          ? { subscribe: [...FOLLOW_CHANNELS], max_events_per_step: 2000 }
+          : { unsubscribe: [...FOLLOW_CHANNELS] },
+      );
+    } catch {
+      /* logged by request(); the low-rate subscription is unaffected either way */
+    }
   }
 
   /** Follow a node that has no actor (an RSU site picked in the viewport). */
@@ -424,6 +637,7 @@ export class StudioEngine {
     useStudio.getState().setSelection(null, nodeId);
     if (!this.client) return;
     await this.request("view.follow", { node: nodeId, telemetry: true }).catch(() => undefined);
+    await this.setFollowChannels(true);
     void this.inspectFollowed();
   }
 
@@ -599,7 +813,19 @@ export class StudioEngine {
     }
   }
 
-  async #fetchWorld(url: string): Promise<void> {
+  /**
+   * Fetch the world payload named by `Hello.world_ref` (§3.1.6 mode 0).
+   *
+   * The URL is resolved against the base the connection was opened on, because §3.1.6's URL is
+   * root-relative and assumes the engine and the page are one origin. They are behind the proxy and
+   * in the deployed build; they are not when the engine is pinned to another port, and a bare
+   * `fetch("/world/…")` then asks the page's own origin for a world it has never heard of. Both
+   * servers also set `cross-origin-resource-policy: same-origin` on every response (§1.1), so a
+   * genuinely cross-origin fetch is refused by the browser however the URL is written — that case
+   * is reported by `lib/target.ts` up front rather than as a mystery here.
+   */
+  async #fetchWorld(path: string): Promise<void> {
+    const url = resolveEngineUrl(this.#baseUrl, path);
     try {
       const res = await fetch(url, { cache: "force-cache" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);

@@ -18,6 +18,7 @@ import type { ExplainResult, ProvenanceInfo } from "@vwp/protocol";
 import { engine } from "../state/engine.js";
 import { useStudio, type ProvEntry } from "../state/store.js";
 import { PROV_SUBJECT_KINDS } from "../lib/format.js";
+import type { ClientProvenance } from "../lib/provenance.js";
 
 /** The model-card families of 03-interfaces §12, in the order the schema lists them. */
 const FAMILIES = [
@@ -52,6 +53,46 @@ function ProvCard({ entry }: { entry: ProvEntry }): React.JSX.Element {
           )}
         </dd>
       </dl>
+    </div>
+  );
+}
+
+/**
+ * Provenance for a value the browser computed.
+ *
+ * Deliberately not shaped like {@link ProvCard}: there is no model id, no version and no parameter
+ * set, because there is no model — and printing empty fields where a model card's would be is how a
+ * client-side number starts looking like a simulation result. What it does carry is the thing that
+ * makes the value checkable: what computed it, from which inputs, under which rule.
+ */
+function ClientCard({ info }: { info: ClientProvenance }): React.JSX.Element {
+  return (
+    <div className="section" data-testid="client-prov-card">
+      <dl className="kv">
+        <dt>produced by</dt>
+        <dd data-testid="client-prov-producer">{info.producer}</dd>
+        <dt>computation</dt>
+        <dd>{info.computation}</dd>
+        <dt>inputs</dt>
+        <dd>{info.inputs}</dd>
+        {info.reference ? (
+          <>
+            <dt>follows</dt>
+            <dd>{info.reference}</dd>
+          </>
+        ) : null}
+        {info.quantisation ? (
+          <>
+            <dt>quantisation</dt>
+            <dd>{info.quantisation}</dd>
+          </>
+        ) : null}
+      </dl>
+      {info.caveat ? (
+        <div className="note">
+          <strong>Caveat.</strong> {info.caveat}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -136,8 +177,10 @@ export function WhyTab(): React.JSX.Element {
     return (
       <div className="panel-body">
         <p className="dim">
-          Click any value in the HUD, the plots strip or the neighbour table to resolve it back to the model,
-          version and parameter set that produced it.
+          Every number in the Studio resolves back to what produced it. Activate a value — in the HUD, the
+          inspector, the plots strip, the overlay menu, the frame-rate strip, the world summary, the event
+          list or the comparison tables — and it opens here with the model, version and parameter set behind
+          it, or, when the browser computed it, with the computation and its inputs.
         </p>
         <p className="faint">
           {provenanceCount} provenance entries received on this connection (§3.8).
@@ -179,6 +222,16 @@ export function WhyTab(): React.JSX.Element {
         </dl>
       </div>
 
+      {why.client ? (
+        <>
+          <div className="note info" data-testid="why-client">
+            Computed in the browser, not by the engine. There is no model card for this number because there
+            is no model behind it; what produced it is below.
+          </div>
+          <ClientCard info={why.client} />
+        </>
+      ) : null}
+
       {local ? (
         <>
           <div className="note info">
@@ -192,7 +245,7 @@ export function WhyTab(): React.JSX.Element {
           defined it yet. §3.8 requires the server to send one covering every id it references before the
           next keyframe; until then the model behind this value is unknown.
         </div>
-      ) : (
+      ) : why.client ? null : (
         <div className="note" data-testid="why-absent">
           <strong>No provenance id is carried for this value.</strong> The §3.5.2 <code>NodeTelemetry</code>{" "}
           record has no <code>prov_id</code> column, so the binary stream cannot say which model produced it.
@@ -201,9 +254,22 @@ export function WhyTab(): React.JSX.Element {
       )}
 
       <div className="row" style={{ marginTop: 8 }}>
-        <button type="button" onClick={() => void ask()} disabled={busy} data-testid="why-explain">
-          {busy ? "asking…" : "Ask the engine (explain)"}
-        </button>
+        {/*
+          `explain` is offered for anything the engine could know about, and withheld for a value it
+          has never seen. Asking the engine to explain this browser's frame rate would either invent
+          an answer or return `-32006 UNKNOWN_ID`; neither is worth a button. A subject that carries
+          a `prov_id` as well as a client record — a difference the browser computed from two engine
+          metrics — keeps the button, because the metric behind it is the engine's.
+        */}
+        {why.client === undefined || wireProvId !== undefined ? (
+          <button type="button" onClick={() => void ask()} disabled={busy} data-testid="why-explain">
+            {busy ? "asking…" : "Ask the engine (explain)"}
+          </button>
+        ) : (
+          <span className="faint" data-testid="why-no-explain">
+            <code>explain</code> (§6.9) is not offered: the engine never saw this value.
+          </span>
+        )}
       </div>
 
       {error ? <div className="note err">explain failed: {error}</div> : null}

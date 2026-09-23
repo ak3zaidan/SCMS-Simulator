@@ -13,6 +13,36 @@ import type { OverlayName } from "@vwp/protocol";
 
 import { engine } from "../state/engine.js";
 import { useStudio } from "../state/store.js";
+import { OVERLAY_SOURCES, overlaySubject } from "../lib/provenance.js";
+
+/**
+ * The provenance trigger beside one overlay.
+ *
+ * An overlay is a value on screen like any other: it says something about the run, and a reader has
+ * to be able to ask what. §6.7's `needs_channels` is the part that matters in practice — an overlay
+ * whose channel is unsubscribed draws nothing, and without this the pane just looks broken.
+ */
+function OverlayWhy({ name, enabled }: { name: string; enabled: boolean }): React.JSX.Element {
+  const setWhy = useStudio((s) => s.setWhy);
+  const channels = OVERLAY_SOURCES[name as keyof typeof OVERLAY_SOURCES]?.channels ?? [];
+  return (
+    <button
+      type="button"
+      className="linklike why-dot"
+      data-testid={`overlay-why-${name}`}
+      aria-label={`What draws the ${name} overlay${channels.length > 0 ? `, from ${channels.join(", ")}` : ""}`}
+      title={channels.length > 0 ? `drawn from ${channels.join(", ")} (§3.6)` : "drawn from the world payload (§4)"}
+      onClick={(e) => {
+        // The label wraps a checkbox, so a click here would otherwise toggle the overlay as well.
+        e.preventDefault();
+        e.stopPropagation();
+        setWhy(overlaySubject(name, enabled));
+      }}
+    >
+      why
+    </button>
+  );
+}
 
 export function OverlayMenu(): React.JSX.Element {
   const [open, setOpen] = useState(false);
@@ -57,8 +87,9 @@ export function OverlayMenu(): React.JSX.Element {
                 disabled={gtLocked && entry.groundTruth}
                 onChange={(e) => void engine.setOverlay(entry.name as OverlayName, e.target.checked)}
               />
-              <span>{overlayLabel(entry.name as OverlayName)}</span>
+              <span className="grow">{overlayLabel(entry.name as OverlayName)}</span>
               {entry.groundTruth ? <span className="gt-tag">GT</span> : null}
+              <OverlayWhy name={entry.name} enabled={overlays[entry.name as OverlayName] === true} />
             </label>
           ))}
           {notDrawable.length > 0 ? (
@@ -67,12 +98,22 @@ export function OverlayMenu(): React.JSX.Element {
               {notDrawable.map((entry) => (
                 <label key={entry.name} className="disabled">
                   <input type="checkbox" checked={false} disabled readOnly />
-                  <span>{overlayLabel(entry.name as OverlayName)}</span>
+                  <span className="grow">{overlayLabel(entry.name as OverlayName)}</span>
                   {entry.groundTruth ? <span className="gt-tag">GT</span> : null}
+                  <OverlayWhy name={entry.name} enabled={false} />
                 </label>
               ))}
             </>
           ) : null}
+          <div className="sec">Subscriptions</div>
+          <div className="note" style={{ margin: "2px 6px 6px" }}>
+            <code>tx_pulses</code>, <code>links</code> and <code>cbr_heatmap</code> are fed by{" "}
+            <code>node.tx</code>, <code>phy.rx</code> and <code>mac.cbr</code>, which §6.12 subscribes only
+            while a node is followed — those three carry millions of records a simulated second otherwise.
+            Click a vehicle and they fill; clear the selection and they stop. Every row&rsquo;s{" "}
+            <em>why</em> names its channel.
+          </div>
+
           {serverOnly.length > 0 ? (
             <>
               <div className="sec">Engine offers, viewer cannot draw</div>

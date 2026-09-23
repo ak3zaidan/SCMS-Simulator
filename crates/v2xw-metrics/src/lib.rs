@@ -19,6 +19,7 @@
 //! | [`channels`] | reader-side views of the event channels of 03-interfaces.md §14 |
 //! | [`comms`], [`security`], [`detection`], [`safety`], [`runtime`] | the five metric families |
 //! | [`invariants`] | each stated invariant as a runnable check that returns which invariant failed and with what numbers |
+//! | [`gate`] | the model-card completeness gate of 10-roadmap.md Phase 6, as a function over the registry: no `todo-calibrate` on a `high`-tier default without a tracked calibration issue |
 //! | [`ledger`] | the decoded record history the invariant checks read |
 //! | [`arrow_out`] | Arrow record batches for tabular output |
 //! | [`summary`] | the run-manifest summary, and the digest runtime diagnostics cannot enter |
@@ -127,6 +128,7 @@ pub mod comms;
 pub mod def;
 pub mod detection;
 pub mod error;
+pub mod gate;
 pub mod invariants;
 pub mod ledger;
 pub mod provider;
@@ -141,6 +143,7 @@ pub mod vis;
 pub use def::{Agg, Dim, DimValue, Dims, MetricDef, MetricSample, SampleValue};
 pub use detection::{Cell, ConfusionMatrix, DetectionLevel};
 pub use error::{MetricError, Result};
+pub use gate::{CalibrationIssue, GateFailure, GateReport, IssueRegister, IssueState};
 pub use invariants::{InvariantOutcome, InvariantReport, InvariantViolation, check_all};
 pub use ledger::EventLedger;
 pub use provider::{MetricProvider, ProviderSet};

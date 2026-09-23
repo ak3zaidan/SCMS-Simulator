@@ -29,7 +29,9 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use v2xw_core::card::{Tier, ValidationStatus};
 
+use super::bytes::{ByteProvenance, ByteProvenanceReport};
 use super::tables::DatasetProfile;
 
 /// One file the dataset wrote, with its digest — the manifest's `outputs` list.
@@ -63,6 +65,70 @@ impl Default for StandardsProfile {
     }
 }
 
+/// One model card that produced a number in a dataset, with the two things a consumer
+/// needs beyond its name.
+///
+/// The legacy manifest carried `(id, version)`. That is enough to *identify* the model and
+/// not enough to *use* it: a dataset is only as good as the validation status of the models
+/// behind it, and 08-measurement-and-data.md §6 asks the datasheet to say what produced its
+/// numbers. A reader who has to open the documentation site to find out whether the
+/// propagation model behind a PDR column was ever compared to anything is a reader who will
+/// not do it.
+///
+/// `content_hash` is the registry's own hash of the card's canonical bytes, so a replay
+/// that used a different card with the same id and version is detectable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelProvenance {
+    /// The model's registry id.
+    pub id: String,
+    /// Its version.
+    pub version: String,
+    /// How far its validation got, in the card schema's own vocabulary.
+    pub validation_status: ValidationStatus,
+    /// The registry's content hash of the card, lower-case hex.
+    pub content_hash: String,
+    /// How many of its parameters are still `todo-calibrate`.
+    ///
+    /// A number, not a flag: a model with one uncited default is a different object from
+    /// one with forty, and both are legitimately registered.
+    pub todo_calibrate: u32,
+    /// The tiers the card declares.
+    pub tiers: Vec<String>,
+}
+
+impl ModelProvenance {
+    /// Every registration in a registry, in id order — the list an engine hands the
+    /// exporter.
+    ///
+    /// In id order rather than registration order, for the reason
+    /// [`v2xw_core::registry::Registry::iter_by_id`] exists: the order two runs load their
+    /// plug-ins in must not show up in anything the run produces.
+    #[must_use]
+    pub fn from_registry(registry: &v2xw_core::registry::Registry) -> Vec<Self> {
+        registry
+            .iter_by_id()
+            .map(|(_, entry)| ModelProvenance {
+                id: entry.card.id.clone(),
+                version: entry.card.version.clone(),
+                validation_status: entry.card.validation.status,
+                content_hash: entry.content_hash_hex(),
+                todo_calibrate: u32::try_from(entry.card.todo_calibrate().count())
+                    .unwrap_or(u32::MAX),
+                tiers: entry.card.tier.iter().map(Tier::to_string).collect(),
+            })
+            .collect()
+    }
+
+    /// True when the model was compared against something outside this repository.
+    #[must_use]
+    pub fn externally_checked(&self) -> bool {
+        matches!(
+            self.validation_status,
+            ValidationStatus::LiteratureChecked | ValidationStatus::FieldChecked
+        )
+    }
+}
+
 /// The provenance an exporter is handed, rather than one it invents.
 ///
 /// Every field here is something only the engine knows, and the exporter refuses to guess
@@ -89,7 +155,25 @@ pub struct RunProvenance {
     /// from.
     pub content_digest: String,
     /// Every model card that produced a number in this dataset, as `(id, version)`.
+    ///
+    /// The legacy key set. [`RunProvenance::models`] carries the same models with their
+    /// validation status and card hash; an engine that fills it need not fill this one, and
+    /// [`DatasetManifest::new`] derives this list from that one when this one is empty.
     pub model_cards: Vec<(String, String)>,
+    /// The same models with their validation status, card hash and calibration debt.
+    ///
+    /// Empty means the engine did not supply it, and the datasheet says so rather than
+    /// implying that no model was involved.
+    #[serde(default)]
+    pub models: Vec<ModelProvenance>,
+    /// What produced each message type's bytes: a real encoder, or a size model.
+    ///
+    /// Keyed by the `msg_type` spelling `node.tx` carries. Declared by the engine, because
+    /// only the layer that chose the codec knows; this crate joins the declaration against
+    /// the recording and counts an undeclared type's bytes as neither real nor modelled
+    /// ([`super::bytes`]).
+    #[serde(default)]
+    pub message_encodings: BTreeMap<String, ByteProvenance>,
     /// The scenario configuration, verbatim, so the run can be replayed from the manifest.
     pub config: BTreeMap<String, serde_json::Value>,
     /// The world bundle's licence, where the world came from licensed data
@@ -137,8 +221,23 @@ pub struct DatasetManifest {
     pub recording_content_digest: String,
     /// The engine's version and commit.
     pub engine: BTreeMap<String, String>,
-    /// The model cards that produced the numbers.
+    /// The model cards that produced the numbers, in the legacy `(id, version)` shape.
     pub model_cards: Vec<BTreeMap<String, String>>,
+    /// The same models with their validation status, card hash and calibration debt.
+    ///
+    /// Beyond the legacy key set; a v1 consumer ignores it. Empty when the engine supplied
+    /// none, which the datasheet reports rather than glossing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelProvenance>,
+    /// Which of this dataset's byte counts came from real bytes and which from a size
+    /// model.
+    ///
+    /// `None` when the writer was not given a tally — a dataset assembled by hand rather
+    /// than from a recording. The datasheet distinguishes "no transmission was recorded"
+    /// from "nobody told the writer", because the first is a fact about the run and the
+    /// second is a gap in the exporter's inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_provenance: Option<ByteProvenanceReport>,
     /// The profile these tables are in.
     pub profile: DatasetProfile,
     /// The leakage linter's verdict over this dataset's node-visible files.
@@ -200,21 +299,49 @@ impl DatasetManifest {
             world_hash: prov.world_hash.clone(),
             recording_content_digest: prov.content_digest.clone(),
             engine,
-            model_cards: prov
-                .model_cards
-                .iter()
-                .map(|(id, version)| {
-                    let mut m = BTreeMap::new();
-                    m.insert("id".to_string(), id.clone());
-                    m.insert("version".to_string(), version.clone());
-                    m
-                })
-                .collect(),
+            model_cards: if prov.model_cards.is_empty() {
+                // Derived from the richer list rather than left empty: the legacy key is
+                // what the frozen audit reads by name, and an engine that filled only the
+                // new field should not silently lose it.
+                prov.models
+                    .iter()
+                    .map(|m| {
+                        let mut entry = BTreeMap::new();
+                        entry.insert("id".to_string(), m.id.clone());
+                        entry.insert("version".to_string(), m.version.clone());
+                        entry
+                    })
+                    .collect()
+            } else {
+                prov.model_cards
+                    .iter()
+                    .map(|(id, version)| {
+                        let mut m = BTreeMap::new();
+                        m.insert("id".to_string(), id.clone());
+                        m.insert("version".to_string(), version.clone());
+                        m
+                    })
+                    .collect()
+            },
+            models: prov.models.clone(),
+            byte_provenance: None,
             profile,
             leakage_lint,
             world_licence: prov.world_licence.clone(),
             world_attribution: prov.world_attribution.clone(),
         }
+    }
+
+    /// Attaches the byte-provenance verdict.
+    ///
+    /// A builder rather than a `new` argument because the verdict is a join between the
+    /// dataset's own tally and the engine's codec declaration, and the writer is the only
+    /// place that holds both. Taking it here also keeps the legacy constructor's signature,
+    /// which every existing caller and test uses.
+    #[must_use]
+    pub fn with_byte_provenance(mut self, report: ByteProvenanceReport) -> Self {
+        self.byte_provenance = Some(report);
+        self
     }
 
     /// The manifest's bytes: `json.dumps(indent=2, sort_keys=True)` plus a trailing

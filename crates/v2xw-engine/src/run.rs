@@ -649,6 +649,17 @@ impl Engine {
         &self.report
     }
 
+    /// The Phase 2 path's state, when the scenario declared one.
+    ///
+    /// Read-only. It exists so that a caller can ask a *built* engine which roadside unit
+    /// carries which role — [`crate::phase2::Phase2::rsus_with_role`] — without running a
+    /// scenario to its horizon to find out. The run loop reaches the field directly and
+    /// does not go through this.
+    #[must_use]
+    pub fn phase2(&self) -> Option<&crate::phase2::Phase2> {
+        self.phase2.as_ref()
+    }
+
     /// **A test hook, not a model parameter.** Walks the node phase in reverse id order.
     ///
     /// The phase reads each node's own inbox and writes only its own state, so the
@@ -712,9 +723,15 @@ impl Engine {
     /// mobility snapshot, and nothing spawns or retires it. So it is created here, at
     /// build, and the reception phase finds it through [`Engine::rsus`] rather than through
     /// a grid query. Its runtime is an [`ObuRuntime`] on an RSU hardware profile with no
-    /// message services, because 06-node-models.md §3's RSU runtime — roles, failure
-    /// states, store-and-forward — does not ship in `v2xw-node`; what it does here is
-    /// receive, and put the CRL on the air when the backend hands it one.
+    /// message services; what it does here is receive, and put the CRL on the air when the
+    /// backend hands it one. 06-node-models.md §3's roadside runtime — roles, failure
+    /// states, store-and-forward — now ships as [`v2xw_node::RsuRuntime`] and this site
+    /// has not been moved onto it; see `crate::phase2`'s "What is not here".
+    ///
+    /// The node ids are minted here, **before** the timeline is seeded and therefore
+    /// before any vehicle's, from the same counter vehicle spawn uses. That ordering is
+    /// published: `v2xw-server`'s live projector reconstructs the actor→node map from it
+    /// and offsets its own counter by the roadside count.
     fn create_rsus(&mut self) {
         let Some(phase2) = self.phase2.as_mut() else {
             return;
@@ -2395,24 +2412,21 @@ impl Engine {
             AppPayload::Report(report) => {
                 // Only a unit with the `report-forward` role carries a report onward; a
                 // vehicle that happens to overhear one does nothing with it, which is what
-                // makes the role a decision rather than a label.
+                // makes the role a decision rather than a label. The question is asked of
+                // **this** unit: asking whether any declared unit carries the role made
+                // the role a property of the scenario instead of the mast.
                 let forwards = self
                     .phase2
                     .as_ref()
-                    .zip(self.rsus.get(&rx))
-                    .map(|(p, _)| {
-                        p.rsu_specs()
-                            .iter()
-                            .any(|s| s.has_role("report-forward") || s.roles.is_empty())
-                    })
-                    .unwrap_or(false);
+                    .is_some_and(|p| p.rsu_has_role(rx, "report-forward"));
                 if !forwards {
                     return;
                 }
+                // And it is this unit's backhaul that is paid for, not the first one's.
                 let latency = self
                     .phase2
                     .as_ref()
-                    .and_then(|p| p.rsu_specs().first().map(|s| s.backhaul))
+                    .and_then(|p| p.rsu_spec_of(rx).map(|s| s.backhaul))
                     .unwrap_or(Duration::ZERO);
                 let at = latency.after(now);
                 if at > horizon {
@@ -2491,6 +2505,14 @@ impl Engine {
         };
         let at = revocation.latency.after(now);
         if at > horizon {
+            // The revocation was issued and the run ends before the backend's own latency
+            // would have put it on the air. Counted, because `crls_issued` without
+            // `crl_broadcasts` otherwise looks exactly like a roadside path that is not
+            // wired up, and those want opposite responses: a longer `time.duration_s`
+            // against a defect in this file.
+            if let Some(phase2) = self.phase2.as_mut() {
+                phase2.note_crl_past_horizon();
+            }
             return;
         }
         let _ = to;
@@ -2510,20 +2532,16 @@ impl Engine {
         else {
             return;
         };
+        // The units that carry the `crl` role, each asked about itself. The predicate
+        // used to ignore the unit it was filtering and ask whether *any* declared unit
+        // carried the role, so a scenario with two masts had the one without the role
+        // broadcast as well — and the counterexample test that says a unit with no `crl`
+        // role puts nothing on the air held only because the shipped scenario declares
+        // exactly one unit.
         let broadcasters: Vec<NodeId> = self
             .phase2
             .as_ref()
-            .map(|p| {
-                p.rsu_nodes()
-                    .iter()
-                    .copied()
-                    .filter(|_| {
-                        p.rsu_specs()
-                            .iter()
-                            .any(|s| s.has_role("crl") || s.roles.is_empty())
-                    })
-                    .collect()
-            })
+            .map(|p| p.rsus_with_role("crl"))
             .unwrap_or_default();
         for rsu in broadcasters {
             let Some(signer) = self

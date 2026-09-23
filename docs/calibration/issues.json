@@ -1,0 +1,40 @@
+{
+  "_README": [
+    "The calibration-issue register, schema v2xw/calibration-issues/1.",
+    "",
+    "This file is the second half of the Phase 6 model-card completeness gate. The first",
+    "half is registry rule R1, which the card schema enforces at registration: a parameter",
+    "whose source is `todo-calibrate` must carry a calibration *plan*, or the model cannot",
+    "be registered at all. A plan is a sentence an implementer wrote. This file records",
+    "which of those plans somebody has TAKEN ON: an id, an owner, a state, and the",
+    "measurement that would close it.",
+    "",
+    "`issues` IS EMPTY, AND THAT IS THE TRUE STATE OF THE PROJECT, NOT A PLACEHOLDER.",
+    "Nobody has been assigned a calibration measurement. The gate therefore fails on every",
+    "uncalibrated high-tier default in the registry, and `docs/RELEASE-CHECKLIST.md` carries",
+    "the number. Writing issues into this file with no owner behind them would turn the gate",
+    "green without a single measurement being made, which is the exact failure the gate",
+    "exists to prevent; `_example` below shows the shape without being read as data.",
+    "",
+    "The gate is implemented in `crates/v2xw-metrics/src/gate.rs` and run by",
+    "`docs/site/tools/cardgen --gate`. See `docs/calibration/README.md` for the pattern",
+    "grammar and for how to open an issue.",
+    "",
+    "Keys beginning with an underscore are ignored by the parser; this block and `_example`",
+    "are two of them."
+  ],
+  "schema": "v2xw/calibration-issues/1",
+  "_example": {
+    "id": "CAL-001",
+    "title": "Cohda MK5 SXF1700 sign and verify throughput are not published",
+    "owner": "name of the person who will bench the device",
+    "state": "open",
+    "covers": [
+      "obu/cohda-mk5::hsm.ops.ecdsa-p256-sign.*",
+      "obu/cohda-mk5::hsm.ops.ecdsa-p256-verify.latency_us"
+    ],
+    "measurement": "Bench an MK5 through the Cohda SDK security API: 10,000 back-to-back sign and verify calls, report the median and the 95th percentile service time and the observed queue depth. Until then the profile's service time is 1/throughput from a flagged SAF5400 proxy.",
+    "tracker": "wherever this project tracks work"
+  },
+  "issues": []
+}

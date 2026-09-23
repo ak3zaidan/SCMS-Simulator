@@ -355,8 +355,18 @@ def render(text, link_rewriter=None, heading_offset=0):
 _INCLUDE_RE = re.compile(
     r"^\{%\s*include\s+(?P<path>[^\s#%]+)"
     r"(?:#(?P<heading>[^%|]+?))?"
-    r"(?:\|\s*demote\s*=\s*(?P<demote>\d+)\s*)?%\}\s*$"
+    # The `\s*` matters: without it, `{% include path | demote=1 %}` -- a whole-file
+    # include with a demote and no heading -- did not match, because only the optional
+    # heading group could absorb the space before the pipe. The directive then fell
+    # through to the paragraph renderer and was printed as literal text, which is the
+    # silent drop this module's docstring says must not happen.
+    r"\s*(?:\|\s*demote\s*=\s*(?P<demote>\d+)\s*)?%\}\s*$"
 )
+
+# Anything that opens with an include directive, however malformed. A line that looks like
+# an include and does not parse is an error, not prose: emitting it verbatim is how a page
+# comes to be missing a whole document while looking finished.
+_INCLUDE_LOOSE_RE = re.compile(r"^\{%\s*include\b.*%\}\s*$")
 
 
 def _section_of(text, heading_prefix):
@@ -409,8 +419,11 @@ def expand_includes(text, repo_root, depth=0):
         raise IncludeError("include nesting deeper than 4 levels")
     out = []
     for line in text.split("\n"):
-        match = _INCLUDE_RE.match(line.strip())
+        stripped = line.strip()
+        match = _INCLUDE_RE.match(stripped)
         if not match:
+            if _INCLUDE_LOOSE_RE.match(stripped):
+                raise IncludeError("include: cannot parse directive: " + stripped)
             out.append(line)
             continue
         rel = match.group("path")

@@ -442,6 +442,47 @@ pub fn provenance() -> super::RunProvenance {
             ),
             ("threat/detector/legacy-12".to_string(), "1.0.0".to_string()),
         ],
+        models: vec![
+            super::ModelProvenance {
+                id: "radio/propagation/log-distance".to_string(),
+                version: "1.0.0".to_string(),
+                validation_status: v2xw_core::card::ValidationStatus::LiteratureChecked,
+                content_hash: "11".repeat(32),
+                todo_calibrate: 2,
+                tiers: vec!["medium".to_string(), "high".to_string()],
+            },
+            super::ModelProvenance {
+                id: "security/envelope/1609dot2".to_string(),
+                version: "1.0.0".to_string(),
+                validation_status: v2xw_core::card::ValidationStatus::UnitTested,
+                content_hash: "22".repeat(32),
+                todo_calibrate: 0,
+                tiers: vec!["medium".to_string()],
+            },
+            super::ModelProvenance {
+                id: "threat/detector/legacy-12".to_string(),
+                version: "1.0.0".to_string(),
+                validation_status: v2xw_core::card::ValidationStatus::Unvalidated,
+                content_hash: "33".repeat(32),
+                todo_calibrate: 5,
+                tiers: vec!["abstract".to_string(), "medium".to_string()],
+            },
+        ],
+        // The fixture's `node.tx` records all carry `msg_type: "bsm"`, and the J2735 BSM
+        // codec is the hand-written real one (04-models.md §8.4 lists PSM, SRM and SSM as
+        // the modelled ones), so the declaration says `uper`. `psm` is declared and unused,
+        // which exercises the report's stale-declaration row — a fixture that agreed with
+        // the implementation on every field would not test the join at all.
+        message_encodings: std::collections::BTreeMap::from([
+            (
+                "bsm".to_string(),
+                super::ByteProvenance::Real("uper".to_string()),
+            ),
+            (
+                "psm".to_string(),
+                super::ByteProvenance::SizeModel("1.0.0".to_string()),
+            ),
+        ]),
         config,
         world_licence: None,
         world_attribution: Vec::new(),

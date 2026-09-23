@@ -4,7 +4,16 @@ Living record of what is built and what has actually been *measured*, as against
 the plan in `10-roadmap.md` and the decisions in `12-build-decisions.md`. Claims
 here carry their evidence; anything unmeasured says so.
 
-Last updated 2026-09-18.
+Last updated 2026-09-18. **The crate table below is stale**: `v2xw-record`,
+`v2xw-metrics`, `v2xw-node` and `v2xw-engine` are no longer stubs, and the line counts
+predate several waves. It is left as written rather than rewritten from memory, because a
+status file whose numbers were re-estimated rather than re-measured is worse than one that
+says it is out of date.
+
+For the current release position — what must be true for a 1.0 tag, what is not true, and
+what each gap would take — see [`docs/RELEASE-CHECKLIST.md`](../RELEASE-CHECKLIST.md)
+(2026-09-22). The Phase 1 acceptance table below is still accurate and the checklist cites
+it.
 
 ## Crates
 

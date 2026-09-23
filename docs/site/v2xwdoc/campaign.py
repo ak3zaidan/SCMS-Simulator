@@ -60,6 +60,7 @@ against a hard-coded vocabulary is how a report loses rows in silence.
 
 import json
 import os
+import re
 
 from . import render
 from .cards import VALIDATION_STATUS, VALIDATION_ORDER
@@ -71,6 +72,8 @@ __all__ = [
     "load",
     "page",
     "contradictions",
+    "register_verdicts",
+    "never_checked",
     "MISSING_RUNS_HELP",
     "CAMPAIGN_SCHEMA",
 ]
@@ -282,6 +285,110 @@ def findings_for(model_id, registers):
     return out
 
 
+# A verdict word an independent reviewer wrote about a claim. Matched as whole words so
+# `FAILED` and `FAILURE` do not become `FAIL`, and normalised to the base word for the
+# label. Deliberately a small vocabulary: the point is to surface the sentences a human
+# reviewer wrote, not to parse them.
+_VERDICT_RE = re.compile(r"\b(PASSES|PASSED|PASS|FAILED|FAILS|FAIL|CONFIRMED|UNVERIFIED|RETRACTED)\b")
+
+_VERDICT_BASE = {
+    "PASS": "PASS",
+    "PASSES": "PASS",
+    "PASSED": "PASS",
+    "FAIL": "FAIL",
+    "FAILS": "FAIL",
+    "FAILED": "FAIL",
+    "CONFIRMED": "CONFIRMED",
+    "UNVERIFIED": "UNVERIFIED",
+    "RETRACTED": "RETRACTED",
+}
+
+VERDICT_CSS = {
+    "PASS": "ok",
+    "FAIL": "fail",
+    "CONFIRMED": "ok",
+    "UNVERIFIED": "warn",
+    "RETRACTED": "retracted",
+}
+
+# Worst-first, the order an honesty page reads best in.
+VERDICT_ORDER = ["FAIL", "UNVERIFIED", "RETRACTED", "CONFIRMED", "PASS"]
+
+
+def _sentences(text):
+    """`text` split into sentences, crudely and tolerantly."""
+    flat = re.sub(r"\s+", " ", text).strip()
+    if not flat:
+        return []
+    # Split after a full stop that is followed by a space and a capital or a quote. Not a
+    # real sentence splitter; it only has to cut prose into quotable pieces.
+    return [p.strip() for p in re.split(r"(?<=[.!?]) +(?=[A-Z\"\'(])", flat) if p.strip()]
+
+
+def register_verdicts(registers):
+    """Every verdict an independent reviewer stated, with the sentence it was stated in.
+
+    The seven registers under `docs/design/findings/` are not only defect lists: they are
+    where the builders' headline claims were independently re-derived, and the reviewers
+    wrote their verdicts as prose — "Byte identity: PASS, independently verified and sound
+    by construction", "Robustness: FAIL". That is real evidence about this engine and it
+    exists nowhere else in a machine-readable form, so this harvest lifts the sentences out
+    rather than leaving them for a reader to find in 1,400 lines of review.
+
+    It is a text harvest and it says so on the page. Nothing here interprets a verdict: the
+    sentence is reproduced as written, next to the register it came from, and the reader
+    judges it. A generated table that *scored* these would be inventing a measurement out
+    of prose, which is the failure this whole page exists to prevent.
+
+    Returns a list of dicts: `register`, `where`, `verdict`, `statement`.
+    """
+    out = []
+    for register in registers:
+        sections = [(heading, body) for heading, _level, body in register.other_sections]
+        sections.extend((f.heading, f.body) for f in register.findings)
+        for heading, body in sections:
+            for sentence in _sentences(body):
+                match = _VERDICT_RE.search(sentence)
+                if not match:
+                    continue
+                out.append(
+                    {
+                        "register": register,
+                        "where": heading,
+                        "verdict": _VERDICT_BASE[match.group(1).upper()],
+                        "statement": sentence,
+                    }
+                )
+    return out
+
+
+def never_checked(catalogue, campaign, registers):
+    """Every model about which no evidence of any kind exists.
+
+    Three sources have to be empty at once: the card names no validation reference and no
+    test, no validation case names the model, and no defect register mentions it. A model
+    that fails all three has not been checked, has not been measured and has not even been
+    *looked at* by an independent reviewer, and the only honest thing a validation report
+    can do is say so by name.
+
+    A model with a defect against it is **not** in this list, which reads oddly and is
+    right: a register finding means somebody read the code and re-derived something, so
+    evidence exists. It is bad evidence, and bad evidence is not no evidence.
+    """
+    by_model = campaign.by_model()
+    out = []
+    for model in catalogue.models:
+        validation = model.validation
+        if validation.get("references") or validation.get("tests"):
+            continue
+        if by_model.get(model.id):
+            continue
+        if findings_for(model.id, registers):
+            continue
+        out.append(model)
+    return out
+
+
 def contradictions(catalogue, campaign):
     """Every model whose card claims more than the runs support.
 
@@ -366,14 +473,16 @@ def page(catalogue, campaign, registers, repo_url=""):
             "displayed, so read the document itself before quoting this page.</p></div>"
         )
 
-    parts.append(_summary(catalogue, campaign))
+    parts.append(_summary(catalogue, campaign, registers))
     parts.append(_contradictions_section(catalogue, campaign))
+    parts.append(_never_checked_section(catalogue, campaign, registers))
     parts.append(_cases_section(campaign))
+    parts.append(_register_evidence_section(registers))
     parts.append(_per_model_section(catalogue, campaign, registers, repo_url))
     return "".join(parts)
 
 
-def _summary(catalogue, campaign):
+def _summary(catalogue, campaign, registers=()):
     total = len(catalogue.models)
     counts = catalogue.counts_by_status()
     external = sum(counts.get(s, 0) for s in EXTERNAL_STATUSES)
@@ -413,6 +522,19 @@ def _summary(catalogue, campaign):
             str(failed),
             "Outside it. A failing case blocks its models' tier from being labelled "
             "checked.",
+        ],
+        [
+            "Models with <strong>no evidence of any kind</strong>",
+            "<strong>" + str(len(never_checked(catalogue, campaign, registers))) + "</strong>",
+            "No validation reference, no named test, no validation case, and no mention in "
+            'any defect register. <a href="#never-checked">Listed by name below.</a>',
+        ],
+        [
+            "Verdicts stated by independent reviewers",
+            str(len(register_verdicts(registers))),
+            "Sentences in the defect registers in which a reviewer recorded a claim as "
+            'PASS, FAIL, CONFIRMED, UNVERIFIED or RETRACTED. <a href="#register-evidence">'
+            "Reproduced below as written.</a>",
         ],
     ]
     out = [
@@ -496,6 +618,148 @@ def _contradictions_section(catalogue, campaign):
             ["Model", "Card says", "Disagreement", "Cases", "What it means"],
             rows,
             "contradictions",
+        )
+    )
+    return "".join(out)
+
+
+def _never_checked_section(catalogue, campaign, registers):
+    models = never_checked(catalogue, campaign, registers)
+    out = [
+        '<h2 id="never-checked">Models about which no evidence of any kind exists'
+        '<a class="anchor" href="#never-checked">#</a></h2>'
+    ]
+    if not models:
+        out.append(
+            '<div class="callout callout-ok"><p>Every registered model has evidence of '
+            "<em>some</em> kind against it: a named reference, a named test, a validation "
+            "case, or a mention in a defect register. That is a low bar and it is the bar "
+            "this section checks; the rest of the page is about how good the evidence "
+            "is.</p></div>"
+        )
+        return "".join(out)
+    out.append(
+        "<p><strong>"
+        + str(len(models))
+        + "</strong> registered model(s) have <em>no</em> validation reference, <em>no</em> "
+        "named test, <em>no</em> validation case naming them, and <em>no</em> mention in any "
+        "defect register. Nothing has checked them, nothing has measured them, and no "
+        "independent reviewer has looked at them. A model with a defect recorded against it "
+        "is deliberately <em>not</em> in this list: a finding means somebody re-derived "
+        "something, and bad evidence is not no evidence.</p>"
+    )
+    rows = []
+    for model in models:
+        css, label, _meaning = VALIDATION_STATUS.get(
+            model.status, ("unvalidated", model.status, "")
+        )
+        rows.append(
+            [
+                '<a href="models.html#'
+                + model.anchor
+                + '"><code>'
+                + escape(model.id)
+                + "</code></a>",
+                escape(model.family),
+                ", ".join(model.tiers) or '<em class="dim">none</em>',
+                render.badge(css, label),
+                str(len(model.todo_parameters())),
+            ]
+        )
+    out.append(
+        render.table(
+            ["Model", "Family", "Tiers", "Card claims", "Uncited defaults"],
+            rows,
+            "never-checked",
+            ["left", "left", "left", "left", "right"],
+        )
+    )
+    out.append(
+        '<p class="dim">A card in this list that claims anything better than '
+        "<code>unvalidated</code> is claiming more than this repository can support, and "
+        'the <a href="#contradictions">contradiction table</a> says so too.</p>'
+    )
+    return "".join(out)
+
+
+def _register_evidence_section(registers):
+    """Verdicts the independent reviewers stated, reproduced as written."""
+    verdicts = register_verdicts(registers)
+    out = [
+        '<h2 id="register-evidence">What the independent reviewers concluded, in their own '
+        'words<a class="anchor" href="#register-evidence">#</a></h2>'
+    ]
+    if not registers:
+        out.append(
+            '<div class="callout callout-warn"><p>No registers were found under '
+            "<code>docs/design/findings/</code>, so this section is empty for a reason that "
+            "is about this build rather than about the engine.</p></div>"
+        )
+        return "".join(out)
+    out.append(
+        "<p>The "
+        + str(len(registers))
+        + " registers under <code>docs/design/findings/</code> are not only defect lists. "
+        "They are where the builders' headline claims were <em>independently re-derived</em> "
+        "— a second ASN.1 encoder, a second MCAP parser, a re-implementation of the packet-"
+        "error model in another language — and the reviewers recorded their verdicts as "
+        "prose. Those sentences are the strongest evidence this project has about itself, "
+        "and until now they existed only inside 1,400 lines of review.</p>"
+    )
+    out.append(
+        '<div class="callout"><p><strong>This is a text harvest, and nothing here '
+        "interprets it.</strong> Each row is a sentence from a register that contains a "
+        "verdict word, reproduced as its reviewer wrote it, with a link to the register. "
+        "The table does not score, weight or aggregate them: a generated table that turned "
+        "review prose into a number would be inventing a measurement, which is the failure "
+        "this page exists to prevent. Read the register before quoting a row.</p></div>"
+    )
+    if not verdicts:
+        out.append(
+            '<p class="dim">No register sentence carries a verdict word. Given the number '
+            "of findings on the register, that is more likely to be a limitation of this "
+            "harvest than a fact about the reviews.</p>"
+        )
+        return "".join(out)
+
+    counts = {}
+    for verdict in verdicts:
+        counts[verdict["verdict"]] = counts.get(verdict["verdict"], 0) + 1
+    legend = []
+    for name in VERDICT_ORDER:
+        if name not in counts:
+            continue
+        legend.append(
+            [render.badge(VERDICT_CSS.get(name, "unknown"), name), str(counts[name])]
+        )
+    for name in sorted(k for k in counts if k not in VERDICT_ORDER):
+        legend.append([render.badge("unknown", name + " (unranked)"), str(counts[name])])
+    out.append(render.table(["Verdict", "Statements"], legend, "verdict-counts", ["left", "right"]))
+
+    rank = {name: i for i, name in enumerate(VERDICT_ORDER)}
+    rows = []
+    for verdict in sorted(
+        verdicts,
+        key=lambda v: (rank.get(v["verdict"], 9), v["register"].slug, v["where"]),
+    ):
+        register = verdict["register"]
+        rows.append(
+            [
+                render.badge(VERDICT_CSS.get(verdict["verdict"], "unknown"), verdict["verdict"]),
+                '<a href="defects.html#r-'
+                + escape(register.slug)
+                + '">'
+                + escape(register.title)
+                + "</a>",
+                escape(verdict["where"][:80]),
+                escape(verdict["statement"][:400]),
+            ]
+        )
+    out.append(
+        render.table(
+            ["Verdict", "Register", "About", "As the reviewer wrote it"],
+            rows,
+            "register-verdicts",
         )
     )
     return "".join(out)

@@ -48,3 +48,12 @@ Krishnan PDR curve, the CBR-versus-density curve, Bazzi's per-distance figures. 
 cases ship **disabled** rather than absent, so the report shows what is missing instead
 of showing a shorter list. A `disabled` outcome is a statement about the literature's
 availability, not about the model.
+
+**Two sections are worth reading before the tables.** *Models about which no evidence of any
+kind exists* names every model with no reference, no test, no validation case and no mention
+in any defect register — the models about which this project can say nothing at all. *What
+the independent reviewers concluded, in their own words* harvests the verdict sentences out
+of the seven defect registers, where the builders' headline claims were re-derived by
+somebody who wrote their own tooling to do it. Those sentences are the strongest evidence
+this project has about itself, and until they were harvested they existed only inside
+1,400 lines of review.

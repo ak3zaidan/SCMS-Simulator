@@ -247,6 +247,17 @@ table.findings td:nth-child(4) { min-width: 18rem; }
 .badge-field-checked { color: var(--ok-rule); border-color: var(--ok-rule); font-weight: 650; }
 .badge-standard, .badge-paper, .badge-datasheet, .badge-dataset { color: var(--accent); border-color: var(--accent); }
 .badge-tier, .badge-rng, .badge-norng, .badge-code { color: var(--ink-dim); }
+/* Outcome and gate-reason modifiers, used by the validation-campaign and completeness-gate
+   pages. Colour is never the only signal: every badge carries its own word. */
+.badge-fail { color: var(--crit); border-color: var(--crit); font-weight: 650; }
+.badge-warn { color: var(--high); border-color: var(--high); font-weight: 600; }
+.badge-ok { color: var(--ok-rule); border-color: var(--ok-rule); }
+.badge-disabled, .badge-notrun { color: var(--low); border-style: dashed; }
+
+/* A gate failure table is wide and every column earns its place, so the two prose columns
+   get a floor rather than wrapping to one word per line. */
+table.gate-failures td:nth-child(5), table.gate-failures td:nth-child(7) { min-width: 14rem; }
+table.gate-summary td:nth-child(2), table.gate-summary th:nth-child(2) { text-align: right; }
 
 .chips { margin: 0.4rem 0 0.8rem; }
 .chips .badge { margin-right: 0.3rem; }

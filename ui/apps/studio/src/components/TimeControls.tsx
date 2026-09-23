@@ -13,13 +13,24 @@
  * step is 3,000 `run.seek` calls, each one pausing the run, each one followed by a `run.status`
  * poll. While the pointer (or an arrow key) is down the value is held in local state, which also
  * stops the 5 Hz stream from fighting the thumb; one `run.seek` goes out when the gesture ends.
+ *
+ * Two additions to that sketch:
+ *
+ *  * **A recording takes the bar over.** With a local recording open (09-ui §7) the scrub drives the
+ *    WebAssembly reader instead of `run.seek`, over the recording's own span, and the transport —
+ *    play, pause, step, speed — is disabled, because a recording has none of those: it has a seek.
+ *  * **Side B follows.** While the comparison view is synchronised, every control that moves side
+ *    A's clock moves side B's afterwards, never in parallel (§6.6 R4 puts a seek's frames before its
+ *    reply, and two in flight would interleave).
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { compare } from "../state/compare.js";
 import { engine } from "../state/engine.js";
 import { useStudio } from "../state/store.js";
 import { simClock } from "../lib/format.js";
+import { eventSubject } from "../lib/provenance.js";
 
 /** Speeds the selector offers, within the 0.1×–100× range 09-ui §6 asks for. */
 const SPEEDS = [0.1, 0.25, 0.5, 1, 2, 5, 10, 25, 50, 100];
@@ -37,48 +48,100 @@ export function TimeControls(): React.JSX.Element {
   const timeline = useStudio((s) => s.timeline);
   const hello = useStudio((s) => s.hello);
   const connection = useStudio((s) => s.connection);
+  const replay = useStudio((s) => s.replay);
+  const compareSide = useStudio((s) => s.compare);
+  const compareSync = useStudio((s) => s.compareSync);
+  const setWhy = useStudio((s) => s.setWhy);
   const [stepUnit, setStepUnit] = useState<"step" | "keyframe" | "second">("step");
   const [busy, setBusy] = useState(false);
   /** The value under the thumb while a scrub gesture is in flight; `null` when it is not. */
   const [scrubNs, setScrubNs] = useState<number | null>(null);
+  const [eventsOpen, setEventsOpen] = useState(false);
   const scrubRef = useRef<number | null>(null);
 
-  const endNs = run.tEndNs > 0 ? run.tEndNs : hello?.simDurationNs ?? 0;
-  const streamNs = simTimeNs > 0 ? simTimeNs : run.tNs;
+  /**
+   * Which clock the bar is driving.
+   *
+   * A local recording wins over a connection whenever one is open, because that is also what the
+   * viewport is showing: `StudioEngine.openLocalRecording` detaches the stream from the viewer, so
+   * a bar that kept issuing `run.seek` would move a run nobody can see. §7.3 makes the recording's
+   * own seek the cheaper of the two anyway — one chunk and one keyframe period of deltas.
+   */
+  const drivingReplay = replay !== null;
+  const endNs = drivingReplay ? replay.endNs : run.tEndNs > 0 ? run.tEndNs : hello?.simDurationNs ?? 0;
+  const startNs = drivingReplay ? replay.startNs : 0;
+  const streamNs = drivingReplay ? replay.tNs : simTimeNs > 0 ? simTimeNs : run.tNs;
   // The clock, the fill and the thumb all read the dragged value, so the readout stays live while
   // the gesture is in flight and no seek has been issued yet.
   const nowNs = scrubNs ?? streamNs;
-  const fraction = endNs > 0 ? Math.min(1, Math.max(0, nowNs / endNs)) : 0;
-  const connected = connection === "streaming";
+  const fraction = endNs > startNs ? Math.min(1, Math.max(0, (nowNs - startNs) / (endNs - startNs))) : 0;
+  const connected = connection === "streaming" || drivingReplay;
+  /** The transport — play, pause, step, speed — exists only for a run. A recording has none. */
+  const transportLive = connection === "streaming" && !drivingReplay;
 
-  const call = useCallback(async (fn: () => Promise<unknown>) => {
-    setBusy(true);
-    try {
-      await fn();
-    } catch {
-      /* logged by engine.request */
-    } finally {
-      setBusy(false);
-      void engine.refreshStatus();
-    }
-  }, []);
+  const call = useCallback(
+    async (fn: () => Promise<unknown>) => {
+      setBusy(true);
+      try {
+        await fn();
+      } catch {
+        /* logged by engine.request */
+      } finally {
+        setBusy(false);
+        if (!drivingReplay) await engine.refreshStatus();
+        // A step, a pause or a resume moves side A's clock too, so side B follows it here rather
+        // than only on a scrub: `run.status` has just been refreshed, so this reads the new time.
+        if (compareSide !== null && compareSync.time) {
+          const state = useStudio.getState();
+          await compare.seekTo(state.simTimeNs > 0 ? state.simTimeNs : state.run.tNs);
+        }
+      }
+    },
+    [compareSide, compareSync.time, drivingReplay],
+  );
 
   const marks = useMemo(() => {
-    if (endNs <= 0) return [];
+    if (endNs <= startNs) return [];
     const seen = new Map<string, { left: number; channel: string; label: string; tNs: number }>();
     for (const m of timeline) {
-      const left = Math.min(100, Math.max(0, (m.tNs / endNs) * 100));
+      const left = Math.min(100, Math.max(0, ((m.tNs - startNs) / (endNs - startNs)) * 100));
       const key = `${m.channel}:${left.toFixed(2)}`;
       if (!seen.has(key)) seen.set(key, { left, channel: m.channel, label: m.label, tNs: m.tNs });
     }
     return [...seen.values()];
-  }, [timeline, endNs]);
+  }, [timeline, endNs, startNs]);
+
+  /**
+   * Whether a seek also moves the comparison side.
+   *
+   * The two runs share one simulated clock while `compareSync.time` is on, which is what "two runs
+   * side by side with synchronised time" means (09-ui §6). Side B is always moved *after* side A,
+   * never in parallel: a `run.seek` streams its keyframe and deltas before its reply (§6.6 R4), so
+   * two of them in flight on one main thread would interleave their frames.
+   *
+   * Every transport control routes through {@link call}, which does that follow-up once. `seekTo`
+   * therefore issues side A's seek only — issuing B's here as well would seek a recording twice for
+   * one gesture.
+   */
+  const syncB = compareSide !== null && compareSync.time;
+
+  const seekOne = useCallback(
+    async (tNs: number): Promise<void> => {
+      const target = Math.round(tNs);
+      if (drivingReplay) {
+        await engine.seekLocalReplay(target);
+        return;
+      }
+      await engine.request("run.seek", { t_ns: target, pause_after: true });
+    },
+    [drivingReplay],
+  );
 
   const seekTo = useCallback(
     (tNs: number) => {
-      void call(() => engine.request("run.seek", { t_ns: Math.round(tNs), pause_after: true }));
+      void call(() => seekOne(tNs));
     },
-    [call],
+    [call, seekOne],
   );
 
   /**
@@ -96,15 +159,16 @@ export function TimeControls(): React.JSX.Element {
     }
     setBusy(true);
     try {
-      await engine.request("run.seek", { t_ns: Math.round(value), pause_after: true });
+      await seekOne(value);
+      if (compareSide !== null && compareSync.time) await compare.seekTo(Math.round(value));
     } catch {
       /* logged by engine.request */
     } finally {
       setBusy(false);
-      await engine.refreshStatus();
+      if (!drivingReplay) await engine.refreshStatus();
       setScrubNs(null);
     }
-  }, []);
+  }, [compareSide, compareSync.time, seekOne, drivingReplay]);
 
   // A range thumb dragged past the edge of the input releases the pointer somewhere else, so the
   // release is caught on the window rather than on the element.
@@ -125,9 +189,9 @@ export function TimeControls(): React.JSX.Element {
         <button
           type="button"
           className="icon"
-          title="Seek to the start (run.seek t_ns=0)"
+          title="Seek to the start of the span"
           disabled={!connected || busy}
-          onClick={() => seekTo(0)}
+          onClick={() => seekTo(startNs)}
           data-testid="seek-start"
         >
           ◀◀
@@ -137,7 +201,7 @@ export function TimeControls(): React.JSX.Element {
           className="icon"
           title="Step back one mobility step — run.seek t_ns = now − Δt_mob"
           disabled={!connected || busy}
-          onClick={() => seekTo(Math.max(0, nowNs - (hello?.mobilityStepNs ?? 1e8)))}
+          onClick={() => seekTo(Math.max(startNs, nowNs - (hello?.mobilityStepNs ?? 1e8)))}
           data-testid="step-back"
         >
           ◀
@@ -147,7 +211,7 @@ export function TimeControls(): React.JSX.Element {
             type="button"
             className="icon primary"
             title="run.pause"
-            disabled={!connected || busy}
+            disabled={!transportLive || busy}
             onClick={() => void call(() => engine.request("run.pause", {}))}
             data-testid="pause"
           >
@@ -158,7 +222,7 @@ export function TimeControls(): React.JSX.Element {
             type="button"
             className="icon primary"
             title="run.resume"
-            disabled={!connected || busy}
+            disabled={!transportLive || busy}
             onClick={() => void call(() => engine.request("run.resume", {}))}
             data-testid="play"
           >
@@ -169,7 +233,7 @@ export function TimeControls(): React.JSX.Element {
           type="button"
           className="icon"
           title={`run.step {unit: ${stepUnit}, count: 1}`}
-          disabled={!connected || busy}
+          disabled={!transportLive || busy}
           onClick={() => void call(() => engine.request("run.step", { unit: stepUnit, count: 1 }))}
           data-testid="step"
         >
@@ -195,7 +259,7 @@ export function TimeControls(): React.JSX.Element {
         style={{ width: "auto" }}
         aria-label="Speed"
         data-testid="speed"
-        disabled={!connected}
+        disabled={!transportLive}
       >
         {SPEEDS.map((s) => (
           <option key={s} value={String(s)}>
@@ -207,21 +271,29 @@ export function TimeControls(): React.JSX.Element {
       <div className="scrub" data-testid="scrub">
         <div className="track" />
         <div className="fill" style={{ width: `${fraction * 100}%` }} />
+        {/*
+          Decorative: the range input sits above the track and owns every pointer event in this
+          box, so a marker cannot be clicked however it is marked up. The same events are reachable
+          by keyboard — and explainable — through the `events ▾` list at the end of the bar, which
+          is the accessible surface for them (09-ui §10) rather than a focusable element that
+          cannot be activated with a pointer.
+        */}
         {marks.map((m) => (
           <div
             key={`${m.channel}-${m.left}`}
             className="mark"
+            aria-hidden="true"
             style={{ left: `${m.left}%`, background: MARK_COLOR[m.channel] ?? "var(--accent)" }}
             title={`${m.channel} @ ${simClock(m.tNs)} — ${m.label}`}
           />
         ))}
         <input
           type="range"
-          min={0}
-          max={Math.max(1, endNs)}
+          min={startNs}
+          max={Math.max(startNs + 1, endNs)}
           step={hello?.mobilityStepNs ?? 1e8}
           value={nowNs}
-          disabled={!connected || endNs <= 0}
+          disabled={!connected || endNs <= startNs}
           aria-label="Scrub"
           aria-valuetext={simClock(nowNs)}
           data-testid="scrub-range"
@@ -262,9 +334,15 @@ export function TimeControls(): React.JSX.Element {
       <span className="clock" data-testid="sim-clock">
         {simClock(nowNs)}
       </span>
-      <span className="dim mono" title="run.status">
-        / {simClock(endNs)} · {run.state}
+      <span className="dim mono" title={drivingReplay ? "the recording's own span (§7.3)" : "run.status"}>
+        / {simClock(endNs)} · {drivingReplay ? "recording" : run.state}
       </span>
+      {syncB ? (
+        <span className="chip" data-testid="sync-chip" title="A scrub seeks both runs; see the Compare panel">
+          B synced{compareSync.offsetNs === 0 ? "" : ` ${(compareSync.offsetNs / 1e9).toFixed(1)} s`}
+        </span>
+      ) : null}
+
       {timeline.length > 0 ? (
         <button
           type="button"
@@ -279,6 +357,52 @@ export function TimeControls(): React.JSX.Element {
         >
           ⤼ event
         </button>
+      ) : null}
+
+      {timeline.length > 0 ? (
+        <div className="menu">
+          <button
+            type="button"
+            className="icon"
+            onClick={() => setEventsOpen((v) => !v)}
+            aria-expanded={eventsOpen}
+            data-testid="event-list-button"
+          >
+            events ▾ <span className="dim">{timeline.length}</span>
+          </button>
+          {eventsOpen ? (
+            <div className="menu-pop up wide" data-testid="event-list">
+              <div className="sec">Latest markers — activate to seek, or open the provenance</div>
+              {[...timeline]
+                .slice(-25)
+                .reverse()
+                .map((m, i) => (
+                  <div className="row" key={`${m.tNs}-${m.channel}-${m.nodeId}-${i}`}>
+                    <button
+                      type="button"
+                      className="linklike"
+                      disabled={!connected || busy}
+                      onClick={() => seekTo(m.tNs)}
+                      aria-label={`Seek to ${simClock(m.tNs)} — ${m.channel}, ${m.label}`}
+                    >
+                      {simClock(m.tNs)}
+                    </button>
+                    <span className="dim" style={{ color: MARK_COLOR[m.channel] ?? "var(--accent)" }}>
+                      {m.channel}
+                    </span>
+                    <button
+                      type="button"
+                      className="linklike grow"
+                      onClick={() => setWhy(eventSubject(m.channel, m.label, m.nodeId, m.provId))}
+                      aria-label={`Explain ${m.label} on node ${m.nodeId}`}
+                    >
+                      {m.label}
+                    </button>
+                  </div>
+                ))}
+            </div>
+          ) : null}
+        </div>
       ) : null}
     </div>
   );

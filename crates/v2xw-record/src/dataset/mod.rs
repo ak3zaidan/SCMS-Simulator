@@ -11,6 +11,7 @@
 //! | The forbidden-key registry and the linter | [`leakage`] |
 //! | The v1 and v2 table shapes | [`tables`] |
 //! | Channels → tables | [`assemble`] |
+//! | Which byte counts are real bytes and which are a size model | [`bytes`] |
 //! | A synthetic run covering every channel they read | [`fixture`] |
 //! | Views for channels `v2xw-metrics` has none for | [`views`] |
 //! | The declared float grids and the dataset scan | [`grids`] |
@@ -42,6 +43,7 @@
 //! consumed random numbers would change the run it was writing about.
 
 pub mod assemble;
+pub mod bytes;
 pub mod datasheet;
 pub mod fixture;
 pub mod grids;
@@ -57,9 +59,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub use assemble::{DatasetAssembler, MaDataset};
+pub use bytes::{ByteProvenance, ByteProvenanceReport, ByteProvenanceRow, MessageBytes, TxTally};
 pub use grids::{DatasetSchema, scan_dataset};
 pub use leakage::{LeakageReport, LeakageViolation, ViolationKind, is_forbidden_feature_key};
-pub use manifest::{DatasetManifest, OutputFile, RunProvenance};
+pub use manifest::{DatasetManifest, ModelProvenance, OutputFile, RunProvenance};
 pub use profiles::{LogProfile, ProfileSet};
 pub use tables::DatasetProfile;
 
@@ -283,8 +286,13 @@ impl DatasetWriter {
                 sha256: v2xw_core::hash::sha256_hex(bytes),
             })
             .collect();
-        let manifest =
-            DatasetManifest::new(profile, prov, dataset.counts(), outputs, lint.summary());
+        // The byte-provenance join happens here because this is the only place that holds
+        // both halves: the dataset's own tally of what was transmitted, and the engine's
+        // declaration of which codec produced each message type's bytes.
+        let byte_provenance =
+            self::bytes::ByteProvenanceReport::new(&dataset.tx, &prov.message_encodings);
+        let manifest = DatasetManifest::new(profile, prov, dataset.counts(), outputs, lint.summary())
+            .with_byte_provenance(byte_provenance);
         let manifest_bytes = manifest.to_bytes()?;
         let manifest_path = self.root.join("manifest.json");
         std::fs::write(&manifest_path, &manifest_bytes)
