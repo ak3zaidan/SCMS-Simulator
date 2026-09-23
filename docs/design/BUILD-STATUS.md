@@ -77,6 +77,37 @@ rather than re-running the builder's test.
 | 6 | Manifest lists engine, plug-in, world and card hashes | Pending. The world hash exists; manifest assembly is owed by `v2xw-engine`. |
 | 7 | Manual map-to-chase fly-down | The automated fly-down passes end to end against the mock engine. Needs a human to judge. |
 
+## 2026-09-23 — the measurement layer measures a real run
+
+What changed, with the evidence (details in `08-measurement-and-data.md` §2.7):
+
+- **Every reception attempt has one recorded fate** on `node.rx` (delivered, lost with one
+  cause, or in flight at the end), with every stamp of the message's journey. Checked on a
+  real 10-vehicle Manhattan run by `crates/v2xw-engine/tests/measurement.rs`: `node.rx`
+  count = `phy.rx` count = the run report's attempts, and M-RX1, M-LAT1, M-BYTE1, M-BYTE2,
+  M-SHARE and M-RANGE all hold with data to check. Shown to fail with delivery stamps
+  shifted by 1 ns (821 M-LAT1 violations).
+- **Frames carry their headers.** A BSM on the air is the SPDU plus 43 octets (WSMP 5,
+  LLC/SNAP 8, QoS Data MAC header 26, FCS 4); a CAM over GN/BTP plus 82. Air time is
+  computed over the whole PSDU. `net.layer: gn-btp` and `messages.generator` now reach the
+  engine (a 200 ms BSM interval halves the frames; shown to fail with the parameters
+  disconnected: ratio 1.0).
+- **The verification queue runs in continuous time**, so a backlog outlives a tick and a
+  frame waits from the instant it arrived. `node.verify` records now decode as the channel's
+  reader-side view; they did not, for any record, before.
+- **Measured on a 27-vehicle procedural grid, live in the page** (debug build): e2e p50
+  10.0-10.7 ms and p95 10.3-21.0 ms (10 s bins), of which the OBU's 9.0 ms HSM signature
+  is 61-86 % (30 s bins);
+  air time 0.30 ms; security envelope 56 % of the octets on the air.
+- **Finding for the radio track, not fixed here:** on that run 23-46 % of resolved reception
+  attempts were lost to collisions and the mean MAC deferral grew from 0.5 to 5.3 ms while
+  each node occupied 0.3 % of the channel. Every node generates at the same engine tick and
+  signs for exactly 9 ms, so every frame reaches the MAC in the same instant; the
+  decomposition (`latency_stage[mac_defer]`, `collision_rate`) is what makes this visible.
+- **Cost, measured:** with `metrics: [all]` the 100-vehicle Manhattan rung ran 23.6 s of
+  engine time for 2 simulated seconds against 14.6 s with `metrics: [pdr]` (debug). Most of
+  the difference is four providers each decoding every `node.rx` record from JSON.
+
 ## Correction, 2026-09-22 — the end-to-end run is a stub at the message layer
 
 An earlier entry here and my report to the owner both described the Phase 1 run
