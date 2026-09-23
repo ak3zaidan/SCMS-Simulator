@@ -88,6 +88,22 @@ pub trait RunRecorder {
     fn frames_written(&self) -> Option<u64> {
         None
     }
+
+    /// Whether the run should end now, before its horizon.
+    ///
+    /// [`crate::Engine::run`] asks this once per dispatched event and stops at the first
+    /// `true`, between two events, so a cancelled run never ends half-way through a
+    /// phase. It is the only cancellation point the kernel has, and it exists because a
+    /// run driven from a server must be stoppable: without it `run.stop` could only stop
+    /// *listening*, and the kernel thread kept computing to the horizon beside the next
+    /// run's — two simulations competing for the machine for every restart.
+    ///
+    /// Defaulted to `false`, so a batch recorder that always wants the whole run need not
+    /// know it exists. A cancelled run is not a result: its report covers the events up
+    /// to the cancellation and nothing after, and no caller should treat it as complete.
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 
 /// A recorder that keeps everything in memory, in emission order.

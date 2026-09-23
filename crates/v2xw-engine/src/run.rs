@@ -872,6 +872,12 @@ impl Engine {
             if key.time > horizon {
                 break;
             }
+            // The one cancellation point (see `RunRecorder::cancelled`): between two
+            // events, never inside a phase. Asked before the event is counted, so a
+            // cancelled run's report does not claim an event it did not run.
+            if recorder.cancelled() {
+                break;
+            }
             self.report.count(event.class());
             match event {
                 Event::Control { item, end } => self.on_control(item as usize, end),
