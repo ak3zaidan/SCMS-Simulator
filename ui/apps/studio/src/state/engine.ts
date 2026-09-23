@@ -224,7 +224,39 @@ export class StudioEngine {
    * remembered because `Hello.world_ref.str_url` is root-relative (§3.1.6): a pinned engine's world
    * has to be fetched from *that* origin, not from the page's.
    */
+  /**
+   * The connection attempt currently in flight, and the origin it is for.
+   *
+   * This exists because `#connectOnce` *starts* by tearing the previous client down, which is a
+   * teardown and not a guard. Two overlapping calls therefore had the second one close the first
+   * one's socket while it was still handshaking, and the browser reports exactly that: "WebSocket
+   * is closed before the connection is established", surfacing as a 1006 with no Hello. React's
+   * StrictMode double-invoke is the common way in, but any second caller does it — a reconnect
+   * landing on top of the mount, or the user pressing Run while the first attempt is still open.
+   *
+   * Whether it bit was a race on how long the `/healthz` probe took, which is why it looked
+   * intermittent: fast probe, the two calls overlap and it fails; slow probe, the first finishes
+   * first and it works.
+   */
+  #connectInFlight: { url: string; promise: Promise<HelloMessage> } | null = null;
+
+  /**
+   * Open the VWP connection, coalescing concurrent callers.
+   *
+   * A second call for the *same* origin joins the attempt already running instead of destroying
+   * it. A call for a *different* origin is a deliberate change of engine, so it supersedes.
+   */
   async connect(baseUrl = window.location.origin): Promise<HelloMessage> {
+    const inFlight = this.#connectInFlight;
+    if (inFlight && inFlight.url === baseUrl) return inFlight.promise;
+    const promise = this.#connectOnce(baseUrl).finally(() => {
+      if (this.#connectInFlight?.promise === promise) this.#connectInFlight = null;
+    });
+    this.#connectInFlight = { url: baseUrl, promise };
+    return promise;
+  }
+
+  async #connectOnce(baseUrl: string): Promise<HelloMessage> {
     this.disconnect();
     const store = useStudio.getState();
     store.setConnection("connecting");
@@ -441,6 +473,7 @@ export class StudioEngine {
 
   /** Tear the connection down; the viewer stays mounted. */
   disconnect(): void {
+    this.#connectInFlight = null;
     if (this.#storeTimer) clearInterval(this.#storeTimer);
     if (this.#statusTimer) clearInterval(this.#statusTimer);
     this.#storeTimer = null;

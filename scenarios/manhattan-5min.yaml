@@ -1,0 +1,153 @@
+# Five minutes of Midtown Manhattan with a fleet, not a single car.
+#
+# Derived from phase1-manhattan.yaml with two changes: the run lasts 300 simulated
+# seconds instead of 60, and the arrival rate is 1500 vehicles per hour instead of 30,
+# which settles at roughly 110 vehicles on the map at once.
+#
+# On this machine that is about two minutes of wall time at "as fast as possible".
+# Measured: ~113 vehicles costs about 0.38 wall seconds per simulated second over a
+# 300-second run. Larger fleets grow faster than linearly — a thousand vehicles for
+# five minutes is hours, not minutes — so this is deliberately the largest fleet that
+# stays comfortable.
+# Phase 1 vertical slice: one equipped vehicle on the real Manhattan street network,
+# broadcasting signed BSMs, recorded to MCAP.
+#
+# This is the document a researcher copies, so every line that is a *choice* says why it is
+# that choice. Run it with:
+#
+#     v2xw run scenarios/phase1-manhattan.yaml --out runs/phase1
+#
+# and inspect what it wrote with `v2xw info runs/phase1/recording.mcap`.
+schema: v2xw/scenario/1
+
+meta:
+  name: phase1-manhattan
+  description: >-
+    One equipped vehicle on the real Manhattan network (OSM), medium mobility and medium
+    radio fidelity, IEEE 1609.2-signed BSMs at 10 Hz from one hardware profile, recorded
+    with a keyframe every simulated second, measuring packet delivery ratio.
+  authors: [v2xw]
+  tags: [phase1, manhattan, osm, dsrc, signed]
+  created: "2026-09-22"
+
+# The master seed. Every RNG stream in the run is derived from this one number through
+# (RngDomain, EntityRef); change it and nothing else to get an independent replication.
+seed: "0xC0FFEE_5EED"
+
+time:
+  # Simulated wall time at t = 0. Nothing reads a real clock; this is what puts the run on
+  # a calendar, and it is what a certificate's validity is compared against.
+  t0: "2027-03-04T08:00:00Z"
+  duration_s: 300.0
+  # 100 ms is the mobility step the car-following models are calibrated at, and it is also
+  # the BSM generation period, so one step is one message.
+  mobility_step_ms: 100
+  des_resolution: 1us
+
+world:
+  source:
+    kind: osm-xml
+    # The D7 Phase 1 extract: 30 MB of Manhattan, already in the repository. Nothing in
+    # the importer is Manhattan-specific; the city lives in this file and nowhere else.
+    path: worlds/cache/manhattan.osm.xml
+    # The legacy preset box, D7: Midtown from 44th to 60th, 8th Avenue to Park.
+    # The box also fixes the world frame — the origin is its south-west corner — so
+    # re-fetching the extract at a different radius cannot move a single metre coordinate.
+    bbox:
+      min_lat_deg: 40.7440
+      min_lon_deg: -73.9900
+      max_lat_deg: 40.7620
+      max_lon_deg: -73.9680
+  # The import date is an input, not a clock read: no part of the engine may read a wall
+  # clock, so the date the extract was downloaded is stated here. It is excluded from the
+  # world's content hash, so changing it does not change the world.
+  # Which jurisdiction's class-default speed limits to fall back on where a way carries
+  # no `maxspeed` tag. There is deliberately no default: the SUMO table is German
+  # free-flow design speed and would put 100 km/h on West 49th Street.
+  highway_preset: urban-us-nyc
+  imported_at: "2026-09-18T00:00:00Z"
+  buildings:
+    # Buildings are imported as radio obstacles. Interior holes are kept in the model even
+    # though the wire payload drops them, because the obstacle geometry is what the
+    # propagation model reads.
+    enabled: true
+    keep_holes: true
+  terrain:
+    # No DEM in Phase 1: the world is flat at z = 0, which is stated rather than implied.
+    dem: null
+
+actors:
+  vehicles:
+    # Every vehicle that spawns is equipped, so "one vehicle" and "one node" are the same
+    # number and the run is not silently measuring an unequipped car.
+    equipped_fraction: 1.0
+    demand:
+      kind: mobility/demand/poisson
+      # The demand model this build ships takes a RATE, not a count: `PoissonParams` has a
+      # `max_total_vehicles` cap but `wiring::build_demand` does not read it, so a scenario
+      # cannot ask for exactly one vehicle. 30 veh/h over 60 s is an expectation of half an
+      # arrival and, under this seed, realises exactly one — which the run report states
+      # rather than this file claiming it. Raise it to sweep the load: measured on this
+      # world, 1500 veh/h gives 9 vehicles, 15000 gives 113 and 60000 gives 460, because
+      # the thinned-Poisson acceptance and the lane capacity reject roughly half the
+      # candidates.
+      rate_veh_per_h: 1500.0
+
+weather:
+  # Clear, which is WeatherState::CLEAR exactly: intensity 0, unlimited visibility, dry
+  # surface. `intensity` and `visibility_m` are separate fields because a road can still be
+  # wet after the rain stops.
+  initial: clear
+  intensity: 0.0
+
+radio:
+  rat: dsrc-80211p
+  tiers:
+    # The medium tier throughout: log-distance with shadowing and Nakagami fading, a
+    # link-budget PHY with a modelled PER curve, and a CSMA/CA MAC with DCC. The high tier
+    # is frame-level and needs a matching MAC; the abstract tier is free-space with no
+    # fading and would make every reception succeed.
+    propagation: medium
+    phy: medium
+    mac: medium
+
+net:
+  layer: wsmp
+
+messages:
+  sets: [bsm]
+  # Real UPER/COER bytes from the encoders, not the validated size model: a signed frame's
+  # length is what the air time and the byte accounting are computed from.
+  codec_tier: uper
+
+security:
+  envelope: ieee1609.2
+  signature: ecdsa-p256
+  # `modeled` costs the signature in HSM service time from the hardware profile's measured
+  # throughput and produces a real signature over real bytes. `real` additionally needs the
+  # credential protocol, which this build does not ship.
+  crypto_mode: modeled
+  # Verify by relevance rather than everything: at one node there is nothing to verify, and
+  # the policy is stated so that adding a second vehicle does not silently change it.
+  verification_policy: prioritized
+  signer_id_policy:
+    # A full certificate once a second, a digest otherwise — the J2945/1 rule, and the
+    # reason a recorded frame's length alternates between two values.
+    full_cert_every_ms: 1000
+    digest_otherwise: true
+  pseudonym_change:
+    strategy: time
+    period_s: 300.0
+
+nodes:
+  # The one hardware profile this build ships: the Unex OBU-301 with a Craton2, whose CPU
+  # and HSM service rates come from its published FIPS security policy.
+  default_obu: obu/unex-obu-301-craton2
+  compute_tier: medium
+  backend_tier: medium
+
+# One metric. `pdr` is the packet delivery ratio over reception attempts; the provider that
+# defines it is installed because it does, and the manifest pins its model card.
+metrics: [pdr]
+
+exporters: []

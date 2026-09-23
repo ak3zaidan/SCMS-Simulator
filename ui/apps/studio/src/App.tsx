@@ -108,8 +108,9 @@ export function App(): React.JSX.Element {
     engine.attachViewer();
   }, []);
 
-  // One resolve-and-connect on mount; StrictMode's double-invoke is absorbed by the guard in
-  // `engine.connect()`, which tears any previous client down first.
+  // One resolve-and-connect on mount. StrictMode invokes this twice, and `engine.connect()`
+  // coalesces the two into one attempt. It did not always: it only tore the previous client
+  // down, which closed the first attempt's socket mid-handshake and surfaced as a 1006.
   useEffect(() => {
     let cancelled = false;
     void connectResolved()
