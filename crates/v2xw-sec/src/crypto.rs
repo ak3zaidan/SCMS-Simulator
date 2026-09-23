@@ -22,8 +22,17 @@
 //!   substituted key changes the commitment and both refuse; truncated bytes fail the
 //!   length check in one and `Signature::from_slice` in the other.
 //!
-//!   The commitment is what makes the *forgery* half true by construction rather than by
-//!   API accident. Keying the token on public material instead — which is what this did
+//!   The commitment is recorded against the key's public material in a directory every
+//!   backend instance shares (`modeled_directory`), and that is not an implementation
+//!   detail: every node in a run owns its own backend, so every verification in a run is
+//!   one instance checking a key another instance generated. Held per instance — which it
+//!   was until 2026-09-22 — a receiver found no commitment for any peer and answered
+//!   `false` for every message from every peer, which is exactly the outcome divergence
+//!   I-S1 forbids. The Phase 2 scenario runs `crypto_mode: modeled`, and it measured
+//!   98.23 % of receptions `Invalid`.
+//!
+//!   The commitment is also what makes the *forgery* half true by construction rather
+//!   than by API accident. Keying the token on public material instead — which is what this did
 //!   until v2.0.0 of the modelled card — let anyone holding a peer's certificate and the
 //!   digest compute a token `verify_prehashed` accepts; nothing reached it only because
 //!   signing needs a [`KeyHandle`] carrying a secret. A forgery model in `v2xw-threat`
@@ -73,6 +82,7 @@
 //! The discrepancy is recorded rather than silently resolved.
 
 use std::collections::BTreeMap;
+use std::sync::{OnceLock, RwLock};
 
 use p256::Scalar;
 use p256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
@@ -772,26 +782,73 @@ const MODELED_SIG_LABEL: &[u8] = b"v2xw-sec/modeled/signature/v1";
 /// one tells you nothing about the other short of inverting SHA-256.
 const MODELED_COMMIT_LABEL: &[u8] = b"v2xw-sec/modeled/secret-commitment/v1";
 
+/// Public material → the secret commitment of the seed it was derived from, for every
+/// modelled key **any** backend instance in this process has generated.
+///
+/// This is what stands in for the mathematics of ECDSA, and it has to be shared, because
+/// what it stands in for is shared. A real verifier decides "was this signed by the
+/// holder of the secret behind this public key?" from the curve equation — a fact that is
+/// global, public, and available to every party that holds the public key. A modelled
+/// backend has no curve, so the same fact has to be materialised somewhere every verifier
+/// can reach it.
+///
+/// # What holding it per instance cost
+///
+/// It was a field on [`Modeled`] until 2026-09-22, populated only by the instance that
+/// generated the key. Every node owns its own backend, so a receiver's map held its own
+/// keys and nothing else: `verify_prehashed` found no commitment for any peer's public
+/// material and answered `false` for **every** message from **every** peer. Measured on
+/// `scenarios/phase2-manhattan.yaml` (`crypto_mode: modeled`): 98.23 % of received
+/// messages `Invalid`, 0.73 % `Verified`, and `signatureVerification` the only detector
+/// firing — a 100 % false-positive rate on honest traffic dressed up as a cryptographic
+/// result. It also broke invariant I-S1 in the one direction nothing was checking: the
+/// same run in `real` mode verified, because the curve equation is not per-instance.
+/// `tests/equivalence.rs` now drives a *second* backend instance for exactly this reason.
+///
+/// # What it does not give away
+///
+/// The map is module-private and only ever point-queried by `verify_prehashed`, so the
+/// forgery property is unchanged: producing a token still needs the commitment, the
+/// commitment is `SHA-256(label ‖ seed)`, and no caller outside this module can read
+/// either. See [`modeled_token`].
+///
+/// A `BTreeMap`, not a `HashMap`: this crate never lets a hash order reach a result, and
+/// although this map is only ever point-queried, the rule is kept structurally rather
+/// than by argument. Writes are idempotent — the same seed yields the same public
+/// material and the same commitment — so two runs in one process cannot disagree about an
+/// entry, whichever order they insert in.
+fn modeled_directory() -> &'static RwLock<BTreeMap<[u8; PUBLIC_MATERIAL_BYTES], [u8; 32]>> {
+    static DIRECTORY: OnceLock<RwLock<BTreeMap<[u8; PUBLIC_MATERIAL_BYTES], [u8; 32]>>> =
+        OnceLock::new();
+    DIRECTORY.get_or_init(|| RwLock::new(BTreeMap::new()))
+}
+
+/// Records a generated key's commitment against its public material.
+fn record_modeled_commitment(
+    public_material: [u8; PUBLIC_MATERIAL_BYTES],
+    commitment: [u8; 32],
+) {
+    if let Ok(mut d) = modeled_directory().write() {
+        d.insert(public_material, commitment);
+    }
+}
+
+/// The commitment for `public_material`, or `None` when no modelled backend ever
+/// generated a key with that public material — which is the modelled counterpart of
+/// `VerifyingKey::from_sec1_bytes` refusing material that is not a point.
+fn modeled_commitment_for(public_material: &[u8; PUBLIC_MATERIAL_BYTES]) -> Option<[u8; 32]> {
+    modeled_directory()
+        .read()
+        .ok()
+        .and_then(|d| d.get(public_material).copied())
+}
+
 /// Modelled cryptography: tokens instead of signatures, sizes from the descriptors.
 #[derive(Debug)]
 pub struct Modeled {
     card: ModelCard,
     next: u64,
     keys: BTreeMap<u64, KeyRecord<[u8; 32]>>,
-    /// Public material → the secret commitment of the seed it was derived from, for every
-    /// key this backend has *generated* (never for one merely imported as public material).
-    ///
-    /// This is what stands in for the mathematics of ECDSA. A real verifier decides
-    /// "was this signed by the holder of the secret behind this public key?" from the
-    /// curve equation, which is available to everyone. A modelled verifier cannot compute
-    /// that from public material alone without also handing an attacker the ability to
-    /// produce it — the two are the same computation. So the backend keeps the answer
-    /// instead of recomputing it, and nothing outside this module can read the map.
-    ///
-    /// A `BTreeMap`, not a `HashMap`: this crate never lets a hash order reach a result,
-    /// and although this map is only ever point-queried, the rule is kept structurally
-    /// rather than by argument.
-    commitments: BTreeMap<[u8; PUBLIC_MATERIAL_BYTES], [u8; 32]>,
 }
 
 impl Default for Modeled {
@@ -807,7 +864,6 @@ impl Modeled {
             card: modeled_card(),
             next: 1,
             keys: BTreeMap::new(),
-            commitments: BTreeMap::new(),
         }
     }
 
@@ -835,9 +891,10 @@ impl Modeled {
         let public_material = modeled_public_material(seed);
         // Generating a key is the one moment the backend holds the secret, so it is the
         // one moment the commitment can be recorded. Re-importing the same seed writes the
-        // same value, so this is idempotent and order-independent.
-        self.commitments
-            .insert(public_material, modeled_commitment(seed));
+        // same value, so this is idempotent and order-independent. It goes into the
+        // process-wide directory rather than into this instance, because a verifier is a
+        // *different* instance — see `modeled_directory`.
+        record_modeled_commitment(public_material, modeled_commitment(seed));
         let id = self.next;
         self.next += 1;
         self.keys.insert(
@@ -1070,13 +1127,14 @@ impl<C: Ctx + ?Sized> CryptoBackend<C> for Modeled {
         let Some(d) = PrimitiveCatalogue::standard().get(rec.primitive) else {
             return false;
         };
-        // Material this backend never generated has no commitment, so nothing verifies
-        // under it — which is the modelled counterpart of `VerifyingKey::from_sec1_bytes`
-        // refusing material that is not a point. Both modes answer `false`.
-        let Some(commitment) = self.commitments.get(&rec.public_material) else {
+        // Material no modelled backend ever generated has no commitment, so nothing
+        // verifies under it — which is the modelled counterpart of
+        // `VerifyingKey::from_sec1_bytes` refusing material that is not a point. Both
+        // modes answer `false`.
+        let Some(commitment) = modeled_commitment_for(&rec.public_material) else {
             return false;
         };
-        let expected = modeled_token(commitment, digest, d.sig_bytes.nominal() as usize);
+        let expected = modeled_token(&commitment, digest, d.sig_bytes.nominal() as usize);
         // A length mismatch is caught by the equality itself, which is what a real
         // backend's `Signature::from_slice` does for a truncated signature: both modes
         // answer `false` for the same malformed input.
@@ -1255,11 +1313,17 @@ fn modeled_card() -> ModelCard {
     let mut card = ModelCard::new(
         MODELED_ID,
         Family::CryptoBackend,
+        // 3.0.0: the secret commitments moved from a field on the instance to a
+        // process-wide directory, so a backend now verifies a key it did not generate.
+        // No token byte changed; what changed is the *outcome* of every cross-instance
+        // verification, from `false` to what the real backend answers. Since every node
+        // in a run owns its own backend, that is every verification in every run.
+        //
         // 2.0.0: the token is keyed on the key's secret commitment rather than on its
         // public material, so every modelled token byte changed. Sizes and outcomes did
         // not, which is what I-S1 constrains — but the bytes are pinned in tests, so the
         // change is a breaking one for anything that recorded them.
-        "2.0.0",
+        "3.0.0",
         "Models cryptography without executing it: a signature is a token derived from \
          the signer's secret commitment and the message digest, verification compares \
          tokens, and every size comes from the primitive descriptor tables. Verification \
@@ -1271,7 +1335,7 @@ fn modeled_card() -> ModelCard {
         v2xw_core::card::Equation::new(
             "modelled secret commitment",
             "commitment = SHA-256( commit-label ‖ seed ), recorded at keygen against the \
-             key's public material",
+             key's public material in a directory every backend instance shares",
         ),
         v2xw_core::card::Equation::new(
             "modelled signature token",
@@ -1301,14 +1365,13 @@ fn modeled_card() -> ModelCard {
          is a hash image, not a signature, and a backend that holds the commitment can \
          produce one for any digest. It models outcomes, not security."
             .to_string(),
-        "Verification is answered from the commitment this backend recorded when it \
-         generated the key, because computing it from public material alone would hand an \
-         attacker the same computation. So a `Modeled` instance verifies only keys it \
-         generated: importing a peer's public material into a *second* instance and \
-         verifying there answers false where the real backend would answer true. Every \
-         run in this workspace drives one backend instance, which is the whole simulated \
-         world's cryptography, so the case does not arise — it is recorded rather than \
-         silently resolved."
+        "Verification is answered from the commitment recorded when the key was \
+         generated, because computing it from public material alone would hand an \
+         attacker the same computation. The commitments therefore live in a directory \
+         shared by every backend instance in the process — the stand-in for the curve \
+         equation, which is likewise global and available to every relying party. What \
+         this models is a world in which a genuine public key is recognisable as one; \
+         what it does not model is a party that has to *decide* that from the key alone."
             .to_string(),
         "I-S1 is demonstrated end to end for `ecdsa-p256-sha256` and `ecqv-p256` only; \
          the other catalogue primitives are exercised for supports/keygen agreement, not \

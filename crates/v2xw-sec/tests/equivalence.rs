@@ -814,3 +814,108 @@ fn both_modes_consume_the_rng_identically() {
         "the two modes must leave the crypto stream at the same position"
     );
 }
+
+/// A verifier that did **not** generate the key still reaches the same answers — the half
+/// of I-S1 a single-instance script cannot see, and the one that was false.
+///
+/// Every node in a run owns its own backend, so every verification in a run is this case:
+/// the signer is one instance, the relying party is another, and all the relying party
+/// ever receives is the 33 bytes of public material a certificate carries. `Real` passes
+/// this because the curve equation is not per-instance. `Modeled` did not: its secret
+/// commitments were a field on the instance that generated the key, so a peer's public
+/// material had no commitment, `verify_prehashed` answered `false`, and **every** message
+/// from **every** peer was rejected. On `scenarios/phase2-manhattan.yaml` that showed up
+/// as 98.23 % of receptions `Invalid` with `signatureVerification` the only detector
+/// firing.
+///
+/// The negative steps are what stop this from being a test that a verifier saying `true`
+/// unconditionally would pass: a second instance must still refuse a tampered digest, a
+/// token made with another key, a truncated token, and material nobody ever generated.
+#[test]
+fn a_second_backend_instance_verifies_a_peers_signature_and_refuses_a_forged_one() {
+    fn trace<B>() -> Vec<String>
+    where
+        B: Default + CryptoBackendInfo + CryptoBackend<TestCtx>,
+    {
+        let mut ctx = TestCtx::new(0xA11CE);
+        // Two instances that share nothing: one signs, the other only ever sees public
+        // material, exactly as two nodes in a run do.
+        let mut signer = B::default();
+        let mut relying_party = B::default();
+
+        let alice = signer
+            .keygen(&mut ctx, PrimitiveId::ECDSA_P256_SHA256, NodeId::new(1))
+            .expect("keygen");
+        let bob = signer
+            .keygen(&mut ctx, PrimitiveId::ECDSA_P256_SHA256, NodeId::new(2))
+            .expect("keygen");
+        let material = |b: &B, k| {
+            b.public_material(&b.public_of(k).expect("public of"))
+                .expect("material")
+        };
+        let alice_pub = material(&signer, &alice);
+
+        let digest = [0x5Au8; 32];
+        let other = [0x5Bu8; 32];
+        let token = signer
+            .sign_prehashed(&mut ctx, &alice, &digest)
+            .expect("signs");
+        let bobs_token = signer
+            .sign_prehashed(&mut ctx, &bob, &digest)
+            .expect("signs");
+
+        let imported = relying_party
+            .import_public(PrimitiveId::ECDSA_P256_SHA256, NodeId::new(1), &alice_pub)
+            .expect("a relying party imports a peer's key from its certificate");
+
+        let mut out = Vec::new();
+        let mut step = |name: &str, ok: bool| out.push(format!("{name}={ok}"));
+
+        step(
+            "peer-signature",
+            relying_party.verify_prehashed(&mut ctx, &imported, &digest, &token),
+        );
+        step(
+            "tampered-digest",
+            relying_party.verify_prehashed(&mut ctx, &imported, &other, &token),
+        );
+        step(
+            "another-keys-token",
+            relying_party.verify_prehashed(&mut ctx, &imported, &digest, &bobs_token),
+        );
+        let mut truncated = token.clone();
+        truncated.bytes.truncate(token.bytes.len() - 1);
+        step(
+            "truncated-token",
+            relying_party.verify_prehashed(&mut ctx, &imported, &digest, &truncated),
+        );
+        // Material with the right shape that no backend ever generated: not a point for
+        // `Real`, not in the modelled directory for `Modeled`. Both must refuse.
+        let mut invented = [0x01u8; 33];
+        invented[0] = 0x02;
+        let ghost = relying_party
+            .import_public(PrimitiveId::ECDSA_P256_SHA256, NodeId::new(3), &invented)
+            .expect("the shape check admits it; the verification is what refuses");
+        step(
+            "invented-key",
+            relying_party.verify_prehashed(&mut ctx, &ghost, &digest, &token),
+        );
+        out
+    }
+
+    let real = trace::<Real>();
+    let modeled = trace::<Modeled>();
+    assert_eq!(real, modeled, "the two modes disagree across instances");
+    assert_eq!(
+        real,
+        vec![
+            "peer-signature=true",
+            "tampered-digest=false",
+            "another-keys-token=false",
+            "truncated-token=false",
+            "invented-key=false",
+        ],
+        "a relying party that holds only a peer's public material must verify what that \
+         peer signed and refuse everything else"
+    );
+}
