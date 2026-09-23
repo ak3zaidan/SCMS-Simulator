@@ -92,13 +92,16 @@ use v2xw_core::registry::{ParamSet, Registry};
 use v2xw_core::rng::{EntityRef, RngDomain, RngRegistry};
 use v2xw_core::time::{Duration, SimTime, WallClock};
 use v2xw_core::weather::WeatherState;
-use v2xw_metrics::channels::{RxOutcome, SignerId};
+use v2xw_metrics::channels::{ByteBucket, RxOutcome, SignerId, rx_cause};
 use v2xw_mobility::{
     ActorSnapshot, DriverProfile, GnssEnv, GnssModel, Mobility, MobilityUpdate, VehicleClass,
     VehicleView,
 };
 use v2xw_msg::generator::DccState;
-use v2xw_node::{NodeConfig, ObuRuntime, RxFrame, StepOutcome, Transmission};
+use v2xw_node::stores::VerificationState;
+use v2xw_node::{
+    NodeConfig, ObuRuntime, RxDisposition, RxFrame, RxReport, RxStamp, StepOutcome, Transmission,
+};
 use v2xw_record::{Cadence, Profile};
 use v2xw_radio::{
     AccessCategory, Arrival, ChannelId, Dcc, EdcaOcbMac, FrameDescriptor, FrameKind,
@@ -111,7 +114,7 @@ use crate::adapters::{BoxedFading, BoxedPropagation};
 use crate::ctx::{EngineCtx, RunRecorder};
 use crate::error::{EngineError, Result};
 use crate::event::{Event, Observe};
-use crate::records::{GtKinematics, NodeTx, PhyRx};
+use crate::records::{GtKinematics, MacCbr, NetBytes, NodeRx, NodeTx, PhyRx};
 use crate::scenario::Scenario;
 use crate::snapshot::{ActorState, SnapshotStream};
 
@@ -169,6 +172,39 @@ const MAX_GRANTS_PER_TIMER: u32 = 8;
 /// estimate, so it is a belief and not a ground-truth density (invariant I-C2).
 const J2945_DENSITY_RADIUS_M: f64 = 100.0;
 
+/// Where a backhaul transfer's byte-accounting id starts.
+///
+/// Invariant I-N1 checks that no id is attributed to two buckets, and a `node.tx` record's
+/// id is its frame number. Backhaul SDUs are numbered by their own counter, so they are
+/// placed in a range no frame number reaches (2^40 frames is decades at any fleet size).
+const BACKHAUL_ID_BASE: u64 = 1 << 40;
+
+/// One node's MAC counters since its last `mac.cbr` report.
+#[derive(Debug, Clone, Copy, Default)]
+struct MacWindow {
+    /// Frames handed to the MAC.
+    frames: u64,
+    /// Their PSDU octets.
+    bytes: u64,
+    /// Their air time, µs.
+    airtime_us: u64,
+    /// Frames the MAC refused.
+    drops: u64,
+}
+
+/// The journey of a misbehaviour report to the roadside unit that forwards it, kept beside
+/// the backhaul transfer so the whole flow can be traced when it reaches the authority.
+#[derive(Debug, Clone, Copy)]
+struct ReportJourney {
+    msg: u64,
+    t_generated: SimTime,
+    t_sign_start: SimTime,
+    t_signed: SimTime,
+    t_tx_start: SimTime,
+    t_tx_end: SimTime,
+    t_arrival: SimTime,
+}
+
 /// What one run produced.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct RunReport {
@@ -208,6 +244,10 @@ pub struct RunReport {
     /// How many frames the PHY refused as too large for the MSDU cap
     /// (04-models.md §4.6: the fragmenter must have acted first, and none is wired in).
     pub phy_refusals: u64,
+    /// How many signed messages were refused before the MAC because they exceeded the
+    /// network layer's MTU (`fragmenter/none`: 1,400 octets for WSMP, 1,398 for
+    /// GeoNetworking).
+    pub net_mtu_refusals: u64,
     /// How many frames were *not* generated because the instant fell in a time-dilation
     /// window (02-architecture.md §5.4).
     pub suppressed_frames: u64,
@@ -369,6 +409,21 @@ struct FrameState {
     payload_bytes: Option<u32>,
     /// The 1609.2 envelope's cost in octets: the SPDU less the payload.
     envelope_bytes: Option<u32>,
+    /// Every octet of the PSDU by layer (`v2xw_net::frame`). `bytes` is the SPDU a
+    /// receiver verifies; `layers.psdu_bytes()` is what went on the air, and what the air
+    /// time is computed from.
+    layers: v2xw_net::FrameLayers,
+    /// Octets of an attached certificate inside the envelope, when the node built one.
+    cert_bytes: Option<u32>,
+    /// The generation instant on the simulation's timeline (`generation_time` is the
+    /// sender's own clock, which is what the payload claims).
+    t_generated: SimTime,
+    /// When the sender's signer picked the message up, on the simulation's timeline.
+    t_sign_start: SimTime,
+    /// Of the channel-access delay, the AIFS, ns.
+    mac_aifs_ns: u64,
+    /// Of the channel-access delay, the backoff slots the MAC counted, ns.
+    mac_backoff_ns: u64,
 }
 
 /// What a Phase 2 application message carries, beyond its length.
@@ -421,7 +476,21 @@ pub struct Engine {
     weather: WeatherState,
     actors: BTreeMap<ActorId, ActorRecord>,
     nodes: BTreeMap<NodeId, ObuRuntime>,
-    inboxes: BTreeMap<NodeId, Vec<RxFrame>>,
+    /// Frames each node has received and not yet processed, with the instant each
+    /// finished arriving and the token its `node.rx` record is joined by.
+    inboxes: BTreeMap<NodeId, Vec<(RxFrame, RxStamp)>>,
+    /// The network and transport stack every frame is framed with (`net.layer`).
+    net: v2xw_net::NetStack,
+    /// Reception attempts a node has been handed and has not yet resolved, by
+    /// (receiver, token): the `node.rx` record so far, waiting for its fate.
+    rx_pending: BTreeMap<(NodeId, u64), NodeRx>,
+    /// The next reception-attempt token.
+    next_rx_token: u64,
+    /// Per-node MAC counters since the last `mac.cbr` report.
+    mac_window: BTreeMap<NodeId, MacWindow>,
+    /// `node.rx` fates settled where no recorder is in hand (a receiver retired), written
+    /// at the next point that has one.
+    orphaned_rx: Vec<NodeRx>,
     frames: BTreeMap<FrameSeq, FrameState>,
     /// Which frames currently have a registered arrival at each receiver, so a new frame
     /// can find the ones it overlaps without scanning every live frame.
@@ -436,7 +505,10 @@ pub struct Engine {
     rsus: BTreeMap<NodeId, Vec3>,
     /// Reports in flight over a backhaul, by the SDU id their [`Event::NetDeliver`]
     /// carries.
-    backhaul: BTreeMap<v2xw_core::ids::SduId, (NodeId, Box<v2xw_threat::MisbehaviourReport>)>,
+    backhaul: BTreeMap<
+        v2xw_core::ids::SduId,
+        (NodeId, Box<v2xw_threat::MisbehaviourReport>, NodeId, ReportJourney),
+    >,
     /// The next backhaul SDU id.
     next_sdu: u32,
     next_node: u32,
@@ -559,6 +631,14 @@ impl Engine {
             actors: BTreeMap::new(),
             nodes: BTreeMap::new(),
             inboxes: BTreeMap::new(),
+            // `validate` refuses any other name, so the fallback is unreachable from a
+            // loaded scenario; it is WSMP because that is the schema's default.
+            net: v2xw_net::NetStack::from_name(&scenario_for_radio.net.layer)
+                .unwrap_or(v2xw_net::NetStack::Wsmp(v2xw_net::WsmpNetLayer::default())),
+            rx_pending: BTreeMap::new(),
+            next_rx_token: 0,
+            mac_window: BTreeMap::new(),
+            orphaned_rx: Vec::new(),
             frames: BTreeMap::new(),
             live_at_rx: BTreeMap::new(),
             pending_tx: BTreeMap::new(),
@@ -891,13 +971,14 @@ impl Engine {
                     what: Observe::EndOfRun,
                 } => {
                     self.report.end_ns = key.time;
+                    self.resolve_in_flight(recorder, key.time);
                     break;
                 }
                 // The remaining classes have no model scheduling them in this build; see
                 // the module documentation's list of what is a missing model rather than a
                 // missing seam. Counting them is what makes their absence visible in the
                 // run report instead of silent.
-                Event::NetDeliver { sdu, to } => self.on_net_deliver(sdu, to, horizon),
+                Event::NetDeliver { sdu, to } => self.on_net_deliver(recorder, sdu, to, horizon),
                 Event::FlowTimer { .. } => self.on_flow_timer(horizon),
                 Event::SignalPhase { .. }
                 | Event::NodeTask { .. }
@@ -1003,6 +1084,9 @@ impl Engine {
         };
 
         self.absorb(&update, now);
+        for orphan in core::mem::take(&mut self.orphaned_rx) {
+            self.emit(recorder, &orphan);
+        }
         self.rebuild_snapshot(&update);
         self.update_beliefs(recorder, now);
 
@@ -1106,6 +1190,21 @@ impl Engine {
             {
                 self.nodes.remove(&node);
                 self.inboxes.remove(&node);
+                self.mac_window.remove(&node);
+                // Frames the retired node had been handed and not yet processed never
+                // reach an application: each attempt is settled here rather than left
+                // without a fate.
+                let pending: Vec<(NodeId, u64)> = self
+                    .rx_pending
+                    .range((node, 0)..=(node, u64::MAX))
+                    .map(|(k, _)| *k)
+                    .collect();
+                for key in pending {
+                    if let Some(attempt) = self.rx_pending.remove(&key) {
+                        self.orphaned_rx
+                            .push(attempt.lost(now, rx_cause::RECEIVER_OFF));
+                    }
+                }
             }
         }
         for (actor, k) in &update.states {
@@ -1164,13 +1263,13 @@ impl Engine {
     /// filed at the time it is actually about, rather than at a time the engine asserted
     /// for it.
     fn publish_state_at(&mut self, recorder: &mut dyn RunRecorder) {
-        let states: Vec<(ActorId, Kinematics, &'static str)> = self
+        let states: Vec<(ActorId, Kinematics, &'static str, Option<NodeId>)> = self
             .actors
             .iter()
-            .map(|(actor, rec)| (*actor, rec.last, rec.class.as_str()))
+            .map(|(actor, rec)| (*actor, rec.last, rec.class.as_str(), rec.node))
             .collect();
-        for (actor, k, class) in states {
-            let rec = GtKinematics::new(actor, &k, class);
+        for (actor, k, class, node) in states {
+            let rec = GtKinematics::new(actor, &k, class).with_node(node);
             self.emit_at(recorder, k.t, &rec);
         }
     }
@@ -1361,7 +1460,19 @@ impl Engine {
         };
         let mut results: Vec<(NodeId, StepOutcome, Vec<v2xw_core::ctx::OwnedRecord>, f64)> = walk
             .map(|(id, runtime)| {
-                let inbox = inboxes.get(id).cloned().unwrap_or_default();
+                // What has finished arriving by now is handed over; a frame whose last
+                // symbol (plus its propagation delay) lands after this instant waits for
+                // the next step, so a node never processes a frame before it arrived.
+                let inbox: Vec<(RxFrame, RxStamp)> = match inboxes.get_mut(id) {
+                    Some(q) => {
+                        let (ready, later): (Vec<_>, Vec<_>) = core::mem::take(q)
+                            .into_iter()
+                            .partition(|(_, st)| st.arrived_at.is_none_or(|t| t <= now));
+                        *q = later;
+                        ready
+                    }
+                    None => Vec::new(),
+                };
                 let mut local = v2xw_node::NodeRuntimeCtx::new(now, rng);
                 // Distance travelled since the last step drives distance-based pseudonym
                 // rotation. It is the node's own odometry, not a ground-truth read: a
@@ -1370,7 +1481,7 @@ impl Engine {
                     .state()
                     .transmits()
                     .then(|| v2xw_core::NodeView::position(runtime).ground_speed_mps() * step_s);
-                let outcome = runtime.step(&mut local, inbox, travelled.unwrap_or(0.0));
+                let outcome = runtime.step_timed(&mut local, inbox, travelled.unwrap_or(0.0));
                 (*id, outcome, local.take_emitted(), travelled.unwrap_or(0.0))
             })
             .collect();
@@ -1388,6 +1499,20 @@ impl Engine {
                 recorder.write(now, rec);
                 self.report.records += 1;
             }
+        }
+
+        // Every received frame whose fate the node settled, joined back to its attempt and
+        // recorded on `node.rx`, in (node, report) order.
+        let mut fates: Vec<NodeRx> = Vec::new();
+        for (id, outcome, _, _) in &results {
+            for report in &outcome.rx_reports {
+                if let Some(attempt) = self.rx_pending.remove(&(*id, report.token)) {
+                    fates.push(resolve_rx(attempt, report, now));
+                }
+            }
+        }
+        for fate in fates {
+            self.emit(recorder, &fate);
         }
 
         for (id, outcome, _, _) in &results {
@@ -1421,9 +1546,6 @@ impl Engine {
             }
         }
 
-        for inbox in inboxes.values_mut() {
-            inbox.clear();
-        }
         self.inboxes = inboxes;
     }
 
@@ -1497,13 +1619,15 @@ impl Engine {
             // `v2xw-proto`'s own wire table and nothing builds the octets, which is
             // exactly the case the constructor exists for — and it is one edit in
             // `v2xw-node` rather than one here when that struct grows a field.
+            // Generation and signing are both on the node's own clock, as they are for
+            // every frame the node's generator builds.
             let tx = Transmission::sized(
                 v2xw_msg::MsgType::Mbr,
                 bytes,
                 signer,
                 true,
                 self.signing_cost(node).after(believed),
-                now,
+                believed,
             );
             self.hand_down_app(
                 node,
@@ -1544,11 +1668,31 @@ impl Engine {
             .map_or(now, |n| n.clock().believed_time(now));
         let signing = Duration::between(believed, tx.ready_at);
         let ready = signing.after(now);
+        // The node's clock stamps, moved onto the simulation's timeline by their distance
+        // from the node's own "now": an offset clock shifts every stamp alike and leaves
+        // the durations between them exact.
+        let on_timeline = |x: SimTime| -> SimTime {
+            if x <= believed {
+                now.saturating_sub(believed - x)
+            } else {
+                now.saturating_add(x - believed)
+            }
+        };
+        let t_generated = on_timeline(tx.generation_time);
+        let t_sign_start = on_timeline(tx.sign_start).max(t_generated);
         if ready > horizon {
             return;
         }
         if self.is_dilated(ready) {
             self.report.suppressed_frames += 1;
+            return;
+        }
+        // `fragmenter/none` (04-models.md §7.3): neither WSMP nor GeoNetworking can split an
+        // SDU, so a signed message above the network layer's MTU is refused here, before
+        // the MAC, and counted, rather than handed down to be refused by the PHY's MSDU cap
+        // with its headers already counted as offered load.
+        if tx.bytes > self.net.sdu_mtu() {
+            self.report.net_mtu_refusals += 1;
             return;
         }
         let belief = self.nodes.get(&node).map(v2xw_core::NodeView::position);
@@ -1656,8 +1800,22 @@ impl Engine {
         // power as well as rate, and the SUPRA filter's output is what the link budget has
         // to be evaluated at. With no DCC model (the abstract tier) it is the profile's.
         let tx_power_dbm = self.dcc_power_dbm(node);
+        // The frame on the air is the SPDU inside a network and transport header, LLC/SNAP,
+        // the 802.11 MAC header and the FCS (`v2xw_net::frame`); the PHY's air time and the
+        // MSDU cap are over all of it, not over the SPDU alone.
+        let layers = v2xw_net::FrameLayers::compose(
+            &self.net,
+            if tx.msg_type == v2xw_msg::MsgType::Denm {
+                v2xw_net::FrameMsg::Denm
+            } else {
+                v2xw_net::FrameMsg::Safety
+            },
+            tx.payload_bytes().zip(tx.envelope_bytes()),
+            tx.bytes,
+        );
+        let psdu = layers.psdu_bytes();
         let descriptor = FrameDescriptor {
-            bytes: tx.bytes,
+            bytes: psdu,
             mcs: SAFETY_MCS,
             tx_power_dbm,
             channel: SAFETY_CHANNEL,
@@ -1667,7 +1825,7 @@ impl Engine {
             // the frame number are the same counter seen from two layers.
             sdu_ref: SduRef::new(v2xw_core::ids::SduId::new(frame.index()), frame),
         };
-        let air = v2xw_radio::air_time(tx.bytes, SAFETY_MCS);
+        let air = v2xw_radio::air_time(psdu, SAFETY_MCS);
         self.frames.insert(
             frame,
             FrameState {
@@ -1699,6 +1857,14 @@ impl Engine {
                 // engine has no business having a second one.
                 payload_bytes: tx.payload_bytes(),
                 envelope_bytes: tx.envelope_bytes(),
+                layers,
+                cert_bytes: tx.cert_bytes(),
+                t_generated,
+                t_sign_start,
+                // The abstract tier's frame waits exactly one AIFS and counts no backoff;
+                // the MAC's grant overwrites both at the medium and high tiers.
+                mac_aifs_ns: AIFS.as_nanos(),
+                mac_backoff_ns: 0,
             },
         );
         if self.mac.is_some() {
@@ -1827,9 +1993,14 @@ impl Engine {
             }
         }
         for (_, frame) in ready {
-            let Some(descriptor) = self.frames.get(&frame).map(|f| f.descriptor) else {
+            let Some((descriptor, air)) = self.frames.get(&frame).map(|f| (f.descriptor, f.air))
+            else {
                 continue;
             };
+            let window = self.mac_window.entry(node).or_default();
+            window.frames += 1;
+            window.bytes += u64::from(descriptor.bytes);
+            window.airtime_us += air.as_nanos() / 1_000;
             let refused = {
                 let Engine {
                     scheduler,
@@ -1863,6 +2034,7 @@ impl Engine {
                 // than left in the map to be swept later: nothing else can resolve it.
                 self.frames.remove(&frame);
                 self.report.mac_drops += 1;
+                self.mac_window.entry(node).or_default().drops += 1;
             }
         }
 
@@ -1903,6 +2075,12 @@ impl Engine {
                 state.start = at;
                 state.end = state.air.after(at);
                 self.report.mac_access_delay_ns += at.saturating_sub(state.ready_at);
+                // The split of the access delay the latency decomposition reports: one
+                // AIFS of the frame's category and the slots the MAC counted down; the
+                // rest is deferral to a busy medium.
+                state.mac_aifs_ns = SAFETY_AC.aifs().as_nanos();
+                state.mac_backoff_ns = u64::from(grant.backoff_slots)
+                    * v2xw_radio::types::timing::SLOT_TIME.as_nanos();
             } else {
                 continue;
             }
@@ -2297,9 +2475,12 @@ impl Engine {
         outcomes.sort_by_key(|o| o.rx);
 
         let mut received_any = false;
-        // Which receivers decoded a frame carrying an application payload, so the payload
-        // is acted on once per receiver after every outcome has been recorded.
-        let mut delivered_app: Vec<NodeId> = Vec::new();
+        // Which receivers decoded a frame carrying an application payload, and when it
+        // reached them, so the payload is acted on once per receiver after every outcome
+        // has been recorded.
+        let mut delivered_app: Vec<(NodeId, SimTime)> = Vec::new();
+        let psdu = state.layers.psdu_bytes();
+        let air_us = state.air.as_nanos() / 1_000;
         for outcome in outcomes {
             self.report.reception_attempts += 1;
             if let Some(cause) = outcome.cause {
@@ -2322,11 +2503,50 @@ impl Engine {
                 outcome.distance_m,
             );
             self.emit(recorder, &record);
-            if outcome.received {
+            // The same attempt, on `node.rx`, with the sender's side of the journey. A PHY
+            // loss is its fate already; a decoded frame's fate is the receiving node's to
+            // decide, and it waits in `rx_pending` until the node reports it.
+            let arrival =
+                v2xw_radio::phy::propagation_delay(outcome.distance_m).after(state.end);
+            let attempt = NodeRx::attempt(
+                state.tx,
+                outcome.rx,
+                frame_index,
+                msg_type_name(state.msg_type),
+                outcome.rssi_dbm,
+                outcome.sinr_db,
+                outcome.distance_m,
+                u64::from(psdu),
+                air_us,
+                state.payload_bytes.map(u64::from),
+            )
+            .journey(
+                state.t_generated,
+                state.t_sign_start,
+                state.ready_at,
+                state.mac_aifs_ns,
+                state.mac_backoff_ns,
+                state.start,
+                state.end,
+                arrival,
+            );
+            if !outcome.received {
+                let cause = outcome.cause.map_or("unknown", cause_name);
+                self.emit(recorder, &attempt.lost(now, cause));
+            } else {
                 self.report.receptions_ok += 1;
                 received_any = true;
+                let token = self.next_rx_token;
+                self.next_rx_token += 1;
+                let handed = self.inboxes.contains_key(&outcome.rx);
+                if handed {
+                    self.rx_pending.insert((outcome.rx, token), attempt);
+                } else {
+                    // Decoded by a radio whose node no longer exists.
+                    self.emit(recorder, &attempt.lost(now, rx_cause::RECEIVER_OFF));
+                }
                 if let Some(inbox) = self.inboxes.get_mut(&outcome.rx) {
-                    inbox.push(RxFrame {
+                    inbox.push((RxFrame {
                         signer: Some(state.signer.clone()),
                         msg_type: state.msg_type,
                         bytes: state.bytes,
@@ -2343,10 +2563,13 @@ impl Engine {
                         claimed_cert_period: state.claimed_cert_period,
                         claimed_linkage: state.claimed_linkage,
                         spdu: state.spdu.clone(),
-                    });
+                    }, RxStamp {
+                        token,
+                        arrived_at: Some(arrival),
+                    }));
                 }
                 if state.app.is_some() {
-                    delivered_app.push(outcome.rx);
+                    delivered_app.push((outcome.rx, arrival));
                 }
             }
         }
@@ -2354,8 +2577,25 @@ impl Engine {
             self.report.frames_received += 1;
         }
         if let Some(app) = state.app.clone() {
-            for rx in delivered_app {
-                self.on_app_message(rx, state.tx, &app, now, self.scenario.time.horizon_ns());
+            for (rx, arrival) in delivered_app {
+                let journey = ReportJourney {
+                    msg: frame_index,
+                    t_generated: state.t_generated,
+                    t_sign_start: state.t_sign_start,
+                    t_signed: state.ready_at,
+                    t_tx_start: state.start,
+                    t_tx_end: state.end,
+                    t_arrival: arrival,
+                };
+                self.on_app_message(
+                    recorder,
+                    rx,
+                    state.tx,
+                    &app,
+                    now,
+                    self.scenario.time.horizon_ns(),
+                    journey,
+                );
             }
         }
 
@@ -2380,7 +2620,7 @@ impl Engine {
             state.tx,
             frame_index,
             msg_type_name(state.msg_type),
-            u64::from(state.bytes),
+            u64::from(psdu),
             state.air.as_nanos() / 1000,
             state.descriptor.tx_power_dbm,
             SAFETY_CHANNEL.0,
@@ -2391,7 +2631,14 @@ impl Engine {
             },
             state.generation_time,
         )
-        .with_sizes(state.payload_bytes, state.envelope_bytes);
+        .with_sizes(state.payload_bytes, state.envelope_bytes)
+        .with_journey(
+            state.t_sign_start,
+            state.ready_at,
+            state.mac_aifs_ns,
+            state.mac_backoff_ns,
+        )
+        .with_layers(&state.layers, state.cert_bytes);
         self.emit(recorder, &tx_record);
     }
 
@@ -2400,13 +2647,16 @@ impl Engine {
     /// The two messages the revocation path needs, and what the receiver does with each.
     /// It is the engine doing an application layer's job; see [`crate::phase2`] for why
     /// and for what that skips.
+    #[allow(clippy::too_many_arguments)]
     fn on_app_message(
         &mut self,
+        recorder: &mut dyn RunRecorder,
         rx: NodeId,
         tx: NodeId,
         app: &AppPayload,
         now: SimTime,
         horizon: SimTime,
+        journey: ReportJourney,
     ) {
         match app {
             AppPayload::Report(report) => {
@@ -2434,7 +2684,18 @@ impl Engine {
                 }
                 let sdu = v2xw_core::ids::SduId::new(self.next_sdu);
                 self.next_sdu += 1;
-                self.backhaul.insert(sdu, (tx, report.clone()));
+                self.backhaul.insert(sdu, (tx, report.clone(), rx, journey));
+                // The report's octets cross the unit's backhaul: one transfer in the
+                // backhaul bucket (invariant I-N1), sized as the report was on the air.
+                let bytes = u64::from(crate::phase2::report_bytes());
+                let transfer = NetBytes::new(
+                    now,
+                    BACKHAUL_ID_BASE + u64::from(sdu.index()),
+                    ByteBucket::Backhaul,
+                    bytes,
+                    Some(rx),
+                );
+                self.emit(recorder, &transfer);
                 // The report crosses the backhaul as a `NetDeliver` to the Misbehaviour
                 // Authority's host, which is the roadside unit's own node id: the backend
                 // has its own id space (`crate::phase2`) and the engine never mixes them,
@@ -2492,11 +2753,39 @@ impl Engine {
     /// The backend then runs to quiescence on its own clock and reports the latency of the
     /// whole revocation; the engine schedules the roadside broadcast for `now + latency`,
     /// which is how the two clocks are kept apart (see [`crate::phase2`], joint 3).
-    fn on_net_deliver(&mut self, sdu: v2xw_core::ids::SduId, to: NodeId, horizon: SimTime) {
+    fn on_net_deliver(
+        &mut self,
+        recorder: &mut dyn RunRecorder,
+        sdu: v2xw_core::ids::SduId,
+        to: NodeId,
+        horizon: SimTime,
+    ) {
         let now = self.scheduler.now();
-        let Some((reporter, report)) = self.backhaul.remove(&sdu) else {
+        let Some((reporter, report, rsu, journey)) = self.backhaul.remove(&sdu) else {
             return;
         };
+        // The report's whole journey, vehicle to authority, as one decomposed trace on
+        // `msg.latency`: the first hop is the V2I frame, the second the backhaul. The
+        // backhaul was scheduled from the end of the frame at the unit, so a backhaul
+        // shorter than the propagation delay (a few microseconds) is clamped rather than
+        // made negative.
+        let mut trace = v2xw_metrics::latency::TraceBuilder::new(
+            "mbr",
+            Some("mbr".to_string()),
+            Some(journey.msg),
+            journey.t_generated,
+        );
+        trace
+            .endpoints(Some(reporter), Some(rsu))
+            .to("sign_queue", journey.t_sign_start)
+            .to("sign", journey.t_signed)
+            .to("mac_access", journey.t_tx_start)
+            .to("airtime", journey.t_tx_end)
+            .to("propagation", journey.t_arrival)
+            .hop(1)
+            .to("backhaul", now.max(journey.t_arrival));
+        let trace = trace.finish();
+        self.emit(recorder, &trace);
         let Some(phase2) = self.phase2.as_mut() else {
             return;
         };
@@ -2551,11 +2840,11 @@ impl Engine {
             else {
                 continue;
             };
-            let ready_at = self.signing_cost(rsu).after(
-                self.nodes
-                    .get(&rsu)
-                    .map_or(now, |n| n.clock().believed_time(now)),
-            );
+            let believed = self
+                .nodes
+                .get(&rsu)
+                .map_or(now, |n| n.clock().believed_time(now));
+            let ready_at = self.signing_cost(rsu).after(believed);
             // Sized from `v2xw-proto`'s CRL wire table; see `run_detectors` for why this
             // frame carries no encoded octets.
             let tx = Transmission::sized(
@@ -2564,7 +2853,7 @@ impl Engine {
                 signer,
                 true,
                 ready_at,
-                now,
+                believed,
             );
             self.hand_down_app(
                 rsu,
@@ -2636,6 +2925,7 @@ impl Engine {
     /// inputs.
     fn on_metric_flush(&mut self, recorder: &mut dyn RunRecorder, horizon: SimTime) {
         let now = self.scheduler.now();
+        self.emit_mac_reports(recorder, now);
         let samples = self.providers.flush(now);
         for sample in samples {
             self.emit(recorder, &sample);
@@ -2649,6 +2939,45 @@ impl Engine {
                     what: Observe::MetricFlush,
                 },
             );
+        }
+    }
+
+    /// Every node's MAC report for the window that closes at `now`, on `mac.cbr`: the
+    /// busy ratio its MAC measured, its EDCA queue depth, and what it offered and was
+    /// refused since the previous report. Only at the tiers that model a MAC.
+    fn emit_mac_reports(&mut self, recorder: &mut dyn RunRecorder, now: SimTime) {
+        let Some(mac) = self.mac.as_ref() else {
+            return;
+        };
+        let span = self.metric_period.as_nanos();
+        let mut reports: Vec<MacCbr> = Vec::with_capacity(self.nodes.len());
+        for &node in self.nodes.keys() {
+            let cbr = Mac::<EngineCtx<'_>>::cbr(mac, node, SAFETY_CHANNEL, now);
+            let depth = mac.queue_len(node, SAFETY_CHANNEL, SAFETY_AC) as u64;
+            let w = self.mac_window.remove(&node).unwrap_or_default();
+            reports.push(MacCbr::report(
+                now,
+                node,
+                SAFETY_CHANNEL.0,
+                cbr,
+                depth,
+                w.drops,
+                w.frames,
+                w.bytes,
+                w.airtime_us,
+                span,
+            ));
+        }
+        for r in reports {
+            self.emit(recorder, &r);
+        }
+    }
+
+    /// At the end of the run, every attempt still between the PHY and an application is
+    /// recorded as in flight, so each `phy.rx` attempt has exactly one `node.rx` fate.
+    fn resolve_in_flight(&mut self, recorder: &mut dyn RunRecorder, at: SimTime) {
+        for (_, attempt) in core::mem::take(&mut self.rx_pending) {
+            self.emit(recorder, &attempt.in_flight(at));
         }
     }
 
@@ -2737,6 +3066,51 @@ impl RunRecorder for Tee<'_> {
 
     fn frames_written(&self) -> Option<u64> {
         self.inner.frames_written()
+    }
+}
+
+/// A node's report on one received frame, joined to the attempt it settles.
+///
+/// The node's instants are on its own clock; each is moved onto the simulation's timeline
+/// by its distance from the frame's arrival, whose true instant the attempt carries. That
+/// keeps every duration the node measured exact whatever its clock offset.
+fn resolve_rx(attempt: NodeRx, report: &RxReport, now: SimTime) -> NodeRx {
+    let arrival = attempt.0.t_arrival.unwrap_or(now);
+    let on_timeline = |x: SimTime| arrival.saturating_add(x.saturating_sub(report.arrived));
+    let rx_done = on_timeline(report.parsed);
+    let verify_start = report.verify_start.map(on_timeline);
+    let verify_done = report.verify_done.map(on_timeline);
+    let mut a = attempt;
+    a.0.t_rx_done = Some(rx_done);
+    a.0.t_verify_start = verify_start;
+    a.0.t_verify_done = verify_done;
+    let delivered_at = verify_done.unwrap_or(rx_done);
+    match report.disposition {
+        RxDisposition::Delivered(VerificationState::Verified) => {
+            a.delivered(now, "verified", delivered_at)
+        }
+        RxDisposition::Delivered(VerificationState::Unverified) => {
+            a.delivered(now, "unverified", delivered_at)
+        }
+        RxDisposition::Delivered(VerificationState::Invalid) => {
+            a.lost(now, rx_cause::SIGNATURE_INVALID)
+        }
+        RxDisposition::Delivered(VerificationState::Revoked) => a.lost(now, rx_cause::REVOKED),
+        RxDisposition::Dropped(cause) => a.lost(now, drop_cause_name(cause)),
+        RxDisposition::NodeOff => a.lost(now, rx_cause::RECEIVER_OFF),
+    }
+}
+
+/// The `node.rx` loss cause a node's drop counter maps to.
+const fn drop_cause_name(cause: v2xw_node::DropCause) -> &'static str {
+    match cause {
+        v2xw_node::DropCause::RxOverflow => rx_cause::RX_OVERFLOW,
+        v2xw_node::DropCause::VerifyOverflow => rx_cause::VERIFY_OVERFLOW,
+        v2xw_node::DropCause::ReassemblyTimeout => rx_cause::REASSEMBLY_FAILED,
+        // A policy's own drop, whichever counter it charged.
+        v2xw_node::DropCause::VerifyPolicySkip
+        | v2xw_node::DropCause::TxOverflow
+        | v2xw_node::DropCause::CrlBacklog => rx_cause::VERIFY_POLICY_DROP,
     }
 }
 

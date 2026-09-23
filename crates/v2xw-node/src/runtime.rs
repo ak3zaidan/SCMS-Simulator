@@ -335,6 +335,10 @@ pub struct NodeConfig {
     /// The PSID a safety message is signed under. Changing it changes the envelope
     /// overhead; see [`crate::secure::PSID_SAFETY`].
     pub psid: u64,
+    /// The BSM generator's inter-transmission times (SAE J2945/1; `messages.generator`).
+    pub bsm_params: v2xw_msg::generator::BsmGenParams,
+    /// The CAM generator's triggering rules (EN 302 637-2; `messages.generator`).
+    pub cam_params: v2xw_msg::generator::CamGenParams,
 }
 
 impl Default for NodeConfig {
@@ -360,6 +364,8 @@ impl Default for NodeConfig {
             station_type: ParticipantType::PassengerCar,
             crypto_mode: CryptoMode::Modeled,
             psid: PSID_SAFETY,
+            bsm_params: v2xw_msg::generator::BsmGenParams::j2945_1(),
+            cam_params: v2xw_msg::generator::CamGenParams::en302637_2(),
         }
     }
 }
@@ -478,7 +484,8 @@ impl ObuRuntime {
             belief: PositionEstimate::no_fix(at),
             stores,
             policy,
-            schedule: MessageSchedule::new(config.services),
+            schedule: MessageSchedule::new(config.services)
+                .with_params(config.cam_params, config.bsm_params),
             state: NodeState::Active,
             received: Vec::new(),
             evidence_capacity: 256,

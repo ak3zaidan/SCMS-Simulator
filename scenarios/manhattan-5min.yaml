@@ -146,8 +146,9 @@ nodes:
   compute_tier: medium
   backend_tier: medium
 
-# One metric. `pdr` is the packet delivery ratio over reception attempts; the provider that
-# defines it is installed because it does, and the manifest pins its model card.
-metrics: [pdr]
+# Every metric this build computes: delivery, decomposed end-to-end delay, awareness, channel
+# load, overhead and byte accounting, security, detection and safety. A long run is where
+# the page's measurement panel is read, so it measures everything it can plot.
+metrics: [all]
 
 exporters: []

@@ -259,9 +259,34 @@ fn a_key_the_engine_cannot_act_on_is_refused_and_names_itself() {
                 }];
             }),
         ),
+        // `net.layer: gn-btp` used to be here; the GeoNetworking/BTP header is now composed
+        // into every frame, and `gn_btp_and_a_generator_override_validate` holds that it
+        // loads. What is still refused is a fragmenter that would split, and a generator
+        // this build does not run or cannot honour.
         (
-            "net.layer",
-            Box::new(|s: &mut Scenario| s.net.layer = "gn-btp".to_string()),
+            "net.fragmenter",
+            Box::new(|s: &mut Scenario| {
+                s.net.fragmenter = Some(v2xw_engine::scenario::ModelChoice::new(
+                    v2xw_net::FRAGMENTER_GENERIC_ID,
+                ));
+            }),
+        ),
+        (
+            "messages.generator.id",
+            Box::new(|s: &mut Scenario| {
+                s.messages.generator =
+                    Some(v2xw_engine::scenario::ModelChoice::new("generator/nonexistent"));
+            }),
+        ),
+        (
+            "messages.generator.params.nominal_itt_ms",
+            Box::new(|s: &mut Scenario| {
+                let mut g =
+                    v2xw_engine::scenario::ModelChoice::new(v2xw_msg::generator::BSM_GENERATOR_ID);
+                // Faster than the nodes are stepped: no node could send that often.
+                g.params = serde_json::json!({"nominal_itt_ms": 20.0});
+                s.messages.generator = Some(g);
+            }),
         ),
         (
             "messages.sets[0]",
@@ -290,6 +315,24 @@ fn a_key_the_engine_cannot_act_on_is_refused_and_names_itself() {
             );
         }
     }
+}
+
+/// The two keys this build now acts on load: the European network stack, and a BSM
+/// generator slowed to 5 Hz. And the generator override reaches the node configuration.
+#[test]
+fn gn_btp_and_a_generator_override_validate() {
+    let mut s = Scenario::minimal();
+    s.net.layer = "gn-btp".to_string();
+    let mut g = v2xw_engine::scenario::ModelChoice::new(v2xw_msg::generator::BSM_GENERATOR_ID);
+    g.params = serde_json::json!({"nominal_itt_ms": 200.0, "max_itt_ms": 600.0});
+    s.messages.generator = Some(g);
+    let errors = validate(&s);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let (bsm, cam) = v2xw_engine::wiring::generator_params(&s);
+    assert_eq!(bsm.nominal_itt.as_nanos(), 200_000_000);
+    assert_eq!(bsm.max_itt.as_nanos(), 600_000_000);
+    assert_eq!(bsm.min_itt, v2xw_msg::generator::BsmGenParams::j2945_1().min_itt);
+    assert_eq!(cam, v2xw_msg::generator::CamGenParams::en302637_2());
 }
 
 /// And the control: a scenario that sets none of them validates, so the rules above are

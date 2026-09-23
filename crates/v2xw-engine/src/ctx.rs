@@ -505,7 +505,18 @@ impl Ctx for EngineCtx<'_> {
         // written to a NODE channel. The tag travels with the record, so this is checkable
         // here rather than only at the exporter, which is where a leak would otherwise be
         // found — after it had already been written.
-        if owned.channel.starts_with("node.") && !owned.visibility.allowed_on_node_channel() {
+        //
+        // What a channel may carry is the channel table's to say (`v2xw_record::CHANNELS`,
+        // the table the recorder itself admits records by). A declared channel refuses a
+        // ground-truth record exactly when it is declared node-only; the `node.` prefix is
+        // the rule for a channel the table does not declare. The prefix alone was the whole
+        // rule, and it refused every `node.rx` record — a reception attempt's fate, which
+        // like `phy.rx` names its true sender and is declared node-and-ground-truth.
+        let node_only = match v2xw_record::channels::by_name(owned.channel) {
+            Some(spec) => spec.visibility.allowed_on_node_channel(),
+            None => owned.channel.starts_with("node."),
+        };
+        if node_only && !owned.visibility.allowed_on_node_channel() {
             self.refused += 1;
             return;
         }
