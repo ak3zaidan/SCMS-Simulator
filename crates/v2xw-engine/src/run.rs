@@ -1453,6 +1453,16 @@ impl Engine {
                 .map(|p| p.detect(&mut ctx, node, &me, delivered))
                 .unwrap_or_default()
         };
+        // The node's counters are cumulative, so take the running total rather than
+        // adding it: accumulating a cumulative counter once per step multiplies it by the
+        // step count, which is how this diagnostic first reported 49 million failures out
+        // of 70,925 messages.
+        if let (Some(rt), Some(p2)) = (self.nodes.get(&node), self.phase2.as_mut()) {
+            let (parse, sig) = (rt.spdu_parse_failures(), rt.spdu_signature_failures());
+            let r = p2.report_mut();
+            r.spdu_parse_failures = r.spdu_parse_failures.max(parse);
+            r.spdu_signature_failures = r.spdu_signature_failures.max(sig);
+        }
         for report in reports {
             let Some(signer) = self
                 .nodes

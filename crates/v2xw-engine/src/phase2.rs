@@ -191,6 +191,24 @@ pub struct Revocation {
 pub struct Phase2Report {
     /// How many roadside units were created.
     pub rsus: u64,
+    /// Received envelopes that would not parse at all.
+    pub spdu_parse_failures: u64,
+    /// Received envelopes that parsed but whose signature did not verify.
+    pub spdu_signature_failures: u64,
+    /// How many received messages landed in each node verification state.
+    ///
+    /// Counted because the detector suite's behaviour is dominated by this one input, and
+    /// the aggregate verdict count cannot tell "the signature failed" from "this node
+    /// never checked" or "this node holds no certificate for the signer". Those are three
+    /// different facts and only one of them is misbehaviour.
+    pub verification_states: std::collections::BTreeMap<String, u64>,
+    /// How many times each detector fired, by detector id.
+    ///
+    /// Reported because the aggregate `verdicts_fired` cannot distinguish a suite in which
+    /// every check contributes a little from one in which a single mis-calibrated check
+    /// accounts for nearly all of it. Those need opposite responses, and the aggregate
+    /// alone sent one investigation down the wrong path.
+    pub verdicts_by_detector: std::collections::BTreeMap<String, u64>,
     /// How many nodes were armed as attackers.
     pub attackers: u64,
     /// How many outgoing claims an attacker falsified.
@@ -450,6 +468,12 @@ impl Phase2 {
     }
 
     /// The counters for the run report.
+    /// The counters, mutably, for the engine to fold node-local totals into.
+    pub fn report_mut(&mut self) -> &mut Phase2Report {
+        &mut self.report
+    }
+
+    /// The counters this path accumulated during the run.
     pub fn report(&self) -> &Phase2Report {
         &self.report
     }
@@ -712,10 +736,23 @@ impl Phase2 {
             };
             let verdict = v2xw_threat::Detector::on_message(detector, ctx, me, &observed, &NoMap);
             self.report.messages_checked += 1;
+            *self
+                .report
+                .verification_states
+                .entry(format!("{:?}", m.verification))
+                .or_insert(0) += 1;
+
             if !verdict.fired() {
                 continue;
             }
             self.report.verdicts_fired += 1;
+            for o in &verdict.fired {
+                *self
+                    .report
+                    .verdicts_by_detector
+                    .entry(o.detector.as_str().to_string())
+                    .or_insert(0) += 1;
+            }
             if !self.filed.insert((node, verdict.subject.clone())) {
                 continue;
             }

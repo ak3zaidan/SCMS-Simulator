@@ -86,7 +86,9 @@ use std::collections::BTreeMap;
 use crate::capability::{angle_diff_rad, bearing_rad};
 use crate::cards::{LEGACY_JVM, LEGACY_PY, design, legacy, legacy_param, legacy_uncited, standard};
 use crate::ctx::{ThreatCtx, ThreatCtxExt};
-use crate::obs::{LocalEnvironment, ObservedKind, ObservedMessage, SelfBelief, StationType};
+use crate::obs::{
+    LocalEnvironment, ObservedKind, ObservedMessage, SelfBelief, StationType, VerificationState,
+};
 use crate::records::DetObservation;
 use v2xw_core::card::{
     Determinism, Equation, Family, ModelCard, Parameter, Tier, Validation, ValidationStatus,
@@ -795,9 +797,24 @@ impl Detector for Legacy12 {
             }
         }
 
-        if !m.verification.is_valid() {
-            // The content of an unverifiable message is worthless, so the plausibility
-            // checks are moot; the receiver reports the cryptographic failure itself.
+        if matches!(m.verification, VerificationState::Unverified) {
+            // NOT CHECKED, because this node's verification policy deferred it. That is
+            // an absence of evidence, not evidence of misbehaviour.
+            //
+            // The content still cannot be trusted, so every plausibility check is zeroed
+            // exactly as it is for a failure — but `signatureVerification` must NOT fire,
+            // because firing it accuses a peer of a bad signature this node never tested.
+            //
+            // Conflating the two cost 98.31 % of honest messages a verdict: under an
+            // on-demand policy almost nothing is verified, every unverified message was
+            // scored a hard cryptographic failure at `hard_fail_score`, and 126 false
+            // reports and one false revocation followed. `VerificationState` has four
+            // members for a reason and three of them are not interchangeable.
+            f = Fingerprint::default();
+        } else if !m.verification.is_valid() {
+            // Checked and failed, or the signer's certificate is unknown. The content of
+            // an unverifiable message is worthless, so the plausibility checks are moot;
+            // the receiver reports the cryptographic failure itself.
             f = Fingerprint::default();
             f.set(DetectorId::SignatureVerification, p.hard_fail_score);
         } else if m.station_type == StationType::Vru {

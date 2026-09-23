@@ -290,6 +290,10 @@ impl Default for NodeConfig {
 
 /// An on-board unit.
 pub struct ObuRuntime {
+    /// Received envelopes that would not parse.
+    spdu_parse_failures: u64,
+    /// Received envelopes that parsed but whose signature did not verify.
+    spdu_signature_failures: u64,
     node: NodeId,
     config: NodeConfig,
     service: ProfileServiceModel,
@@ -359,6 +363,8 @@ impl ObuRuntime {
             ..Default::default()
         };
         ObuRuntime {
+            spdu_parse_failures: 0,
+            spdu_signature_failures: 0,
             node,
             cpu: ServerBank::new("cpu", cpu_servers, at),
             hsm: ServerBank::new("hsm", hsm_servers, at),
@@ -672,6 +678,30 @@ impl ObuRuntime {
         let Some(lv) = frame.claimed_linkage else {
             return VerificationState::Verified;
         };
+        // Tell the gate which i-period this node believes it is in, before asking it to
+        // judge a peer's.
+        //
+        // `CrlGate` refuses a claimed period further than its skew from `current_period`,
+        // so that an attacker cannot make a receiver walk a hash chain for a period a
+        // year away. That defence turns into a denial of service against honest traffic
+        // if nothing ever tells the gate what period it is: it starts at 0 through
+        // `Default`, every real certificate claims a provisioned period, the difference
+        // exceeds the skew, and every frame is refused.
+        //
+        // Measured before this line existed: 98.23 % of received messages in a Phase 2
+        // run landed in `Invalid`, only 0.73 % verified, and the detector suite reported
+        // every one of them as a signature failure — 126 false misbehaviour reports and
+        // one honest device revoked.
+        //
+        // A node's own active credential is the right source: it was provisioned for the
+        // period the node is in, it is the node's own state rather than ground truth, and
+        // it needs no new plumbing from the engine.
+        if let Some(own) = self.stores.certs.active() {
+            let mine = own.i_period;
+            if self.stores.crl.current_period() != mine {
+                self.stores.crl.set_period(mine);
+            }
+        }
         match self
             .stores
             .crl
@@ -696,6 +726,7 @@ impl ObuRuntime {
     /// learned nothing about the message signed under it.
     fn verify_on_the_wire(&mut self, ctx: &mut dyn NodeCtx, bytes: &[u8]) -> SpduVerdict {
         let Some(parsed) = self.security.parse(bytes) else {
+            self.spdu_parse_failures += 1;
             return SpduVerdict::Invalid;
         };
         let certificate = match NodeSecurity::attached_certificate(&parsed) {
@@ -709,8 +740,30 @@ impl ObuRuntime {
         let Some(certificate) = certificate else {
             return SpduVerdict::Unverifiable;
         };
-        self.security
-            .verify_parsed(ctx, &parsed, &certificate, self.node)
+        let v = self
+            .security
+            .verify_parsed(ctx, &parsed, &certificate, self.node);
+        if v == SpduVerdict::Invalid {
+            self.spdu_signature_failures += 1;
+        }
+        v
+    }
+
+    /// How many received SPDUs failed to parse at all.
+    ///
+    /// Split from the signature failures because the two have nothing in common: one is a
+    /// malformed or truncated envelope, the other is a well-formed envelope whose
+    /// signature does not check out. The aggregate `Invalid` count cannot tell them apart,
+    /// and while it could not, two wrong hypotheses were pursued.
+    #[must_use]
+    pub const fn spdu_parse_failures(&self) -> u64 {
+        self.spdu_parse_failures
+    }
+
+    /// How many received SPDUs parsed but whose signature did not verify.
+    #[must_use]
+    pub const fn spdu_signature_failures(&self) -> u64 {
+        self.spdu_signature_failures
     }
 
     fn to_message(

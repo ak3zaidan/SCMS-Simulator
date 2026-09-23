@@ -176,6 +176,24 @@ fn the_detector_suite_has_false_positives_on_honest_traffic() {
         p.cases_opened,
         p.cases_unresolved
     );
+    println!(
+        "  of the Invalid: {} would not parse, {} parsed but failed the signature",
+        p.spdu_parse_failures, p.spdu_signature_failures
+    );
+    for (state, n) in &p.verification_states {
+        println!(
+            "  state {state:24} {n:7} ({:.2} % of messages)",
+            100.0 * *n as f64 / p.messages_checked.max(1) as f64
+        );
+    }
+    let mut by: Vec<(&String, &u64)> = p.verdicts_by_detector.iter().collect();
+    by.sort_by(|a, b| b.1.cmp(a.1));
+    for (name, n) in by {
+        println!(
+            "  {name:30} {n:7} ({:.2} % of messages)",
+            100.0 * *n as f64 / p.messages_checked.max(1) as f64
+        );
+    }
     assert_eq!(
         p.crls_issued, 0,
         "false reports revoked a device, which is what the two-authority resolution exists \
