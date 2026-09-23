@@ -181,10 +181,15 @@ impl SidelinkAccess {
         self.mac.pool().slot()
     }
 
-    /// Registers the PHY's and the MAC's cards, so the manifest pins them.
+    /// Registers the PHY's and the MAC's cards, and the card of the coupling this module
+    /// adds between them, so the manifest pins all three.
     pub(crate) fn register(&self, registry: &mut v2xw_core::registry::Registry) -> Result<()> {
         use v2xw_core::model::Model;
-        for card in [self.phy.card().clone(), self.mac.card().clone()] {
+        for card in [
+            self.phy.card().clone(),
+            self.mac.card().clone(),
+            coupling_card(self.mac.pool(), self.mac.params()),
+        ] {
             if !registry.contains(&card.id) {
                 registry.register(card)?;
             }
@@ -527,4 +532,87 @@ impl Engine {
             .collect();
         Some(report)
     }
+}
+
+/// Model id of the engine's coupling between the sidelink PHY, the SPS engine and the run.
+pub const SIDELINK_ACCESS_ID: &str = "access/sidelink/engine-coupling";
+
+/// The card of what this module adds on top of the radio crate's sidelink models: the
+/// pool and profile a scenario gets, and the approximations the coupling makes.
+fn coupling_card(pool: &PoolConfig, params: &SpsParams) -> v2xw_core::card::ModelCard {
+    use v2xw_core::card::{Family, ModelCard, Parameter, Source, SourceKind, Validation, ValidationStatus};
+    let std_src = |r: &str| Source::new(SourceKind::Standard, r);
+    let mut card = ModelCard::new(
+        SIDELINK_ACCESS_ID,
+        Family::Mac,
+        "1.0.0",
+        "How a run drives the sidelink: slot-aligned SPS grants from the event loop, \
+         co-slot interference and in-band emission at every shared receiver, sensing at \
+         every receiver in range, and the resource pool and SPS profile radio.rat selects.",
+    );
+    card.tier = vec![Tier::Medium, Tier::High];
+    card.parameters = vec![
+        Parameter::new(
+            "channel",
+            "-",
+            serde_json::json!(CV2X_CHANNEL.0),
+            std_src("FCC 20-164 (2020): 5.905-5.925 GHz reserved for C-V2X; channel 183"),
+        ),
+        Parameter::new(
+            "tx_power_dbm",
+            "dBm",
+            serde_json::json!(CV2X_TX_POWER_DBM),
+            std_src("3GPP TR 36.885 Table A.1.2-1 / TR 37.885 Table 6.1.1-1: 23 dBm UE"),
+        ),
+        Parameter::new(
+            "subchannels",
+            "count",
+            serde_json::json!(pool.subchannels()),
+            Source::new(
+                SourceKind::Paper,
+                "Molina-Masegosa 2017 (LTE) / Todisco 2021 (NR) pools, via 04-models.md §5.5",
+            ),
+        ),
+        Parameter::new(
+            "rsrp_threshold_dbm",
+            "dBm",
+            serde_json::json!(params.rsrp_threshold_dbm),
+            Source::new(SourceKind::Paper, "04-models.md §5.1, §5.2 study profiles"),
+        ),
+        Parameter::new(
+            "latency_budget_ms",
+            "ms",
+            serde_json::json!(params.rri.0),
+            std_src("3GPP TR 37.885 Table 5.1-1: 100 ms for periodic 10 Hz safety traffic"),
+        ),
+    ];
+    card.assumptions = vec![
+        "A UE that receives a transmission at or above the RSRP exclusion threshold is \
+         taken to have decoded its SCI and records the reservation; the published \
+         simulators the radio crate's sweep follows make the same approximation."
+            .to_string(),
+        "A wideband jammer's power lands across the whole pool, so its share in a \
+         transport block's allocation is the allocation's share of the pool."
+            .to_string(),
+    ];
+    card.limitations = vec![
+        "The CBR-dependent CR limit of TS 36.213 §14.1.1.4C is measured, not enforced: no \
+         UE is throttled by sidelink congestion control."
+            .to_string(),
+        "Each transport block is sent once: no blind retransmission.".to_string(),
+        "SPS sensing does not see a jammer's energy.".to_string(),
+        "Links beyond the engine's 1 km candidate range are neither received nor counted \
+         as interference or sensed energy."
+            .to_string(),
+    ];
+    card.sources = vec![
+        std_src("3GPP TS 36.213 §14.1.1.6, TS 36.321 §5.14.1.1 (Rel-14 Mode 4)"),
+        std_src("3GPP TS 38.214 §8.1.4, TS 38.321 §5.22.1 (Rel-16 Mode 2)"),
+    ];
+    card.validation = Validation {
+        status: ValidationStatus::UnitTested,
+        references: Vec::new(),
+        tests: vec!["radio_access::each_radio_technology_runs_its_own_access_layer".to_string()],
+    };
+    card
 }

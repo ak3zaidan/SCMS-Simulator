@@ -228,19 +228,14 @@ fn a_key_the_engine_cannot_act_on_is_refused_and_names_itself() {
     // Each case sets exactly one thing and expects exactly that field back. A case that
     // set two would pass while one of the rules was missing.
     let cases: Vec<(&str, Box<dyn Fn(&mut Scenario)>)> = vec![
+        // `radio.tiers.focus` used to be here; it is wired now (a focus region runs its
+        // receivers at the focus tier), and `radio_access::a_focus_region_runs_its_
+        // receivers_at_the_focus_tier` is its test. `hybrid` is the radio value that
+        // remains refused: it needs a per-message policy no key states.
         (
-            "radio.tiers.focus",
+            "radio.rat",
             Box::new(|s: &mut Scenario| {
-                s.radio.tiers.propagation = v2xw_core::card::Tier::Abstract;
-                s.radio.tiers.phy = v2xw_core::card::Tier::Abstract;
-                s.radio.tiers.mac = v2xw_core::card::Tier::Abstract;
-                s.radio.tiers.focus = Some(v2xw_engine::scenario::Focus {
-                    region: v2xw_engine::scenario::FocusRegion::Follow {
-                        node: 0,
-                        radius_m: 250.0,
-                    },
-                    tier: v2xw_core::card::Tier::High,
-                });
+                s.radio.rat = v2xw_engine::scenario::schema::Rat::Hybrid;
             }),
         ),
         (
