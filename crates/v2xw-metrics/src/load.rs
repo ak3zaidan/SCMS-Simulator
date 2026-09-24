@@ -26,9 +26,9 @@ use v2xw_core::model::Model;
 use v2xw_core::time::{Duration, SimTime};
 
 use crate::cards;
-use crate::channels::{ChannelView, MacCbrView, NodeRxView, NodeTxView, RxFate, decode};
+use crate::channels::{ChannelView, MacCbrView, NodeRxView, NodeTxView, RxFate};
 use crate::def::{Agg, DEFAULT_LEVEL, Dim, DimValue, Dims, MetricDef, MetricSample, SampleValue};
-use crate::provider::MetricProvider;
+use crate::provider::{Decoded, MetricProvider};
 use crate::quant::Quantum;
 use crate::stats::{ConfidenceLevel, Distribution, Estimate, Proportion};
 
@@ -407,19 +407,23 @@ impl MetricProvider for LoadProvider {
     }
 
     fn on_event(&mut self, ev: &EventRecord) {
-        match ev.channel {
-            NodeTxView::CHANNEL => match decode::<NodeTxView>(ev) {
-                Ok(v) => self.on_tx(&v),
-                Err(_) => self.rejected += 1,
-            },
-            NodeRxView::CHANNEL => match decode::<NodeRxView>(ev) {
-                Ok(v) => self.on_rx(&v),
-                Err(_) => self.rejected += 1,
-            },
-            MacCbrView::CHANNEL => match decode::<MacCbrView>(ev) {
-                Ok(v) => self.on_mac(&v),
-                Err(_) => self.rejected += 1,
-            },
+        self.on_decoded(&Decoded::new(ev));
+    }
+
+    fn on_decoded(&mut self, ev: &Decoded<'_>) {
+        match ev.channel() {
+            NodeTxView::CHANNEL => ev.with(|v: Option<&NodeTxView>| match v {
+                Some(v) => self.on_tx(v),
+                None => self.rejected += 1,
+            }),
+            NodeRxView::CHANNEL => ev.with(|v: Option<&NodeRxView>| match v {
+                Some(v) => self.on_rx(v),
+                None => self.rejected += 1,
+            }),
+            MacCbrView::CHANNEL => ev.with(|v: Option<&MacCbrView>| match v {
+                Some(v) => self.on_mac(v),
+                None => self.rejected += 1,
+            }),
             _ => {}
         }
     }

@@ -30,10 +30,10 @@ use v2xw_core::time::SimTime;
 
 use crate::cards;
 use crate::channels::{
-    ByteBucket, ChannelView, GtKinematicsView, NetBytesView, NodeTxView, ProtoMsgView, decode,
+    ByteBucket, ChannelView, GtKinematicsView, NetBytesView, NodeTxView, ProtoMsgView,
 };
 use crate::def::{Agg, Dim, DimValue, Dims, MetricDef, MetricSample, SampleValue};
-use crate::provider::MetricProvider;
+use crate::provider::{Decoded, MetricProvider};
 use crate::quant::Quantum;
 use crate::stats::{Estimate, ratio_of_sums};
 
@@ -284,27 +284,31 @@ impl MetricProvider for OverheadProvider {
     }
 
     fn on_event(&mut self, ev: &EventRecord) {
-        match ev.channel {
-            NodeTxView::CHANNEL => match decode::<NodeTxView>(ev) {
-                Ok(v) => self.on_tx(&v),
-                Err(_) => self.rejected += 1,
-            },
-            NetBytesView::CHANNEL => match decode::<NetBytesView>(ev) {
-                Ok(v) => *self.buckets.entry(v.bucket).or_insert(0) += v.bytes_on_wire,
-                Err(_) => self.rejected += 1,
-            },
-            ProtoMsgView::CHANNEL => match decode::<ProtoMsgView>(ev) {
-                Ok(v) => {
+        self.on_decoded(&Decoded::new(ev));
+    }
+
+    fn on_decoded(&mut self, ev: &Decoded<'_>) {
+        match ev.channel() {
+            NodeTxView::CHANNEL => ev.with(|v: Option<&NodeTxView>| match v {
+                Some(v) => self.on_tx(v),
+                None => self.rejected += 1,
+            }),
+            NetBytesView::CHANNEL => ev.with(|v: Option<&NetBytesView>| match v {
+                Some(v) => *self.buckets.entry(v.bucket).or_insert(0) += v.bytes_on_wire,
+                None => self.rejected += 1,
+            }),
+            ProtoMsgView::CHANNEL => ev.with(|v: Option<&ProtoMsgView>| match v {
+                Some(v) => {
                     if let Some(b) = v.transport {
                         *self.buckets.entry(b).or_insert(0) += v.bytes_on_wire;
                     }
                 }
-                Err(_) => self.rejected += 1,
-            },
-            GtKinematicsView::CHANNEL => match decode::<GtKinematicsView>(ev) {
-                Ok(v) => self.on_kinematics(&v),
-                Err(_) => self.rejected += 1,
-            },
+                None => self.rejected += 1,
+            }),
+            GtKinematicsView::CHANNEL => ev.with(|v: Option<&GtKinematicsView>| match v {
+                Some(v) => self.on_kinematics(v),
+                None => self.rejected += 1,
+            }),
             _ => {}
         }
     }

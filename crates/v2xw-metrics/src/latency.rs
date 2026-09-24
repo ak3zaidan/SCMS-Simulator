@@ -57,7 +57,7 @@ use v2xw_core::time::SimTime;
 use crate::cards;
 use crate::channels::{ChannelView, NodeRxView, decode};
 use crate::def::{Agg, Dim, DimValue, Dims, MetricDef, MetricSample, SampleValue};
-use crate::provider::MetricProvider;
+use crate::provider::{Decoded, MetricProvider};
 use crate::quant::Quantum;
 use crate::stats::{Distribution, ratio_of_sums};
 
@@ -599,9 +599,14 @@ impl MetricProvider for LatencyProvider {
     }
 
     fn on_event(&mut self, ev: &EventRecord) {
+        self.on_decoded(&Decoded::new(ev));
+    }
+
+    fn on_decoded(&mut self, d: &Decoded<'_>) {
+        let ev = d.record();
         match ev.channel {
-            NodeRxView::CHANNEL => match decode::<NodeRxView>(ev) {
-                Ok(v) => {
+            NodeRxView::CHANNEL => d.with(|v: Option<&NodeRxView>| match v {
+                Some(v) => {
                     if v.outcome == crate::channels::RxFate::Delivered {
                         match v.latency_trace() {
                             Some(t) => {
@@ -616,8 +621,8 @@ impl MetricProvider for LatencyProvider {
                         }
                     }
                 }
-                Err(_) => self.rejected += 1,
-            },
+                None => self.rejected += 1,
+            }),
             MSG_LATENCY => match decode::<LatencyTrace>(ev) {
                 Ok(t) => {
                     self.observe(&t);

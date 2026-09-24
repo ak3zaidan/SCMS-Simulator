@@ -160,7 +160,7 @@ pub use error::{MetricError, Result};
 pub use gate::{CalibrationIssue, GateFailure, GateReport, IssueRegister, IssueState};
 pub use invariants::{InvariantOutcome, InvariantReport, InvariantViolation, check_all};
 pub use ledger::EventLedger;
-pub use provider::{MetricProvider, ProviderSet};
+pub use provider::{Decoded, MetricProvider, ProviderSet};
 pub use quant::Quantum;
 pub use stats::{
     ConfidenceLevel, Distribution, DistributionSummary, Estimate, Interpolation, Percentile,

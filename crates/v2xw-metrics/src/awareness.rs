@@ -34,9 +34,9 @@ use v2xw_core::time::{Duration, SimTime};
 
 use crate::bins::Bins;
 use crate::cards;
-use crate::channels::{ChannelView, GtKinematicsView, NodeRxView, RxFate, decode};
+use crate::channels::{ChannelView, GtKinematicsView, NodeRxView, RxFate};
 use crate::def::{Agg, DEFAULT_LEVEL, Dim, DimValue, Dims, MetricDef, MetricSample, SampleValue};
-use crate::provider::MetricProvider;
+use crate::provider::{Decoded, MetricProvider};
 use crate::quant::Quantum;
 use crate::stats::{ConfidenceLevel, Distribution, Proportion, ratio_of_sums};
 
@@ -446,15 +446,19 @@ impl MetricProvider for AwarenessProvider {
     }
 
     fn on_event(&mut self, ev: &EventRecord) {
-        match ev.channel {
-            NodeRxView::CHANNEL => match decode::<NodeRxView>(ev) {
-                Ok(v) => self.on_rx(&v),
-                Err(_) => self.rejected += 1,
-            },
-            GtKinematicsView::CHANNEL => match decode::<GtKinematicsView>(ev) {
-                Ok(v) => self.on_kinematics(&v),
-                Err(_) => self.rejected += 1,
-            },
+        self.on_decoded(&Decoded::new(ev));
+    }
+
+    fn on_decoded(&mut self, ev: &Decoded<'_>) {
+        match ev.channel() {
+            NodeRxView::CHANNEL => ev.with(|v: Option<&NodeRxView>| match v {
+                Some(v) => self.on_rx(v),
+                None => self.rejected += 1,
+            }),
+            GtKinematicsView::CHANNEL => ev.with(|v: Option<&GtKinematicsView>| match v {
+                Some(v) => self.on_kinematics(v),
+                None => self.rejected += 1,
+            }),
             _ => {}
         }
     }
