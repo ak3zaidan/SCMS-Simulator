@@ -2731,7 +2731,7 @@ impl LiveEngine {
     /// opened on, which is where a document the page edited came from.
     fn scenario_from_document(&self, doc: &Value) -> std::result::Result<Scenario, Vec<ParamError>> {
         let text = serde_json::to_string(doc).map_err(|e| {
-            vec![ParamError::new("/", &e.to_string(), "pass a JSON object")]
+            vec![ParamError::new("/", e.to_string(), "pass a JSON object")]
         })?;
         let base = self.source.as_ref().and_then(|p| p.parent());
         match Scenario::parse(&text, base) {
@@ -2797,14 +2797,14 @@ fn scenario_error(e: &v2xw_engine::ScenarioError) -> ParamError {
         .field()
         .map(|f| format!("/{}", f.replace('.', "/")))
         .unwrap_or_else(|| "/".to_string());
-    ParamError::new(path, &e.to_string(), "see the field's help text for its allowed values")
+    ParamError::new(path, e.to_string(), "see the field's help text for its allowed values")
 }
 
 /// An engine error from the loader as a `{path, message, hint}` row.
 fn engine_error(e: &v2xw_engine::EngineError) -> ParamError {
     match e {
         v2xw_engine::EngineError::Scenario(inner) => scenario_error(inner),
-        other => ParamError::new("/", &other.to_string(), "check the scenario document"),
+        other => ParamError::new("/", other.to_string(), "check the scenario document"),
     }
 }
 
@@ -2861,7 +2861,7 @@ fn apply_patch(doc: &mut Value, ops: &[Value]) -> std::result::Result<(), ParamE
                 if doc.pointer(path) != value.as_ref() {
                     return Err(ParamError::new(
                         format!("/patch/{i}"),
-                        &format!("test failed at {path}"),
+                        format!("test failed at {path}"),
                         "the document changed under this patch",
                     ));
                 }
@@ -2870,7 +2870,7 @@ fn apply_patch(doc: &mut Value, ops: &[Value]) -> std::result::Result<(), ParamE
                 let target = doc.pointer_mut(parent).ok_or_else(|| {
                     ParamError::new(
                         format!("/patch/{i}/path"),
-                        &format!("`{parent}` does not exist"),
+                        format!("`{parent}` does not exist"),
                         "add the enclosing object first",
                     )
                 })?;
@@ -2915,7 +2915,7 @@ fn apply_patch(doc: &mut Value, ops: &[Value]) -> std::result::Result<(), ParamE
                     _ => {
                         return Err(ParamError::new(
                             format!("/patch/{i}/path"),
-                            &format!("`{parent}` is not an object or an array"),
+                            format!("`{parent}` is not an object or an array"),
                             "patch a field inside an object",
                         ));
                     }
@@ -2924,7 +2924,7 @@ fn apply_patch(doc: &mut Value, ops: &[Value]) -> std::result::Result<(), ParamE
             other => {
                 return Err(ParamError::new(
                     format!("/patch/{i}/op"),
-                    &format!("`{other}` is not supported here"),
+                    format!("`{other}` is not supported here"),
                     "use add, replace, remove or test",
                 ));
             }
