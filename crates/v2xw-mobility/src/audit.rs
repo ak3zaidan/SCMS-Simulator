@@ -36,6 +36,7 @@
 //! | [`Check::QueueJump`] | a lane change round a vehicle standing at the stop line, started inside the no-change zone |
 //! | [`Check::IllegalTransition`] | a vehicle arrived on a lane the lane graph does not connect to its previous one |
 //! | [`Check::Teleport`] | the published position moved further in one step than the speed allows |
+//! | [`Check::StepSpeed`] | the published position moved a distance the reported speed does not explain — a freeze or a catch-up jump |
 //! | [`Check::HeadingJump`] / [`Check::HeadingFlip`] | the heading turned faster than a car can, or reversed |
 //! | [`Check::SpeedJump`] | the speed changed faster than any acceleration the vehicle can produce |
 //! | [`Check::AccelBound`] | the acceleration is outside the vehicle's capability or the tyre-road limit |
@@ -61,7 +62,7 @@ use v2xw_core::ids::{ActorId, JunctionId, LaneId};
 use v2xw_core::math;
 use v2xw_core::time::{SimTime, ns_to_secs};
 use v2xw_world::model::{normalise_angle, point_in_ring, ring_distance_sq_2d};
-use v2xw_world::{JunctionControl, LaneKind, SignalState, World};
+use v2xw_world::{JunctionControl, LaneKind, SignalState, World, road_meets_building};
 
 use crate::intersection::zones::{ConflictZones, Zone};
 use crate::views::DespawnCause;
@@ -102,6 +103,9 @@ pub struct AuditActor {
     pub route_next: Option<LaneId>,
     /// The published reference point (rear-axle centre).
     pub pos: Vec3,
+    /// The tightest radius this vehicle's reference point can follow, metres: its class's
+    /// AASHTO design vehicle ([`crate::VehicleClass::min_path_radius_m`]).
+    pub min_path_radius_m: f64,
     /// The published heading, radians.
     pub heading_rad: f64,
 }
@@ -134,6 +138,9 @@ pub enum Check {
     IllegalTransition,
     /// A position jump the speed cannot explain.
     Teleport,
+    /// A step whose distance disagrees with the speed the vehicle reports — the published
+    /// point froze while the speed said it moved, or caught up in a jump.
+    StepSpeed,
     /// A heading rate no car can turn at.
     HeadingJump,
     /// A heading reversal in one step.
@@ -150,7 +157,8 @@ pub enum Check {
     MidRoadDespawn,
     /// World: an internal path that leaves its junction's area.
     WorldInternalOutsideJunction,
-    /// World: a lane centreline inside a building footprint.
+    /// World: a lane centreline inside a building's volume where the world marks no
+    /// passage.
     WorldLaneInBuilding,
     /// World: two conflicting movements given a protected green in the same phase.
     WorldConflictingGreens,
@@ -158,7 +166,7 @@ pub enum Check {
 
 impl Check {
     /// Every class, in report order.
-    pub const ALL: [Check; 22] = [
+    pub const ALL: [Check; 23] = [
         Check::Overlap,
         Check::GapBelowMinimum,
         Check::LateralOffset,
@@ -171,6 +179,7 @@ impl Check {
         Check::QueueJump,
         Check::IllegalTransition,
         Check::Teleport,
+        Check::StepSpeed,
         Check::HeadingJump,
         Check::HeadingFlip,
         Check::SpeedJump,
@@ -198,6 +207,7 @@ impl Check {
             Check::QueueJump => "queue-jump",
             Check::IllegalTransition => "illegal-transition",
             Check::Teleport => "teleport",
+            Check::StepSpeed => "step-speed",
             Check::HeadingJump => "heading-jump",
             Check::HeadingFlip => "heading-flip",
             Check::SpeedJump => "speed-jump",
@@ -239,15 +249,23 @@ pub struct AuditParams {
     /// builds 8-9 m/s² in 0.2-0.3 s). 30 m/s³ is therefore the physical ceiling, not a
     /// comfort target.
     pub max_jerk_mps3: f64,
-    /// The tightest path radius the published reference point may follow, metres.
-    ///
-    /// A passenger car's kerb-to-kerb turning radius is about 5-6 m (AASHTO 2018 Table 2-2,
-    /// design vehicle P: minimum centreline turning radius 7.3 m, minimum inside radius
-    /// 4.4 m). 4 m is the inside radius rounded down, so the check only fires on a heading
-    /// change no road vehicle can make.
+    /// A floor under every vehicle's own minimum path radius, metres: the heading check
+    /// holds each vehicle to the tighter of this and its class's AASHTO design-vehicle
+    /// radius ([`AuditActor::min_path_radius_m`] — 5.42 m for a passenger car, from a
+    /// 6.4 m centreline radius and a 3.4 m wheelbase). Zero by default, so the class's own
+    /// geometry is the bound; it exists for a caller that wants the looser bound this
+    /// check used to have (4 m, the P design vehicle's inside radius rounded down).
     pub min_turn_radius_m: f64,
     /// Slack on the teleport test, metres.
     pub teleport_slack_m: f64,
+    /// Relative tolerance of the step-versus-speed test.
+    ///
+    /// **This crate's choice**: 5 %. On the tightest arc a vehicle may drive (5.4 m), a
+    /// 1.1 m step's chord is 0.3 % short of its arc, so 5 % is noise-free headroom.
+    pub step_speed_tolerance: f64,
+    /// Absolute slack of the step-versus-speed test, metres: 2 cm, twice the millimetre
+    /// quantisation of both endpoints with room for the arc's chord at walking pace.
+    pub step_speed_slack_m: f64,
     /// The no-change zone before a stop line, metres.
     ///
     /// MUTCD 2009 §3B.04: a solid lane line where "crossing the lane line markings is
@@ -278,8 +296,10 @@ impl Default for AuditParams {
             gap_tolerance_m: 0.05,
             max_decel_mps2: 9.0,
             max_jerk_mps3: 30.0,
-            min_turn_radius_m: 4.0,
+            min_turn_radius_m: 0.0,
             teleport_slack_m: 0.25,
+            step_speed_tolerance: 0.05,
+            step_speed_slack_m: 0.02,
             no_change_zone_m: crate::engine::DEFAULT_NO_CHANGE_ZONE_M,
             standstill_limit_s: 180.0,
             amber_decel_mps2: 3.0,
@@ -333,11 +353,11 @@ pub struct AuditStats {
     /// Steps at which two conflicting movements were both inside one junction (not a
     /// violation by itself: a permissive left waits inside the box).
     pub conflicting_occupancy_steps: u64,
-    /// Vehicle-steps with the body in a building while on a lane whose own centreline
-    /// runs through that building ([`Check::WorldLaneInBuilding`]): the source data puts
-    /// the road there, as a passage or a covered ramp. Not counted as
-    /// [`Check::InBuilding`], which is a vehicle off its road.
-    pub in_building_on_lanes_through_buildings: u64,
+    /// Vehicle-steps with the body in a building while on a lane the world marks as a
+    /// passage through that building ([`v2xw_world::Passage`]): the source puts the road
+    /// there — the Park Avenue portals, a covered ramp, a garage entrance. Not counted as
+    /// [`Check::InBuilding`], which is a vehicle where no road goes.
+    pub in_building_on_passages: u64,
     /// Largest |jerk| seen, m/s³.
     pub max_jerk_mps3: f64,
     /// Largest deceleration seen, m/s².
@@ -395,9 +415,6 @@ pub struct TrafficAuditor {
     flagged_standing: BTreeSet<ActorId>,
     /// Every junction's conflict zones.
     zones: ConflictZones,
-    /// Lanes whose own centreline passes through a building footprint in the source
-    /// data — a tunnel under one, a passage through one.
-    lanes_through_buildings: BTreeSet<LaneId>,
 }
 
 impl TrafficAuditor {
@@ -417,11 +434,6 @@ impl TrafficAuditor {
             standing_since: BTreeMap::new(),
             flagged_standing: BTreeSet::new(),
             zones: ConflictZones::build(world),
-            lanes_through_buildings: audit_world(world)
-                .into_iter()
-                .filter(|(c, _)| *c == Check::WorldLaneInBuilding)
-                .filter_map(|(_, e)| e.lane.map(LaneId::new))
-                .collect(),
         }
     }
 
@@ -702,18 +714,20 @@ impl TrafficAuditor {
                 let Some(building) = world.building(b) else {
                     continue;
                 };
+                // A building raised over the road, or a road on a viaduct over a low
+                // building, does not meet the vehicle at all.
+                if !road_meets_building(building, a.pos.z) {
+                    continue;
+                }
                 for p in &points {
                     if building.contains_2d(*p) {
-                        let on_data_lane = self.lanes_through_buildings.contains(&a.lane)
-                            || a.prev_lane
-                                .is_some_and(|l| self.lanes_through_buildings.contains(&l));
-                        if on_data_lane {
-                            // The source data runs this road through (or under) the
-                            // building — the Park Avenue portals of the Helmsley
-                            // Building, a covered tunnel ramp. That is the world's fact,
-                            // reported once per lane by `WorldLaneInBuilding`, not a
-                            // vehicle leaving its lane; it is counted as a statistic.
-                            self.stats.in_building_on_lanes_through_buildings += 1;
+                        let on_passage = world.is_passage(a.lane, b)
+                            || a.prev_lane.is_some_and(|l| world.is_passage(l, b));
+                        if on_passage {
+                            // The source runs this road through the building: the world
+                            // marks the lane a passage, and the renderer draws the
+                            // opening. A statistic, not a vehicle leaving its lane.
+                            self.stats.in_building_on_passages += 1;
                             break 'buildings;
                         }
                         let ex = Self::example(
@@ -1076,6 +1090,29 @@ impl TrafficAuditor {
             let moved = a.pos.distance_2d(p.pos);
             let v = a.speed_mps.max(p.speed_mps);
             let lateral = (a.lateral_m - p.lateral_m).abs();
+            // The engine advances a vehicle by the speed it reports at the end of the step
+            // (`s += v·dt`), and the published point rides the path with it, so the step
+            // is `v·dt` to within the chord of a curve and the lateral slide of a lane
+            // change. A step far shorter is a freeze, one far longer a catch-up jump — the
+            // 0.4 s standstill at 11 m/s followed by a 6.1 m leap the owner saw.
+            // Along the path in three dimensions: the speed is along a ramp's slope.
+            let moved_3d = a.pos.distance(p.pos);
+            let expected = a.speed_mps * dt;
+            let tolerance =
+                self.params.step_speed_tolerance * expected + self.params.step_speed_slack_m + lateral;
+            if (moved_3d - expected).abs() > tolerance {
+                let ex = Self::example(
+                    Check::StepSpeed,
+                    t,
+                    a,
+                    None,
+                    format!(
+                        "moved {moved_3d:.3} m in {dt:.2} s reporting {:.2} m/s (expected {expected:.3} m)",
+                        a.speed_mps
+                    ),
+                );
+                self.flag(Check::StepSpeed, ex);
+            }
             let allowed = v * dt + lateral + self.params.teleport_slack_m;
             if moved > allowed {
                 let ex = Self::example(
@@ -1111,7 +1148,12 @@ impl TrafficAuditor {
                 // A path of radius R turns at most `distance / R`; the lateral slide of a
                 // lane change adds its own heading swing, which the engine caps at 12°.
                 let travelled = 0.5 * (a.speed_mps + p.speed_mps) * dt;
-                let bound = travelled / self.params.min_turn_radius_m + 0.02;
+                let radius = if self.params.min_turn_radius_m > 0.0 {
+                    a.min_path_radius_m.min(self.params.min_turn_radius_m)
+                } else {
+                    a.min_path_radius_m
+                };
+                let bound = travelled / radius.max(0.5) + 0.02;
                 if turn
                     > bound
                         + if a.changing.is_some() || p.changing.is_some() {
@@ -1350,7 +1392,13 @@ pub fn audit_world(world: &World) -> Vec<(Check, Example)> {
             }
             if !building_reported && p.z >= -UNDERGROUND_Z_M {
                 for b in world.buildings_in_bbox(Bbox::new(p, p)) {
-                    if world.building(b).is_some_and(|bl| bl.contains_2d(p)) {
+                    if world.is_passage(lane.id, b) {
+                        continue;
+                    }
+                    if world
+                        .building(b)
+                        .is_some_and(|bl| bl.contains_2d(p) && road_meets_building(bl, p.z))
+                    {
                         building_reported = true;
                         out.push((
                             Check::WorldLaneInBuilding,
@@ -1469,6 +1517,7 @@ mod tests {
             route_next: None,
             pos: l.point_at(rear),
             heading_rad: l.heading_at(rear),
+            min_path_radius_m: crate::VehicleClass::Passenger.min_path_radius_m(),
         }
     }
 
@@ -1670,6 +1719,28 @@ mod tests {
             &[(ActorId::new(0), DespawnCause::LifetimeExpired)],
         );
         assert_eq!(audit.report().count(Check::MidRoadDespawn), 1);
+    }
+
+    /// The freeze-then-jump the owner saw before wave A — a car reporting 11 m/s whose
+    /// drawn position stood still, then leapt — is a step-versus-speed violation both
+    /// ways; a step of exactly `v·dt` is not.
+    #[test]
+    fn a_frozen_or_leaping_position_disagrees_with_the_reported_speed() {
+        let world = grid();
+        let lane = straight_lane(&world).id;
+        let mut audit = TrafficAuditor::new(&world, AuditParams::default());
+        let a0 = at(&world, 0, lane, 10.0, 11.0);
+        let a1 = at(&world, 0, lane, 11.1, 11.0);
+        audit.observe(&world, 0, 100_000_000, &[a0], &[]);
+        audit.observe(&world, 100_000_000, 200_000_000, &[a1], &[]);
+        assert_eq!(audit.report().count(Check::StepSpeed), 0);
+        // Frozen: the same position a step later at 11 m/s.
+        audit.observe(&world, 200_000_000, 300_000_000, &[a1], &[]);
+        assert_eq!(audit.report().count(Check::StepSpeed), 1);
+        // Leaping: 3.3 m in one 0.1 s step at 11 m/s.
+        let a2 = at(&world, 0, lane, 14.4, 11.0);
+        audit.observe(&world, 300_000_000, 400_000_000, &[a2], &[]);
+        assert_eq!(audit.report().count(Check::StepSpeed), 2);
     }
 
     #[test]
@@ -1889,6 +1960,61 @@ mod tests {
         );
         assert!(
             !audit_world(&world)
+                .iter()
+                .any(|(c, _)| *c == Check::WorldLaneInBuilding)
+        );
+        // The same building, with the world marking the lane a passage through it: the
+        // world check is clean, a vehicle on that lane inside the footprint is a
+        // statistic, and the same body on another lane is still a violation. And raised
+        // 10 m over the road (OSM `min_height`), the building meets no lane at all.
+        let passage = v2xw_world::Passage {
+            lane: lane.id,
+            building: v2xw_core::ids::BuildingId::new(0),
+            kind: v2xw_world::PassageKind::BuildingPassage,
+            s_from_m: 0.5 * lane.length_m - 3.0,
+            s_to_m: 0.5 * lane.length_m + 3.0,
+        };
+        let with_passage = World::builder(world.origin)
+            .roads(world.roads.clone())
+            .signals(world.signals.clone())
+            .buildings(with_building.buildings.clone())
+            .passages(vec![passage])
+            .provenance(world.provenance.clone())
+            .build()
+            .expect("a world");
+        assert!(
+            !audit_world(&with_passage)
+                .iter()
+                .any(|(c, _)| *c == Check::WorldLaneInBuilding)
+        );
+        let mut on = at(&with_passage, 0, lane.id, 0.5 * lane.length_m + 2.0, 5.0);
+        on.pos = mid;
+        let mut audit = TrafficAuditor::new(&with_passage, AuditParams::default());
+        audit.observe(&with_passage, 0, 100_000_000, &[on], &[]);
+        assert_eq!(audit.report().count(Check::InBuilding), 0);
+        assert_eq!(audit.report().stats.in_building_on_passages, 1);
+        let other = world
+            .roads
+            .lanes()
+            .iter()
+            .find(|l| l.kind == LaneKind::Driving && l.id != lane.id)
+            .expect("another lane")
+            .id;
+        let off = AuditActor { lane: other, ..on };
+        audit.observe(&with_passage, 100_000_000, 200_000_000, &[off], &[]);
+        assert_eq!(audit.report().count(Check::InBuilding), 1);
+        let mut raised_building = with_building.buildings[0].clone();
+        raised_building.min_height_m = 10.0;
+        raised_building.height_m = 30.0;
+        let raised = World::builder(world.origin)
+            .roads(world.roads.clone())
+            .signals(world.signals.clone())
+            .buildings(vec![raised_building])
+            .provenance(world.provenance.clone())
+            .build()
+            .expect("a world");
+        assert!(
+            !audit_world(&raised)
                 .iter()
                 .any(|(c, _)| *c == Check::WorldLaneInBuilding)
         );

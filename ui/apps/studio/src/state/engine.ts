@@ -1315,7 +1315,9 @@ export class StudioEngine {
     if (viewer) {
       viewer.setWorld(world);
       const extent = Math.max(world.bbox.maxXM - world.bbox.minXM, world.bbox.maxYM - world.bbox.minYM);
-      viewer.cameras.fitExtent(Math.min(extent * 1.05, MAP_OPEN_EXTENT_M));
+      // The opening zoom is the viewer's own, so it may widen to hold the traffic (see
+      // `Viewer.setOpeningExtent`); a user's zoom is never touched.
+      viewer.setOpeningExtent(Math.min(extent * 1.05, MAP_OPEN_EXTENT_M));
       if (viewer.cameras.mode === "map") viewer.cameras.snap();
       this.#applyModeOverlays(viewer.cameras.mode);
     }

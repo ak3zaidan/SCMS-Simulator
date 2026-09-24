@@ -206,6 +206,22 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
 @media (max-width: 1000px) {
   .body { grid-template-columns: 200px minmax(0, 1fr) 240px; }
 }
+/*
+ * A small window is still a simulator window: at 800 x 520 the 200 + 240 px panels and the
+ * 150 px plots strip left the viewport 360 x 146 px, a letterbox nobody can drive a camera in.
+ * Below 900 px wide the side panels narrow again and scroll their own content; below 640 px tall
+ * the plots strip shrinks, and below 560 px to one row of sparklines. The viewport keeps at least half of each
+ * dimension (measured by `e2e/regressions.spec.ts`).
+ */
+@media (max-width: 900px) {
+  .body { grid-template-columns: 150px minmax(0, 1fr) 180px; }
+}
+@media (max-height: 640px) {
+  .app { grid-template-rows: 30px minmax(0, 1fr) 84px; }
+}
+@media (max-height: 560px) {
+  .app { grid-template-rows: 30px minmax(0, 1fr) 58px; }
+}
 
 .panel {
   background: var(--bg-panel);

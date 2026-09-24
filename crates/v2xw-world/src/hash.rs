@@ -96,6 +96,9 @@ mod tag {
     pub const SITES: u8 = 0x0A;
     /// Land-use zones.
     pub const LANDUSE: u8 = 0x0B;
+    /// Passages (lanes through buildings). Absorbed only when there are any, so a world
+    /// without one hashes exactly as it did before passages existed.
+    pub const PASSAGES: u8 = 0x0C;
     /// End marker, so a truncated stream cannot hash like a complete one.
     pub const END: u8 = 0xFF;
 }
@@ -304,6 +307,17 @@ pub fn content_hash(world: &World) -> [u8; 32] {
     h.tag(tag::LANDUSE).count(world.landuse.len());
     for z in &world.landuse {
         hash_zone(&mut h, world, z);
+    }
+
+    if !world.passages.is_empty() {
+        h.tag(tag::PASSAGES).count(world.passages.len());
+        for p in &world.passages {
+            h.u32(p.lane.index())
+                .u32(p.building.index())
+                .u32(u32::from(p.kind.code()))
+                .quantised(p.s_from_m, crate::quant::Q_POSITION_M)
+                .quantised(p.s_to_m, crate::quant::Q_POSITION_M);
+        }
     }
 
     h.tag(tag::END);

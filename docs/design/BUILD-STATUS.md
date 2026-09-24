@@ -15,6 +15,85 @@ what each gap would take — see [`docs/RELEASE-CHECKLIST.md`](../RELEASE-CHECKL
 (2026-09-22). The Phase 1 acceptance table below is still accurate and the checklist cites
 it.
 
+## 2026-09-24 — junction geometry, signal timing, passages (junction track)
+
+Every number below comes from `traffic_audit` (`crates/v2xw-engine/examples/traffic_audit.rs`)
+or a test run on this machine. Scenarios are run for 300 s. "Dense" means 6,000 veh/h.
+
+| Class | dense Manhattan | manhattan-5min | dense grid |
+|---|---|---|---|
+| world: conflicting protected greens | 19 → 0 | 19 → 0 | 0 → 0 |
+| world: lanes in a building, no passage | 64 → 0 | 64 → 0 | 0 → 0 |
+| heading flip | 1 → 0 | 0 → 0 | 0 → 0 |
+| heading jump, old 4 m bound | 79 → 39 | 10 → 21 | 0 → 0 |
+| heading jump, AASHTO P bound (5.42 m) | — → 177 | — → 46 | — → 0 |
+| in a building outside a passage | 12 → 12 | 6 → 6 | 0 → 0 |
+| jerk > 30 m/s³ | 52 → 38 | 5 → 4 | 13 → 13 |
+| step vs reported speed (new) | — → 7 | — → 2 | — → 0 |
+| all other safety classes | 0 → 0 | 0 → 0 | 0 → 0 |
+
+Two dense-Manhattan runs gave identical counts.
+
+What changed:
+
+- **Turns are drivable arcs.**
+  - Junction connectors used to be quadratic Béziers. They are now AASHTO simple curves:
+    the largest circular arc that fits between the two lane ends.
+  - Motor lane corners are rounded the same way (`v2xw_world::curve`).
+  - Lane ends are pulled back, up to 7 m, until each turn has room for the P design
+    vehicle's 6.4 m centreline radius.
+  - The auditor holds each class to its AASHTO minimum path radius. For a car that is
+    5.42 m.
+- **Forks share their lanes out in order.** Signal plans use split phasing where
+  approaches conflict.
+- **Change intervals follow ITE 2020, per phase group.**
+  - Amber: `y = t + v/(2a + 2Gg)`, clamped to 3-6 s (MUTCD §4D.26).
+  - All-red: `r = (W + L)/v`, capped at 6 s.
+  - Room is left in the plan for a pedestrian walk phase, which this track does not add.
+- **Passages are in the world model** (`World.passages`).
+  - Each lane that runs through a building is classified by its OSM tags.
+  - Of the 62 such lanes: 39 are tagged (the Helmsley Building portals, the Park Avenue
+    Viaduct at Grand Central, basement ramps) and 23 are untagged driveways. The untagged
+    ones are counted as the `untagged-building-passage` anomaly.
+  - The auditor now accepts a vehicle inside a building only on a passage through that
+    building, and it compares heights as well as footprints.
+  - The viewer draws an opening in the wall where each passage lane enters a building.
+- **Signals.**
+  - Every producer now streams one row per head group: the live projector, the fixture
+    engine and the recorder. Before, the recorder's signal block was empty, and the fixture
+    engine sent only the controller's first movement.
+  - Rows are evaluated with the plan's own arithmetic. Previously, at a phase boundary on
+    Manhattan, a head showed green while its movements were amber.
+  - All producers use one J2735 table.
+  - `tests/signal_heads.rs` checks 733,764 Manhattan head-group samples over a full cycle,
+    after a seek and after a rewind. All match the engine.
+- **Studio.**
+  - The aerial view now opens with all of the traffic in frame. The three aerial
+    scene-validation tests that predated wave A now pass.
+  - At 800 × 520 the viewport is 470 × 278 (it was 360 × 146).
+
+Still open:
+
+- **Heading jumps.** Every remaining jump is on a connector next to a 1 m lane. That lane is
+  left where a segment is too short to hold both junctions' areas; it happens on divided
+  avenues.
+  - Joining those junctions (netconvert `--junctions.join`) cut the P-bound count from 177
+    to 52 in a trial. It also produced 8 overlaps between side-by-side connectors, so it
+    was not kept.
+- **Jerk.** Classified onsets of hard braking in moving vehicles on dense Manhattan:
+  - 23 of 30 are junction merge ordering against a vehicle on another path;
+  - 4 are on a free road;
+  - 3 are same-path leaders;
+  - none are from a signal.
+
+  Two merge-ordering changes each lowered the count on one scenario and raised it on
+  another, so neither was kept.
+- **In a building outside a passage.** All 12 are one newsstand (way 1117866998), mapped
+  0.8 m from a lane centreline.
+- **Shadow acne.** No pixel test was added. Bias 0, a positive bias and a 128² shadow map
+  all left the headless SwiftShader frame free of measurable acne, so a test could not be
+  shown to fail.
+
 ## 2026-09-23 — five tracks merged: stability, traffic, radio, metrics, rendering
 
 Five engineers worked in isolated worktrees and the integrator merged them into `main` in

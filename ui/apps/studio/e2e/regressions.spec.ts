@@ -330,3 +330,25 @@ test("Q14 — the marker overlay's shape channels are on from the first frame", 
   expect(state!.attackersGt).toBe(false);
 
 });
+
+/**
+ * A small window is still a simulator: at 800 x 520 the fixed side panels and plots strip used to
+ * leave the viewport 360 x 146 px. It keeps at least half of each dimension now, at every window
+ * size the camera fuzz drives.
+ */
+test("the viewport keeps a usable share of a small window", async ({ page }) => {
+  for (const size of [
+    { width: 800, height: 520 },
+    { width: 960, height: 600 },
+    { width: 1280, height: 800 },
+  ]) {
+    await page.setViewportSize(size);
+    await page.goto("/");
+    const box = await page.getByTestId("viewport").boundingBox();
+    expect(box, `no viewport at ${size.width} x ${size.height}`).not.toBeNull();
+    const share = { w: box!.width / size.width, h: box!.height / size.height };
+    console.log(`viewport ${box!.width} x ${box!.height} in ${size.width} x ${size.height}`);
+    expect(share.w, `viewport ${box!.width} px wide in a ${size.width} px window`).toBeGreaterThanOrEqual(0.5);
+    expect(share.h, `viewport ${box!.height} px tall in a ${size.height} px window`).toBeGreaterThanOrEqual(0.5);
+  }
+});

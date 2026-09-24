@@ -163,6 +163,9 @@ const DEFAULT_SCHEDULER: FrameScheduler = {
  */
 const DEPTH_CUE_REFERENCE_M = 10;
 
+/** Margin kept round the traffic when the opening plan view widens to hold it, metres. */
+const OPEN_TRAFFIC_PADDING_M = 60;
+
 /** How often the traffic's centre is recomputed for the plan view, hertz. See `Viewer#trackTraffic`. */
 const AUTO_FRAME_HZ = 5;
 
@@ -242,6 +245,8 @@ export class Viewer {
   #autoFrameActors: boolean;
   /** Set until the plan view has been centred on the traffic once, which is done with a cut. */
   #autoFramePending = true;
+  /** The plan-view extent the viewer itself last set, or null once someone else has zoomed. */
+  #autoExtentM: number | null = null;
   /** Seconds since the traffic centre was last recomputed; see `#trackTraffic`. */
   #autoFrameAccum = 0;
   /** Scratch table of per-class bounding radii, rebuilt on each `Hello`. */
@@ -467,10 +472,22 @@ export class Viewer {
     const b = world.bbox;
     this.cameras.focusOn((b.minXM + b.maxXM) / 2, (b.minYM + b.maxYM) / 2, b.minZM);
     this.cameras.fitExtent(Math.max(b.maxXM - b.minXM, b.maxYM - b.minYM) * 1.05);
+    this.#autoExtentM = this.cameras.extentM;
     if (this.cameras.mode === "map") this.cameras.snap();
     // The opening framing is the world's, not the traffic's, so ask for the first recentre to be a
     // cut rather than a drift. `#trackTraffic` keeps it there afterwards.
     if (!this.cameras.userHasMoved) this.#autoFramePending = true;
+  }
+
+  /**
+   * Set the extent the plan view opens on, metres, as the viewer's own framing: until the user
+   * or a caller changes the zoom, the plan view may widen from here to keep every live vehicle in
+   * frame (see `#trackTraffic`). A plain `cameras.fitExtent` is a caller's zoom, which the viewer
+   * then leaves alone.
+   */
+  setOpeningExtent(extentM: number): void {
+    this.cameras.fitExtent(extentM);
+    this.#autoExtentM = this.cameras.extentM;
   }
 
   /** Adopt the class table, capacities and world origin a `Hello` announces (§3.1). */
@@ -1217,10 +1234,24 @@ export class Viewer {
     this.#autoFrameAccum = 0;
     const f = this.liveActorFraming();
     if (!f) return; // no traffic yet — nothing to centre on
-    // Only the centre moves. Widening to fit the traffic would override the zoom the opening view
-    // chose and, with traffic spread over a whole city, make every vehicle smaller — the opposite
-    // of the complaint this answers.
+    // While the zoom is still the viewer's own opening framing, the plan view is widened — never
+    // narrowed — just enough to hold every live vehicle, never wider than the world. Vehicle
+    // marks are a constant angular size (`VEHICLE_MARK_ANGULAR_RADIUS`), so a wider view no longer
+    // makes a vehicle smaller on screen; it stops the opening frame from leaving a quarter of the
+    // traffic outside it (54 of 200 on the mock run at the fixed 1,400 m), and a vehicle entering
+    // at the world's edge from being culled. Once anyone else sets the zoom — the user (checked
+    // above), or a caller through `cameras` — the zoom is theirs and only the centre moves.
     this.cameras.focusOn(f.centerX, f.centerY, f.centerZ);
+    const own = this.#autoExtentM;
+    if (own !== null && Math.abs(this.cameras.extentM - own) <= 1e-6 * Math.max(1, own)) {
+      const w = this.worldRenderer.world;
+      const worldExtent = w ? Math.max(w.bbox.maxXM - w.bbox.minXM, w.bbox.maxYM - w.bbox.minYM) * 1.05 : Infinity;
+      const want = Math.min(worldExtent, f.extentM + 2 * OPEN_TRAFFIC_PADDING_M);
+      if (want > this.cameras.extentM) this.cameras.fitExtent(want);
+      this.#autoExtentM = this.cameras.extentM;
+    } else {
+      this.#autoExtentM = null;
+    }
     if (this.#autoFramePending) {
       // A snap mid-flight is a cut, and coming back from chase to the map *is* a flight.
       if (!this.cameras.isFlying) this.cameras.snap();

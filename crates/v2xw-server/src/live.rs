@@ -294,73 +294,12 @@ fn body_centre(reference: [f64; 3], heading_rad: f64, class_idx: u8) -> [f64; 3]
 /// to that group's next change. A plan with no heads — nothing to draw — keeps the old
 /// controller-wide entry under its plain id.
 fn group_signal_plans(world: &v2xw_world::World) -> Vec<SignalPlan> {
-    let mut approach_of: BTreeMap<LaneId, LaneId> = BTreeMap::new();
-    for c in world.roads.connections() {
-        if let Some(via) = c.via {
-            approach_of.entry(via).or_insert(c.from_lane);
-        }
-    }
-    let mut out = Vec::new();
-    for plan in &world.signals {
-        if plan.heads.is_empty() {
-            out.push(SignalPlan {
-                signal: SignalId::new(plan.id.index()),
-                phases: plan
-                    .phases
-                    .iter()
-                    .map(|p| {
-                        (
-                            p.states.first().copied().unwrap_or(SignalState::Off),
-                            p.duration_s,
-                        )
-                    })
-                    .collect(),
-                cycle_s: plan.cycle_s,
-                offset_s: plan.offset_s,
-            });
-            continue;
-        }
-        for (group, timeline) in plan.group_timelines(|l| approach_of.get(&l).copied()) {
-            out.push(SignalPlan {
-                signal: SignalId::new(v2xw_world::signal_group_wire_id(plan.id, group)),
-                phases: timeline,
-                cycle_s: plan.cycle_s,
-                offset_s: plan.offset_s,
-            });
-        }
-    }
-    out
+    world.group_signals()
 }
 
-/// One signal controller's fixed-time plan, flattened for evaluation without the world.
-#[derive(Debug, Clone)]
-struct SignalPlan {
-    signal: SignalId,
-    /// `(dominant state, duration)` per phase, in plan order.
-    phases: Vec<(SignalState, f64)>,
-    cycle_s: f64,
-    offset_s: f64,
-}
-
-impl SignalPlan {
-    /// The phase at `t_s` and how long it has left, or `None` for a degenerate plan.
-    fn at(&self, t_s: f64) -> Option<(SignalState, f64)> {
-        if self.cycle_s <= 0.0 || self.phases.is_empty() {
-            return None;
-        }
-        let mut into = (t_s - self.offset_s) % self.cycle_s;
-        if into < 0.0 {
-            into += self.cycle_s;
-        }
-        for (state, duration) in &self.phases {
-            if into < *duration {
-                return Some((*state, (*duration - into).max(0.0)));
-            }
-            into -= *duration;
-        }
-        self.phases.last().map(|(s, d)| (*s, *d))
-    }
-}
+/// One head group's timeline — the world's own evaluation ([`v2xw_world::GroupSignal`]),
+/// which reads the phase with exactly the arithmetic the vehicles' signal model uses.
+type SignalPlan = v2xw_world::GroupSignal;
 
 /// How many kernel threads exist in this process right now.
 ///
@@ -1898,7 +1837,7 @@ impl Projector {
             .filter_map(|plan| {
                 let (state, remaining) = plan.at(t_s)?;
                 Some(WireSignal {
-                    signal: plan.signal,
+                    signal: SignalId::new(plan.wire_id),
                     phase: movement_phase(state),
                     time_to_change: Some(Duration::from_nanos((remaining * 1e9) as u64)),
                 })
@@ -2089,15 +2028,7 @@ fn received_json(v: &NodeRxView) -> Value {
 
 /// `MovementPhaseState` (SAE J2735) for a world signal state.
 const fn movement_phase(state: SignalState) -> u8 {
-    match state {
-        SignalState::Red => 3,
-        SignalState::RedAmber => 4,
-        SignalState::Amber => 8,
-        SignalState::Green => 6,
-        SignalState::GreenYield => 5,
-        SignalState::FlashingAmber => 7,
-        SignalState::Off => 0,
-    }
+    state.j2735_phase()
 }
 
 /// The nearest-rank percentile of a sorted nanosecond list, in milliseconds.
@@ -4166,7 +4097,7 @@ mod signal_stream_tests {
                 let id = v2xw_world::signal_group_wire_id(plan.id, group);
                 let entry = streamed
                     .iter()
-                    .find(|e| e.signal.index() == id)
+                    .find(|e| e.wire_id == id)
                     .expect("every head group is streamed");
                 let mut last = None;
                 for k in 0..(2.0 * plan.cycle_s * 10.0) as u64 {
@@ -4206,7 +4137,7 @@ mod signal_stream_tests {
             let t_s = k as f64 * 0.1;
             let greens = streamed
                 .iter()
-                .filter(|e| e.signal.index() / 65536 == plan.id.index() + 1)
+                .filter(|e| e.wire_id / 65536 == plan.id.index() + 1)
                 .filter(|e| {
                     matches!(
                         e.at(t_s),

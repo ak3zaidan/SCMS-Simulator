@@ -20,7 +20,8 @@ use v2xw_world::osm::{
 };
 use v2xw_world::quant::is_on_grid;
 use v2xw_world::{
-    ClassMask, HeightSource, JunctionControl, LaneKind, TurnDirection, World, WorldSource,
+    ClassMask, HeightSource, JunctionControl, LaneKind, PassageKind, SignalState,
+    TurnDirection, World, WorldSource,
     WorldSourceSpec, serde_native, serde_vwp,
 };
 
@@ -654,15 +655,253 @@ fn a_traffic_signals_node_synthesises_a_plan() {
     }
     // Phases fill the cycle exactly, which `World::validate` requires.
     assert!((plan.total_phase_duration_s() - plan.cycle_s).abs() <= 1e-3);
-    // Two groups, each with a green and an amber, and no all-red by default.
-    assert_eq!(plan.phases.len(), 4);
-    // 30 mph is 13.4112 m/s, so y = 1 + 13.4112 / 6 = 3.235 s, rounded to 3.2 s.
+    // Two groups, each with a green, an amber and an all-red.
+    assert_eq!(plan.phases.len(), 6);
+    // 30 mph is 13.4112 m/s, so y = 1 + 13.4112 / 6 = 3.235 s, rounded to 3.2 s (flat, so
+    // the grade term is zero).
     let amber = plan.phases[1].duration_s;
     assert!(
         (amber - 3.2).abs() < 1e-9,
         "amber from the ITE formula, got {amber}"
     );
+    // The all-red is ITE's red clearance r = (W + L) / v, W the longest path across the
+    // junction from a stop line of the group, L = 6.1 m, v = 13.4112 m/s.
+    for (g, phase) in [(0usize, 2usize), (1, 5)] {
+        let red = &plan.phases[phase];
+        assert!(red.states.iter().all(|s| *s == SignalState::Red), "group {g}");
+        let green = &plan.phases[phase - 2];
+        let w = plan
+            .controlled
+            .iter()
+            .zip(&green.states)
+            .filter(|(_, s)| s.permits_entry())
+            .map(|(l, _)| world.lane(*l).length_m)
+            .fold(0.0f64, f64::max);
+        let want = ((w + 6.1) / 13.4112 * 10.0).round() / 10.0;
+        assert!(
+            (red.duration_s - want).abs() < 1e-9,
+            "group {g}: all-red {} against (W + L) / v = {want} with W = {w}",
+            red.duration_s
+        );
+    }
     assert!(world.validate().is_ok());
+}
+
+/// Every pair of movements a plan gives a protected green in one phase, that the
+/// junction's conflict matrix calls foes — other than two lanes of one road merging into
+/// one lane (a lane drop, which the engine zips) or two movements from one lane.
+fn conflicting_protected_greens(world: &World) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut from_of = std::collections::BTreeMap::new();
+    let mut to_of = std::collections::BTreeMap::new();
+    for c in world.roads.connections() {
+        if let Some(via) = c.via {
+            from_of.insert(via, c.from_lane);
+            to_of.insert(via, c.to_lane);
+        }
+    }
+    for plan in &world.signals {
+        let j = world.junction(plan.junction);
+        let row = |l: LaneId| j.internal.iter().position(|x| *x == l).expect("a row");
+        for (pi, phase) in plan.phases.iter().enumerate() {
+            for (a, sa) in phase.states.iter().enumerate() {
+                for (b, sb) in phase.states.iter().enumerate().skip(a + 1) {
+                    if *sa != SignalState::Green || *sb != SignalState::Green {
+                        continue;
+                    }
+                    let (la, lb) = (plan.controlled[a], plan.controlled[b]);
+                    let (fa, fb) = (from_of[&la], from_of[&lb]);
+                    if fa == fb
+                        || (world.lane(fa).edge == world.lane(fb).edge
+                            && to_of[&la] == to_of[&lb])
+                    {
+                        continue;
+                    }
+                    if j.conflicts.is_foe(row(la), row(lb)) {
+                        out.push(format!("plan {} phase {pi}: {la} and {lb}", plan.id));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A signalised fork: one four-lane one-way approach splitting into two two-lane one-way
+/// branches, both "straight on". The approach lanes are shared out in order — the two
+/// right lanes to the right branch, the two left lanes to the left — so no two lane paths
+/// cross, and no two conflicting movements are ever green together.
+///
+/// Before the fork rule every lane took both branches: lane 0 went left while lane 3 went
+/// right, the paths crossed, and both were protected green (19 such pairs on Manhattan).
+#[test]
+fn a_signalised_fork_shares_its_lanes_out_and_never_greens_a_conflict() {
+    let body = [
+        node(1, 0.0, -0.001),
+        tagged_node(2, 0.0, 0.0, &[("highway", "traffic_signals")]),
+        node(3, 0.0003, 0.001),
+        node(4, -0.0003, 0.001),
+        way(
+            20,
+            &[1, 2],
+            &[("highway", "primary"), ("lanes", "4"), ("oneway", "yes")],
+        ),
+        way(
+            21,
+            &[2, 3],
+            &[("highway", "primary"), ("lanes", "2"), ("oneway", "yes")],
+        ),
+        way(
+            22,
+            &[2, 4],
+            &[("highway", "primary"), ("lanes", "2"), ("oneway", "yes")],
+        ),
+    ]
+    .concat();
+    let (world, _) = import(&document(&body));
+    assert_eq!(world.signals.len(), 1);
+    let fork_y = world.junction(world.signals[0].junction).position.y;
+    // Which branch each approach lane feeds: the left branch runs north of the fork.
+    let mut feeds: Vec<(u8, bool)> = Vec::new();
+    for c in world.roads.connections() {
+        if c.via.is_none() || world.lane(c.from_lane).kind != LaneKind::Driving {
+            continue;
+        }
+        let to = world.lane(c.to_lane);
+        feeds.push((world.lane(c.from_lane).index, to.end().y > fork_y));
+    }
+    feeds.sort_unstable();
+    feeds.dedup();
+    assert_eq!(
+        feeds,
+        vec![(0, false), (1, false), (2, true), (3, true)],
+        "approach lanes, rightmost first, and whether each feeds the left branch"
+    );
+    assert_eq!(conflicting_protected_greens(&world), Vec::<String>::new());
+    assert!(world.validate().is_ok());
+}
+
+/// Every turn at a plain crossroads is a circular arc no tighter than the passenger-car
+/// design vehicle's minimum centreline turning radius (AASHTO 2018 Table 2-2, 6.4 m), and
+/// every connector leaves its approach and joins its departure without a kink.
+#[test]
+fn every_turn_at_a_crossroads_is_a_drivable_arc() {
+    let body = [
+        crossroads_nodes(),
+        way(10, &[1, 2, 3], &[("highway", "primary"), ("lanes", "2")]),
+        way(11, &[4, 2, 5], &[("highway", "secondary"), ("lanes", "2")]),
+    ]
+    .concat();
+    let (world, _) = import(&document(&body));
+    let heading = |a: Vec3, b: Vec3| (b.y - a.y).atan2(b.x - a.x);
+    let wrap = |d: f64| {
+        let t = std::f64::consts::TAU;
+        ((d + std::f64::consts::PI).rem_euclid(t)) - std::f64::consts::PI
+    };
+    let mut turns = 0;
+    for c in world.roads.connections() {
+        let Some(via) = c.via else { continue };
+        let pts = &world.lane(via).centreline;
+        let (from, to) = (world.lane(c.from_lane), world.lane(c.to_lane));
+        // Heading continuity at both joins, to the grid's resolution.
+        let n = from.centreline.len();
+        let into = wrap(
+            heading(pts[0], pts[1]) - heading(from.centreline[n - 2], from.centreline[n - 1]),
+        );
+        let m = pts.len();
+        let out =
+            wrap(heading(to.centreline[0], to.centreline[1]) - heading(pts[m - 2], pts[m - 1]));
+        assert!(
+            into.abs() < 0.06 && out.abs() < 0.06,
+            "connector {via}: kinks {into} / {out} rad"
+        );
+        if matches!(c.direction, TurnDirection::Left | TurnDirection::Right) {
+            turns += 1;
+            for w in pts.windows(3) {
+                let t = wrap(heading(w[1], w[2]) - heading(w[0], w[1])).abs();
+                let l = 0.5 * (w[0].distance_2d(w[1]) + w[1].distance_2d(w[2]));
+                if t > 1e-6 {
+                    assert!(
+                        l / t > 6.3,
+                        "connector {via} ({:?}): radius {} m",
+                        c.direction,
+                        l / t
+                    );
+                }
+            }
+        }
+    }
+    assert!(turns >= 8, "{turns} turns checked");
+}
+
+/// A road through a building is a passage, classified by its tags; a building raised
+/// over the road is not in its way at all.
+///
+/// Three parallel east-west streets each pass through a building: one tagged
+/// `tunnel=building_passage` (the Helmsley Building's Park Avenue portals), one with no
+/// tag (a driveway into a garage, which the importer keeps and counts), and one under a
+/// building whose built part starts 10 m up. The first two become passages of their
+/// kind; the third is no passage and no lane in a building.
+#[test]
+fn roads_through_buildings_are_passages_by_their_tags() {
+    let block = |id: i64, lat: f64| {
+        [
+            node(id, lat - 0.00005, -0.0001),
+            node(id + 1, lat - 0.00005, 0.0001),
+            node(id + 2, lat + 0.00005, 0.0001),
+            node(id + 3, lat + 0.00005, -0.0001),
+        ]
+        .concat()
+    };
+    let body = [
+        node(1, 0.0, -0.001),
+        node(2, 0.0, 0.001),
+        node(3, 0.0005, -0.001),
+        node(4, 0.0005, 0.001),
+        node(5, -0.0005, -0.001),
+        node(6, -0.0005, 0.001),
+        block(100, 0.0),
+        block(200, 0.0005),
+        block(300, -0.0005),
+        way(
+            10,
+            &[1, 2],
+            &[("highway", "primary"), ("lanes", "2"), ("tunnel", "building_passage")],
+        ),
+        way(11, &[3, 4], &[("highway", "service"), ("lanes", "2")]),
+        way(12, &[5, 6], &[("highway", "primary"), ("lanes", "2")]),
+        way(20, &[100, 101, 102, 103, 100], &[("building", "office"), ("height", "60")]),
+        way(21, &[200, 201, 202, 203, 200], &[("building", "yes"), ("height", "30")]),
+        way(
+            22,
+            &[300, 301, 302, 303, 300],
+            &[("building", "yes"), ("height", "30"), ("min_height", "10")],
+        ),
+    ]
+    .concat();
+    let (world, report) = import(&document(&body));
+    let by_kind: BTreeSet<PassageKind> = world.passages.iter().map(|p| p.kind).collect();
+    assert_eq!(
+        by_kind,
+        [PassageKind::BuildingPassage, PassageKind::Untagged].into_iter().collect(),
+        "passages: {:?}",
+        world.passages
+    );
+    // Both directions of both streets, and no lane of the street under the raised
+    // building.
+    let raised = world
+        .buildings
+        .iter()
+        .find(|b| b.min_height_m > 0.0)
+        .expect("the raised building");
+    assert!(world.passages.iter().all(|p| p.building != raised.id));
+    assert!(world.passages.iter().all(|p| p.s_to_m > p.s_from_m));
+    assert_eq!(report.anomaly(Anomaly::UntaggedBuildingPassage), 1);
+    // The world round-trips through the native format with its passages.
+    let bytes = serde_native::to_bytes(&world).expect("writes");
+    let back = serde_native::from_bytes(&bytes).expect("reads back");
+    assert_eq!(back.passages, world.passages);
+    assert_eq!(back.content_hash, world.content_hash);
 }
 
 /// A signal node that is not itself a junction is attached to the nearest junction within

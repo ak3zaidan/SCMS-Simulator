@@ -2415,6 +2415,42 @@ impl SignalState {
         }
     }
 
+    /// The SAE J2735 `MovementPhaseState` code the live stream carries for this state
+    /// (docs/protocol/vwp-v1.md §3.3.3): 1 dark, 3 stop-and-remain, 4 pre-movement,
+    /// 5 permissive-movement-allowed, 6 protected-movement-allowed, 8 protected-clearance,
+    /// 9 caution-conflicting-traffic.
+    ///
+    /// One table for every producer: the live projector sent flashing amber as 7
+    /// (permissive-clearance, a *steady* amber) and dark as 0 (unavailable), the fixture
+    /// engine as 9 and 1, so the same head drew differently depending on which engine fed
+    /// the page.
+    pub const fn j2735_phase(self) -> u8 {
+        match self {
+            SignalState::Off => 1,
+            SignalState::Red => 3,
+            SignalState::RedAmber => 4,
+            SignalState::GreenYield => 5,
+            SignalState::Green => 6,
+            SignalState::Amber => 8,
+            SignalState::FlashingAmber => 9,
+        }
+    }
+
+    /// How permissive the state is, for choosing what a head over several movements
+    /// shows: Green over GreenYield over FlashingAmber over Amber over RedAmber over Red
+    /// over Off ([`SignalPlan::group_timelines`]).
+    pub const fn permissiveness(self) -> u8 {
+        match self {
+            SignalState::Green => 6,
+            SignalState::GreenYield => 5,
+            SignalState::FlashingAmber => 4,
+            SignalState::Amber => 3,
+            SignalState::RedAmber => 2,
+            SignalState::Red => 1,
+            SignalState::Off => 0,
+        }
+    }
+
     /// True if a vehicle may enter the junction on this state.
     pub const fn permits_entry(self) -> bool {
         matches!(
@@ -2626,6 +2662,133 @@ impl SignalPlan {
     }
 }
 
+/// One signal head group's state through its plan's cycle, flattened so that a producer
+/// can evaluate it without the world: what every head of the group shows
+/// ([`SignalPlan::group_timelines`]), keyed by [`signal_group_wire_id`]. A plan with no
+/// heads is one entry under its plain controller id, carrying its first movement's state.
+///
+/// The timeline is kept **per phase**, not merged, and [`GroupSignal::at`] finds the phase
+/// with exactly [`SignalPlan::phase_at`]'s arithmetic: a merged timeline summed two phase
+/// durations before comparing, and at a phase boundary that rounded the other way from
+/// the plan the vehicles obey — on Manhattan a head showed green at 84.5 s while its
+/// movements were already amber.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupSignal {
+    /// The id on the wire's signal block (§3.3.3).
+    pub wire_id: u32,
+    /// `(state, duration_s)` for each phase of the plan, in cycle order.
+    pub timeline: Vec<(SignalState, f64)>,
+    /// The plan's cycle, seconds.
+    pub cycle_s: f64,
+    /// The plan's offset, seconds.
+    pub offset_s: f64,
+}
+
+impl GroupSignal {
+    /// The state at `t_s` and the time to its next *change* (the phases that follow in
+    /// the same state are counted in), seconds; `None` for a degenerate plan.
+    pub fn at(&self, t_s: f64) -> Option<(SignalState, f64)> {
+        if !(self.cycle_s.is_finite() && self.cycle_s > 0.0) || self.timeline.is_empty() {
+            return None;
+        }
+        let mut into = (t_s - self.offset_s) % self.cycle_s;
+        if into < 0.0 {
+            into += self.cycle_s;
+        }
+        let n = self.timeline.len();
+        let mut acc = 0.0;
+        let mut found = (n - 1, into - acc);
+        for (i, (_, d)) in self.timeline.iter().enumerate() {
+            if into < acc + d {
+                found = (i, into - acc);
+                break;
+            }
+            acc += d;
+            if i + 1 == n {
+                found = (n - 1, into - acc + d);
+            }
+        }
+        let (i, elapsed) = found;
+        let state = self.timeline[i].0;
+        let mut remaining = (self.timeline[i].1 - elapsed).max(0.0);
+        for k in 1..n {
+            let (s, d) = self.timeline[(i + k) % n];
+            if s != state {
+                break;
+            }
+            remaining += d;
+        }
+        Some((state, remaining))
+    }
+}
+
+impl World {
+    /// Every signal head group of every plan ([`GroupSignal`]), plans in id order and
+    /// groups ascending: what a producer of the live signal block streams.
+    pub fn group_signals(&self) -> Vec<GroupSignal> {
+        let mut approach_of: std::collections::BTreeMap<LaneId, LaneId> =
+            std::collections::BTreeMap::new();
+        for c in self.roads.connections() {
+            if let Some(via) = c.via {
+                approach_of.entry(via).or_insert(c.from_lane);
+            }
+        }
+        let mut out = Vec::new();
+        for plan in &self.signals {
+            if plan.heads.is_empty() {
+                out.push(GroupSignal {
+                    wire_id: plan.id.index(),
+                    timeline: plan
+                        .phases
+                        .iter()
+                        .map(|p| (p.states.first().copied().unwrap_or(SignalState::Off), p.duration_s))
+                        .collect(),
+                    cycle_s: plan.cycle_s,
+                    offset_s: plan.offset_s,
+                });
+                continue;
+            }
+            // Which head group each controlled movement lights: the group of the head over
+            // its approach lane.
+            let group_of: Vec<Option<u16>> = plan
+                .controlled
+                .iter()
+                .map(|l| {
+                    let approach = approach_of.get(l)?;
+                    plan.heads.iter().find(|h| h.lane == *approach).map(|h| h.group)
+                })
+                .collect();
+            let mut ids: Vec<u16> = plan.heads.iter().map(|h| h.group).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            for group in ids {
+                let timeline = plan
+                    .phases
+                    .iter()
+                    .map(|p| {
+                        let state = p
+                            .states
+                            .iter()
+                            .zip(&group_of)
+                            .filter(|(_, g)| **g == Some(group))
+                            .map(|(s, _)| *s)
+                            .max_by_key(|s| s.permissiveness())
+                            .unwrap_or(SignalState::Off);
+                        (state, p.duration_s)
+                    })
+                    .collect();
+                out.push(GroupSignal {
+                    wire_id: signal_group_wire_id(plan.id, group),
+                    timeline,
+                    cycle_s: plan.cycle_s,
+                    offset_s: plan.offset_s,
+                });
+            }
+        }
+        out
+    }
+}
+
 /// The id a signal *group* goes by on the live stream's signal block
 /// (docs/protocol/vwp-v1.md §3.3.3): `(controller + 1) · 65536 + group`.
 ///
@@ -2635,6 +2798,97 @@ pub const fn signal_group_wire_id(plan: SignalId, group: u16) -> u32 {
     (plan.index() + 1)
         .wrapping_mul(65536)
         .wrapping_add(group as u32)
+}
+
+// ---------------------------------------------------------------------------
+// Passages: roads through buildings
+// ---------------------------------------------------------------------------
+
+/// The vertical envelope a road vehicle needs above the road surface, metres: 4.9 m
+/// (16 ft), the AASHTO Green Book (2018, §8.2) minimum vertical clearance of a road under
+/// a structure. A building whose built part starts at least this far above the road (OSM
+/// `min_height`) stands over the road, not in its way.
+pub const ROAD_CLEARANCE_M: f64 = 4.9;
+
+/// Why a road runs through a building footprint, as the source says it.
+///
+/// The discriminants are this crate's own codes (the native format stores them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
+pub enum PassageKind {
+    /// `tunnel=building_passage`: a road through a building at street level — the Park
+    /// Avenue portals of the Helmsley Building.
+    BuildingPassage = 0,
+    /// `covered=yes`: a road under a roof or an overhanging building.
+    Covered = 1,
+    /// `tunnel=*` otherwise: a tunnel or covered ramp whose portal lies under a building.
+    Tunnel = 2,
+    /// `bridge=*` with a positive `layer`: a viaduct carried through or around a building
+    /// (the Park Avenue Viaduct at Grand Central).
+    Viaduct = 3,
+    /// No tag says so: the source draws the road through the footprint and says nothing
+    /// — a driveway into a garage, a hotel forecourt under the building. The road is real
+    /// (it is mapped as one); the missing tag is the source's defect, and the importer
+    /// counts it (`Anomaly::UntaggedBuildingPassage`).
+    Untagged = 4,
+}
+
+impl PassageKind {
+    /// The native format's code.
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// The kind for a code.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => PassageKind::BuildingPassage,
+            1 => PassageKind::Covered,
+            2 => PassageKind::Tunnel,
+            3 => PassageKind::Viaduct,
+            4 => PassageKind::Untagged,
+            _ => return None,
+        })
+    }
+
+    /// A stable lower-case label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            PassageKind::BuildingPassage => "building-passage",
+            PassageKind::Covered => "covered",
+            PassageKind::Tunnel => "tunnel",
+            PassageKind::Viaduct => "viaduct",
+            PassageKind::Untagged => "untagged",
+        }
+    }
+}
+
+/// A stretch of lane that runs through a building's footprint within the building's
+/// vertical extent — a road the source puts through (or under, or over, inside) a
+/// building. A vehicle on it is where the road is, not inside a wall; a renderer draws
+/// an opening there.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Passage {
+    /// The lane.
+    pub lane: LaneId,
+    /// The building it passes through.
+    pub building: BuildingId,
+    /// Why, by the source's tags.
+    pub kind: PassageKind,
+    /// Arc length along the lane where it enters the footprint, metres.
+    pub s_from_m: f64,
+    /// Arc length along the lane where it leaves the footprint, metres.
+    pub s_to_m: f64,
+}
+
+/// True if a vehicle standing on a road surface at height `z` would be inside
+/// `building`'s volume: the footprint's vertical extent, from `base + min_height` to the
+/// roof, overlaps `[z, z + ROAD_CLEARANCE_M]`.
+pub fn road_meets_building(building: &Building, z: f64) -> bool {
+    let bottom = building.base_z_m + building.min_height_m;
+    let top = building.roof_z_m();
+    top > z && bottom < z + ROAD_CLEARANCE_M
 }
 
 // ---------------------------------------------------------------------------
@@ -3490,6 +3744,9 @@ pub struct World {
     pub sites: Vec<Site>,
     /// Land-use zones, in id order.
     pub landuse: Vec<LanduseZone>,
+    /// Stretches of lane that run through a building, ordered by `(lane, building)`.
+    #[serde(default)]
+    pub passages: Vec<Passage>,
     /// The propagation environment outside every land-use zone.
     pub default_env: EnvClass,
     /// The world's interned strings.
@@ -3519,6 +3776,7 @@ impl Clone for World {
             signals: self.signals.clone(),
             sites: self.sites.clone(),
             landuse: self.landuse.clone(),
+            passages: self.passages.clone(),
             default_env: self.default_env,
             symbols: self.symbols.clone(),
             provenance: self.provenance.clone(),
@@ -3540,6 +3798,7 @@ impl PartialEq for World {
             && self.signals == other.signals
             && self.sites == other.sites
             && self.landuse == other.landuse
+            && self.passages == other.passages
             && self.default_env == other.default_env
             && self.symbols == other.symbols
             && self.provenance == other.provenance
@@ -3621,6 +3880,18 @@ impl World {
         self.buildings.get(id.as_usize())
     }
 
+    /// The passages of `lane`: the stretches of it that run through a building.
+    pub fn passages_of(&self, lane: LaneId) -> &[Passage] {
+        let lo = self.passages.partition_point(|p| p.lane < lane);
+        let hi = self.passages.partition_point(|p| p.lane <= lane);
+        &self.passages[lo..hi]
+    }
+
+    /// True if `lane` runs through `building` by the source's own account.
+    pub fn is_passage(&self, lane: LaneId, building: BuildingId) -> bool {
+        self.passages_of(lane).iter().any(|p| p.building == building)
+    }
+
     /// The signal plan with this id, or `None`.
     pub fn signal_plan(&self, id: SignalId) -> Option<&SignalPlan> {
         self.signals.get(id.as_usize())
@@ -3692,6 +3963,23 @@ impl World {
         let lane_count = self.roads.lanes().len() as u32;
         let junction_count = self.roads.junctions().len() as u32;
         let edge_count = self.roads.edges().len() as u32;
+
+        for p in &self.passages {
+            if p.lane.index() >= lane_count {
+                return Err(WorldError::DanglingReference {
+                    what: format!("passage through building {}", p.building),
+                    kind: "lane",
+                    id: p.lane.index(),
+                });
+            }
+            if p.building.index() as usize >= self.buildings.len() {
+                return Err(WorldError::DanglingReference {
+                    what: format!("passage of lane {}", p.lane),
+                    kind: "building",
+                    id: p.building.index(),
+                });
+            }
+        }
 
         for lane in self.roads.lanes() {
             if lane.edge.index() >= edge_count {
@@ -4183,6 +4471,7 @@ pub struct WorldBuilder {
     signals: Vec<SignalPlan>,
     sites: Vec<Site>,
     landuse: Vec<LanduseZone>,
+    passages: Vec<Passage>,
     default_env: EnvClass,
     symbols: SymbolTable,
     provenance: Option<WorldProvenance>,
@@ -4202,6 +4491,7 @@ impl WorldBuilder {
             signals: Vec::new(),
             sites: Vec::new(),
             landuse: Vec::new(),
+            passages: Vec::new(),
             default_env: EnvClass::Urban,
             symbols: SymbolTable::new(),
             provenance: None,
@@ -4251,6 +4541,18 @@ impl WorldBuilder {
     #[must_use]
     pub fn signals(mut self, signals: Vec<SignalPlan>) -> Self {
         self.signals = signals;
+        self
+    }
+
+    /// Sets the passages (lanes through buildings); they are sorted by `(lane, building)`.
+    #[must_use]
+    pub fn passages(mut self, mut passages: Vec<Passage>) -> Self {
+        passages.sort_by(|a, b| {
+            (a.lane, a.building)
+                .cmp(&(b.lane, b.building))
+                .then(a.s_from_m.total_cmp(&b.s_from_m))
+        });
+        self.passages = passages;
         self
     }
 
@@ -4395,6 +4697,15 @@ impl WorldBuilder {
             signals,
             sites,
             landuse: self.landuse,
+            passages: self
+                .passages
+                .into_iter()
+                .map(|p| Passage {
+                    s_from_m: quantise(p.s_from_m, Q_POSITION_M),
+                    s_to_m: quantise(p.s_to_m, Q_POSITION_M),
+                    ..p
+                })
+                .collect(),
             default_env: self.default_env,
             symbols: self.symbols,
             provenance: {
@@ -4479,6 +4790,8 @@ pub struct WorldParts {
     pub sites: Vec<Site>,
     /// Land-use zones, in id order.
     pub landuse: Vec<LanduseZone>,
+    /// Lanes through buildings, ordered by `(lane, building)`.
+    pub passages: Vec<Passage>,
     /// The environment outside every zone.
     pub default_env: EnvClass,
     /// The interned strings.
@@ -4510,6 +4823,7 @@ impl World {
             signals: parts.signals,
             sites: parts.sites,
             landuse: parts.landuse,
+            passages: parts.passages,
             default_env: parts.default_env,
             symbols: parts.symbols,
             provenance: parts.provenance,
@@ -4543,6 +4857,7 @@ impl World {
             signals: self.signals.clone(),
             sites: self.sites.clone(),
             landuse: self.landuse.clone(),
+            passages: self.passages.clone(),
             default_env: self.default_env,
             symbols: self.symbols.clone(),
             provenance: self.provenance.clone(),

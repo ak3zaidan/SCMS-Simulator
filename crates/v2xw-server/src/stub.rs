@@ -118,6 +118,8 @@ pub struct StubEngine {
     descriptor: RunDescriptor,
     world: Arc<WorldPayload>,
     geometry: Arc<World>,
+    /// Every signal head group of the world, evaluated per frame.
+    groups: Vec<v2xw_world::GroupSignal>,
     options: StubOptions,
     plans: Vec<ActorPlan>,
     /// Node ids in table order, for telemetry and `inspect.node`.
@@ -213,6 +215,7 @@ impl StubEngine {
         Ok(StubEngine {
             descriptor,
             world: payload,
+            groups: world.group_signals(),
             geometry: world,
             state: if options.paused {
                 RunState::Paused
@@ -352,22 +355,23 @@ impl StubEngine {
         Some((p.x, p.y, p.z, heading, 0.0, last))
     }
 
+    /// One row per signal head group (§3.3.3), each the state its own heads show.
+    ///
+    /// It used to send one row per controller carrying the controller's *first*
+    /// movement's state, so every head of a junction lit the same colour — cross streets
+    /// green together (14,874 green head-samples against 1,406 red on the fixture run).
     fn signals_at(&self, t_s: f64) -> Vec<WireSignal> {
-        let mut out = Vec::with_capacity(self.geometry.signals.len());
-        for plan in &self.geometry.signals {
-            let Some((phase_idx, into)) = plan.phase_at(t_s) else {
-                continue;
-            };
-            let phase = &plan.phases[phase_idx];
-            let dominant = phase.states.first().copied().unwrap_or(SignalState::Off);
-            let remaining = (phase.duration_s - into).max(0.0);
-            out.push(WireSignal {
-                signal: SignalId::new(plan.id.index()),
-                phase: movement_phase(dominant),
-                time_to_change: Some(Duration::from_nanos((remaining * 1e9) as u64)),
-            });
-        }
-        out
+        self.groups
+            .iter()
+            .filter_map(|g| {
+                let (state, remaining) = g.at(t_s)?;
+                Some(WireSignal {
+                    signal: SignalId::new(g.wire_id),
+                    phase: movement_phase(state),
+                    time_to_change: Some(Duration::from_nanos((remaining * 1e9) as u64)),
+                })
+            })
+            .collect()
     }
 
     fn telemetry_of(&self, i: usize, node: NodeId, step: u64) -> NodeTelemetry {
@@ -555,15 +559,7 @@ fn verified_neighbours(i: usize, step: u64) -> u8 {
 
 /// The SAE J2735 `MovementPhaseState` code for a world signal state (§3.3.3).
 fn movement_phase(s: SignalState) -> u8 {
-    match s {
-        SignalState::Red => 3,
-        SignalState::RedAmber => 4,
-        SignalState::Amber => 8,
-        SignalState::Green => 6,
-        SignalState::GreenYield => 5,
-        SignalState::FlashingAmber => 9,
-        SignalState::Off => 1,
-    }
+    s.j2735_phase()
 }
 
 fn plan_actors(world: &World, options: &StubOptions) -> Vec<ActorPlan> {

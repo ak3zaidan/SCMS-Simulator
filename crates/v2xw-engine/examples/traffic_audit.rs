@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! cargo run -p v2xw-engine --example traffic_audit -- <scenario.yaml> \
-//!     [--rate VEH_PER_H] [--duration S] [--json OUT]
+//!     [--rate VEH_PER_H] [--duration S] [--json OUT] [--examples N]
 //! ```
 //!
 //! The world, the mobility engine and the demand model are built by the same
@@ -123,6 +123,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    // `--geometry`: the distribution of the tightest radius on every drivable path — each
+    // junction connector's, and each lane-to-lane join's — then stop.
+    if args.iter().any(|a| a == "--geometry") {
+        geometry_report(&world, args.iter().any(|a| a == "--verbose"));
+        return Ok(());
+    }
     {
         let mut kinds: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         let mut bike = 0usize;
@@ -134,7 +140,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         eprintln!("lane kinds: {kinds:?}; lanes admitting bicycles: {bike}");
     }
-    let mut auditor = TrafficAuditor::new(&world, AuditParams::default());
+    // `--examples N`: keep N examples per class rather than the default five.
+    let mut params = AuditParams::default();
+    if let Some(n) = value("--examples") {
+        params.examples_per_check = n.parse()?;
+    }
+    // `--turn-radius-floor R`: hold every vehicle to the looser of its class's AASHTO
+    // radius and R metres (4 reproduces the bound this check had before it was per class).
+    if let Some(r) = value("--turn-radius-floor") {
+        params.min_turn_radius_m = r.parse()?;
+    }
+    let mut auditor = TrafficAuditor::new(&world, params);
     auditor.audit_world(&world);
     let trace: Option<Vec<u32>> =
         value("--trace").map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
@@ -218,4 +234,133 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     Ok(())
+}
+
+/// Prints how tight every drivable path is: each motor lane's and connector's tightest
+/// radius, and the same across every join between a lane and its successor — measured as
+/// the heading change between successive 0.5 m chords of the path (so a sharp vertex reads
+/// as `0.5 m / δ`, a circular arc as its radius, and millimetre grid noise not at all).
+fn geometry_report(world: &v2xw_world::World, args_verbose: bool) {
+    use v2xw_world::LaneKind;
+    const STEP: f64 = 1.0;
+    // The tightest radius along `pts`, and where.
+    let tightest = |pts: &[v2xw_core::geom::Vec3]| -> (f64, f64, f64) {
+        let mut cum = vec![0.0];
+        for w in pts.windows(2) {
+            cum.push(cum.last().unwrap() + w[0].distance_2d(w[1]));
+        }
+        let total = *cum.last().unwrap();
+        let at = |s: f64| {
+            let k = cum.partition_point(|c| *c <= s).clamp(1, pts.len() - 1);
+            let seg = cum[k] - cum[k - 1];
+            let f = if seg > 0.0 { (s - cum[k - 1]) / seg } else { 0.0 };
+            pts[k - 1].lerp(pts[k], f.clamp(0.0, 1.0))
+        };
+        // The circumradius of three points `STEP` apart along the path (Menger
+        // curvature): an arc's own radius, whatever its sampling, and `STEP / δ` at a
+        // sharp vertex of angle δ.
+        let n = (total / STEP).floor() as usize;
+        let mut best = (f64::INFINITY, 0.0, 0.0);
+        for k in 0..n.saturating_sub(1) {
+            let a = at(k as f64 * STEP);
+            let b = at((k + 1) as f64 * STEP);
+            let c = at((k + 2) as f64 * STEP);
+            let cross = ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs();
+            if cross < 1e-12 {
+                continue;
+            }
+            let r = a.distance_2d(b) * b.distance_2d(c) * c.distance_2d(a) / (2.0 * cross);
+            if r < best.0 {
+                best = (r, b.x, b.y);
+            }
+        }
+        best
+    };
+    let buckets = [2.0, 4.0, 5.4, 8.0, 12.0, f64::INFINITY];
+    let mut within = [[0usize; 6]; 3];
+    let mut by_turn: std::collections::BTreeMap<String, [usize; 6]> = Default::default();
+    let mut worst: Vec<(f64, u32, &'static str, f64, f64)> = Vec::new();
+    for lane in world.roads.lanes() {
+        let kind = match lane.kind {
+            LaneKind::Internal => 0,
+            k if k.is_motorised() => 1,
+            _ => continue,
+        };
+        let (r, x, y) = tightest(&lane.centreline);
+        within[kind][buckets.iter().position(|b| r < *b).unwrap_or(5)] += 1;
+        if kind == 0 {
+            let dir = world
+                .roads
+                .connections()
+                .iter()
+                .find(|c| c.via == Some(lane.id))
+                .map_or("none".to_string(), |c| format!("{:?}", c.direction));
+            let arms = lane.junction.map_or(0, |j| world.junction(j).incoming.len());
+            let row = by_turn.entry(format!("{dir} arms>=3:{}", arms >= 3)).or_insert([0usize; 6]);
+            row[buckets.iter().position(|b| r < *b).unwrap_or(5)] += 1;
+            if r < 5.4 && dir != "UTurn" && args_verbose {
+                if let Some(c) = world.roads.connections().iter().find(|c| c.via == Some(lane.id)) {
+                    let f = world.lane(c.from_lane);
+                    let t = world.lane(c.to_lane);
+                    println!(
+                        "  tight {dir} connector {} r={r:.2} at ({x:.1},{y:.1}): from {} len {:.1}, to {} len {:.1}, connector len {:.1}",
+                        lane.id.index(), c.from_lane.index(), f.length_m, c.to_lane.index(), t.length_m, lane.length_m
+                    );
+                }
+            }
+        }
+        if r < 5.4 {
+            worst.push((r, lane.id.index(), if kind == 0 { "connector" } else { "lane" }, x, y));
+        }
+        // Joins: the last 3 m of this lane and the first 3 m of each successor.
+        for next in world.successor_lanes(lane.id) {
+            let nl = world.lane(next);
+            if !nl.kind.is_motorised() {
+                continue;
+            }
+            let gap = lane.end().distance_2d(nl.start());
+            if gap > 0.05 {
+                worst.push((-gap, lane.id.index(), "disjoint join", lane.end().x, lane.end().y));
+                continue;
+            }
+            let mut pts = vec![lane.point_at((lane.length_m - 3.0).max(0.0))];
+            for (k, p) in lane.centreline.iter().enumerate() {
+                if lane.cumulative[k] > lane.length_m - 3.0 {
+                    pts.push(*p);
+                }
+            }
+            for (k, p) in nl.centreline.iter().enumerate().skip(1) {
+                if nl.cumulative[k] < 3.0 {
+                    pts.push(*p);
+                }
+            }
+            pts.push(nl.point_at(nl.length_m.min(3.0)));
+            let mut clean: Vec<v2xw_core::geom::Vec3> = Vec::new();
+            for p in pts {
+                if clean.last().is_none_or(|q| q.distance_2d(p) > 1e-4) {
+                    clean.push(p);
+                }
+            }
+            if clean.len() < 2 {
+                continue;
+            }
+            let (r, x, y) = tightest(&clean);
+            within[2][buckets.iter().position(|b| r < *b).unwrap_or(5)] += 1;
+            if r < 5.4 {
+                worst.push((r, lane.id.index(), "join", x, y));
+            }
+        }
+    }
+    println!("tightest radius (3 points 1 m apart), buckets <2 <4 <5.4 <8 <12 >=12 m");
+    println!("connectors: {:?}", within[0]);
+    println!("lanes:      {:?}", within[1]);
+    println!("joins:      {:?}", within[2]);
+    for (k, v) in &by_turn {
+        println!("  connectors {k:<28} {v:?}");
+    }
+    worst.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (r, lane, what, x, y) in worst.iter().take(60) {
+        println!("  {what} lane {lane}: {r:.2} m at ({x:.1}, {y:.1})");
+    }
+    println!("  ({} below 5.4 m or disjoint)", worst.len());
 }
