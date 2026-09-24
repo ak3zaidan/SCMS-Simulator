@@ -120,16 +120,50 @@ test("an edited setting reaches the next run: duration, seed, arrival rate, radi
   expect(cam.engine.stats.tx_by_type.bsm, "no BSM once the set is [cam]").toBeUndefined();
 
   // --- a setting the engine does not act on is marked, and an edit to it is called out ---------
-  // (weather.visibility_m was the example until the traffic track wired it: drivers now keep to
-  // their sight distance. nodes.backend_tier is still read by nothing.)
+  // weather.visibility_m was the example until the traffic track wired it (drivers keep to their
+  // sight distance), and nodes.backend_tier until the security track did (each backend entity is
+  // an M/M/c queue at medium and high). It is now marked as partly applied, as its KEY_STATUS row
+  // says. Whatever the engine still reads nothing from is found in the published surface and
+  // checked; the engine's own table says there is none, and then that is what is asserted.
   await page.getByTestId("settings-filter").fill("backend_tier");
-  const inert = page.locator('[data-testid="setting"][data-pointer="/nodes/backend_tier"]');
-  await expect(inert.getByTestId("field-status")).toHaveText("not applied");
-  const current = await inert.locator("select").inputValue();
-  await inert.locator("select").selectOption(current === "high" ? "abstract" : "high");
-  await expect(page.getByTestId("inert-edits")).toContainText("nothing in this build");
-  await page.getByTestId("discard-edits").click();
+  const partial = page.locator('[data-testid="setting"][data-pointer="/nodes/backend_tier"]');
+  await expect(partial.getByTestId("field-status")).toHaveText("partly applied");
   await page.getByTestId("settings-filter").fill("");
+  const notApplied = page
+    .locator('[data-testid="setting"]')
+    .filter({ has: page.getByTestId("field-status").filter({ hasText: /^not applied$/ }) });
+  const inertKeys = await notApplied.count();
+  if (inertKeys > 0) {
+    const inert = notApplied.first();
+    const control = inert.locator("select, input").first();
+    if ((await control.evaluate((e) => e.tagName)) === "SELECT") {
+      const options = await control.locator("option").allTextContents();
+      const current = await control.inputValue();
+      await control.selectOption(options.find((o) => o !== current) ?? current);
+    } else {
+      await control.fill(`${(await control.inputValue()) || "0"}1`);
+    }
+    await expect(page.getByTestId("inert-edits")).toContainText("nothing in this build");
+    await page.getByTestId("discard-edits").click();
+  } else {
+    // The leaves the form is built from (`fields`), each with the engine's own status.
+    const statuses = await page.evaluate(async () => {
+      const engine = window.__vwpStudio?.engine as unknown as {
+        requestHttp(m: string, p: unknown, o: unknown): Promise<{ fields?: { "x-path"?: string; "x-status"?: string }[] }>;
+      };
+      const res = await engine.requestHttp("scenario.get", { with_schema: true }, { quiet: true });
+      return (res.fields ?? []).map((f) => [f["x-path"] ?? "", f["x-status"] ?? ""] as const);
+    });
+    expect(statuses.length, "the published surface was read").toBeGreaterThan(50);
+    expect(
+      statuses.filter(([, st]) => st === "not-implemented" || st === "unknown").map(([p]) => p),
+      "the engine publishes no setting it reads nothing from",
+    ).toEqual([]);
+    test.info().annotations.push({
+      type: "not tested",
+      description: "no setting in this build is read by nothing, so the not-applied call-out has no subject",
+    });
+  }
 
   // --- an edit the loader refuses is said so, and nothing is held -------------------------------
   await setField(page, "/radio/tiers/propagation", "abstract");
