@@ -100,6 +100,9 @@ pub const SCMS_DEVICE_BASE: u32 = 1_000_000;
 /// The mast height a roadside unit's antenna stands at above its ground position, metres.
 pub const RSU_MAST_HEIGHT_M: f64 = 6.0;
 
+/// The hardware profile a roadside unit runs on when the scenario names none.
+pub const DEFAULT_RSU_PROFILE: &str = "rsu/commsignia-its-rs4";
+
 /// How often a reporter may report one subject again, by default: the legacy engine
 /// reported every step its detectors fired, at `PipelineConfig.dt` = 1.0 s.
 pub const REPORT_INTERVAL_S: f64 = 1.0;
@@ -746,10 +749,15 @@ impl Phase2 {
             rsus.push(RsuSpec {
                 position,
                 roles: spec.roles.clone(),
+                // The Commsignia ITS-RS4 by default: of the two RSU profiles that ship it is
+                // the one whose datasheet publishes a verification rate (>2,000/s, R7 §C2).
+                // The Cohda MK5 RSU brief publishes no compute figure at all, so a unit on
+                // it could price no verification and dropped every frame it heard as a
+                // verification-queue overflow — it received, but it never saw a message.
                 profile: spec
                     .profile
                     .clone()
-                    .unwrap_or_else(|| "rsu/cohda-mk5-rsu".to_string()),
+                    .unwrap_or_else(|| DEFAULT_RSU_PROFILE.to_string()),
                 backhaul: access.backhaul_of(spec.backhaul.as_deref())?,
             });
         }

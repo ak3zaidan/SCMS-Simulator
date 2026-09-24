@@ -451,3 +451,45 @@ fn a_vehicle_without_a_modem_relays_through_a_roadside_unit() {
     assert_eq!(q.reports_received, 0, "a report crossed a backhaul that is not there");
     assert!(q.reports_sent > 0, "the detectors must still fire, or this proves nothing");
 }
+
+/// A roadside unit verifies what it hears and checks it with the detector suite. The unit
+/// runs on the default roadside profile; on the Cohda MK5 RSU profile, whose brief
+/// publishes no verification rate, a unit could price no verification and dropped every
+/// frame as a verification-queue overflow — the control shows exactly that.
+#[test]
+fn a_roadside_unit_verifies_and_checks_what_it_hears() {
+    let build = |profile: Option<&str>| {
+        let mut s = grid(30.0, 900.0);
+        s.security.verification_policy = "verify-all".to_string();
+        s.detection.local = vec![ModelChoice::new(v2xw_engine::phase2::LEGACY_12)];
+        cellular(&mut s);
+        for x in [150.0, 450.0, 750.0, 1050.0] {
+            s.actors.rsus.push(v2xw_engine::scenario::Rsu {
+                site: None,
+                position_m: Some([x, 300.0, 0.0]),
+                roles: vec!["report-forward".to_string()],
+                profile: profile.map(str::to_string),
+                backhaul: None,
+            });
+        }
+        s
+    };
+    let delivered_at_units = |rec: &MemoryRecorder| {
+        records(rec, "node.rx")
+            .iter()
+            .filter(|r| r["rx"].as_u64().is_some_and(|n| n < 4))
+            .filter(|r| r["outcome"] == "delivered")
+            .count()
+    };
+    let (with_default, rec) = run(build(None));
+    let (with_mk5, rec_mk5) = run(build(Some("rsu/cohda-mk5-rsu")));
+    let (a, b) = (delivered_at_units(&rec), delivered_at_units(&rec_mk5));
+    println!(
+        "units delivered {a} frames on the default profile, {b} on the MK5 RSU; the suite \
+         checked {} and {} messages",
+        with_default.phase2.messages_checked, with_mk5.phase2.messages_checked
+    );
+    assert!(a > 0, "no roadside unit delivered a frame to its applications");
+    assert_eq!(b, 0, "the control: the MK5 RSU profile prices no verification");
+    assert!(with_default.phase2.messages_checked > with_mk5.phase2.messages_checked);
+}
