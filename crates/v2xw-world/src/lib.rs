@@ -89,7 +89,7 @@ pub use index::{IndexOptions, IndexStats, LaneMatch};
 pub use los::{ProfileParams, TerrainEdge, TerrainLos, TerrainProfile};
 pub use model::{
     Building, ClassMask, ConflictMatrix, Connection, Crossing, CrossingId, Edge, EnvClass, GeoBbox,
-    GeoOrigin, HeightSource, Interpolation, Junction, JunctionControl, LanduseClass, LanduseZone,
+    GeoOrigin, GroupSignal, HeightSource, Interpolation, Junction, JunctionControl, LanduseClass, LanduseZone,
     Lane, LaneKind, LaneProjection, LayerLicence, LodHint, MaterialClass, NetworkCounts,
     Passage, PassageKind, Projection, ROAD_CLEARANCE_M, RoadClass, RoadNetwork, SignalHead, SignalHeadKind, SignalPhase, SignalPlan,
     SignalState, Site, SiteId, SiteKind, SymbolId, SymbolTable, Terrain, Transformation,

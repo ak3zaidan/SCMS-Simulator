@@ -687,7 +687,8 @@ impl Engine {
                 crate::snapshot::DEFAULT_KEYFRAME_PERIOD,
             ),
             Profile::Full,
-        );
+        )
+        .with_signals(&world);
         // The radio stack is selected from the scenario, which the struct literal below
         // moves; the clone is one `Scenario` per run, not per anything.
         let scenario_for_radio = scenario.clone();
@@ -781,7 +782,8 @@ impl Engine {
     /// It resets the stream: the next frame is a keyframe opening GOP 0, with sequence
     /// numbers from zero. Call it before [`Engine::run`].
     pub fn configure_snapshots(&mut self, cadence: Cadence, profile: Profile) {
-        self.snapshots = SnapshotStream::new(&self.world.bbox, cadence, profile);
+        self.snapshots =
+            SnapshotStream::new(&self.world.bbox, cadence, profile).with_signals(&self.world);
         self.report.keyframes = 0;
         self.report.deltas = 0;
     }

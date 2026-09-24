@@ -42,10 +42,12 @@
 //!   table, so the cause would have to be carried across a step to reach the frame that
 //!   reports it; nothing reads the field yet, and an invented cause code is worse than an
 //!   honest "unknown".
-//! * **Signals.** The mobility update carries signal states and the world carries signal
-//!   plans, but nothing in this build advances a signal controller, so every frame's
-//!   signal block is empty rather than carrying a constant phase that would read as a
-//!   measurement.
+//! * **Signals.** Each frame's signal block (§3.3.3) carries one row per signal head
+//!   group, the state the world's fixed-time plan gives that group at the frame's time —
+//!   the same plan the mobility engine's vehicles obey, evaluated the same way
+//!   ([`v2xw_world::World::group_signals`]), once [`SnapshotStream::with_signals`] has
+//!   been given the world. It used to be empty: a recording played back in the page
+//!   drew every lamp as "no data".
 //! * **`verified_neighbors`** is the node's own count of peers in state *verified*
 //!   ([`v2xw_node::NeighborTable::counts`]), saturating at 255 as §3.3.2 requires. An
 //!   unequipped actor has none and the column is zero.
@@ -132,6 +134,8 @@ pub struct SnapshotStream {
     profile: Profile,
     keyframes: u64,
     deltas: u64,
+    /// Every signal head group of the world, evaluated per frame.
+    signals: Vec<v2xw_world::GroupSignal>,
 }
 
 impl SnapshotStream {
@@ -148,7 +152,16 @@ impl SnapshotStream {
             profile,
             keyframes: 0,
             deltas: 0,
+            signals: Vec::new(),
         }
+    }
+
+    /// The same stream, carrying `world`'s signal head groups in every frame's signal
+    /// block.
+    #[must_use]
+    pub fn with_signals(mut self, world: &v2xw_world::World) -> Self {
+        self.signals = world.group_signals();
+        self
     }
 
     /// The cadence this stream runs at.
@@ -213,7 +226,20 @@ impl SnapshotStream {
                 verified_neighbors: u8::try_from(s.verified_neighbors).unwrap_or(u8::MAX),
             });
         }
-        let snap = Snapshot::new(at, actors);
+        let mut snap = Snapshot::new(at, actors);
+        let t_s = v2xw_core::time::ns_to_secs(at);
+        snap.signals = self
+            .signals
+            .iter()
+            .filter_map(|g| {
+                let (state, remaining) = g.at(t_s)?;
+                Some(v2xw_record::encoder::SignalState {
+                    signal: v2xw_core::ids::SignalId::new(g.wire_id),
+                    phase: state.j2735_phase(),
+                    time_to_change: Some(Duration::from_nanos((remaining * 1e9) as u64)),
+                })
+            })
+            .collect();
         let frame = self.encoder.encode(&snap)?;
         if frame.is_keyframe() {
             self.keyframes += 1;
