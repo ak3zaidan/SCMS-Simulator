@@ -208,45 +208,124 @@ pub fn register_all(registry: &mut Registry) -> Result<()> {
 
 /// The mobility provider the scenario names.
 pub fn build_mobility(scenario: &Scenario) -> Box<dyn Mobility> {
+    Box::new(native_mobility(scenario))
+}
+
+/// The native mobility engine exactly as [`build_mobility`] configures it, as its concrete
+/// type — what the traffic-invariant auditor (`examples/traffic_audit.rs`) steps, so the
+/// run it audits is the run the kernel would drive.
+pub fn native_mobility(scenario: &Scenario) -> NativeMobility {
     let params = v2xw_mobility::EngineParams {
         step: scenario.time.mobility_step(),
         ..v2xw_mobility::EngineParams::default()
     };
-    Box::new(NativeMobility::new(params))
+    NativeMobility::new(params).with_vru_population(v2xw_mobility::engine::VruPopulation {
+        pedestrians: scenario.actors.vru.pedestrians,
+        cyclists: scenario.actors.vru.cyclists,
+    })
+}
+
+/// True for the classes `actors.vru` populates: whether an actor carries a device is drawn
+/// with `actors.vru.device_fraction` for these and `actors.vehicles.equipped_fraction` for
+/// every other class.
+pub const fn is_vru_class(class: VehicleClass) -> bool {
+    matches!(class, VehicleClass::Pedestrian | VehicleClass::Bicycle)
+}
+
+/// The demand models a scenario may name in `actors.vehicles.demand.kind`.
+///
+/// `mobility/demand/poisson` is the scenario spelling of the thinned-Poisson model, whose
+/// card id is `mobility/demand/poisson-thinned`; both are accepted.
+pub const DEMAND_KINDS: [&str; 4] = [
+    "mobility/demand/none",
+    "mobility/demand/poisson",
+    v2xw_mobility::demand::poisson::MODEL_ID,
+    v2xw_mobility::demand::tr36885::MODEL_ID,
+];
+
+/// The vehicle classes `actors.vehicles.classes` may name: the motorised ones. A cyclist
+/// or a pedestrian is a vulnerable road user and belongs in `actors.vru`.
+pub fn vehicle_class_named(name: &str) -> Option<VehicleClass> {
+    VehicleClass::ALL
+        .into_iter()
+        .find(|c| c.as_str() == name)
+        .filter(|c| !matches!(c, VehicleClass::Bicycle | VehicleClass::Pedestrian))
 }
 
 /// The demand model the scenario names.
 ///
+/// * `mobility/demand/none` — nothing arrives.
+/// * `mobility/demand/poisson` (or `…/poisson-thinned`) — the thinned-Poisson model;
+///   `params` is its own parameter struct plus an optional `od` object for the
+///   origin-destination law ([`v2xw_mobility::demand::OdParams`]).
+/// * `mobility/demand/tr36885-drop` — the 3GPP TR 36.885 vehicle drop; `params` is its
+///   [`v2xw_mobility::demand::DropParams`].
+///
+/// `actors.vehicles.classes`, when given, is the fleet mix: its shares replace the Poisson
+/// model's `fleet` preset, and a single class sets the drop model's class.
+///
 /// # Errors
+/// [`EngineError::Scenario`] if `params` does not fit the model, and
 /// [`EngineError::Mobility`] if the world admits no trip the demand model could place.
 pub fn build_demand(scenario: &Scenario, world: &World) -> Result<Box<dyn Demand>> {
     let d = &scenario.actors.vehicles.demand;
-    if d.kind == "mobility/demand/none" {
-        return Ok(Box::new(NoDemand::new()));
-    }
-    // `params` is the model's own parameter struct, so a scenario reaches every field the
-    // demand model publishes — including `max_total_vehicles`, which is the only way to
-    // ask for an exact fleet size. Until this read the field was unreachable and a
-    // scenario could only state a rate, so "one vehicle" was a property of the seed.
-    let mut params: v2xw_mobility::demand::PoissonParams = if d.params.is_null() {
-        v2xw_mobility::demand::PoissonParams::default()
-    } else {
-        serde_json::from_value(d.params.clone()).map_err(|e| {
-            EngineError::Scenario(crate::ScenarioError::conflict(
-                "actors.vehicles.demand.params",
-                format!("does not fit the thinned-Poisson demand model's parameters: {e}"),
-            ))
-        })?
+    let bad = |what: &str, e: String| {
+        EngineError::Scenario(crate::ScenarioError::conflict(
+            "actors.vehicles.demand.params",
+            format!("does not fit the {what}'s parameters: {e}"),
+        ))
     };
-    // Two fields the scenario states outside `params`, and the outer spelling wins:
-    // `duration` is the run's, not the demand model's, and `rate_veh_per_h` is the
-    // friendlier unit for the same quantity as `arrival_rate_per_s`.
-    params.duration = Duration::from_secs_f64(scenario.time.duration_s);
-    if let Some(rate) = d.rate_veh_per_h {
-        params.arrival_rate_per_s = rate / 3600.0;
+    let shares: Vec<(VehicleClass, f64)> = scenario
+        .actors
+        .vehicles
+        .classes
+        .iter()
+        .filter_map(|(name, c)| vehicle_class_named(name).map(|class| (class, c.fraction)))
+        .collect();
+    match d.kind.as_str() {
+        "mobility/demand/none" => Ok(Box::new(NoDemand::new())),
+        k if k == v2xw_mobility::demand::tr36885::MODEL_ID => {
+            let mut params: v2xw_mobility::demand::DropParams = if d.params.is_null() {
+                v2xw_mobility::demand::DropParams::default()
+            } else {
+                serde_json::from_value(d.params.clone())
+                    .map_err(|e| bad("TR 36.885 drop model", e.to_string()))?
+            };
+            if let [(class, _)] = shares.as_slice() {
+                params.class = *class;
+            }
+            Ok(Box::new(v2xw_mobility::demand::DropModel::new(params)))
+        }
+        _ => {
+            // `params` is the model's own parameter struct, so a scenario reaches every
+            // field the demand model publishes — including `max_total_vehicles`, the only
+            // way to ask for an exact fleet size — plus `od` for the OD law.
+            let mut raw = if d.params.is_null() {
+                serde_json::Value::Object(serde_json::Map::new())
+            } else {
+                d.params.clone()
+            };
+            let od: v2xw_mobility::demand::OdParams =
+                match raw.as_object_mut().and_then(|m| m.remove("od")) {
+                    Some(v) => serde_json::from_value(v)
+                        .map_err(|e| bad("origin-destination law", e.to_string()))?,
+                    None => v2xw_mobility::demand::OdParams::default(),
+                };
+            let mut params: v2xw_mobility::demand::PoissonParams = serde_json::from_value(raw)
+                .map_err(|e| bad("thinned-Poisson demand model", e.to_string()))?;
+            // Two fields the scenario states outside `params`, and the outer spelling
+            // wins: `duration` is the run's, not the demand model's, and `rate_veh_per_h`
+            // is the friendlier unit for the same quantity as `arrival_rate_per_s`.
+            params.duration = Duration::from_secs_f64(scenario.time.duration_s);
+            if let Some(rate) = d.rate_veh_per_h {
+                params.arrival_rate_per_s = rate / 3600.0;
+            }
+            if !shares.is_empty() {
+                params.fleet = v2xw_mobility::demand::FleetMix::from_shares(&shares);
+            }
+            Ok(Box::new(PoissonDemand::new(world, params, od)?))
+        }
     }
-    let od = v2xw_mobility::demand::OdParams::default();
-    Ok(Box::new(PoissonDemand::new(world, params, od)?))
 }
 
 /// The GNSS model the scenario names.

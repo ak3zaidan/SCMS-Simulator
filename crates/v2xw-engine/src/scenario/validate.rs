@@ -316,24 +316,29 @@ pub static KEY_STATUS: &[KeyStatus] = &[
         note: "Which jurisdiction's fallback speed limits the OpenStreetMap importer \
                uses. An OSM import is refused without it." },
     // --- what moves --------------------------------------------------------
-    KeyStatus { path: "actors.vehicles.demand.kind", status: Status::Partial,
-        note: "Only 'mobility/demand/none' is distinguished. Every other id runs the \
-               thinned-Poisson model, so naming another demand model selects Poisson." },
+    KeyStatus { path: "actors.vehicles.demand.kind", status: Status::Wired,
+        note: "Which demand model runs: 'mobility/demand/none', 'mobility/demand/poisson' \
+               (the thinned-Poisson model) or 'mobility/demand/tr36885-drop' (the 3GPP \
+               TR 36.885 vehicle drop). Any other id is refused." },
     KeyStatus { path: "actors.vehicles.demand.rate_veh_per_h", status: Status::Wired,
         note: "Vehicles per hour offered to the network." },
-    KeyStatus { path: "actors.vehicles.demand.params", status: Status::Partial,
-        note: "Deserialised as the thinned-Poisson model's parameters and nothing else. \
-               'max_total_vehicles' is the only way to ask for an exact fleet size." },
+    KeyStatus { path: "actors.vehicles.demand.params", status: Status::Wired,
+        note: "The named model's own parameters: the Poisson model's (with an optional \
+               'od' object for the origin-destination law) or the drop model's. \
+               'max_total_vehicles' asks the Poisson model for an exact fleet size." },
     KeyStatus { path: "actors.vehicles.equipped_fraction", status: Status::Wired,
         note: "What share of vehicles carry a radio. 0 is a legal pure-traffic run." },
-    KeyStatus { path: "actors.vehicles.classes", status: Status::NotImplemented,
-        note: "The shares are validated to sum to 1 and then ignored: the fleet mix comes \
-               from the demand model's own 'fleet' parameter, which defaults to cars \
-               only." },
-    KeyStatus { path: "actors.vru", status: Status::Refused,
-        note: "Nothing in this build spawns a pedestrian or a cyclist, so the loader \
-               refuses any value above zero rather than reporting no VRU traffic without \
-               saying why." },
+    KeyStatus { path: "actors.vehicles.classes", status: Status::Wired,
+        note: "The fleet mix: each vehicle's class is drawn with these shares, and its \
+               size, driver, hardware profile and CAM station type follow from the class. \
+               Only motorised classes; cyclists and pedestrians are actors.vru." },
+    KeyStatus { path: "actors.vru", status: Status::Partial,
+        note: "Pedestrians walk the sidewalk and crossing lanes (social-force model) and \
+               cyclists ride the lanes that admit bicycles (car-following on the SUMO \
+               bicycle vType); each one who finishes is replaced, so the count holds. \
+               Both need such lanes: an OpenStreetMap import has them, the procedural \
+               grid does not. device_fraction must be 0: no VRU device (PSM/VAM) is \
+               hosted by the kernel yet." },
     KeyStatus { path: "actors.rsus", status: Status::Wired,
         note: "Roadside units. Placed, given a profile and a role set, and they transmit." },
     KeyStatus { path: "actors.rsus[].backhaul", status: Status::NotImplemented,
@@ -349,17 +354,23 @@ pub static KEY_STATUS: &[KeyStatus] = &[
         note: "Validated as a topology and then ignored: every backend hop uses one \
                constant latency and no capacity limit." },
     // --- environment -------------------------------------------------------
-    KeyStatus { path: "weather.initial", status: Status::Partial,
-        note: "Reaches the propagation model and the GNSS error model. It changes no \
-               driving behaviour, because the mobility provider is never told the \
-               weather." },
-    KeyStatus { path: "weather.intensity", status: Status::Partial,
-        note: "Only the high-tier propagation model reads it, and only for rain and \
-               sleet. At the default medium tier it changes nothing." },
-    KeyStatus { path: "weather.visibility_m", status: Status::NotImplemented,
-        note: "Carried into the weather state and read by no model that runs." },
-    KeyStatus { path: "weather.surface", status: Status::NotImplemented,
-        note: "No model that runs reads the road surface condition." },
+    KeyStatus { path: "weather.initial", status: Status::Wired,
+        note: "The weather drivers, the radio and the GNSS model start in. Rain, snow and \
+               fog lower desired speeds and stretch headways by the FHWA Road Weather \
+               Management bands (arterial rows on city streets, freeway rows at 50 mph \
+               and over); a weather-front event changes it and its end restores it." },
+    KeyStatus { path: "weather.intensity", status: Status::Wired,
+        note: "Heavy (0.5 and over) takes the FHWA heavy-rain and heavy-snow rows for \
+               drivers; the high-tier propagation model reads it for rain and sleet. The \
+               0.5 threshold is an uncalibrated choice, stated on the card." },
+    KeyStatus { path: "weather.visibility_m", status: Status::Wired,
+        note: "Drivers keep to a speed they can stop from within what they can see: the \
+               AASHTO stopping sight distance (2.5 s reaction, 3.4 m/s^2) solved for \
+               speed." },
+    KeyStatus { path: "weather.surface", status: Status::Partial,
+        note: "Caps braking at the surface's grip, mu*g (wet 0.5, snow 0.25, ice 0.1; \
+               secondary friction figures), which also shrinks the comfortable braking \
+               the car-following model plans with. A dry surface is not capped." },
     // --- radio -------------------------------------------------------------
     KeyStatus { path: "radio.rat", status: Status::NotImplemented,
         note: "The radio access technology is 802.11p whatever this says. The cellular \
@@ -560,16 +571,21 @@ fn unreachable_keys(s: &Scenario, e: &mut Vec<ScenarioError>) {
         ));
     }
 
-    // Vulnerable road users are a mobility population. `v2xw-mobility` spawns vehicles
-    // from a demand model and nothing spawns a pedestrian or a cyclist, so the three
-    // fields select a population that never exists.
+    // Pedestrians and cyclists move (v2xw_mobility::engine::VruPopulation). What does not
+    // exist yet is their *device*: v2xw-node's VruDeviceRuntime (PSM / VAM, the EN 302 571
+    // duty cycle, the battery) is not hosted by the kernel, whose nodes are vehicle OBUs.
+    // An equipped pedestrian would broadcast vehicle BSMs, so a device fraction above zero
+    // is refused rather than faked.
     let vru = &s.actors.vru;
-    if vru.pedestrians > 0 || vru.cyclists > 0 || vru.device_fraction > 0.0 {
+    if vru.device_fraction > 0.0 {
         e.push(conflict(
-            "actors.vru",
+            "actors.vru.device_fraction",
             format!(
-                "asks for {} pedestrians and {} cyclists at a device fraction of {}, and                  nothing in this build spawns a vulnerable road user: the mobility provider                  creates vehicles from `actors.vehicles.demand` only, so these three fields                  change nothing and the run would report no VRU traffic without saying why",
-                vru.pedestrians, vru.cyclists, vru.device_fraction
+                "is {}, and this build's kernel hosts no VRU device: pedestrians and \
+                 cyclists walk and ride, but v2xw-node's VruDeviceRuntime (PSM/VAM) is not \
+                 wired into the node phase, and giving them a vehicle OBU would put \
+                 vehicle BSMs on the air from a pedestrian. Set it to 0",
+                vru.device_fraction
             ),
         ));
     }
@@ -856,6 +872,21 @@ fn actors(s: &Scenario, e: &mut Vec<ScenarioError>) {
                 e,
             );
             total += c.fraction;
+            if crate::wiring::vehicle_class_named(name).is_none() {
+                e.push(conflict(
+                    &format!("actors.vehicles.classes.{name}"),
+                    format!(
+                        "'{name}' is not a vehicle class this engine drives; the classes are \
+                         {}. A cyclist or a pedestrian belongs in actors.vru",
+                        v2xw_mobility::VehicleClass::ALL
+                            .iter()
+                            .filter(|c| crate::wiring::vehicle_class_named(c.as_str()).is_some())
+                            .map(|c| c.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            }
         }
         // 1e-9 is the project's cross-engine float tolerance (D9); anything looser would
         // let a fleet quietly lose vehicles.
@@ -869,6 +900,19 @@ fn actors(s: &Scenario, e: &mut Vec<ScenarioError>) {
                 ),
             ));
         }
+    }
+
+    // A demand model this build does not have is refused by name, rather than silently
+    // running the Poisson model under another model's id.
+    if !crate::wiring::DEMAND_KINDS.contains(&s.actors.vehicles.demand.kind.as_str()) {
+        e.push(conflict(
+            "actors.vehicles.demand.kind",
+            format!(
+                "'{}' is not a demand model this build ships; use one of {}",
+                s.actors.vehicles.demand.kind,
+                crate::wiring::DEMAND_KINDS.join(", ")
+            ),
+        ));
     }
 
     if let Some(rate) = s.actors.vehicles.demand.rate_veh_per_h

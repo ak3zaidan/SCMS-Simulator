@@ -141,6 +141,14 @@ impl ActorSnapshot {
             .push(actor);
     }
 
+    /// Registers `actor` as an occupant of `lane` at front arc length `s_m` as well as of
+    /// its own lane — a vehicle whose body still straddles the lane it is changing out of.
+    /// The actor must already have been [`push`](ActorSnapshot::push)ed;
+    /// [`ActorSnapshot::sort`] must be called before any query.
+    pub fn push_ghost(&mut self, lane: LaneId, s_m: f64, actor: ActorId) {
+        self.by_lane.entry(lane).or_default().push((s_m, actor));
+    }
+
     /// Puts every list in its canonical order. Idempotent.
     pub fn sort(&mut self) {
         self.entries.sort_by_key(|e| e.view.actor);

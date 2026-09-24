@@ -2553,6 +2553,77 @@ impl SignalPlan {
     pub fn total_phase_duration_s(&self) -> f64 {
         self.phases.iter().map(|p| p.duration_s).sum()
     }
+
+    /// What each signal group of this plan's heads shows through the cycle, as
+    /// `(group, [(state, duration_s)])`, groups ascending, phases merged where the
+    /// group's state does not change (so a duration is the time to the next *change*).
+    ///
+    /// A group shows the most permissive state among the movements whose approach lane
+    /// carries one of its heads (Green over GreenYield over FlashingAmber over Amber over
+    /// RedAmber over Red over Off): a head over an approach shows the through movement's
+    /// green while the left turn from the same approach has a permissive one.
+    /// `approach_of` maps a controlled (internal) lane to the lane that approaches it.
+    ///
+    /// This is what a renderer colours a head with. The plan's own phase states are per
+    /// *movement*; picking any one movement's state for the whole controller — the first,
+    /// as the live stream once did — shows every head the state of one approach.
+    pub fn group_timelines(
+        &self,
+        approach_of: impl Fn(LaneId) -> Option<LaneId>,
+    ) -> Vec<(u16, Vec<(SignalState, f64)>)> {
+        let mut groups: Vec<u16> = self.heads.iter().map(|h| h.group).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        let group_of: Vec<Option<u16>> = self
+            .controlled
+            .iter()
+            .map(|l| {
+                let approach = approach_of(*l)?;
+                self.heads.iter().find(|h| h.lane == approach).map(|h| h.group)
+            })
+            .collect();
+        let rank = |s: SignalState| match s {
+            SignalState::Green => 6,
+            SignalState::GreenYield => 5,
+            SignalState::FlashingAmber => 4,
+            SignalState::Amber => 3,
+            SignalState::RedAmber => 2,
+            SignalState::Red => 1,
+            SignalState::Off => 0,
+        };
+        groups
+            .into_iter()
+            .map(|g| {
+                let mut timeline: Vec<(SignalState, f64)> = Vec::new();
+                for phase in &self.phases {
+                    let state = phase
+                        .states
+                        .iter()
+                        .zip(&group_of)
+                        .filter(|(_, og)| **og == Some(g))
+                        .map(|(s, _)| *s)
+                        .max_by_key(|s| rank(*s))
+                        .unwrap_or(SignalState::Off);
+                    match timeline.last_mut() {
+                        Some((last, d)) if *last == state => *d += phase.duration_s,
+                        _ => timeline.push((state, phase.duration_s)),
+                    }
+                }
+                (g, timeline)
+            })
+            .collect()
+    }
+}
+
+/// The id a signal *group* goes by on the live stream's signal block
+/// (docs/protocol/vwp-v1.md §3.3.3): `(controller + 1) · 65536 + group`.
+///
+/// Always at least 65536, so a plain controller id (below 65536) stays available for a
+/// producer that knows only a controller's state, and a consumer can tell the two apart.
+pub const fn signal_group_wire_id(plan: SignalId, group: u16) -> u32 {
+    (plan.index() + 1)
+        .wrapping_mul(65536)
+        .wrapping_add(group as u32)
 }
 
 // ---------------------------------------------------------------------------

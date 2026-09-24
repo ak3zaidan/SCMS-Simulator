@@ -96,7 +96,10 @@ impl GtKinematics {
             y_m: q.pos.y,
             z_m: Some(q.pos.z),
             speed_mps: q3(k.ground_speed_mps()),
-            acc_mps2: Some(q3(q.acc.x.hypot_like(q.acc.y))),
+            // Signed and longitudinal — along the heading — as vwp-v1 §3.3.2's `accel_cq`
+            // column and every consumer read it. The magnitude of the vector was recorded
+            // here, so a braking car streamed a *positive* acceleration.
+            acc_mps2: Some(q3(longitudinal(q.acc.x, q.acc.y, q.heading_rad))),
             heading_rad: Some(q.heading_rad),
             lane: q.lane.map(|l| l.lane.0),
             lane_pos_m: q.lane.map(|l| q3(l.s_m)),
@@ -105,16 +108,10 @@ impl GtKinematics {
     }
 }
 
-/// `f64::hypot` is a transcendental in the standard library and therefore banned
-/// (ADR 0003, ADR 0004 §4). This is the `v2xw_core::math` spelling of the same quantity.
-trait HypotLike {
-    fn hypot_like(self, other: f64) -> f64;
-}
-
-impl HypotLike for f64 {
-    fn hypot_like(self, other: f64) -> f64 {
-        v2xw_core::math::hypot(self, other)
-    }
+/// The component of a horizontal acceleration along `heading_rad`, m/s².
+fn longitudinal(ax: f64, ay: f64, heading_rad: f64) -> f64 {
+    let (s, c) = v2xw_core::math::sin_cos(heading_rad);
+    ax * c + ay * s
 }
 
 impl NodeTx {
@@ -234,6 +231,24 @@ mod tests {
         let view: GtKinematicsView = decode(&owned).expect("decodes");
         assert_eq!(view.actor, ActorId::new(7));
         assert_eq!(view.speed_mps, 5.0);
+        assert_eq!(view.acc_mps2, Some(q3(v2xw_core::math::cos(0.5))));
+        // A braking vehicle records a negative acceleration.
+        let braking = Kinematics {
+            acc: Vec3::new(
+                -3.0 * v2xw_core::math::cos(0.5),
+                -3.0 * v2xw_core::math::sin(0.5),
+                0.0,
+            ),
+            ..k
+        };
+        let view: GtKinematicsView =
+            decode(&GtKinematics::new(ActorId::new(7), &braking, "car").to_owned_record().expect("serialises"))
+                .expect("decodes");
+        assert!(
+            view.acc_mps2.is_some_and(|a| (a + 3.0).abs() < 2e-3),
+            "a car braking at 3 m/s² recorded {:?}",
+            view.acc_mps2
+        );
         // D9: the writer quantised, so the reader sees a value on the 1 mm grid.
         assert_eq!(view.x_m, 12.346);
 

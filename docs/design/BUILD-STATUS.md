@@ -61,6 +61,46 @@ drivable lanes a 100 km/h limit on Manhattan side streets, and lane width is a
 single global constant so every lane is exactly 3.50 m. A third is worse for
 routing: only 52.8 % of driving lanes lie in a strongly connected component.
 
+## Traffic — audited, 2026-09-23
+
+`v2xw_mobility::audit` checks every vehicle at every mobility step against the traffic
+invariants (footprint overlap, gap below `s0`, lateral offset, body in a building or
+outside its junction, red and avoidable-amber entry, two conflicting movements in one
+conflict zone, lane change near a junction or round a standing queue, unconnected lane
+transition, teleport, heading jump and flip, speed jump, acceleration and jerk bounds,
+gridlock, mid-road despawn) plus three world checks. Measure any scenario with
+`cargo run -p v2xw-engine --example traffic_audit -- <scenario.yaml> [--rate R]`; the
+gate is `crates/v2xw-mobility/tests/traffic_invariants.rs`, which also runs a control
+with the junction rules off that must go red.
+
+300 s runs, before → after (counts are vehicle-steps, or pair-steps for overlaps):
+
+| Class | dense grid (6000 veh/h) | Manhattan (manhattan-5min) | Manhattan, 6000 veh/h |
+|---|---|---|---|
+| overlap | 183 → 0 | 82 → 0 | 1787 → 0 |
+| gap below s0 | 256 → 0 | 96 → 0 | 1189 → 0 |
+| red entry | 59 → 0 | 42 → 0 | 287 → 0 |
+| conflict zone | 33 → 0 | 14 → 0 | 257 → 0 |
+| illegal lane transition | 119 → 0 | 56 → 0 | 515 → 0 |
+| teleport | 2503 → 0 | 1419 → 0 | 6523 → 0 |
+| lane change near a junction | 39 → 0 | 18 → 0 | 269 → 0 |
+| heading flip | 0 → 0 | 19 → 0 | 108 → 1 |
+| heading jump | 1198 → 0 | 367 → 10 | 1629 → 79 |
+| body in a building | 0 → 0 | 1351 → 6 | 4397 → 12 |
+| jerk > 30 m/s³ | 231 → 13 | 122 → 5 | 784 → 52 |
+
+What remains, honestly: heading jumps are vehicles on OSM junction connectors whose
+curvature is tighter than a 4 m radius; the bodies in buildings clip the corners of two
+buildings built over covered tunnel ramps (The Horizon, The Corinthian); the jerk
+excursions are emergency braking the car-following model asks for. The world check still
+reports 64 lanes whose centreline runs through a building footprint — Park Avenue's
+portals in the Helmsley Building and covered ramps, at grade in the source — and 19
+conflicting protected greens in the synthesised OSM signal plans (crossing lane
+assignments within one approach). Tunnels now run below ground and bridges above it.
+
+Mean speed 4.4–5.8 m/s with 10–15 % of vehicle-steps standing;
+no vehicle stands longer than 46 s.
+
 ## Phase 1 acceptance criteria
 
 Three of seven are now met with independently reproduced evidence. "Independent"

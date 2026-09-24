@@ -1485,3 +1485,74 @@ fn precision_warnings_cover_every_narrowed_column() {
             .is_empty()
     );
 }
+
+/// Each head group's timeline is, phase by phase, the most permissive state of the
+/// movements its heads face, and covers the whole cycle.
+#[test]
+fn a_signal_groups_timeline_is_its_movements_most_permissive_state() {
+    use v2xw_world::{SignalState, procedural::GridParams};
+    let world = v2xw_world::procedural::grid(
+        &GridParams {
+            lanes_per_direction: 2,
+            ..GridParams::legacy().with_signals(true)
+        },
+        &v2xw_world::ImportOptions::default(),
+    )
+    .expect("grid");
+    let approach_of = |l: v2xw_core::ids::LaneId| {
+        world
+            .roads
+            .connections()
+            .iter()
+            .find(|c| c.via == Some(l))
+            .map(|c| c.from_lane)
+    };
+    let rank = |s: SignalState| match s {
+        SignalState::Green => 6,
+        SignalState::GreenYield => 5,
+        SignalState::FlashingAmber => 4,
+        SignalState::Amber => 3,
+        SignalState::RedAmber => 2,
+        SignalState::Red => 1,
+        SignalState::Off => 0,
+    };
+    let mut checked = 0;
+    for plan in &world.signals {
+        let timelines = plan.group_timelines(approach_of);
+        assert!(timelines.len() >= 2, "a crossroads has two head groups");
+        for (group, timeline) in &timelines {
+            let total: f64 = timeline.iter().map(|(_, d)| d).sum();
+            assert!((total - plan.cycle_s).abs() < 1e-6, "the timeline covers the cycle");
+            // Walk the cycle in 0.1 s steps and compare with the movements.
+            for k in 0..(plan.cycle_s * 10.0) as usize {
+                let t = k as f64 * 0.1 + 0.05;
+                let states = plan.states_at(t).expect("a phase");
+                let want = plan
+                    .controlled
+                    .iter()
+                    .zip(states)
+                    .filter(|(l, _)| {
+                        approach_of(**l).is_some_and(|a| {
+                            plan.heads.iter().any(|h| h.lane == a && h.group == *group)
+                        })
+                    })
+                    .map(|(_, s)| *s)
+                    .max_by_key(|s| rank(*s))
+                    .expect("the group controls a movement");
+                let mut into = t % plan.cycle_s;
+                let mut got = None;
+                for (state, d) in timeline {
+                    if into < *d {
+                        got = Some(*state);
+                        break;
+                    }
+                    into -= d;
+                }
+                assert_eq!(got, Some(want), "plan {} group {group} at {t} s", plan.id);
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 1000);
+    assert!(v2xw_world::signal_group_wire_id(v2xw_core::ids::SignalId::new(0), 0) >= 65536);
+}

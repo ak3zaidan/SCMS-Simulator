@@ -1105,6 +1105,19 @@ pub struct OsmOptions {
     /// is cut back to `height - roof:height`, the structural top, and the building is
     /// counted as [`Anomaly::SpireHeightCapped`].
     pub roof_spire_fraction: f64,
+    /// How far beyond the kerb line of the crossing road a lane's stop line is set back
+    /// at a junction where three or more motor ways meet, metres.
+    ///
+    /// A lane used to end exactly at the half-width of the widest carriageway: on the kerb
+    /// line of the road it meets, in the middle of where the crosswalk is. That put a
+    /// right turn from the kerb lane on a path of 2-3 m radius — tighter than any car can
+    /// turn (AASHTO *Green Book* 2018 Table 2-2: passenger-car minimum inside radius
+    /// 4.4 m), with the vehicle's body sweeping over the corner building. The setback is
+    /// the crosswalk plus the stop line ahead of it: MUTCD 2009 §3B.16 puts the stop line
+    /// 4 ft (1.2 m) in advance of the crosswalk, and NYC DOT's *Street Design Manual*
+    /// (2020) marks crosswalks 10 ft (3.0 m) wide at minimum, so 4.2 m. A place where
+    /// only two ways meet is a continuation, not a junction, and keeps no setback.
+    pub stop_line_setback_m: f64,
     /// Width of a sidewalk lane, metres.
     pub sidewalk_width_m: f64,
     /// Width of a cycle lane, metres.
@@ -1140,6 +1153,7 @@ impl Default for OsmOptions {
             lane_width_m: None,
             min_useful_lane_m: 5.0,
             roof_spire_fraction: 0.5,
+            stop_line_setback_m: 4.2,
             sidewalk_width_m: 2.0,
             cycleway_width_m: 1.5,
             crossing_width_m: 4.0,
@@ -2322,6 +2336,13 @@ pub struct WayPlan {
     pub bridge: bool,
     /// `tunnel=*` other than `no`. Recorded, and part of the merge key.
     pub tunnel: bool,
+    /// How many levels below ground the way runs: `-layer` for a tunnel (at least 1 for
+    /// `tunnel=yes`), `0` at grade. A `tunnel=building_passage` runs *through* a building
+    /// at street level and stays at grade.
+    pub levels_below: u8,
+    /// How many levels above ground a bridge runs: its `layer` when positive, `0`
+    /// otherwise (a bridge tagged at layer 0 crosses water or a gap, not a road).
+    pub levels_above: u8,
 }
 
 impl WayPlan {
@@ -2625,6 +2646,33 @@ pub fn classify_way(
             .unwrap_or(0),
         bridge: way.tags.get("bridge").is_some_and(|v| v != "no"),
         tunnel: way.tags.get("tunnel").is_some_and(|v| v != "no"),
+        levels_below: {
+            let tunnel = way.tags.get("tunnel").map(str::trim);
+            let underground = tunnel.is_some_and(|v| v != "no" && v != "building_passage");
+            let layer = way
+                .tags
+                .get("layer")
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .unwrap_or(0);
+            if underground {
+                u8::try_from((-layer).max(1)).unwrap_or(u8::MAX)
+            } else {
+                0
+            }
+        },
+        levels_above: {
+            let bridge = way.tags.get("bridge").is_some_and(|v| v != "no");
+            let layer = way
+                .tags
+                .get("layer")
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .unwrap_or(0);
+            if bridge && layer > 0 {
+                u8::try_from(layer).unwrap_or(u8::MAX)
+            } else {
+                0
+            }
+        },
     })
 }
 
@@ -3320,6 +3368,14 @@ fn collapse_trivial_junctions(
 /// The shortest lane this importer will emit, metres. Below it a lane is noise.
 const MIN_LANE_LENGTH_M: f64 = 1.0;
 
+/// How far one `layer` level puts a roadway below ground (a tunnel) or above it (a
+/// bridge over a road), metres.
+///
+/// **This importer's choice**: OSM's `layer` is an ordering, not a height. 6 m is the
+/// 4.9 m (16 ft) minimum vertical clearance of a road under a structure (AASHTO Green
+/// Book 2018 §8.2) plus the structure, rounded; a second level is twice that.
+const TUNNEL_LEVEL_DEPTH_M: f64 = 6.0;
+
 /// The smallest junction trimming radius, metres.
 const MIN_JUNCTION_RADIUS_M: f64 = 1.0;
 
@@ -3603,23 +3659,38 @@ fn connector_geometry(start: Vec3, heading_in: f64, end: Vec3, heading_out: f64)
     let (sin_in, cos_in) = math::sin_cos(heading_in);
     let (sin_out, cos_out) = math::sin_cos(heading_out);
     let chord = end - start;
+    // How far the end lies off the approach's own line: a straight connector between two
+    // parallel but laterally offset lanes would meet both at an angle, so it takes the
+    // S-shaped cubic instead.
+    let offset = (chord.x * sin_in - chord.y * cos_in).abs();
     if turn.abs() < 1e-3 {
-        // Parallel tangents: a straight connector, unless the two lanes are laterally
-        // offset, in which case a symmetric S needs a curve the Bézier cannot give. Two
-        // points is right for the common case and honest for the rest.
+        if offset > 0.05 {
+            return cubic_connector(start, heading_in, end, heading_out);
+        }
         return vec![start, end];
     }
     // Solve `start + u · dir_in = end - v · dir_out` for u.
     let denominator = cos_in * sin_out - sin_in * cos_out;
     if denominator.abs() < 1e-9 {
+        if offset > 0.05 {
+            return cubic_connector(start, heading_in, end, heading_out);
+        }
         return vec![start, end];
     }
     let u = (chord.x * sin_out - chord.y * cos_out) / denominator;
     let control = Vec3::new(start.x + cos_in * u, start.y + sin_in * u, start.z);
-    // A control point behind the start or far beyond the chord means the two tangents meet
-    // outside the junction; the straight chord is then the better answer.
-    if !control.is_finite() || u <= 0.0 || u > 4.0 * chord.norm_2d() + 1.0 {
-        return vec![start, end];
+    // The tangent lines must meet *between* the two ends: ahead of the start along the
+    // approach heading and behind the end along the departure heading, and not far out of
+    // the junction. A meeting point beyond the end — two nearly parallel lanes offset
+    // sideways, the commonest case on an avenue where a lane is dropped — made the
+    // quadratic run past the end and double back on itself: a 40 m connector across a
+    // 13 m junction with a 180° heading reversal in it, which the traffic auditor found as
+    // vehicles reversing inside junctions and overlapping on one lane. Those take the
+    // tangent-continuous cubic instead.
+    let v = (end.x - control.x) * cos_out + (end.y - control.y) * sin_out;
+    let reach = 2.0 * chord.norm_2d() + 1.0;
+    if !control.is_finite() || u <= 0.0 || v <= 0.0 || u > reach || v > reach {
+        return cubic_connector(start, heading_in, end, heading_out);
     }
     (0..TURN_SAMPLES)
         .map(|i| {
@@ -3629,6 +3700,32 @@ fn connector_geometry(start: Vec3, heading_in: f64, end: Vec3, heading_out: f64)
                 w * w * start.x + 2.0 * w * t * control.x + t * t * end.x,
                 w * w * start.y + 2.0 * w * t * control.y + t * t * end.y,
                 w * w * start.z + 2.0 * w * t * control.z + t * t * end.z,
+            )
+        })
+        .collect()
+}
+
+/// A tangent-continuous cubic Bézier from `(start, heading_in)` to `(end, heading_out)`,
+/// with both handles a third of the chord long — the Hermite curve with the chord's own
+/// speed, which leaves along the approach heading, arrives along the departure heading
+/// and never overshoots either end. Used where the quadratic's tangent intersection lies
+/// outside the junction; a pair of exactly parallel, exactly collinear ends stays a
+/// straight two-point lane.
+fn cubic_connector(start: Vec3, heading_in: f64, end: Vec3, heading_out: f64) -> Vec<Vec3> {
+    let (sin_in, cos_in) = math::sin_cos(heading_in);
+    let (sin_out, cos_out) = math::sin_cos(heading_out);
+    let k = start.distance_2d(end) / 3.0;
+    let p1 = Vec3::new(start.x + cos_in * k, start.y + sin_in * k, start.z);
+    let p2 = Vec3::new(end.x - cos_out * k, end.y - sin_out * k, end.z);
+    (0..TURN_SAMPLES)
+        .map(|i| {
+            let t = i as f64 / (TURN_SAMPLES - 1) as f64;
+            let w = 1.0 - t;
+            let (b0, b1, b2, b3) = (w * w * w, 3.0 * w * w * t, 3.0 * w * t * t, t * t * t);
+            Vec3::new(
+                b0 * start.x + b1 * p1.x + b2 * p2.x + b3 * end.x,
+                b0 * start.y + b1 * p1.y + b2 * p2.y + b3 * end.y,
+                b0 * start.z + b1 * p1.z + b2 * p2.z + b3 * end.z,
             )
         })
         .collect()
@@ -3798,12 +3895,31 @@ fn lanes_for_turn(turn: TurnDirection, lanes: usize) -> Vec<usize> {
     }
 }
 
-/// Which departure lane a movement from approach lane `k` enters.
-fn target_lane(turn: TurnDirection, k: usize, out_lanes: usize) -> usize {
+/// Which departure lane a movement from approach lane `k` enters, given every approach
+/// lane (`sharing`, ascending) that makes the same movement.
+///
+/// Turning lanes are paired off from the kerb they turn towards: the rightmost
+/// right-turning lane takes the rightmost departure lane, the next one the next, and the
+/// same from the left for left turns and U-turns. Mapping every turning lane to the kerb
+/// lane — the old rule — sent a double right turn (`turn:lanes=right|right;through|…`,
+/// common on Manhattan's avenues) into one lane side by side, and the traffic auditor
+/// found the pair colliding at the merge. Through lanes keep their own index, shifted
+/// right only as far as the departure is narrower than the highest through lane needs;
+/// only where there are more through lanes than departure lanes do two meet (a lane drop).
+fn target_lane(turn: TurnDirection, k: usize, sharing: &[usize], out_lanes: usize) -> usize {
+    let last = out_lanes - 1;
     match turn {
-        TurnDirection::Right | TurnDirection::SlightRight => 0,
-        TurnDirection::Left | TurnDirection::UTurn => out_lanes - 1,
-        _ => k.min(out_lanes - 1),
+        TurnDirection::Right | TurnDirection::SlightRight => {
+            sharing.iter().filter(|j| **j < k).count().min(last)
+        }
+        TurnDirection::Left | TurnDirection::UTurn => {
+            last - sharing.iter().filter(|j| **j > k).count().min(last)
+        }
+        _ => {
+            let highest = sharing.iter().copied().max().unwrap_or(k);
+            let excess = highest.saturating_sub(last);
+            k.saturating_sub(excess).min(last)
+        }
     }
 }
 
@@ -3841,6 +3957,7 @@ fn build_network(
     // cut back by the width of the avenue it crosses.
     let mut motor_radius = vec![0.0f64; junction_nodes.len()];
     let mut soft_radius = vec![0.0f64; junction_nodes.len()];
+    let mut motor_arms = vec![0usize; junction_nodes.len()];
     for segment in segments {
         let plan = &plans[segment.plan];
         let half = plan.half_width_m();
@@ -3848,12 +3965,16 @@ fn build_network(
             let j = junction_of[&node].as_usize();
             if plan.family == WayFamily::Motor {
                 motor_radius[j] = motor_radius[j].max(half);
+                motor_arms[j] += 1;
             } else {
                 soft_radius[j] = soft_radius[j].max(half);
             }
         }
     }
-    for r in &mut motor_radius {
+    for (r, arms) in motor_radius.iter_mut().zip(&motor_arms) {
+        if *arms >= 3 {
+            *r += options.stop_line_setback_m.max(0.0);
+        }
         *r = r.clamp(MIN_JUNCTION_RADIUS_M, MAX_JUNCTION_RADIUS_M);
     }
     for r in &mut soft_radius {
@@ -3974,7 +4095,22 @@ fn build_network(
             for k in 0..direction_lanes {
                 let offset = -(half_width - (f64::from(k) + 0.5) * plan.lane_width_m);
                 let (offset_points, repaired) = offset_polyline(geometry, offset);
-                let centreline = dedupe_points(offset_points);
+                let mut centreline = dedupe_points(offset_points);
+                // A tunnel runs below ground. Flat at z = 0 it ran *through* the buildings
+                // above it — the FDR Drive under the United Nations, the Park Avenue, 1st
+                // Avenue and Queens-Midtown tunnels — and every vehicle in one was drawn
+                // inside a building. The junction connectors at its portals interpolate
+                // z, so the descent is made there.
+                // And a bridge over a road runs above it: at z = 0 the Park Avenue
+                // Viaduct crossed the street under it at grade, and the auditor found the
+                // cars on the two "colliding".
+                if plan.levels_below > 0 || plan.levels_above > 0 {
+                    let z = TUNNEL_LEVEL_DEPTH_M
+                        * (f64::from(plan.levels_above) - f64::from(plan.levels_below));
+                    for p in &mut centreline {
+                        p.z = z;
+                    }
+                }
                 if centreline.len() < 2 || polyline_length(&centreline) < MIN_KEPT_LANE_M {
                     report.note(Anomaly::DegenerateLane, plan.osm_id);
                     continue;
@@ -4300,21 +4436,24 @@ fn build_movements(
                 continue;
             }
 
+            let permits = |k: usize, turn: TurnDirection| -> bool {
+                match approach.turns.as_ref().and_then(|t| t.get(k)) {
+                    Some(set) if !set.is_empty() => set.iter().any(|t| turn_matches(*t, turn)),
+                    _ => lanes_for_turn(turn, in_lanes.len()).contains(&k),
+                }
+            };
             for (k, &from_lane) in in_lanes.iter().enumerate() {
-                let tagged = approach.turns.as_ref().and_then(|t| t.get(k));
                 let mut made = 0usize;
                 let mut seen: Vec<LaneId> = Vec::new();
                 for &(b, turn, _) in &candidates {
                     let departure = &net.edge_info[b];
                     let out_lanes = departure.lanes.len();
-                    let permitted_here = match tagged {
-                        Some(set) if !set.is_empty() => set.iter().any(|t| turn_matches(*t, turn)),
-                        _ => lanes_for_turn(turn, in_lanes.len()).contains(&k),
-                    };
-                    if !permitted_here {
+                    if !permits(k, turn) {
                         continue;
                     }
-                    let to_lane = departure.lanes[target_lane(turn, k, out_lanes)];
+                    let sharing: Vec<usize> =
+                        (0..in_lanes.len()).filter(|j| permits(*j, turn)).collect();
+                    let to_lane = departure.lanes[target_lane(turn, k, &sharing, out_lanes)];
                     if seen.contains(&to_lane) {
                         continue;
                     }
@@ -4349,7 +4488,7 @@ fn build_movements(
                         .copied();
                     if let Some((b, turn, _)) = best {
                         let departure = &net.edge_info[b];
-                        let to_lane = departure.lanes[target_lane(turn, k, departure.lanes.len())];
+                        let to_lane = departure.lanes[target_lane(turn, k, &[k], departure.lanes.len())];
                         add_movement(
                             net,
                             &mut movements,
@@ -7782,10 +7921,20 @@ mod tests {
         assert_eq!(lanes_for_turn(TurnDirection::Straight, 3), vec![0, 1, 2]);
         // A single-lane approach makes every movement from its one lane.
         assert_eq!(lanes_for_turn(TurnDirection::Left, 1), vec![0]);
-        assert_eq!(target_lane(TurnDirection::Right, 2, 3), 0);
-        assert_eq!(target_lane(TurnDirection::Left, 0, 3), 2);
-        assert_eq!(target_lane(TurnDirection::Straight, 1, 3), 1);
-        assert_eq!(target_lane(TurnDirection::Straight, 2, 2), 1);
+        assert_eq!(target_lane(TurnDirection::Right, 2, &[2], 3), 0);
+        assert_eq!(target_lane(TurnDirection::Left, 0, &[0], 3), 2);
+        assert_eq!(target_lane(TurnDirection::Straight, 1, &[1], 3), 1);
+        assert_eq!(target_lane(TurnDirection::Straight, 2, &[2], 2), 1);
+        // A double right turn pairs off from the kerb instead of doubling up on it.
+        assert_eq!(target_lane(TurnDirection::Right, 0, &[0, 1], 3), 0);
+        assert_eq!(target_lane(TurnDirection::Right, 1, &[0, 1], 3), 1);
+        // A double left, from the other kerb.
+        assert_eq!(target_lane(TurnDirection::Left, 2, &[1, 2], 3), 2);
+        assert_eq!(target_lane(TurnDirection::Left, 1, &[1, 2], 3), 1);
+        // Three through lanes after a right-turn-only lane, into three departure lanes:
+        // shifted right by one rather than two of them sharing the last lane.
+        assert_eq!(target_lane(TurnDirection::Straight, 1, &[1, 2, 3], 3), 0);
+        assert_eq!(target_lane(TurnDirection::Straight, 3, &[1, 2, 3], 3), 2);
     }
 
     #[test]

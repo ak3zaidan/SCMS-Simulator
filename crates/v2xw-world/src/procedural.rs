@@ -224,6 +224,18 @@ pub struct GridParams {
     pub rsu_antenna_height_m: f64,
     /// RSU antenna gain, dBi.
     pub rsu_antenna_gain_dbi: f64,
+    /// The kerb corner radius, metres: how far beyond the crossing street's kerb line a
+    /// lane ends, which is what gives a right turn from the kerb lane a radius a car can
+    /// drive.
+    ///
+    /// `0` — the two presets, whose layouts are reference geometry — ends every lane on
+    /// the kerb line, and a right turn from the kerb lane is then a quarter circle of
+    /// half a lane width (1.75 m), tighter than any car turns (AASHTO *Green Book* 2018
+    /// Table 2-2: passenger car minimum inside radius 4.4 m). A scenario that wants
+    /// drivable corners sets a kerb radius; 4.5 m is the AASHTO passenger-car edge radius
+    /// for a 90° urban turn (15 ft, *Green Book* 2018 Ch. 9 — **secondary**, read from
+    /// design guidance rather than re-verified against the table).
+    pub corner_radius_m: f64,
 }
 
 impl Default for GridParams {
@@ -258,6 +270,7 @@ impl GridParams {
             rsu_at_junctions: false,
             rsu_antenna_height_m: 6.0,
             rsu_antenna_gain_dbi: 5.0,
+            corner_radius_m: 0.0,
         }
     }
 
@@ -290,6 +303,7 @@ impl GridParams {
             rsu_at_junctions: false,
             rsu_antenna_height_m: 6.0,
             rsu_antenna_gain_dbi: 5.0,
+            corner_radius_m: 0.0,
         }
     }
 
@@ -363,7 +377,13 @@ impl GridParams {
                 format!("{} m is negative", self.sidewalk_m),
             ));
         }
-        let half = self.half_width_m();
+        if !(self.corner_radius_m.is_finite() && self.corner_radius_m >= 0.0) {
+            return Err(bad(
+                "corner_radius_m",
+                format!("{} m is not a non-negative radius", self.corner_radius_m),
+            ));
+        }
+        let half = self.half_width_m() + self.corner_radius_m;
         for (name, block) in [("block_x_m", self.block_x_m), ("block_y_m", self.block_y_m)] {
             if block <= 2.0 * half + 1.0 {
                 return Err(bad(
@@ -428,6 +448,8 @@ struct Layout {
     lanes: u32,
     width_m: f64,
     half_m: f64,
+    /// Where lanes end: the kerb line plus the corner radius.
+    stop_m: f64,
 }
 
 impl Layout {
@@ -440,6 +462,7 @@ impl Layout {
             lanes: p.lanes_per_direction,
             width_m: p.lane_width_m,
             half_m: p.half_width_m(),
+            stop_m: p.half_width_m() + p.corner_radius_m,
         }
     }
 
@@ -486,8 +509,8 @@ impl Layout {
         let (rx, ry) = d.right_vector();
         let off = self.lane_offset_m(k);
         Vec3::new_2d(
-            cx + fx * self.half_m + rx * off,
-            cy + fy * self.half_m + ry * off,
+            cx + fx * self.stop_m + rx * off,
+            cy + fy * self.stop_m + ry * off,
         )
     }
 
@@ -499,8 +522,8 @@ impl Layout {
         let (rx, ry) = d.right_vector();
         let off = self.lane_offset_m(k);
         Vec3::new_2d(
-            cx - fx * self.half_m + rx * off,
-            cy - fy * self.half_m + ry * off,
+            cx - fx * self.stop_m + rx * off,
+            cy - fy * self.stop_m + ry * off,
         )
     }
 
@@ -571,7 +594,7 @@ pub fn grid(params: &GridParams, opts: &ImportOptions) -> Result<World> {
     for row in 0..layout.rows {
         for col in 0..layout.cols {
             let (cx, cy) = layout.junction_xy(col, row);
-            let h = layout.half_m;
+            let h = layout.stop_m;
             junctions.push(Junction {
                 id: layout.junction_id(col, row),
                 position: Vec3::new_2d(cx, cy),
@@ -1225,6 +1248,21 @@ pub fn card() -> ModelCard {
         ),
         "m",
         6.0.into(),
+    );
+    push(
+        Parameter::new(
+            "corner_radius_m",
+            "m",
+            0.0.into(),
+            Source::new(
+                SourceKind::Standard,
+                "AASHTO Green Book 2018 Ch. 9: passenger-car edge radius for a 90° urban \
+                 turn, 15 ft (4.5 m) — secondary; 0 in the presets, which reproduce \
+                 reference layouts",
+            ),
+        ),
+        "m",
+        0.0.into(),
     );
     push(
         todo(

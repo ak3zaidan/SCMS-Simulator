@@ -65,6 +65,10 @@ world:
       block_buildings: true
       building_height_m: 30.0
       rsu_at_junctions: false
+      # Lanes end 4.5 m past the crossing street's kerb line (the AASHTO passenger-car
+      # 90-degree turn edge radius, 15 ft), so a right turn from the kerb lane has a
+      # radius a car can drive; with 0 it is a 1.75 m pivot.
+      corner_radius_m: 4.5
   # A procedural world has no source file, so this date only dates the run's provenance
   # record. It is still an argument and not a clock read.
   imported_at: "2026-09-18T00:00:00Z"

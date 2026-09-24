@@ -73,6 +73,13 @@ pub trait Mobility: Model {
 
     /// The last published state of one actor, for perception and safety metrics.
     fn kinematics(&self, a: ActorId) -> Option<&Kinematics>;
+
+    /// The weather every vehicle drives in from the next step on.
+    ///
+    /// A provided method, so a tier that models no weather response keeps compiling; the
+    /// native engine overrides it. Until the kernel called it, `weather.*` reached the
+    /// radio and the GNSS models and no driver: a snowstorm changed nothing on the road.
+    fn set_weather(&mut self, _weather: v2xw_core::weather::WeatherState) {}
 }
 
 /// Longitudinal acceleration from the gap and the speed difference to the leader

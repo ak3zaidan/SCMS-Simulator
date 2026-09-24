@@ -226,6 +226,9 @@ struct Setup {
     /// Signal plans as `(signal id, phase boundaries)`, evaluated by the projector.
     signals: Vec<SignalPlan>,
     equipped_fraction: f64,
+    /// `actors.vru.device_fraction`: what the kernel draws a pedestrian's or a cyclist's
+    /// device with, instead of `equipped_fraction`.
+    vru_device_fraction: f64,
     /// How many node ids the kernel mints before the first vehicle's.
     ///
     /// `v2xw_engine::Engine::build` calls `create_rsus` before it seeds the timeline, and
@@ -251,6 +254,55 @@ struct Setup {
 struct WorldMemo {
     key: String,
     bytes: Vec<u8>,
+}
+
+/// Every signal *group*'s timeline, flattened for evaluation without the world: one entry
+/// per group of heads, keyed by [`v2xw_world::signal_group_wire_id`].
+///
+/// The stream used to carry one state per controller — its *first* movement's — and the
+/// renderer keyed every head of a junction by the controller id, so all but one head of a
+/// junction stayed dark and the one that lit showed whichever approach happened to be
+/// movement 0: half the junctions' lights looked wrong. Each group now carries the state
+/// its own heads show (`SignalPlan::group_timelines`), and its time to change is the time
+/// to that group's next change. A plan with no heads — nothing to draw — keeps the old
+/// controller-wide entry under its plain id.
+fn group_signal_plans(world: &v2xw_world::World) -> Vec<SignalPlan> {
+    let mut approach_of: BTreeMap<LaneId, LaneId> = BTreeMap::new();
+    for c in world.roads.connections() {
+        if let Some(via) = c.via {
+            approach_of.entry(via).or_insert(c.from_lane);
+        }
+    }
+    let mut out = Vec::new();
+    for plan in &world.signals {
+        if plan.heads.is_empty() {
+            out.push(SignalPlan {
+                signal: SignalId::new(plan.id.index()),
+                phases: plan
+                    .phases
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.states.first().copied().unwrap_or(SignalState::Off),
+                            p.duration_s,
+                        )
+                    })
+                    .collect(),
+                cycle_s: plan.cycle_s,
+                offset_s: plan.offset_s,
+            });
+            continue;
+        }
+        for (group, timeline) in plan.group_timelines(|l| approach_of.get(&l).copied()) {
+            out.push(SignalPlan {
+                signal: SignalId::new(v2xw_world::signal_group_wire_id(plan.id, group)),
+                phases: timeline,
+                cycle_s: plan.cycle_s,
+                offset_s: plan.offset_s,
+            });
+        }
+    }
+    out
 }
 
 /// One signal controller's fixed-time plan, flattened for evaluation without the world.
@@ -932,25 +984,7 @@ fn assemble_setup(
         flags: PROV_FINAL,
     };
 
-    let signals: Vec<SignalPlan> = world
-        .signals
-        .iter()
-        .map(|plan| SignalPlan {
-            signal: SignalId::new(plan.id.index()),
-            phases: plan
-                .phases
-                .iter()
-                .map(|p| {
-                    (
-                        p.states.first().copied().unwrap_or(SignalState::Off),
-                        p.duration_s,
-                    )
-                })
-                .collect(),
-            cycle_s: plan.cycle_s,
-            offset_s: plan.offset_s,
-        })
-        .collect();
+    let signals = group_signal_plans(&world);
 
     let bbox = world.bbox;
     let mut scenario_hash = [0u8; 32];
@@ -1013,6 +1047,7 @@ fn assemble_setup(
         class_names,
         signals,
         equipped_fraction: scenario.actors.vehicles.equipped_fraction,
+        vru_device_fraction: scenario.actors.vru.device_fraction,
         roadside_nodes: roadside_node_count(scenario),
         actor_capacity,
         seed: scenario.seed,
@@ -1168,6 +1203,9 @@ struct Projector {
     nodes: BTreeMap<NodeId, ActorId>,
     rng: v2xw_core::rng::RngRegistry,
     equipped_fraction: f64,
+    /// `actors.vru.device_fraction`: what the kernel draws a pedestrian's or a cyclist's
+    /// device with, instead of `equipped_fraction`.
+    vru_device_fraction: f64,
     /// The node ids `0..roadside_nodes`, which the kernel gave to masts and not to actors.
     /// No reconstruction is owed for them and none is possible: a roadside unit has no
     /// `gt.kinematics` record because it has no actor.
@@ -1257,6 +1295,7 @@ impl Projector {
             nodes: BTreeMap::new(),
             rng: v2xw_core::rng::RngRegistry::new(setup.seed),
             equipped_fraction: setup.equipped_fraction,
+            vru_device_fraction: setup.vru_device_fraction,
             roadside_nodes: setup.roadside_nodes,
             // Not zero: the masts hold `0..roadside_nodes` (see `roadside_node_count`).
             next_node: setup.roadside_nodes,
@@ -1291,14 +1330,19 @@ impl Projector {
     /// and the id counts as accounted for the moment it is handed out, even if a record
     /// named it a step earlier. The caller equips a step's new actors in `ActorId` order,
     /// which is spawn order, because the kernel assigns `ActorId`s ascending at spawn.
-    fn equip(&mut self, actor: ActorId) -> Option<NodeId> {
+    fn equip(&mut self, actor: ActorId, vru: bool) -> Option<NodeId> {
+        let fraction = if vru {
+            self.vru_device_fraction
+        } else {
+            self.equipped_fraction
+        };
         let equipped = self
             .rng
             .checkout(
                 v2xw_core::rng::RngDomain::Spawn,
                 v2xw_core::rng::EntityRef::Actor(actor),
             )
-            .bool(self.equipped_fraction);
+            .bool(fraction);
         if !equipped {
             return None;
         }
@@ -1582,10 +1626,14 @@ impl Projector {
     fn absorb(&mut self, index: u64, t: SimTime, kinematics: &[GtKinematicsView]) {
         let mut present: BTreeSet<ActorId> = BTreeSet::new();
         let mut fresh: Vec<ActorId> = Vec::new();
+        let mut vru: BTreeSet<ActorId> = BTreeSet::new();
         for view in kinematics {
             present.insert(view.actor);
             if !self.actors.contains_key(&view.actor) {
                 fresh.push(view.actor);
+            }
+            if matches!(view.class.as_deref(), Some("pedestrian" | "bicycle")) {
+                vru.insert(view.actor);
             }
         }
         // Spawn order is `ActorId` order, and the node ids the kernel hands out are dense
@@ -1596,7 +1644,11 @@ impl Projector {
             // The equipped draw happens for every actor whether or not it gets a slot, so
             // that a run at capacity still assigns the node ids the kernel assigned: the
             // draw is what keeps the reconstruction aligned with the kernel's own.
-            let node = self.equip(actor);
+            // The kernel draws a pedestrian's or a cyclist's device with
+            // `actors.vru.device_fraction` (v2xw_engine::wiring::is_vru_class), so the
+            // reconstruction does too; drawing them with the vehicles' fraction minted
+            // node ids the kernel never did and shifted every later vehicle's.
+            let node = self.equip(actor, vru.contains(&actor));
             let slot = self.slots.allocate(actor, t);
             if slot >= self.actor_capacity {
                 // §3.1.1: the client refuses a slot at or beyond `actor_capacity`, so
@@ -3627,5 +3679,112 @@ mod tests {
             1,
             "with one mast the first vehicle's node id is 1, not 0"
         );
+    }
+}
+
+#[cfg(test)]
+mod signal_stream_tests {
+    use super::group_signal_plans;
+    use std::collections::BTreeMap;
+    use v2xw_core::ids::LaneId;
+    use v2xw_mobility::FixedTimeSignals;
+    use v2xw_world::model::SignalState;
+    use v2xw_world::procedural::GridParams;
+
+    fn rank(s: SignalState) -> u8 {
+        match s {
+            SignalState::Green => 6,
+            SignalState::GreenYield => 5,
+            SignalState::FlashingAmber => 4,
+            SignalState::Amber => 3,
+            SignalState::RedAmber => 2,
+            SignalState::Red => 1,
+            SignalState::Off => 0,
+        }
+    }
+
+    /// What the page is shown for every head group equals what the mobility engine's own
+    /// signal model shows that group's movements, at every 0.1 s step of two cycles — and
+    /// in particular at every change.
+    #[test]
+    fn the_streamed_signal_state_is_the_engines_at_every_step() {
+        let world = v2xw_world::procedural::grid(
+            &GridParams {
+                lanes_per_direction: 2,
+                ..GridParams::legacy().with_signals(true)
+            },
+            &v2xw_world::ImportOptions::default(),
+        )
+        .expect("grid");
+        let streamed = group_signal_plans(&world);
+        let engine = FixedTimeSignals::default();
+        let mut approach_of: BTreeMap<LaneId, LaneId> = BTreeMap::new();
+        for c in world.roads.connections() {
+            if let Some(via) = c.via {
+                approach_of.entry(via).or_insert(c.from_lane);
+            }
+        }
+        let mut changes = 0;
+        for plan in &world.signals {
+            let groups: Vec<u16> = {
+                let mut g: Vec<u16> = plan.heads.iter().map(|h| h.group).collect();
+                g.sort_unstable();
+                g.dedup();
+                g
+            };
+            for group in groups {
+                let id = v2xw_world::signal_group_wire_id(plan.id, group);
+                let entry = streamed
+                    .iter()
+                    .find(|e| e.signal.index() == id)
+                    .expect("every head group is streamed");
+                let mut last = None;
+                for k in 0..(2.0 * plan.cycle_s * 10.0) as u64 {
+                    let t_s = k as f64 * 0.1;
+                    let engine_state = plan
+                        .controlled
+                        .iter()
+                        .filter(|l| {
+                            approach_of.get(l).is_some_and(|a| {
+                                plan.heads.iter().any(|h| h.lane == *a && h.group == group)
+                            })
+                        })
+                        .filter_map(|l| engine.state_for(plan, *l, t_s))
+                        .max_by_key(|s| rank(*s))
+                        .expect("the group controls a movement");
+                    let (shown, _) = entry.at(t_s).expect("a state");
+                    assert_eq!(
+                        shown, engine_state,
+                        "plan {} group {group} at {t_s} s",
+                        plan.id
+                    );
+                    if last.is_some_and(|l| l != shown) {
+                        changes += 1;
+                    }
+                    last = Some(shown);
+                }
+            }
+        }
+        assert!(changes > 100, "the check saw {changes} changes");
+        // And no two head groups of a crossroads show a green together.
+        let plan = world
+            .signals
+            .iter()
+            .find(|p| world.junction(p.junction).incoming.len() >= 4)
+            .expect("a crossroads");
+        for k in 0..(plan.cycle_s * 10.0) as u64 {
+            let t_s = k as f64 * 0.1;
+            let greens = streamed
+                .iter()
+                .filter(|e| e.signal.index() / 65536 == plan.id.index() + 1)
+                .filter(|e| {
+                    matches!(
+                        e.at(t_s),
+                        Some((SignalState::Green | SignalState::GreenYield, _))
+                    )
+                })
+                .count();
+            assert!(greens <= 1, "{greens} groups green at {t_s} s");
+        }
     }
 }

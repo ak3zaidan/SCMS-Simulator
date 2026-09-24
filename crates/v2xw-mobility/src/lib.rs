@@ -87,6 +87,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod audit;
 pub mod carfollowing;
 pub mod classes;
 pub mod clock;
@@ -240,7 +241,8 @@ mod tests {
             "gnss/error/ou-bias-legacy:sigma_heading",
             "mobility/car-following/idm:a_min",
             "mobility/car-following/idm:weather.heavy_intensity_threshold",
-            "mobility/car-following/idm:weather.max_decel_mps2",
+            // `weather.max_decel_mps2` left this list when the surface cap was given the
+            // friction table it was waiting for (`weather.surface_friction`, secondary).
             "mobility/demand/poisson-thinned:wall_clock_mapping",
             "mobility/lane-change/mobil:politeness",
             "vru/pedestrian/social-force:fluctuation",
@@ -251,5 +253,9 @@ mod tests {
                 "{want} is missing from the todo-calibrate report: {todos:?}"
             );
         }
+        assert!(
+            !todos.iter().any(|t| t.ends_with(":weather.max_decel_mps2")),
+            "the surface cap is cited now: {todos:?}"
+        );
     }
 }

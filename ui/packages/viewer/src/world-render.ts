@@ -269,7 +269,12 @@ export class WorldRenderer {
   #gridItems = new Int32Array(0);
 
   #signals: InstancedMesh<BufferGeometry, Material> | null = null;
-  #signalIndexById = new Map<number, number>();
+  /**
+   * Stream signal id → the head rows it colours. A head group's id is
+   * `(controller + 1) · 65536 + group` (vwp-v1 §3.3.3); a plain controller id (< 65536)
+   * colours every head of that controller.
+   */
+  #signalIndexById = new Map<number, number[]>();
   #signalPhase = new Uint8Array(0);
   #signalColors = new Float32Array(4 * 3);
   #signalColor = new Color();
@@ -1005,7 +1010,12 @@ export class WorldRenderer {
       m.identity().setPosition(s.xM, s.yM, s.zM);
       mesh.setMatrixAt(i, m);
       mesh.setColorAt(i, this.#scratchColor);
-      this.#signalIndexById.set(s.signalId, i);
+      const groupKey = (s.signalId + 1) * 65536 + s.group;
+      for (const key of [groupKey, s.signalId]) {
+        const rows = this.#signalIndexById.get(key);
+        if (rows) rows.push(i);
+        else this.#signalIndexById.set(key, [i]);
+      }
       this.#signalPhase[i] = 0;
     }
     mesh.instanceMatrix.needsUpdate = true;
@@ -1056,9 +1066,9 @@ export class WorldRenderer {
     if (!mesh) return;
     if (block) {
       for (let i = 0; i < block.count; i++) {
-        const idx = this.#signalIndexById.get(block.signalId[i]);
-        if (idx === undefined) continue;
-        this.#signalPhase[idx] = block.phase[i];
+        const rows = this.#signalIndexById.get(block.signalId[i]);
+        if (rows === undefined) continue;
+        for (const idx of rows) this.#signalPhase[idx] = block.phase[i];
       }
     } else {
       this.#signalPhase.fill(0);

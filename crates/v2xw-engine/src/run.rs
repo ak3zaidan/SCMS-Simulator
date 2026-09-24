@@ -507,6 +507,9 @@ impl Engine {
             .map_err(|e| EngineError::Core(v2xw_core::error::CoreError::Time(e)))?;
         let rng = RngRegistry::new(scenario.seed);
         let mut mobility = crate::wiring::build_mobility(&scenario);
+        // The drivers see the weather the run starts in (FHWA speed and headway, sight
+        // distance, surface grip — v2xw_mobility::weather).
+        mobility.set_weather(crate::wiring::initial_weather(&scenario));
         let gnss = crate::wiring::build_gnss(&scenario);
         let (propagation, fading) = crate::wiring::build_radio(&scenario, &world);
 
@@ -947,11 +950,30 @@ impl Engine {
         use crate::scenario::TimelineKind;
         match item.kind {
             TimelineKind::WeatherFront => {
-                if let Some(v) = item.params.get("value")
+                if end {
+                    // The front has passed: back to the scenario's own weather, rather than
+                    // leaving the storm in force for the rest of the run.
+                    self.weather = crate::wiring::initial_weather(&self.scenario);
+                } else if let Some(v) = item.params.get("value")
                     && let Ok(kind) = serde_json::from_value(v.clone())
                 {
-                    self.weather = crate::wiring::weather_of(kind, 1.0, None, None);
+                    let intensity = item
+                        .params
+                        .get("intensity")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(1.0);
+                    let visibility = item
+                        .params
+                        .get("visibility_m")
+                        .and_then(serde_json::Value::as_f64);
+                    let surface = item
+                        .params
+                        .get("surface")
+                        .and_then(|s| serde_json::from_value(s.clone()).ok());
+                    self.weather = crate::wiring::weather_of(kind, intensity, visibility, surface);
                 }
+                // And the drivers feel it, from the next mobility step.
+                self.mobility.set_weather(self.weather);
             }
             TimelineKind::Outage => {
                 // `target` names a node by index. An outage turns the node off, which is
@@ -1047,10 +1069,15 @@ impl Engine {
             self.report.actors_spawned += 1;
             // The equipped draw is keyed by the actor, so whether a vehicle carries an OBU
             // does not depend on how many vehicles spawned before it (ADR 0004 §3).
+            let fraction = if crate::wiring::is_vru_class(spawn.class) {
+                self.scenario.actors.vru.device_fraction
+            } else {
+                self.scenario.actors.vehicles.equipped_fraction
+            };
             let equipped = self
                 .rng
                 .checkout(RngDomain::Spawn, EntityRef::Actor(spawn.actor))
-                .bool(self.scenario.actors.vehicles.equipped_fraction);
+                .bool(fraction);
             let node = if equipped {
                 let id = NodeId::new(self.next_node);
                 self.next_node += 1;
