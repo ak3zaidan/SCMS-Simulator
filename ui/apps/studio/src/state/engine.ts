@@ -296,6 +296,19 @@ export class StudioEngine {
     useStudio.getState().setReconnectAttempts(0);
     if ((hello.helloFlags & HelloFlags.RESUMED) !== 0) {
       this.#log("info", "vwp", "reconnected; the engine resumed the stream where it left off");
+      // The stream resumes, but a subscription is the connection's (§6.7 is connection-scoped)
+      // and the server builds each connection's session afresh, so the followed node's telemetry
+      // and message feed stopped with the old socket. Asking again is idempotent.
+      const node = this.#followedNode;
+      if (node !== null && this.client) {
+        try {
+          const res = await this.client.request("view.follow", { node, telemetry: true, feed: FEED_OPTIONS });
+          this.#noteFeedAnswer(res.feed);
+          await this.setFollowChannels(true);
+        } catch (err) {
+          this.#log("warn", "follow", `could not resubscribe node ${node} after the reconnect: ${errText(err)}`);
+        }
+      }
       return;
     }
     this.#log(
