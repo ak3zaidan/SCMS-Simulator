@@ -15,6 +15,155 @@ what each gap would take — see [`docs/RELEASE-CHECKLIST.md`](../RELEASE-CHECKL
 (2026-09-22). The Phase 1 acceptance table below is still accurate and the checklist cites
 it.
 
+## 2026-09-23 — five tracks merged: stability, traffic, radio, metrics, rendering
+
+Five engineers worked in isolated worktrees and the integrator merged them into `main` in
+that order (merge commits `2cf3e75`, `0f1340d`, `b0ad18a`, `af00eec`, `7636985`), testing
+the touched crates after each merge and fixing the seams between tracks in commits of their
+own. Every number below comes from a command run on this machine; the release binaries were
+built from `main` and driven in a browser.
+
+### What each track delivered
+
+- **Stability.** Apply reaches the next run. Every `run.start` sends a fresh `Hello`, and
+  there is one kernel per run: `run.stop` joins it. A world imported once is reused exactly
+  (`world.cache`, and in memory). The engine-backed Playwright suite (`e2e-engine/`, 5 tests)
+  drives every control against the real server.
+- **Traffic.** An invariant auditor (`v2xw_mobility::audit`) checks every vehicle at every
+  step, with a fault-injection test for each class. Fixed: commitment at junctions, merges,
+  deadlock at a red, insertion, smooth headings, tunnels below ground. Signal state is now
+  streamed per signal group rather than per controller. Weather, fleet classes, demand
+  models and VRUs now affect driving.
+- **Radio.** `radio.rat` runs LTE-V2X Mode 4 and NR-V2X Mode 2 sidelinks as well as 802.11p.
+  Buildings obstruct links (Sommer), and so does terrain from a DEM (knife-edge). Each
+  vehicle generates at its own phase with J2945/1-style jitter. Also wired: jammers,
+  `radio.models`, the focus region and `nodes.compute_tier`.
+- **Metrics.** End-to-end delay is split into stages that tile each message's journey, and
+  every reception attempt has exactly one recorded fate. New metrics: awareness (AoI, NAR),
+  load and overhead (security, network, link, certificate share, bytes per vehicle-hour).
+  The PSDU is composed layer by layer; the page offers every series through a picker.
+- **Rendering.** Vehicles move along smooth curves between mobility samples. Signal lamps
+  show the state for the drawn instant, and each head shows its own group's state. The
+  camera stays out of walls and above the road, and the lens is shifted so the HUD does
+  not cover the followed car. Plan-view markings no longer shimmer.
+
+### Seams fixed at integration, each in its own commit
+
+- `world.cache` key: it now includes the importer revision and the DEM bytes (`159a371`,
+  `b0ad18a`).
+- `messages.generator`: the radio track's timing parameters and the metrics track's rule
+  parameters now share one validator (`af00eec`).
+- Sidelink frames carry no 802.11 framing (`af00eec`).
+- Signal group keys were ported into the rendering track's `SignalRenderer` (`7636985`).
+- The stream now sends each vehicle's body centre. It used to send the rear-bumper
+  reference, which drew every car 2.5 m behind itself (`c2bd4e6`).
+- Tests that the merged behaviour had made vacuous were changed to measure what they
+  meant, with no assertion weakened (`98fc437`, `f915539`, `894f329`, `45cd5d6`).
+- `v2xw-threat` in-the-loop broke under the metrics track's continuous-time verification:
+  3,604 reports and 0 of 5 attackers caught. Bisected to the metrics branch; the test host
+  now joins claims across steps and gets 72,916 reports with all 5 caught (`246d6b0`).
+- Conformance kit: the method count is now 33 and a hash-order false positive is gone
+  (`23a81ab`). The first golden record is blessed, `grid-traffic` (`1aaa943`, re-blessed
+  in `b66b3cd` and `5cac9a0`). Before each blessing the digest was shown identical twice
+  at `RAYON_NUM_THREADS` = 1, 4 and 8.
+
+### Built for the owner's requests during integration
+
+- **Message content in the chase view.** `node.tx` names the pseudonym that signed each
+  frame and carries the BSM's decoded Part I (`17f85bc`). The inspector lists the followed
+  vehicle's broadcasts, marking any pseudonym change; each row expands to every field, the
+  octets by layer and the signing delay. It also lists what the vehicle heard, with fate,
+  RSSI, SINR, distance and end-to-end delay (`7954007`, `fdd18ca`).
+- **Pseudonym rotation.** It now follows `security.pseudonym_change` (time, distance or
+  silent) over a pool of 20 pseudonyms used round-robin. Before this, a period other than
+  300 s was ignored, each vehicle held a single pseudonym, and the store alternated
+  between two (`544a23e`).
+- **Found by driving the release build in a browser:**
+  - Clicking a car followed no radio when the page did not know the car's node (`fdd7cae`).
+  - The kernel simulated the whole run ahead of the stream, which emptied the message log
+    and inflated `run.status` (`d4fe381`).
+  - The node's telemetry window, with its queues and CPU load, was never published
+    (`1950d08`).
+  - The fallback settings list offered radio technologies the engine refuses (`cafa7f5`).
+
+### Evidence
+
+- **Rust, one crate at a time, debug:**
+  - core 215, proto 101, world 211 (4 ignored), mobility 214, msg 203 (1 ignored), sec 99,
+    radio 263 (6 ignored), net 113, node 186, threat 210, record 239, copilot 68, py 16,
+    wasm 6: all pass, at `1aaa943`.
+  - metrics 235, server 77, cli 15, experiment 80, conformance 69: all pass, at `5cac9a0`.
+  - engine at `5cac9a0`: 115 pass, 2 fail (below).
+- **UI:**
+  - Typecheck is clean for protocol, viewer, mock-server and studio.
+  - vitest: protocol 186, viewer 132, mock-server 45, studio 143.
+  - Studio e2e against the mock: 20 of 24 pass (below).
+  - Studio e2e against the real server: 5 of 5.
+- **Release build:** `cargo build --release -p v2xw-server -p v2xw-cli` succeeds.
+- **Live check** (the owner's `run.txt` commands on ports 8787 and 5173, Playwright,
+  screenshots read):
+  - The aerial view shows 26 vehicles whose positions move between frames. A click on a
+    car switches to chase view on `node 21`, which is stopped behind a red stop bar.
+  - The inspector lists 50 broadcasts (BSM #116, id `ac285d32`, 40.75261°, -73.97935°,
+    176 B) and 50 receptions, all delivered and verified. The queues show 0/0, 1/1, 0/0,
+    1/1, 0/0 (p50/p95), and the HUD shows the pseudonym `ac28…5b`.
+  - Pause stops the clock at 00:02:00.500; one step moves it to 00:02:00.599.
+  - After editing the duration to 20 s and the seed to 0x2a, Apply says "Applied 2
+    changes". The run finishes at 20 s, and Run again gives the same digest,
+    `d0d6139e…`. No page errors.
+
+### Still open
+
+- **Engine `phase2.rs`, 2 of 8 fail** (they failed on `main` before this wave):
+  `with_no_attacker_nothing_is_revoked` and
+  `the_detector_suite_has_false_positives_on_honest_traffic`. The legacy-12 suite fires on
+  3.51 % of honest messages (positionSpeedInconsistency 1.84 %, headingInconsistency
+  1.74 %). Of the 3 candidate pairs, the two linkage authorities refuse 2, and 1 innocent
+  device is revoked.
+- **Studio mock e2e, 4 failures** (they fail on `main` too, per the rendering track):
+  - The aerial view opens at a fixed 1,400 m extent: 54 of 200 vehicles are outside the
+    frustum, and 0.735 of the map is populated against a 0.9 floor.
+  - A vehicle mark covers 16 px against a 40 px floor.
+  - The inspector's radio count reads 178 against 191 nodes in the table.
+  - `the nothing in the interface covers the vehicle` test is flaky under load: 2 of 3
+    passes, drift 0.066 against 0.03. Q3 scrub failed 3 times and passed 3 times across
+    runs; the e2e file itself notes that a Vite hot reload produces exactly that failure.
+- **Not built:**
+  - The backend path over cellular (Uu). `net.uu`, `net.backhaul` and `net.backend_net`
+    are read by nothing. Vehicle-to-SCMS traffic (enrolment, pseudonym top-up, misbehaviour
+    reports, CRL download) uses a constant backhaul latency with no capacity limit, and
+    CRL distribution is an RSU broadcast only.
+  - A pseudonym certificate's expiry and re-provisioning during a run: the bootstrap pool
+    is valid for the whole run.
+- **From the tracks:**
+  - Traffic, Manhattan at 6,000 veh/h:
+    - 79 heading jumps, from OSM connectors tighter than a 4 m radius.
+    - 12 in-building steps at covered ramps.
+    - 64 lanes through building footprints, which are real passages in the source.
+    - 19 conflicting protected greens in synthesised plans.
+    - No all-red interval.
+    - No VRU device (PSM/VAM).
+  - Radio:
+    - No sidelink congestion control is enforced, and there are no blind retransmissions.
+    - The 1 km candidate range truncates reception.
+    - The NR BLER is a fit, not a measured curve.
+    - `phase2-manhattan.yaml` runs with buildings off, because one mast hears 2 of 30
+      reports with them on.
+  - Metrics:
+    - Only `fragmenter/none` exists.
+    - The size-model codec tier is refused.
+    - Per-node breakdowns are only in the recording.
+  - Stability:
+    - `events` beyond outage and weather are inert.
+    - A reconnect gets a resync, not a true resume.
+- **Behaviour the owner will see:**
+  - With buildings obstructing, the Midtown 5-minute run delivers 9,970 of 146,618
+    reception attempts (PDR 0.07). The attempts include every pair within 1 km; within
+    100 m, delivery is 0.85 to 1.0 (radio track, `radio_access.rs`).
+  - The e2e-latency plot kept a previous run's history after Run again with a short run
+    (`e2e_latency.p95` axis 50–125 s on a 20 s run). Not investigated.
+  - Forward seeking now reaches only as far as the kernel's bounded lead, 12.8 s by default.
+
 ## Crates
 
 | Crate | Lines | State | Evidence |
