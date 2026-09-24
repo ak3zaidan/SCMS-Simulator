@@ -590,17 +590,18 @@ export function buildActorGeometry(def: ActorClassDef, lod: LodLevel): BufferGeo
     return g2;
   }
 
+  if (def.category === 1 && isRiddenVru(def.name)) {
+    buildCyclist(b, L, W, H, lod);
+    const gc = b.toGeometry();
+    if (!gc) throw new Error("cyclist geometry is empty");
+    return gc;
+  }
+
   if (def.category === 1) {
-    // VRU: a capsule-ish stack — legs, torso, head. Reads as a person from above and from the side.
-    const legH = H * 0.45;
-    const torsoH = H * 0.38;
-    const headR = Math.min(W, H * 0.11);
-    addBox(b, 0, -W * 0.22, legH / 2, W * 0.34, W * 0.3, legH, 0, 0.75, 0.75, 0.8);
-    addBox(b, 0, W * 0.22, legH / 2, W * 0.34, W * 0.3, legH, 0, 0.75, 0.75, 0.8);
-    addBox(b, 0, 0, legH + torsoH / 2, L * 0.9, W, torsoH, 0, 1, 1, 1);
-    if (lod === 0) {
-      addCylinder(b, 0, 0, legH + torsoH, legH + torsoH + headR * 2, headR, 8, 0.95, 0.85, 0.75);
-    }
+    // A person on foot: legs apart, a torso a little narrower than the shoulders, arms at the
+    // sides and a head. Reads as a person from the chase camera and from above; the legs are split
+    // across the body's width so the silhouette is not a post.
+    buildPedestrian(b, L, W, H, lod);
     const gv = b.toGeometry();
     if (!gv) throw new Error("VRU geometry is empty");
     return gv;
@@ -647,6 +648,93 @@ export function buildActorGeometry(def: ActorClassDef, lod: LodLevel): BufferGeo
   const g = b.toGeometry();
   if (!g) throw new Error(`actor geometry for class ${def.name} is empty`);
   return g;
+}
+
+/** True for a vulnerable-road-user class that rides something: a bicycle or a scooter. */
+export function isRiddenVru(name: string): boolean {
+  return name === "bicycle" || name === "scooter" || name === "cyclist";
+}
+
+/**
+ * A person on foot, `H` tall, facing +x: two legs, a torso, two arms and a head. The class table's
+ * width is shoulder to shoulder and its length front to back, as `VehicleClass::Pedestrian` sizes
+ * the body the mobility model moves.
+ */
+function buildPedestrian(b: MeshBuilder, L: number, W: number, H: number, lod: LodLevel): void {
+  const legH = H * 0.47;
+  const torsoH = H * 0.33;
+  const headR = Math.min(W * 0.32, H * 0.075);
+  const torsoW = W * 0.72;
+  const depth = Math.min(L, W) * 0.55;
+  // Trousers, darker than the torso so the gait reads.
+  addBox(b, 0, -torsoW * 0.26, legH / 2, depth * 0.8, torsoW * 0.4, legH, 0, 0.32, 0.36, 0.48);
+  addBox(b, 0, torsoW * 0.26, legH / 2, depth * 0.8, torsoW * 0.4, legH, 0, 0.32, 0.36, 0.48);
+  // Torso: takes the class colour.
+  addBox(b, 0, 0, legH + torsoH / 2, depth, torsoW, torsoH, 0, 1, 1, 1);
+  if (lod === 0) {
+    // Arms hang beside the torso.
+    const armH = torsoH * 0.95;
+    const armZ = legH + torsoH - armH / 2;
+    addBox(b, 0, -(torsoW / 2 + W * 0.08), armZ, depth * 0.6, W * 0.14, armH, 0, 0.85, 0.85, 0.9);
+    addBox(b, 0, torsoW / 2 + W * 0.08, armZ, depth * 0.6, W * 0.14, armH, 0, 0.85, 0.85, 0.9);
+    // Neck and head, skin-toned.
+    const z0 = legH + torsoH;
+    addCylinder(b, 0, 0, z0, z0 + headR * 0.5, headR * 0.45, 6, 0.9, 0.78, 0.66);
+    addCylinder(b, 0, 0, z0 + headR * 0.4, z0 + headR * 2.4, headR, 10, 0.93, 0.8, 0.68);
+  } else {
+    addBox(b, 0, 0, legH + torsoH + headR, depth, headR * 1.6, headR * 2, 0, 0.93, 0.8, 0.68);
+  }
+}
+
+/**
+ * A rider on a bicycle, facing +x: two wheels, the frame between them, and the rider sitting on
+ * it with the torso leaning forward to the bars. `L` is the bicycle's length (wheel to wheel), `H`
+ * the rider's height on it.
+ */
+function buildCyclist(b: MeshBuilder, L: number, W: number, H: number, lod: LodLevel): void {
+  const wheelR = Math.min(0.34, L * 0.21);
+  const axle = L / 2 - wheelR;
+  const tyre = Math.min(0.06, W * 0.1);
+  // Wheels: thin vertical discs, dark tyres.
+  for (const x of [axle, -axle]) {
+    if (lod === 0) {
+      // Four boxes rotated around the hub make a readable wheel from the side.
+      for (let k = 0; k < 4; k++) {
+        const a = (k * Math.PI) / 4;
+        // Each spoke pair spans the wheel's diameter and never reaches below the road.
+        addBox(b, x, 0, wheelR, Math.max(wheelR * 2 * Math.abs(Math.cos(a)), tyre), tyre,
+          Math.max(wheelR * 2 * Math.abs(Math.sin(a)), tyre), 0, 0.1, 0.1, 0.12);
+      }
+    } else {
+      addBox(b, x, 0, wheelR, wheelR * 2, tyre, wheelR * 2, 0, 0.1, 0.1, 0.12);
+    }
+  }
+  // Frame: the top tube and the down tube, at hub-to-saddle height.
+  const frameZ = wheelR * 1.25;
+  addBox(b, 0, 0, frameZ, axle * 2, tyre * 1.2, tyre * 1.5, 0, 0.55, 0.6, 0.65);
+  addBox(b, -axle * 0.15, 0, (wheelR + frameZ + wheelR * 0.9) / 2, tyre * 1.5, tyre * 1.2,
+    frameZ + wheelR * 0.9 - wheelR, 0, 0.55, 0.6, 0.65);
+  // Handlebars at the front.
+  const barZ = wheelR * 2.25;
+  addBox(b, axle * 0.85, 0, barZ, tyre * 1.5, Math.min(W, 0.6), tyre * 1.5, 0, 0.2, 0.2, 0.22);
+  // Rider: legs down to the pedals, a torso leaning forward, a head.
+  const saddleZ = wheelR * 2.1;
+  const legW = Math.min(W * 0.25, 0.16);
+  addBox(b, -axle * 0.1, -legW, (wheelR + saddleZ) / 2, 0.14, legW, saddleZ - wheelR, 0, 0.32, 0.36, 0.48);
+  addBox(b, -axle * 0.1, legW, (wheelR + saddleZ) / 2, 0.14, legW, saddleZ - wheelR, 0, 0.32, 0.36, 0.48);
+  const torsoH = Math.max(0.3, H - saddleZ - 0.28);
+  // The torso takes the class colour: lean it by setting it forward of the saddle.
+  addBox(b, axle * 0.2, 0, saddleZ + torsoH / 2, axle * 0.7, Math.min(W * 0.7, 0.4), torsoH, 0, 1, 1, 1);
+  if (lod === 0) {
+    const headR = 0.11;
+    const hx = axle * 0.4;
+    addCylinder(b, hx, 0, saddleZ + torsoH, saddleZ + torsoH + headR * 2, headR, 10, 0.93, 0.8, 0.68);
+    // Arms from the shoulders to the bars.
+    addBox(b, (axle * 0.4 + axle * 0.85) / 2, -0.18, (saddleZ + torsoH * 0.85 + barZ) / 2,
+      axle * 0.5, 0.08, 0.08, 0, 0.85, 0.85, 0.9);
+    addBox(b, (axle * 0.4 + axle * 0.85) / 2, 0.18, (saddleZ + torsoH * 0.85 + barZ) / 2,
+      axle * 0.5, 0.08, 0.08, 0, 0.85, 0.85, 0.9);
+  }
 }
 
 /** A ring in the xy plane, `innerRadius..1`, for the transmission-pulse overlay. */
