@@ -2017,6 +2017,9 @@ fn sent_json(v: &NodeTxView) -> Value {
         "signer": v.signer,
         "t_generated_ns": v.t_generated,
         "t_signed_ns": v.t_signed,
+        "channel": v.channel,
+        "pseudonym": v.pseudonym,
+        "content": v.content,
     })
 }
 

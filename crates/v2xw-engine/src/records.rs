@@ -178,7 +178,21 @@ impl NodeTx {
             frag_header_bytes: None,
             spdu_bytes: None,
             cert_bytes: None,
+            pseudonym: None,
+            content: None,
         })
+    }
+
+    /// Fills in which pseudonym signed the frame and what the message said.
+    #[must_use]
+    pub fn with_content(
+        mut self,
+        pseudonym: Option<String>,
+        content: Option<v2xw_metrics::channels::MsgContentView>,
+    ) -> Self {
+        self.0.pseudonym = pseudonym;
+        self.0.content = content;
+        self
     }
 
     /// Fills in the sender's side of the latency decomposition: when signing started, when

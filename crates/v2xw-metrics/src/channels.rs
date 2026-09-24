@@ -324,6 +324,65 @@ pub struct NodeTxView {
     /// the certificate's own encoding when one was attached, zero otherwise.
     #[serde(default)]
     pub cert_bytes: Option<u64>,
+    /// The pseudonym certificate the frame was signed with: its IEEE 1609.2 `HashedId8`,
+    /// sixteen hex digits (03-interfaces.md §14's "pseudonym digest"). It changes exactly
+    /// when the node rotates its pseudonym.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pseudonym: Option<String>,
+    /// What the message said, decoded from the payload octets that went on the air.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<MsgContentView>,
+}
+
+/// What one transmitted message said.
+///
+/// The wire fields are decoded from the payload octets the node encoded (a J2735
+/// `MessageFrame` for a BSM), so they are what a receiver would read, units converted from
+/// their J2735 least significant bits. The `claimed_*` fields are the kinematic claim the
+/// engine hands the receivers' plausibility detectors in the world frame; for an honest
+/// sender they are the node's own belief, for an attacker the falsified claim.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MsgContentView {
+    /// `msgCnt`, 0-127, incremented per message and wrapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_count: Option<u8>,
+    /// The temporary identifier (BSM `id`, CAM `stationID`), eight hex digits. It is the
+    /// first four octets of the pseudonym's digest, so it rotates with the pseudonym.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_id: Option<String>,
+    /// `secMark`, milliseconds within the minute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sec_mark_ms: Option<u16>,
+    /// Latitude, degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lat_deg: Option<f64>,
+    /// Longitude, degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lon_deg: Option<f64>,
+    /// Elevation, metres.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elev_m: Option<f64>,
+    /// Speed, m/s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_mps: Option<f64>,
+    /// Heading, degrees clockwise from true north.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading_deg: Option<f64>,
+    /// How many Part II containers the BSM carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_ii: Option<u8>,
+    /// The claimed position in the world frame, metres east.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_x_m: Option<f64>,
+    /// The claimed position in the world frame, metres north.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_y_m: Option<f64>,
+    /// The claimed speed, m/s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_speed_mps: Option<f64>,
+    /// The claimed heading, radians, ENU (0 = east, counter-clockwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_heading_rad: Option<f64>,
 }
 
 impl NodeTxView {

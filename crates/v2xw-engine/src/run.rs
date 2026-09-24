@@ -438,6 +438,8 @@ struct FrameState {
     mac_aifs_ns: u64,
     /// Of the channel-access delay, the backoff slots the MAC counted, ns.
     mac_backoff_ns: u64,
+    /// What the message said, for the `node.tx` record ([`message_content`]).
+    content: Option<v2xw_metrics::channels::MsgContentView>,
 }
 
 /// What a Phase 2 application message carries, beyond its length.
@@ -2121,6 +2123,12 @@ impl Engine {
                 // the MAC's grant overwrites both at the medium and high tiers.
                 mac_aifs_ns: AIFS.as_nanos(),
                 mac_backoff_ns: 0,
+                content: Some(message_content(
+                    tx.msg_type,
+                    tx.signed.as_ref().map(|f| f.payload.as_slice()),
+                    &tx.signer,
+                    claim,
+                )),
             },
         );
         if self.mac.is_some() || self.sidelink.is_some() {
@@ -2926,7 +2934,8 @@ impl Engine {
             state.mac_aifs_ns,
             state.mac_backoff_ns,
         )
-        .with_layers(&state.layers, state.cert_bytes);
+        .with_layers(&state.layers, state.cert_bytes)
+        .with_content(Some(hex_digest(&state.signer.0[..])), state.content.clone());
         self.emit(recorder, &tx_record);
     }
 
@@ -3493,6 +3502,59 @@ fn radio_class(class: VehicleClass) -> v2xw_radio::ActorClass {
 }
 
 /// The lower-case name a `node.tx` record carries for a message type.
+/// Lower-case hex of an identifier's octets.
+fn hex_digest(bytes: &[u8]) -> String {
+    use core::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// What a message said, for the followed-vehicle view and the recording.
+///
+/// A BSM's Part I is decoded from the payload octets the node actually encoded (a J2735
+/// `MessageFrame`), so the fields are the ones a receiver reads, converted from their
+/// least significant bits and left out when they carry J2735's "unavailable" value. Every
+/// other type carries its temporary identifier only, which the node takes from the first
+/// four octets of the pseudonym's digest for a CAM and a BSM alike
+/// (`v2xw_node::ObuRuntime::encode_payload`). The claim is the kinematic claim the
+/// receivers' detectors are handed (an attacker's is falsified).
+fn message_content(
+    msg_type: v2xw_msg::MsgType,
+    payload: Option<&[u8]>,
+    signer: &v2xw_msg::sec_types::HashedId8,
+    claim: (Vec3, f64, f64),
+) -> v2xw_metrics::channels::MsgContentView {
+    use v2xw_msg::j2735::bsm;
+    let mut c = v2xw_metrics::channels::MsgContentView {
+        temp_id: Some(hex_digest(&signer.0[..4])),
+        claimed_x_m: Some(claim.0.x),
+        claimed_y_m: Some(claim.0.y),
+        claimed_speed_mps: Some(claim.1),
+        claimed_heading_rad: Some(claim.2),
+        ..Default::default()
+    };
+    if msg_type == v2xw_msg::MsgType::Bsm
+        && let Some(bytes) = payload
+        && let Ok(m) = bsm::decode_message_frame(bytes)
+    {
+        let k = &m.core;
+        c.msg_count = Some(k.msg_cnt);
+        c.temp_id = Some(hex_digest(&k.id));
+        c.sec_mark_ms = (k.sec_mark != bsm::D_SECOND_UNAVAILABLE).then_some(k.sec_mark);
+        c.lat_deg = (k.lat != bsm::LATITUDE_UNAVAILABLE).then(|| f64::from(k.lat) * 1e-7);
+        c.lon_deg = (k.lon != bsm::LONGITUDE_UNAVAILABLE).then(|| f64::from(k.lon) * 1e-7);
+        c.elev_m = (k.elev != bsm::ELEVATION_UNKNOWN).then(|| f64::from(k.elev) * 0.1);
+        c.speed_mps = (k.speed != bsm::SPEED_UNAVAILABLE).then(|| f64::from(k.speed) * 0.02);
+        c.heading_deg =
+            (k.heading != bsm::HEADING_UNAVAILABLE).then(|| f64::from(k.heading) * 0.0125);
+        c.part_ii = Some(u8::try_from(m.part_ii.len()).unwrap_or(u8::MAX));
+    }
+    c
+}
+
 fn msg_type_name(t: v2xw_msg::MsgType) -> &'static str {
     match t {
         v2xw_msg::MsgType::Bsm => "bsm",

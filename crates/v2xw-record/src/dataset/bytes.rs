@@ -331,6 +331,8 @@ mod tests {
             frag_header_bytes: None,
             spdu_bytes: None,
             cert_bytes: None,
+            pseudonym: None,
+            content: None,
         }
     }
 
