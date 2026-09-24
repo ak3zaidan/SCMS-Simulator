@@ -348,11 +348,11 @@ export class CameraController {
   /**
    * Keep the part of the viewport under an interface panel out of the framing.
    *
-   * The camera is framed on the *unobstructed* rectangle — its field of view, its aspect and the
-   * point it looks at all belong to that rectangle — and the strips under the insets are still
-   * drawn, as an extension of the same projection. A chase camera puts its vehicle a little below
-   * the centre of the frame, which is exactly where the floating OBU HUD sits; with the HUD's
-   * height as the bottom inset the vehicle is below the centre of what the user can see instead.
+   * The point the camera looks at is put in the middle of the *unobstructed* rectangle by shifting
+   * the lens, and everything else about the projection — field of view, scale — is left alone, so
+   * the map does not zoom when a panel opens. A chase camera puts its vehicle a little below the
+   * centre of the frame, which is exactly where the floating OBU HUD sits; with the HUD's height as
+   * the bottom inset the vehicle is a little below the centre of what the user can see instead.
    * CSS pixels, clamped so at least a quarter of the viewport stays framed.
    */
   setViewInsets(insets: { top?: number; right?: number; bottom?: number; left?: number }): void {
@@ -379,15 +379,13 @@ export class CameraController {
     const { top, right, bottom, left } = this.#insets;
     const w = this.#viewportW;
     const h = this.#viewportH;
-    const vw = Math.max(1, w - left - right);
-    const vh = Math.max(1, h - top - bottom);
-    this.camera.aspect = vw / vh;
+    this.camera.aspect = w / h;
     if (top === 0 && right === 0 && bottom === 0 && left === 0) {
       this.camera.clearViewOffset();
     } else {
-      // The virtual image is the unobstructed rectangle; the canvas is a window onto it that
-      // extends past it by the insets (three.js `setViewOffset` accepts offsets outside the image).
-      this.camera.setViewOffset(vw, vh, -left, -top, w, h);
+      // A lens shift: the projection keeps its scale — the map's zoom, the marks' pixel sizes — and
+      // its principal point moves to the middle of the unobstructed rectangle.
+      this.camera.setViewOffset(w, h, (right - left) / 2, (bottom - top) / 2, w, h);
     }
     this.camera.updateProjectionMatrix();
   }
