@@ -2013,7 +2013,12 @@ impl Projector {
 }
 
 /// How many sent and how many received messages a node's evidence log keeps.
-const MESSAGE_LOG: usize = 64;
+///
+/// The log is filled as steps are absorbed, which is up to [`LiveOptions::lookahead_steps`]
+/// ahead of the stream plus the host channel's own lookahead, and read at the stream's
+/// instant, so it has to hold that lead and some history behind it: 384 frames is 38 s of
+/// a 10 Hz sender, and 384 receptions about 13 s at the 30 a second a dense street gives.
+const MESSAGE_LOG: usize = 384;
 
 /// One transmitted frame as a followed vehicle's evidence: what it was and every octet
 /// of it by layer, and when it was generated, signed and put on the air.
@@ -2259,8 +2264,16 @@ fn node_tx_payload(view: &NodeTxView) -> Vec<u8> {
             .and_then(|b| u16::try_from(b).ok())
             .unwrap_or(0xFFFF),
     );
-    // The digest itself is in the envelope, not in the record; the record names the signer
-    // *kind*. Eight zero bytes is §0's "absent" for a byte array.
+    // §3.6.10's `pseudonym_digest`: the HashedId8 of the signing certificate, which
+    // `node.tx` now carries (it rotates on the air when the node changes pseudonym, and
+    // the page's HUD shows it). Eight zero bytes, §0's "absent", when a record has none.
+    if let Some(hex) = view.pseudonym.as_deref()
+        && hex.len() == 16
+    {
+        for (i, byte) in p[28..36].iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap_or(0);
+        }
+    }
     put_u32(&mut p, 36, 0);
     p
 }
@@ -2811,10 +2824,24 @@ impl LiveEngine {
     fn pump(&mut self) {
         use std::sync::mpsc::TryRecvError;
         loop {
-            // Retention is the only bound on how far the kernel may run ahead once a
-            // client is attached: past it, the channel stays full and the kernel stops in
-            // `StepRecorder::send`.
+            // Retention bounds how much history is kept; `lookahead_steps` bounds how far
+            // ahead of the stream the kernel may run. Once the stream is that far behind,
+            // nothing more is taken off the channel, the channel fills, and the kernel
+            // stops in `StepRecorder::send` — which is what the option's own documentation
+            // promised ("small enough that a paused run stops the kernel"), and what this
+            // loop did not do: it absorbed until the retention was full, so a client at 1x
+            // saw a kernel that had already simulated the whole run. That cost memory
+            // proportional to the run, made the followed vehicle's message log (filled at
+            // absorb time, read at the stream's instant) show only the run's last seconds,
+            // and made run.status report counters from the end of the run.
             if self.timeline.len() >= self.options.retain_steps && self.base_index >= self.cursor {
+                break;
+            }
+            if self.produced
+                >= self
+                    .cursor
+                    .saturating_add(self.options.lookahead_steps.max(1) as u64)
+            {
                 break;
             }
             match self.host.steps.try_recv() {
@@ -4101,5 +4128,27 @@ mod body_centre_tests {
             assert!((c[2] - 1.5).abs() < 1e-12, "{class:?} keeps its height");
             assert!(half > 0.0, "{class:?} has a length");
         }
+    }
+}
+
+#[cfg(test)]
+mod node_tx_payload_tests {
+    use super::node_tx_payload;
+    use v2xw_metrics::channels::NodeTxView;
+
+    /// §3.6.10's `pseudonym_digest` carries the signing certificate's HashedId8 when the
+    /// record names one, and §0's eight zero bytes when it does not.
+    #[test]
+    fn the_pseudonym_digest_reaches_the_wire() {
+        let mut v: NodeTxView = serde_json::from_value(serde_json::json!({
+            "t": 0, "node": 3, "bytes_on_wire": 200, "pseudonym": "0123456789abcdef"
+        }))
+        .expect("a node.tx view");
+        assert_eq!(
+            &node_tx_payload(&v)[28..36],
+            &[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
+        );
+        v.pseudonym = None;
+        assert_eq!(&node_tx_payload(&v)[28..36], &[0u8; 8]);
     }
 }
