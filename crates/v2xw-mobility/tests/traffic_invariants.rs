@@ -78,7 +78,7 @@ fn run(params: EngineParams, seconds: u64) -> AuditReport {
 
 /// The classes that must be zero: every one a collision, a rule broken or a physically
 /// impossible motion.
-const SAFETY: [Check; 16] = [
+const SAFETY: [Check; 17] = [
     Check::Overlap,
     Check::GapBelowMinimum,
     Check::LateralOffset,
@@ -91,6 +91,7 @@ const SAFETY: [Check; 16] = [
     Check::QueueJump,
     Check::IllegalTransition,
     Check::Teleport,
+    Check::StepSpeed,
     Check::HeadingFlip,
     Check::SpeedJump,
     Check::AccelBound,

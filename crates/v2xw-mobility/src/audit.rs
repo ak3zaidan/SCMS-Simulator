@@ -36,6 +36,7 @@
 //! | [`Check::QueueJump`] | a lane change round a vehicle standing at the stop line, started inside the no-change zone |
 //! | [`Check::IllegalTransition`] | a vehicle arrived on a lane the lane graph does not connect to its previous one |
 //! | [`Check::Teleport`] | the published position moved further in one step than the speed allows |
+//! | [`Check::StepSpeed`] | the published position moved a distance the reported speed does not explain — a freeze or a catch-up jump |
 //! | [`Check::HeadingJump`] / [`Check::HeadingFlip`] | the heading turned faster than a car can, or reversed |
 //! | [`Check::SpeedJump`] | the speed changed faster than any acceleration the vehicle can produce |
 //! | [`Check::AccelBound`] | the acceleration is outside the vehicle's capability or the tyre-road limit |
@@ -137,6 +138,9 @@ pub enum Check {
     IllegalTransition,
     /// A position jump the speed cannot explain.
     Teleport,
+    /// A step whose distance disagrees with the speed the vehicle reports — the published
+    /// point froze while the speed said it moved, or caught up in a jump.
+    StepSpeed,
     /// A heading rate no car can turn at.
     HeadingJump,
     /// A heading reversal in one step.
@@ -162,7 +166,7 @@ pub enum Check {
 
 impl Check {
     /// Every class, in report order.
-    pub const ALL: [Check; 22] = [
+    pub const ALL: [Check; 23] = [
         Check::Overlap,
         Check::GapBelowMinimum,
         Check::LateralOffset,
@@ -175,6 +179,7 @@ impl Check {
         Check::QueueJump,
         Check::IllegalTransition,
         Check::Teleport,
+        Check::StepSpeed,
         Check::HeadingJump,
         Check::HeadingFlip,
         Check::SpeedJump,
@@ -202,6 +207,7 @@ impl Check {
             Check::QueueJump => "queue-jump",
             Check::IllegalTransition => "illegal-transition",
             Check::Teleport => "teleport",
+            Check::StepSpeed => "step-speed",
             Check::HeadingJump => "heading-jump",
             Check::HeadingFlip => "heading-flip",
             Check::SpeedJump => "speed-jump",
@@ -252,6 +258,14 @@ pub struct AuditParams {
     pub min_turn_radius_m: f64,
     /// Slack on the teleport test, metres.
     pub teleport_slack_m: f64,
+    /// Relative tolerance of the step-versus-speed test.
+    ///
+    /// **This crate's choice**: 5 %. On the tightest arc a vehicle may drive (5.4 m), a
+    /// 1.1 m step's chord is 0.3 % short of its arc, so 5 % is noise-free headroom.
+    pub step_speed_tolerance: f64,
+    /// Absolute slack of the step-versus-speed test, metres: 2 cm, twice the millimetre
+    /// quantisation of both endpoints with room for the arc's chord at walking pace.
+    pub step_speed_slack_m: f64,
     /// The no-change zone before a stop line, metres.
     ///
     /// MUTCD 2009 §3B.04: a solid lane line where "crossing the lane line markings is
@@ -284,6 +298,8 @@ impl Default for AuditParams {
             max_jerk_mps3: 30.0,
             min_turn_radius_m: 0.0,
             teleport_slack_m: 0.25,
+            step_speed_tolerance: 0.05,
+            step_speed_slack_m: 0.02,
             no_change_zone_m: crate::engine::DEFAULT_NO_CHANGE_ZONE_M,
             standstill_limit_s: 180.0,
             amber_decel_mps2: 3.0,
@@ -1074,6 +1090,29 @@ impl TrafficAuditor {
             let moved = a.pos.distance_2d(p.pos);
             let v = a.speed_mps.max(p.speed_mps);
             let lateral = (a.lateral_m - p.lateral_m).abs();
+            // The engine advances a vehicle by the speed it reports at the end of the step
+            // (`s += v·dt`), and the published point rides the path with it, so the step
+            // is `v·dt` to within the chord of a curve and the lateral slide of a lane
+            // change. A step far shorter is a freeze, one far longer a catch-up jump — the
+            // 0.4 s standstill at 11 m/s followed by a 6.1 m leap the owner saw.
+            // Along the path in three dimensions: the speed is along a ramp's slope.
+            let moved_3d = a.pos.distance(p.pos);
+            let expected = a.speed_mps * dt;
+            let tolerance =
+                self.params.step_speed_tolerance * expected + self.params.step_speed_slack_m + lateral;
+            if (moved_3d - expected).abs() > tolerance {
+                let ex = Self::example(
+                    Check::StepSpeed,
+                    t,
+                    a,
+                    None,
+                    format!(
+                        "moved {moved_3d:.3} m in {dt:.2} s reporting {:.2} m/s (expected {expected:.3} m)",
+                        a.speed_mps
+                    ),
+                );
+                self.flag(Check::StepSpeed, ex);
+            }
             let allowed = v * dt + lateral + self.params.teleport_slack_m;
             if moved > allowed {
                 let ex = Self::example(
@@ -1680,6 +1719,28 @@ mod tests {
             &[(ActorId::new(0), DespawnCause::LifetimeExpired)],
         );
         assert_eq!(audit.report().count(Check::MidRoadDespawn), 1);
+    }
+
+    /// The freeze-then-jump the owner saw before wave A — a car reporting 11 m/s whose
+    /// drawn position stood still, then leapt — is a step-versus-speed violation both
+    /// ways; a step of exactly `v·dt` is not.
+    #[test]
+    fn a_frozen_or_leaping_position_disagrees_with_the_reported_speed() {
+        let world = grid();
+        let lane = straight_lane(&world).id;
+        let mut audit = TrafficAuditor::new(&world, AuditParams::default());
+        let a0 = at(&world, 0, lane, 10.0, 11.0);
+        let a1 = at(&world, 0, lane, 11.1, 11.0);
+        audit.observe(&world, 0, 100_000_000, &[a0], &[]);
+        audit.observe(&world, 100_000_000, 200_000_000, &[a1], &[]);
+        assert_eq!(audit.report().count(Check::StepSpeed), 0);
+        // Frozen: the same position a step later at 11 m/s.
+        audit.observe(&world, 200_000_000, 300_000_000, &[a1], &[]);
+        assert_eq!(audit.report().count(Check::StepSpeed), 1);
+        // Leaping: 3.3 m in one 0.1 s step at 11 m/s.
+        let a2 = at(&world, 0, lane, 14.4, 11.0);
+        audit.observe(&world, 300_000_000, 400_000_000, &[a2], &[]);
+        assert_eq!(audit.report().count(Check::StepSpeed), 2);
     }
 
     #[test]
