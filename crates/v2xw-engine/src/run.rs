@@ -994,6 +994,7 @@ impl Engine {
             self.report.nodes_created += 1;
             if let Some(phase2) = self.phase2.as_mut() {
                 phase2.note_rsu(id);
+                phase2.arm_rsu_detector(id);
             }
         }
     }
@@ -3639,6 +3640,42 @@ impl Engine {
         now: SimTime,
         horizon: SimTime,
     ) {
+        // A roadside unit's own report goes straight onto its backhaul: it is wired
+        // infrastructure with no access leg to pay.
+        if let Some(backhaul) = self
+            .phase2
+            .as_ref()
+            .and_then(|p| p.rsu_spec_of(node).map(|s| s.backhaul))
+        {
+            if !backhaul.connected {
+                return;
+            }
+            let sent_at = self.signing_cost(node).after(now);
+            let at = backhaul.delay(crate::phase2::report_bytes()).after(sent_at);
+            if at > horizon {
+                return;
+            }
+            let sdu = v2xw_core::ids::SduId::new(self.next_sdu);
+            self.next_sdu += 1;
+            self.transfers.insert(
+                sdu,
+                Transfer::Report {
+                    reporter: node,
+                    report: Box::new(report),
+                    via: Some(node),
+                    journey: None,
+                    detected_at,
+                    sent_at,
+                    transport: v2xw_proto::Transport::RsuBackhaul,
+                },
+            );
+            self.scheduler.schedule(
+                at,
+                EventClass::NetDeliver,
+                Event::NetDeliver { sdu, to: node },
+            );
+            return;
+        }
         let Some(kind) = self.phase2.as_ref().map(|p| p.access_kind(node)) else {
             return;
         };

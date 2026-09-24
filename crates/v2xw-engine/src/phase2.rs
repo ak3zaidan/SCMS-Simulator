@@ -1129,6 +1129,19 @@ impl Phase2 {
         false
     }
 
+    /// Gives a roadside unit the local detector suite, when the scenario runs one.
+    ///
+    /// A unit verifies every frame it hears (`verify-all`, `wiring::build_rsu`) and the
+    /// legacy authority counts it as trusted infrastructure — "never rate-limited or
+    /// distrusted" (run.py `trusted()`, `LegacyWindow::trust_infrastructure`) — so a unit
+    /// is a reporter like a vehicle, whose reports go straight onto its backhaul.
+    pub fn arm_rsu_detector(&mut self, node: NodeId) {
+        if self.detection_on {
+            self.detectors
+                .insert(node, Legacy12::new(self.detector_params.clone()));
+        }
+    }
+
     /// Whether this node is an armed attacker.
     #[must_use]
     pub fn is_attacker(&self, node: NodeId) -> bool {
@@ -1271,6 +1284,9 @@ impl Phase2 {
             let reporter = reporter_digest.clone().unwrap_or_else(|| {
                 v2xw_core::hash::hex_encode(&me.node.index().to_le_bytes())
             });
+            if self.rsu_nodes.contains(&node) {
+                self.ma.trust_infrastructure(reporter.clone());
+            }
             if let Some(report) =
                 MisbehaviourReport::from_verdict(id, node, reporter, &verdict, &evidence)
             {
