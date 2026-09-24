@@ -440,6 +440,13 @@ export function ScenarioPanel(): React.JSX.Element {
                     {f.status && f.status !== "wired" && f.statusNote ? (
                       <div className="help status-note">{f.statusNote}</div>
                     ) : null}
+                    {/* A fully applied field's note says what the engine does with it, including
+                        where a value changes nothing (radio.tiers.phy "abstract" under a medium
+                        MAC, security.envelope on a BSM run). It is shown once the field is
+                        edited — the moment the user needs it — rather than on all hundred rows. */}
+                    {f.status === "wired" && edited && f.statusNote ? (
+                      <div className="help faint" data-testid="wired-note">{f.statusNote}</div>
+                    ) : null}
                     {devDetails ? <div className="help faint"><code>{f.pointer}</code></div> : null}
                   </div>
                 );
