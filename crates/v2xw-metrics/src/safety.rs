@@ -719,6 +719,7 @@ impl MetricProvider for SafetyProvider {
                     crate::stats::RatioEstimate::Insufficient {
                         trials: acc.samples,
                         required: 1,
+                        successes: None,
                     },
                 ),
             };

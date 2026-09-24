@@ -663,6 +663,37 @@ button.stat:focus-visible { outline: 2px solid var(--accent); outline-offset: 1p
 }
 .plot-card.wide { min-width: 320px; }
 
+/* ------------------------------------------------------------------ breakdown cards */
+
+.breakdown { display: flex; flex-direction: column; gap: 2px; }
+.breakdown-empty { margin: 8px 4px; font-size: 11px; }
+.breakdown svg { display: block; }
+.breakdown svg .grid { stroke: var(--border); stroke-width: 1; }
+.breakdown svg .axis { fill: var(--text-faint); font: 9px var(--sans); }
+.breakdown svg .band { fill: var(--accent); opacity: 0.18; stroke: none; }
+.breakdown svg .line { fill: none; stroke-width: 1.5; }
+.breakdown svg .line.prr { stroke: var(--accent); }
+.breakdown svg .line.app { stroke: var(--warn); stroke-dasharray: 3 2; }
+.breakdown svg .dot.prr { fill: var(--accent); }
+.breakdown svg .dot.app { fill: var(--warn); }
+.breakdown .legend { font-size: 9px; }
+.breakdown .legend::before { content: ""; display: inline-block; width: 10px; height: 2px; margin-right: 4px; vertical-align: middle; }
+.breakdown .legend.prr::before { background: var(--accent); }
+.breakdown .legend.app::before { background: var(--warn); }
+.stage-rows { display: flex; flex-direction: column; gap: 4px; padding: 4px 2px; }
+.stage-row { display: flex; align-items: center; gap: 6px; font-size: 10px; }
+.stage-type { width: 34px; color: var(--text-dim); }
+.stage-bar { display: flex; height: 10px; border-radius: 2px; overflow: hidden; background: var(--bg-input); }
+.stage-seg { display: block; height: 100%; }
+.stage-legend { display: flex; flex-wrap: wrap; gap: 2px 8px; max-width: 300px; font-size: 9px; }
+.stage-legend i { display: inline-block; width: 8px; height: 8px; margin-right: 3px; border-radius: 1px; vertical-align: -1px; }
+.node-rank { border-collapse: collapse; font-size: 10px; }
+.node-rank th, .node-rank td { padding: 1px 6px; text-align: right; }
+.node-rank th:first-child, .node-rank td:first-child { text-align: left; }
+.node-rank tbody tr { cursor: pointer; }
+.node-rank tbody tr:hover { background: var(--bg-panel); }
+.node-rank .active-sort { color: var(--accent); }
+
 /* A checkbox row in a panel body. */
 .check { display: flex; gap: 6px; align-items: center; font-size: 12px; padding: 2px 0; }
 .check input { flex: none; }

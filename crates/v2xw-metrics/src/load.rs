@@ -191,7 +191,7 @@ impl LoadProvider {
                  air time, over the window. One is a channel exactly full; above one, more \
                  is being offered than the channel can carry.",
             )
-            .with_dims([Dim::T])
+            .with_dims([Dim::T, Dim::Node])
             .with_source(cards::paper(
                 "Torrent-Moreno, Mittag, Santi, Hartenstein, IEEE Trans. Veh. Technol. \
                  58(7), 2009",
@@ -453,6 +453,7 @@ impl MetricProvider for LoadProvider {
 
         // --- channel_load ----------------------------------------------------------------
         let mut load = Distribution::new();
+        let mut per_node: Vec<(NodeId, f64)> = Vec::new();
         if window_us > 0 {
             let nodes: std::collections::BTreeSet<NodeId> = own
                 .keys()
@@ -469,7 +470,9 @@ impl MetricProvider for LoadProvider {
                     .unwrap_or(0)
                     .max(offered.get(&n).copied().unwrap_or(0));
                 let total = sensed.get(&n).copied().unwrap_or(0) + own_demand;
-                load.observe((total as f64) / (window_us as f64));
+                let ratio = (total as f64) / (window_us as f64);
+                load.observe(ratio);
+                per_node.push((n, ratio));
             }
         }
         out.push(MetricSample::new(
@@ -478,6 +481,18 @@ impl MetricProvider for LoadProvider {
             Dims::new(),
             SampleValue::Distribution(load.summary(1)),
         ));
+        // Each node's own load, for a ranking: the distribution above is across nodes and
+        // cannot say which node is the loaded one.
+        for (n, ratio) in per_node {
+            let mut dims = Dims::new();
+            dims.insert(Dim::Node, DimValue::index(u64::from(n.index())));
+            out.push(MetricSample::new(
+                &self.def("channel_load"),
+                at,
+                dims,
+                SampleValue::Scalar(Estimate::Value { point: ratio, n: 1 }),
+            ));
+        }
 
         // --- offered and carried load ----------------------------------------------------
         let carried = core::mem::take(&mut self.carried_bits);
@@ -643,6 +658,18 @@ mod tests {
             Some(8000.0),
             "no MAC report: offered = carried"
         );
+        // And each node's own load, by node, so a page can rank them.
+        let by_node: Vec<(u64, f64)> = s
+            .iter()
+            .filter(|x| x.metric == "channel_load")
+            .filter_map(|x| {
+                let DimValue::Index(n) = x.dims.get(&Dim::Node)? else {
+                    return None;
+                };
+                Some((*n, x.value.point()?))
+            })
+            .collect();
+        assert_eq!(by_node, vec![(1, 0.1), (2, 0.3)]);
     }
 
     #[test]

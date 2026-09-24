@@ -318,6 +318,12 @@ pub enum RatioEstimate {
         trials: u64,
         /// How many the definition asked for; `1` means "any at all".
         required: u64,
+        /// For a proportion, the successes among those trials: a count, not an estimate,
+        /// carried so that windows too thin to estimate alone can still be *pooled* into
+        /// one that is not (a delivery ratio per distance bin over a whole run). `None` for
+        /// a ratio of sums, which has no successes to count.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        successes: Option<u64>,
     },
     /// A proportion of `successes` among `trials`, with its Wilson score interval.
     Proportion {
@@ -516,6 +522,7 @@ impl Proportion {
             return RatioEstimate::Insufficient {
                 trials: self.trials,
                 required,
+                successes: Some(self.successes),
             };
         }
         let (ci_lo, ci_hi) = wilson_interval(self.successes, self.trials, level);
@@ -547,6 +554,7 @@ impl Proportion {
             return RatioEstimate::Insufficient {
                 trials: clusters,
                 required,
+                successes: None,
             };
         }
         let point = (self.successes as f64) / (self.trials as f64);
@@ -591,6 +599,7 @@ pub fn ratio_of_sums(numerator: f64, denominator: f64, n: u64, min_n: u64) -> Ra
         return RatioEstimate::Insufficient {
             trials: n,
             required,
+            successes: None,
         };
     }
     RatioEstimate::RatioOfSums {
@@ -613,6 +622,12 @@ pub enum DistributionSummary {
         n: u64,
         /// How many the definition asked for.
         required: u64,
+        /// The sum of the samples, reduced over the sorted sample: not an estimate, carried
+        /// so that windows too thin to summarise alone can still be *pooled* into a mean
+        /// that is not (a latency stage per message type over a whole run). `None` for an
+        /// empty sample.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sum: Option<f64>,
     },
     /// The summary.
     Summary {
@@ -837,7 +852,8 @@ impl Distribution {
         let required = min_samples.max(1);
         let n = self.values.len() as u64;
         if n < required {
-            return DistributionSummary::Insufficient { n, required };
+            let sum = (n > 0).then(|| sum_ordered(self.sorted().iter().copied()));
+            return DistributionSummary::Insufficient { n, required, sum };
         }
         let sorted = self.sorted();
         let sum = sum_ordered(sorted.iter().copied());
@@ -929,9 +945,15 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!((ci_lo, ci_hi), wilson_interval(10, 20, ConfidenceLevel::P95));
+        assert_eq!(
+            (ci_lo, ci_hi),
+            wilson_interval(10, 20, ConfidenceLevel::P95)
+        );
         // No cluster at all is no estimate.
-        assert!(p.estimate_clustered(0, 1, ConfidenceLevel::P95).is_insufficient());
+        assert!(
+            p.estimate_clustered(0, 1, ConfidenceLevel::P95)
+                .is_insufficient()
+        );
     }
 
     /// Published Wilson values. Sources: the worked example in Brown, Cai and DasGupta
@@ -1013,7 +1035,8 @@ mod tests {
             p.estimate(30, ConfidenceLevel::P95),
             RatioEstimate::Insufficient {
                 trials: 1,
-                required: 30
+                required: 30,
+                successes: Some(1),
             }
         );
         // …and with the threshold lowered, the same counts do give a point.
@@ -1049,7 +1072,8 @@ mod tests {
                 e,
                 RatioEstimate::Insufficient {
                     trials: 10,
-                    required: 1
+                    required: 1,
+                    successes: None,
                 },
                 "{bad} as a numerator"
             );
@@ -1068,10 +1092,49 @@ mod tests {
     fn an_empty_distribution_is_insufficient_and_never_nan() {
         let d = Distribution::new();
         let s = d.summary(1);
-        assert_eq!(s, DistributionSummary::Insufficient { n: 0, required: 1 });
+        assert_eq!(
+            s,
+            DistributionSummary::Insufficient {
+                n: 0,
+                required: 1,
+                sum: None
+            }
+        );
         assert_eq!(s.mean(), None);
         assert_eq!(s.quantile(Percentile::P95), None);
         assert!(d.mean(1).is_insufficient());
+    }
+
+    /// A thin distribution refuses a summary and still carries its sum, so windows can be
+    /// pooled into a mean over enough samples.
+    #[test]
+    fn a_thin_distribution_carries_its_sum_and_no_summary() {
+        let mut d = Distribution::new();
+        d.observe_all([3.0, 1.0, 2.0]);
+        let s = d.summary(30);
+        assert_eq!(
+            s,
+            DistributionSummary::Insufficient {
+                n: 3,
+                required: 30,
+                sum: Some(6.0)
+            }
+        );
+        assert_eq!(
+            s.mean(),
+            None,
+            "the sum is for pooling, not a reported mean"
+        );
+        let json = serde_json::to_value(DistributionSummary::Insufficient {
+            n: 0,
+            required: 1,
+            sum: None,
+        })
+        .unwrap();
+        assert!(
+            json.get("sum").is_none(),
+            "an empty sample has no sum: {json}"
+        );
     }
 
     /// The hand-computed case: the eight-value sample whose type-7 median is 3.5.

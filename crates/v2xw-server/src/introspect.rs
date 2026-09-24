@@ -51,6 +51,27 @@ pub struct MetricInfo {
     pub base: String,
 }
 
+/// One group of a grouped `metrics.query`: the dimension's value and the metric pooled
+/// over the query's window.
+///
+/// Pooled, not averaged: a proportion pools its successes and trials across windows and
+/// carries the Wilson interval of the pooled count; a ratio of sums pools its two sums; a
+/// distribution's mean is weighted by its sample count. So a bin that saw ten trials in one
+/// window and a thousand in another is not given equal say.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupRow {
+    /// The dimension's value, e.g. `0-20` or `airtime`.
+    pub key: String,
+    /// The pooled value, or `None` when nothing in the window measured it.
+    pub value: Option<f64>,
+    /// The 95 % interval's bounds, for a proportion.
+    pub lo: Option<f64>,
+    /// See [`GroupRow::lo`].
+    pub hi: Option<f64>,
+    /// The samples (trials, observations) behind it.
+    pub n: u64,
+}
+
 /// What [`answer`] needs from the engine that is serving the run.
 ///
 /// Every method that can be unanswerable returns `Option`; see the module header.
@@ -71,6 +92,26 @@ pub trait Introspect: Engine {
         bin: u64,
         limit: usize,
     ) -> Vec<(u64, Option<f64>)>;
+
+    /// One metric's dimensioned samples up to now, pooled over `[from, to]` and grouped by
+    /// the value of `dim`, keeping only samples whose *other* dimensions are exactly
+    /// `filter` — so `latency_stage` grouped by `stage` with `{msg_type: bsm}` is the BSM's
+    /// stages and not every flow's mixed together.
+    ///
+    /// This is how a breakdown a metric does not stream as a series — the delivery ratio
+    /// per distance bin, the latency stage per message type, a per-node figure — reaches a
+    /// client. Empty for an engine that keeps no breakdowns, which is honest: the fixture
+    /// and a replay answer only the headline series.
+    fn metric_groups(
+        &self,
+        _name: &str,
+        _dim: &str,
+        _filter: &std::collections::BTreeMap<String, String>,
+        _from: u64,
+        _to: u64,
+    ) -> Vec<GroupRow> {
+        Vec::new()
+    }
 
     /// The provenance chain every answer cites (§3.8, §6.9).
     fn provenance_chain(&self) -> Vec<Value>;
@@ -314,11 +355,17 @@ pub fn answer<E: Introspect + ?Sized>(engine: &mut E, query: &Query) -> Result<V
             t_to_ns,
             bin_ns,
             group_by,
+            filter,
             limit,
         } => {
             let catalogue = engine.metric_catalogue();
+            // A grouped query names the metric itself (`latency_stage`), which is the base
+            // of the catalogue's breakdown series (`latency_stage[airtime]`) and may have
+            // no series of its own name.
+            let grouped = group_by.iter().any(|d| d.as_str() != "t");
+            let known = |row: &MetricInfo, m: &str| row.name == m || (grouped && row.base == m);
             for m in metrics {
-                if !catalogue.iter().any(|row| &row.name == m) {
+                if !catalogue.iter().any(|row| known(row, m)) {
                     return Err(ServerError::UnknownMetric {
                         metric: m.clone(),
                         did_you_mean: near_misses(&catalogue, m),
@@ -327,6 +374,66 @@ pub fn answer<E: Introspect + ?Sized>(engine: &mut E, query: &Query) -> Result<V
             }
             let from = t_from_ns.unwrap_or(0);
             let to = t_to_ns.unwrap_or(now).max(from);
+            // Grouped by a dimension other than time: one row per value of it, each metric
+            // pooled over the window (`GroupRow`), with its interval and its sample count.
+            if let Some(dim) = group_by.iter().find(|d| d.as_str() != "t") {
+                let mut columns =
+                    vec![json!({"name": dim, "type": "string", "visibility": "META"})];
+                let mut keys: Vec<String> = Vec::new();
+                let mut per_metric: Vec<Vec<GroupRow>> = Vec::with_capacity(metrics.len());
+                for m in metrics {
+                    let row = catalogue
+                        .iter()
+                        .find(|row| known(row, m))
+                        .expect("checked above");
+                    for (suffix, ty, unit) in [
+                        ("", "float", row.unit.as_str()),
+                        (".lo", "float", row.unit.as_str()),
+                        (".hi", "float", row.unit.as_str()),
+                        (".n", "int", "count"),
+                    ] {
+                        columns.push(json!({"name": format!("{m}{suffix}"), "type": ty,
+                                            "unit": unit, "visibility": row.visibility}));
+                    }
+                    let groups = engine.metric_groups(m, dim, filter, from, to);
+                    for g in &groups {
+                        if !keys.contains(&g.key) {
+                            keys.push(g.key.clone());
+                        }
+                    }
+                    per_metric.push(groups);
+                }
+                keys.sort_by(|a, b| group_order(a).cmp(&group_order(b)).then_with(|| a.cmp(b)));
+                let q = |v: Option<f64>| v.map_or(Value::Null, |v| json!(math::quantize(v, 6)));
+                let rows: Vec<Value> = keys
+                    .iter()
+                    .take(*limit)
+                    .map(|k| {
+                        let mut row = vec![json!(k)];
+                        for groups in &per_metric {
+                            match groups.iter().find(|g| &g.key == k) {
+                                Some(g) => {
+                                    row.push(q(g.value));
+                                    row.push(q(g.lo));
+                                    row.push(q(g.hi));
+                                    row.push(json!(g.n));
+                                }
+                                None => {
+                                    row.extend([Value::Null, Value::Null, Value::Null, json!(0)])
+                                }
+                            }
+                        }
+                        Value::Array(row)
+                    })
+                    .collect();
+                return Ok(json!({
+                    "columns": columns,
+                    "rows": rows,
+                    "truncated": keys.len() > *limit,
+                    "provenance": relevant_chain(engine.provenance_chain(), "metric"),
+                    "group_by": group_by,
+                }));
+            }
             let bin = (*bin_ns).max(1);
             let mut columns = vec![json!({"name": "t_ns", "type": "time_ns", "unit": "ns",
                                           "visibility": "META"})];
@@ -396,6 +503,17 @@ pub fn answer<E: Introspect + ?Sized>(engine: &mut E, query: &Query) -> Result<V
         export @ (Query::ExportDataset { .. } | Query::ExportRecording { .. }) => {
             engine.export(export)
         }
+    }
+}
+
+/// The order a group key sorts in: a range label (`20-40`, `1000+`) by its lower bound, a
+/// node index by its number, and anything else after them, by name. A lexical sort would
+/// put `100-120` before `20-40` on a distance axis.
+fn group_order(key: &str) -> (u8, u64) {
+    let lead: String = key.chars().take_while(char::is_ascii_digit).collect();
+    match lead.parse::<u64>() {
+        Ok(n) => (0, n),
+        Err(_) => (1, 0),
     }
 }
 

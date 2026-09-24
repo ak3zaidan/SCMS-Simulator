@@ -93,6 +93,8 @@ pub struct AwarenessProvider {
     delivery_by_bin: BTreeMap<usize, Proportion>,
     delivery_unbinned: Proportion,
     delivery_all: Proportion,
+    /// Delivery outcomes per receiving node, for a per-node ranking.
+    delivery_by_node: BTreeMap<NodeId, Proportion>,
     /// The kinematics instant being assembled, and the last instant `nar` was sampled at.
     frame_t: Option<SimTime>,
     nar_sampled_at: Option<SimTime>,
@@ -125,6 +127,7 @@ impl AwarenessProvider {
             delivery_by_bin: BTreeMap::new(),
             delivery_unbinned: Proportion::new(),
             delivery_all: Proportion::new(),
+            delivery_by_node: BTreeMap::new(),
             frame_t: None,
             nar_sampled_at: None,
             nar_window: [Proportion::new(); 2],
@@ -318,7 +321,7 @@ impl AwarenessProvider {
                  the signature check. With no dimension over every distance; `dist_bin` in \
                  50 m bins out to 1 km.",
             )
-            .with_dims([Dim::T, Dim::DistBin])
+            .with_dims([Dim::T, Dim::DistBin, Dim::Node])
             .with_breakdown(
                 Dim::DistBin,
                 (0..self.bins.len()).map(|i| self.bins.label(i)),
@@ -344,6 +347,10 @@ impl AwarenessProvider {
         }
         let delivered = v.outcome == RxFate::Delivered;
         self.delivery_all.observe(delivered);
+        self.delivery_by_node
+            .entry(v.rx)
+            .or_default()
+            .observe(delivered);
         match v.dist_m.and_then(|d| self.bins.index_of(d)) {
             Some(bin) => self
                 .delivery_by_bin
@@ -593,6 +600,18 @@ impl MetricProvider for AwarenessProvider {
                 SampleValue::Ratio(p.estimate(self.min_samples, self.level)),
             ));
         }
+        // Per receiving node, for a ranking of the worst-served receivers. Reported with the
+        // same insufficiency rule, so a node with two attempts says so rather than ranking.
+        for (node, p) in core::mem::take(&mut self.delivery_by_node) {
+            let mut dims = Dims::new();
+            dims.insert(Dim::Node, DimValue::index(u64::from(node.index())));
+            out.push(MetricSample::new(
+                &dr,
+                at,
+                dims,
+                SampleValue::Ratio(p.estimate(self.min_samples, self.level)),
+            ));
+        }
         let unbinned = core::mem::replace(&mut self.delivery_unbinned, Proportion::new());
         if unbinned.trials() > 0 {
             let mut dims = Dims::new();
@@ -759,7 +778,9 @@ mod tests {
         let s = p.flush(1_000 * NS_PER_MS);
         let nar = s
             .iter()
-            .find(|x| x.metric == "nar" && x.dims.get(&Dim::Radius) == Some(&DimValue::label("100m")))
+            .find(|x| {
+                x.metric == "nar" && x.dims.get(&Dim::Radius) == Some(&DimValue::label("100m"))
+            })
             .unwrap();
         assert!(!nar.value.is_insufficient(), "{:?}", nar.value);
         assert_eq!(nar.value.point(), Some(0.5));
@@ -803,5 +824,26 @@ mod tests {
             point(&s, "delivery_ratio", &[(Dim::DistBin, "450-500")]),
             Some(0.0)
         );
+    }
+
+    /// Each receiver's own delivery ratio is reported by node, so a page can rank the
+    /// worst-served receivers; the pooled ratio is unchanged by the split.
+    #[test]
+    fn delivery_ratio_is_reported_per_receiving_node() {
+        let mut p = AwarenessProvider::new(0).with_min_samples(1);
+        p.on_event(&delivered(1, 2, 0, NS_PER_MS, 20.0));
+        p.on_event(&lost(1, 3, NS_PER_MS, 30.0));
+        p.on_event(&delivered(4, 2, 0, NS_PER_MS, 20.0));
+        let s = p.flush(NS_PER_MS * 10);
+        let by_node: Vec<(u64, f64)> = s
+            .iter()
+            .filter(|x| x.metric == "delivery_ratio")
+            .filter_map(|x| match (x.dims.len(), x.dims.get(&Dim::Node)) {
+                (1, Some(DimValue::Index(n))) => Some((*n, x.value.point()?)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(by_node, vec![(1, 0.5), (4, 1.0)]);
+        assert!((point(&s, "delivery_ratio", &[]).unwrap() - 2.0 / 3.0).abs() < 1e-3);
     }
 }

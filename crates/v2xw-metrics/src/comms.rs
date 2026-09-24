@@ -843,6 +843,7 @@ impl MetricProvider for CommsProvider {
                 None => crate::stats::RatioEstimate::Insufficient {
                     trials: deliveries,
                     required: 1,
+                    successes: None,
                 },
             }),
         ));
@@ -1009,8 +1010,14 @@ mod tests {
             p.on_event(&rx(3, 4, 30.0, ok, 1_000_000 * (i as u64 + 1)));
         }
         let s = p.flush(1_000_000_000);
-        assert_eq!(sample(&s, "pdr_all_pairs|dist_bin=0-25").value.point(), Some(0.75));
-        assert_eq!(sample(&s, "pdr_all_pairs|dist_bin=25-50").value.point(), Some(0.25));
+        assert_eq!(
+            sample(&s, "pdr_all_pairs|dist_bin=0-25").value.point(),
+            Some(0.75)
+        );
+        assert_eq!(
+            sample(&s, "pdr_all_pairs|dist_bin=25-50").value.point(),
+            Some(0.25)
+        );
         // Overall: 4 of 8.
         assert_eq!(sample(&s, "pdr_all_pairs").value.point(), Some(0.5));
         assert_eq!(sample(&s, "pdr_all_pairs").value.n(), 8);
@@ -1058,7 +1065,10 @@ mod tests {
             json!({"t_start":0,"t_end":10,"tx":1,"rx":2,"outcome":"ok"}),
         ));
         let s = p.flush(1_000_000_000);
-        assert_eq!(sample(&s, "pdr_all_pairs|dist_bin=unbinned").value.point(), Some(1.0));
+        assert_eq!(
+            sample(&s, "pdr_all_pairs|dist_bin=unbinned").value.point(),
+            Some(1.0)
+        );
         assert_eq!(sample(&s, "pdr_all_pairs").value.n(), 1);
     }
 
@@ -1266,7 +1276,12 @@ mod tests {
     #[test]
     fn pdr_is_the_3gpp_reception_ratio_over_the_census() {
         let mut p = CommsProvider::new(0).with_min_samples(1);
-        p.on_event(&census(json!([[0, 4, 3], [4, 2, 1], [14, 5, 0], [20, 10, 1]])));
+        p.on_event(&census(json!([
+            [0, 4, 3],
+            [4, 2, 1],
+            [14, 5, 0],
+            [20, 10, 1]
+        ])));
         let s = p.flush(1_000_000_000);
         // Ratios are written on the 1e-4 grid (D9).
         let headline = &sample(&s, "pdr").value;

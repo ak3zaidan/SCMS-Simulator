@@ -411,3 +411,137 @@ fn every_channel_the_kernel_emits_is_projected_or_reported() {
         );
     }
 }
+
+/// A grouped `metrics.query` answers the breakdowns the stream does not carry as series:
+/// the delivery ratio per distance bin, the latency stages of one message type, and a
+/// per-node figure — each pooled over the run, with its interval and its sample count.
+#[test]
+fn a_grouped_metrics_query_answers_the_breakdowns_the_stream_does_not_carry() {
+    use v2xw_server::engine::Query;
+    let path = scenario(
+        "grouped",
+        &[
+            ("duration_s: 60.0", "duration_s: 20.0"),
+            ("rate_veh_per_h: 30.0", "rate_veh_per_h: 6000.0"),
+            ("metrics: [pdr]", "metrics: [all]"),
+        ],
+    );
+    let mut engine = LiveEngine::open(&path, options()).expect("build");
+    let _ = drain(&mut engine);
+
+    let mut grouped = |metric: &str, by: &str, filter: &[(&str, &str)]| {
+        let answer = engine
+            .query(&Query::Metrics {
+                metrics: vec![metric.to_string()],
+                t_from_ns: None,
+                t_to_ns: None,
+                bin_ns: 1_000_000_000,
+                group_by: vec![by.to_string()],
+                filter: filter
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                limit: 10_000,
+            })
+            .expect("grouped query");
+        let columns: Vec<String> = answer["columns"]
+            .as_array()
+            .expect("columns")
+            .iter()
+            .map(|c| c["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            columns,
+            vec![
+                by.to_string(),
+                metric.to_string(),
+                format!("{metric}.lo"),
+                format!("{metric}.hi"),
+                format!("{metric}.n"),
+            ]
+        );
+        answer["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| {
+                (
+                    r[0].as_str().expect("key").to_string(),
+                    r[1].as_f64(),
+                    r[2].as_f64(),
+                    r[3].as_f64(),
+                    r[4].as_u64().expect("n"),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // Delivery by distance, on the axis's own order: `100-120` after `20-40`, not before.
+    let by_distance = grouped("pdr", "dist_bin", &[]);
+    assert!(
+        by_distance.len() > 3,
+        "a 20 s grid run at 6,000 veh/h has receptions across several 20 m bins: {by_distance:?}"
+    );
+    let lower = |k: &str| -> u64 {
+        k.split(['-', '+'])
+            .next()
+            .unwrap_or_default()
+            .parse()
+            .expect("a range label")
+    };
+    for pair in by_distance.windows(2) {
+        assert!(
+            lower(&pair[0].0) < lower(&pair[1].0),
+            "out of order: {pair:?}"
+        );
+    }
+    // A bin still under the metric's sample floor once pooled carries its count and no
+    // value; the others carry a point inside its interval.
+    for (key, value, lo, hi, n) in &by_distance {
+        assert!(*n > 0, "{key}: a bin with no trials is not a row");
+        let Some(v) = *value else {
+            assert!(
+                lo.is_none() && hi.is_none(),
+                "{key}: an interval with no point"
+            );
+            continue;
+        };
+        let (lo, hi) = (lo.expect("lo"), hi.expect("hi"));
+        assert!((0.0..=1.0).contains(&v), "{key}: {v}");
+        assert!(lo <= v && v <= hi, "{key}: {lo} <= {v} <= {hi}");
+    }
+    assert!(
+        by_distance.iter().filter(|r| r.1.is_some()).count() > 3,
+        "{by_distance:?}"
+    );
+
+    // The BSM's latency stages, and nothing from another type: the stacked bars add up to
+    // the BSM's own end-to-end mean.
+    let stages = grouped("latency_stage", "stage", &[("msg_type", "bsm")]);
+    assert!(!stages.is_empty(), "the BSM's delay has stages");
+    let e2e = grouped("e2e_latency", "msg_type", &[]);
+    let bsm = e2e
+        .iter()
+        .find(|r| r.0 == "bsm")
+        .expect("a BSM end-to-end row");
+    let stacked: f64 = stages.iter().filter_map(|r| r.1).sum();
+    let total = bsm
+        .1
+        .unwrap_or_else(|| panic!("no BSM e2e mean: {e2e:?}; stages {stages:?}"));
+    assert!(
+        (stacked - total).abs() <= 1e-3 * total.max(1.0),
+        "the BSM's stages stack to {stacked} ms against an end-to-end mean of {total} ms"
+    );
+    assert!(
+        grouped("latency_stage", "stage", &[("msg_type", "no-such-type")]).is_empty(),
+        "a `where` that matches nothing must answer nothing, not everything"
+    );
+
+    // A per-node ranking: every receiver's own delivery ratio.
+    let by_node = grouped("delivery_ratio", "node", &[]);
+    assert!(by_node.len() > 1, "{by_node:?}");
+    for pair in by_node.windows(2) {
+        let (a, b): (u64, u64) = (pair[0].0.parse().unwrap(), pair[1].0.parse().unwrap());
+        assert!(a < b, "node rows sort by number: {pair:?}");
+    }
+}
