@@ -15,6 +15,7 @@
 //! | The content hash (invariant I-W2) | [`hash`] | 03-interfaces.md §2 |
 //! | The procedural generators: grid, radial, random | [`procedural`] | 04-models.md §1.2 |
 //! | The OpenStreetMap importer | [`osm`] | 04-models.md §1.2, §1.3 |
+//! | Drivable path geometry: corners rounded into arcs | [`curve`] | AASHTO Green Book 2018 §9.5, Table 2-2 |
 //! | The SUMO `net.xml` and OpenDRIVE importers | [`sumo`] | 04-models.md §1.1, §1.2 |
 //! | The DEM importers, and draping geometry onto one | [`dem`] | 04-models.md §1.4 |
 //! | Line of sight over terrain | [`los`] | 04-models.md §1.4, §3.5 |
@@ -65,6 +66,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod curve;
 pub mod dem;
 pub mod error;
 pub mod hash;

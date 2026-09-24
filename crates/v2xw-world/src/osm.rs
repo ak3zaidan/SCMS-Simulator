@@ -489,6 +489,13 @@ pub struct ImportCounts {
     /// Lanes whose centreline crossed itself after offsetting and had to be repaired
     /// (R1).
     pub lanes_repaired: u64,
+    /// Signalised movements given a permissive rather than a protected green because they
+    /// cross another lane of their own approach inside the junction, which no phase can
+    /// separate (see `synthesise_signals`).
+    pub signal_movements_made_permissive: u64,
+    /// Lane ends pulled back from a junction to give a turn room for the design radius
+    /// ([`TURN_DESIGN_RADIUS_M`]), counted once per lane per pull.
+    pub lane_ends_pulled_back: u64,
     /// Driving lanes shorter than [`OsmOptions::min_useful_lane_m`] (V8).
     pub short_driving_lanes: u64,
     /// Connections in the world (each movement appears twice: see [`Connection`]).
@@ -887,17 +894,34 @@ pub struct SignalDefaults {
     pub green_s: f64,
     /// Shortest green a stretched phase may be reduced to, seconds.
     pub min_green_s: f64,
-    /// All-red between phases, seconds. netconvert `--tls.allred.time`, default 0.
+    /// The shortest all-red (red clearance) between phases, seconds.
+    ///
+    /// The all-red itself is computed per phase by the ITE formula (see
+    /// [`SignalDefaults::red_clearance_vehicle_length_m`]); this is a floor under it.
+    /// netconvert's `--tls.allred.time` default is 0, which is what the floor defaults to.
     pub all_red_s: f64,
     /// Deceleration used for the amber time, m/s². netconvert `--tls.yellow.min-decel`,
-    /// default 3.
+    /// default 3; ITE (2020) uses 10 ft/s² (3.05 m/s²), so 3 gives the marginally longer
+    /// amber.
     pub yellow_min_decel_mps2: f64,
-    /// Driver reaction time in the ITE amber formula `y = t + v / (2a)`, seconds.
+    /// Driver perception-reaction time in the ITE amber formula, seconds: 1.0 s (ITE,
+    /// *Guidelines for Determining Traffic Signal Change and Clearance Intervals*, 2020).
     pub yellow_reaction_s: f64,
-    /// Lower clamp on the computed amber, seconds (FHWA guidance 3–6 s).
+    /// Lower clamp on the computed amber, seconds: MUTCD 2009 §4D.26 guidance, a yellow
+    /// change interval of about 3 to 6 s.
     pub yellow_min_s: f64,
-    /// Upper clamp on the computed amber, seconds.
+    /// Upper clamp on the computed amber, seconds (MUTCD 2009 §4D.26, 6 s).
     pub yellow_max_s: f64,
+    /// Whether each phase ends in an all-red computed by the ITE red-clearance formula
+    /// `r = (W + L) / v`. Off, the all-red is [`SignalDefaults::all_red_s`] flat, which is
+    /// netconvert's behaviour.
+    pub ite_red_clearance: bool,
+    /// `L` in the red-clearance formula: the length of the vehicle that must clear,
+    /// metres. ITE (2020) uses 20 ft (6.1 m), a passenger car.
+    pub red_clearance_vehicle_length_m: f64,
+    /// Upper bound on the computed all-red, seconds: MUTCD 2009 §4D.26 — "the duration of
+    /// a red clearance interval shall not exceed 6 seconds" (bar the exceptions it lists).
+    pub red_clearance_max_s: f64,
     /// Height of a signal lantern above the road surface, metres.
     pub head_height_m: f64,
 }
@@ -913,6 +937,9 @@ impl Default for SignalDefaults {
             yellow_reaction_s: 1.0,
             yellow_min_s: 3.0,
             yellow_max_s: 6.0,
+            ite_red_clearance: true,
+            red_clearance_vehicle_length_m: 6.1,
+            red_clearance_max_s: 6.0,
             head_height_m: 5.0,
         }
     }
@@ -3400,8 +3427,21 @@ const MAX_SOFT_JUNCTION_RADIUS_M: f64 = 5.0;
 /// graph, whereas dropping it disconnects whatever was on the other side.
 const MIN_KEPT_LANE_M: f64 = 0.2;
 
-/// How many points a turning connector is sampled at.
-const TURN_SAMPLES: usize = 7;
+/// The shortest segment a motor lane keeps inside it, metres: a shorter one is merged into
+/// its neighbour ([`crate::curve::drop_short_segments`]).
+///
+/// **This importer's choice**: half a metre is far below any feature of a road's plan
+/// (OpenStreetMap mapping guidance puts nodes metres apart on a curve) and far above the
+/// millimetre position grid, on which a shorter segment's direction is noise.
+const MIN_LANE_SEGMENT_M: f64 = 0.5;
+
+/// The largest radius a motor lane's corners are rounded to, metres.
+///
+/// **This importer's choice**: a vertex of an OSM way is a sampled curve, and a 50 m arc
+/// rounds a gentle mapped bend while moving the lane only centimetres off the mapped line
+/// (a 10° vertex rounded at 50 m sits 19 cm inside it). A sharp vertex gets the largest
+/// arc its two segments leave room for, whatever this cap.
+const LANE_FILLET_MAX_RADIUS_M: f64 = 50.0;
 
 /// The horizontal length of a polyline, metres.
 fn polyline_length(points: &[Vec3]) -> f64 {
@@ -3653,9 +3693,21 @@ fn segment_crossing(p: Vec3, p2: Vec3, q: Vec3, q2: Vec3) -> Option<Vec3> {
 /// A junction connector from `(start, heading_in)` to `(end, heading_out)`.
 ///
 /// A movement whose two tangents are nearly collinear and whose endpoints lie on that line
-/// becomes a straight two-point lane; anything else becomes a quadratic Bézier through the
-/// point where the two tangent lines meet, sampled at [`TURN_SAMPLES`] points. Polynomial
-/// arithmetic only, so a turn's geometry is bit-identical on every platform.
+/// becomes a straight two-point lane. A turn is the **simple curve** of the AASHTO Green
+/// Book (2018, §9.5): the corner where the approach's and the departure's tangent lines
+/// meet, rounded by [`crate::curve::fillet_polyline`] into the largest circular arc that
+/// fits between the two lane ends — tangent to the approach at one end and to the
+/// departure at the other, so the heading is continuous through both joins.
+///
+/// This replaced a quadratic Bézier through the same corner. With unequal legs — the
+/// common case where an avenue's kerb lane turns into a side street — a Bézier's
+/// curvature piles up at its shorter end: a 95° right turn at Manhattan junction 379 had a
+/// 3 m radius at its exit where the arc through the same corner has the whole shorter leg
+/// to turn in. A connector between two parallel but laterally offset lanes (a lane drop,
+/// a skewed crossing) is a reverse curve: the polygon out along the approach heading a
+/// third of the chord and in along the departure heading a third of the chord, rounded.
+/// Polynomial arithmetic and [`v2xw_core::math`], so a turn's geometry is bit-identical on
+/// every platform.
 fn connector_geometry(start: Vec3, heading_in: f64, end: Vec3, heading_out: f64) -> Vec<Vec3> {
     let turn = normalise_angle(heading_out - heading_in);
     let (sin_in, cos_in) = math::sin_cos(heading_in);
@@ -3663,11 +3715,11 @@ fn connector_geometry(start: Vec3, heading_in: f64, end: Vec3, heading_out: f64)
     let chord = end - start;
     // How far the end lies off the approach's own line: a straight connector between two
     // parallel but laterally offset lanes would meet both at an angle, so it takes the
-    // S-shaped cubic instead.
+    // reverse curve instead.
     let offset = (chord.x * sin_in - chord.y * cos_in).abs();
     if turn.abs() < 1e-3 {
         if offset > 0.05 {
-            return cubic_connector(start, heading_in, end, heading_out);
+            return reverse_curve_connector(start, heading_in, end, heading_out);
         }
         return vec![start, end];
     }
@@ -3675,7 +3727,7 @@ fn connector_geometry(start: Vec3, heading_in: f64, end: Vec3, heading_out: f64)
     let denominator = cos_in * sin_out - sin_in * cos_out;
     if denominator.abs() < 1e-9 {
         if offset > 0.05 {
-            return cubic_connector(start, heading_in, end, heading_out);
+            return reverse_curve_connector(start, heading_in, end, heading_out);
         }
         return vec![start, end];
     }
@@ -3684,53 +3736,43 @@ fn connector_geometry(start: Vec3, heading_in: f64, end: Vec3, heading_out: f64)
     // The tangent lines must meet *between* the two ends: ahead of the start along the
     // approach heading and behind the end along the departure heading, and not far out of
     // the junction. A meeting point beyond the end — two nearly parallel lanes offset
-    // sideways, the commonest case on an avenue where a lane is dropped — made the
-    // quadratic run past the end and double back on itself: a 40 m connector across a
-    // 13 m junction with a 180° heading reversal in it, which the traffic auditor found as
-    // vehicles reversing inside junctions and overlapping on one lane. Those take the
-    // tangent-continuous cubic instead.
+    // sideways, the commonest case on an avenue where a lane is dropped — would turn the
+    // corner the wrong way round; those take the reverse curve instead.
     let v = (end.x - control.x) * cos_out + (end.y - control.y) * sin_out;
     let reach = 2.0 * chord.norm_2d() + 1.0;
     if !control.is_finite() || u <= 0.0 || v <= 0.0 || u > reach || v > reach {
-        return cubic_connector(start, heading_in, end, heading_out);
+        return reverse_curve_connector(start, heading_in, end, heading_out);
     }
-    (0..TURN_SAMPLES)
-        .map(|i| {
-            let t = i as f64 / (TURN_SAMPLES - 1) as f64;
-            let w = 1.0 - t;
-            Vec3::new(
-                w * w * start.x + 2.0 * w * t * control.x + t * t * end.x,
-                w * w * start.y + 2.0 * w * t * control.y + t * t * end.y,
-                w * w * start.z + 2.0 * w * t * control.z + t * t * end.z,
-            )
-        })
-        .collect()
+    let control = Vec3::new(control.x, control.y, start.z + (end.z - start.z) * u / (u + v));
+    crate::curve::fillet_polyline(&[start, control, end], f64::INFINITY)
 }
 
-/// A tangent-continuous cubic Bézier from `(start, heading_in)` to `(end, heading_out)`,
-/// with both handles a third of the chord long — the Hermite curve with the chord's own
-/// speed, which leaves along the approach heading, arrives along the departure heading
-/// and never overshoots either end. Used where the quadratic's tangent intersection lies
-/// outside the junction; a pair of exactly parallel, exactly collinear ends stays a
-/// straight two-point lane.
-fn cubic_connector(start: Vec3, heading_in: f64, end: Vec3, heading_out: f64) -> Vec<Vec3> {
+/// A tangent-continuous reverse curve from `(start, heading_in)` to `(end, heading_out)`:
+/// out along the approach heading a third of the chord, in along the departure heading a
+/// third of the chord, and the two corners of that polygon rounded into arcs
+/// ([`crate::curve::fillet_polyline`]). It leaves along the approach heading, arrives along
+/// the departure heading, and never overshoots either end. Used where the corner of the
+/// two tangent lines lies outside the junction — two parallel lanes offset sideways.
+fn reverse_curve_connector(
+    start: Vec3,
+    heading_in: f64,
+    end: Vec3,
+    heading_out: f64,
+) -> Vec<Vec3> {
     let (sin_in, cos_in) = math::sin_cos(heading_in);
     let (sin_out, cos_out) = math::sin_cos(heading_out);
     let k = start.distance_2d(end) / 3.0;
-    let p1 = Vec3::new(start.x + cos_in * k, start.y + sin_in * k, start.z);
-    let p2 = Vec3::new(end.x - cos_out * k, end.y - sin_out * k, end.z);
-    (0..TURN_SAMPLES)
-        .map(|i| {
-            let t = i as f64 / (TURN_SAMPLES - 1) as f64;
-            let w = 1.0 - t;
-            let (b0, b1, b2, b3) = (w * w * w, 3.0 * w * w * t, 3.0 * w * t * t, t * t * t);
-            Vec3::new(
-                b0 * start.x + b1 * p1.x + b2 * p2.x + b3 * end.x,
-                b0 * start.y + b1 * p1.y + b2 * p2.y + b3 * end.y,
-                b0 * start.z + b1 * p1.z + b2 * p2.z + b3 * end.z,
-            )
-        })
-        .collect()
+    let p1 = Vec3::new(
+        start.x + cos_in * k,
+        start.y + sin_in * k,
+        start.z + (end.z - start.z) / 3.0,
+    );
+    let p2 = Vec3::new(
+        end.x - cos_out * k,
+        end.y - sin_out * k,
+        start.z + (end.z - start.z) * 2.0 / 3.0,
+    );
+    crate::curve::fillet_polyline(&[start, p1, p2, end], f64::INFINITY)
 }
 
 /// The counter-clockwise convex hull of `points`, closed (the last point repeats the
@@ -4098,6 +4140,16 @@ fn build_network(
                 let offset = -(half_width - (f64::from(k) + 0.5) * plan.lane_width_m);
                 let (offset_points, repaired) = offset_polyline(geometry, offset);
                 let mut centreline = dedupe_points(offset_points);
+                // A motor lane is a path a vehicle drives: its corners are rounded into
+                // arcs, so its heading is continuous (see `crate::curve`), and a noisy
+                // millimetre segment left at either end by the trim is merged first, so the
+                // end heading its connectors are built tangent to is the road's.
+                if plan.family == WayFamily::Motor {
+                    centreline = crate::curve::fillet_polyline(
+                        &crate::curve::drop_short_segments(&centreline, MIN_LANE_SEGMENT_M),
+                        LANE_FILLET_MAX_RADIUS_M,
+                    );
+                }
                 // A tunnel runs below ground. Flat at z = 0 it ran *through* the buildings
                 // above it — the FDR Drive under the United Nations, the Park Avenue, 1st
                 // Avenue and Queens-Midtown tunnels — and every vehicle in one was drawn
@@ -4376,8 +4428,19 @@ fn fit_trim(
 ///    movement ([`turn_matches`]). Where it does not, the geometric rule applies: right
 ///    turns from the rightmost lane, left turns and U-turns from the leftmost, everything
 ///    else from any lane ([`lanes_for_turn`]).
-/// 4. Any approach lane left with no movement at all is given the straightest candidate,
+/// 4. **At a fork** — two or more departures that are all "straight on" from one approach
+///    — the approach lanes that could take any of them are shared out in order: the
+///    rightmost lanes to the rightmost branch, in proportion to each branch's lane count
+///    ([`fork_assignment`]). Letting every lane take every branch crossed the lane paths
+///    inside the junction (lane 0 to the left branch while lane 3 went to the right one),
+///    and because both are "straight" the signal plan gave the crossing pair the same
+///    protected green: 19 conflicting greens on the Manhattan extract.
+/// 5. Any approach lane left with no movement at all is given the straightest candidate,
 ///    so that a lane is never a dead end because of a tag.
+/// 6. **Room to turn.** Every movement's approach lane end and departure lane start are
+///    pulled back from the junction, as far as needed and as far as the lanes allow, until
+///    the arc between them can have the design radius [`TURN_DESIGN_RADIUS_M`]
+///    ([`pull_back_for_turns`]). Only then are the connectors built.
 ///
 /// A movement whose two lane ends are within a millimetre of each other — which happens
 /// when a segment was too short to trim — gets no connector lane, because [`Lane::new`]
@@ -4407,6 +4470,7 @@ fn build_movements(
         let internal_edge = EdgeId::new(net.edges.len() as u32);
         let mut movements: Vec<Movement> = Vec::new();
         let mut internal_lanes: Vec<LaneId> = Vec::new();
+        let mut requests: Vec<MovementRequest<'_>> = Vec::new();
 
         for &a in &approaches {
             let approach = net.edge_info[a].clone();
@@ -4438,10 +4502,20 @@ fn build_movements(
                 continue;
             }
 
-            let permits = |k: usize, turn: TurnDirection| -> bool {
+            let tagged_or_geometric = |k: usize, turn: TurnDirection| -> bool {
                 match approach.turns.as_ref().and_then(|t| t.get(k)) {
                     Some(set) if !set.is_empty() => set.iter().any(|t| turn_matches(*t, turn)),
                     _ => lanes_for_turn(turn, in_lanes.len()).contains(&k),
+                }
+            };
+            let fork = fork_assignment(net, &candidates, in_lanes.len(), &tagged_or_geometric);
+            let permits = |k: usize, b: usize, turn: TurnDirection| -> bool {
+                if !tagged_or_geometric(k, turn) {
+                    return false;
+                }
+                match fork.as_ref().and_then(|f| f.get(k).copied().flatten()) {
+                    Some(assigned) if is_through(turn) => assigned == b,
+                    _ => true,
                 }
             };
             for (k, &from_lane) in in_lanes.iter().enumerate() {
@@ -4450,36 +4524,28 @@ fn build_movements(
                 for &(b, turn, _) in &candidates {
                     let departure = &net.edge_info[b];
                     let out_lanes = departure.lanes.len();
-                    if !permits(k, turn) {
+                    if !permits(k, b, turn) {
                         continue;
                     }
-                    let sharing: Vec<usize> =
-                        (0..in_lanes.len()).filter(|j| permits(*j, turn)).collect();
+                    let sharing: Vec<usize> = (0..in_lanes.len())
+                        .filter(|j| permits(*j, b, turn))
+                        .collect();
                     let to_lane = departure.lanes[target_lane(turn, k, &sharing, out_lanes)];
                     if seen.contains(&to_lane) {
                         continue;
                     }
                     seen.push(to_lane);
                     made += 1;
-                    add_movement(
-                        net,
-                        &mut movements,
-                        &mut internal_lanes,
-                        &mut direct,
-                        report,
-                        internal_edge,
-                        j,
-                        MovementRequest {
-                            from_lane,
-                            to_lane,
-                            turn,
-                            approach_heading,
-                            from_edge: a,
-                            to_edge: b,
-                            plan: approach.plan,
-                            plans,
-                        },
-                    );
+                    requests.push(MovementRequest {
+                        from_lane,
+                        to_lane,
+                        turn,
+                        approach_heading,
+                        from_edge: a,
+                        to_edge: b,
+                        plan: approach.plan,
+                        plans,
+                    });
                 }
                 if made == 0 {
                     // Give the lane the straightest candidate rather than leave it a dead
@@ -4492,28 +4558,37 @@ fn build_movements(
                         let departure = &net.edge_info[b];
                         let to_lane =
                             departure.lanes[target_lane(turn, k, &[k], departure.lanes.len())];
-                        add_movement(
-                            net,
-                            &mut movements,
-                            &mut internal_lanes,
-                            &mut direct,
-                            report,
-                            internal_edge,
-                            j,
-                            MovementRequest {
-                                from_lane,
-                                to_lane,
-                                turn,
-                                approach_heading,
-                                from_edge: a,
-                                to_edge: b,
-                                plan: approach.plan,
-                                plans,
-                            },
-                        );
+                        requests.push(MovementRequest {
+                            from_lane,
+                            to_lane,
+                            turn,
+                            approach_heading,
+                            from_edge: a,
+                            to_edge: b,
+                            plan: approach.plan,
+                            plans,
+                        });
                     }
                 }
             }
+        }
+
+        pull_back_for_turns(net, j, &requests, report);
+        for mut request in requests {
+            // The approach heading is re-read: pulling a lane end back along a curve turns
+            // it a little, and the priority and phase rules should see the lane as built.
+            let lane = &net.lanes[net.edge_info[request.from_edge].lanes[0].as_usize()];
+            request.approach_heading = lane.heading_at(lane.length_m);
+            add_movement(
+                net,
+                &mut movements,
+                &mut internal_lanes,
+                &mut direct,
+                report,
+                internal_edge,
+                j,
+                request,
+            );
         }
 
         if !internal_lanes.is_empty() {
@@ -4530,6 +4605,210 @@ fn build_movements(
         net.movements[j] = movements;
     }
     direct
+}
+
+/// True for the "straight on" family of turns — straight, slight left, slight right — that
+/// a fork's branches all belong to.
+fn is_through(turn: TurnDirection) -> bool {
+    matches!(
+        turn,
+        TurnDirection::Straight | TurnDirection::SlightLeft | TurnDirection::SlightRight
+    )
+}
+
+/// At a fork, which branch each approach lane takes: `Some(assignment)` indexed by approach
+/// lane (rightmost first), each entry the departure edge that lane's through movement goes
+/// to, or `None` for a lane that is not shared out; `None` overall when the approach is not
+/// a fork.
+///
+/// A fork is two or more candidate departures in the through family ([`is_through`]).
+/// The lanes shared out are the ones `permits` lets take *every* branch; a lane a tag
+/// already restricts keeps its tag. The branches are ordered right to left by the heading
+/// change into them, the lanes right to left by index, and each branch gets a contiguous
+/// block of lanes in proportion to its own lane count — the way a fork's lanes are marked,
+/// and what keeps two lane paths from crossing inside the junction. If there are fewer
+/// shared lanes than branches, nothing is shared out and every lane may take every branch,
+/// as before, rather than cut a branch off.
+fn fork_assignment(
+    net: &Net,
+    candidates: &[(usize, TurnDirection, f64)],
+    lanes: usize,
+    permits: &dyn Fn(usize, TurnDirection) -> bool,
+) -> Option<Vec<Option<usize>>> {
+    let mut branches: Vec<(usize, TurnDirection, f64)> = candidates
+        .iter()
+        .copied()
+        .filter(|(_, turn, _)| is_through(*turn))
+        .collect();
+    if branches.len() < 2 {
+        return None;
+    }
+    branches.sort_by(|x, y| x.2.total_cmp(&y.2).then(x.0.cmp(&y.0)));
+    let shared: Vec<usize> = (0..lanes)
+        .filter(|k| branches.iter().all(|(_, turn, _)| permits(*k, *turn)))
+        .collect();
+    if shared.len() < branches.len() {
+        return None;
+    }
+    let weights: Vec<f64> = branches
+        .iter()
+        .map(|(b, _, _)| net.edge_info[*b].lanes.len().max(1) as f64)
+        .collect();
+    let total: f64 = weights.iter().sum();
+    let m = shared.len();
+    let mut pick: Vec<usize> = Vec::with_capacity(m);
+    for p in 0..m {
+        let f = (p as f64 + 0.5) / m as f64;
+        let mut acc = 0.0;
+        let mut chosen = branches.len() - 1;
+        for (i, w) in weights.iter().enumerate() {
+            acc += w / total;
+            if f < acc {
+                chosen = i;
+                break;
+            }
+        }
+        pick.push(chosen);
+    }
+    // Every branch gets at least one lane: fall back to an even split if the proportional
+    // one starved a narrow branch.
+    if (0..branches.len()).any(|i| !pick.contains(&i)) {
+        let d = branches.len();
+        pick = (0..m).map(|p| (p * d / m).min(d - 1)).collect();
+    }
+    let mut out = vec![None; lanes];
+    for (p, k) in shared.iter().enumerate() {
+        out[*k] = Some(branches[pick[p]].0);
+    }
+    Some(out)
+}
+
+/// The radius a junction connector is built to, when the lanes leave room for it, metres.
+///
+/// The AASHTO Green Book (2018, Table 2-2) gives the passenger-car design vehicle P a
+/// minimum centreline turning radius of 6.4 m (21 ft). A connector is the path the
+/// passenger car drives, so it is laid out no tighter than the tightest turn that car can
+/// make; larger design vehicles swing wider than any lane-centreline model draws them.
+pub const TURN_DESIGN_RADIUS_M: f64 = 6.4;
+
+/// The furthest one lane end is pulled back to make room for a turn, metres.
+///
+/// **This importer's choice**: two lane widths. A turn that still lacks room after that
+/// is at a junction a mapped network squeezed — a sliver of road between two junctions a
+/// metre apart — and pulling further would eat the approach.
+const MAX_TURN_PULL_BACK_M: f64 = 7.0;
+
+/// Pulls the approach lane ends and departure lane starts at junction `j` back from the
+/// junction until every requested movement's corner has room for an arc of
+/// [`TURN_DESIGN_RADIUS_M`].
+///
+/// A turn through `θ` between two tangent lines needs `R · tan(θ/2)` of each to round the
+/// corner at radius `R`; the room it has is the distance from each lane end to the point
+/// where the tangent lines meet. Where that falls short, the whole edge end is pulled back
+/// by the shortfall — every lane of the approach, so its stop line stays square across
+/// the carriageway — as far as [`MAX_TURN_PULL_BACK_M`] and the lanes' own length allow
+/// (each keeps at least [`MIN_LANE_LENGTH_M`] and half of itself). A U-turn is not given
+/// room: turning a car round on its own carriageway is a three-point manoeuvre, not a
+/// path, and the room it would need is the whole junction.
+fn pull_back_for_turns(
+    net: &mut Net,
+    j: usize,
+    requests: &[MovementRequest<'_>],
+    report: &mut ImportReport,
+) {
+    let mut need_end: BTreeMap<usize, f64> = BTreeMap::new();
+    let mut need_start: BTreeMap<usize, f64> = BTreeMap::new();
+    for r in requests {
+        if r.turn == TurnDirection::UTurn {
+            continue;
+        }
+        let from = &net.lanes[r.from_lane.as_usize()];
+        let to = &net.lanes[r.to_lane.as_usize()];
+        let (start, h_in) = (from.end(), from.heading_at(from.length_m));
+        let (end, h_out) = (to.start(), to.heading_at(0.0));
+        let turn = normalise_angle(h_out - h_in).abs();
+        if turn < 0.05 {
+            continue;
+        }
+        let Some((u, v)) = tangent_legs(start, h_in, end, h_out) else {
+            continue;
+        };
+        let want = TURN_DESIGN_RADIUS_M * math::tan(0.5 * turn.min(2.8));
+        if want > u {
+            let e = need_end.entry(r.from_edge).or_insert(0.0);
+            *e = e.max(want - u);
+        }
+        if want > v {
+            let e = need_start.entry(r.to_edge).or_insert(0.0);
+            *e = e.max(want - v);
+        }
+    }
+    for (edge, need) in need_end {
+        pull_edge_end(net, edge, need, true, report);
+    }
+    for (edge, need) in need_start {
+        pull_edge_end(net, edge, need, false, report);
+    }
+    let _ = j;
+}
+
+/// Where the tangent lines of `(start, heading_in)` and `(end, heading_out)` meet, as the
+/// distance from `start` forward along its heading and from `end` back along its heading;
+/// `None` when they are parallel or meet behind either end.
+fn tangent_legs(start: Vec3, heading_in: f64, end: Vec3, heading_out: f64) -> Option<(f64, f64)> {
+    let (sin_in, cos_in) = math::sin_cos(heading_in);
+    let (sin_out, cos_out) = math::sin_cos(heading_out);
+    let chord = end - start;
+    let denominator = cos_in * sin_out - sin_in * cos_out;
+    if denominator.abs() < 1e-9 {
+        return None;
+    }
+    let u = (chord.x * sin_out - chord.y * cos_out) / denominator;
+    let cx = start.x + cos_in * u;
+    let cy = start.y + sin_in * u;
+    let v = (end.x - cx) * cos_out + (end.y - cy) * sin_out;
+    (u > 0.0 && v > 0.0 && u.is_finite() && v.is_finite()).then_some((u, v))
+}
+
+/// Shortens every lane of edge `edge` by `need` metres at its end (`at_end`) or its start,
+/// capped as [`pull_back_for_turns`] describes.
+fn pull_edge_end(net: &mut Net, edge: usize, need: f64, at_end: bool, report: &mut ImportReport) {
+    let lanes = net.edge_info[edge].lanes.clone();
+    let mut cut = need.min(MAX_TURN_PULL_BACK_M);
+    for id in &lanes {
+        let lane = &net.lanes[id.as_usize()];
+        cut = cut
+            .min(lane.length_m - MIN_LANE_LENGTH_M)
+            .min(0.5 * lane.length_m);
+    }
+    if cut < 0.05 {
+        return;
+    }
+    for id in &lanes {
+        let lane = &net.lanes[id.as_usize()];
+        let (from_s, to_s) = if at_end {
+            (0.0, lane.length_m - cut)
+        } else {
+            (cut, lane.length_m)
+        };
+        let Some(points) = trim_polyline(&lane.centreline, from_s, to_s) else {
+            continue;
+        };
+        if let Ok(trimmed) = Lane::new(
+            lane.id,
+            lane.edge,
+            lane.junction,
+            lane.index,
+            lane.kind,
+            points,
+            lane.width_m,
+            lane.speed_limit_mps,
+            lane.allowed,
+        ) {
+            net.lanes[id.as_usize()] = trimmed;
+        }
+    }
+    report.counts.lane_ends_pulled_back += lanes.len() as u64;
 }
 
 /// The arguments of [`add_movement`], grouped so the function takes one parameter block
@@ -4989,6 +5268,123 @@ fn phase_group(approach_heading: f64, reference: f64) -> u16 {
     u16::from(!(d <= quarter || d >= 3.0 * quarter))
 }
 
+/// True if movements `a` and `b` (rows `ia`, `ib` of `conflicts`) would both be
+/// *protected* on one green and cross or merge: neither is a turn across opposing traffic
+/// (which is permissive, and gives way by the matrix), and they are not two lanes of one
+/// road merging into one lane where the road narrows — a lane drop, which is a zip.
+fn protected_pair_conflicts(
+    a: &Movement,
+    b: &Movement,
+    lanes: &[Lane],
+    conflicts: &ConflictMatrix,
+    ia: usize,
+    ib: usize,
+) -> bool {
+    if a.turn.crosses_opposing_traffic() || b.turn.crosses_opposing_traffic() {
+        return false;
+    }
+    if !conflicts.is_foe(ia, ib) {
+        return false;
+    }
+    let lane_drop =
+        a.to_lane == b.to_lane && lanes[a.from_lane.as_usize()].edge == lanes[b.from_lane.as_usize()].edge;
+    !lane_drop
+}
+
+/// The phase group of every movement: the axis rule of [`phase_group`], then **split
+/// phasing** wherever that would give two conflicting movements of different approaches a
+/// protected green together.
+///
+/// Approaches are taken in movement order (which is approach order); each keeps its axis
+/// group unless one of its protected movements conflicts with a protected movement of an
+/// approach already placed there, in which case it takes the lowest group where nothing
+/// conflicts, opening a new one if none does. That is split phasing — each conflicting
+/// approach served on its own green — one of the phasing schemes of the *Signal Timing
+/// Manual* (2nd ed., NCHRP Report 812, 2015; section not re-verified here), used where
+/// approaches' movements cannot share a green: skewed and offset junctions, a fork, two
+/// streets merging. On a plain crossroads nothing moves and the plan is the two-phase plan
+/// it always was.
+fn split_phases(
+    movements: &[Movement],
+    lanes: &[Lane],
+    conflicts: &ConflictMatrix,
+    axis: impl Fn(&Movement) -> u16,
+) -> Vec<u16> {
+    let mut approaches: Vec<usize> = Vec::new();
+    for m in movements {
+        if !approaches.contains(&m.from_edge) {
+            approaches.push(m.from_edge);
+        }
+    }
+    let rows_of = |edge: usize| -> Vec<usize> {
+        (0..movements.len())
+            .filter(|i| movements[*i].from_edge == edge)
+            .collect()
+    };
+    let clash = |x: usize, y: usize| -> bool {
+        rows_of(x).iter().any(|a| {
+            rows_of(y).iter().any(|b| {
+                protected_pair_conflicts(&movements[*a], &movements[*b], lanes, conflicts, *a, *b)
+            })
+        })
+    };
+    let mut group_of: Vec<(usize, u16)> = Vec::new();
+    for &edge in &approaches {
+        let first = rows_of(edge)[0];
+        let preferred = axis(&movements[first]);
+        let fits = |g: u16, placed: &[(usize, u16)]| {
+            placed
+                .iter()
+                .filter(|(_, pg)| *pg == g)
+                .all(|(other, _)| !clash(edge, *other))
+        };
+        let mut chosen = preferred;
+        if !fits(preferred, &group_of) {
+            let mut g = 0u16;
+            while !fits(g, &group_of) {
+                g += 1;
+            }
+            chosen = g;
+        }
+        group_of.push((edge, chosen));
+    }
+    // Renumber densely in order of first use, so group ids stay 0, 1, 2, ….
+    let mut order: Vec<u16> = Vec::new();
+    for (_, g) in &group_of {
+        if !order.contains(g) {
+            order.push(*g);
+        }
+    }
+    order.sort_unstable();
+    movements
+        .iter()
+        .map(|m| {
+            let g = group_of
+                .iter()
+                .find(|(e, _)| *e == m.from_edge)
+                .map_or(0, |(_, g)| *g);
+            order.iter().position(|x| *x == g).unwrap_or(0) as u16
+        })
+        .collect()
+}
+
+/// Standard gravity, m/s², for the grade term of the ITE amber formula.
+const GRAVITY_MPS2: f64 = 9.806_65;
+
+/// The grade of an approach over its last 30 m (or its length, if shorter), as a
+/// decimal fraction: positive uphill in the direction of travel. The ITE amber formula's
+/// `G`: a downhill approach needs a longer amber, because braking downhill takes longer.
+fn approach_grade(lane: &Lane) -> f64 {
+    let span = lane.length_m.min(30.0);
+    if span < 1.0 {
+        return 0.0;
+    }
+    let end = lane.end();
+    let from = lane.point_at(lane.length_m - span);
+    ((end.z - from.z) / span).clamp(-0.15, 0.15)
+}
+
+
 /// Synthesises a fixed-time plan for every junction that has a `traffic_signals` node on
 /// it or near it, with the defaults of 04-models.md §2.3.
 ///
@@ -4997,9 +5393,19 @@ fn phase_group(approach_heading: f64, reference: f64) -> u16 {
 /// [`ImportOptions::guess_signals_m`], which is what netconvert's `--tls.guess-signals`
 /// does. One with no junction in range is counted as an orphan and ignored.
 ///
-/// The amber time is the ITE formula `y = t + v / (2a)` on the fastest approach, clamped to
-/// the FHWA range; the greens are then whatever is left of the target cycle, so that the
-/// plan's phases sum to its cycle exactly as [`World::validate`] requires.
+/// Each phase group ends in a change interval computed from its own approaches by ITE's
+/// *Guidelines for Determining Traffic Signal Change and Clearance Intervals* (2020): an
+/// amber `y = t + v / (2a + 2Gg)` (perception-reaction `t`, deceleration `a`, the
+/// approach's grade `G` from its lane geometry, the speed limit `v`), clamped to the 3-6 s
+/// of MUTCD 2009 §4D.26, then an all-red `r = (W + L) / v` (`W` the movement's path from
+/// the stop line across the junction, `L` a 20 ft passenger car), at most §4D.26's 6 s.
+/// The greens are whatever is left of the target cycle, so that the plan's phases sum to
+/// its cycle exactly as [`World::validate`] requires. A vehicle already inside the
+/// junction when its movement turns red is still given way to: the mobility engine's
+/// junction rules, not the all-red, are what guarantee that.
+///
+/// No two conflicting movements are ever given a protected green together: see the
+/// permissive rule in the body.
 fn synthesise_signals(
     net: &mut Net,
     file: &OsmFile,
@@ -5053,27 +5459,56 @@ fn synthesise_signals(
             continue;
         }
         let reference = movements[0].approach_heading;
-        let groups: Vec<u16> = movements
-            .iter()
-            .map(|m| phase_group(m.approach_heading, reference))
-            .collect();
+        let groups = split_phases(
+            &movements,
+            &net.lanes,
+            &net.junctions[j].conflicts,
+            |m| phase_group(m.approach_heading, reference),
+        );
         let present: Vec<u16> = {
             let mut g = groups.clone();
             g.sort_unstable();
             g.dedup();
             g
         };
-        let speed = movements
+        // The change interval of each phase group, from its own approaches (ITE 2020):
+        // the amber `y = t + v / (2a + 2Gg)` on the approach needing the longest, clamped
+        // to MUTCD 2009 §4D.26's 3-6 s, and the all-red `r = (W + L) / v` on the movement
+        // needing the longest, capped at §4D.26's 6 s — `W` the path from the stop line
+        // across the junction (the connector), `L` a passenger car.
+        let timing: Vec<(u16, f64, f64)> = present
             .iter()
-            .map(|m| net.lanes[m.from_lane.as_usize()].speed_limit_mps)
-            .fold(0.0f64, f64::max);
-        let yellow = quantise(
-            (defaults.yellow_reaction_s + speed / (2.0 * defaults.yellow_min_decel_mps2))
-                .clamp(defaults.yellow_min_s, defaults.yellow_max_s),
-            0.1,
-        );
-        let all_red = quantise(defaults.all_red_s.max(0.0), Q_TIME_S);
-        let fixed = (yellow + all_red) * present.len() as f64;
+            .map(|g| {
+                let members: Vec<usize> =
+                    (0..movements.len()).filter(|i| groups[*i] == *g).collect();
+                let mut yellow: f64 = defaults.yellow_min_s;
+                let mut red: f64 = 0.0;
+                for i in &members {
+                    let m = &movements[*i];
+                    let approach = &net.lanes[m.from_lane.as_usize()];
+                    let v = approach.speed_limit_mps.max(1.0);
+                    let grade = approach_grade(approach);
+                    let brake = 2.0 * defaults.yellow_min_decel_mps2 + 2.0 * grade * GRAVITY_MPS2;
+                    let y = defaults.yellow_reaction_s + v / brake.max(0.5);
+                    yellow = yellow.max(y);
+                    if defaults.ite_red_clearance {
+                        let w = net.lanes[m.internal.as_usize()].length_m;
+                        red = red.max((w + defaults.red_clearance_vehicle_length_m) / v);
+                    }
+                }
+                let yellow = quantise(
+                    yellow.clamp(defaults.yellow_min_s, defaults.yellow_max_s),
+                    0.1,
+                );
+                let red = quantise(
+                    red.min(defaults.red_clearance_max_s)
+                        .max(defaults.all_red_s.max(0.0)),
+                    0.1,
+                );
+                (*g, yellow, red)
+            })
+            .collect();
+        let fixed: f64 = timing.iter().map(|(_, y, r)| y + r).sum();
         let green = quantise(
             ((defaults.cycle_s - fixed) / present.len() as f64).max(defaults.min_green_s),
             Q_TIME_S,
@@ -5092,19 +5527,66 @@ fn synthesise_signals(
                 SignalState::Green
             }
         };
+        // Split phasing puts conflicting approaches on different greens; what it cannot
+        // separate is two lanes of *one* approach whose paths cross inside the junction —
+        // no signal plan can give one lane of a road green and its neighbour red on the
+        // same head. The fork lane assignment of `build_movements` exists to prevent that;
+        // if the source still produces it, the movement that gives way (by the matrix, or
+        // the later one where the matrix leaves them level) is made permissive and the
+        // matrix told who yields, so the engine settles it by priority. Counted, so a
+        // reader sees how often it happens.
+        let mut permissive = vec![false; movements.len()];
+        {
+            let conflicts = &mut net.junctions[j].conflicts;
+            for a in 0..movements.len() {
+                for b in a + 1..movements.len() {
+                    let (ma, mb) = (&movements[a], &movements[b]);
+                    if groups[a] != groups[b]
+                        || ma.from_edge != mb.from_edge
+                        || ma.from_lane == mb.from_lane
+                        || !protected_pair_conflicts(ma, mb, &net.lanes, conflicts, a, b)
+                        || permissive[a]
+                        || permissive[b]
+                    {
+                        continue;
+                    }
+                    let loser = if conflicts.must_yield(a, b) {
+                        a
+                    } else if conflicts.must_yield(b, a) {
+                        b
+                    } else {
+                        conflicts.set_response(b, a, true);
+                        b
+                    };
+                    permissive[loser] = true;
+                    report.counts.signal_movements_made_permissive += 1;
+                }
+            }
+        }
+        let state_of = |active: u16, amber: bool, index: usize| -> SignalState {
+            let s = state_of(active, amber, index);
+            if s == SignalState::Green && permissive[index] {
+                SignalState::GreenYield
+            } else {
+                s
+            }
+        };
+        // The phases: each group's green, its amber, and its all-red. There is room in
+        // this list for a pedestrian walk interval (a phase whose states are all red for
+        // vehicles while a crossing's head shows walk); this importer does not add one.
         let mut phases: Vec<SignalPhase> = Vec::new();
-        for active in &present {
+        for &(active, yellow, all_red) in &timing {
             phases.push(SignalPhase {
                 duration_s: green,
                 states: (0..movements.len())
-                    .map(|i| state_of(*active, false, i))
+                    .map(|i| state_of(active, false, i))
                     .collect(),
                 name: None,
             });
             phases.push(SignalPhase {
                 duration_s: yellow,
                 states: (0..movements.len())
-                    .map(|i| state_of(*active, true, i))
+                    .map(|i| state_of(active, true, i))
                     .collect(),
                 name: None,
             });
@@ -7159,6 +7641,18 @@ fn build_provenance(
             ),
     );
     provenance.record(
+        Transformation::new("turn-geometry")
+            .with(
+                "rule",
+                "motor lane corners rounded into circular arcs (AASHTO simple curves); \
+                 junction connectors are the largest arc between the lane ends; lane ends \
+                 pulled back until a turn has room for the design radius",
+            )
+            .with("design_radius_m", TURN_DESIGN_RADIUS_M)
+            .with("max_pull_back_m", MAX_TURN_PULL_BACK_M)
+            .with("lane_ends_pulled_back", report.counts.lane_ends_pulled_back),
+    );
+    provenance.record(
         Transformation::new("lane-offset-repair")
             .with(
                 "rule",
@@ -7200,8 +7694,30 @@ fn build_provenance(
             .with("guess_signals_m", options.import.guess_signals_m)
             .with("cycle_s", options.signals.cycle_s)
             .with("green_s", options.signals.green_s)
-            .with("all_red_s", options.signals.all_red_s)
-            .with("yellow_rule", "ITE y = t + v / (2a)")
+            .with("all_red_floor_s", options.signals.all_red_s)
+            .with(
+                "yellow_rule",
+                "ITE 2020 y = t + v / (2a + 2Gg) per phase group, clamped to MUTCD 2009 \
+                 §4D.26 3-6 s",
+            )
+            .with(
+                "all_red_rule",
+                if options.signals.ite_red_clearance {
+                    "ITE 2020 r = (W + L) / v per phase group, W the connector, at most \
+                     MUTCD 2009 §4D.26 6 s"
+                } else {
+                    "flat all_red_floor_s"
+                },
+            )
+            .with(
+                "red_clearance_vehicle_length_m",
+                options.signals.red_clearance_vehicle_length_m,
+            )
+            .with(
+                "conflict_rule",
+                "no two conflicting movements share a protected green: the one that yields \
+                 is permissive",
+            )
             .with("yellow_reaction_s", options.signals.yellow_reaction_s)
             .with(
                 "yellow_min_decel_mps2",
