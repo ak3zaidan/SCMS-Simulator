@@ -388,15 +388,28 @@ fn the_queues_are_the_five_of_the_node_model_with_their_waits() {
         assert_eq!(ids, ["rx", "verify", "app", "tx", "crl"]);
         for q in list {
             if q["id"] != "crl" {
-                assert!(q["depth"].is_u64(), "{q}");
-                let shown = q["waiting"].as_array().unwrap().len() as u64;
-                assert_eq!(
-                    shown + q["waiting_omitted"].as_u64().unwrap(),
-                    q["depth"].as_u64().unwrap()
-                );
-                for w in q["waiting"].as_array().unwrap() {
+                // `waiting` is every message that waited during the last step: those still
+                // there (`left_ns` null, as many as `depth`) and those that left during it.
+                let depth = q["depth"].as_u64().expect("a depth");
+                let peak = q["peak"].as_u64().expect("a peak");
+                let rows = q["waiting"].as_array().unwrap();
+                let total = rows.len() as u64 + q["waiting_omitted"].as_u64().unwrap();
+                assert!(depth <= peak && peak <= total.max(depth), "{q}");
+                if q["waiting_omitted"] == 0 {
+                    let still = rows.iter().filter(|w| w["left_ns"].is_null()).count() as u64;
+                    assert_eq!(still, depth, "{q}");
+                }
+                let now = feed["t_ns"].as_u64().unwrap();
+                let step = (feed["queues"]["step_ms"].as_f64().unwrap() * 1e6) as u64;
+                for w in rows {
                     assert!(w["waited_ms"].as_f64().unwrap() >= 0.0);
-                    assert!(w["enqueued_ns"].as_u64().unwrap() <= feed["t_ns"].as_u64().unwrap());
+                    assert!(w["enqueued_ns"].as_u64().unwrap() <= now);
+                    if let Some(left) = w["left_ns"].as_u64() {
+                        assert!(
+                            left <= now && left > now - step,
+                            "left outside the step: {w}"
+                        );
+                    }
                 }
             }
             served += q["served"].as_u64().unwrap();
@@ -601,8 +614,11 @@ fn the_feed_has_the_shape_of_the_published_vector() {
             .expect("delivered");
         v["received"] = json!([delivered]);
         std::fs::create_dir_all(path.parent().expect("a directory")).expect("mkdir");
-        std::fs::write(&path, serde_json::to_string_pretty(&v).expect("json") + "\n")
-            .expect("write the vector");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&v).expect("json") + "\n",
+        )
+        .expect("write the vector");
     }
     let vector: Value = serde_json::from_str(
         &std::fs::read_to_string(&path).expect("docs/protocol/vectors/node-feed-v1.json"),

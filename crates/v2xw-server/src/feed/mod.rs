@@ -295,12 +295,17 @@ pub struct FeedStore {
     logs: BTreeMap<u32, NodeLog>,
     /// The SPDUs tapped in the step being projected, until their `node.tx` records arrive.
     pending_taps: BTreeMap<u64, Arc<[u8]>>,
+    /// The mobility step, ns: the interval a queue reading covers (see `queues_json`).
+    step_ns: u64,
 }
 
 impl FeedStore {
-    /// An empty store.
-    pub fn new() -> Self {
-        FeedStore::default()
+    /// An empty store for a run whose stream advances `step_ns` at a time.
+    pub fn new(step_ns: u64) -> Self {
+        FeedStore {
+            step_ns,
+            ..FeedStore::default()
+        }
     }
 
     /// Holds one tapped SPDU until its `node.tx` record is read.
@@ -519,6 +524,17 @@ impl FeedStore {
 
     /// The node's queues at `now`, reconstructed from its own stamps (see the module
     /// header), with the node's own telemetry window beside them.
+    ///
+    /// # Over the last step, not only at its instant
+    ///
+    /// The stream is shown on the mobility-step grid, and a vehicle's traffic is periodic at a
+    /// multiple of the same period: a BSM every 100 ms whose generation falls at the node's own
+    /// phase. A reading taken only at the step instant therefore sees the same point of every
+    /// cycle — a node whose phase is early in the step always reads "transmit queue empty",
+    /// however busy it is. So each queue reports its depth at the instant (`depth`), the most
+    /// messages it held at once during the last step (`peak`), and every message that waited in
+    /// it during that step (`waiting`, each with the instant it left or `null` if it is still
+    /// there), which is what a vehicle's queue did since the previous frame the page drew.
     pub fn queues_json(
         &self,
         node: u32,
@@ -533,6 +549,7 @@ impl FeedStore {
         let clock = Clock {
             now,
             win_lo: now.saturating_sub(QUEUE_WINDOW_NS),
+            step_lo: now.saturating_sub(self.step_ns),
         };
         let drop_lo = now.saturating_sub(DROP_WINDOW_NS);
         if let Some(log) = self.logs.get(&node) {
@@ -623,6 +640,7 @@ impl FeedStore {
             for f in log.sent.iter().filter_map(|m| self.frames.get(m)) {
                 let Some(g) = f.t_generated else { continue };
                 let stage_name = match (f.t_sign_start, f.t_signed) {
+                    _ if f.t <= now => "on the air",
                     (Some(s0), _) if now < s0 => "awaiting the signer",
                     (_, Some(s1)) if now < s1 => "signing",
                     _ => "awaiting channel access",
@@ -656,26 +674,29 @@ impl FeedStore {
         let mut list: Vec<Value> = Vec::new();
         for (id, label, what) in QUEUES {
             let Some(q) = qs.get_mut(id) else { continue };
-            q.waiting.sort_by(|a, b| a.0.cmp(&b.0));
-            let depth = q.waiting.len();
+            // Still waiting first, longest first; then those that left during the step.
+            q.waiting.sort_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
+            let seen = q.waiting.len();
             let shown: Vec<Value> = q
                 .waiting
                 .iter()
                 .take(waiting_limit)
-                .map(|(_, v)| v.clone())
+                .map(|(_, _, v)| v.clone())
                 .collect();
+            let peak = peak_of(&q.spans, clock.step_lo, now).max(q.depth);
             let mut row = json!({
                 "id": id,
                 "label": label,
                 "what": what,
-                "depth": if id == "crl" { Value::Null } else { json!(depth) },
+                "depth": if id == "crl" { Value::Null } else { json!(q.depth) },
+                "peak": if id == "crl" { Value::Null } else { json!(peak) },
                 "in_service": q.in_service,
                 "served": q.served,
                 "wait_p50_ms": percentile_ms(&mut q.waits_ns, 0.50),
                 "wait_p95_ms": percentile_ms(&mut q.waits_ns, 0.95),
                 "drops": q.drops,
                 "waiting": shown,
-                "waiting_omitted": depth.saturating_sub(waiting_limit),
+                "waiting_omitted": seen.saturating_sub(waiting_limit),
                 "reported_depth": rep(id),
             });
             if id == "tx" {
@@ -688,6 +709,7 @@ impl FeedStore {
         }
         json!({
             "t_ns": now,
+            "step_ms": (self.step_ns as f64) / 1e6,
             "window_ms": QUEUE_WINDOW_NS / 1_000_000,
             "drop_window_ms": DROP_WINDOW_NS / 1_000_000,
             "source": "reconstructed from the node's own node.tx and node.rx stamps; \
@@ -839,14 +861,40 @@ const QUEUES: [(&str, &str, &str); 5] = [
     ),
 ];
 
-/// One queue's reconstruction at an instant.
+/// One queue's reconstruction over the last step.
 #[derive(Default)]
 struct QueueTally {
-    waiting: Vec<(SimTime, Value)>,
+    /// `(enqueued, gone, row)`: every message that waited during the last step, `gone` false
+    /// for one still waiting at the instant.
+    waiting: Vec<(SimTime, bool, Value)>,
+    /// Their intervals, clipped to the step, for the peak.
+    spans: Vec<(SimTime, SimTime)>,
+    /// Waiting at the instant.
+    depth: usize,
     in_service: usize,
     waits_ns: Vec<u64>,
     served: usize,
     drops: BTreeMap<&'static str, u64>,
+}
+
+/// The most intervals `[a, b)` that overlap at any instant of `(lo, hi]`.
+fn peak_of(spans: &[(SimTime, SimTime)], lo: SimTime, hi: SimTime) -> usize {
+    // Ends before starts at the same instant: `[a, b)` and `[b, c)` never overlap.
+    let mut edges: Vec<(SimTime, i32)> = Vec::with_capacity(2 * spans.len());
+    for &(a, b) in spans {
+        let (a, b) = (a.max(lo), b.min(hi.saturating_add(1)));
+        if a < b {
+            edges.push((a, 1));
+            edges.push((b, -1));
+        }
+    }
+    edges.sort_unstable();
+    let (mut now, mut peak) = (0i32, 0i32);
+    for (_, d) in edges {
+        now += d;
+        peak = peak.max(now);
+    }
+    usize::try_from(peak).unwrap_or(0)
 }
 
 /// A message, as a waiting-entry row names it.
@@ -856,15 +904,17 @@ struct Who {
     from: Option<u32>,
 }
 
-/// The instant a reconstruction is for, and the start of its wait window.
+/// The instant a reconstruction is for, the start of its wait window, and the start of the
+/// step it covers.
 struct Clock {
     now: SimTime,
     win_lo: SimTime,
+    step_lo: SimTime,
 }
 
 impl Clock {
-    /// One stage interval `[a, b)` of one message: waiting (or in service) at `now`, and a
-    /// served wait when it ended inside the window.
+    /// One stage interval `[a, b)` of one message: waiting (or in service) at `now`, waiting
+    /// at some instant of the last step, and a served wait when it ended inside the window.
     #[allow(clippy::too_many_arguments)]
     fn stage(
         &self,
@@ -878,16 +928,26 @@ impl Clock {
     ) {
         let (Some(a), Some(b)) = (a, b) else { return };
         let Some(q) = qs.get_mut(q) else { return };
-        if a <= self.now && self.now < b {
-            if service {
+        let here = a <= self.now && self.now < b;
+        if service {
+            if here {
                 q.in_service += 1;
-            } else {
-                q.waiting.push((
-                    a,
-                    json!({"msg": who.msg, "type": who.ty, "from": who.from, "enqueued_ns": a,
-                           "waited_ms": ((self.now - a) as f64) / 1e6, "stage": stage}),
-                ));
             }
+        } else if a <= self.now && b > self.step_lo && b > a {
+            // Waited at some instant of `(step_lo, now]`.
+            if here {
+                q.depth += 1;
+            }
+            let gone = !here;
+            let until = b.min(self.now);
+            q.spans.push((a, b));
+            q.waiting.push((
+                a,
+                gone,
+                json!({"msg": who.msg, "type": who.ty, "from": who.from, "enqueued_ns": a,
+                       "left_ns": if gone { json!(b) } else { Value::Null },
+                       "waited_ms": ((until - a) as f64) / 1e6, "stage": stage}),
+            ));
         }
         if !service && b <= self.now && b > self.win_lo && b >= a {
             q.waits_ns.push(b - a);
@@ -962,7 +1022,7 @@ mod tests {
     /// A message delivered through every stage: arrival 100 ms, parsed 101, verification
     /// 105–106, delivered 107.
     fn one_delivery() -> FeedStore {
-        let mut store = FeedStore::new();
+        let mut store = FeedStore::new(100 * MS);
         let s = |x: u64| Some(x * MS);
         store.on_rx(&rx(
             1,
@@ -1044,7 +1104,7 @@ mod tests {
 
     #[test]
     fn a_verification_overflow_is_a_drop_of_the_verification_queue() {
-        let mut store = FeedStore::new();
+        let mut store = FeedStore::new(100 * MS);
         let s = |x: u64| Some(x * MS);
         store.on_rx(&rx(
             2,
@@ -1071,7 +1131,7 @@ mod tests {
 
     #[test]
     fn an_undetected_frame_is_counted_and_not_listed() {
-        let mut store = FeedStore::new();
+        let mut store = FeedStore::new(100 * MS);
         store.on_rx(&rx(
             3,
             RxFate::Lost,
@@ -1086,7 +1146,7 @@ mod tests {
 
     #[test]
     fn a_transmitted_frame_waits_for_the_signer_then_for_the_channel() {
-        let mut store = FeedStore::new();
+        let mut store = FeedStore::new(100 * MS);
         let tx: NodeTxView = serde_json::from_value(json!({
             "t": 5 * MS, "node": 7, "msg": 11, "msg_type": "bsm", "bytes_on_wire": 176,
             "t_generated": 0, "t_sign_start": MS, "t_signed": 3 * MS,
@@ -1103,12 +1163,66 @@ mod tests {
         assert_eq!(stage_at(MS / 2).as_deref(), Some("awaiting the signer"));
         assert_eq!(stage_at(2 * MS).as_deref(), Some("signing"));
         assert_eq!(stage_at(4 * MS).as_deref(), Some("awaiting channel access"));
-        assert_eq!(stage_at(5 * MS), None, "on the air at 5 ms");
+        // On the air at 5 ms: gone from the queue, and still listed as having waited in it
+        // during the step, with the instant it left.
+        assert_eq!(stage_at(5 * MS).as_deref(), Some("on the air"));
+        let q = store.queues_json(7, 5 * MS, None, 8);
+        assert_eq!(queue(&q, "tx")["depth"].as_u64(), Some(0));
+        assert_eq!(
+            queue(&q, "tx")["waiting"][0]["left_ns"].as_u64(),
+            Some(5 * MS)
+        );
+        assert_eq!(stage_at(200 * MS), None, "a step later it is history");
         let q = store.queues_json(7, 100 * MS, None, 8);
         assert_eq!(queue(&q, "tx")["wait_p50_ms"].as_f64(), Some(5.0));
         // A frame with no octets says so rather than decoding nothing.
         let feed = store.feed_json(7, None, 10 * MS, &FeedLimits::default(), true, None);
         assert!(feed["sent"][0]["decoded"]["note"].is_string(), "{feed}");
+    }
+
+    /// A vehicle whose BSM is generated at 80 ms into each 100 ms step and is on the air by
+    /// 90 ms never has a frame in its transmit queue at a step instant. Read only at the
+    /// instant, its queue said "empty" forever; read over the step, it shows the frame that
+    /// waited, how long, and that one frame was the peak.
+    #[test]
+    fn a_queue_busy_only_between_step_instants_is_not_read_as_empty() {
+        let mut store = FeedStore::new(100 * MS);
+        for k in 0..3u64 {
+            let tx: NodeTxView = serde_json::from_value(json!({
+                "t": k * 100 * MS + 90 * MS, "node": 7, "msg": 20 + k, "msg_type": "bsm",
+                "bytes_on_wire": 176, "t_generated": k * 100 * MS + 80 * MS,
+                "t_sign_start": k * 100 * MS + 81 * MS, "t_signed": k * 100 * MS + 84 * MS,
+            }))
+            .expect("a node.tx view");
+            store.on_tx(&tx);
+        }
+        for step in 1..=3u64 {
+            let q = store.queues_json(7, step * 100 * MS, None, 8);
+            let tx = queue(&q, "tx");
+            assert_eq!(
+                tx["depth"].as_u64(),
+                Some(0),
+                "never waiting at the instant"
+            );
+            assert_eq!(
+                tx["peak"].as_u64(),
+                Some(1),
+                "one frame waited during the step: {tx}"
+            );
+            let rows = tx["waiting"].as_array().expect("rows");
+            assert_eq!(rows.len(), 1, "{tx}");
+            assert_eq!(rows[0]["msg"].as_u64(), Some(20 + step - 1));
+            assert_eq!(rows[0]["waited_ms"].as_f64(), Some(10.0));
+        }
+    }
+
+    #[test]
+    fn the_peak_counts_overlap_and_not_touching_intervals() {
+        let spans = [(0, 10), (10, 20), (5, 15), (30, 40)];
+        assert_eq!(peak_of(&spans, 0, 100), 2);
+        assert_eq!(peak_of(&[(0, 10), (10, 20)], 0, 100), 1);
+        assert_eq!(peak_of(&spans, 25, 100), 1);
+        assert_eq!(peak_of(&[], 0, 100), 0);
     }
 
     #[test]

@@ -158,12 +158,15 @@ export interface FeedReceived {
   decoded?: FeedDecoded;
 }
 
-/** One message waiting in a queue. */
+/** One message that waited in a queue during the last step. */
 export interface FeedWaiting {
   msg: number | null;
   type: string;
   from: NodeId | null;
   enqueued_ns: SimTimeNs;
+  /** When it left the queue; `null` while it is still waiting at the push's instant. */
+  left_ns: SimTimeNs | null;
+  /** How long it waited, or has waited so far. */
   waited_ms: number;
   stage: string;
 }
@@ -173,14 +176,21 @@ export interface FeedQueue {
   id: "rx" | "verify" | "app" | "tx" | "crl";
   label: string;
   what: string;
-  /** Messages waiting now; `null` for the CRL queue, whose tasks are not stamped. */
+  /** Messages waiting at the push's instant; `null` for the CRL queue, whose tasks are not stamped. */
   depth: number | null;
+  /**
+   * The most messages waiting at once during the last step. The stream is shown on the step grid
+   * and a vehicle's traffic is periodic at the same period, so the instant alone can read "empty"
+   * for a queue that is busy every step; the peak and `waiting` cover the whole step.
+   */
+  peak: number | null;
   in_service: number;
   served: number;
   wait_p50_ms: number | null;
   wait_p95_ms: number | null;
   drops: Record<string, number>;
   drops_note?: string;
+  /** Every message that waited during the last step: still waiting first, then those that left. */
   waiting: FeedWaiting[];
   waiting_omitted: number;
   /** The node's own telemetry window's depth percentiles. */
@@ -190,6 +200,14 @@ export interface FeedQueue {
 /** The node's queues. */
 export interface FeedQueues {
   t_ns: SimTimeNs;
+  /** The step a reading covers (`peak`, `waiting`). */
+  step_ms: number;
+  /**
+   * How far past the push's instant the engine had simulated. A message still queued at the
+   * instant is known only if the engine has run past the moment it leaves, so a lead of a step or
+   * two (a kernel slower than real time) can under-count `depth`.
+   */
+  kernel_lead_ms?: number;
   window_ms: number;
   drop_window_ms: number;
   source: string;

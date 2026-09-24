@@ -1466,7 +1466,7 @@ impl Projector {
             over_capacity: BTreeSet::new(),
             unmapped_nodes: BTreeSet::new(),
             unnamed_metrics: BTreeSet::new(),
-            feed: crate::feed::FeedStore::new(),
+            feed: crate::feed::FeedStore::new(step_ns),
             unprojected_channels: BTreeSet::new(),
             undecodable_channels: BTreeMap::new(),
             links: BTreeMap::new(),
@@ -3652,6 +3652,17 @@ impl Engine for LiveEngine {
             self.last_telemetry.get(&node),
         );
         feed["reset"] = json!(reset);
+        // How far past the shown instant the kernel has run. A message's record is written
+        // when its journey ends, so one still in a queue at the shown instant is known only if
+        // the kernel has passed the instant it leaves; with a kernel slower than real time the
+        // lead is a step or two and the queue view says so rather than reading as idle.
+        feed["queues"]["kernel_lead_ms"] = json!(
+            (self
+                .produced
+                .saturating_mul(self.step_ns())
+                .saturating_sub(now) as f64)
+                / 1e6
+        );
         Some(feed)
     }
 }

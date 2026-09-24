@@ -19,6 +19,8 @@ import {
   VWP_NOTIFICATIONS,
   parseNodeFeed,
   type FeedQueue,
+  type FeedQueues,
+  type FeedWaiting,
   type FeedReceived,
   type FeedSent,
   type NodeFeedNotification,
@@ -40,9 +42,11 @@ const RECEIVED_DELIVERED = [
   "from", "dist_m", "decoded",
 ] as const satisfies readonly (keyof FeedReceived)[];
 const QUEUE = [
-  "id", "label", "what", "depth", "in_service", "served", "wait_p50_ms", "wait_p95_ms", "drops", "waiting", "waiting_omitted",
-  "reported_depth",
+  "id", "label", "what", "depth", "peak", "in_service", "served", "wait_p50_ms", "wait_p95_ms", "drops", "waiting",
+  "waiting_omitted", "reported_depth",
 ] as const satisfies readonly (keyof FeedQueue)[];
+const QUEUES = ["t_ns", "step_ms", "kernel_lead_ms", "window_ms", "drop_window_ms", "source", "list"] as const satisfies readonly (keyof FeedQueues)[];
+const WAITING = ["msg", "type", "from", "enqueued_ns", "left_ns", "waited_ms", "stage"] as const satisfies readonly (keyof FeedWaiting)[];
 
 const keys = (o: unknown): string[] => Object.keys(o as Record<string, unknown>).sort();
 
@@ -67,6 +71,10 @@ describe("node.feed v1 — the shared vector", () => {
       expect(keys(q).filter((k) => k !== "drops_note")).toEqual([...QUEUE].sort());
     }
     expect(v.queues.list.map((q) => q.id)).toEqual(["rx", "verify", "app", "tx", "crl"]);
+    expect(keys(v.queues)).toEqual([...QUEUES].sort());
+    const tx = v.queues.list.find((q) => q.id === "tx");
+    expect(tx?.waiting.length, "the vector's transmit queue lists the frame that waited in the step").toBeGreaterThan(0);
+    expect(keys(tx?.waiting[0])).toEqual([...WAITING].sort());
   });
 
   it("decodes a BSM whose spans tile its SPDU and whose signer is the frame's pseudonym", () => {
