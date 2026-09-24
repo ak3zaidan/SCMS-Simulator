@@ -360,6 +360,9 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_pong = Instant::now();
+    // When this connection last pushed a `node.feed`. The feed is paced on the transport's
+    // clock (§1.5's kind of wall time): how often a client is told moves no simulated value.
+    let mut last_feed: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -470,6 +473,14 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
                                 return;
                             }
                         }
+                        if let Some(notice) = feed_push(&state, &mut session, &mut last_feed)
+                            && socket
+                                .send(Message::Text(notice.to_string().into()))
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         // §1.5: the connection fell behind. A resync keyframe is owed, and
@@ -514,6 +525,28 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
             }
         }
     }
+}
+
+/// The `node.feed` notification owed now, if the connection has a feed subscription and
+/// its pacing interval has passed (vwp-v1 §6.7, §6.14).
+///
+/// Each push carries what the followed node sent and resolved since the last one, bounded
+/// by the subscription's limits with the number left out, and the node's queues at the
+/// stream's instant. A push with nothing new is still sent — the queues move while a
+/// vehicle is silent — but never faster than the subscription's rate.
+fn feed_push(state: &AppState, session: &mut Session, last: &mut Option<Instant>) -> Option<Value> {
+    let sub = session.feed()?.clone();
+    let period = WallDuration::from_secs_f64(1.0 / sub.hz.max(0.2));
+    if last.is_some_and(|at| at.elapsed() < period) {
+        return None;
+    }
+    *last = Some(Instant::now());
+    let gt = !session.profile().is_node_only();
+    let params = state.run.node_feed(sub.node, sub.after, &sub.limits, gt)?;
+    if let Some(t) = params["t_ns"].as_u64() {
+        session.feed_covered(t);
+    }
+    Some(rpc::notification("node.feed", params))
 }
 
 /// Moves a connection onto the run's new generation: a fresh `Hello`, then the state at

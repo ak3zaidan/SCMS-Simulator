@@ -185,6 +185,9 @@ struct RawStep {
     index: u64,
     /// Every record the engine emitted in this step, in the order it emitted them.
     records: Vec<OwnedRecord>,
+    /// The octets of every frame put on the air in this step, by message id
+    /// (`RunRecorder::tap_frame`). Not records: nothing recorded or digested sees them.
+    taps: Vec<(u64, Arc<[u8]>)>,
 }
 
 /// What the host thread reports.
@@ -449,8 +452,8 @@ impl Drop for Host {
 /// with no idea why.
 struct StepRecorder {
     step_ns: u64,
-    /// The step being accumulated, and its records.
-    current: Option<(u64, Vec<OwnedRecord>)>,
+    /// The step being accumulated, its records and its tapped frames.
+    current: Option<(u64, Vec<OwnedRecord>, Vec<(u64, Arc<[u8]>)>)>,
     /// The last step index that was handed over, so the empty ones between can be filled.
     emitted_through: Option<u64>,
     /// The final step index of the run, from the scenario horizon.
@@ -466,17 +469,22 @@ struct StepRecorder {
 
 impl StepRecorder {
     /// Hands `index` over as a complete step, with every empty step before it.
-    fn hand_over(&mut self, index: u64, records: Vec<OwnedRecord>) {
+    fn hand_over(&mut self, index: u64, records: Vec<OwnedRecord>, taps: Vec<(u64, Arc<[u8]>)>) {
         let first = self.emitted_through.map_or(0, |e| e + 1);
         for empty in first..index {
             if !self.send(RawStep {
                 index: empty,
                 records: Vec::new(),
+                taps: Vec::new(),
             }) {
                 return;
             }
         }
-        let _ = self.send(RawStep { index, records });
+        let _ = self.send(RawStep {
+            index,
+            records,
+            taps,
+        });
     }
 
     /// Blocks until the transport takes the step. Returns `false` once closed.
@@ -515,14 +523,15 @@ impl StepRecorder {
 
     /// Closes the last step and every empty step up to the horizon.
     fn finish(&mut self) {
-        if let Some((index, records)) = self.current.take() {
-            self.hand_over(index, records);
+        if let Some((index, records, taps)) = self.current.take() {
+            self.hand_over(index, records, taps);
         }
         let first = self.emitted_through.map_or(0, |e| e + 1);
         for empty in first..=self.last_index {
             if !self.send(RawStep {
                 index: empty,
                 records: Vec::new(),
+                taps: Vec::new(),
             }) {
                 break;
             }
@@ -530,6 +539,26 @@ impl StepRecorder {
         if let Some(writer) = self.recording.take() {
             let _ = writer.finish();
         }
+    }
+}
+
+impl StepRecorder {
+    /// The accumulator of step `index`, handing the previous step over when the instant
+    /// has crossed into a new one.
+    fn step_at(&mut self, index: u64) -> (&mut Vec<OwnedRecord>, &mut Vec<(u64, Arc<[u8]>)>) {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|(current, _, _)| *current != index)
+        {
+            if let Some((current, records, taps)) = self.current.take() {
+                self.hand_over(current, records, taps);
+            }
+        }
+        let (_, records, taps) = self
+            .current
+            .get_or_insert_with(|| (index, Vec::new(), Vec::new()));
+        (records, taps)
     }
 }
 
@@ -544,15 +573,15 @@ impl v2xw_engine::RunRecorder for StepRecorder {
             return;
         }
         let index = at / self.step_ns.max(1);
-        match &mut self.current {
-            Some((current, records)) if *current == index => records.push(record.clone()),
-            Some(_) => {
-                let (current, records) = self.current.take().unwrap_or((index, Vec::new()));
-                self.hand_over(current, records);
-                self.current = Some((index, vec![record.clone()]));
-            }
-            None => self.current = Some((index, vec![record.clone()])),
+        self.step_at(index).0.push(record.clone());
+    }
+
+    fn tap_frame(&mut self, at: SimTime, _node: v2xw_core::ids::NodeId, msg: u64, spdu: &[u8]) {
+        if self.closed {
+            return;
         }
+        let index = at / self.step_ns.max(1);
+        self.step_at(index).1.push((msg, Arc::from(spdu)));
     }
 
     // Forwarded, not defaulted. `RunRecorder::write_wire_frame` discards by default so a
@@ -1362,16 +1391,9 @@ struct Projector {
     unmapped_nodes: BTreeSet<u32>,
     /// Metric names the stream carried that the symbol table does not hold.
     unnamed_metrics: BTreeSet<String>,
-    /// Per node, the most recent frames it put on the air and the most recent receptions
-    /// it resolved, as the evidence `inspect.node`'s `messages` section shows for a
-    /// followed vehicle. Bounded at [`MESSAGE_LOG`] each.
-    messages: BTreeMap<
-        NodeId,
-        (
-            std::collections::VecDeque<Value>,
-            std::collections::VecDeque<Value>,
-        ),
-    >,
+    /// Every node's recent traffic, for the followed node's message feed and queues and for
+    /// `inspect.node`'s `messages` section (`crate::feed`).
+    feed: crate::feed::FeedStore,
     /// Channels seen in the stream that this projector has no §3.6 payload for.
     unprojected_channels: BTreeSet<String>,
     /// Channels whose records the channel's own reader-side view could not decode.
@@ -1444,7 +1466,7 @@ impl Projector {
             over_capacity: BTreeSet::new(),
             unmapped_nodes: BTreeSet::new(),
             unnamed_metrics: BTreeSet::new(),
-            messages: BTreeMap::new(),
+            feed: crate::feed::FeedStore::new(),
             unprojected_channels: BTreeSet::new(),
             undecodable_channels: BTreeMap::new(),
             links: BTreeMap::new(),
@@ -1530,6 +1552,9 @@ impl Projector {
         if !kinematics.is_empty() {
             self.absorb(raw.index, t, &kinematics);
         }
+        for (msg, spdu) in &raw.taps {
+            self.feed.tap(*msg, Arc::clone(spdu));
+        }
 
         for record in &raw.records {
             match record.channel {
@@ -1548,7 +1573,7 @@ impl Projector {
                         if let Some(power) = view.power_dbm {
                             counters.tx_power_cdbm = Some((power * 100.0).round() as i16);
                         }
-                        self.log_message(view.node, true, sent_json(&view));
+                        self.feed.on_tx(&view);
                         events.push(EventEntry {
                             sim_time_ns: t,
                             channel_id: 10,
@@ -1676,20 +1701,10 @@ impl Projector {
                 // One reception attempt's fate, a backend flow's latency trace and a
                 // transfer's byte accounting are recording and metric channels: the stream
                 // carries what they measure as metric samples, not as §3.6 payloads.
-                "node.rx" => {
-                    // The evidence is what the radio decoded: a delivery, or a loss above the
-                    // PHY. The PHY's own losses — most of them a distant frame below
-                    // sensitivity — are on `phy.rx` and in the link view.
-                    if let Ok(view) = decode::<NodeRxView>(record)
-                        && (view.outcome == v2xw_metrics::channels::RxFate::Delivered
-                            || !view
-                                .cause
-                                .as_deref()
-                                .is_some_and(v2xw_metrics::channels::rx_cause::is_phy))
-                    {
-                        self.log_message(view.rx, false, received_json(&view));
-                    }
-                }
+                "node.rx" => match decode::<NodeRxView>(record) {
+                    Err(_) => self.undecodable(record.channel),
+                    Ok(view) => self.feed.on_rx(&view),
+                },
                 "msg.latency" | "net.bytes" => {}
                 "metric.sample" => match serde_json::from_slice::<MetricSample>(&record.json) {
                     Ok(sample) => self.push_metric(&sample, &mut metrics),
@@ -1742,6 +1757,7 @@ impl Projector {
             Vec::new()
         };
 
+        self.feed.end_step();
         events.sort_by_key(|e| (e.sim_time_ns, e.channel_id));
         StepOutput {
             sim_time: t,
@@ -1754,16 +1770,6 @@ impl Projector {
             recorded: Vec::new(),
             generation: 0,
         }
-    }
-
-    /// Appends one message to a node's evidence log, dropping the oldest past the bound.
-    fn log_message(&mut self, node: NodeId, sent: bool, entry: Value) {
-        let (tx, rx) = self.messages.entry(node).or_default();
-        let log = if sent { tx } else { rx };
-        if log.len() >= MESSAGE_LOG {
-            log.pop_front();
-        }
-        log.push_back(entry);
     }
 
     /// Counts one record its channel's own reader-side view refused.
@@ -2010,67 +2016,6 @@ impl Projector {
         out.sort_by_key(|r| (r.str_metric, r.node_id));
         out.dedup_by_key(|r| (r.str_metric, r.node_id));
     }
-}
-
-/// How many sent and how many received messages a node's evidence log keeps.
-///
-/// The log is filled as steps are absorbed, which is up to [`LiveOptions::lookahead_steps`]
-/// ahead of the stream plus the host channel's own lookahead, and read at the stream's
-/// instant, so it has to hold that lead and some history behind it: 384 frames is 38 s of
-/// a 10 Hz sender, and 384 receptions about 13 s at the 30 a second a dense street gives.
-const MESSAGE_LOG: usize = 384;
-
-/// One transmitted frame as a followed vehicle's evidence: what it was and every octet
-/// of it by layer, and when it was generated, signed and put on the air.
-fn sent_json(v: &NodeTxView) -> Value {
-    json!({
-        "t_ns": v.t,
-        "msg": v.msg,
-        "msg_type": v.msg_type,
-        "bytes_on_wire": v.bytes_on_wire,
-        "payload_bytes": v.payload_bytes,
-        "envelope_bytes": v.envelope_bytes,
-        "cert_bytes": v.cert_bytes,
-        "net_header_bytes": v.net_header_bytes,
-        "link_bytes": v.link_bytes,
-        "airtime_us": v.airtime_us,
-        "power_dbm": v.power_dbm,
-        "signer": v.signer,
-        "t_generated_ns": v.t_generated,
-        "t_signed_ns": v.t_signed,
-        "channel": v.channel,
-        "pseudonym": v.pseudonym,
-        "content": v.content,
-    })
-}
-
-/// One reception as a followed vehicle's evidence: from whom, what it measured, what
-/// became of it, and — when it reached an application — its delay stage by stage, in ms.
-fn received_json(v: &NodeRxView) -> Value {
-    let stages: serde_json::Map<String, Value> = v
-        .latency_trace()
-        .map(|t| {
-            t.stage_ns()
-                .into_iter()
-                .map(|(k, ns)| (k, json!((ns as f64) / 1e6)))
-                .collect()
-        })
-        .unwrap_or_default();
-    json!({
-        "t_ns": v.t,
-        "msg": v.msg,
-        "from": v.tx,
-        "msg_type": v.msg_type,
-        "outcome": v.outcome,
-        "cause": v.cause,
-        "verification": v.verification,
-        "rssi_dbm": v.rssi_dbm,
-        "sinr_db": v.sinr_db,
-        "dist_m": v.dist_m,
-        "bytes_on_wire": v.bytes_on_wire,
-        "e2e_ms": v.e2e_ns().map(|ns| (ns as f64) / 1e6),
-        "stages_ms": stages,
-    })
 }
 
 /// `MovementPhaseState` (SAE J2735) for a world signal state.
@@ -3484,6 +3429,9 @@ impl Engine for LiveEngine {
                 self.last_telemetry.insert(row.node_id, *row);
             }
             self.intern_labels(out);
+            self.projector
+                .feed
+                .prune(out.sim_time.saturating_sub(crate::feed::HISTORY_NS));
         }
         if let Some(out) = &out
             && out.end_of_run
@@ -3677,7 +3625,34 @@ impl Engine for LiveEngine {
             },
             "retained_steps": self.timeline.len(),
             "retain_limit_steps": self.options.retain_steps,
+            "feed_store": {
+                "frames": self.projector.feed.size().0,
+                "receptions": self.projector.feed.size().1,
+            },
         })
+    }
+
+    fn node_feed(
+        &self,
+        node: u32,
+        after: Option<SimTime>,
+        limits: &crate::feed::FeedLimits,
+        gt: bool,
+    ) -> Option<Value> {
+        let now = self.sim_time();
+        // A backward seek puts the stream before the last push: start over.
+        let reset = after.is_none_or(|a| a > now);
+        let after = if reset { None } else { after };
+        let mut feed = self.projector.feed.feed_json(
+            node,
+            after,
+            now,
+            limits,
+            gt,
+            self.last_telemetry.get(&node),
+        );
+        feed["reset"] = json!(reset);
+        Some(feed)
     }
 }
 
@@ -3820,23 +3795,24 @@ impl Introspect for LiveEngine {
             }
             return Some(Value::Array(rows));
         }
-        // `messages`: what this node most recently sent and received, message by message —
-        // each frame's layers and stamps, each reception's fate, cause and decomposed
-        // delay. Answered from the projector's log, so it needs no telemetry window.
+        // `messages`: what this node most recently sent and received, message by message,
+        // each one decoded from its octets. Answered from the feed store, so it needs no
+        // telemetry window.
         if section == "messages" {
-            let (sent, received) = self.projector.messages.get(&NodeId::new(node))?;
-            let now = self.sim_time();
-            let pick = |log: &std::collections::VecDeque<Value>| -> Vec<Value> {
-                let mut v: Vec<Value> = log
-                    .iter()
-                    .filter(|e| e["t_ns"].as_u64().is_none_or(|t| t <= now))
-                    .cloned()
-                    .collect();
-                let skip = v.len().saturating_sub(limit);
-                v.drain(..skip);
-                v
-            };
-            return Some(json!({ "sent": pick(sent), "received": pick(received) }));
+            return self
+                .projector
+                .feed
+                .messages_json(node, self.sim_time(), limit, true);
+        }
+        // `queues`: the five queues at the stream's instant, reconstructed from the node's
+        // own stamps, with its telemetry window's depth percentiles beside them.
+        if section == "queues" {
+            return Some(self.projector.feed.queues_json(
+                node,
+                self.sim_time(),
+                self.last_telemetry.get(&node),
+                limit,
+            ));
         }
         let telemetry = self.last_telemetry.get(&node)?;
         match section {

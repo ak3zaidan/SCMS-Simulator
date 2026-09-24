@@ -62,8 +62,11 @@ pub const METHODS: [&str; 33] = [
 /// The three methods that need a connection to act on (§6.2).
 pub const CONNECTION_SCOPED: [&str; 3] = ["view.follow", "view.camera", "overlay.set"];
 
-/// The eight notification names of §6.14.
-pub const NOTIFICATIONS: [&str; 8] = [
+/// The nine notification names of §6.14.
+///
+/// `node.feed` was added in v1.1 (additive, §8.4): the followed node's messages and queues,
+/// pushed only while a `view.follow {feed}` subscription stands.
+pub const NOTIFICATIONS: [&str; 9] = [
     "run.state",
     "stream.drop",
     "job.progress",
@@ -72,6 +75,7 @@ pub const NOTIFICATIONS: [&str; 8] = [
     "log",
     "validation",
     "experiment.progress",
+    "node.feed",
 ];
 
 /// What a dispatched call produced.
@@ -651,6 +655,7 @@ fn view_follow(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome>
         _ => Vec::new(),
     };
     let camera = text(p, "camera").map(str::to_string);
+    let feed = feed_param(p)?;
     let session = ctx.session.as_deref_mut().expect("checked in dispatch");
     let subscribed = session.follow(node, clear, telemetry, &extra);
     let mut result = json!({
@@ -660,7 +665,124 @@ fn view_follow(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome>
     if let Some(mode) = camera {
         result["camera"] = json!(mode);
     }
-    Ok(Outcome::of(result))
+    let mut notifications = Vec::new();
+    match (feed, session.following()) {
+        (Some(Some((limits, hz))), Some(node)) => {
+            // The first push is the node's kept history, sent after the reply so the
+            // client knows the subscription stands before its first notification.
+            let gt = !session.profile().is_node_only();
+            match ctx.run.node_feed(node, None, &limits, gt) {
+                Some(first) => {
+                    session.set_feed(Some(crate::session::FeedSub {
+                        node,
+                        limits,
+                        hz,
+                        after: first["t_ns"].as_u64(),
+                    }));
+                    result["feed"] = json!({
+                        "v": crate::feed::FEED_VERSION,
+                        "available": true,
+                        "hz": hz,
+                        "sent": limits.sent,
+                        "received": limits.received,
+                        "waiting": limits.waiting,
+                        "bytes": limits.bytes,
+                    });
+                    notifications.push(notification("node.feed", first));
+                }
+                None => {
+                    session.set_feed(None);
+                    result["feed"] = json!({
+                        "v": crate::feed::FEED_VERSION,
+                        "available": false,
+                        "reason": "this engine produces no message feed: the fixture \
+                                   synthesises no frames and a recording carries no octets",
+                    });
+                }
+            }
+        }
+        (Some(None), _) => session.set_feed(None),
+        _ => {}
+    }
+    Ok(Outcome {
+        result,
+        notifications,
+        ..Default::default()
+    })
+}
+
+/// `view.follow`'s `feed` parameter: absent (leave the subscription as it is), `false`
+/// (drop it), `true` (the default limits) or an object of limits. `Some(None)` drops the
+/// subscription and `Some(Some(..))` makes one.
+#[allow(clippy::type_complexity)]
+fn feed_param(p: &Map<String, Value>) -> Result<Option<Option<(crate::feed::FeedLimits, f64)>>> {
+    let Some(v) = p.get("feed") else {
+        return Ok(None);
+    };
+    let mut limits = crate::feed::FeedLimits::default();
+    let mut hz = 4.0;
+    match v {
+        Value::Bool(false) => return Ok(Some(None)),
+        Value::Bool(true) => {}
+        Value::Object(o) => {
+            for key in o.keys() {
+                if !["sent", "received", "waiting", "bytes", "hz"].contains(&key.as_str()) {
+                    return Err(ServerError::param(
+                        &format!("/feed/{key}"),
+                        "is not a feed option",
+                        "the options are sent, received, waiting, bytes and hz",
+                    ));
+                }
+            }
+            let int = |key: &str, max: u64| -> Result<Option<usize>> {
+                match o.get(key) {
+                    None => Ok(None),
+                    Some(x) => match x.as_u64() {
+                        Some(n) if n <= max => Ok(Some(n as usize)),
+                        _ => Err(ServerError::param(
+                            &format!("/feed/{key}"),
+                            &format!("must be an integer in 0..={max}"),
+                            "omit it for the default",
+                        )),
+                    },
+                }
+            };
+            if let Some(n) = int("sent", 200)? {
+                limits.sent = n;
+            }
+            if let Some(n) = int("received", 500)? {
+                limits.received = n;
+            }
+            if let Some(n) = int("waiting", 100)? {
+                limits.waiting = n;
+            }
+            if let Some(b) = o.get("bytes") {
+                limits.bytes = b.as_bool().ok_or_else(|| {
+                    ServerError::param("/feed/bytes", "must be a boolean", "omit it for `true`")
+                })?;
+            }
+            if let Some(h) = o.get("hz") {
+                hz = h
+                    .as_f64()
+                    .filter(|h| (0.2..=20.0).contains(h))
+                    .ok_or_else(|| {
+                        ServerError::param(
+                            "/feed/hz",
+                            "must be a number in 0.2..=20",
+                            "omit it for 4 pushes a second",
+                        )
+                    })?;
+            }
+        }
+        _ => {
+            return Err(ServerError::param(
+                "/feed",
+                "must be a boolean or an object",
+                "pass true, false or {\"sent\": 20, \"received\": 40, \"hz\": 4}",
+            ));
+        }
+    }
+    Ok(Some(Some((limits, hz))))
 }
 
 fn view_camera(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
@@ -815,12 +937,28 @@ fn inspect_node(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome
         ]
     };
     let limit = bounded(p, "limit", 1.0, 1_000.0, 50.0)? as usize;
-    let value = ctx.run.query(&Query::Node {
+    let mut value = ctx.run.query(&Query::Node {
         node,
         t_ns: uint(p, "t_ns"),
         include,
         limit,
     })?;
+    if ctx
+        .session
+        .as_ref()
+        .is_some_and(|s| s.profile().is_node_only())
+        && let Some(rows) = value
+            .pointer_mut("/messages/received")
+            .and_then(Value::as_array_mut)
+    {
+        // §5.2: the true sender and the true distance are ground truth.
+        for row in rows {
+            if let Some(obj) = row.as_object_mut() {
+                obj.remove("from");
+                obj.remove("dist_m");
+            }
+        }
+    }
     Ok(Outcome::of(value))
 }
 

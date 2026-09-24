@@ -225,6 +225,24 @@ pub struct StepEffects {
     pub fatal: bool,
 }
 
+/// A connection's `node.feed` subscription (vwp-v1 §6.7 `view.follow {feed}`).
+///
+/// The feed is the followed node's messages and queues, pushed as a JSON-RPC notification
+/// while the node is followed and only then. `after` is the stream instant the last push
+/// covered, so each push carries what is new; the transport paces pushes at `hz` on its own
+/// clock, which is a transport concern and moves no simulated quantity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeedSub {
+    /// The node whose feed this is: always the followed node.
+    pub node: u32,
+    /// What one push carries.
+    pub limits: crate::feed::FeedLimits,
+    /// The most pushes per wall-clock second.
+    pub hz: f64,
+    /// The stream instant the last push covered.
+    pub after: Option<SimTime>,
+}
+
 /// One client connection.
 #[derive(Debug)]
 pub struct Session {
@@ -261,6 +279,8 @@ pub struct Session {
     camera: CameraState,
     /// The node `view.follow` is following.
     following: Option<u32>,
+    /// The followed node's `node.feed` subscription, while there is one.
+    feed: Option<FeedSub>,
     /// True once §1.5 says a resync keyframe is owed.
     resync_pending: bool,
     /// Drops not yet reported in a `stream.drop` notification.
@@ -314,6 +334,7 @@ impl Session {
             opacity: BTreeMap::new(),
             camera: CameraState::default(),
             following: None,
+            feed: None,
             resync_pending: false,
             pending_drops: DropCounts::default(),
             drop_span: None,
@@ -458,6 +479,23 @@ impl Session {
     /// The node being followed, if any.
     pub fn following(&self) -> Option<u32> {
         self.following
+    }
+
+    /// The `node.feed` subscription, if the followed node has one.
+    pub fn feed(&self) -> Option<&FeedSub> {
+        self.feed.as_ref()
+    }
+
+    /// Subscribes the followed node to `node.feed`, or drops the subscription.
+    pub fn set_feed(&mut self, feed: Option<FeedSub>) {
+        self.feed = feed.filter(|f| Some(f.node) == self.following);
+    }
+
+    /// Records that a push covered the stream up to `t`.
+    pub fn feed_covered(&mut self, t: SimTime) {
+        if let Some(f) = &mut self.feed {
+            f.after = Some(t);
+        }
     }
 
     /// The nodes subscribed to telemetry, in id order.
@@ -1007,10 +1045,16 @@ impl Session {
     ) -> Vec<u32> {
         if clear {
             self.following = None;
+            self.feed = None;
             self.telemetry_nodes.clear();
             return Vec::new();
         }
         if let Some(node) = node {
+            if self.following != Some(node) {
+                // The feed follows the node, never outlives it: a feed subscribed for the
+                // previous vehicle is not this one's.
+                self.feed = None;
+            }
             self.following = Some(node);
             if telemetry {
                 self.telemetry_nodes.insert(node);

@@ -228,6 +228,17 @@ impl Run {
         self.engine.lock().query(query)
     }
 
+    /// The followed node's message feed; see [`crate::engine::Engine::node_feed`].
+    pub fn node_feed(
+        &self,
+        node: u32,
+        after: Option<SimTime>,
+        limits: &crate::feed::FeedLimits,
+        gt: bool,
+    ) -> Option<Value> {
+        self.engine.lock().node_feed(node, after, limits, gt)
+    }
+
     /// Advances one step and broadcasts what it produced.
     ///
     /// Returns `false` at the end of the run. Called from the producer task while the run
