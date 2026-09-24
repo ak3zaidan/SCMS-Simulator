@@ -69,6 +69,25 @@ pub trait RunRecorder {
         let _ = frame;
     }
 
+    /// The octets of one frame that went on the air: the signed IEEE 1609.2 SPDU exactly as
+    /// the node's security stack built it, handed over beside the `node.tx` record for the
+    /// same frame (`msg` is that record's message id) and at the same instant.
+    ///
+    /// **A tap, not a record.** It is not written to a recording, it is not counted in the
+    /// run report and it is not part of any digest, so the determinism contract is not
+    /// touched: a recorder that ignores it (the default) sees a byte-identical record stream.
+    /// It exists for a viewer — the chase view's message inspector decodes these octets with
+    /// the real 1609.2 and J2735/ETSI decoders rather than printing what the sender believed
+    /// it had encoded — and every frame's bytes are already in memory at this point, so the
+    /// cost of calling it is one virtual call per transmitted frame.
+    ///
+    /// Only frames the node itself encoded and signed arrive here. A frame the engine sized
+    /// from a protocol table (a misbehaviour report, a CRL broadcast) has no octets and is
+    /// not tapped.
+    fn tap_frame(&mut self, at: SimTime, node: v2xw_core::ids::NodeId, msg: u64, spdu: &[u8]) {
+        let _ = (at, node, msg, spdu);
+    }
+
     /// How many records were refused, for the run report.
     fn refused(&self) -> u64 {
         0
