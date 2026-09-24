@@ -176,7 +176,7 @@ export const PHASE1_FIELDS: readonly FormField[] = [
   { pointer: "/actors/vru/pedestrians", label: "Pedestrians", group: "Traffic", kind: "integer", min: 0, help: "Walking road users. Counted separately because they move differently and are the hardest to detect." },
   { pointer: "/actors/vru/cyclists", label: "Cyclists", group: "Traffic", kind: "integer", min: 0 },
 
-  { pointer: "/radio/rat", label: "Radio technology", group: "Radio", kind: "enum", options: ["dsrc-80211p", "c-v2x-pc5", "nr-v2x", "both"], help: "Which radio the vehicles use to talk to one another." },
+  { pointer: "/radio/rat", label: "Radio technology", group: "Radio", kind: "enum", options: ["dsrc-80211p", "lte-v2x-pc5", "nr-v2x-pc5"], help: "Which radio the vehicles use to talk to one another: 802.11p (DSRC), or the LTE or 5G NR sidelink (PC5)." },
   { pointer: "/radio/tiers/phy", label: "Signal detail", group: "Radio", kind: "enum", options: ["abstract", "medium", "high"], help: "How carefully the radio signal itself is modelled. The most detailed setting also requires the most detailed channel-access model below." },
   { pointer: "/radio/tiers/mac", label: "Channel-access detail", group: "Radio", kind: "enum", options: ["abstract", "medium", "high"], help: "How carefully vehicles taking turns on a shared channel is modelled." },
   { pointer: "/radio/tiers/propagation", label: "Propagation detail", group: "Radio", kind: "enum", options: ["abstract", "medium", "high"], help: "How carefully the signal's path through the streets and around buildings is modelled." },
