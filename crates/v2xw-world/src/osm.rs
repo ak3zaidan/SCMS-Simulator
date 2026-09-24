@@ -8356,14 +8356,27 @@ pub fn card() -> ModelCard {
             ),
             Equation::new(
                 "junction trim",
-                "each approach is cut back by r_j = clamp(max incident W/2, 1 m, 25 m)",
+                "each approach is cut back by r_j = clamp(max incident W/2 (+ 4.2 m stop-line \
+                 setback at 3+ arms), 1 m, 25 m); then each edge end is pulled back by up to \
+                 7 m until every turn has R tan(theta/2) of tangent, R = 6.4 m (AASHTO P)",
             ),
             Equation::new(
                 "connector",
-                "quadratic Bezier through the meeting point of the two tangent lines, \
-                 sampled at 7 points",
+                "the corner of the two tangent lines rounded into the largest circular arc \
+                 between the lane ends (AASHTO simple curve), sampled every 6 deg; parallel \
+                 offset lanes take a reverse curve; motor lane vertices rounded the same way \
+                 up to R = 50 m",
             ),
-            Equation::new("amber", "y = t + v / (2 a), clamped to [3, 6] s"),
+            Equation::new(
+                "amber",
+                "per phase group, y = t + v / (2a + 2 G g) with t = 1 s, a = 3 m/s^2, G the \
+                 approach grade, clamped to [3, 6] s (ITE 2020; MUTCD 2009 4D.26)",
+            ),
+            Equation::new(
+                "all-red",
+                "per phase group, r = (W + L) / v with W the connector length, L = 6.1 m, at \
+                 most 6 s (ITE 2020; MUTCD 2009 4D.26)",
+            ),
             Equation::new(
                 "building height",
                 "height tag; else building:levels x metres_per_level; else default_height_m; \
