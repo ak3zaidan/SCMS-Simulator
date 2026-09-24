@@ -614,6 +614,12 @@ after despawn so that a late delta cannot be misapplied.
 | 11 | `u8[A]` | `verified_neighbors` | count of neighbours in state *verified*, saturating at 255 | NODE |
 | 12 | `u8[A]` | `flags8` | reserved, 0 | — |
 
+**The pose is the body's centre.** `x_mm`/`y_mm`/`z_cm` locate the centre of the class's
+bounding box (§4 class table `length_m` × `width_m`), not the kinematic reference point the
+recording's `gt.kinematics` carries (the rear-axle reference, taken at the rear bumper). The
+server moves it half the class's length forward along `heading_brad`, so a client draws the
+body centred on the pose. A recording read directly keeps the reference point.
+
 #### 3.3.3 Signal block (`signal_count = S`, 8·S bytes, 4-aligned)
 
 | # | Type | Column | Meaning |

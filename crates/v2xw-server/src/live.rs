@@ -259,6 +259,26 @@ struct WorldMemo {
     bytes: Vec<u8>,
 }
 
+/// Where a vehicle's body is centred, from the reference point mobility publishes.
+///
+/// `gt.kinematics` carries the rear-axle reference, taken at the rear bumper
+/// (`v2xw_mobility::engine`, "The reference point"), with the heading along the body. A
+/// renderer draws a body centred on the pose it is given, so streaming the reference point
+/// as it is drew every vehicle half a length behind where it is: stopped well short of its
+/// stop line, and swung outwards through a turn. The stream's pose is therefore the body's
+/// centre, half the class's length ahead of the reference along the heading. The recording
+/// and every metric keep the reference point; this is the display projection only.
+fn body_centre(reference: [f64; 3], heading_rad: f64, class_idx: u8) -> [f64; 3] {
+    let half = VehicleClass::ALL
+        .get(usize::from(class_idx))
+        .map_or(0.0, |c| c.spec().length_m * 0.5);
+    [
+        reference[0] + half * v2xw_core::math::cos(heading_rad),
+        reference[1] + half * v2xw_core::math::sin(heading_rad),
+        reference[2],
+    ]
+}
+
 /// Every signal *group*'s timeline, flattened for evaluation without the world: one entry
 /// per group of heads, keyed by [`v2xw_world::signal_group_wire_id`].
 ///
@@ -1683,7 +1703,7 @@ impl Projector {
                 slot,
                 actor: *actor,
                 node: live.node,
-                pos_m: live.pos_m,
+                pos_m: body_centre(live.pos_m, live.heading_rad, live.class_idx),
                 heading_rad: live.heading_rad,
                 speed_mps: live.speed_mps,
                 accel_mps2: live.accel_mps2,
@@ -4021,6 +4041,28 @@ mod signal_stream_tests {
                 })
                 .count();
             assert!(greens <= 1, "{greens} groups green at {t_s} s");
+        }
+    }
+}
+
+#[cfg(test)]
+mod body_centre_tests {
+    use super::body_centre;
+    use v2xw_mobility::VehicleClass;
+
+    /// A car heading north-east draws half its length ahead of its reference point, and a
+    /// longer class further ahead, so a car stopped with its bumper on the line is drawn
+    /// short of it by nothing.
+    #[test]
+    fn the_streamed_pose_is_half_a_length_ahead_of_the_reference() {
+        for (i, class) in VehicleClass::ALL.iter().enumerate() {
+            let half = class.spec().length_m * 0.5;
+            let h = core::f64::consts::FRAC_PI_4;
+            let c = body_centre([10.0, 20.0, 1.5], h, u8::try_from(i).unwrap());
+            assert!((c[0] - (10.0 + half * h.cos())).abs() < 1e-9, "{class:?} x");
+            assert!((c[1] - (20.0 + half * h.sin())).abs() < 1e-9, "{class:?} y");
+            assert!((c[2] - 1.5).abs() < 1e-12, "{class:?} keeps its height");
+            assert!(half > 0.0, "{class:?} has a length");
         }
     }
 }
