@@ -180,7 +180,24 @@ impl NodeTx {
             cert_bytes: None,
             pseudonym: None,
             content: None,
+            radio: None,
         })
+    }
+
+    /// Fills in how the access layer sent the frame.
+    #[must_use]
+    ///
+    /// `mcs_index` is the index in the technology's own table — the 802.11 OFDM rate index
+    /// (0 = 3 Mbit/s … 7 = 27 Mbit/s at 10 MHz), the LTE MCS or the NR MCS — which is what
+    /// the `mcs` byte of the wire record carries; `radio.mcs` names the table.
+    pub fn with_radio(
+        mut self,
+        mcs_index: Option<u8>,
+        radio: Option<v2xw_metrics::channels::TxRadioView>,
+    ) -> Self {
+        self.0.mcs = mcs_index;
+        self.0.radio = radio;
+        self
     }
 
     /// Fills in which pseudonym signed the frame and what the message said.
@@ -432,7 +449,18 @@ impl PhyRx {
             dist_m: Some(q3(dist_m)),
             candidate: true,
             payload_bytes: None,
+            focus: None,
+            copies: None,
         })
+    }
+
+    /// Tags the link with its place against the focus region and, for a sidelink, the
+    /// number of copies combined.
+    #[must_use]
+    pub fn with_link_tags(mut self, focus: Option<&str>, copies: Option<u32>) -> Self {
+        self.0.focus = focus.map(str::to_string);
+        self.0.copies = copies;
+        self
     }
 }
 

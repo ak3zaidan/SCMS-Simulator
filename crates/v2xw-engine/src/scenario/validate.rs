@@ -561,10 +561,16 @@ pub static KEY_STATUS: &[KeyStatus] = &[
         path: "radio.rat",
         status: Status::Wired,
         note: "The radio access technology. dsrc-80211p runs CSMA/CA with J2945/1 \
-               congestion control on channel 172; lte-v2x-pc5 runs Mode 4 sensing-based \
-               semi-persistent scheduling on a 10 MHz, four-sub-channel pool in channel \
-               183; nr-v2x-pc5 runs Mode 2 at 30 kHz with re-evaluation and pre-emption. \
-               'hybrid' is refused: it needs a per-message policy no key states.",
+               congestion control on channel 172. lte-v2x-pc5 runs Mode 4 sensing-based \
+               semi-persistent scheduling on the SAE J3161/1 US profile: channel 183, \
+               20 MHz, ten 10-PRB sub-channels, MCS 7, probResourceKeep 0.8, and the \
+               J3161/1 CR limits enforced per CBR zone (values second-hand, via Abrar et \
+               al. 2026). nr-v2x-pc5 runs Mode 2 at 30 kHz with re-evaluation, \
+               pre-emption and the ETSI TS 103 574 CR limits, on Todisco 2021's study \
+               pool: no US NR-V2X deployment profile was found. Sensing records only \
+               decoded SCIs. 'hybrid' is refused: the radio crate's hybrid selector \
+               arbitrates a direct radio against the cellular Uu link, not 802.11p \
+               against a sidelink, and the Uu backend path is not wired.",
     },
     KeyStatus {
         path: "radio.tiers.propagation",
@@ -592,9 +598,11 @@ pub static KEY_STATUS: &[KeyStatus] = &[
         status: Status::Partial,
         note: "A region — a disc following one node, or a map box — whose links run the \
                propagation and the receiver at the focus tier (at high: weather \
-               attenuation and preamble capture). Links entering it use the surrounding \
-               propagation with no fading draw. Medium access stays one model for the \
-               whole world, and 802.11p only: a sidelink run ignores the region's PHY tier.",
+               attenuation, and 802.11p preamble capture or the sidelink's SCI stage). \
+               Links entering it use the surrounding propagation with no fading draw. \
+               Every phy.rx record is tagged inside, outside, inbound or outbound; \
+               outbound links carry the region's stated bias. Medium access stays one \
+               model for the whole world.",
     },
     KeyStatus {
         path: "radio.models",
@@ -602,8 +610,13 @@ pub static KEY_STATUS: &[KeyStatus] = &[
         note: "Picks a model per radio family, overriding the tier's default: \
                propagation (free-space, two-ray-ground, log-distance with a named preset, \
                tr37885), fading (none, nakagami-m with a preset), per (the 802.11p error \
-               model's implementation loss), phy (the 802.11p sensitivity table) and \
-               obstacle (the Sommer building row). Unknown families and ids are refused.",
+               model's implementation loss), phy (the 802.11p sensitivity table), \
+               obstacle (the Sommer building row) and sidelink \
+               (access/sidelink/engine-coupling: profile sae-j3161, \
+               molina-masegosa-2017 or todisco-2021; mcs; max_transmissions for blind \
+               HARQ retransmissions, 1-2 LTE, 1-3 NR; congestion_control \
+               etsi-ts-103-574, sae-j3161 or off). Unknown families, ids and values are \
+               refused.",
     },
     // --- network -----------------------------------------------------------
     KeyStatus {
@@ -743,9 +756,13 @@ pub static KEY_STATUS: &[KeyStatus] = &[
         path: "nodes.compute_tier",
         status: Status::Partial,
         note: "abstract: signing and verification cost a microsecond and no node is ever \
-               compute-bound. medium and high: every operation costs the hardware \
-               profile's service time and queues behind the node's servers; high adds \
-               nothing over medium yet.",
+               compute-bound. medium: every operation costs the hardware profile's \
+               service time and queues FIFO behind one CPU server and the profile's HSM \
+               (06-node-models 2.1). high: the CPU runs as the profile's cores, so \
+               software cryptography and application tasks are served in parallel; it \
+               changes nothing for a profile whose cryptography runs on its HSM. \
+               Processor sharing, priority classes and HSM latency distributions are not \
+               built.",
     },
     KeyStatus {
         path: "nodes.backend_tier",
@@ -767,11 +784,13 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus {
         path: "threats.jammers",
         status: Status::Wired,
-        note: "Fixed-position jammers: constant, pulsed (period_ms, duty) or reactive \
-               (trigger_dbm), with position_m, power_dbm and an active window. Their \
-               energy raises the noise at every receiver in range, holds 802.11p carrier \
-               sense busy, counts as channel load, and a frame they kill is reported \
-               'jammed'.",
+        note: "Jammers: constant, pulsed (period_ms, duty) or reactive (trigger_dbm), \
+               with power_dbm and an active window, placed one way: position_m (fixed), \
+               follow_node (riding a vehicle or unit) or path_m with speed_mps and \
+               loop_path (driving a polyline). Their energy raises the noise at every \
+               receiver in range, holds 802.11p carrier sense busy, counts as channel \
+               load, enters a sidelink UE's S-RSSI and CBR (and so its CR limit), and a \
+               frame they kill is reported 'jammed'.",
     },
     KeyStatus {
         path: "threats.compromised_rsus",

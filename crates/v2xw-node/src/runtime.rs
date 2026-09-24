@@ -507,6 +507,20 @@ impl ObuRuntime {
         self.service = self.service.clone().unlimited();
     }
 
+    /// Runs the node's CPU as `servers` FIFO servers.
+    ///
+    /// 06-node-models §2.1's tiers: `medium` is one CPU server and one HSM server, `high`
+    /// is `c` CPU cores — the profile's `cpu.cores`, which is what [`ObuRuntime::new`]
+    /// builds. The engine sets one at the medium compute tier.
+    pub fn set_cpu_servers(&mut self, servers: u32) {
+        self.cpu = self.cpu.clone().resized(servers);
+    }
+
+    /// How many CPU servers the node runs.
+    pub fn cpu_servers(&self) -> usize {
+        self.cpu.servers()
+    }
+
     /// Sets the cost of a parse, a detector pass or a neighbour-table task on this node's
     /// CPU — the `app_task_us` every shipped profile carries as uncalibrated.
     ///

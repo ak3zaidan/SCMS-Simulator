@@ -2041,6 +2041,11 @@ fn sent_json(v: &NodeTxView) -> Value {
         "channel": v.channel,
         "pseudonym": v.pseudonym,
         "content": v.content,
+        // How the access layer sent it: the technology's own MCS and, on a sidelink, the
+        // resource (slot, sub-channels), the HARQ transmission and the CBR/CR it was
+        // granted under.
+        "mcs": v.mcs,
+        "radio": v.radio,
     })
 }
 

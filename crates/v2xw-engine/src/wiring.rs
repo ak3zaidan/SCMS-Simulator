@@ -430,7 +430,161 @@ pub const RADIO_MODEL_FAMILIES: &[(&str, &[&str])] = &[
     ("per", &[v2xw_radio::PerModel::ID]),
     ("phy", &[v2xw_radio::OfdmPhy::ID]),
     ("obstacle", &[v2xw_radio::BuildingShadowing::ID]),
+    ("sidelink", &[crate::run::sidelink::SIDELINK_ACCESS_ID]),
 ];
+
+/// Which published configuration a sidelink run takes its pool and scheduler from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SidelinkProfile {
+    /// LTE-V2X: the SAE J3161/1 US deployment profile (20 MHz channel 183, ten 10-PRB
+    /// sub-channels, MCS 5/7/11, `probResourceKeep` 0.8, J3161/1 CR limits).
+    #[serde(rename = "sae-j3161")]
+    SaeJ3161,
+    /// LTE-V2X: the Molina-Masegosa 2017 validation pool (10 MHz, four 12-PRB
+    /// sub-channels, QPSK r0.7), a study configuration.
+    #[serde(rename = "molina-masegosa-2017")]
+    MolinaMasegosa2017,
+    /// NR-V2X: Todisco 2021's Mode 2 pool at 30 kHz, a study configuration; no US NR
+    /// deployment profile was found.
+    #[serde(rename = "todisco-2021")]
+    Todisco2021,
+}
+
+/// Which congestion-control table a sidelink run enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CongestionChoice {
+    /// The profile's own: J3161/1's for the J3161 profile, ETSI TS 103 574's otherwise.
+    ProfileDefault,
+    /// No congestion control: CR is measured and never limits.
+    Off,
+    /// A named table ([`v2xw_radio::sidelink::CrLimitTable::by_id`]).
+    Table(&'static str),
+}
+
+/// `radio.models.sidelink`, parsed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SidelinkChoice {
+    /// The configuration; `None` is the RAT's default.
+    pub profile: Option<SidelinkProfile>,
+    /// The MCS index in the profile's table.
+    pub mcs: Option<u8>,
+    /// Transmissions per transport block, blind retransmissions included.
+    pub max_transmissions: Option<u32>,
+    /// The congestion-control table.
+    pub congestion: CongestionChoice,
+}
+
+impl Default for SidelinkChoice {
+    fn default() -> Self {
+        Self {
+            profile: None,
+            mcs: None,
+            max_transmissions: None,
+            congestion: CongestionChoice::ProfileDefault,
+        }
+    }
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SidelinkParams {
+    #[serde(default)]
+    profile: Option<SidelinkProfile>,
+    #[serde(default)]
+    mcs: Option<u8>,
+    #[serde(default)]
+    max_transmissions: Option<u32>,
+    #[serde(default)]
+    congestion_control: Option<String>,
+}
+
+/// Checks `radio.models.sidelink`'s parameters against the RAT the scenario runs.
+fn sidelink_choice(
+    rat: crate::scenario::schema::Rat,
+    p: SidelinkParams,
+) -> core::result::Result<SidelinkChoice, String> {
+    use crate::scenario::schema::Rat;
+    let lte = match rat {
+        Rat::LteV2xPc5 => true,
+        Rat::NrV2xPc5 => false,
+        _ => {
+            return Err(
+                "configures a sidelink, and radio.rat is not lte-v2x-pc5 or \
+                        nr-v2x-pc5"
+                    .to_string(),
+            );
+        }
+    };
+    let profile = p.profile.unwrap_or(if lte {
+        SidelinkProfile::SaeJ3161
+    } else {
+        SidelinkProfile::Todisco2021
+    });
+    match (lte, profile) {
+        (true, SidelinkProfile::Todisco2021) => {
+            return Err("profile 'todisco-2021' is an NR-V2X pool; radio.rat is \
+                        lte-v2x-pc5 (choose sae-j3161 or molina-masegosa-2017)"
+                .to_string());
+        }
+        (false, SidelinkProfile::SaeJ3161 | SidelinkProfile::MolinaMasegosa2017) => {
+            return Err("names an LTE-V2X profile; radio.rat is nr-v2x-pc5 (choose \
+                        todisco-2021)"
+                .to_string());
+        }
+        _ => {}
+    }
+    if let Some(m) = p.mcs {
+        let ok = match profile {
+            SidelinkProfile::SaeJ3161 => matches!(m, 5 | 7 | 11),
+            SidelinkProfile::MolinaMasegosa2017 => false,
+            SidelinkProfile::Todisco2021 => m <= 28,
+        };
+        if !ok {
+            return Err(match profile {
+                SidelinkProfile::SaeJ3161 => format!(
+                    "mcs {m} is not one this build carries for SAE J3161/1: 5, 7 or 11 \
+                     (MCS 6 is admitted by the profile but no allocation for it is \
+                     published)"
+                ),
+                SidelinkProfile::MolinaMasegosa2017 => {
+                    "the Molina-Masegosa pool has one MCS (QPSK r0.7); remove mcs".to_string()
+                }
+                SidelinkProfile::Todisco2021 => {
+                    format!("mcs {m} is outside TS 38.214 Table 5.1.3.1-1 (0-28)")
+                }
+            });
+        }
+    }
+    if let Some(n) = p.max_transmissions {
+        let max = if lte { 2 } else { 3 };
+        if !(1..=max).contains(&n) {
+            return Err(format!(
+                "max_transmissions {n} is outside 1..={max}: LTE-V2X allows one blind \
+                 retransmission (allowedRetxNumberPSSCH-r14), NR-V2X three resources per \
+                 SCI (sl-MaxNumPerReserve-r16)"
+            ));
+        }
+    }
+    let congestion = match p.congestion_control.as_deref() {
+        None => CongestionChoice::ProfileDefault,
+        Some("off") => CongestionChoice::Off,
+        Some(id) => match v2xw_radio::sidelink::CrLimitTable::by_id(id) {
+            Some(t) => CongestionChoice::Table(t.id),
+            None => {
+                return Err(format!(
+                    "congestion_control '{id}' is not one of: etsi-ts-103-574, sae-j3161, off"
+                ));
+            }
+        },
+    };
+    Ok(SidelinkChoice {
+        profile: Some(profile),
+        mcs: p.mcs,
+        max_transmissions: p.max_transmissions,
+        congestion,
+    })
+}
 
 /// Which propagation law `radio.models.propagation` selects.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -469,6 +623,8 @@ pub struct RadioModels {
     pub sensitivity: Option<v2xw_radio::SensitivityPreset>,
     /// The Sommer 2011 fitted row the building obstacle model uses.
     pub building_fit: Option<v2xw_radio::SommerFit>,
+    /// The sidelink access layer's configuration.
+    pub sidelink: Option<SidelinkChoice>,
 }
 
 #[derive(serde::Deserialize)]
@@ -595,6 +751,12 @@ pub fn radio_models(
                 Ok(p) => {
                     out.building_fit = Some(p.fit.unwrap_or(v2xw_radio::SommerFit::Default));
                 }
+                Err(e) => errors.push(bad(e)),
+            },
+            "sidelink" => match params_of::<SidelinkParams>(&choice.params)
+                .and_then(|p| sidelink_choice(scenario.radio.rat, p))
+            {
+                Ok(c) => out.sidelink = Some(c),
                 Err(e) => errors.push(bad(e)),
             },
             _ => {}
@@ -1228,13 +1390,23 @@ pub fn build_node(
     runtime
 }
 
-/// `nodes.compute_tier`: at `abstract` the node's cryptography costs a microsecond and no
-/// node is ever compute-bound; at `medium` and `high` every operation costs its hardware
-/// profile's service time and queues behind the node's own servers. The two upper tiers
-/// are the same model: nothing in this build adds service-time variability at `high`.
+/// `nodes.compute_tier`, the tiers of 06-node-models §2.1:
+///
+/// * `abstract` — the node's cryptography costs a microsecond and no node is ever
+///   compute-bound;
+/// * `medium` — every operation costs its hardware profile's service time and queues FIFO
+///   behind **one** CPU server and the profile's HSM server;
+/// * `high` — the same, with the CPU run as the profile's `cpu.cores` servers, so work
+///   that runs on the CPU (software cryptography, application tasks) is served in
+///   parallel.
+///
+/// What §2.1's `high` also lists — processor sharing, priority classes, memory
+/// accounting, an HSM latency distribution — is not built; the key-status note says so.
 fn apply_compute_tier(runtime: &mut ObuRuntime, scenario: &Scenario) {
-    if scenario.nodes.compute_tier == v2xw_core::card::Tier::Abstract {
-        runtime.set_compute_unlimited();
+    match scenario.nodes.compute_tier {
+        v2xw_core::card::Tier::Abstract => runtime.set_compute_unlimited(),
+        v2xw_core::card::Tier::Medium => runtime.set_cpu_servers(1),
+        _ => {}
     }
 }
 
