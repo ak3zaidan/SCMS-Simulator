@@ -131,6 +131,9 @@ export function TimeControls(): React.JSX.Element {
   const setWhy = useStudio((s) => s.setWhy);
   const status = useStatus();
   const seekProgress = useStudio((s) => s.seekProgress);
+  const scenarioDoc = useStudio((s) => s.scenario);
+  const stagedScenario = useStudio((s) => s.scenarioExtras.staged);
+  const firedEvents = useStudio((s) => s.firedEvents);
   const [stepUnit, setStepUnit] = useState<"step" | "keyframe" | "second">("step");
   const [busy, setBusy] = useState(false);
   /** The value under the thumb while a scrub gesture is in flight; `null` when it is not. */
@@ -202,6 +205,43 @@ export function TimeControls(): React.JSX.Element {
     },
     [compareSide, compareSync.time, drivingReplay],
   );
+
+  /**
+   * The scenario's own timeline (`events`): what is planned to happen and when, drawn whether or
+   * not it has happened yet, and filled in once the engine reports it fired. Only while the
+   * document the page holds is the running one — with settings applied for the next run, the
+   * document describes that run instead, and its events would be drawn on the wrong run.
+   */
+  const planned = useMemo(() => {
+    if (span <= 0 || stagedScenario !== null || drivingReplay) return [];
+    const events = (scenarioDoc as { events?: unknown } | null)?.events;
+    if (!Array.isArray(events)) return [];
+    return events.flatMap((raw, index) => {
+      const e = raw as { t?: unknown; until?: unknown; type?: unknown; target?: unknown; value?: unknown; path?: unknown };
+      if (typeof e.t !== "number") return [];
+      const tNs = e.t * 1e9;
+      const untilNs = typeof e.until === "number" ? e.until * 1e9 : null;
+      const fired = firedEvents.filter((f) => f.index === index);
+      const what =
+        e.type === "closure" ? `closure of ${String(e.target)}`
+        : e.type === "demand.multiplier" ? `demand ×${String(e.value)}`
+        : e.type === "weather.front" ? `weather front: ${String(e.value)}`
+        : e.type === "param.change" ? `${String(e.path)} → ${JSON.stringify(e.value)}`
+        : e.type === "outage" ? `outage of node ${String(e.target)}`
+        : String(e.type);
+      return [{
+        index,
+        type: String(e.type),
+        tNs,
+        untilNs,
+        left: pct(tNs),
+        width: untilNs === null ? 0 : Math.max(0, pct(untilNs) - pct(tNs)),
+        fired: fired.length > 0,
+        title: `${what} at ${simClock(tNs)}${untilNs === null ? "" : ` until ${simClock(untilNs)}`}` +
+          (fired.length > 0 ? ` — ${fired.map((f) => f.effect).join("; ")}` : " — not reached yet"),
+      }];
+    });
+  }, [span, stagedScenario, drivingReplay, scenarioDoc, firedEvents, pct]);
 
   const marks = useMemo(() => {
     if (span <= 0) return [];
@@ -448,6 +488,23 @@ export function TimeControls(): React.JSX.Element {
           is the accessible surface for them rather than a focusable element that cannot be
           activated with a pointer.
         */}
+        {planned.map((p) =>
+          p.width > 0 ? (
+            <div key={`band-${p.index}`} className="event-band" aria-hidden="true" style={{ left: `${p.left}%`, width: `${p.width}%` }} title={p.title} />
+          ) : null,
+        )}
+        {planned.map((p) => (
+          <div
+            key={`scenario-${p.index}`}
+            className="scenario-mark"
+            aria-hidden="true"
+            data-testid="scenario-event-mark"
+            data-kind={p.type}
+            data-fired={p.fired ? "true" : "false"}
+            style={{ left: `${p.left}%` }}
+            title={p.title}
+          />
+        ))}
         {marks.map((m) => (
           <div
             key={`${m.channel}-${m.left}`}

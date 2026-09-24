@@ -26,6 +26,8 @@ declare global {
       selectFirstActor: () => number | null;
       fps: () => number;
       actorCount: () => number;
+      /** The page's log lines, newest first — what a test checks for an error the user saw. */
+      logs: () => readonly { level: string; target: string; message: string }[];
     };
   }
 }
@@ -98,6 +100,7 @@ export function Viewport(): React.JSX.Element {
 
     window.__vwpStudio = {
       engine,
+      logs: () => useStudio.getState().logs,
       selectFirstActor: () => {
         const client = engine.client;
         if (!client) return null;
@@ -139,6 +142,14 @@ export function Viewport(): React.JSX.Element {
     if (!viewer) return;
     const rect = ev.currentTarget.getBoundingClientRect();
     const hit = viewer.pickAtPixel(ev.clientX - rect.left, ev.clientY - rect.top);
+    // A panel asked for a point on the map (the event editor's "pick on the map"): this click
+    // answers it and does nothing else.
+    const pick = useStudio.getState().mapPick;
+    if (pick !== null) {
+      useStudio.getState().setMapPick(null);
+      if (hit) pick.resolve({ x: hit.point.x, y: hit.point.y });
+      return;
+    }
     if (!hit) {
       void engine.selectActor(null);
       return;

@@ -112,6 +112,29 @@ export interface RunInfo {
   readonly kernelThreads: number | null;
 }
 
+/**
+ * One scenario timeline item as the engine fired it (`run.status` → `engine.timeline`, from the
+ * `scenario.event` record): what it was and what it did.
+ */
+export interface FiredEvent {
+  readonly t: number;
+  readonly index: number;
+  readonly kind: string;
+  readonly phase: "start" | "end";
+  readonly effect: string;
+  readonly lanes?: readonly number[];
+  readonly multiplier?: number;
+  readonly path?: string;
+  readonly value?: string;
+  readonly populations?: readonly number[];
+}
+
+/** A one-shot "pick a point on the map" request from a panel; the viewport answers it. */
+export interface MapPickRequest {
+  readonly purpose: string;
+  readonly resolve: (point: { readonly x: number; readonly y: number }) => void;
+}
+
 /** One row of the engine's published settings surface (`scenario.get {with_schema}` `fields`). */
 export interface PublishedField {
   readonly "x-pointer"?: string;
@@ -405,6 +428,10 @@ interface StudioState {
    * (§6.14 `job.progress`); `null` when none is.
    */
   seekProgress: { readonly progress: number; readonly message: string } | null;
+  /** The scenario timeline's items the running run has fired, as of the stream position. */
+  firedEvents: readonly FiredEvent[];
+  /** A panel waiting for a click on the map, or `null`. */
+  mapPick: MapPickRequest | null;
   logs: readonly LogLine[];
   provenanceCount: number;
   metricProvenance: Readonly<Record<string, number>>;
@@ -470,6 +497,9 @@ interface StudioState {
   setValidation: (v: ValidationView | null) => void;
   addTimelineMarks: (marks: readonly TimelineMark[]) => void;
   setSeekProgress: (p: { readonly progress: number; readonly message: string } | null) => void;
+  /** Keeps the previous array when the content is the same, like the other 5 Hz setters. */
+  setFiredEvents: (events: readonly FiredEvent[]) => void;
+  setMapPick: (request: MapPickRequest | null) => void;
   addLog: (line: LogLine) => void;
   setProvenanceCount: (n: number) => void;
   /**
@@ -625,6 +655,8 @@ export const useStudio = create<StudioState>((set) => ({
   validation: null,
   timeline: [],
   seekProgress: null,
+  firedEvents: [],
+  mapPick: null,
   logs: [],
   provenanceCount: 0,
   metricProvenance: {},
@@ -691,6 +723,11 @@ export const useStudio = create<StudioState>((set) => ({
   setScenarioList: (items) => set({ scenarioList: items }),
   setValidation: (v) => set({ validation: v }),
   setSeekProgress: (p) => set({ seekProgress: p }),
+  setFiredEvents: (events) =>
+    set((state) =>
+      JSON.stringify(state.firedEvents) === JSON.stringify(events) ? state : { firedEvents: events },
+    ),
+  setMapPick: (request) => set({ mapPick: request }),
   addTimelineMarks: (marks) =>
     set((state) => (marks.length === 0 ? state : { timeline: [...state.timeline, ...marks].slice(-MAX_MARKS) })),
   addLog: (line) => set((state) => ({ logs: [line, ...state.logs].slice(0, MAX_LOGS) })),

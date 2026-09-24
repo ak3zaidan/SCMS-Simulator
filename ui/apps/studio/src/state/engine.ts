@@ -53,6 +53,7 @@ import { studioTheme, type ThemeName } from "../lib/theme.js";
 import {
   MAX_MARKS,
   useStudio,
+  type FiredEvent,
   type LogLine,
   type NodeInfo,
   type ProvEntry,
@@ -1068,6 +1069,10 @@ export class StudioEngine {
         outputDigest: typeof s.engine?.output_digest === "string" ? s.engine.output_digest : null,
         kernelThreads: typeof s.engine?.kernel_threads === "number" ? s.engine.kernel_threads : null,
       });
+      // The scenario timeline's items the run has fired by the stream position, each with what
+      // it did (`scenario.event`); the time bar marks them as happened.
+      const fired = (s.engine as { timeline?: unknown } | undefined)?.timeline;
+      useStudio.getState().setFiredEvents(Array.isArray(fired) ? (fired as FiredEvent[]) : []);
     } catch {
       /* a poll failure is not worth a log line */
     }
@@ -1244,6 +1249,7 @@ export class StudioEngine {
     this.#pendingPseudonyms.length = 0;
     this.#pendingLinkCount = 0;
     const store = useStudio.getState();
+    store.setFiredEvents([]);
     store.setProvenanceCount(0);
     store.setInspect(null);
     store.setInspectMessages(null);

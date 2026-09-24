@@ -43,7 +43,13 @@ export function writeScenarios(): { a: string; b: string } {
 export class EngineProcess {
   #child: ChildProcess | null = null;
 
-  constructor(readonly scenario: string) {}
+  /** `port` defaults to the one the page's proxy targets; a test that interposes on the
+   * connection (resume.spec.ts) starts the engine elsewhere and listens there itself. */
+  constructor(
+    readonly scenario: string,
+    readonly port: number = ENGINE_PORT,
+    readonly speed: string = "0",
+  ) {}
 
   get pid(): number {
     const pid = this.#child?.pid;
@@ -54,7 +60,7 @@ export class EngineProcess {
   async start(): Promise<void> {
     this.#child = spawn(
       ENGINE_BIN,
-      ["--scenario", this.scenario, "--port", String(ENGINE_PORT), "--paused", "--speed", "0", "--quiet"],
+      ["--scenario", this.scenario, "--port", String(this.port), "--paused", "--speed", this.speed, "--quiet"],
       { cwd: REPO, stdio: ["ignore", "ignore", "pipe"] },
     );
     let stderr = "";
@@ -65,7 +71,7 @@ export class EngineProcess {
     while (Date.now() < deadline) {
       if (this.#child.exitCode !== null) throw new Error(`the engine exited: ${stderr}`);
       try {
-        const res = await fetch(`http://127.0.0.1:${ENGINE_PORT}/healthz`);
+        const res = await fetch(`http://127.0.0.1:${this.port}/healthz`);
         if (res.ok) return;
       } catch {
         /* not up yet */
