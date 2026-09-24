@@ -29,6 +29,7 @@
 import {
   BackSide,
   BatchedMesh,
+  BufferAttribute,
   BufferGeometry,
   Color,
   DirectionalLight,
@@ -49,6 +50,7 @@ import {
 } from "three";
 import type { SignalBlock, VwpWorld } from "@vwp/protocol";
 import { SignalRenderer } from "./signals.js";
+import { findPortals } from "./passages.js";
 import { MeshBuilder, addBox, addCylinder, addDisc, addExtrudedRing, addPolygon, addRibbon } from "./geometry.js";
 import type { RingShading } from "./geometry.js";
 import type { ViewerTheme } from "./theme.js";
@@ -148,6 +150,8 @@ export interface WorldBuildReport {
   readonly buildingIndices: number;
   readonly surfaceVertices: number;
   readonly markingVertices: number;
+  /** Openings drawn where a road runs through a building (see `passages.ts`). */
+  readonly portals: number;
   readonly drawables: number;
   readonly buildMs: number;
 }
@@ -228,7 +232,7 @@ export class WorldRenderer {
   #report: WorldBuildReport = {
     tiles: 0, lanes: 0, buildings: 0, junctions: 0, signals: 0, sites: 0, crossings: 0, landuse: 0,
     buildingBackend: "none", buildingVertices: 0, buildingIndices: 0, surfaceVertices: 0,
-    markingVertices: 0, drawables: 0, buildMs: 0,
+    markingVertices: 0, portals: 0, drawables: 0, buildMs: 0,
   };
 
   #surfaceMaterial: MeshLambertMaterial;
@@ -587,6 +591,7 @@ export class WorldRenderer {
     const t0 = nowMs();
     this.#clearWorld();
     this.#world = world;
+    this.#report = { ...this.#report, portals: 0 };
 
     const bbox = world.bbox;
     const cx = (bbox.minXM + bbox.maxXM) / 2;
@@ -716,6 +721,7 @@ export class WorldRenderer {
     // ---- Buildings. ----
     if (this.#options.buildings && world.buildings.count > 0) {
       this.#buildBuildings(world, surfaceOf, tileIndex);
+      this.#buildPortals(world);
     }
 
     // ---- Publish the tile meshes. ----
@@ -772,9 +778,53 @@ export class WorldRenderer {
       buildingIndices: this.#report.buildingIndices,
       surfaceVertices: surfaceVerts,
       markingVertices: markVerts,
-      drawables,
+      portals: this.#report.portals,
+      drawables: drawables + (this.#report.portals > 0 ? 1 : 0),
       buildMs: nowMs() - t0,
     };
+  }
+
+  /**
+   * A dark opening in every wall a road runs through (`passages.ts`): the car on a passage lane
+   * drives into it rather than into a wall. One mesh for the whole city, drawn just outside the
+   * wall with a polygon offset so it never fights the wall for depth.
+   */
+  #buildPortals(world: VwpWorld): void {
+    const portals = findPortals(world);
+    this.#report = { ...this.#report, portals: portals.length };
+    if (portals.length === 0) return;
+    const pos = new Float32Array(portals.length * 4 * 3);
+    const idx = new Uint32Array(portals.length * 6);
+    portals.forEach((p, i) => {
+      // Outward normal of a counter-clockwise ring: the wall direction turned clockwise.
+      const nx = p.ey;
+      const ny = -p.ex;
+      const ox = p.x + nx * 0.04;
+      const oy = p.y + ny * 0.04;
+      const z0 = p.z + 0.02;
+      const z1 = p.z + p.height;
+      const corners = [
+        [ox - p.ex * p.halfWidth, oy - p.ey * p.halfWidth, z0],
+        [ox + p.ex * p.halfWidth, oy + p.ey * p.halfWidth, z0],
+        [ox + p.ex * p.halfWidth, oy + p.ey * p.halfWidth, z1],
+        [ox - p.ex * p.halfWidth, oy - p.ey * p.halfWidth, z1],
+      ];
+      corners.forEach((c, k) => pos.set(c, (i * 4 + k) * 3));
+      idx.set([i * 4, i * 4 + 1, i * 4 + 2, i * 4, i * 4 + 2, i * 4 + 3], i * 6);
+    });
+    const geom = new BufferGeometry();
+    geom.setAttribute("position", new BufferAttribute(pos, 3));
+    geom.setIndex(new BufferAttribute(idx, 1));
+    geom.computeBoundingSphere();
+    const mat = new MeshBasicMaterial({
+      color: this.#theme.portal, side: DoubleSide, name: "portals",
+      polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+    });
+    const mesh = new Mesh(geom, mat);
+    mesh.name = "world/portals";
+    mesh.matrixAutoUpdate = false;
+    this.buildingsGroup.add(mesh);
+    this.#disposables.push(geom, mat);
   }
 
   #buildBuildings(

@@ -51,6 +51,8 @@ export interface ViewerTheme {
   readonly crossing: number;
   readonly building: number;
   readonly buildingRoof: number;
+  /** The opening drawn where a road runs through a building (`passages.ts`): the dark of a portal. */
+  readonly portal: number;
   readonly water: number;
   readonly park: number;
   readonly industrial: number;
@@ -132,6 +134,7 @@ export const DARK_THEME: ViewerTheme = {
   crossing: 0xcdd6e0,
   building: 0x5b6674,
   buildingRoof: 0x424c58,
+  portal: 0x0c0f13,
   water: 0x16374f,
   park: 0x24402e,
   industrial: 0x3f3b33,
@@ -184,6 +187,7 @@ export const LIGHT_THEME: ViewerTheme = {
   crossing: 0xffffff,
   building: 0xc4ccd5,
   buildingRoof: 0xb2bac3,
+  portal: 0x2a2f36,
   water: 0x9dc6e0,
   park: 0xbcd7b6,
   industrial: 0xd3ccc0,
