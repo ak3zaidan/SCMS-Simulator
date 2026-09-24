@@ -61,6 +61,7 @@ pub mod ctx;
 pub mod error;
 pub mod event;
 pub mod export;
+pub mod frag;
 pub mod infra;
 pub mod manifest;
 pub mod phase2;

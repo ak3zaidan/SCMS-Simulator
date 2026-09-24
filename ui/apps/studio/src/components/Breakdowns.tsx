@@ -16,6 +16,8 @@
  *   delivered, beside the mean end-to-end delay.
  * - **Nodes.** Per-node figures, ranked: air time, channel load, and delivery as a receiver. A row
  *   follows the node.
+ * - **Fragmentation**, only in a run that splits messages: the realised SDU loss beside the
+ *   fragment loss it amplifies and the two predictions of 04-models.md §7.4.
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -333,13 +335,82 @@ function NodeRankings(): React.JSX.Element {
   );
 }
 
-/** The three breakdown cards, laid beside the plots. */
+/** The fragmentation metrics a run reports, in the card's column order. */
+const FRAG_COLUMNS = [
+  ["frag_sdu_loss", "SDU loss", "Fragmented SDUs, per receiver in range, of which some fragment did not decode (frag_sdu_loss)"],
+  ["frag_fragment_loss", "fragment", "Fragments that did not decode (frag_fragment_loss): what the SDU loss amplifies"],
+  [
+    "frag_sdu_loss_predicted",
+    "PHY-predicted",
+    "1 − Π(1 − p_i) with each p_i the PHY's loss probability for that fragment under the interference it met (frag_sdu_loss_predicted)",
+  ],
+  [
+    "frag_sdu_loss_independent",
+    "independent",
+    "1 − (1 − p)^n with p the measured fragment loss: what independent fragment losses would give (frag_sdu_loss_independent)",
+  ],
+  ["frag_content_loss", "content", "Payload octets not received (frag_content_loss): what independent segments lose instead"],
+] as const;
+
+/**
+ * Loss amplification (04-models.md §7.4), when the run fragments anything: the realised SDU loss
+ * beside the per-fragment loss it amplifies and the two predictions. Nothing at all in a run that
+ * never splits a message.
+ */
+function Fragmentation(): React.JSX.Element | null {
+  const load = useCallback(async () => {
+    const all = await Promise.all(FRAG_COLUMNS.map(([m]) => grouped(m, "msg_type")));
+    return all.map((gs) => new Map(gs.map((g) => [g.key, g])));
+  }, []);
+  const data = usePolled(load, [] as Map<string, Group>[]);
+  const types = useMemo(() => [...new Set(data.flatMap((m) => [...m.keys()]))].sort(), [data]);
+  if (types.length === 0) return null;
+  return (
+    <div className="plot-card wide breakdown" data-testid="breakdown-fragmentation">
+      <div className="title">
+        <span>Fragmentation</span>
+        <span className="faint">pooled over the run</span>
+      </div>
+      <table className="node-rank">
+        <thead>
+          <tr>
+            <th>type</th>
+            {FRAG_COLUMNS.map(([m, label, title]) => (
+              <th key={m} title={title}>
+                {label}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {types.map((t) => (
+            <tr key={t}>
+              <td className="mono">{t}</td>
+              {FRAG_COLUMNS.map(([m], i) => {
+                const g = data[i]?.get(t);
+                const band = g?.lo !== null && g?.lo !== undefined && g.hi !== null ? ` (${g.lo.toFixed(3)}–${g.hi.toFixed(3)})` : "";
+                return (
+                  <td key={m} className="mono" title={g ? `${g.n} samples${band}` : ""}>
+                    {g?.value === null || g?.value === undefined ? "—" : g.value.toFixed(4)}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** The breakdown cards, laid beside the plots. */
 export function Breakdowns(): React.JSX.Element {
   return (
     <>
       <DeliveryByDistance />
       <LatencyStages />
       <NodeRankings />
+      <Fragmentation />
     </>
   );
 }

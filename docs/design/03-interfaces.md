@@ -1083,6 +1083,7 @@ Recorded as MCAP channels; each channel has a self-describing schema record, a v
 | `phy.prr` | GT | t, tx, msg, msg type, bins: `[20 m bin, receivers truly in range, receivers that decoded]` — the per-frame census behind the 3GPP packet reception ratio (TR 36.885 §A.2.1.4); record-only, never an `Event` payload |
 | `mac.cbr` | NODE | t, node, channel, cbr |
 | `net.frag` | NODE | t, node, sdu id, fragments, outcome |
+| `net.reassembly` | GT | t, rx, tx, sdu, strategy, kind (message / segments / certificate), msg type, fragments, received, bytes, bytes received, predicted loss `1 − Π(1 − p_i)` and predicted content loss from the fragments' PHY success probabilities, outcome, cause — one fragmented SDU followed to its fate at one receiver (04-models.md §7.4); record-only, never an `Event` payload |
 | `node.verify` | NODE | t_enqueue, t_start, t_done, node, primitive, cost µs, outcome, policy decision |
 | `node.telemetry` | NODE | t, node, cpu %, ram, storage, hsm util, queue depths, drops by cause |
 | `node.neighbor` | NODE | t, node, table delta |

@@ -278,13 +278,14 @@ fn a_key_the_engine_cannot_act_on_is_refused_and_names_itself() {
         ),
         // `net.layer: gn-btp` used to be here; the GeoNetworking/BTP header is now composed
         // into every frame, and `gn_btp_and_a_generator_override_validate` holds that it
-        // loads. What is still refused is a fragmenter that would split, and a generator
-        // this build does not run or cannot honour.
+        // loads. Every fragmenter runs now (`crate::frag`); what is still refused is one the
+        // stack in use cannot honour — ETSI facilities-layer segmentation on WSMP — and a
+        // generator this build does not run or cannot honour.
         (
             "net.fragmenter",
             Box::new(|s: &mut Scenario| {
                 s.net.fragmenter = Some(v2xw_engine::scenario::ModelChoice::new(
-                    v2xw_net::FRAGMENTER_GENERIC_ID,
+                    v2xw_net::FRAGMENTER_FACILITIES_ID,
                 ));
             }),
         ),

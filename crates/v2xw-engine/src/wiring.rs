@@ -261,6 +261,9 @@ pub fn register_all(registry: &mut Registry) -> Result<()> {
         v2xw_core::model::Model::card(&v2xw_net::WsmpNetLayer::default()).clone(),
         v2xw_core::model::Model::card(&v2xw_net::GnBtpNetLayer::default()).clone(),
         v2xw_core::model::Model::card(&v2xw_net::NoneFragmenter::default()).clone(),
+        v2xw_core::model::Model::card(&v2xw_net::GenericSduFragmenter::default()).clone(),
+        v2xw_core::model::Model::card(&v2xw_net::FacilitiesSegmentation::default()).clone(),
+        v2xw_core::model::Model::card(&v2xw_net::CertCyclePartialHybrid::default()).clone(),
     ];
     for card in extra {
         if !registry.contains(&card.id) {
@@ -1031,6 +1034,7 @@ pub fn build_metrics(
         Box::new(v2xw_metrics::awareness::AwarenessProvider::new(0)),
         Box::new(v2xw_metrics::load::LoadProvider::new(0)),
         Box::new(v2xw_metrics::overhead::OverheadProvider::new(0)),
+        Box::new(v2xw_metrics::frag::FragProvider::new()),
         Box::new(v2xw_metrics::security::SecurityProvider::new(0)),
         Box::new(v2xw_metrics::detection::DetectionProvider::new()),
         Box::new(v2xw_metrics::safety::SafetyProvider::new(0)),

@@ -169,6 +169,16 @@ pub const CHANNELS: &[ChannelSpec] = &[
         visibility: Visibility::Node,
         payload_bytes: Some(24),
     },
+    // One fragmented SDU followed to its fate at one receiver, beside the loss its
+    // fragments' PHY success probabilities predicted (04-models.md §7.4). Ground truth
+    // whole — the sender's identity and those probabilities are no node's — so the
+    // NODE-only profile strips it. Never an `Event` payload.
+    ChannelSpec {
+        name: "net.reassembly",
+        wire_id: None,
+        visibility: Visibility::Gt,
+        payload_bytes: None,
+    },
     ChannelSpec {
         name: "node.neighbor",
         wire_id: Some(16),
@@ -314,7 +324,7 @@ mod tests {
             .filter(|c| c.wire_id.is_none())
             .map(|c| c.name)
             .collect();
-        assert_eq!(record_only, vec!["phy.prr"]);
+        assert_eq!(record_only, vec!["net.reassembly", "phy.prr"]);
     }
 
     /// The channel-name pattern of §6.5's `ChannelName` schema.

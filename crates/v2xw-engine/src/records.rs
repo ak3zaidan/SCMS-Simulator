@@ -88,6 +88,14 @@ channel_record!(
     Visibility::NodeAndGt
 );
 channel_record!(
+    /// `net.reassembly` — one fragmented SDU followed to its fate at one receiver, with the
+    /// loss its fragments' PHY success probabilities predicted. Ground truth whole.
+    NetReassembly,
+    v2xw_metrics::channels::NetReassemblyView,
+    "net.reassembly",
+    Visibility::Gt
+);
+channel_record!(
     /// `net.bytes` — one transfer on an accounting bucket other than the air.
     NetBytes,
     NetBytesView,
@@ -440,7 +448,15 @@ impl PhyRx {
             dist_m: Some(q3(dist_m)),
             candidate: true,
             payload_bytes: None,
+            sdu: None,
         })
+    }
+
+    /// Marks the attempt as one fragment of the SDU followed on `node.rx` as `sdu`.
+    #[must_use]
+    pub fn of_sdu(mut self, sdu: Option<u64>) -> Self {
+        self.0.sdu = sdu;
+        self
     }
 }
 

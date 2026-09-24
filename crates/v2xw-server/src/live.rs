@@ -1699,8 +1699,9 @@ impl Projector {
                     }
                 }
                 // `phy.prr` is one transmission's reception census (3GPP TR 36.885 PRR),
-                // ground truth for the `pdr` metric, which is what the stream carries.
-                "msg.latency" | "net.bytes" | "phy.prr" => {}
+                // ground truth for the `pdr` metric, which is what the stream carries; the
+                // two reassembly channels are what the fragmentation metrics measure.
+                "msg.latency" | "net.bytes" | "phy.prr" | "net.frag" | "net.reassembly" => {}
                 "metric.sample" => match serde_json::from_slice::<MetricSample>(&record.json) {
                     Ok(sample) => self.push_metric(&sample, &mut metrics),
                     Err(_) => self.undecodable(record.channel),

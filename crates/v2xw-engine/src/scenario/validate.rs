@@ -621,14 +621,20 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     },
     KeyStatus {
         path: "net.fragmenter",
-        status: Status::Refused,
-        note: "Only 'fragmenter/none' loads, and it is enforced: a signed message larger \
-               than the network layer's MTU (1,400 octets for WSMP, 1,398 for \
-               GeoNetworking) is refused before the MAC and counted in the run report. The \
-               splitting fragmenters are refused because no message this build signs \
-               comes near the MTU (a CAM with a certificate is about 400 octets), so they \
-               would have nothing to split; they matter once post-quantum signatures can \
-               be selected, which security.signature does not yet offer.",
+        status: Status::Wired,
+        note: "All four run. 'fragmenter/none' (the default) refuses a signed message \
+               above the network layer's MTU (1,400 octets WSMP, 1,398 GeoNetworking) \
+               before the MAC. 'fragmenter/generic-sdu' sends it as pieces with a 4-octet \
+               header, reassembled per sender with a timeout; the message reaches the \
+               node only whole. 'fragmenter/facilities-segmentation' (gn-btp) sends \
+               independently interpretable segments, each a message of its own. \
+               'fragmenter/cert-cycle-partial-hybrid' carries the hybrid certificate in \
+               the first α SPDUs of each 5-SPDU cycle. Every fragmented SDU is followed \
+               per receiver to net.reassembly beside the loss 1 − Π(1 − p_i) its \
+               fragments' PHY success probabilities predict. No selectable signature \
+               makes a message that large yet, so params.sdu_padding_bytes pads every \
+               signed message (counted as payload) to stand in for a post-quantum one. \
+               802.11p only.",
     },
     KeyStatus {
         path: "net.backhaul",
@@ -958,24 +964,42 @@ fn unreachable_keys(s: &Scenario, e: &mut Vec<ScenarioError>) {
         }
     }
 
-    // The fragmenter. `fragmenter/none` is enforced at `Engine::hand_down_app`; the
-    // splitting strategies exist in `v2xw-net` and no message this build signs is large
-    // enough for them to act on (see the key's status note).
-    if let Some(f) = s.net.fragmenter.as_ref()
-        && f.id != v2xw_net::FRAGMENTER_NONE_ID
-    {
-        e.push(conflict(
-            "net.fragmenter",
-            format!(
-                "is '{}', and only '{}' runs in this build: the largest message a node \
-                 signs is a CAM with a certificate, about 400 octets against a 1,398-octet \
-                 MTU, so a splitting fragmenter would never split anything. It becomes \
-                 meaningful with post-quantum signatures, which security.signature does \
-                 not yet offer",
-                f.id,
-                v2xw_net::FRAGMENTER_NONE_ID
-            ),
-        ));
+    // The fragmenter (`crate::frag`): the model and its parameters resolve against its
+    // card, and the padding knob is the engine's.
+    if let Some(f) = s.net.fragmenter.as_ref() {
+        match crate::frag::FragPlan::from_choice(f) {
+            Err(why) => e.push(conflict("net.fragmenter", why)),
+            Ok(plan) if plan.strategy.is_some() => {
+                if s.radio.rat != crate::scenario::schema::Rat::Dsrc80211p {
+                    e.push(conflict(
+                        "net.fragmenter",
+                        format!(
+                            "is '{}', and fragmentation runs over 802.11p only in this build: \
+                             a sidelink transport block takes its size in sub-channels \
+                             (04-models.md §5.1) and its error model does not expose the \
+                             per-block success probability the loss prediction is built from",
+                            f.id
+                        ),
+                    ));
+                }
+                if f.id == v2xw_net::FRAGMENTER_FACILITIES_ID && s.net.layer != "gn-btp" {
+                    e.push(conflict(
+                        "net.fragmenter",
+                        "is facilities-layer segmentation, which is the ETSI stack's \
+                         (TS 103 301 MAPEM layerID, TS 103 324 CPM messageSegmentInfo); \
+                         set net.layer to 'gn-btp', or use fragmenter/generic-sdu on wsmp"
+                            .to_string(),
+                    ));
+                }
+            }
+            Ok(plan) if plan.padding > 0 => e.push(conflict(
+                "net.fragmenter.params.sdu_padding_bytes",
+                "pads every signed message past what fragmenter/none can send; with no \
+                 splitting fragmenter every padded message above the MTU would be refused"
+                    .to_string(),
+            )),
+            Ok(_) => {}
+        }
     }
 
     // Message generators: which node decides to send each set (`v2xw_node::ServiceSet` and

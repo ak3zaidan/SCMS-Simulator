@@ -139,6 +139,7 @@ pub mod comms;
 pub mod def;
 pub mod detection;
 pub mod error;
+pub mod frag;
 pub mod gate;
 pub mod invariants;
 pub mod latency;
@@ -170,7 +171,7 @@ pub use summary::{DigestSet, RunDiagnostics, RunSummary, metric_digest};
 
 /// The providers 08-measurement-and-data.md's catalog is covered by, registered in one call.
 ///
-/// In a fixed order: communication, latency, awareness, load, overhead, security,
+/// In a fixed order: communication, latency, awareness, load, overhead, fragmentation, security,
 /// detection, mobility and safety, runtime diagnostics. `t0` is the start of the first
 /// window.
 ///
@@ -190,6 +191,7 @@ pub fn register_all(
     set.register(registry, Box::new(awareness::AwarenessProvider::new(t0)))?;
     set.register(registry, Box::new(load::LoadProvider::new(t0)))?;
     set.register(registry, Box::new(overhead::OverheadProvider::new(t0)))?;
+    set.register(registry, Box::new(frag::FragProvider::new()))?;
     set.register(registry, Box::new(security::SecurityProvider::new(t0)))?;
     set.register(registry, Box::new(detection::DetectionProvider::new()))?;
     set.register(registry, Box::new(safety::SafetyProvider::new(t0)))?;

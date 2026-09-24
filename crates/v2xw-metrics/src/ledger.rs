@@ -26,8 +26,9 @@ use v2xw_core::ctx::{OwnedRecord, Visibility};
 
 use crate::channels::{
     ChannelView, DetObservationView, GtAttackActionView, GtKinematicsView, MaDecisionView,
-    MaReportView, MacCbrView, NetBytesView, NetFragView, NodeRxView, NodeTelemetryView, NodeTxView,
-    NodeVerifyView, PhyPrrView, PhyRxView, ProtoMsgView, ProtoRevocationView, SecCertView, decode,
+    MaReportView, MacCbrView, NetBytesView, NetFragView, NetReassemblyView, NodeRxView,
+    NodeTelemetryView, NodeTxView, NodeVerifyView, PhyPrrView, PhyRxView, ProtoMsgView,
+    ProtoRevocationView, SecCertView, decode,
 };
 use crate::latency::LatencyTrace;
 
@@ -55,6 +56,8 @@ pub struct EventLedger {
     pub cbr: Vec<MacCbrView>,
     /// `net.frag`, in arrival order.
     pub frag: Vec<NetFragView>,
+    /// `net.reassembly`, in arrival order.
+    pub reassembly: Vec<NetReassemblyView>,
     /// `net.bytes`, in arrival order.
     pub bytes: Vec<NetBytesView>,
     /// `proto.msg`, in arrival order.
@@ -153,6 +156,7 @@ impl EventLedger {
             crate::latency::MSG_LATENCY => take!(LatencyTrace, latency),
             MacCbrView::CHANNEL => take!(MacCbrView, cbr),
             NetFragView::CHANNEL => take!(NetFragView, frag),
+            NetReassemblyView::CHANNEL => take!(NetReassemblyView, reassembly),
             NetBytesView::CHANNEL => take!(NetBytesView, bytes),
             ProtoMsgView::CHANNEL => take!(ProtoMsgView, proto_msg),
             NodeVerifyView::CHANNEL => take!(NodeVerifyView, verify),

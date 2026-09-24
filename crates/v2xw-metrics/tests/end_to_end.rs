@@ -318,11 +318,11 @@ fn every_provider_registers_through_the_core_registry_with_a_valid_card() {
     v2xw_metrics::register_all(&mut registry, &mut set, 0).unwrap();
     assert_eq!(
         set.len(),
-        9,
-        "communication, latency, awareness, load, overhead, security, detection, safety, \
-         runtime"
+        10,
+        "communication, latency, awareness, load, overhead, fragmentation, security, \
+         detection, safety, runtime"
     );
-    assert_eq!(registry.len(), 9);
+    assert_eq!(registry.len(), 10);
     // One catalogue, so one name per metric: two providers defining the same name would
     // put two different definitions behind one series in the page and the recording.
     let catalog = set.catalog();

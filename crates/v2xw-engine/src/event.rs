@@ -148,6 +148,9 @@ pub enum NodeTask {
     PseudonymChange,
     /// A certificate top-up request is due.
     CredentialTopUp,
+    /// A reassembly timeout has run out: the node gives up on the fragments still missing
+    /// from the SDUs it was reassembling (`crate::frag`).
+    Reassembly,
 }
 
 /// What an [`EventClass::Observe`] event is for.

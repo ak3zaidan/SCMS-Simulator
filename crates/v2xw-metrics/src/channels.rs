@@ -74,6 +74,9 @@ const CHANNEL_VISIBILITY: &[(&str, &[Visibility])] = &[
     ("msg.latency", &[Visibility::Node, Visibility::NodeAndGt]),
     ("net.bytes", &[Visibility::Node]),
     ("net.frag", &[Visibility::Node]),
+    // One fragmented SDU's fate at one receiver, with the loss its fragments' PHY success
+    // probabilities predicted: the sender's identity and those probabilities are ground truth.
+    ("net.reassembly", &[Visibility::Gt]),
     ("node.neighbor", &[Visibility::Node]),
     // Like `phy.rx`: the sender's identity and the distance are ground truth.
     ("node.rx", &[Visibility::Node, Visibility::NodeAndGt]),
@@ -231,7 +234,8 @@ pub enum VerifyOutcome {
     Skipped,
 }
 
-/// The outcome of a reassembly (`net.frag`).
+/// The outcome of a reassembly (`net.frag`), as `v2xw_net::frag::ReassemblyOutcome::label`
+/// spells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FragOutcome {
@@ -243,6 +247,8 @@ pub enum FragOutcome {
     Expired,
     /// Still waiting for fragments at the time of the record.
     Pending,
+    /// A fragment of an SDU this receiver had already delivered.
+    Duplicate,
 }
 
 /// `node.tx` — what a node transmitted (NODE).
@@ -456,6 +462,12 @@ pub struct PhyRxView {
     /// The application payload delivered, for goodput.
     #[serde(default)]
     pub payload_bytes: Option<u64>,
+    /// For a fragment of an SDU that is reassembled before it reaches the node (a
+    /// `fragmenter/generic-sdu` piece): the message id the SDU is followed under on
+    /// `node.rx`, so its fragments' attempts are one attempt at the message. Absent for
+    /// every whole frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdu: Option<u64>,
 }
 
 /// serde default for a `bool` field that defaults to true.
@@ -811,10 +823,11 @@ impl ChannelView for MacCbrView {
     const CHANNEL: &'static str = "mac.cbr";
 }
 
-/// `net.frag` — one reassembly outcome (NODE).
+/// `net.frag` — one reassembly outcome (NODE), as `v2xw_net::frag::FragRecord` writes it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NetFragView {
-    /// The instant of the outcome.
+    /// The instant of the outcome, on the receiving node's own clock (`t_ns` on the wire).
+    #[serde(alias = "t_ns")]
     pub t: SimTime,
     /// The reassembling node.
     pub node: NodeId,
@@ -827,10 +840,69 @@ pub struct NetFragView {
     /// The message type, for the per-type breakdown.
     #[serde(default)]
     pub msg_type: Option<String>,
+    /// How many distinct fragments had arrived when the outcome was reached.
+    #[serde(default)]
+    pub have: Option<u32>,
+    /// SDU payload octets delivered (on `complete`) or discarded (on `expired`).
+    #[serde(default)]
+    pub bytes: Option<u64>,
 }
 
 impl ChannelView for NetFragView {
     const CHANNEL: &'static str = "net.frag";
+}
+
+/// `net.reassembly` — one fragmented SDU followed to its fate at one receiver (GT).
+///
+/// The loss-amplification record of 04-models.md §7.4: the realised outcome next to the
+/// loss the per-fragment PHY success probabilities predicted if the fragments were lost
+/// independently. One record per (SDU, receiver that had at least one of its fragments in
+/// its arrival set), written when the group completes or its timeout runs out.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NetReassemblyView {
+    /// When the group was resolved.
+    pub t: SimTime,
+    /// The receiving node.
+    pub rx: NodeId,
+    /// The sending node (ground truth).
+    #[serde(default)]
+    pub tx: Option<NodeId>,
+    /// The message id the group is recorded under.
+    pub sdu: u64,
+    /// The fragmenter's model id.
+    pub strategy: String,
+    /// What was reassembled: `message` (pieces of one SDU), `segments` (independently
+    /// interpretable segments) or `certificate` (a hybrid certificate over a cycle).
+    pub kind: String,
+    /// The message type.
+    #[serde(default)]
+    pub msg_type: Option<String>,
+    /// How many fragments the SDU was split into.
+    pub fragments: u32,
+    /// How many of them decoded at this receiver.
+    pub received: u32,
+    /// The SDU's octets: what its fragments carry between them (the signed message, or
+    /// the hybrid certificate), not counting any fragment's own header.
+    pub bytes: u64,
+    /// The SDU octets the decoded fragments carried.
+    pub bytes_received: u64,
+    /// The predicted probability that some fragment is lost, `1 − Π (1 − p_i)`, with `p_i`
+    /// one minus the PHY's success probability for each fragment at this receiver (one for
+    /// a fragment that never reached it). For pieces and certificates it is the SDU's loss.
+    pub predicted_loss: f64,
+    /// The predicted fraction of the SDU's content lost, `Σ w_i p_i` with `w_i` each
+    /// fragment's share of the payload: what independent segments lose.
+    pub predicted_content_loss: f64,
+    /// `complete` when every fragment decoded, `lost` otherwise.
+    pub outcome: String,
+    /// For a lost group, the first PHY loss cause among its fragments, or
+    /// `reassembly-failed` when every fragment that reached it decoded and one never did.
+    #[serde(default)]
+    pub cause: Option<String>,
+}
+
+impl ChannelView for NetReassemblyView {
+    const CHANNEL: &'static str = "net.reassembly";
 }
 
 /// `node.verify` — one verification task (NODE).
