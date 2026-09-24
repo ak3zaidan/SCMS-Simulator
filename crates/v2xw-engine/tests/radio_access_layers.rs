@@ -455,7 +455,18 @@ fn the_sidelink_senses_a_jammer_in_its_cbr() {
 /// link's place against the region.
 #[test]
 fn a_focus_region_decides_sidelink_receivers_at_its_tier_and_tags_the_links() {
-    let base = with_rat(fleet(30, 2.0), "lte-v2x-pc5");
+    let mut base = with_rat(fleet(30, 2.0), "lte-v2x-pc5");
+    // The region raises the propagation tier to its own as well as the PHY's, and since
+    // the radioprop track the high propagation tier is the geometric city-street law,
+    // which on this building-free extract is line of sight all the way (TR 37.885's
+    // shallow LOS exponent) and so delivers *more* than the medium law (5,803 against
+    // 5,426 receptions). That compares two path-loss laws, not the SCI stage. Both runs
+    // therefore price links with the medium tier's law, named in `radio.models`, and the
+    // region raises the PHY rule and the fading.
+    base.radio.models.insert(
+        "propagation".to_string(),
+        ModelChoice::new("propagation/log-distance-shadowing"),
+    );
     let world = v2xw_engine::wiring::build_world(&base).expect("the world builds");
     let origin: v2xw_core::geo::GeoOrigin = world.origin.into();
     let (lat0, lon0, _) = origin.to_geodetic(world.bbox.min);
