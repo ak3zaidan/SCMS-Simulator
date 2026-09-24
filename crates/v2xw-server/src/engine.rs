@@ -298,8 +298,9 @@ pub enum Control {
     Start {
         /// Start paused at `t = 0`.
         paused: bool,
-        /// Multiple of real time; `0` is unthrottled.
-        speed: f64,
+        /// Multiple of real time; `0` is unthrottled. `None` keeps the speed the run
+        /// has now, so a rewind of a server started with `--speed 0` stays unthrottled.
+        speed: Option<f64>,
         /// Seed override.
         seed: Option<u64>,
         /// The scenario to run instead of the staged or current one.
@@ -525,6 +526,26 @@ pub trait Engine: Send + std::fmt::Debug {
 
     /// The seekable sim-time range, `(min_ns, max_ns)`, for `-32003`'s `data`.
     fn seek_range(&self) -> (u64, u64);
+
+    /// Lets the run compute ahead towards `t` for up to `budget` of wall time, and returns
+    /// how far the seekable range now reaches, in simulated nanoseconds.
+    ///
+    /// A live kernel runs only a bounded distance ahead of the stream (see
+    /// `LiveOptions::lookahead_steps`), so a seek past that distance has nothing to show
+    /// until the kernel has been let run there. The transport calls this in slices, with the
+    /// run lock released between them, and reports progress to the client as it goes.
+    ///
+    /// The default is the seekable range as it is: a replay and the fixture already reach
+    /// the end of the run. `budget` is a **transport** wait, like §1.5's stall timeout: no
+    /// simulated quantity depends on it.
+    fn extend_to(&mut self, _t: SimTime, _budget: std::time::Duration) -> u64 {
+        self.seek_range().1
+    }
+
+    /// The end of the run, simulated nanoseconds: how far a seek may ever reach.
+    fn horizon_ns(&self) -> u64 {
+        self.descriptor().duration
+    }
 
     /// What history this run is keeping (§6.5's `retention`).
     ///

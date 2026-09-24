@@ -247,8 +247,33 @@ export interface RunStatusResult {
     output_digest?: string | null;
     digest_steps?: number;
     failure?: string | null;
+    /** The scenario timeline's items fired by the stream position (03-interfaces §13). */
+    timeline?: ScenarioEventRecord[];
     [key: string]: unknown;
   };
+}
+
+/**
+ * One scenario timeline item as the engine fired it: the `scenario.event` record
+ * (03-interfaces §14), as `run.status` reports it in `engine.timeline`.
+ */
+export interface ScenarioEventRecord {
+  /** When it took effect, simulated ns. */
+  t: number;
+  /** Its position in the scenario's `events`. */
+  index: number;
+  /** Its `type`, e.g. `closure`. */
+  kind: string;
+  /** `start`, or `end` when its `until` arrived. */
+  phase: "start" | "end";
+  /** What it did, as a sentence. */
+  effect: string;
+  lanes?: number[];
+  multiplier?: number;
+  path?: string;
+  /** The value a `param.change` set, as JSON text. */
+  value?: string;
+  populations?: number[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,17 +1066,28 @@ export class JsonRpcClient {
     return this.#pending.size;
   }
 
-  /** Call a method and await its typed result. */
-  request<M extends VwpMethodName>(method: M, params: ParamsOf<M>): Promise<ResultOf<M>> {
+  /**
+   * Call a method and await its typed result.
+   *
+   * `options.timeoutMs` overrides the client's timeout for this one call — for a call the server
+   * reports progress on while it works (a `run.seek` past what a live kernel has produced sends
+   * `job.progress` until it lands), where the default would give up on a call that is going well.
+   */
+  request<M extends VwpMethodName>(
+    method: M,
+    params: ParamsOf<M>,
+    options: { readonly timeoutMs?: number } = {},
+  ): Promise<ResultOf<M>> {
     const id = this.#nextId++;
     const payload: JsonRpcRequest = { jsonrpc: "2.0", method, params, id };
+    const timeoutMs = options.timeoutMs ?? this.#timeoutMs;
     return new Promise<ResultOf<M>>((resolve, reject) => {
       const timer =
-        this.#timeoutMs > 0
+        timeoutMs > 0
           ? setTimeout(() => {
               this.#pending.delete(id);
-              reject(new Error(`${method} timed out after ${this.#timeoutMs} ms`));
-            }, this.#timeoutMs)
+              reject(new Error(`${method} timed out after ${timeoutMs} ms`));
+            }, timeoutMs)
           : null;
       this.#pending.set(id, {
         method,

@@ -180,6 +180,14 @@ impl Run {
         self.tx.subscribe()
     }
 
+    /// How many broadcast steps the slowest subscriber has not taken yet.
+    ///
+    /// What `run.speed {sync: "client"}` paces the producer on (§1.5 "Live pacing"): a
+    /// connection that encodes only as fast as its socket drains holds its steps here.
+    pub fn step_backlog(&self) -> usize {
+        self.tx.len()
+    }
+
     /// The current run state.
     pub fn state(&self) -> RunState {
         self.engine.lock().state()
@@ -320,6 +328,17 @@ impl Run {
             stepped += 1;
         }
         Ok((stepped, self.sim_time()))
+    }
+
+    /// Lets the run compute ahead towards `t` for up to `budget`; see
+    /// [`Engine::extend_to`]. Returns the new end of the seekable range.
+    pub fn extend_to(&self, t: SimTime, budget: std::time::Duration) -> u64 {
+        self.engine.lock().extend_to(t, budget)
+    }
+
+    /// The end of the run, which no seek can pass.
+    pub fn horizon_ns(&self) -> u64 {
+        self.engine.lock().horizon_ns()
     }
 
     /// Positions the run at `t` (§7.3).

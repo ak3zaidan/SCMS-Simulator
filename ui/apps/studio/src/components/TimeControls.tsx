@@ -96,6 +96,12 @@ const CHANNEL_LABEL: Record<string, string> = {
   "app.warning": "safety warning",
 };
 
+/**
+ * How long a seek may take. A seek past what the live kernel has produced runs the kernel to the
+ * target first (with progress shown), which on a large map in a debug build can take minutes.
+ */
+const SEEK_TIMEOUT_MS = 10 * 60_000;
+
 /** The seekable range an engine reported when it refused a seek (`-32003`). */
 interface SeekRefusal {
   readonly minNs: number;
@@ -124,6 +130,10 @@ export function TimeControls(): React.JSX.Element {
   const compareSync = useStudio((s) => s.compareSync);
   const setWhy = useStudio((s) => s.setWhy);
   const status = useStatus();
+  const seekProgress = useStudio((s) => s.seekProgress);
+  const scenarioDoc = useStudio((s) => s.scenario);
+  const stagedScenario = useStudio((s) => s.scenarioExtras.staged);
+  const firedEvents = useStudio((s) => s.firedEvents);
   const [stepUnit, setStepUnit] = useState<"step" | "keyframe" | "second">("step");
   const [busy, setBusy] = useState(false);
   /** The value under the thumb while a scrub gesture is in flight; `null` when it is not. */
@@ -196,6 +206,43 @@ export function TimeControls(): React.JSX.Element {
     [compareSide, compareSync.time, drivingReplay],
   );
 
+  /**
+   * The scenario's own timeline (`events`): what is planned to happen and when, drawn whether or
+   * not it has happened yet, and filled in once the engine reports it fired. Only while the
+   * document the page holds is the running one — with settings applied for the next run, the
+   * document describes that run instead, and its events would be drawn on the wrong run.
+   */
+  const planned = useMemo(() => {
+    if (span <= 0 || stagedScenario !== null || drivingReplay) return [];
+    const events = (scenarioDoc as { events?: unknown } | null)?.events;
+    if (!Array.isArray(events)) return [];
+    return events.flatMap((raw, index) => {
+      const e = raw as { t?: unknown; until?: unknown; type?: unknown; target?: unknown; value?: unknown; path?: unknown };
+      if (typeof e.t !== "number") return [];
+      const tNs = e.t * 1e9;
+      const untilNs = typeof e.until === "number" ? e.until * 1e9 : null;
+      const fired = firedEvents.filter((f) => f.index === index);
+      const what =
+        e.type === "closure" ? `closure of ${String(e.target)}`
+        : e.type === "demand.multiplier" ? `demand ×${String(e.value)}`
+        : e.type === "weather.front" ? `weather front: ${String(e.value)}`
+        : e.type === "param.change" ? `${String(e.path)} → ${JSON.stringify(e.value)}`
+        : e.type === "outage" ? `outage of node ${String(e.target)}`
+        : String(e.type);
+      return [{
+        index,
+        type: String(e.type),
+        tNs,
+        untilNs,
+        left: pct(tNs),
+        width: untilNs === null ? 0 : Math.max(0, pct(untilNs) - pct(tNs)),
+        fired: fired.length > 0,
+        title: `${what} at ${simClock(tNs)}${untilNs === null ? "" : ` until ${simClock(untilNs)}`}` +
+          (fired.length > 0 ? ` — ${fired.map((f) => f.effect).join("; ")}` : " — not reached yet"),
+      }];
+    });
+  }, [span, stagedScenario, drivingReplay, scenarioDoc, firedEvents, pct]);
+
   const marks = useMemo(() => {
     if (span <= 0) return [];
     const seen = new Map<string, { left: number; channel: string; label: string; tNs: number }>();
@@ -228,7 +275,10 @@ export function TimeControls(): React.JSX.Element {
         return;
       }
       try {
-        await engine.request("run.seek", { t_ns: target, pause_after: true });
+        // A target past what the live kernel has produced is reached by running the kernel
+        // there; the engine reports `job.progress` meanwhile (shown below the bar), so the call
+        // is allowed as long as a long jump on a large map takes rather than the usual 30 s.
+        await engine.request("run.seek", { t_ns: target, pause_after: true }, { timeoutMs: SEEK_TIMEOUT_MS });
       } catch (err) {
         // §6.6's `-32003` carries the range that would have worked. Remembering it is how the bar
         // learns a bound `run.status` never publishes — and how the two engines in this repository,
@@ -237,8 +287,8 @@ export function TimeControls(): React.JSX.Element {
         if (range === null) throw err;
         setRefused(range);
         throw new Error(
-          `The engine has only simulated up to ${simClock(range.maxNs)} so far, so it cannot move to ` +
-            `${simClock(target)} yet. Let the run reach that point first.`,
+          `The engine could only simulate up to ${simClock(range.maxNs)}, so it cannot move to ` +
+            `${simClock(target)}: the run ended or stopped before it got there.`,
         );
       }
     },
@@ -427,7 +477,7 @@ export function TimeControls(): React.JSX.Element {
           <div
             className="produced"
             style={{ width: `${pct(seekableNs)}%` }}
-            title={`Simulated up to ${simClock(seekableNs)}. Beyond that there is nothing to show yet.`}
+            title={`Simulated up to ${simClock(seekableNs)}. Moving beyond it runs the simulation there first.`}
           />
         ) : null}
         <div className="fill" style={{ width: `${pct(nowNs)}%` }} />
@@ -438,6 +488,23 @@ export function TimeControls(): React.JSX.Element {
           is the accessible surface for them rather than a focusable element that cannot be
           activated with a pointer.
         */}
+        {planned.map((p) =>
+          p.width > 0 ? (
+            <div key={`band-${p.index}`} className="event-band" aria-hidden="true" style={{ left: `${p.left}%`, width: `${p.width}%` }} title={p.title} />
+          ) : null,
+        )}
+        {planned.map((p) => (
+          <div
+            key={`scenario-${p.index}`}
+            className="scenario-mark"
+            aria-hidden="true"
+            data-testid="scenario-event-mark"
+            data-kind={p.type}
+            data-fired={p.fired ? "true" : "false"}
+            style={{ left: `${p.left}%` }}
+            title={p.title}
+          />
+        ))}
         {marks.map((m) => (
           <div
             key={`${m.channel}-${m.left}`}
@@ -579,6 +646,14 @@ export function TimeControls(): React.JSX.Element {
         </div>
       ) : null}
 
+      {seekProgress !== null ? (
+        <div className="timebar-notice" role="status" data-testid="seek-progress">
+          <progress value={seekProgress.progress} max={1} aria-label="Simulating ahead to the seek target" />{" "}
+          {seekProgress.message !== ""
+            ? seekProgress.message.replace(/^simulating/, "Simulating")
+            : `Simulating ahead: ${Math.round(seekProgress.progress * 100)} %`}
+        </div>
+      ) : null}
       {notice ? (
         <div className="timebar-notice" role="status" data-testid="time-notice">
           {notice}

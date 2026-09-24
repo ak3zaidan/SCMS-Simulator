@@ -182,7 +182,8 @@ fn all_methods() -> Vec<Value> {
                 json!({
                     "scenario": {"oneOf": [{"type": "string"}, {"type": "object"}]},
                     "seed": {"type": "integer", "minimum": 0},
-                    "speed": {"type": "number", "minimum": 0, "maximum": 100, "default": 1},
+                    "speed": {"type": "number", "minimum": 0, "maximum": 100,
+                              "description": "absent keeps the run's current speed (1 on a fresh server)"},
                     "paused": {"type": "boolean", "default": false},
                     "record": {"type": "boolean", "default": true},
                     "record_path": {"type": "string"},

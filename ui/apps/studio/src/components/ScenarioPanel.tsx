@@ -28,6 +28,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ValidationError } from "@vwp/protocol";
 
+import { EventsEditor } from "./EventsEditor.js";
 import { Identifier } from "./Identifier.js";
 import { engine } from "../state/engine.js";
 import { useStudio } from "../state/store.js";
@@ -176,7 +177,7 @@ function StatusBadge({ field }: { field: Field }): React.JSX.Element | null {
 }
 
 /** Groups open when the panel first shows: the ones a run is usually changed in. */
-const OPEN_GROUPS = new Set(["Run", "Traffic", "Radio", "Messages"]);
+const OPEN_GROUPS = new Set(["Run", "Traffic", "Radio", "Messages", "Timeline"]);
 
 export function ScenarioPanel(): React.JSX.Element {
   const scenario = useStudio((s) => s.scenario);
@@ -415,7 +416,18 @@ export function ScenarioPanel(): React.JSX.Element {
                     <label htmlFor={fieldId(f)}>
                       {f.label} {f.unit ? <span className="unit">[{f.unit}]</span> : null} <StatusBadge field={f} />
                     </label>
-                    <Widget field={f} value={getPointer(draft, f.pointer)} onChange={(v) => edit(f.pointer, v)} />
+                    {f.pointer === "/events" ? (
+                      <EventsEditor
+                        value={getPointer(draft, f.pointer)}
+                        onChange={(v) => edit(f.pointer, v)}
+                        durationS={(() => {
+                          const d = getPointer(draft, "/time/duration_s");
+                          return typeof d === "number" ? d : undefined;
+                        })()}
+                      />
+                    ) : (
+                      <Widget field={f} value={getPointer(draft, f.pointer)} onChange={(v) => edit(f.pointer, v)} />
+                    )}
                     {f.help ? <div className="help">{f.help}</div> : null}
                     {f.status && f.status !== "wired" && f.statusNote ? (
                       <div className="help status-note">{f.statusNote}</div>

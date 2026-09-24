@@ -110,10 +110,18 @@ describe("transport", () => {
     expect(t.restart.enabled).toBe(false);
   });
 
-  it("does not offer a seek before anything has been simulated", () => {
-    // `run.start` rewinds to `produced = 0`, where the engine's seek range is (0, 0).
+  it("offers a seek into a run nobody has watched yet, because the engine simulates ahead to it", () => {
+    // `run.start` rewinds to `produced = 0`. The engine used to refuse any seek past what it had
+    // produced; it now runs the kernel to the target first (crates/v2xw-server, `compute_ahead`),
+    // so the bar is live from the first instant — and still reports how far is simulated.
     const t = transport({ ...BASE, runState: "paused", tNs: 0, streamNs: 0 });
+    expect(t.seek.enabled).toBe(true);
+    expect(t.seekMaxNs).toBe(0);
+    expect(t.partial).toBe(true);
+  });
+
+  it("does not offer a seek in a run with no length", () => {
+    const t = transport({ ...BASE, runState: "paused", tNs: 0, streamNs: 0, tEndNs: 0 });
     expect(t.seek.enabled).toBe(false);
-    expect(t.seek.why).toMatch(/Nothing has been simulated/);
   });
 });

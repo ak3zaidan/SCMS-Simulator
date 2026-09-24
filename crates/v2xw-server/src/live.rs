@@ -109,6 +109,10 @@ use crate::engine::{
 use crate::error::{ParamError, Result, ServerError};
 use crate::introspect::{Introspect, MetricInfo};
 
+/// How many steps one `extend_to` slice takes before it returns to the transport, which then
+/// reports progress and gives the run lock back.
+const EXTEND_SLICE_STEPS: usize = 50;
+
 /// How a live run is started.
 #[derive(Debug, Clone)]
 pub struct LiveOptions {
@@ -1386,6 +1390,9 @@ struct Projector {
     /// the newest [`LINK_HISTORY`] observations of each pair, which is what an averaging
     /// window over the recent past needs and all it needs.
     links: BTreeMap<(u32, u32), std::collections::VecDeque<LinkObservation>>,
+    /// `scenario.event` records seen since the owner last took them: the scenario
+    /// timeline's items as they fired, with what each did.
+    scenario_events: Vec<Value>,
     last_index: u64,
 }
 
@@ -1448,6 +1455,7 @@ impl Projector {
             unprojected_channels: BTreeSet::new(),
             undecodable_channels: BTreeMap::new(),
             links: BTreeMap::new(),
+            scenario_events: Vec::new(),
             last_index: setup.duration / step_ns,
         }
     }
@@ -1691,6 +1699,12 @@ impl Projector {
                     }
                 }
                 "msg.latency" | "net.bytes" => {}
+                // A scenario timeline item firing: kept for `run.status` (`timeline`), which
+                // is how the page marks an event as having happened and says what it did.
+                "scenario.event" => match serde_json::from_slice::<Value>(&record.json) {
+                    Ok(v) => self.scenario_events.push(v),
+                    Err(_) => self.undecodable(record.channel),
+                },
                 "metric.sample" => match serde_json::from_slice::<MetricSample>(&record.json) {
                     Ok(sample) => self.push_metric(&sample, &mut metrics),
                     Err(_) => self.undecodable(record.channel),
@@ -2539,6 +2553,12 @@ pub struct LiveEngine {
     cursor: u64,
     /// One past the highest step index produced.
     produced: u64,
+    /// The scenario timeline's items as the kernel fired them, `(t_ns, record)`, in order.
+    /// Reported by `run.status` up to the stream position, not the kernel's frontier.
+    fired: Vec<(u64, Value)>,
+    /// A step a seek is waiting for, beyond the bounded lead: while it is set, [`Self::pump`]
+    /// takes steps past `lookahead_steps` until it is produced. Cleared by the seek.
+    seek_goal: Option<u64>,
     state: RunState,
     speed: f64,
     client_sync: bool,
@@ -2719,6 +2739,8 @@ impl LiveEngine {
             base_index: 0,
             cursor: 0,
             produced: 0,
+            fired: Vec::new(),
+            seek_goal: None,
             client_sync: false,
             report: None,
             failure: None,
@@ -2862,13 +2884,21 @@ impl LiveEngine {
             // proportional to the run, made the followed vehicle's message log (filled at
             // absorb time, read at the stream's instant) show only the run's last seconds,
             // and made run.status report counters from the end of the run.
-            if self.timeline.len() >= self.options.retain_steps && self.base_index >= self.cursor {
+            // A seek waiting beyond the lead lifts both bounds until its step is here: the
+            // retention window then slides forward past the stream position (see `absorb`),
+            // because the seek is about to move the stream there anyway.
+            let seeking = self.seek_goal.is_some_and(|goal| self.produced <= goal);
+            if !seeking
+                && self.timeline.len() >= self.options.retain_steps
+                && self.base_index >= self.cursor
+            {
                 break;
             }
-            if self.produced
-                >= self
-                    .cursor
-                    .saturating_add(self.options.lookahead_steps.max(1) as u64)
+            if !seeking
+                && self.produced
+                    >= self
+                        .cursor
+                        .saturating_add(self.options.lookahead_steps.max(1) as u64)
             {
                 break;
             }
@@ -2907,6 +2937,10 @@ impl LiveEngine {
             HostMsg::Step(raw) => {
                 let index = raw.index;
                 let out = self.projector.project(&raw);
+                for event in self.projector.scenario_events.drain(..) {
+                    let t = event.get("t").and_then(Value::as_u64).unwrap_or(0);
+                    self.fired.push((t, event));
+                }
                 self.digest_step(&out);
                 self.stats.absorb(&out);
                 for row in &out.metrics {
@@ -2922,12 +2956,16 @@ impl LiveEngine {
                 }
                 self.timeline.push_back(out);
                 self.produced = index + 1;
+                let seeking = self.seek_goal.is_some();
                 while self.timeline.len() > self.options.retain_steps
-                    && self.base_index < self.cursor
+                    && (self.base_index < self.cursor || seeking)
                 {
                     self.timeline.pop_front();
                     self.base_index += 1;
                 }
+                // Only while seeking can the window have slid past the stream position; the
+                // position then waits at the oldest step still held, where the seek finds it.
+                self.cursor = self.cursor.max(self.base_index);
                 true
             }
             HostMsg::Done(report) => {
@@ -3025,6 +3063,8 @@ impl LiveEngine {
         self.base_index = 0;
         self.cursor = 0;
         self.produced = 0;
+        self.fired.clear();
+        self.seek_goal = None;
         self.report = None;
         self.failure = None;
         self.history.clear();
@@ -3395,7 +3435,9 @@ impl Engine for LiveEngine {
                 // Staged edits are consumed by the run that runs them; the form then shows
                 // the running scenario, which is now the edited one.
                 self.staged = None;
-                self.speed = speed;
+                if let Some(speed) = speed {
+                    self.speed = speed;
+                }
                 self.state = if paused {
                     RunState::Paused
                 } else {
@@ -3494,6 +3536,8 @@ impl Engine for LiveEngine {
     }
 
     fn seek(&mut self, t: SimTime) -> Result<Vec<StepOutput>> {
+        // Whatever the seek decides, the lead goes back to its bound afterwards.
+        self.seek_goal = None;
         self.pump();
         let (min_ns, max_ns) = self.seek_range();
         if t < min_ns || t > max_ns {
@@ -3524,6 +3568,35 @@ impl Engine for LiveEngine {
             self.state = RunState::Paused;
         }
         Ok(outputs)
+    }
+
+    fn extend_to(&mut self, t: SimTime, budget: std::time::Duration) -> u64 {
+        let step_ns = self.step_ns();
+        let goal = (t.min(self.descriptor.duration)) / step_ns;
+        if self.has(goal) || self.report.is_some() || self.failure.is_some() {
+            self.pump();
+            return self.seek_range().1;
+        }
+        self.seek_goal = Some(goal);
+        // A transport wait, like `pump_blocking`'s: the kernel's output is the same whenever
+        // it is collected, so how long this waits changes nothing but when the seek lands.
+        // The slice is bounded by steps taken and by one wait of `budget` for the next step,
+        // so this module reads no clock: the transport (`http.rs`) is the one that does.
+        for _ in 0..EXTEND_SLICE_STEPS {
+            self.pump();
+            if self.produced > goal || self.report.is_some() || self.failure.is_some() {
+                break;
+            }
+            match self.host.steps.recv_timeout(budget) {
+                Ok(message) => {
+                    if !self.absorb(message) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        self.seek_range().1
     }
 
     fn seek_range(&self) -> (u64, u64) {
@@ -3677,6 +3750,15 @@ impl Engine for LiveEngine {
             },
             "retained_steps": self.timeline.len(),
             "retain_limit_steps": self.options.retain_steps,
+            // The scenario timeline's items that have fired by the stream position, with
+            // what each did (`scenario.event`). The kernel is ahead of the stream, so an
+            // item it has fired but the page has not reached yet is not reported.
+            "timeline": self
+                .fired
+                .iter()
+                .filter(|(t, _)| *t <= self.sim_time())
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>(),
         })
     }
 }

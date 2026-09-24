@@ -395,6 +395,14 @@ pub fn build_demand(scenario: &Scenario, world: &World) -> Result<Box<dyn Demand
             if !shares.is_empty() {
                 params.fleet = v2xw_mobility::demand::FleetMix::from_shares(&shares);
             }
+            // The thinning is exact only while the candidate boost covers every multiplier
+            // the timeline puts in force (`PoissonParams::candidate_boost`), so the boost is
+            // raised to the timeline's peak. A scenario with no demand event has a peak of 1
+            // and keeps the draw sequence it always had.
+            let peak = crate::timeline::demand_peak(scenario);
+            if peak > params.candidate_boost {
+                params.candidate_boost = peak;
+            }
             Ok(Box::new(PoissonDemand::new(world, params, od)?))
         }
     }

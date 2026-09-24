@@ -2660,6 +2660,10 @@ impl Mobility for NativeMobility {
     fn set_weather(&mut self, weather: WeatherState) {
         self.weather = weather;
     }
+
+    fn set_demand_multiplier(&mut self, m: f64) -> bool {
+        self.demand.as_mut().is_some_and(|d| d.set_multiplier(m))
+    }
 }
 
 /// A point `d_m` to the left of `lane`'s centreline at arc length `s_m`, with the normal

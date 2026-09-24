@@ -44,8 +44,16 @@ export class SeriesRing {
     return this.#x[(this.#start + this.#count - 1) % this.capacity];
   }
 
-  /** Append one aligned sample. `null` in `values` marks a gap the plot will not draw. */
+  /**
+   * Append one aligned sample. `null` in `values` marks a gap the plot will not draw.
+   *
+   * The ring is written in ascending `x`. A sample *earlier* than the newest one means the stream
+   * went back — a seek, or a new run — and every sample at or after it belongs to a timeline that
+   * is no longer this one, so they are dropped before it is written. Keeping them drew the old
+   * run's history under the new one.
+   */
   push(x: number, values: readonly (number | null)[]): void {
+    while (this.#count > 0 && this.#x[(this.#start + this.#count - 1) % this.capacity] >= x) this.#count--;
     const i = (this.#start + this.#count) % this.capacity;
     this.#x[i] = x;
     for (let k = 0; k < this.#y.length; k++) {
@@ -159,6 +167,10 @@ export class MetricHistory {
       this.#names = [...this.#series.keys()].sort();
       this.#version++;
     }
+    // The stream went back (a seek, or a new run on this socket): what this series holds from the
+    // sample's time on is another timeline, so it goes. Metric frames are written in ascending time,
+    // so everything to drop is at the end.
+    while (s.count > 0 && s.xs[(s.start + s.count - 1) % this.capacity] > tSeconds) s.count--;
     // Metric frames repeat the bin's end time; a repeat overwrites rather than stacking.
     if (s.count > 0) {
       const last = (s.start + s.count - 1) % this.capacity;

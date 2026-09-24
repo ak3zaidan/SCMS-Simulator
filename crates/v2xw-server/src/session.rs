@@ -1,7 +1,10 @@
 //! The connection state machine of §1: the handshake, resume, subscriptions and framing.
 //!
-//! One [`Session`] per WebSocket. It owns everything that is connection-scoped and nothing
-//! that is run-scoped:
+//! One [`Session`] per client stream. It owns everything that is connection-scoped and
+//! nothing that is run-scoped. A session outlives the socket it started on: when the socket
+//! drops, [`crate::resume`] keeps the session — and keeps encoding the run into its ring —
+//! so a reconnect that names its token resumes it (§1.4). "Connection" below means that
+//! stream, not one TCP socket.
 //!
 //! | Connection-scoped | Why |
 //! |---|---|
@@ -70,6 +73,9 @@ pub struct ConnectParams {
     pub run: Option<String>,
     /// The canonical `seq` to resume from (§1.4).
     pub resume: Option<u64>,
+    /// The session token a previous `Hello` issued (§1.4, `?session=`): which retained
+    /// session a reconnect is resuming. Without it `resume` names a `seq` of nothing.
+    pub session: Option<String>,
     /// `full` or `node` (§5). Immutable for the connection.
     pub profile: Profile,
     /// Whether the client can decompress zstd.
@@ -83,6 +89,7 @@ impl Default for ConnectParams {
         ConnectParams {
             run: None,
             resume: None,
+            session: None,
             profile: Profile::Full,
             compress: Compression::Zstd,
             version: 1,
@@ -118,6 +125,12 @@ impl ConnectParams {
                             "pass the seq one past the last frame applied",
                         )
                     })?);
+                }
+                "session" => {
+                    // Opaque: whatever a `Hello` issued. An empty value is no token.
+                    if !value.is_empty() {
+                        out.session = Some(value.to_string());
+                    }
                 }
                 "profile" => {
                     out.profile = match value {
@@ -285,6 +298,12 @@ pub struct Session {
     generation: u64,
     /// The opaque token every `Hello` on this connection echoes (§3.1.1).
     session_token: String,
+    /// Where the symbol table grew inside the stream: `(seq, length before)` for every
+    /// canonical frame that appended strings (a §3.8 extension). A resumed `Hello` must
+    /// carry the table *as the client held it at the resume point*, not as it is now, or
+    /// the replayed frames' extensions would append their strings a second time and every
+    /// later id would resolve one string off. Pruned to what the ring still holds.
+    string_marks: std::collections::VecDeque<(u64, usize)>,
 }
 
 impl Session {
@@ -325,6 +344,7 @@ impl Session {
             resumed: false,
             generation: 0,
             session_token: String::new(),
+            string_marks: std::collections::VecDeque::new(),
             params,
         }
     }
@@ -339,6 +359,59 @@ impl Session {
     /// The run generation this session's `Hello` described.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// The token this session's `Hello` issued.
+    pub fn session_token(&self) -> &str {
+        &self.session_token
+    }
+
+    /// Hands this retained session to a new connection that asked to resume at `resume`.
+    ///
+    /// The profile, subscriptions, overlays, camera, follow, encoder, ring and `seq` are the
+    /// session's and stay; what belonged to the *old socket* does not. Its send queue held
+    /// frames that socket never wrote — every one of them is in the ring, which is what the
+    /// resumed `Hello` replays from — so the queue is emptied rather than sent twice, and
+    /// drop accounting starts again.
+    ///
+    /// A profile is immutable for a session (§5.3): a reconnect asking for a different one
+    /// is not a resume of this session and the caller must not hand it over; see
+    /// [`Session::accepts`].
+    pub fn reattach(&mut self, resume: Option<u64>) {
+        self.params.resume = resume;
+        self.queue = SendQueue::new(SendQueue::DEFAULT_MAX_FRAMES, SendQueue::DEFAULT_MAX_BYTES);
+        self.pending_drops = DropCounts::default();
+        self.drop_span = None;
+        self.greeted = false;
+        self.resumed = false;
+    }
+
+    /// Whether a reconnect with `params` may take this session over: the same profile.
+    pub fn accepts(&self, params: &ConnectParams) -> bool {
+        params.profile == self.profile
+    }
+
+    /// True when `seq` can be resumed on this session (§1.4 rule 1).
+    ///
+    /// Either the ring holds `seq` behind a retained keyframe, or `seq` is exactly the next
+    /// frame this session will produce — a client that missed nothing, which the ring
+    /// cannot vouch for because the frame does not exist yet, and which is the commonest
+    /// reconnect of all: a drop while the run was paused.
+    pub fn can_resume(&self, seq: u64) -> bool {
+        if seq == self.seq {
+            // Resuming at the head needs a keyframe the client already applied, which is
+            // true of any seq past the first frame of the stream, and vacuous at 0.
+            return true;
+        }
+        self.ring.can_resume(seq)
+    }
+
+    /// The length the symbol table had when frame `seq` was about to be sent.
+    fn table_len_at(&self, seq: u64) -> usize {
+        self.string_marks
+            .iter()
+            .find(|(at, _)| *at >= seq)
+            .map_or(self.strings.strings.len(), |(_, len)| *len)
     }
 
     /// The session for this same connection on the run `descriptor` describes.
@@ -518,10 +591,16 @@ impl Session {
         session_token: &str,
         nodes: Option<(&[crate::engine::NodeFacts], &[String])>,
     ) -> Result<Frame> {
-        let resume_target = self.params.resume.filter(|seq| self.ring.can_resume(*seq));
+        let resume_target = self.params.resume.filter(|seq| self.can_resume(*seq));
         self.resumed = resume_target.is_some();
         if !self.resumed {
             self.strings = descriptor.hello.strings.clone();
+            self.string_marks.clear();
+            // The client throws its table away on a non-resumed `Hello` (§2.5), including the
+            // strings the run's provenance appended, so the provenance goes out again after
+            // the resync keyframe. A retained session that falls back to §1.4 rule 2 has
+            // already sent it once; without this its metrics would name nothing.
+            self.provenance = descriptor.provenance.clone();
         }
 
         let mut body = descriptor.hello.clone();
@@ -549,6 +628,48 @@ impl Session {
             body.resume_seq = self.seq;
         }
         body.sim_time_ns = sim_time;
+        if let Some(seq) = resume_target {
+            // §1.4 rule 1 / §2.5: the client keeps its table, and the replay that follows
+            // extends it exactly as the original frames did. So this `Hello` carries the
+            // table as it stood at `seq` and appends nothing: an id interned here would take
+            // the slot a replayed §3.8 extension is about to append into. A node whose label
+            // is not in that table yet is labelled with id 0, the empty string, until the
+            // next non-resumed `Hello`; the label is cosmetic, the ids are not.
+            let len = self.table_len_at(seq);
+            body.strings = StrTable {
+                strings: self.strings.strings[..len.min(self.strings.strings.len())].to_vec(),
+            };
+            if let Some((nodes, _)) = nodes {
+                let find = |t: &StrTable, s: &str| {
+                    t.strings
+                        .iter()
+                        .position(|x| x == s)
+                        .and_then(|i| u32::try_from(i).ok())
+                        .unwrap_or(0)
+                };
+                body.nodes = nodes
+                    .iter()
+                    .map(|facts| NodeRow {
+                        node_id: facts.node_id,
+                        actor_id: facts.actor_id,
+                        pos_m: facts.pos_m,
+                        str_label: find(&body.strings, &facts.label),
+                        str_profile_id: find(&body.strings, &facts.profile_id),
+                        flags: facts.flags,
+                        kind: facts.kind,
+                        class_idx: facts.class_idx,
+                    })
+                    .collect();
+            }
+            body.str_session_token = body
+                .strings
+                .strings
+                .iter()
+                .position(|x| x == session_token)
+                .and_then(|i| u32::try_from(i).ok())
+                .unwrap_or(0);
+            return self.finish_hello(body);
+        }
         body.strings = self.strings.clone();
         if let Some((nodes, appended)) = nodes {
             // §2.5 is append-only and an id must mean one string for the whole run, so the
@@ -575,7 +696,12 @@ impl Session {
         }
         body.str_session_token = body.strings.intern(session_token);
         self.strings = body.strings.clone();
+        self.finish_hello(body)
+    }
 
+    /// The part of building a `Hello` that is the same for a fresh and a resumed one: the
+    /// profile's channel table, the subscriptions, and the resync decision.
+    fn finish_hello(&mut self, mut body: v2xw_record::wire::hello::HelloBody) -> Result<Frame> {
         if self.profile.is_node_only() {
             // §5.2: GT channels are absent from the table entirely, not merely disabled,
             // and `nodes.flags` bit 1 must be zero.
@@ -633,7 +759,7 @@ impl Session {
 
     /// The retained frames a resumed handshake replays (§1.4 rule 1).
     pub fn resume_backlog(&self) -> Vec<Frame> {
-        match self.params.resume.filter(|seq| self.ring.can_resume(*seq)) {
+        match self.params.resume.filter(|seq| self.can_resume(*seq)) {
             Some(seq) => self
                 .ring
                 .replay_from(seq)
@@ -803,6 +929,11 @@ impl Session {
                 keyframe,
                 frame: frame.canonical(),
             });
+            if let Some(first) = self.ring.first_seq() {
+                while self.string_marks.front().is_some_and(|(at, _)| *at < first) {
+                    self.string_marks.pop_front();
+                }
+            }
         }
         let report = self.queue.enqueue(frame);
         self.absorb(report, effects);
@@ -888,6 +1019,10 @@ impl Session {
             }
             // Mirroring the append here keeps the session's view of the table exactly what
             // the client will compute.
+            if !ext.strings.is_empty() {
+                self.string_marks
+                    .push_back((self.seq, self.strings.strings.len()));
+            }
             self.strings.strings.extend(ext.strings.iter().cloned());
         }
         let seq = self.take_seq();

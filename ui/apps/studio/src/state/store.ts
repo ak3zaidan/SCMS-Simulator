@@ -112,6 +112,29 @@ export interface RunInfo {
   readonly kernelThreads: number | null;
 }
 
+/**
+ * One scenario timeline item as the engine fired it (`run.status` → `engine.timeline`, from the
+ * `scenario.event` record): what it was and what it did.
+ */
+export interface FiredEvent {
+  readonly t: number;
+  readonly index: number;
+  readonly kind: string;
+  readonly phase: "start" | "end";
+  readonly effect: string;
+  readonly lanes?: readonly number[];
+  readonly multiplier?: number;
+  readonly path?: string;
+  readonly value?: string;
+  readonly populations?: readonly number[];
+}
+
+/** A one-shot "pick a point on the map" request from a panel; the viewport answers it. */
+export interface MapPickRequest {
+  readonly purpose: string;
+  readonly resolve: (point: { readonly x: number; readonly y: number }) => void;
+}
+
 /** One row of the engine's published settings surface (`scenario.get {with_schema}` `fields`). */
 export interface PublishedField {
   readonly "x-pointer"?: string;
@@ -400,6 +423,15 @@ interface StudioState {
   reconnectAttempts: number;
   validation: ValidationView | null;
   timeline: readonly TimelineMark[];
+  /**
+   * A seek that is running the live kernel forward to its target, as the engine reports it
+   * (§6.14 `job.progress`); `null` when none is.
+   */
+  seekProgress: { readonly progress: number; readonly message: string } | null;
+  /** The scenario timeline's items the running run has fired, as of the stream position. */
+  firedEvents: readonly FiredEvent[];
+  /** A panel waiting for a click on the map, or `null`. */
+  mapPick: MapPickRequest | null;
   logs: readonly LogLine[];
   provenanceCount: number;
   metricProvenance: Readonly<Record<string, number>>;
@@ -431,7 +463,11 @@ interface StudioState {
   compareMetrics: readonly string[];
 
   setConnection: (s: VwpConnectionState) => void;
-  setHello: (h: HelloSummary) => void;
+  /**
+   * Adopt a `Hello`. A new run (or a non-resumed reconnect) empties the timeline; a resumed one
+   * (§1.4 case 1) continues the stream the timeline already describes, so it keeps it.
+   */
+  setHello: (h: HelloSummary, options?: { readonly resumed?: boolean }) => void;
   setWorldSummary: (w: WorldSummary) => void;
   setRun: (r: Partial<RunInfo>) => void;
   setSelection: (actorId: number | null, nodeId: number | null) => void;
@@ -460,6 +496,10 @@ interface StudioState {
   setScenarioList: (items: readonly ScenarioListItem[]) => void;
   setValidation: (v: ValidationView | null) => void;
   addTimelineMarks: (marks: readonly TimelineMark[]) => void;
+  setSeekProgress: (p: { readonly progress: number; readonly message: string } | null) => void;
+  /** Keeps the previous array when the content is the same, like the other 5 Hz setters. */
+  setFiredEvents: (events: readonly FiredEvent[]) => void;
+  setMapPick: (request: MapPickRequest | null) => void;
   addLog: (line: LogLine) => void;
   setProvenanceCount: (n: number) => void;
   /**
@@ -614,6 +654,9 @@ export const useStudio = create<StudioState>((set) => ({
   reconnectAttempts: 0,
   validation: null,
   timeline: [],
+  seekProgress: null,
+  firedEvents: [],
+  mapPick: null,
   logs: [],
   provenanceCount: 0,
   metricProvenance: {},
@@ -633,7 +676,7 @@ export const useStudio = create<StudioState>((set) => ({
   compareMetrics: [],
 
   setConnection: (s) => set({ connection: s }),
-  setHello: (h) => set({ hello: h, timeline: [] }),
+  setHello: (h, options) => set(options?.resumed === true ? { hello: h } : { hello: h, timeline: [] }),
   setWorldSummary: (w) => set({ world: w }),
   setRun: (r) => set((state) => (sameRun(state.run, r) ? state : { run: { ...state.run, ...r } })),
   setSelection: (actorId, nodeId) => set({ selectedActor: actorId, selectedNode: nodeId, pseudonym: null, inspect: null, inspectMessages: null }),
@@ -679,6 +722,12 @@ export const useStudio = create<StudioState>((set) => ({
   setReconnectAttempts: (n) => set((state) => (state.reconnectAttempts === n ? state : { reconnectAttempts: n })),
   setScenarioList: (items) => set({ scenarioList: items }),
   setValidation: (v) => set({ validation: v }),
+  setSeekProgress: (p) => set({ seekProgress: p }),
+  setFiredEvents: (events) =>
+    set((state) =>
+      JSON.stringify(state.firedEvents) === JSON.stringify(events) ? state : { firedEvents: events },
+    ),
+  setMapPick: (request) => set({ mapPick: request }),
   addTimelineMarks: (marks) =>
     set((state) => (marks.length === 0 ? state : { timeline: [...state.timeline, ...marks].slice(-MAX_MARKS) })),
   addLog: (line) => set((state) => ({ logs: [line, ...state.logs].slice(0, MAX_LOGS) })),

@@ -67,6 +67,7 @@ pub mod records;
 pub mod run;
 pub mod scenario;
 pub mod snapshot;
+pub mod timeline;
 pub mod wiring;
 
 pub use ctx::{DigestRecorder, EngineCtx, MemoryRecorder, NullRecorder, RunRecorder};

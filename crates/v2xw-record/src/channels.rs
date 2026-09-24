@@ -220,6 +220,15 @@ pub const CHANNELS: &[ChannelSpec] = &[
         visibility: Visibility::Public,
         payload_bytes: Some(32),
     },
+    // A scenario timeline item taking effect (03-interfaces §13): what it was and what the
+    // engine did with it. A recording and run-log channel, a handful of records per run; the
+    // live server turns it into the timeline `run.status` reports.
+    ChannelSpec {
+        name: "scenario.event",
+        wire_id: None,
+        visibility: Visibility::Public,
+        payload_bytes: None,
+    },
     ChannelSpec {
         name: "sec.cert",
         wire_id: Some(20),

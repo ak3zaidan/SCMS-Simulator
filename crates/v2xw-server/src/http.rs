@@ -50,8 +50,8 @@ pub struct AppState {
     pub run: Arc<Run>,
     /// The bearer token a non-loopback bind requires (02-architecture §12).
     pub token: Option<Arc<String>>,
-    /// The opaque session token `Hello` echoes; `""` on loopback (§3.1.1).
-    pub session_token: Arc<String>,
+    /// The sessions this server holds, attached or parked for a resume (§1.4).
+    pub sessions: Arc<crate::resume::Sessions>,
 }
 
 /// The three cross-origin isolation headers of §1.1, plus the immutability headers for a
@@ -284,6 +284,111 @@ async fn upgrade(
     response
 }
 
+/// How a connection's loop ended, which decides what becomes of its session.
+enum Exit {
+    /// The socket went away without saying goodbye: park the session for a resume (§1.4).
+    Park,
+    /// The client closed cleanly (1000) or the server ended the connection on purpose:
+    /// nobody will resume this session.
+    Forget,
+    /// Another connection presented this session's token: hand it over (§1.4 supersede).
+    Handover(crate::resume::Claim),
+}
+
+/// The session a new connection starts with: a retained one it named, or a new one.
+struct Attached {
+    session: Session,
+    steps: tokio::sync::broadcast::Receiver<Arc<crate::engine::StepOutput>>,
+    notices: tokio::sync::broadcast::Receiver<Value>,
+    claims: tokio::sync::mpsc::Receiver<crate::resume::Claim>,
+    /// The frames to send before the loop starts: `Hello`, then a replay or a keyframe.
+    greeting: Vec<Frame>,
+}
+
+/// Finds or makes the session for a new connection and builds its greeting.
+///
+/// A token that names a retained session with the same profile takes it over, and the
+/// greeting is §1.4 rule 1 when the ring still covers `?resume=` (a resumed `Hello` and the
+/// missed frames, nothing re-encoded) or rule 2 when it does not (a fresh `Hello` and a
+/// resync keyframe). If the run moved to a new generation while the client was away, the
+/// client has not seen that run's `Hello`, so it gets one — never a resume across runs.
+async fn attach(state: &AppState, params: ConnectParams) -> Result<Attached> {
+    let claimed = match params.session.as_deref() {
+        Some(token) => state.sessions.claim(token, Instant::now()).await,
+        None => None,
+    };
+    if let Some(d) = claimed {
+        if d.session.accepts(&params) {
+            let crate::resume::Detached {
+                mut session,
+                steps,
+                notices,
+                claims,
+                client_generation,
+            } = *d;
+            let generation = state.run.generation();
+            let greeting = if session.generation() != generation {
+                // The run moved on while nobody was attached; the parked task follows
+                // steps, not generations, so it may still be on the previous one.
+                session.reattach(None);
+                session.regreet(&state.run)?
+            } else {
+                let resumable = client_generation == session.generation();
+                session.reattach(if resumable { params.resume } else { None });
+                let descriptor = state.run.descriptor();
+                let mut frames = session.greet(&state.run, &descriptor)?;
+                if session.resumed() {
+                    // Hello first, then the ring from `?resume=`: the frames this client
+                    // missed, with the `seq` it would have seen them under.
+                    let backlog = session.resume_backlog();
+                    frames.splice(1..1, backlog);
+                }
+                frames
+            };
+            return Ok(Attached {
+                session,
+                steps,
+                notices,
+                claims,
+                greeting,
+            });
+        }
+        // A different profile is a different stream (§5.3): the retained session stays
+        // retained for a client that asks for it as it was.
+        state
+            .sessions
+            .park(Arc::clone(&state.run), d, Instant::now());
+    }
+
+    // Subscribed before the generation is read, so a run started between the two is seen
+    // as a change rather than missed.
+    let notices = state.run.subscribe_notices();
+    let steps = state.run.subscribe();
+    let generation = state.run.generation();
+    let descriptor = state.run.descriptor();
+    let mut params = params;
+    // `?resume=` without a session this server holds names a `seq` of nothing (§1.4 rule 2).
+    params.resume = None;
+    let mut session = Session::new(params, &descriptor);
+    let token = state.sessions.mint();
+    let claims = state.sessions.register(&token);
+    session.bind(generation, &token);
+    // §1.3: the server sends exactly one Hello immediately, before anything else. A live
+    // run's node table is the set it has *now*, not the set it had when the server bound
+    // (§3.1.3), so it is read here per connection. A run that is not moving also gets the
+    // state at its position, so a page that attaches to a paused or finished run — a
+    // reload, a second tab, a reconnect after the engine restarted — shows the city as it
+    // stands instead of nothing.
+    let greeting = session.greet(&state.run, &descriptor)?;
+    Ok(Attached {
+        session,
+        steps,
+        notices,
+        claims,
+        greeting,
+    })
+}
+
 /// One connection's whole life (§1.3 onwards).
 async fn connection(mut socket: WebSocket, state: AppState, query: String) {
     let params = match ConnectParams::parse(&query) {
@@ -307,48 +412,92 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
         }
     }
 
-    // Subscribed before the generation is read, so a run started between the two is seen
-    // as a change rather than missed.
     let mut generations = state.run.watch_generation();
-    let mut notices = state.run.subscribe_notices();
-    let mut steps = state.run.subscribe();
-    let generation = *generations.borrow_and_update();
-    let descriptor = state.run.descriptor();
-    let mut session = Session::new(params, &descriptor);
-    session.bind(generation, &state.session_token);
-
-    // §1.3: the server sends exactly one Hello immediately, before anything else. A live
-    // run's node table is the set it has *now*, not the set it had when the server bound
-    // (§3.1.3), so it is read here per connection. A run that is not moving also gets the
-    // state at its position, so a page that attaches to a paused or finished run — a
-    // reload, a second tab, a reconnect after the engine restarted — shows the city as it
-    // stands instead of nothing.
-    let greeting = match session.greet(&state.run, &descriptor) {
-        Ok(frames) => frames,
+    generations.borrow_and_update();
+    let Attached {
+        mut session,
+        mut steps,
+        mut notices,
+        mut claims,
+        greeting,
+    } = match attach(&state, params).await {
+        Ok(a) => a,
         Err(e) => {
             let _ = send_error_and_bye(&mut socket, &e, 3, 1011).await;
             return;
         }
     };
-    let (hello, rest) = greeting.split_at(1);
-    if socket
-        .send(Message::Binary(hello[0].clone().into_bytes().into()))
-        .await
-        .is_err()
-    {
-        return;
+    let greeted_generation = session.generation();
+    let exit = run_connection(
+        &mut socket,
+        &state,
+        &mut session,
+        &mut steps,
+        &mut notices,
+        &mut claims,
+        &mut generations,
+        greeting,
+    )
+    .await;
+    // Every regreet on this connection was written before the loop went on, so the last
+    // `Hello` the client got is the one for the session's generation — unless the socket
+    // died inside a regreet, in which case it is the one the connection started with.
+    let client_generation = if session.greeted() {
+        session.generation()
+    } else {
+        greeted_generation
+    };
+    let detached = Box::new(crate::resume::Detached {
+        session,
+        steps,
+        notices,
+        claims,
+        client_generation,
+    });
+    match exit {
+        Exit::Park => state
+            .sessions
+            .park(Arc::clone(&state.run), detached, Instant::now()),
+        Exit::Forget => state.sessions.forget(detached.session.session_token()),
+        Exit::Handover(reply) => {
+            // §1.4: "the server sends `Bye{reason = 4 (superseded)}` on the old socket and
+            // closes it with 1012". Said before the hand-over, so the old page's last word
+            // from the server is why it lost its stream.
+            if let Ok(frame) = bye_frame(state.run.sim_time(), 0, 4, "superseded") {
+                let _ = socket
+                    .send(Message::Binary(frame.into_bytes().into()))
+                    .await;
+            }
+            let _ = close(&mut socket, 1012, "superseded by a resumed connection").await;
+            if let Err(back) = reply.send(detached) {
+                // The claimant gave up waiting; the session is still resumable.
+                state
+                    .sessions
+                    .park(Arc::clone(&state.run), back, Instant::now());
+            }
+        }
     }
-    for frame in session
-        .resume_backlog()
-        .into_iter()
-        .chain(rest.iter().cloned())
-    {
+}
+
+/// The connection loop, from the greeting to whatever ends it.
+#[allow(clippy::too_many_arguments)]
+async fn run_connection(
+    socket: &mut WebSocket,
+    state: &AppState,
+    session: &mut Session,
+    steps: &mut tokio::sync::broadcast::Receiver<Arc<crate::engine::StepOutput>>,
+    notices: &mut tokio::sync::broadcast::Receiver<Value>,
+    claims: &mut tokio::sync::mpsc::Receiver<crate::resume::Claim>,
+    generations: &mut tokio::sync::watch::Receiver<u64>,
+    greeting: Vec<Frame>,
+) -> Exit {
+    for frame in greeting {
         if socket
             .send(Message::Binary(frame.into_bytes().into()))
             .await
             .is_err()
         {
-            return;
+            return Exit::Park;
         }
     }
 
@@ -364,40 +513,54 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
     loop {
         tokio::select! {
             biased;
+            claim = claims.recv() => {
+                match claim {
+                    Some(reply) => return Exit::Handover(reply),
+                    // The registry forgot this session (the server is going away).
+                    None => return Exit::Forget,
+                }
+            }
             incoming = socket.recv() => {
                 match incoming {
-                    None => return,
-                    Some(Err(_)) => return,
+                    None | Some(Err(_)) => return Exit::Park,
                     Some(Ok(Message::Pong(_))) => last_pong = Instant::now(),
                     Some(Ok(Message::Ping(_))) => { /* axum answers automatically */ }
-                    Some(Ok(Message::Close(_))) => return,
+                    Some(Ok(Message::Close(frame))) => {
+                        // 1000 is "I am done"; anything else — 1001 on a navigation, a
+                        // proxy's 1006 — may be followed by a reconnect.
+                        return if frame.as_ref().is_some_and(|f| f.code == 1000) {
+                            Exit::Forget
+                        } else {
+                            Exit::Park
+                        };
+                    }
                     Some(Ok(Message::Binary(_))) => {
                         // §1.2: a conforming client never sends binary in v1; the server
                         // replies with an Error frame and may close with 1003.
                         let e = ServerError::InvalidRequest(
                             "client-to-server binary frames do not exist in v1".to_string(),
                         );
-                        let _ = send_error_and_bye(&mut socket, &e, 3, 1003).await;
-                        return;
+                        let _ = send_error_and_bye(socket, &e, 3, 1003).await;
+                        return Exit::Forget;
                     }
                     Some(Ok(Message::Text(text))) => {
-                        if !handle_text(&mut socket, &state, &mut session, &mut steps, &text)
-                            .await
-                        {
-                            return;
+                        match handle_text(socket, state, session, steps, &text).await {
+                            TextOutcome::Continue => {}
+                            TextOutcome::Gone => return Exit::Park,
+                            TextOutcome::Ended => return Exit::Forget,
                         }
                     }
                 }
             }
             changed = generations.changed() => {
                 if changed.is_err() {
-                    return;
+                    return Exit::Forget;
                 }
                 let current = *generations.borrow_and_update();
                 if current != session.generation()
-                    && !regreet(&mut socket, &state, &mut session).await
+                    && !regreet(socket, state, session).await
                 {
-                    return;
+                    return Exit::Park;
                 }
             }
             notice = notices.recv() => {
@@ -408,13 +571,13 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
                             .await
                             .is_err()
                         {
-                            return;
+                            return Exit::Park;
                         }
                     }
                     // A notification is advisory state, and `run.status` is the
                     // authoritative answer; a connection that missed some carries on.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Exit::Forget,
                 }
             }
             step = steps.recv() => {
@@ -425,9 +588,9 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
                             continue;
                         }
                         if output.generation > session.generation()
-                            && !regreet(&mut socket, &state, &mut session).await
+                            && !regreet(socket, state, session).await
                         {
-                            return;
+                            return Exit::Park;
                         }
                         let effects = match session.encode_step(&output) {
                             Ok(e) => e,
@@ -435,13 +598,13 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
                                 // Said, not swallowed: a connection that ends here with no
                                 // frame looked, from the page, like the engine vanishing.
                                 tracing::error!(error = %e, "a step could not be encoded");
-                                let _ = send_error_and_bye(&mut socket, &e, 3, 1011).await;
-                                return;
+                                let _ = send_error_and_bye(socket, &e, 3, 1011).await;
+                                return Exit::Forget;
                             }
                         };
                         if effects.fatal {
-                            let _ = close(&mut socket, 1011, "send queue overflow").await;
-                            return;
+                            let _ = close(socket, 1011, "send queue overflow").await;
+                            return Exit::Forget;
                         }
                         for frame in effects.frames {
                             if socket
@@ -449,7 +612,7 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
                                 .await
                                 .is_err()
                             {
-                                return;
+                                return Exit::Park;
                             }
                         }
                         if let Some((first, last, counts, resync)) = effects.drop_notice {
@@ -467,7 +630,7 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
                                 .await
                                 .is_err()
                             {
-                                return;
+                                return Exit::Park;
                             }
                         }
                     }
@@ -497,19 +660,19 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
                             .await
                             .is_err()
                         {
-                            return;
+                            return Exit::Park;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Exit::Forget,
                 }
             }
             _ = ping.tick() => {
                 if last_pong.elapsed() > PONG_DEADLINE {
-                    let _ = close(&mut socket, 1001, "no pong within 30 s").await;
-                    return;
+                    let _ = close(socket, 1001, "no pong within 30 s").await;
+                    return Exit::Park;
                 }
                 if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
-                    return;
+                    return Exit::Park;
                 }
             }
         }
@@ -538,30 +701,56 @@ async fn regreet(socket: &mut WebSocket, state: &AppState, session: &mut Session
     true
 }
 
-/// Handles one text frame. Returns `false` when the connection must end.
+/// What handling one text frame left the connection in.
+enum TextOutcome {
+    /// Carry on.
+    Continue,
+    /// The socket failed under a write: the client may come back.
+    Gone,
+    /// The connection was ended on purpose (`run.stop` with its `Bye`).
+    Ended,
+}
+
+/// Handles one text frame.
 async fn handle_text(
     socket: &mut WebSocket,
     state: &AppState,
     session: &mut Session,
     steps: &mut tokio::sync::broadcast::Receiver<Arc<crate::engine::StepOutput>>,
     text: &str,
-) -> bool {
+) -> TextOutcome {
+    let sent = |ok: bool| {
+        if ok {
+            TextOutcome::Continue
+        } else {
+            TextOutcome::Gone
+        }
+    };
     let request = match rpc::parse(text) {
         Ok(r) => r,
         Err(e) => {
             let response = rpc::failure(&Value::Null, &e);
-            return socket
-                .send(Message::Text(response.to_string().into()))
-                .await
-                .is_ok();
+            return sent(
+                socket
+                    .send(Message::Text(response.to_string().into()))
+                    .await
+                    .is_ok(),
+            );
         }
     };
     let id = request.id.clone();
+    let received_at = Instant::now();
+    if request.method == "run.seek"
+        && let Some(target) = seek_target(&state.run, &request.params)
+        && !compute_ahead(socket, state, target).await
+    {
+        return TextOutcome::Gone;
+    }
     let mut ctx = rpc::Context {
         run: &state.run,
         session: Some(session),
         pending: Some(steps),
-        received_at: Some(Instant::now()),
+        received_at: Some(received_at),
     };
     let outcome = rpc::dispatch(&mut ctx, &request);
     match outcome {
@@ -573,7 +762,7 @@ async fn handle_text(
                     .await
                     .is_err()
                 {
-                    return false;
+                    return TextOutcome::Gone;
                 }
             }
             if let Some(id) = id {
@@ -583,7 +772,7 @@ async fn handle_text(
                     .await
                     .is_err()
                 {
-                    return false;
+                    return TextOutcome::Gone;
                 }
             }
             for notice in outcome.notifications {
@@ -592,13 +781,13 @@ async fn handle_text(
                     .await
                     .is_err()
                 {
-                    return false;
+                    return TextOutcome::Gone;
                 }
             }
             if outcome.bye {
                 let _ = send_bye(socket, state, 1, "run.stop").await;
                 let _ = close(socket, 1000, "client requested stop").await;
-                return false;
+                return TextOutcome::Ended;
             }
             // Steps that arrived while this call ran are the calling connection's to
             // encode against the generation it is on now, which the call may have moved.
@@ -611,29 +800,113 @@ async fn handle_text(
                                 .await
                                 .is_err()
                             {
-                                return false;
+                                return TextOutcome::Gone;
                             }
                         }
                     }
-                    Err(_) => return false,
+                    Err(_) => return TextOutcome::Gone,
                 }
             }
-            true
+            TextOutcome::Continue
         }
         Err(e) => {
             // §6.1: a notification never gets a reply, not even an error one.
             match id {
-                None => true,
+                None => TextOutcome::Continue,
                 Some(id) => {
                     let response = rpc::failure(&id, &e);
-                    socket
-                        .send(Message::Text(response.to_string().into()))
-                        .await
-                        .is_ok()
+                    sent(
+                        socket
+                            .send(Message::Text(response.to_string().into()))
+                            .await
+                            .is_ok(),
+                    )
                 }
             }
         }
     }
+}
+
+/// Where a `run.seek` asks to go, when that is past what the run has produced but inside
+/// the run: the case [`compute_ahead`] exists for. `None` for anything the seek itself will
+/// answer — a target already seekable, one outside the run, a malformed request.
+fn seek_target(run: &Run, params: &serde_json::Map<String, Value>) -> Option<u64> {
+    let horizon = run.horizon_ns();
+    let target = match (params.get("t_ns"), params.get("fraction")) {
+        (Some(t), _) => t.as_u64()?,
+        (None, Some(f)) => {
+            let f = f.as_f64()?;
+            if !(0.0..=1.0).contains(&f) {
+                return None;
+            }
+            (horizon as f64 * f) as u64
+        }
+        _ => return None,
+    };
+    let (_, max_ns) = run.seek_range();
+    (target > max_ns && target <= horizon).then_some(target)
+}
+
+/// Runs the kernel forward until `target` is seekable, telling the client how far it is.
+///
+/// A live kernel keeps only a bounded lead on the stream (`LiveOptions::lookahead_steps`,
+/// 12.8 s at the defaults once the channel is counted), so a seek past it used to be refused
+/// with "the engine has only simulated up to …": the scrub bar could not reach most of a run
+/// the user had not watched. The kernel is let run ahead in 100 ms slices, with the run lock
+/// released between them so `run.status` and the producer keep going, and every slice sends
+/// §6.14's `job.progress` so the page can show a progress bar rather than a frozen control.
+/// The seek then lands exactly as one inside the range does. Returns `false` if the socket
+/// went away meanwhile.
+async fn compute_ahead(socket: &mut WebSocket, state: &AppState, target: u64) -> bool {
+    const SLICE: WallDuration = WallDuration::from_millis(100);
+    let job_id = format!("run.seek:{target}");
+    let (_, start) = state.run.seek_range();
+    let mut last = start;
+    let mut stalled = 0u32;
+    loop {
+        let run = Arc::clone(&state.run);
+        let reached = tokio::task::spawn_blocking(move || run.extend_to(target, SLICE))
+            .await
+            .unwrap_or(last);
+        let progress = if target > start {
+            ((reached.saturating_sub(start)) as f64 / (target - start) as f64).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let done = reached >= target;
+        let notice = rpc::notification(
+            "job.progress",
+            json!({"job_id": job_id, "progress": progress,
+                   "message": format!("simulating ahead to {:.1} s: at {:.1} s",
+                                      target as f64 / 1e9, reached as f64 / 1e9),
+                   "t_ns": reached, "target_ns": target}),
+        );
+        if socket
+            .send(Message::Text(notice.to_string().into()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        if done {
+            break;
+        }
+        // A kernel that has ended, or failed, will not get further; the seek then answers
+        // with the range it has, which is -32003 and says so.
+        stalled = if reached == last { stalled + 1 } else { 0 };
+        if stalled >= 50 {
+            break;
+        }
+        last = reached;
+    }
+    let done = rpc::notification(
+        "job.done",
+        json!({"job_id": job_id, "state": "done", "outputs": []}),
+    );
+    socket
+        .send(Message::Text(done.to_string().into()))
+        .await
+        .is_ok()
 }
 
 /// Sends an `Error` frame, a `Bye` and closes (§3.10, §3.11).
@@ -715,6 +988,12 @@ pub fn bye_frame(
     Ok(Frame::new(MsgType::Bye, 0, 0, &body)?)
 }
 
+/// How many steps a connection may fall behind before a client-synchronised producer waits.
+///
+/// Well under the broadcast capacity (`run::STEP_CHANNEL_CAPACITY`, 64), so a paced run never
+/// reaches the lag that forces a resync.
+pub const SYNC_HIGH_WATER_STEPS: usize = 8;
+
 /// The producer task: advances the run and paces it against wall time (§1.5).
 ///
 /// `speed` is a multiple of real time and `0` means unthrottled. The loop never blocks on
@@ -723,9 +1002,18 @@ pub fn bye_frame(
 pub async fn producer(run: Arc<Run>) {
     let step = run.descriptor().cadence.mobility_step;
     loop {
-        let (speed, _) = run.speed();
+        let (speed, client_sync) = run.speed();
         if run.state() != RunState::Running {
             tokio::time::sleep(WallDuration::from_millis(5)).await;
+            continue;
+        }
+        // §1.5 "Live pacing": with `sync: "client"` the producer waits while any connection
+        // is more than a few steps behind, so no connection ever lags and nothing is shed.
+        // The option was accepted and reported by `run.status` and did nothing: the producer
+        // read the speed and ignored the mode, so a "lossless" demo at speed 0 dropped
+        // deltas like any other.
+        if client_sync && run.step_backlog() >= SYNC_HIGH_WATER_STEPS {
+            tokio::time::sleep(WallDuration::from_millis(2)).await;
             continue;
         }
         match run.tick() {

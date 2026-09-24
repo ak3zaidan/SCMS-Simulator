@@ -56,6 +56,7 @@ pub mod introspect;
 pub mod live;
 pub mod openrpc;
 pub mod replay;
+pub mod resume;
 pub mod ring;
 pub mod rpc;
 pub mod run;
@@ -112,7 +113,12 @@ pub struct ServerOptions {
     pub bind: SocketAddr,
     /// The bearer token a non-loopback bind requires. `None` on loopback.
     pub token: Option<String>,
-    /// The opaque session token `Hello` echoes; `""` on loopback (§3.1.1).
+    /// A token interned into the run's own symbol table up front.
+    ///
+    /// Not the token a `Hello` issues any more: every session gets its own, minted by
+    /// [`resume::Sessions`], because §1.4's resume names *a session* and one token shared
+    /// by every connection could not. Kept so a caller that pinned the run's table size
+    /// keeps compiling; `""` is the right value.
     pub session_token: String,
 }
 
@@ -153,7 +159,7 @@ impl VwpServer {
         let state = http::AppState {
             run: Arc::clone(&run),
             token: options.token.map(Arc::new),
-            session_token: Arc::new(options.session_token),
+            sessions: Arc::new(resume::Sessions::new()),
         };
         let app = http::router(state);
         let listener = tokio::net::TcpListener::bind(options.bind)

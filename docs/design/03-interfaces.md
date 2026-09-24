@@ -1062,10 +1062,26 @@ events:                                       # timeline; each item {t, until?, 
   - {t: 120, until: 300, type: demand.multiplier, value: 3}
   - {t: 200, type: weather.front, value: fog}
   - {t: 250, type: attack.wave, ids: [...]}
-  - {t: 400, type: outage, target: backend.ra, until: 460}
-  - {t: 500, type: param.change, path: security.pseudonym_change.params.period_s, value: 120}
+  - {t: 400, type: outage, target: 12, until: 460}          # a node id
+  - {t: 450, until: 600, type: closure, target: "edge:314"}  # or lane:<id>, street:<name>
+  - {t: 500, type: param.change, path: security.pseudonym_change.period_s, value: 120}
 experiment: null | {sweep: {...}, seeds: [...], replications: n}   # see 08-measurement §4
 ```
+
+**The timeline as built (2026-09-23).** Every item is a control-priority event (priority 0), so
+everything at that instant sees it, and writes a `scenario.event` record of what it did
+(`crates/v2xw-engine/src/timeline.rs`):
+
+| `type` | Effect | `until` |
+|---|---|---|
+| `weather.front` | the weather drivers and links see (`value`, `intensity`, `visibility_m`, `surface`) | not allowed: the next front replaces it |
+| `outage` | node `target` stops transmitting and receiving | the node comes back |
+| `demand.multiplier` | the thinned-Poisson arrival rate × `value`; several compose by product; the candidate process is sized to the timeline's peak so the thinning stays exact | the multiplier is lifted |
+| `closure` | the vehicle lanes of `target` (`lane:<id>`, `edge:<id>`, `street:<name>`) cost infinity to every router; every vehicle re-plans; one already on a closed lane finishes it; one that cannot avoid it leaves the run at the barrier (`RouteBlocked`) | the lanes reopen |
+| `param.change` | one parameter from `LIVE_PARAMS` takes `value`: `weather.*` and `actors.vehicles.demand.rate_veh_per_h` now; the equipped and device shares, `security.verification_policy`, `security.pseudonym_change.*` and `nodes.default_obu` for what enters after the change; any other path is refused at load, because the model that reads it is built when the run starts | not allowed |
+| `attack.wave` | the attacker populations `ids` (index or model id) act only inside the wave: the wave is their `AttackSchedule`, one window per population | the population goes quiet |
+
+A closure target that names no vehicle lane is refused when the run is built, naming the item.
 
 Validation returns actionable errors (`radio.tiers.phy: 'high' requires mac 'high' (mac is 'medium')`) and migration is by explicit `schema` version with a migrator per version step.
 
@@ -1088,6 +1104,7 @@ Recorded as MCAP channels; each channel has a self-describing schema record, a v
 | `sec.cert` | NODE | t, node, event (change, expire, top-up, learn), digest |
 | `proto.msg` | NODE | t, from, to, flow, step, bytes, transport |
 | `proto.revocation` | PUBLIC | t, stage, id, size |
+| `scenario.event` | PUBLIC | t, index, kind, phase (start/end), effect, lanes, multiplier, path, value, populations |
 | `det.observation` | NODE | t, node, detector, subject digest, score |
 | `ma.report` / `ma.case` / `ma.decision` | NODE | as in the MA dataset |
 | `app.warning` | NODE | t, node, app, subject, kind |

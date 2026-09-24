@@ -101,6 +101,69 @@ channel_record!(
     Visibility::Node
 );
 
+/// `scenario.event` — one scenario timeline item taking effect or ending, and what it did.
+///
+/// PUBLIC: every field restates the scenario document or says what the engine did with
+/// it; nothing here is a vehicle's ground truth. The view is defined here rather than in
+/// `v2xw-metrics` because no metric reads it — the page and the run log do.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ScenarioEventView {
+    /// The instant it took effect.
+    pub t: SimTime,
+    /// Its position in the scenario's `events` list.
+    pub index: u32,
+    /// Its `type`, e.g. `closure`.
+    pub kind: String,
+    /// `start`, or `end` when its `until` arrived.
+    pub phase: String,
+    /// What it did, as a sentence.
+    pub effect: String,
+    /// The lanes a closure closed or reopened, ascending.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lanes: Vec<u32>,
+    /// The demand multiplier in force after it, for a demand change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multiplier: Option<f64>,
+    /// The parameter a `param.change` set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The value it set, as JSON text (so a float is recorded exactly as written).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// The attacker populations an `attack.wave` names, by index.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub populations: Vec<u32>,
+}
+
+impl ScenarioEventView {
+    /// A record for item `index` of kind `kind` at `t`, its effect still to be written.
+    pub fn new(t: SimTime, index: usize, kind: crate::scenario::TimelineKind, end: bool) -> Self {
+        ScenarioEventView {
+            t,
+            index: u32::try_from(index).unwrap_or(u32::MAX),
+            kind: serde_json::to_value(kind)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default(),
+            phase: if end { "end" } else { "start" }.to_string(),
+            effect: String::new(),
+            lanes: Vec::new(),
+            multiplier: None,
+            path: None,
+            value: None,
+            populations: Vec::new(),
+        }
+    }
+}
+
+channel_record!(
+    /// `scenario.event` — a scenario timeline item taking effect.
+    ScenarioEvent,
+    ScenarioEventView,
+    "scenario.event",
+    Visibility::Public
+);
+
 impl GtKinematics {
     /// The record for one actor's published state, quantised (D9).
     pub fn new(actor: ActorId, k: &Kinematics, class: &str) -> Self {

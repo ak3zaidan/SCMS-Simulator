@@ -66,7 +66,7 @@ is no `TBD`. Where the design documents left a choice open, the choice is made h
 One WebSocket endpoint per engine process:
 
 ```
-GET /vwp/v1?run=<run_id>&resume=<seq>&profile=<full|node>&compress=<zstd|none>&v=1
+GET /vwp/v1?run=<run_id>&session=<token>&resume=<seq>&profile=<full|node>&compress=<zstd|none>&v=1
 Upgrade: websocket
 Sec-WebSocket-Protocol: vwp.v1
 ```
@@ -80,7 +80,8 @@ Query parameters (all optional):
 | Param | Default | Meaning |
 |---|---|---|
 | `run` | the server's current run | run id (36-char UUID string) to attach to, or `latest` |
-| `resume` | absent | canonical `seq` to resume from (§1.4) |
+| `session` | absent | the `Hello.str_session_token` of the session to resume (§1.4) |
+| `resume` | absent | canonical `seq` to resume from (§1.4); meaningful only with `session` |
 | `profile` | `full` | `full` or `node` (§5). Immutable for the life of the connection. |
 | `compress` | `zstd` | `zstd` or `none`. A client that cannot decompress zstd MUST pass `compress=none`. |
 | `v` | `1` | protocol major version the client speaks |
@@ -173,23 +174,45 @@ Every canonical frame carries a 64-bit `seq` (§2.1) assigned by the *producer* 
 reader) in canonical emission order, starting at 0 for the first canonical frame of the run. `seq` is
 deterministic: the same run replayed produces the same `seq` for the same frame.
 
-The server keeps a per-run **resume ring** of recently produced canonical frames. **`DECISION`: the resume
-ring holds `max(2 GOPs, 8 MiB)` and at most 4096 frames — two GOPs guarantee that any resume point is
-preceded by a retained keyframe, and 8 MiB bounds memory at ~10,000 actors.**
+The server keeps a **resume ring** of recently produced canonical frames for every *session*.
+**`DECISION`: the resume ring holds `max(2 GOPs, 8 MiB)` and at most 4096 frames — two GOPs guarantee that
+any resume point is preceded by a retained keyframe, and 8 MiB bounds memory at ~10,000 actors.**
 
-On reconnect the client sends `?run=<run_id>&resume=<seq>` where `seq` is one past the last frame it fully
-applied. The server then:
+**`DECISION` (2026-09-23): a session outlives its socket.** Every `Hello` names its session in
+`str_session_token` (§3.1.1), an opaque token the server mints per session. `seq`, the symbol table,
+the subscriptions (§6.7, §6.12) and the ring belong to the session, not to the socket. When a socket goes
+away without a clean close — anything but close code 1000 from the client — the server keeps the session
+for **120 s** of wall time (at most 8 retained sessions, the oldest evicted first) and **keeps encoding the
+run into its ring** exactly as it would have for the socket. A client that closes with 1000 has ended its
+session and cannot resume it.
 
-1. **Resumable** — `seq` is in the ring *and* the `Keyframe` opening `seq`'s GOP is also in the ring:
-   the server sends `Hello` with `HELLO_RESUMED` set, `resume_seq = seq`, and then replays the ring from
-   `seq`. The client keeps its world, string table, actor slots and camera state.
+On reconnect the client sends `?session=<token>&resume=<seq>` where `token` is its last `Hello`'s
+`str_session_token` and `seq` is one past the last frame it fully applied. The server then:
+
+1. **Resumable** — the session is retained, the run has not started a new generation since the client's
+   last `Hello`, and either `seq` is the session's next `seq` (the client missed nothing) or `seq` is in the
+   ring *and* the `Keyframe` opening `seq`'s GOP is also in the ring: the server sends `Hello` with
+   `HELLO_RESUMED` set, `resume_seq = seq`, and then replays the ring from `seq` — the frames the client
+   missed, byte for byte as they were first encoded, followed by the live stream. There is no resync
+   keyframe and no `seq` gap. The client keeps its world, string table, actor slots and camera state.
+   The resumed `Hello`'s symbol table is the table **as the client held it at `seq`**: strings a
+   replayed §3.8 extension appends are not in it, so the replay extends the table exactly as the original
+   frames did; a node whose label is not in that table carries label id 0 until the next non-resumed
+   `Hello`. The session's subscriptions and follow are kept, so the client does not re-send them.
+   Notifications (§6.14) produced while it was away are delivered after the replay, up to 64.
 2. **Not resumable** — the server sends `Hello` *without* `HELLO_RESUMED` (`resume_seq` = the next seq it
    will emit), then a `Keyframe` with `FLAG_RESYNC`. The client MUST discard all stream state except a
    world whose content hash equals `Hello.world_hash`, and MUST reset its string table (§2.5) to empty.
+   This is also the answer to a `session` the server does not hold (expired, evicted, ended with 1000, or
+   from another server process), to a `resume` without a `session`, and to a resume across a `run.start`:
+   the client gets a new session, with a new token.
 3. **Unknown run** — `Error{code:-32000}` then `Bye{reason=3}`, close 4404.
 
-A new connection for a run that already has a connection with the same session token supersedes the old
-one: the server sends `Bye{reason = 4 (superseded)}` on the old socket and closes it with 1012.
+A new connection presenting the session token of a connection that is still open supersedes it — the
+server cannot tell a half-open socket from a live one, and the client that holds the token is the one that
+is asking: the server sends `Bye{reason = 4 (superseded)}` on the old socket, closes it with 1012, and
+resumes the session on the new one as above. A reconnect asking for a different `profile` is a new session
+(§5.3: the profile is immutable for a session).
 
 The client SHOULD reconnect with exponential backoff 250 ms → 8 s with ±20 % jitter, and MUST stop
 retrying after `Bye{reason = 0 (run-complete)}` or close code 4406/4404. **`DECISION` (2026-09-23): a server whose runs can be started again (a live engine, the fixture) does not send `Bye{reason = 0}` at the end of a run** — it marks the last frame `FLAG_END_OF_RUN`, publishes `run.state {state: "finished"}`, and keeps the connection, so the client can seek back through the finished run and `run.start` a new one on the same socket. `Bye{reason = 0}` remains the signal for a server that will serve nothing further.
@@ -431,7 +454,7 @@ Body = **fixed prefix (256 B)** ‖ node table ‖ class table ‖ channel table
 | 240 | 4 | `u32` | `str_engine_version` | e.g. `"v2xw 0.4.0+9f0649d"` (version + git commit) |
 | 244 | 4 | `u32` | `str_scenario_name` | `scenario.meta.name` |
 | 248 | 4 | `u32` | `str_run_label` | human label, may be `""` |
-| 252 | 4 | `u32` | `str_session_token` | opaque token echoed on `?resume=`; `""` on loopback |
+| 252 | 4 | `u32` | `str_session_token` | this session's opaque token, sent back as `?session=` on a resume (§1.4) |
 
 #### 3.1.2 `hello_flags`
 
@@ -1773,8 +1796,8 @@ Loads a scenario (or the already-set one) and begins producing the stream.
     "scenario":  {"oneOf":[{"type":"string","description":"path or preset id"},
                            {"type":"object","description":"inline scenario document (schema v2xw/scenario/1)"}]},
     "seed":      {"type":"integer","minimum":0,"description":"overrides scenario.seed"},
-    "speed":     {"type":"number","minimum":0,"maximum":100,"default":1,
-                  "description":"0 = as fast as possible"},
+    "speed":     {"type":"number","minimum":0,"maximum":100,
+                  "description":"0 = as fast as possible; absent keeps the speed the run has now"},
     "paused":    {"type":"boolean","default":false,"description":"start paused at t=0"},
     "record":    {"type":"boolean","default":true,"description":"write the MCAP recording"},
     "record_path": {"type":"string"},
@@ -1854,8 +1877,13 @@ all frames produced by the step before replying.
 
 Ordering guarantee: the server MUST send the `Keyframe` (with `FLAG_SEEK_RESULT | FLAG_RESYNC`) and all
 deltas up to `t_ns` **before** the JSON-RPC reply. A client can therefore treat the reply as "the scene is
-now at `t_ns`". Live runs support `run.seek` only backwards into recorded time and only when
-`HELLO_SEEKABLE` is set; seeking a live run pauses it.
+now at `t_ns`". Live runs support `run.seek` only when `HELLO_SEEKABLE` is set; seeking a live run
+pauses it. **`DECISION` (2026-09-23): a live run seeks forward too.** A live kernel computes only a
+bounded distance ahead of the stream; a target past what it has produced, but inside the run, is reached
+by letting the kernel run there first. While it does, the server sends `job.progress`
+`{"job_id":"run.seek:<t_ns>","progress","message","t_ns","target_ns"}` on the calling connection (§6.14),
+then `job.done`, then the frames and the reply as above. A client should allow such a call longer than
+its usual timeout. `-32003` then means only that the run ended before `t_ns`.
 
 #### `run.speed`
 
@@ -3369,7 +3397,9 @@ only, `B` = both. The test-kit ids match `tests/conformance/vwp/` (03-interfaces
 - [ ] **C · H3** Sends nothing before receiving `Hello`.
 - [ ] **B · H4** `seq` is dense and monotonic across canonical frames; `Hello`/`Error`/`Bye` do not consume
       a `seq` and carry the next one.
-- [ ] **S · H5** `?resume=<seq>` inside the ring resumes with `HELLO_RESUMED` and no gap.
+- [ ] **S · H5** `?session=<token>&resume=<seq>` inside the ring resumes with `HELLO_RESUMED`, replays the
+      missed frames and has no gap, no duplicate and no resync keyframe; a second socket with the token
+      supersedes the first (`Bye{reason = 4}`, close 1012).
 - [ ] **S · H6** `?resume=<seq>` outside the ring falls back to `Hello` + `FLAG_RESYNC` keyframe, never an
       error.
 - [ ] **S · H7** Under a client that reads at 1/10 the production rate, memory is bounded: queued bytes

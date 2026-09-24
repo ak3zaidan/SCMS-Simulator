@@ -103,6 +103,10 @@ pub struct PoissonDemand {
     next: Option<SimTime>,
     /// How many trips have been produced, which is also the next trip's `seq` (I-M2).
     seq: u64,
+    /// The scenario timeline's demand multiplier in force (03-interfaces.md §13), `1` when
+    /// none is. It scales the thinning probability, so it is exact while it is at most
+    /// `candidate_boost` — which is what the engine sizes the boost to.
+    event_multiplier: f64,
     card: ModelCard,
 }
 
@@ -120,6 +124,7 @@ impl PoissonDemand {
             od,
             next: None,
             seq: 0,
+            event_multiplier: 1.0,
         })
     }
 
@@ -164,7 +169,7 @@ impl PoissonDemand {
     /// Turns a surviving candidate into a trip.
     fn make_trip(&mut self, ctx: &mut dyn MobCtx, t: SimTime) -> Option<TripRequest> {
         let multiplier = self.multiplier_at(t);
-        let keep = multiplier / self.params.candidate_boost.max(1.0);
+        let keep = multiplier * self.event_multiplier / self.params.candidate_boost.max(1.0);
         if !ctx
             .rng(RngDomain::Spawn, EntityRef::Global)
             .bool(keep.clamp(0.0, 1.0))
@@ -236,6 +241,11 @@ impl Demand for PoissonDemand {
             self.next = Some(self.advance(ctx, t));
         }
         out
+    }
+
+    fn set_multiplier(&mut self, m: f64) -> bool {
+        self.event_multiplier = if m.is_finite() { m.max(0.0) } else { 1.0 };
+        true
     }
 }
 
@@ -406,6 +416,38 @@ mod tests {
                 assert!(trip.t >= trips[i - 1].t);
             }
         }
+    }
+
+    /// A scenario timeline's `demand.multiplier` (03-interfaces.md §13) scales the arrival
+    /// rate, exactly, as long as the candidate boost covers it; and a multiplier of one is
+    /// no multiplier at all — the stream is the one without it, draw for draw.
+    #[test]
+    fn a_demand_multiplier_scales_the_rate_and_one_changes_nothing() {
+        let w = world();
+        let params = PoissonParams {
+            arrival_rate_per_s: 2.0,
+            candidate_boost: 3.0,
+            duration: Duration::from_secs(300),
+            ..PoissonParams::default()
+        };
+        let mut plain = demand(&w, params);
+        let base = collect(&mut plain, &w, &RngRegistry::new(5), 300, 100);
+        let mut unit = demand(&w, params);
+        assert!(
+            unit.set_multiplier(1.0),
+            "the Poisson model honours a multiplier"
+        );
+        let same = collect(&mut unit, &w, &RngRegistry::new(5), 300, 100);
+        assert_eq!(base, same, "a multiplier of one changes nothing");
+
+        let mut tripled = demand(&w, params);
+        tripled.set_multiplier(3.0);
+        let more = collect(&mut tripled, &w, &RngRegistry::new(5), 300, 100);
+        // 600 expected against 1,800: each is a Poisson count, so a 10 % band is several
+        // standard deviations wide on both.
+        let (n, m) = (base.len() as f64, more.len() as f64);
+        assert!((n - 600.0).abs() < 60.0, "{n} trips at the base rate");
+        assert!((m - 1800.0).abs() < 180.0, "{m} trips at three times it");
     }
 
     #[test]

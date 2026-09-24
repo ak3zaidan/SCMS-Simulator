@@ -66,6 +66,9 @@ pub struct StubOptions {
     pub paused: bool,
     /// A human label for `Hello.str_run_label`.
     pub label: String,
+    /// The initial speed multiple; `0` is unthrottled. The binary's `--speed` sets it,
+    /// which it did not before: the usage line said "both" and the fixture ran at 1.
+    pub speed: f64,
 }
 
 impl Default for StubOptions {
@@ -78,6 +81,7 @@ impl Default for StubOptions {
             seed: 20_260_918,
             paused: false,
             label: String::new(),
+            speed: 1.0,
         }
     }
 }
@@ -205,6 +209,7 @@ impl StubEngine {
             provenance: Some(provenance_body(0, &hello_strings)),
         };
 
+        let options_speed = options.speed;
         Ok(StubEngine {
             descriptor,
             world: payload,
@@ -220,7 +225,7 @@ impl StubEngine {
             rsu_nodes,
             str_ids,
             step_index: 0,
-            speed: 1.0,
+            speed: options_speed,
             client_sync: false,
         })
     }
@@ -979,7 +984,9 @@ impl Engine for StubEngine {
                 // It used to only set the state, so on a finished fixture run it reported
                 // `running` and produced nothing: the page's Run-again did nothing at all.
                 self.step_index = 0;
-                self.speed = speed;
+                if let Some(speed) = speed {
+                    self.speed = speed;
+                }
                 self.state = if paused {
                     RunState::Paused
                 } else {

@@ -53,6 +53,7 @@ import { studioTheme, type ThemeName } from "../lib/theme.js";
 import {
   MAX_MARKS,
   useStudio,
+  type FiredEvent,
   type LogLine,
   type NodeInfo,
   type ProvEntry,
@@ -268,7 +269,11 @@ export class StudioEngine {
     this.#reconnectAttempts = 0;
     useStudio.getState().setReconnectAttempts(0);
     if ((hello.helloFlags & HelloFlags.RESUMED) !== 0) {
-      this.#log("info", "vwp", "reconnected; the engine resumed the stream where it left off");
+      // The session kept its subscriptions and its follow (§1.4 case 1), so nothing is re-sent;
+      // the run may have changed state while the socket was down, so its status is asked for.
+      this.#log("info", "vwp", `reconnected; the engine resumed the stream at seq ${hello.resumeSeq}, with nothing missed`);
+      useStudio.getState().setConnection("streaming");
+      void this.refreshStatus();
       return;
     }
     this.#log(
@@ -385,6 +390,16 @@ export class StudioEngine {
       // A finished or stopped run publishes its output digest and its final counts; fetch them
       // now rather than at the next 2 s poll, so the page says "finished" the moment it is.
       if (p.state === "finished" || p.state === "paused") void this.refreshStatus();
+    });
+    // A seek past what the live kernel has produced runs the kernel forward first, reporting
+    // §6.14 `job.progress` as it goes (crates/v2xw-server/src/http.rs, `compute_ahead`).
+    client.onRpcNotification("job.progress", (p) => {
+      if (typeof p.job_id === "string" && p.job_id.startsWith("run.seek:")) {
+        useStudio.getState().setSeekProgress({ progress: p.progress, message: p.message ?? "" });
+      }
+    });
+    client.onRpcNotification("job.done", (p) => {
+      if (typeof p.job_id === "string" && p.job_id.startsWith("run.seek:")) useStudio.getState().setSeekProgress(null);
     });
     client.onRpcNotification("log", (p) => this.#log(p.level === "error" ? "error" : p.level === "warn" ? "warn" : "info", p.target ?? "engine", p.message));
     client.onRpcNotification("view.changed", (p) => {
@@ -613,12 +628,16 @@ export class StudioEngine {
    * connection's own view and are refused over HTTP with −32009. Rather than send a call that
    * cannot succeed, this says what is missing.
    */
-  async request<M extends VwpMethodName>(method: M, params: ParamsOf<M>): Promise<ResultOf<M>> {
+  async request<M extends VwpMethodName>(
+    method: M,
+    params: ParamsOf<M>,
+    options?: { readonly timeoutMs?: number },
+  ): Promise<ResultOf<M>> {
     const client = this.client;
     if (this.streaming && client) {
       useStudio.getState().noteRpcCall(method);
       try {
-        return await client.request(method, params);
+        return await client.request(method, params, options);
       } catch (err) {
         this.#log("error", "rpc", `${method}: ${errText(err)}`);
         throw err;
@@ -637,7 +656,7 @@ export class StudioEngine {
         const reopened = this.client;
         if (this.streaming && reopened) {
           useStudio.getState().noteRpcCall(method);
-          return await reopened.request(method, params);
+          return await reopened.request(method, params, options);
         }
       }
       const err = new Error(
@@ -1050,6 +1069,10 @@ export class StudioEngine {
         outputDigest: typeof s.engine?.output_digest === "string" ? s.engine.output_digest : null,
         kernelThreads: typeof s.engine?.kernel_threads === "number" ? s.engine.kernel_threads : null,
       });
+      // The scenario timeline's items the run has fired by the stream position, each with what
+      // it did (`scenario.event`); the time bar marks them as happened.
+      const fired = (s.engine as { timeline?: unknown } | undefined)?.timeline;
+      useStudio.getState().setFiredEvents(Array.isArray(fired) ? (fired as FiredEvent[]) : []);
     } catch {
       /* a poll failure is not worth a log line */
     }
@@ -1115,22 +1138,34 @@ export class StudioEngine {
    */
   handleHello(hello: HelloMessage): void {
     const strings = this.client?.strings;
+    // §1.4 case 1: a resumed `Hello` continues the stream this page is already showing. The frames
+    // that follow it are the ones it missed, so the plots, the timeline, the inspector and the
+    // world all stay as they are. Anything else is a new stream: a new run on this socket, or a
+    // reconnect the engine could not resume.
+    const resumed = (hello.helloFlags & HelloFlags.RESUMED) !== 0;
+    const sameWorld = this.world !== null && this.#promisedWorldHash === bytesToHex(hello.worldHash);
     // §10.5 W3 — every world this run adopts must hash to this, whether it arrives over HTTP or as
     // §3.9 chunks. Recorded before either path can start.
     this.#promisedWorldHash = bytesToHex(hello.worldHash);
+    const previousLabels = new Map<number, string>();
+    if (resumed) for (const [id, info] of this.nodes) previousLabels.set(id, info.label);
     this.nodes.clear();
     this.nodeByActor.clear();
-    // `setHello` empties the timeline, so anything still queued belongs to the previous run.
-    this.#pendingMarks = [];
-    this.#pendingPseudonyms.length = 0;
+    if (!resumed) {
+      // `setHello` empties the timeline, so anything still queued belongs to the previous run.
+      this.#resetRunViews();
+    }
     const n = hello.nodes;
     for (let i = 0; i < n.count; i++) {
       const nodeId = n.nodeId[i];
       const actorId = n.actorId[i];
+      // A resumed Hello names a node whose label the client has not been sent yet with id 0 (§1.4);
+      // the label this page already knows for it is the better one.
+      const label = strings?.get(n.strLabel[i]) ?? "";
       const info: NodeInfo = {
         nodeId,
         actorId: actorId === 0xffffffff ? null : actorId,
-        label: strings?.get(n.strLabel[i]) ?? "",
+        label: label === "" ? (previousLabels.get(nodeId) ?? "") : label,
         profileId: strings?.get(n.strProfileId[i]) ?? "",
         kind: n.kind[i],
         flags: n.flags[i],
@@ -1175,10 +1210,12 @@ export class StudioEngine {
       bbox: { minX: hello.bboxMinXM, minY: hello.bboxMinYM, maxX: hello.bboxMaxXM, maxY: hello.bboxMaxYM },
       versionMajor: hello.versionMajor,
       versionMinor: hello.versionMinor,
-    });
+    }, { resumed });
 
-    this.#log("info", "vwp", `Hello v${hello.versionMajor}.${hello.versionMinor} from ${hello.engineVersion}: ${hello.nodes.count} nodes, ${hello.classes.count} classes`);
+    this.#log("info", "vwp", `Hello v${hello.versionMajor}.${hello.versionMinor} from ${hello.engineVersion}: ${hello.nodes.count} nodes, ${hello.classes.count} classes${resumed ? " (resumed)" : ""}`);
 
+    // The world this page already holds is the one a resumed stream is about.
+    if (resumed && sameWorld) return;
     // §3.1.6 — mode 0 fetches the world over HTTP by content hash; mode 1 streams WorldChunks.
     if (hello.worldRef.mode === 0) {
       const url = strings?.get(hello.worldRef.strUrl) ?? "";
@@ -1187,6 +1224,37 @@ export class StudioEngine {
       this.#worldChunks = [];
       this.#worldChunkBytes = 0;
     }
+  }
+
+  /**
+   * Forget everything that describes one run: the plots, the followed node's sparklines and
+   * telemetry, the provenance dictionary and the metric projection, the queued timeline marks and
+   * pseudonyms, and the inspector's answers.
+   *
+   * Called on every `Hello` that is not a resume. The plots strip used to keep the previous run's
+   * history after "Run again" — a 20 s run drew `e2e_latency.p95` on a 50–125 s axis — because the
+   * metric store was only emptied when the page disconnected, and a new run on the same socket is
+   * not a disconnect.
+   */
+  #resetRunViews(): void {
+    this.metrics.reset();
+    this.spark.reset();
+    this.telemetry.clear();
+    this.provenance.clear();
+    this.dims.clear();
+    this.#metricProv.clear();
+    this.#metricDims.clear();
+    this.#metricProjectionDirty = true;
+    this.#pendingMarks = [];
+    this.#pendingPseudonyms.length = 0;
+    this.#pendingLinkCount = 0;
+    const store = useStudio.getState();
+    store.setFiredEvents([]);
+    store.setProvenanceCount(0);
+    store.setInspect(null);
+    store.setInspectMessages(null);
+    store.bumpSeries();
+    this.#dirty = true;
   }
 
   /**
