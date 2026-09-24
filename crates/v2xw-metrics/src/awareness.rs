@@ -46,6 +46,12 @@ pub const NAR_RADII_M: [u32; 2] = [100, 300];
 /// How recently a neighbour must have been heard to count as known, the `T` of `nar`.
 pub const NAR_HORIZON: Duration = Duration::from_secs(1);
 
+/// How many distinct neighbour pairs a window needs before `nar` reports an estimate:
+/// one. A small sample is reported with the wide interval it deserves
+/// ([`crate::stats::Proportion::estimate_clustered`]) rather than refused; only a window
+/// with no neighbour pair at all — where the ratio has no denominator — is insufficient.
+pub const NAR_MIN_PAIRS: u64 = 1;
+
 /// How long a link may go unheard before its age-of-information sawtooth is restarted
 /// rather than extended — a vehicle that drove away and came back is a new encounter.
 pub const AOI_RESTART: Duration = Duration::from_secs(10);
@@ -87,6 +93,13 @@ pub struct AwarenessProvider {
     delivery_by_bin: BTreeMap<usize, Proportion>,
     delivery_unbinned: Proportion,
     delivery_all: Proportion,
+    /// The kinematics instant being assembled, and the last instant `nar` was sampled at.
+    frame_t: Option<SimTime>,
+    nar_sampled_at: Option<SimTime>,
+    /// `nar`'s pair observations over the window, per radius in [`NAR_RADII_M`] order, and
+    /// the distinct (receiver, neighbour) pairs behind them — the clusters.
+    nar_window: [Proportion; 2],
+    nar_pairs: [std::collections::BTreeSet<(NodeId, NodeId)>; 2],
     rejected: u64,
 }
 
@@ -112,6 +125,10 @@ impl AwarenessProvider {
             delivery_by_bin: BTreeMap::new(),
             delivery_unbinned: Proportion::new(),
             delivery_all: Proportion::new(),
+            frame_t: None,
+            nar_sampled_at: None,
+            nar_window: [Proportion::new(); 2],
+            nar_pairs: Default::default(),
             rejected: 0,
         }
     }
@@ -203,6 +220,12 @@ impl AwarenessProvider {
             "Roadside units are neither counted as neighbours nor as receivers in nar, \
              because they carry no gt.kinematics record."
                 .to_string(),
+            "nar is sampled at every mobility step and its interval assumes the samples of \
+             one neighbour pair are fully correlated (the effective sample size is the number \
+             of distinct pairs, Kish 1965). That is the conservative extreme: the true \
+             interval is somewhat narrower. An instant is sampled when the next instant's \
+             first record arrives, so a delivery up to one step after it can count as heard."
+                .to_string(),
         ];
         card.ignores = vec![
             "Pseudonym changes: every metric here pairs on the sender's true node id.".to_string(),
@@ -262,16 +285,22 @@ impl AwarenessProvider {
                 Quantum::RATIO,
                 "Neighbourhood awareness ratio: of the vehicles truly within R metres of each \
                  equipped vehicle, the fraction it has received a message from in the last \
-                 second. Reported at R = 100 m and R = 300 m.",
+                 second. Reported at R = 100 m and R = 300 m. Sampled at every mobility step \
+                 and pooled over the window; the 95 % Wilson interval is computed on the \
+                 number of distinct neighbour pairs, not on the samples, because one pair \
+                 seen ten times is not ten independent observations — so a sparse run \
+                 reports an estimate with a wide interval instead of refusing.",
             )
             .with_dims([Dim::T, Dim::Radius])
             .with_breakdown(Dim::Radius, NAR_RADII_M.iter().map(|r| format!("{r}m")))
             .breakdown_only()
             .with_source(cards::paper(
                 "Boban and d'Orey, IEEE Trans. Veh. Technol. 65(6), 2016; \
-                 08-measurement-and-data.md §2.1",
+                 08-measurement-and-data.md §2.1; the interval: Brown, Cai, DasGupta, \
+                 Statistical Science 16(2), 2001 (Wilson for small n) and Kish, Survey \
+                 Sampling, 1965 (effective sample size of a clustered sample)",
             ))
-            .with_min_samples(self.min_samples)
+            .with_min_samples(NAR_MIN_PAIRS)
             .with_range(0.0, 1.0)
             .not_accounting_for("roadside units, which have no ground-truth kinematics")
             .not_accounting_for(
@@ -370,13 +399,39 @@ impl AwarenessProvider {
     }
 
     fn on_kinematics(&mut self, v: &GtKinematicsView) {
+        // A record from a new instant closes the previous one: every vehicle's position at
+        // that instant is in, so its neighbourhoods can be sampled.
+        if self.frame_t != Some(v.t) {
+            if let Some(prev) = self.frame_t {
+                self.sample_nar(prev);
+            }
+            self.frame_t = Some(v.t);
+        }
         if let Some(node) = v.node {
             self.positions.insert(node, (v.t, v.x_m, v.y_m));
         }
     }
 
-    /// `nar` at `at` for every radius: (heard, neighbours) pair counts.
-    fn nar_counts(&self, at: SimTime) -> Vec<(u32, Proportion)> {
+    /// Samples `nar` at one instant into the window's accumulators, once per instant.
+    ///
+    /// Sampled at every published instant (every mobility step) rather than once per
+    /// window, so a sparse run's few neighbour pairs are observed ten times a second rather
+    /// than once. The observations of one pair are correlated, which is why each pair is
+    /// also recorded as a *cluster*: the interval is computed on the number of distinct
+    /// pairs ([`Proportion::estimate_clustered`]), not on the number of observations.
+    fn sample_nar(&mut self, at: SimTime) {
+        if self.nar_sampled_at == Some(at) {
+            return;
+        }
+        self.nar_sampled_at = Some(at);
+        for (k, (_, p, pairs)) in self.nar_counts(at).into_iter().enumerate() {
+            self.nar_window[k].merge(p);
+            self.nar_pairs[k].extend(pairs);
+        }
+    }
+
+    /// `nar` at `at` for every radius: (heard, neighbours) pair counts, and the pairs.
+    fn nar_counts(&self, at: SimTime) -> Vec<(u32, Proportion, Vec<(NodeId, NodeId)>)> {
         let fresh: Vec<(NodeId, f64, f64)> = self
             .positions
             .iter()
@@ -394,9 +449,9 @@ impl AwarenessProvider {
             grid.entry(cell(*x, *y)).or_default().push(i);
         }
         let horizon = NAR_HORIZON.as_nanos();
-        let mut out: Vec<(u32, Proportion)> = NAR_RADII_M
+        let mut out: Vec<(u32, Proportion, Vec<(NodeId, NodeId)>)> = NAR_RADII_M
             .iter()
-            .map(|&r| (r, Proportion::new()))
+            .map(|&r| (r, Proportion::new(), Vec::new()))
             .collect();
         for (i, (rx, x, y)) in fresh.iter().enumerate() {
             let (cx, cy) = cell(*x, *y);
@@ -412,14 +467,20 @@ impl AwarenessProvider {
                         let (tx, xj, yj) = fresh[j];
                         let (ex, ey) = (xj - x, yj - y);
                         let d2 = ex * ex + ey * ey;
+                        // Heard within the horizon before `at`. An instant is sampled when
+                        // the next instant's first record arrives, so a delivery up to one
+                        // mobility step after `at` may already be in, and it counts: the
+                        // latest delivery is all a link keeps, and refusing it would forget
+                        // every earlier one. The bias is at most one step of a 1 s horizon.
                         let heard = self
                             .last_heard
                             .get(&(*rx, tx))
-                            .is_some_and(|&t| t <= at && at - t <= horizon);
-                        for (r, p) in &mut out {
+                            .is_some_and(|&t| t >= at.saturating_sub(horizon));
+                        for (r, p, pairs) in &mut out {
                             let r = f64::from(*r);
                             if d2 <= r * r {
                                 p.observe(heard);
+                                pairs.push((*rx, tx));
                             }
                         }
                     }
@@ -489,15 +550,27 @@ impl MetricProvider for AwarenessProvider {
         ));
 
         // --- nar -------------------------------------------------------------------------
+        // The instant being assembled belongs to this window if it is not past it.
+        if let Some(t) = self.frame_t
+            && t <= at
+        {
+            self.sample_nar(t);
+        }
         let nar = self.def("nar");
-        for (r, p) in self.nar_counts(at) {
+        let window = core::mem::replace(&mut self.nar_window, [Proportion::new(); 2]);
+        let pairs = core::mem::take(&mut self.nar_pairs);
+        for ((r, p), clusters) in NAR_RADII_M.iter().zip(window).zip(pairs) {
             let mut dims = Dims::new();
             dims.insert(Dim::Radius, DimValue::label(format!("{r}m")));
             out.push(MetricSample::new(
                 &nar,
                 at,
                 dims,
-                SampleValue::Ratio(p.estimate(self.min_samples, self.level)),
+                SampleValue::Ratio(p.estimate_clustered(
+                    clusters.len() as u64,
+                    NAR_MIN_PAIRS,
+                    self.level,
+                )),
             ));
         }
 
@@ -668,6 +741,50 @@ mod tests {
         assert!((nar("100m").point().unwrap() - 1.0 / 6.0).abs() < 1e-3);
         // Within 300 m: those six plus 1-4, 4-1, 2-4, 4-2, 3-4, 4-3; still one heard.
         assert_eq!(nar("300m").n(), 12);
+    }
+
+    /// Two vehicles 50 m apart for one second, sampled at every 100 ms step; vehicle 1
+    /// hears vehicle 2 throughout and vehicle 2 never hears vehicle 1. That is two pairs —
+    /// far below the thirty a proportion normally needs — and `nar` still reports: 0.5, with
+    /// the Wilson interval of two independent observations, not of the twenty samples.
+    #[test]
+    fn a_sparse_run_reports_nar_with_the_interval_of_its_few_pairs() {
+        let mut p = AwarenessProvider::new(0); // the default threshold of 30 samples
+        for k in 0..10u64 {
+            let t = k * 100 * NS_PER_MS;
+            p.on_event(&kin(1, t, 0.0));
+            p.on_event(&kin(2, t, 50.0));
+            p.on_event(&delivered(1, 2, t, t + NS_PER_MS, 50.0));
+        }
+        let s = p.flush(1_000 * NS_PER_MS);
+        let nar = s
+            .iter()
+            .find(|x| x.metric == "nar" && x.dims.get(&Dim::Radius) == Some(&DimValue::label("100m")))
+            .unwrap();
+        assert!(!nar.value.is_insufficient(), "{:?}", nar.value);
+        assert_eq!(nar.value.point(), Some(0.5));
+        // Twenty pair observations (two pairs at ten instants) behind the point …
+        assert_eq!(nar.value.n(), 20);
+        // … and the interval of two pairs: Wilson(0.5, n = 2) at 95 % is (0.0945, 0.9055).
+        let SampleValue::Ratio(r) = &nar.value else {
+            panic!("nar is a ratio")
+        };
+        let (lo, hi) = r.interval().expect("an estimate carries its interval");
+        assert!((lo - 0.0945).abs() < 1e-3, "{lo}");
+        assert!((hi - 0.9055).abs() < 1e-3, "{hi}");
+        // Not the falsely tight interval of twenty independent trials, (0.299, 0.701).
+        assert!(lo < 0.2 && hi > 0.8);
+    }
+
+    #[test]
+    fn a_window_with_no_neighbour_pair_is_insufficient_not_zero() {
+        let mut p = AwarenessProvider::new(0);
+        p.on_event(&kin(1, 0, 0.0));
+        p.on_event(&kin(2, 0, 900.0));
+        let s = p.flush(1_000 * NS_PER_MS);
+        for x in s.iter().filter(|x| x.metric == "nar") {
+            assert!(x.value.is_insufficient(), "{:?}", x.value);
+        }
     }
 
     #[test]

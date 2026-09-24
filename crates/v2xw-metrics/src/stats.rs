@@ -177,7 +177,34 @@ pub fn wilson_interval(successes: u64, trials: u64, level: ConfidenceLevel) -> (
         return (0.0, 1.0);
     }
     let n = trials as f64;
-    let p = (successes as f64) / n;
+    // One formula, not two: the integer form is the real-valued one at p = s/n.
+    wilson_interval_p((successes as f64) / n, n, level)
+}
+
+/// The Wilson score interval for an observed proportion `p` treated as the mean of
+/// `n_eff` independent trials — the form a *clustered* sample needs.
+///
+/// [`wilson_interval`] takes integer counts because it assumes every trial is independent.
+/// When the trials come in correlated clusters — the same pair of vehicles observed at ten
+/// instants in one second — the information in the sample is that of fewer independent
+/// trials: Kish's effective sample size `n / deff` (Kish, *Survey Sampling*, Wiley 1965).
+/// With the design effect at its upper bound, the cluster size, `n_eff` is the number of
+/// clusters, and the interval computed on it is the conservative one. The formula is
+/// Wilson's with `p` and `n` real-valued; with `p = s/n` and `n_eff = n` it is
+/// [`wilson_interval`] exactly.
+///
+/// Wilson rather than the normal approximation because it keeps its coverage at the small
+/// `n` this form exists for (Brown, Cai, DasGupta, "Interval estimation for a binomial
+/// proportion", *Statistical Science* 16(2), 2001, which recommends it for `n < 40`).
+///
+/// `n_eff ≤ 0` or a non-finite input returns `(0.0, 1.0)`, the honest interval for no data.
+#[must_use]
+pub fn wilson_interval_p(p: f64, n_eff: f64, level: ConfidenceLevel) -> (f64, f64) {
+    if !(n_eff > 0.0 && n_eff.is_finite() && p.is_finite()) {
+        return (0.0, 1.0);
+    }
+    let p = p.clamp(0.0, 1.0);
+    let n = n_eff;
     let z = level.z();
     let z2 = z * z;
     let denom = 1.0 + z2 / n;
@@ -494,6 +521,41 @@ impl Proportion {
         let (ci_lo, ci_hi) = wilson_interval(self.successes, self.trials, level);
         RatioEstimate::Proportion {
             point: (self.successes as f64) / (self.trials as f64),
+            ci_lo,
+            ci_hi,
+            level,
+            trials: self.trials,
+            successes: self.successes,
+        }
+    }
+
+    /// The estimate of a proportion whose trials come in `clusters` correlated groups: the
+    /// point is `successes / trials` over every trial, and the interval is Wilson's at the
+    /// cluster count ([`wilson_interval_p`]), the conservative effective sample size.
+    ///
+    /// Reported whenever there is at least `min_clusters` clusters, however few trials
+    /// that is: a small sample is stated with a wide interval, not refused.
+    #[must_use]
+    pub fn estimate_clustered(
+        self,
+        clusters: u64,
+        min_clusters: u64,
+        level: ConfidenceLevel,
+    ) -> RatioEstimate {
+        let required = min_clusters.max(1);
+        if self.trials == 0 || clusters < required {
+            return RatioEstimate::Insufficient {
+                trials: clusters,
+                required,
+            };
+        }
+        let point = (self.successes as f64) / (self.trials as f64);
+        // A cluster count above the trial count is not a clustering; it is capped, so the
+        // interval can never claim more independent information than there were trials.
+        let n_eff = clusters.min(self.trials) as f64;
+        let (ci_lo, ci_hi) = wilson_interval_p(point, n_eff, level);
+        RatioEstimate::Proportion {
+            point,
             ci_lo,
             ci_hi,
             level,
@@ -825,6 +887,52 @@ impl Distribution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real-valued form is the integer form when the sample is not clustered, to the
+    /// last bit: one formula, not two.
+    #[test]
+    fn the_clustered_wilson_interval_is_wilsons_when_every_trial_is_its_own_cluster() {
+        for (s, n) in [(25_u64, 100_u64), (0, 10), (3, 10), (7, 7)] {
+            let exact = wilson_interval(s, n, ConfidenceLevel::P95);
+            let real = wilson_interval_p((s as f64) / (n as f64), n as f64, ConfidenceLevel::P95);
+            assert_eq!(exact, real, "{s}/{n}");
+        }
+        assert_eq!(
+            wilson_interval_p(0.5, 0.0, ConfidenceLevel::P95),
+            (0.0, 1.0)
+        );
+    }
+
+    /// Twenty observations of two pairs are two pairs' worth of information.
+    #[test]
+    fn a_clustered_estimate_widens_the_interval_to_the_cluster_count_and_no_further() {
+        let p = Proportion::from_counts(10, 20);
+        let RatioEstimate::Proportion {
+            point,
+            ci_lo,
+            ci_hi,
+            trials,
+            ..
+        } = p.estimate_clustered(2, 1, ConfidenceLevel::P95)
+        else {
+            panic!("two clusters are enough for an estimate")
+        };
+        assert_eq!(point, 0.5);
+        assert_eq!(trials, 20);
+        assert_eq!(
+            (ci_lo, ci_hi),
+            wilson_interval_p(0.5, 2.0, ConfidenceLevel::P95)
+        );
+        // More clusters than trials is not a clustering: capped at the trial count.
+        let RatioEstimate::Proportion { ci_lo, ci_hi, .. } =
+            p.estimate_clustered(1_000, 1, ConfidenceLevel::P95)
+        else {
+            panic!()
+        };
+        assert_eq!((ci_lo, ci_hi), wilson_interval(10, 20, ConfidenceLevel::P95));
+        // No cluster at all is no estimate.
+        assert!(p.estimate_clustered(0, 1, ConfidenceLevel::P95).is_insufficient());
+    }
 
     /// Published Wilson values. Sources: the worked example in Brown, Cai and DasGupta
     /// (2001) and the standard textbook cases at the boundaries, all recomputed here to
