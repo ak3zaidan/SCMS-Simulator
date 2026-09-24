@@ -387,9 +387,14 @@ pub static KEY_STATUS: &[KeyStatus] = &[
         note: "Path-loss fidelity. Abstract is free-space; medium and high are \
                log-distance with shadowing." },
     KeyStatus { path: "radio.tiers.phy", status: Status::Wired,
-        note: "Physical-layer fidelity." },
+        note: "Physical-layer fidelity. Medium decides each frame from its SINR over time \
+               with the 802.11p error model; high adds preamble capture, which only \
+               changes frames that overlap another at the receiver, so a sparse run gives \
+               the same result at either." },
     KeyStatus { path: "radio.tiers.mac", status: Status::Wired,
-        note: "Medium-access fidelity." },
+        note: "Medium-access fidelity. Abstract has no MAC (reception comes from a \
+               table); medium and high run the same 802.11p EDCA/OCB CSMA model with \
+               J2945/1 congestion control, so high adds nothing over medium." },
     KeyStatus { path: "radio.tiers.focus", status: Status::Partial,
         note: "A region — a disc following one node, or a map box — whose links run the \
                propagation and the receiver at the focus tier (at high: weather \

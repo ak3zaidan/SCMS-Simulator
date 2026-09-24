@@ -41,6 +41,14 @@ fn scenario() -> Scenario {
     }
     s.metrics = vec!["all".to_string()];
     s.time.duration_s = 3.0;
+    // Open air. Since the radio track made buildings obstruct, ten vehicles scattered over
+    // Midtown deliver 23 of 1,134 receptions in three seconds (measured), too few for any
+    // one-second window to reach the 30 samples a latency percentile needs, so the
+    // headline latency is "insufficient" in every window. With obstruction off the same
+    // run delivers 1,059 and every window has an estimate. This file checks the
+    // measurement layer, which needs deliveries to measure; buildings are the radio
+    // track's tests' business (radio_access.rs).
+    s.world.buildings.enabled = false;
     s
 }
 

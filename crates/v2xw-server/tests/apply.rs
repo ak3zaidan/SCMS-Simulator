@@ -187,15 +187,25 @@ fn the_arrival_rate_moves_the_fleet() {
     );
 }
 
+/// An edited radio model reaches the next run's receptions.
+///
+/// This used to switch the PHY and MAC tiers from medium to high. The radio track made
+/// every node generate at its own phase with a hand-off jitter, so on this grid no two
+/// frames overlap at a receiver any more; the high PHY's only addition, preamble capture,
+/// decides overlapping frames alone, and the high MAC is the medium one (KEY_STATUS says
+/// both). The tiers are therefore correctly inert here, and the test edits the key the
+/// radio track wired instead: `radio.models`, free-space propagation with no fading in
+/// place of the default dual-slope law with Nakagami fading, which changes every received
+/// power. The assertion is the same.
 #[test]
-fn a_radio_tier_changes_what_is_received() {
+fn a_radio_setting_changes_what_is_received() {
     let run = serve(&scenario("radio", 20, 6000));
     let medium = run_to_end(&run);
     patch(
         &run,
         json!([
-            {"op": "replace", "path": "/radio/tiers/phy", "value": "high"},
-            {"op": "replace", "path": "/radio/tiers/mac", "value": "high"},
+            {"op": "add", "path": "/radio/models/propagation", "value": {"id": "propagation/free-space"}},
+            {"op": "add", "path": "/radio/models/fading", "value": {"id": "fading/none"}},
         ]),
     );
     let high = run_to_end(&run);
@@ -206,7 +216,7 @@ fn a_radio_tier_changes_what_is_received() {
     assert_ne!(
         (stats(&medium)["rx_ok"].clone(), digest(&medium)),
         (stats(&high)["rx_ok"].clone(), digest(&high)),
-        "the PHY and MAC tiers must change the reception outcome"
+        "the radio models must change the reception outcome"
     );
     // A conflicting edit is refused and changes nothing: the next run is the last good one.
     let refused = call(
