@@ -214,6 +214,108 @@ pub static BOUNDS: &[Bound] = &[
         exclusive_lo: true,
         what: "the follow radius",
     },
+    // A conducted power the FCC's 33 dBm EIRP ceiling for C-V2X on-board and roadside
+    // units (FCC 24-123 §95.3204, §90.391) could not be radiated at with any antenna, and
+    // a floor well below any J2945/1 or ETSI setting.
+    Bound {
+        path: "radio.devices.obu.tx_power_dbm",
+        lo: -20.0,
+        hi: 33.0,
+        exclusive_lo: false,
+        what: "the on-board unit's transmit power",
+    },
+    Bound {
+        path: "radio.devices.rsu.tx_power_dbm",
+        lo: -20.0,
+        hi: 33.0,
+        exclusive_lo: false,
+        what: "the roadside unit's transmit power",
+    },
+    Bound {
+        path: "radio.devices.vru.tx_power_dbm",
+        lo: -20.0,
+        hi: 33.0,
+        exclusive_lo: false,
+        what: "the VRU device's transmit power",
+    },
+    Bound {
+        path: "radio.devices.obu.antenna_gain_dbi",
+        lo: -10.0,
+        hi: 20.0,
+        exclusive_lo: false,
+        what: "the on-board unit's antenna gain",
+    },
+    Bound {
+        path: "radio.devices.rsu.antenna_gain_dbi",
+        lo: -10.0,
+        hi: 20.0,
+        exclusive_lo: false,
+        what: "the roadside unit's antenna gain",
+    },
+    Bound {
+        path: "radio.devices.vru.antenna_gain_dbi",
+        lo: -10.0,
+        hi: 20.0,
+        exclusive_lo: false,
+        what: "the VRU device's antenna gain",
+    },
+    Bound {
+        path: "radio.devices.obu.cable_loss_db",
+        lo: 0.0,
+        hi: 20.0,
+        exclusive_lo: false,
+        what: "the on-board unit's cable loss",
+    },
+    Bound {
+        path: "radio.devices.rsu.cable_loss_db",
+        lo: 0.0,
+        hi: 20.0,
+        exclusive_lo: false,
+        what: "the roadside unit's cable loss",
+    },
+    Bound {
+        path: "radio.devices.vru.cable_loss_db",
+        lo: 0.0,
+        hi: 20.0,
+        exclusive_lo: false,
+        what: "the VRU device's cable loss",
+    },
+    // Above ground; the FCC caps a C-V2X roadside antenna at 15 m (FCC 24-123 §90.391(b)).
+    Bound {
+        path: "radio.devices.obu.antenna_height_m",
+        lo: 0.1,
+        hi: 15.0,
+        exclusive_lo: false,
+        what: "the on-board unit's antenna height",
+    },
+    Bound {
+        path: "radio.devices.rsu.antenna_height_m",
+        lo: 0.1,
+        hi: 15.0,
+        exclusive_lo: false,
+        what: "the roadside unit's antenna height",
+    },
+    Bound {
+        path: "radio.devices.vru.antenna_height_m",
+        lo: 0.1,
+        hi: 15.0,
+        exclusive_lo: false,
+        what: "the VRU device's antenna height",
+    },
+    Bound {
+        path: "radio.range.margin_db",
+        lo: 0.0,
+        hi: 40.0,
+        exclusive_lo: false,
+        what: "the candidate-range margin",
+    },
+    Bound {
+        path: "radio.range.max_m",
+        lo: 50.0,
+        hi: 100_000.0,
+        exclusive_lo: false,
+        what: "the candidate-range cap",
+    },
     Bound {
         path: "security.pseudonym_change.period_s",
         lo: 1.0,
@@ -417,11 +519,13 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus {
         path: "world.buildings.enabled",
         status: Status::Wired,
-        note: "Whether buildings obstruct radio links. On, a link through a building \
-               loses 9 dB per wall and 0.4 dB per metre inside (Sommer 2011), capped at \
-               the around-the-corner street-canyon loss of 3GPP TR 37.885's urban NLOS \
-               law; off, every link is line of sight. Buildings are imported and drawn \
-               either way. Applies at the medium and high propagation tiers.",
+        note: "Whether buildings obstruct radio links. On, at the medium tier a link \
+               through a building loses 9 dB per wall and 0.4 dB per metre inside (Sommer \
+               2011), capped at 3GPP TR 37.885's urban NLOS loss; at the high tier the \
+               street corner the link turns round is traced and priced by the Mangel 2011 \
+               intersection model (TR 37.885 NLOS where no single corner connects), or \
+               the path through the building when that is stronger. Off, every link is \
+               line of sight. Buildings are imported and drawn either way.",
     },
     KeyStatus {
         path: "world.buildings.keep_holes",
@@ -555,8 +659,11 @@ pub static KEY_STATUS: &[KeyStatus] = &[
         path: "weather.intensity",
         status: Status::Wired,
         note: "Heavy (0.5 and over) takes the FHWA heavy-rain and heavy-snow rows for \
-               drivers; the high-tier propagation model reads it for rain and sleet. The \
-               0.5 threshold is an uncalibrated choice, stated on the card.",
+               drivers; the 0.5 threshold is an uncalibrated choice, stated on the card. \
+               For the radio, rain and sleet at intensity 1 stand for 50 mm/h, which ITU-R \
+               P.838-3 prices at 0.21 dB per km at 5.9 GHz: 0.06 dB on a 300 m link. That \
+               is the real size of rain at this carrier, and it changes no delivery \
+               measurably. Fog and snow cost the radio nothing.",
     },
     KeyStatus {
         path: "weather.visibility_m",
@@ -585,8 +692,15 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus {
         path: "radio.tiers.propagation",
         status: Status::Wired,
-        note: "Path-loss fidelity. Abstract is free-space; medium and high are \
-               log-distance with shadowing.",
+        note: "Path-loss fidelity. Abstract is free space. Medium is the Abbas 2015 \
+               dual-slope law with correlated shadowing and Sommer building loss capped \
+               at TR 37.885's NLOS law. High is priced from the geometry: TR 37.885 line \
+               of sight, TR 37.885 blockage from the vehicles actually on the path, the \
+               Mangel 2011 model round a traced street corner, TR 37.885 NLOS where no \
+               single corner connects. Both take Nakagami fading unless radio.models \
+               says otherwise. High is the default: on a street grid it is the law best \
+               supported by the intersection measurements it was fitted to, at about 1.8 \
+               times medium's cost. Rain applies at medium and high.",
     },
     KeyStatus {
         path: "radio.tiers.phy",
@@ -617,9 +731,30 @@ pub static KEY_STATUS: &[KeyStatus] = &[
         status: Status::Wired,
         note: "Picks a model per radio family, overriding the tier's default: \
                propagation (free-space, two-ray-ground, log-distance with a named preset, \
-               tr37885), fading (none, nakagami-m with a preset), per (the 802.11p error \
+               tr37885, v2v-urban-geometric), fading (none, nakagami-m with a preset), per (the 802.11p error \
                model's implementation loss), phy (the 802.11p sensitivity table) and \
                obstacle (the Sommer building row). Unknown families and ids are refused.",
+    },
+    KeyStatus {
+        path: "radio.devices",
+        status: Status::Wired,
+        note: "The radio each kind of node carries. Transmit power is the conducted power \
+               at the antenna port; the link budget applies antenna gain less cable loss at \
+               both ends. Defaults are 3GPP TR 36.885's: 23 dBm with a 3 dBi antenna on a \
+               vehicle or a roadside unit, 23 dBm and 0 dBi on a pedestrian's device, \
+               no cable loss, antennas 1.5 m high (3 m on a truck). On 802.11p a vehicle's \
+               J2945/1 congestion control sets the radiated power (20 dBm at most) and \
+               the unit transmits at the lesser of that less its net gain and this power.",
+    },
+    KeyStatus {
+        path: "radio.range",
+        status: Status::Wired,
+        note: "How far each transmission is followed: to where, in line of sight, a unit \
+               radiating the 33 dBm regulatory maximum would still arrive at no less than \
+               the noise floor minus the margin. A link too lossy for even that to clear \
+               it is counted as interference, not a reception attempt; the reference is \
+               fixed, so the links a run attempts do not move with the transmit power. An optional cap bounds the fully evaluated range; beyond it, \
+               line-of-sight receivers still get the frame's energy as interference.",
     },
     // --- network -----------------------------------------------------------
     KeyStatus {
@@ -1386,6 +1521,53 @@ fn weather(s: &Scenario, e: &mut Vec<ScenarioError>) {
 
 fn radio(s: &Scenario, e: &mut Vec<ScenarioError>) {
     let t = &s.radio.tiers;
+
+    // `radio.devices` and `radio.range`: every number the link budget reads.
+    let d = &s.radio.devices;
+    for (class, power, gain, loss, height) in [
+        (
+            "obu",
+            d.obu.tx_power_dbm,
+            d.obu.antenna_gain_dbi,
+            d.obu.cable_loss_db,
+            d.obu.antenna_height_m,
+        ),
+        (
+            "rsu",
+            d.rsu.tx_power_dbm,
+            d.rsu.antenna_gain_dbi,
+            d.rsu.cable_loss_db,
+            d.rsu.antenna_height_m,
+        ),
+        (
+            "vru",
+            d.vru.tx_power_dbm,
+            d.vru.antenna_gain_dbi,
+            d.vru.cable_loss_db,
+            Some(d.vru.antenna_height_m),
+        ),
+    ] {
+        for (leaf, value) in [
+            ("tx_power_dbm", Some(power)),
+            ("antenna_gain_dbi", Some(gain)),
+            ("cable_loss_db", Some(loss)),
+            ("antenna_height_m", height),
+        ] {
+            if let Some(v) = value {
+                let path = format!("radio.devices.{class}.{leaf}");
+                bounded_at(&path, &path, v, e);
+            }
+        }
+    }
+    bounded_at(
+        "radio.range.margin_db",
+        "radio.range.margin_db",
+        s.radio.range.margin_db,
+        e,
+    );
+    if let Some(cap) = s.radio.range.max_m {
+        bounded_at("radio.range.max_m", "radio.range.max_m", cap, e);
+    }
 
     // `radio.models`: every family and id must be one `wiring::build_radio`,
     // `build_phy` and `build_obstacles` act on, with parameters that fit the model. The

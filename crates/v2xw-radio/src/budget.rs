@@ -86,6 +86,11 @@ pub fn merge_los(parts: &[LosResult]) -> LosResult {
         out.walls_crossed = out.walls_crossed.saturating_add(part.walls_crossed);
         out.obstructed_len_m += part.obstructed_len_m;
         out.knife_edges.extend(part.knife_edges.iter().copied());
+        // One corner per link: the first model that traced one is the one that owns the
+        // building geometry.
+        if out.corner.is_none() {
+            out.corner = part.corner;
+        }
     }
     out.class = match (building, vehicle, terrain) {
         (true, true, _) => LosClass::NlosBv,
@@ -159,11 +164,18 @@ pub fn evaluate<C: Ctx + ?Sized>(
         from_stack,
     );
     let obstacle_db = breakdown.obstacle_db + from_stack;
+    // Rain, once, whatever the law (`weather/attenuation/itu-r-p838`): no law in this
+    // crate charges it itself, and the abstract tier is free space by definition.
+    let weather_db = if propagation.tier() == v2xw_core::card::Tier::Abstract {
+        breakdown.weather_db
+    } else {
+        breakdown.weather_db + crate::prop::rain_attenuation_db(weather, distance_m, f_hz)
+    };
     breakdown = LossBreakdown::new(
         breakdown.path_db,
         breakdown.shadow_db,
         obstacle_db,
-        breakdown.weather_db,
+        weather_db,
         breakdown.antenna_db,
     );
     let fading_db = fading.sample_db(ctx, LinkKey(tx.node, rx.node), distance_m, t);
@@ -214,6 +226,7 @@ mod tests {
                     actor: ActorId::new(3),
                 },
             }],
+            corner: None,
         };
         let merged = merge_los(&[building.clone(), vehicle.clone()]);
         assert_eq!(merged.class, LosClass::NlosBv);

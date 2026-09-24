@@ -138,9 +138,13 @@ fn the_decomposed_latency_is_the_right_size_for_802_11p() {
             "air time {} ns",
             st["airtime"]
         );
-        // 1 km at the speed of light is 3.34 µs; the candidate range is 1 km.
+        // The candidate range is the link budget's (`radio.range`), not a fixed 1 km: in
+        // this open-air run a 1.2 km line-of-sight link delivers. No link is longer than
+        // the extract's diagonal — 2.0 km by 1.9 km, 2.7 km across, 9.1 µs at the speed
+        // of light — so a stage stamped on the wrong clock or in the wrong unit still
+        // fails here.
         assert!(
-            st["propagation"] <= 3_400,
+            st["propagation"] <= 9_500,
             "propagation {} ns",
             st["propagation"]
         );

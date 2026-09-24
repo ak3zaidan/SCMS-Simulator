@@ -131,10 +131,10 @@ pub use error::{RadioError, Result};
 pub use traits::{Dcc, Fading, Mac, ObstacleModel, Phy, Propagation};
 pub use types::{
     AccessCategory, ActorClass, ActorObstacle, ActorSet, CcaState, ChannelId, CodeRate,
-    DccAlgorithm, DccState, DropCause, EdgeSource, FrameDescriptor, FrameKind, GateDecision,
-    KnifeEdge, LosClass, LosResult, LossBreakdown, LossCause, MacSdu, Mcs, Modulation, PatternRef,
-    RadioEndpoint, Rat, ReactiveState, ResourceModel, RxHandle, RxOutcome, SduRef, TxGrant,
-    TxHandle, TxRequest, timing,
+    CornerGeometry, DccAlgorithm, DccState, DropCause, EdgeSource, FrameDescriptor, FrameKind,
+    GateDecision, KnifeEdge, LosClass, LosResult, LossBreakdown, LossCause, MacSdu, Mcs,
+    Modulation, PatternRef, RadioEndpoint, Rat, ReactiveState, ResourceModel, RxHandle, RxOutcome,
+    SduRef, TxGrant, TxHandle, TxRequest, timing,
 };
 
 pub use abstract_tier::{
@@ -159,9 +159,9 @@ pub use jamming::{
 };
 pub use mac::{Backoff, CbrMeter, EdcaOcbMac, SlottedMac};
 pub use obstacle::{
-    BuildingIndex, BuildingShadowing, MultiEdgeRule, NlosvCase, SommerFit, TerrainDiffraction,
-    VehicleBlockage, knife_edge_loss_db, knife_edge_loss_exact_db, knife_edge_parameter,
-    multi_edge_loss_db,
+    BuildingIndex, BuildingShadowing, CornerTracer, MultiEdgeRule, NlosvCase, SommerFit,
+    TerrainDiffraction, VehicleBlockage, first_wall_m, knife_edge_loss_db,
+    knife_edge_loss_exact_db, knife_edge_parameter, multi_edge_loss_db, segment_blocked,
 };
 pub use per::{PerModel, PerPreset, coded_error_probability, data_field_bits, uncoded_ber};
 pub use phy::{
@@ -169,8 +169,10 @@ pub use phy::{
     air_time, sinr_db,
 };
 pub use prop::{
-    DualSlope, FreeSpace, LogDistancePreset, LogDistanceShadowing, Polarization, ShadowProcess,
-    SommerCoefficients, Tr37885, Tr37885State, TwoRayGround, friis_loss_db, two_ray_ground_loss_db,
+    DualSlope, FreeSpace, GeometricState, GeometricUrbanV2v, LogDistancePreset,
+    LogDistanceShadowing, Polarization, RainAttenuation, ShadowProcess, SommerCoefficients,
+    Tr37885, Tr37885State, TwoRayGround, friis_loss_db, mangel_breakpoint_m, mangel_nlos_db,
+    p838_coefficients, rain_attenuation_db, two_ray_ground_loss_db,
 };
 pub use terrain::{
     EdgeExtraction, GroundProfile, ProfilePoint, TerrainProfile, any_edge_obstructs, knife_edges,
