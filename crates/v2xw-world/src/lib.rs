@@ -77,6 +77,7 @@ pub mod quant;
 pub mod serde_native;
 pub mod serde_vwp;
 pub mod sumo;
+pub mod walk;
 
 use serde::{Deserialize, Serialize};
 use v2xw_core::card::ModelCard;

@@ -529,6 +529,22 @@ pub struct ImportCounts {
     pub heights_defaulted: u64,
     /// Pedestrian crossings imported.
     pub crossings: u64,
+    /// Lanes of kind [`LaneKind::Crossing`]: the walking directions of `footway=crossing`
+    /// ways.
+    #[serde(default)]
+    pub crossing_lanes: u64,
+    /// Crosswalks given pedestrian signal intervals (`crate::walk::signalise_crossings`).
+    #[serde(default)]
+    pub signalised_crosswalks: u64,
+    /// Of those, walks shorter than the MUTCD 7 s minimum (but at least 4 s).
+    #[serde(default)]
+    pub crosswalks_short_walk: u64,
+    /// Crosswalks whose window could not hold 4 s of walk and the full clearance.
+    #[serde(default)]
+    pub crosswalks_short_clearance: u64,
+    /// Crosswalks at a signalised junction with no walk window at all.
+    #[serde(default)]
+    pub crosswalks_never_walk: u64,
     /// Land-use zones imported.
     pub landuse_zones: u64,
     /// `highway=traffic_signals` nodes found in the file.
@@ -720,6 +736,16 @@ impl ImportReport {
             s,
             "other             {} crossings, {} land-use zones, {} signal nodes",
             c.crossings, c.landuse_zones, c.traffic_signal_nodes
+        );
+        let _ = writeln!(
+            s,
+            "crosswalks        {} crossing lanes; {} signalised ({} short walk, {} short \
+             clearance, {} never walk)",
+            c.crossing_lanes,
+            c.signalised_crosswalks,
+            c.crosswalks_short_walk,
+            c.crosswalks_short_clearance,
+            c.crosswalks_never_walk
         );
         let _ = writeln!(s, "anomalies         {} in total", self.total_anomalies());
         for (kind, count) in &self.anomalies {
@@ -2616,6 +2642,15 @@ pub fn classify_way(
             report,
         ),
         WayFamily::Cycle => (options.cycleway_width_m, WidthSource::Option),
+        // A crosswalk's two walking directions tile its painted band, so each lane is half
+        // the band: the `width` tag when it has one, `crossing_width_m` otherwise.
+        WayFamily::Foot if is_crossing_way(&way.tags) => {
+            let band = match way.tags.get("width").map(parse_measure) {
+                Some(Some(m)) if m.metres > 0.0 && m.metres < 50.0 => m.metres,
+                _ => options.crossing_width_m,
+            };
+            (0.5 * band, WidthSource::WayTag)
+        }
         WayFamily::Foot => (options.sidewalk_width_m, WidthSource::Option),
     };
 
@@ -2631,7 +2666,14 @@ pub fn classify_way(
         lane_width_m,
         width_source,
         allowed,
-        kind: defaults.family.lane_kind(),
+        // A `footway=crossing` way is the crosswalk itself: its lanes are crossing lanes,
+        // which is what lets a pedestrian router, the vehicle yield rule and the signal
+        // plan's pedestrian intervals find it.
+        kind: if defaults.family == WayFamily::Foot && is_crossing_way(&way.tags) {
+            LaneKind::Crossing
+        } else {
+            defaults.family.lane_kind()
+        },
         turn_fwd,
         turn_bwd,
         roundabout,
@@ -5157,6 +5199,15 @@ fn synthesise_signals(
 // Stage 9: crossings
 // ---------------------------------------------------------------------------
 
+/// True for a way that is a crossing of a road: `footway=crossing`, `cycleway=crossing`,
+/// `path=crossing`, or any highway carrying a `crossing=*` tag.
+fn is_crossing_way(tags: &Tags) -> bool {
+    tags.is("footway", "crossing")
+        || tags.is("cycleway", "crossing")
+        || tags.is("path", "crossing")
+        || (tags.has("crossing") && tags.has("highway"))
+}
+
 /// Imports `footway=crossing` (and `cycleway=crossing`) ways as [`Crossing`] records.
 ///
 /// A crossing belongs to the junction nearest its midpoint, within
@@ -5172,11 +5223,7 @@ fn build_crossings(
 ) -> Vec<Crossing> {
     let mut out: Vec<(JunctionId, i64, Crossing)> = Vec::new();
     for way in &file.ways {
-        let is_crossing = way.tags.is("footway", "crossing")
-            || way.tags.is("cycleway", "crossing")
-            || way.tags.is("path", "crossing")
-            || (way.tags.has("crossing") && way.tags.has("highway"));
-        if !is_crossing {
+        if !is_crossing_way(&way.tags) {
             continue;
         }
         let resolved: Vec<Vec3> = way
@@ -6845,8 +6892,21 @@ fn import_parsed(file: &OsmFile, options: &OsmOptions, report: &mut ImportReport
     assign_control(&mut net, &plans, file);
 
     // --- stage 8: signals ----------------------------------------------------------
-    let signals = synthesise_signals(&mut net, file, &points, options, report);
+    let mut signals = synthesise_signals(&mut net, file, &points, options, report);
     report.counts.signalised_junctions = signals.len() as u64;
+    // Pedestrian intervals for the crosswalks of every signalised junction (MUTCD 2009
+    // §4E.06), added beside the vehicle phases without changing them.
+    let pedestrian = crate::walk::signalise_crossings(
+        &mut signals,
+        &net.lanes,
+        &connections,
+        |j| net.junctions[j.as_usize()].position,
+        &crate::walk::PedestrianTiming::mutcd(),
+    );
+    report.counts.signalised_crosswalks = u64::from(pedestrian.signalised);
+    report.counts.crosswalks_short_walk = u64::from(pedestrian.short_walk);
+    report.counts.crosswalks_short_clearance = u64::from(pedestrian.short_clearance);
+    report.counts.crosswalks_never_walk = u64::from(pedestrian.never_walk);
 
     // V9: 77.6 % of the Phase 1 world's junctions were footway intersections in the
     // sidewalk mesh, so both the junction count and the signalisation share meant
@@ -6913,6 +6973,7 @@ fn import_parsed(file: &OsmFile, options: &OsmOptions, report: &mut ImportReport
         match lane.kind {
             LaneKind::Internal => report.counts.internal_lanes += 1,
             LaneKind::Sidewalk => report.counts.sidewalk_lanes += 1,
+            LaneKind::Crossing => report.counts.crossing_lanes += 1,
             LaneKind::Cycle => report.counts.cycle_lanes += 1,
             _ => {}
         }
