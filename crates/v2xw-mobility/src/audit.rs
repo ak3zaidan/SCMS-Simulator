@@ -1618,6 +1618,10 @@ pub fn audit_world(world: &World) -> Vec<(Check, Example)> {
             continue;
         };
         let row = |l: LaneId| j.internal.iter().position(|x| *x == l);
+        // Each conflicting pair once per plan, at the first phase that has it: a plan whose
+        // phases are split (the pedestrian intervals of `v2xw_world::walk` split them without
+        // changing a vehicle state) would otherwise count one defect once per piece.
+        let mut seen: BTreeSet<(LaneId, LaneId)> = BTreeSet::new();
         for (pi, phase) in plan.phases.iter().enumerate() {
             for (a, sa) in phase.states.iter().enumerate() {
                 for (b, sb) in phase.states.iter().enumerate().skip(a + 1) {
@@ -1641,7 +1645,7 @@ pub fn audit_world(world: &World) -> Vec<(Check, Example)> {
                     let (Some(ra), Some(rb)) = (row(la), row(lb)) else {
                         continue;
                     };
-                    if j.conflicts.is_foe(ra, rb) {
+                    if j.conflicts.is_foe(ra, rb) && seen.insert((la, lb)) {
                         out.push((
                             Check::WorldConflictingGreens,
                             example(
