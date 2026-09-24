@@ -165,7 +165,9 @@ impl Default for IdmParams {
             coolness: 0.99,
             lookahead_m: LEGACY_LOOKAHEAD_M,
             weather_response: WeatherResponse::Fhwa,
-            road_context: RoadContext::Freeway,
+            // The FHWA arterial rows on a city street and the freeway rows on an
+            // expressway, by the lane's limit: one world can hold both.
+            road_context: RoadContext::BySpeedLimit,
         }
     }
 }
@@ -513,14 +515,19 @@ impl CarFollowing for Idm {
         lane: &LaneView,
         w: &WeatherState,
     ) -> f64 {
-        let effects =
-            weather::driving_effects(self.params.weather_response, w, self.params.road_context);
+        let road = self.params.road_context.resolve(lane.speed_limit_mps);
+        let effects = weather::driving_effects(self.params.weather_response, w, road);
         // The order weather applies, recorded on the card: the legal limit and the
         // driver's wish are reconciled first, then the weather slows the result. Applying
         // the factor only to the driver's wish would leave an urban run where the limit
         // binds completely unaffected by snow.
-        let v0 =
+        let mut v0 =
             effects.apply_to_desired_speed(ego.driver.desired_speed_mps.min(lane.speed_limit_mps));
+        // In fog a driver keeps to a speed they can stop from within what they can see:
+        // the AASHTO stopping sight distance, solved for speed.
+        if self.params.weather_response == WeatherResponse::Fhwa {
+            v0 = v0.min(weather::sight_limited_speed_mps(effects.visibility_m));
+        }
         let driver = DriverProfile {
             desired_speed_mps: v0,
             max_accel_mps2: ego.driver.max_accel_mps2,
@@ -528,7 +535,7 @@ impl CarFollowing for Idm {
             time_headway_s: effects.apply_to_headway(ego.driver.time_headway_s),
             min_gap_m: ego.driver.min_gap_m,
         };
-        match leader {
+        let a = match leader {
             None => self.accel_full(ego.speed_mps, v0, f64::INFINITY, 0.0, 0.0, &driver),
             Some(l) => self.accel_full(
                 ego.speed_mps,
@@ -538,7 +545,9 @@ impl CarFollowing for Idm {
                 l.accel_mps2,
                 &driver,
             ),
-        }
+        };
+        // And no car brakes harder than its tyres grip on this surface.
+        a.max(-effects.max_decel_mps2)
     }
 
     fn profile(&self, class: VehicleClass) -> DriverProfile {
@@ -1174,6 +1183,34 @@ mod tests {
         );
         let snowy_gap = m.accel(&ego(25.0, d), Some(&leader), &lane(33.3), &snow);
         assert!(snowy_gap < clear_gap, "and stretches the headway");
+    }
+
+    #[test]
+    fn fog_slows_the_driver_and_ice_limits_the_braking() {
+        let m = Idm::new(IdmPreset::Kesting2010);
+        let d = m.profile(VehicleClass::Passenger);
+        // 40 m of fog on a 33 m/s road: a driver at 20 m/s is above the ≈ 10.3 m/s it can
+        // stop from within 40 m, and slows.
+        let fog = WeatherState::new(
+            v2xw_core::weather::WeatherKind::Fog,
+            0.5,
+            40.0,
+            v2xw_core::weather::SurfaceCondition::Dry,
+        );
+        assert!(m.accel(&ego(20.0, d), None, &lane(33.3), &WeatherState::CLEAR) > 0.0);
+        assert!(m.accel(&ego(20.0, d), None, &lane(33.3), &fog) < 0.0);
+        // On ice nothing brakes harder than μ·g ≈ 0.98 m/s², however close the obstacle.
+        let ice = WeatherState::new(
+            v2xw_core::weather::WeatherKind::Clear,
+            0.0,
+            f64::INFINITY,
+            v2xw_core::weather::SurfaceCondition::Ice,
+        );
+        let obstacle = LeaderView::virtual_obstacle(5.0, 0.0);
+        let dry = m.accel(&ego(15.0, d), Some(&obstacle), &lane(15.0), &WeatherState::CLEAR);
+        let icy = m.accel(&ego(15.0, d), Some(&obstacle), &lane(15.0), &ice);
+        assert!(dry < -3.0, "{dry}");
+        assert!((icy + 0.980_665).abs() < 1e-9, "{icy}");
     }
 
     #[test]

@@ -168,6 +168,22 @@ pub enum FleetMix {
     LegacyMixed,
     /// The MOBIL study's mix: 20 % trucks, the rest cars [Kesting 2007, R10 §B3].
     Kesting2007,
+    /// The scenario's own shares (`actors.vehicles.classes`), in parts per million, one
+    /// per [`VehicleClass::ALL`] entry in that order.
+    Shares([u32; 12]),
+}
+
+impl FleetMix {
+    /// A mix from `(class, fraction)` pairs, fractions summing to 1.
+    pub fn from_shares(shares: &[(VehicleClass, f64)]) -> FleetMix {
+        let mut ppm = [0u32; 12];
+        for (class, fraction) in shares {
+            if let Some(i) = VehicleClass::ALL.iter().position(|c| c == class) {
+                ppm[i] = (fraction.clamp(0.0, 1.0) * 1e6).round() as u32;
+            }
+        }
+        FleetMix::Shares(ppm)
+    }
 }
 
 impl FleetMix {
@@ -177,6 +193,7 @@ impl FleetMix {
             FleetMix::CarsOnly => "cars-only",
             FleetMix::LegacyMixed => "legacy-mixed",
             FleetMix::Kesting2007 => "kesting-2007",
+            FleetMix::Shares(_) => "scenario-shares",
         }
     }
 
@@ -191,6 +208,12 @@ impl FleetMix {
             FleetMix::Kesting2007 => {
                 vec![(VehicleClass::Passenger, 0.8), (VehicleClass::Truck, 0.2)]
             }
+            FleetMix::Shares(ppm) => VehicleClass::ALL
+                .iter()
+                .zip(ppm)
+                .filter(|(_, w)| *w > 0)
+                .map(|(c, w)| (*c, f64::from(w) * 1e-6))
+                .collect(),
         }
     }
 

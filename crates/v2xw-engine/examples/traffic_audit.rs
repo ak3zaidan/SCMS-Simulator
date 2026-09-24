@@ -121,6 +121,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    {
+        let mut kinds: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        let mut bike = 0usize;
+        for l in world.roads.lanes() {
+            *kinds.entry(l.kind.wire_name()).or_default() += 1;
+            if l.admits(v2xw_world::ClassMask::BICYCLE) {
+                bike += 1;
+            }
+        }
+        eprintln!("lane kinds: {kinds:?}; lanes admitting bicycles: {bike}");
+    }
     let mut auditor = TrafficAuditor::new(&world, AuditParams::default());
     auditor.audit_world(&world);
     let trace: Option<Vec<u32>> = value("--trace")

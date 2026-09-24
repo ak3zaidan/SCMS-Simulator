@@ -219,6 +219,9 @@ struct Setup {
     /// Signal plans as `(signal id, phase boundaries)`, evaluated by the projector.
     signals: Vec<SignalPlan>,
     equipped_fraction: f64,
+    /// `actors.vru.device_fraction`: what the kernel draws a pedestrian's or a cyclist's
+    /// device with, instead of `equipped_fraction`.
+    vru_device_fraction: f64,
     /// How many node ids the kernel mints before the first vehicle's.
     ///
     /// `v2xw_engine::Engine::build` calls `create_rsus` before it seeds the timeline, and
@@ -881,6 +884,7 @@ fn assemble_setup(
         class_names,
         signals,
         equipped_fraction: scenario.actors.vehicles.equipped_fraction,
+        vru_device_fraction: scenario.actors.vru.device_fraction,
         roadside_nodes: roadside_node_count(scenario),
         actor_capacity,
         seed: scenario.seed,
@@ -1036,6 +1040,9 @@ struct Projector {
     nodes: BTreeMap<NodeId, ActorId>,
     rng: v2xw_core::rng::RngRegistry,
     equipped_fraction: f64,
+    /// `actors.vru.device_fraction`: what the kernel draws a pedestrian's or a cyclist's
+    /// device with, instead of `equipped_fraction`.
+    vru_device_fraction: f64,
     /// The node ids `0..roadside_nodes`, which the kernel gave to masts and not to actors.
     /// No reconstruction is owed for them and none is possible: a roadside unit has no
     /// `gt.kinematics` record because it has no actor.
@@ -1125,6 +1132,7 @@ impl Projector {
             nodes: BTreeMap::new(),
             rng: v2xw_core::rng::RngRegistry::new(setup.seed),
             equipped_fraction: setup.equipped_fraction,
+            vru_device_fraction: setup.vru_device_fraction,
             roadside_nodes: setup.roadside_nodes,
             // Not zero: the masts hold `0..roadside_nodes` (see `roadside_node_count`).
             next_node: setup.roadside_nodes,
@@ -1159,14 +1167,19 @@ impl Projector {
     /// and the id counts as accounted for the moment it is handed out, even if a record
     /// named it a step earlier. The caller equips a step's new actors in `ActorId` order,
     /// which is spawn order, because the kernel assigns `ActorId`s ascending at spawn.
-    fn equip(&mut self, actor: ActorId) -> Option<NodeId> {
+    fn equip(&mut self, actor: ActorId, vru: bool) -> Option<NodeId> {
+        let fraction = if vru {
+            self.vru_device_fraction
+        } else {
+            self.equipped_fraction
+        };
         let equipped = self
             .rng
             .checkout(
                 v2xw_core::rng::RngDomain::Spawn,
                 v2xw_core::rng::EntityRef::Actor(actor),
             )
-            .bool(self.equipped_fraction);
+            .bool(fraction);
         if !equipped {
             return None;
         }
@@ -1449,10 +1462,14 @@ impl Projector {
     fn absorb(&mut self, index: u64, t: SimTime, kinematics: &[GtKinematicsView]) {
         let mut present: BTreeSet<ActorId> = BTreeSet::new();
         let mut fresh: Vec<ActorId> = Vec::new();
+        let mut vru: BTreeSet<ActorId> = BTreeSet::new();
         for view in kinematics {
             present.insert(view.actor);
             if !self.actors.contains_key(&view.actor) {
                 fresh.push(view.actor);
+            }
+            if matches!(view.class.as_deref(), Some("pedestrian" | "bicycle")) {
+                vru.insert(view.actor);
             }
         }
         // Spawn order is `ActorId` order, and the node ids the kernel hands out are dense
@@ -1463,7 +1480,11 @@ impl Projector {
             // The equipped draw happens for every actor whether or not it gets a slot, so
             // that a run at capacity still assigns the node ids the kernel assigned: the
             // draw is what keeps the reconstruction aligned with the kernel's own.
-            let node = self.equip(actor);
+            // The kernel draws a pedestrian's or a cyclist's device with
+            // `actors.vru.device_fraction` (v2xw_engine::wiring::is_vru_class), so the
+            // reconstruction does too; drawing them with the vehicles' fraction minted
+            // node ids the kernel never did and shifted every later vehicle's.
+            let node = self.equip(actor, vru.contains(&actor));
             let slot = self.slots.allocate(actor, t);
             if slot >= self.actor_capacity {
                 // §3.1.1: the client refuses a slot at or beyond `actor_capacity`, so

@@ -81,6 +81,7 @@ use crate::views::{
     PhaseState, Route, Side, TripRequest, VehicleView,
 };
 use crate::vru::social_force::SocialForce;
+use v2xw_core::rng::{EntityRef, RngDomain};
 
 /// The model id.
 pub const MODEL_ID: &str = "mobility/native/medium";
@@ -136,6 +137,41 @@ const PLANNED_BRAKE_JERK_MPS3: f64 = 20.0;
 /// the 3.4 m/s² AASHTO *Green Book* 2018 §3.2.2 takes as the deceleration most drivers
 /// brake at when they must stop for something unexpected.
 const PLANNED_STOP_MAX_DECEL_MPS2: f64 = 3.4;
+
+/// How many vulnerable road users the engine keeps in the world (`actors.vru`).
+///
+/// Pedestrians walk the world's sidewalk and crossing lanes with the social-force model
+/// ([`SocialForce`]); cyclists ride the lanes that admit bicycles with the car-following
+/// and lane-change models, on the SUMO bicycle vType ([`bicycle_driver`]). Each one that
+/// finishes its walk or ride is replaced, so the population holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct VruPopulation {
+    /// Pedestrians.
+    pub pedestrians: u32,
+    /// Cyclists.
+    pub cyclists: u32,
+}
+
+/// The model id VRU placement draws its streams under.
+const VRU_PLACEMENT_ID: &str = "mobility/vru/population";
+
+/// How many walkable lanes a pedestrian's walk strings together at most.
+const PEDESTRIAN_WALK_LANES: usize = 12;
+
+/// The driver of a bicycle: the SUMO vType defaults for vClass `bicycle` (the class
+/// table's [`crate::classes::ClassSpec`]: desired 20 km/h, acceleration 1.2 m/s²,
+/// deceleration 3.0 m/s², gap 0.5 m) with SUMO's default `tau` of 1 s as the time
+/// headway. The car-following presets calibrate cars and trucks, not riders.
+pub fn bicycle_driver() -> DriverProfile {
+    let spec = VehicleClass::Bicycle.spec();
+    DriverProfile {
+        desired_speed_mps: spec.desired_max_speed_mps.unwrap_or(spec.max_speed_mps),
+        max_accel_mps2: spec.accel_mps2,
+        comfort_decel_mps2: spec.decel_mps2,
+        time_headway_s: 1.0,
+        min_gap_m: spec.min_gap_m,
+    }
+}
 
 /// Which intersection rule the engine applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -466,7 +502,14 @@ pub struct NativeMobility {
     signals: FixedTimeSignals,
     two_coloring: Option<TwoColoring>,
     router: DynamicReroute,
+    /// Routes riders over the lanes that admit bicycles.
+    bike_router: DynamicReroute,
     demand: Option<Box<dyn Demand>>,
+    /// The VRU population to keep.
+    vru_population: VruPopulation,
+    /// The walkable lanes, and the lanes a bicycle may use, in id order (from `init`).
+    walkable: Vec<LaneId>,
+    bike_lanes: Vec<LaneId>,
     vru: Option<SocialForce>,
     clock: Option<Box<dyn ClockModel>>,
     actors: BTreeMap<ActorId, Actor>,
@@ -560,7 +603,14 @@ impl NativeMobility {
             signals: FixedTimeSignals::new(SignalPlanParams::default()),
             two_coloring: None,
             router,
+            bike_router: DynamicReroute::new(
+                DijkstraParams::for_classes(ClassMask::BICYCLE),
+                crate::views::ReroutePolicy::STATIC,
+            ),
             demand: None,
+            vru_population: VruPopulation::default(),
+            walkable: Vec::new(),
+            bike_lanes: Vec::new(),
             vru: None,
             clock: None,
             actors: BTreeMap::new(),
@@ -583,6 +633,27 @@ impl NativeMobility {
     pub fn with_vru(mut self, vru: SocialForce) -> Self {
         self.vru = Some(vru);
         self
+    }
+
+    /// Keeps `population` vulnerable road users in the world. Pedestrians need the
+    /// social-force model, which is installed if it is not already.
+    #[must_use]
+    pub fn with_vru_population(mut self, population: VruPopulation) -> Self {
+        if population.pedestrians > 0 && self.vru.is_none() {
+            self.vru = Some(SocialForce::default());
+        }
+        self.vru_population = population;
+        self
+    }
+
+    /// The router for a class: riders on the bicycle lane graph, everyone else on the
+    /// engine's own.
+    fn router_for(&self, class: VehicleClass) -> &DynamicReroute {
+        if class == VehicleClass::Bicycle {
+            &self.bike_router
+        } else {
+            &self.router
+        }
     }
 
     /// Adds a clock model. The engine does not read it — believed time belongs to the node
@@ -855,7 +926,7 @@ impl NativeMobility {
     ) -> Insertion {
         let costs = self.costs(world);
         let Some(route) = self
-            .router
+            .router_for(trip.class)
             .replan(world, trip.origin, trip.destination, trip.t, &costs)
         else {
             return Insertion::Unroutable;
@@ -968,6 +1039,132 @@ impl NativeMobility {
         Insertion::Placed(id)
     }
 
+    /// Tops the VRU population up to [`VruPopulation`], removing pedestrians who have
+    /// finished their walk (they are replaced by new ones). Pedestrians start on a random
+    /// walkable lane and walk a random chain of connected ones; cyclists ride from a random
+    /// bicycle lane to another over the bicycle lane graph. Every draw comes from the new
+    /// actor's own stream, so the placement does not depend on how many others were placed.
+    fn keep_vru_population(
+        &mut self,
+        ctx: &mut dyn MobCtx,
+        now: SimTime,
+        spawned: &mut Vec<ActorSpawn>,
+        gone: &mut Vec<(ActorId, DespawnCause)>,
+    ) {
+        let target = self.vru_population;
+        // Pedestrians.
+        if target.pedestrians > 0 && !self.walkable.is_empty() {
+            if let Some(vru) = self.vru.as_mut() {
+                let arrived: Vec<ActorId> = vru
+                    .people()
+                    .filter(|p| p.arrived)
+                    .map(|p| p.actor)
+                    .collect();
+                for a in arrived {
+                    vru.despawn(a);
+                    gone.push((a, DespawnCause::TripComplete));
+                }
+            }
+            let mut attempts = 0;
+            while self.vru.as_ref().map_or(0, SocialForce::len) < target.pedestrians as usize
+                && attempts < target.pedestrians as usize + 4
+            {
+                attempts += 1;
+                let id = ActorId::new(self.next_actor);
+                self.next_actor += 1;
+                let (route, s_m) = {
+                    let world = ctx.world();
+                    let walkable = &self.walkable;
+                    let mut rng = ctx.rng(RngDomain::plugin(VRU_PLACEMENT_ID), EntityRef::Actor(id));
+                    let first = walkable[rng.below(walkable.len() as u64) as usize];
+                    let mut route = vec![first];
+                    while route.len() < PEDESTRIAN_WALK_LANES {
+                        let last = *route.last().expect("non-empty");
+                        let next: Vec<LaneId> = world
+                            .successor_lanes(last)
+                            .into_iter()
+                            .filter(|l| SocialForce::is_walkable(world, *l) && !route.contains(l))
+                            .collect();
+                        if next.is_empty() {
+                            break;
+                        }
+                        route.push(next[rng.below(next.len() as u64) as usize]);
+                    }
+                    let length = world.lane(first).length_m;
+                    (route, rng.uniform(0.0, length))
+                };
+                let Some(mut vru) = self.vru.take() else { break };
+                let placed = vru.spawn(ctx, id, route.clone(), s_m).is_ok();
+                if placed && let Some(p) = vru.get(id) {
+                    let world = ctx.world();
+                    let mut k = Kinematics::at_rest(now, p.position(world));
+                    k.dims = VehicleClass::Pedestrian.dims();
+                    k.heading_rad = world.lane(p.lane).heading_at(p.s_m);
+                    spawned.push(ActorSpawn {
+                        actor: id,
+                        t: now,
+                        class: VehicleClass::Pedestrian,
+                        kinematics: k,
+                        route: Self::route_of(world, route),
+                        driver: DriverProfile {
+                            desired_speed_mps: p.desired_speed_mps,
+                            max_accel_mps2: 0.0,
+                            comfort_decel_mps2: 0.0,
+                            time_headway_s: 0.0,
+                            min_gap_m: 0.0,
+                        },
+                        seq: self.next_seq,
+                    });
+                    self.next_seq += 1;
+                }
+                self.vru = Some(vru);
+            }
+        }
+        // Cyclists.
+        if target.cyclists > 0 && self.bike_lanes.len() >= 2 {
+            let riding = self
+                .actors
+                .values()
+                .filter(|a| a.class == VehicleClass::Bicycle)
+                .count();
+            let mut missing = (target.cyclists as usize).saturating_sub(riding);
+            let mut attempts = 0;
+            while missing > 0 && attempts < 2 * target.cyclists as usize + 4 {
+                attempts += 1;
+                let key = self.next_seq;
+                let (origin, destination, s_m) = {
+                    let lanes = &self.bike_lanes;
+                    let mut rng = ctx.rng(
+                        RngDomain::plugin(VRU_PLACEMENT_ID),
+                        EntityRef::custom(VRU_PLACEMENT_ID, key),
+                    );
+                    let o = lanes[rng.below(lanes.len() as u64) as usize];
+                    let d = lanes[rng.below(lanes.len() as u64) as usize];
+                    let length = ctx.world().lane(o).length_m;
+                    (o, d, rng.uniform(VehicleClass::Bicycle.spec().length_m, length))
+                };
+                if origin == destination {
+                    continue;
+                }
+                let trip = TripRequest {
+                    seq: key,
+                    t: now,
+                    origin,
+                    origin_s_m: s_m,
+                    destination,
+                    class: VehicleClass::Bicycle,
+                    desired_speed_mps: bicycle_driver().desired_speed_mps,
+                };
+                self.next_seq += 1;
+                let world = ctx.world();
+                if let Insertion::Placed(id) = self.try_insert(world, &trip, now, None) {
+                    spawned.push(self.actor_spawn(world, id, now));
+                    missing -= 1;
+                }
+            }
+        }
+    }
+
     /// The [`ActorSpawn`] announcing an actor this engine has just inserted.
     ///
     /// One builder for both spawn paths — commanded and demand-driven — so the two cannot
@@ -988,6 +1185,9 @@ impl NativeMobility {
     /// The driver profile a class gets: the installed car-following model's own
     /// calibration.
     fn driver_for(&self, class: VehicleClass) -> DriverProfile {
+        if class == VehicleClass::Bicycle {
+            return bicycle_driver();
+        }
         // [`CarFollowing::profile`] exists for this. Hard-coding a set here instead meant
         // `NativeMobility::legacy()` — the documented legacy-parity configuration — ran
         // the legacy equations with Kesting 2010 drivers: (1.4, 2.0, 1.5, 2.0) where the
@@ -1508,7 +1708,7 @@ impl NativeMobility {
             .map(|e| world.edge(e).lanes.clone())
             .unwrap_or_default();
         for d in std::iter::once(actor.destination).chain(dest_lanes) {
-            if let Some(rest) = self.router.replan(world, cur, d, t, costs) {
+            if let Some(rest) = self.router_for(actor.class).replan(world, cur, d, t, costs) {
                 lanes.extend(rest.lanes.into_iter().skip(1));
                 return Some((Self::route_of(world, lanes), d));
             }
@@ -1829,6 +2029,25 @@ impl Mobility for NativeMobility {
                 self.turn_speed = turn_speeds(world, self.params.turn_lateral_accel_mps2);
             }
         }
+        self.walkable = world
+            .roads
+            .lanes()
+            .iter()
+            .filter(|l| SocialForce::is_walkable(world, l.id))
+            .map(|l| l.id)
+            .collect();
+        self.bike_lanes = world
+            .roads
+            .lanes()
+            .iter()
+            .filter(|l| {
+                l.kind != LaneKind::Internal
+                    && l.kind != LaneKind::Sidewalk
+                    && l.admits(ClassMask::BICYCLE)
+                    && l.length_m >= VehicleClass::Bicycle.spec().length_m + 1.0
+            })
+            .map(|l| l.id)
+            .collect();
         self.demand = Some(demand);
         Ok(())
     }
@@ -1893,6 +2112,10 @@ impl Mobility for NativeMobility {
             }
         }
 
+        // --- pass 2b: the vulnerable road users ------------------------------
+        let mut vru_gone: Vec<(ActorId, DespawnCause)> = Vec::new();
+        self.keep_vru_population(ctx, t0, &mut spawned, &mut vru_gone);
+
         // --- pass 3: freeze ------------------------------------------------
         let world = ctx.world();
         let snapshot = self.snapshot(world, t0);
@@ -1931,7 +2154,9 @@ impl Mobility for NativeMobility {
             let options = NeighborOptions {
                 lookahead_m: self.params.lookahead_m,
                 max_lane_hops: 8,
-                classes: self.params.classes,
+                // The ego's own classes: a car does not change onto a bus lane, and a
+                // rider follows the bicycle lane graph.
+                classes: actor.class.class_mask(),
                 sides: self.params.lane_changes,
             };
             // **One** neighbour query, shared by the car-following and lane-change models.
@@ -2282,8 +2507,12 @@ impl Mobility for NativeMobility {
                     && let Some(n) = next
                     && !world.successor_lanes(actor.lane).contains(&n)
                 {
-                    next = self
-                        .router
+                    let router = if actor.class == VehicleClass::Bicycle {
+                        &self.bike_router
+                    } else {
+                        &self.router
+                    };
+                    next = router
                         .replan(world, actor.lane, actor.destination, t1, &costs)
                         .and_then(|route| {
                             let n = route.lanes.get(1).copied();
@@ -2344,11 +2573,13 @@ impl Mobility for NativeMobility {
                 .map(|a| a.id)
                 .collect();
             for id in due {
-                let (lane, destination) = {
+                let (lane, destination, class) = {
                     let a = &self.actors[&id];
-                    (a.lane, a.destination)
+                    (a.lane, a.destination, a.class)
                 };
-                let replanned = self.router.replan(world, lane, destination, t1, &costs);
+                let replanned = self
+                    .router_for(class)
+                    .replan(world, lane, destination, t1, &costs);
                 let a = self.actors.get_mut(&id).expect("present");
                 a.planned_at = t1;
                 a.planned_generation = generation;
@@ -2361,6 +2592,7 @@ impl Mobility for NativeMobility {
         for (id, _) in &despawned {
             self.actors.remove(id);
         }
+        despawned.extend(vru_gone);
 
         // Publish, in actor-id order.
         let mut states: Vec<(ActorId, Kinematics)> = self
@@ -2394,6 +2626,10 @@ impl Mobility for NativeMobility {
 
     fn kinematics(&self, a: ActorId) -> Option<&Kinematics> {
         self.published.get(&a)
+    }
+
+    fn set_weather(&mut self, weather: WeatherState) {
+        self.weather = weather;
     }
 }
 
@@ -2733,6 +2969,15 @@ pub fn card(params: &EngineParams, car_following: &str) -> ModelCard {
             .to_string(),
         "A vehicle that chose to go on amber is committed to clearing the junction and does \
          not slow for the turn ahead until it has entered."
+            .to_string(),
+        "Vulnerable road users (VruPopulation): pedestrians are placed on a random walkable \
+         lane and walk a random chain of connected walkable lanes with the social-force \
+         model; cyclists ride between random bicycle-admitting lanes on the bicycle lane \
+         graph with the car-following model and the SUMO bicycle vType (20 km/h, 1.2 m/s², \
+         3.0 m/s², 0.5 m, tau 1 s). Each one that finishes is replaced."
+            .to_string(),
+        "A trip whose origin has no room waits, oldest first, up to 120 s (SUMO's insertion \
+         queue), holding the actor id it was given when it first asked."
             .to_string(),
     ];
     card.limitations = vec![

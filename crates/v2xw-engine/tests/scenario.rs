@@ -243,11 +243,30 @@ fn a_key_the_engine_cannot_act_on_is_refused_and_names_itself() {
                 });
             }),
         ),
+        // Pedestrians and cyclists now walk and ride; what the kernel still cannot host is
+        // their device, so that is the one field refused.
         (
-            "actors.vru",
+            "actors.vru.device_fraction",
             Box::new(|s: &mut Scenario| {
-                s.actors.vru.pedestrians = 40;
                 s.actors.vru.device_fraction = 0.5;
+            }),
+        ),
+        (
+            "actors.vehicles.demand.kind",
+            Box::new(|s: &mut Scenario| {
+                s.actors.vehicles.demand.kind = "mobility/demand/activity-based".to_string();
+            }),
+        ),
+        (
+            "actors.vehicles.classes.pedestrian",
+            Box::new(|s: &mut Scenario| {
+                s.actors.vehicles.classes.insert(
+                    "pedestrian".to_string(),
+                    v2xw_engine::scenario::schema::VehicleClassSpec {
+                        fraction: 1.0,
+                        obu: None,
+                    },
+                );
             }),
         ),
         (
