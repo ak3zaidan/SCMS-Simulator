@@ -19,13 +19,18 @@ import { join } from "node:path";
 
 import { EngineProcess, REPO, open, runToEnd, status } from "./support.js";
 
-const CLOSE_AT_S = 6;
+const CLOSE_AT_S = 5;
 
 function scenario(): string {
   const text = readFileSync(join(REPO, "scenarios/phase1-grid.yaml"), "utf8")
     .replace("name: phase1-grid", "name: e2e-events")
-    .replace("duration_s: 60.0", "duration_s: 30.0")
-    .replace("rate_veh_per_h: 30.0", "rate_veh_per_h: 7200.0");
+    .replace("duration_s: 60.0", "duration_s: 40.0")
+    .replace("rate_veh_per_h: 30.0", "rate_veh_per_h: 14400.0")
+    // A small grid, so the traffic is dense enough on each street for the check to bite:
+    // the Midtown-shaped 13 x 34 grid spreads a minute of arrivals over hundreds of streets.
+    .replace("cols: 13", "cols: 3")
+    .replace("rows: 34", "rows: 3")
+    .replace("block_x_m: 274.0", "block_x_m: 120.0");
   const dir = join(tmpdir(), `vwp-engine-events-${process.pid}`);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, "e2e-events.yaml");
@@ -107,7 +112,9 @@ test("a closure added in the settings reaches the next run and traffic avoids th
   await recordLaneChanges(page);
   await runToEnd(page);
   const baseline = await entriesAfter(page, CLOSE_AT_S);
-  const [edge, before] = [...baseline.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0])[0] ?? [NaN, 0];
+  const ranked = [...baseline.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+  console.log(`streets entered after ${CLOSE_AT_S} s without a closure: ${JSON.stringify(ranked.slice(0, 8))}`);
+  const [edge, before] = ranked[0] ?? [NaN, 0];
   expect(before, "the busiest street carries traffic without a closure, so the check can fail").toBeGreaterThanOrEqual(3);
 
   // --- add the closure in the editor ------------------------------------------------------------
