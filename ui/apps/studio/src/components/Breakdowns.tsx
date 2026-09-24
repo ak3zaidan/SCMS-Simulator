@@ -62,15 +62,55 @@ const STAGE_COLOURS = [
   "#882255",
 ];
 
+/**
+ * The metrics this run measures (the catalogue's names and their bases), asked once per run.
+ *
+ * A run measures only the metrics its scenario asks for, and the engine answers a query for any
+ * other with −32007. Asking anyway put an "unknown metric" error in the page's log every two
+ * seconds for each card whose metric the run does not have (the phase 1 grid has no
+ * `delivery_ratio`, `e2e_latency` or `channel_load`, and only a fragmenting run has `frag_*`).
+ */
+let measured: { key: string; names: Promise<ReadonlySet<string>> } | null = null;
+
+function measuredNames(): Promise<ReadonlySet<string>> {
+  const run = useStudio.getState().run;
+  const key = `${run.runId}#${run.generation}`;
+  if (measured === null || measured.key !== key) {
+    const names = engine
+      .request("metrics.query", {}, { quiet: true })
+      .then((res) => {
+        const set = new Set<string>();
+        for (const c of res.catalogue ?? []) {
+          set.add(c.name);
+          if (c.base) set.add(c.base);
+        }
+        return set as ReadonlySet<string>;
+      })
+      .catch(() => new Set<string>() as ReadonlySet<string>);
+    measured = { key, names };
+  }
+  return measured.names;
+}
+
 /** Asks for one metric grouped by one dimension; an engine without breakdowns answers nothing. */
 async function grouped(metric: string, by: string, where: Record<string, string> = {}): Promise<Group[]> {
+  const names = await measuredNames();
+  if (!names.has(metric)) {
+    // An empty catalogue is an answer too early in a run; ask again next time rather than keep it.
+    if (names.size === 0) measured = null;
+    return [];
+  }
   try {
-    const res = await engine.request("metrics.query", {
-      metrics: [metric],
-      group_by: [by as "t"],
-      ...(Object.keys(where).length > 0 ? { where } : {}),
-      t_from_ns: 0,
-    });
+    const res = await engine.request(
+      "metrics.query",
+      {
+        metrics: [metric],
+        group_by: [by as "t"],
+        ...(Object.keys(where).length > 0 ? { where } : {}),
+        t_from_ns: 0,
+      },
+      { quiet: true },
+    );
     return (res.rows ?? []).map((row) => ({
       key: String(row[0]),
       value: typeof row[1] === "number" ? row[1] : null,

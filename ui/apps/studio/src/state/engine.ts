@@ -674,15 +674,20 @@ export class StudioEngine {
   async request<M extends VwpMethodName>(
     method: M,
     params: ParamsOf<M>,
-    options?: { readonly timeoutMs?: number },
+    options?: { readonly timeoutMs?: number; readonly quiet?: boolean },
   ): Promise<ResultOf<M>> {
     const client = this.client;
+    // `quiet` is for a background poll whose caller handles the failure itself (the breakdown
+    // cards answer "nothing yet"): its failures are not the user's errors, and a poll that was in
+    // flight when a socket dropped and resumed is not an error at all.
+    const quiet = options?.quiet === true;
+    const clientOptions = options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : undefined;
     if (this.streaming && client) {
-      useStudio.getState().noteRpcCall(method);
+      if (!quiet) useStudio.getState().noteRpcCall(method);
       try {
-        return await client.request(method, params, options);
+        return await client.request(method, params, clientOptions);
       } catch (err) {
-        this.#log("error", "rpc", `${method}: ${errText(err)}`);
+        if (!quiet) this.#log("error", "rpc", `${method}: ${errText(err)}`);
         throw err;
       }
     }
@@ -699,7 +704,7 @@ export class StudioEngine {
         const reopened = this.client;
         if (this.streaming && reopened) {
           useStudio.getState().noteRpcCall(method);
-          return await reopened.request(method, params, options);
+          return await reopened.request(method, params, clientOptions);
         }
       }
       const err = new Error(
@@ -711,9 +716,9 @@ export class StudioEngine {
       throw err;
     }
     try {
-      return await this.requestHttp(method, params);
+      return await this.requestHttp(method, params, { quiet });
     } catch (err) {
-      this.#log("error", "rpc", `${method} over HTTP: ${errText(err)}`);
+      if (!quiet) this.#log("error", "rpc", `${method} over HTTP: ${errText(err)}`);
       throw err;
     }
   }
