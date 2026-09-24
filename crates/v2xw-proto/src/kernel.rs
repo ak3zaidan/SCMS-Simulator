@@ -445,6 +445,15 @@ impl<M> Kernel<M> {
                 to: s.to,
             })?;
             let bytes = s.size.bytes();
+            // A handler names the device's access leg as the cellular uplink because that
+            // is the deployment's default; the link a driver actually gave the device
+            // (`ScmsRun::set_access`) says which access carried it — a roadside relay's
+            // backhaul, say — and the bytes belong in that bucket.
+            let transport = if s.transport == Transport::CellularUu {
+                link.transport
+            } else {
+                s.transport
+            };
             self.steps.push(WireStep {
                 t: done,
                 from: node,
@@ -453,7 +462,7 @@ impl<M> Kernel<M> {
                 run: s.run,
                 step: s.step,
                 bytes,
-                transport: s.transport,
+                transport,
             });
             let arrival = link.delay(bytes).after(done);
             let delivery = Delivery {

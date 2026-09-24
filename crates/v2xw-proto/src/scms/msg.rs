@@ -262,6 +262,9 @@ pub enum ScmsMsg {
     Report(Box<ReportSubmission>),
     /// The report shuffle window closing.
     ReportShuffleTimer,
+    /// The CRL Generator's cadence boundary: publish what has been appended since the
+    /// last one.
+    CrlPublishTimer,
     /// MA → PCA: which device holds this linkage value?
     PcaLookupRequest {
         /// The i-period.
