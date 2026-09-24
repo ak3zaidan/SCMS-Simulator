@@ -60,9 +60,18 @@ pub fn build_world(scenario: &Scenario) -> Result<World> {
     }
 }
 
+/// The importers' output revision, part of every [`world_cache_key`].
+///
+/// The workspace version never moves (it is `0.1.0` for every commit), so it cannot tell a
+/// cache written by an older importer from one written by this one. Bump this whenever an
+/// importer's output changes for the same inputs, or a kept cache entry replays the old
+/// world. Revision 2: the traffic track's OSM connector, stop-line setback, tunnel/bridge
+/// height and lane-pairing fixes changed the Manhattan world's content hash.
+pub const IMPORTER_REVISION: u32 = 2;
+
 /// The key a world is cached under: a digest of everything that decides what the import
 /// produces — the scenario's `world` section (less `cache` itself), the bytes of the source
-/// file when there is one, and the importer's version.
+/// file when there is one, and the importer's revision ([`IMPORTER_REVISION`]).
 ///
 /// The source file's *content* is hashed, not its name or its modification time, so an
 /// edited extract is a different world and a copied one is the same world. Hashing a large
@@ -81,7 +90,7 @@ pub fn world_cache_key(scenario: &Scenario) -> Result<String> {
         EngineError::Scenario(crate::ScenarioError::conflict("world", e.to_string()))
     })?;
     let mut material = format!(
-        "v2xw-world-cache/1 workspace={} native=1\n",
+        "v2xw-world-cache/1 importer={IMPORTER_REVISION} workspace={} native=1\n",
         env!("CARGO_PKG_VERSION")
     )
     .into_bytes();
