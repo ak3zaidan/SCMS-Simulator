@@ -43,6 +43,9 @@
 //! | [`Check::Jerk`] | the acceleration changed faster than the jerk bound |
 //! | [`Check::Standstill`] | a vehicle stood still for longer than the standstill limit (gridlock) |
 //! | [`Check::MidRoadDespawn`] | a vehicle left the road anywhere but at the end of its trip |
+//! | [`Check::PedestrianOverlap`] | a vehicle's footprint and a pedestrian's intersect |
+//! | [`Check::OccupiedCrosswalkEntry`] | a vehicle's front crossed into a crosswalk band while someone was on that crosswalk |
+//! | [`Check::PedestrianDontWalkEntry`] | a pedestrian stepped onto a signalised crosswalk that was not showing walk |
 //!
 //! And three static checks of the world ([`audit_world`]): internal paths that leave their
 //! junction, lanes that pass through a building, and signal phases that give two
@@ -110,6 +113,25 @@ pub struct AuditActor {
     pub heading_rad: f64,
 }
 
+/// One pedestrian as the auditor sees it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AuditPedestrian {
+    /// Which actor.
+    pub actor: ActorId,
+    /// The walkable lane it is on.
+    pub lane: LaneId,
+    /// Arc length along that lane.
+    pub s_m: f64,
+    /// Its published position: the centre of the body.
+    pub pos: Vec3,
+    /// Its published heading, radians.
+    pub heading_rad: f64,
+    /// Body length (front to back), metres.
+    pub length_m: f64,
+    /// Body width (shoulder to shoulder), metres.
+    pub width_m: f64,
+}
+
 /// A violation class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -162,11 +184,20 @@ pub enum Check {
     WorldLaneInBuilding,
     /// World: two conflicting movements given a protected green in the same phase.
     WorldConflictingGreens,
+    /// A vehicle and a pedestrian whose footprints intersect.
+    PedestrianOverlap,
+    /// A vehicle that entered a crosswalk band while a pedestrian was on the crosswalk
+    /// (UVC §11-502(a), §11-202(a)1).
+    OccupiedCrosswalkEntry,
+    /// A pedestrian who stepped onto a signalised crosswalk showing flashing or steady
+    /// don't-walk (UVC §11-203). Expected only when crossing against the signal is
+    /// switched on.
+    PedestrianDontWalkEntry,
 }
 
 impl Check {
     /// Every class, in report order.
-    pub const ALL: [Check; 23] = [
+    pub const ALL: [Check; 26] = [
         Check::Overlap,
         Check::GapBelowMinimum,
         Check::LateralOffset,
@@ -190,6 +221,9 @@ impl Check {
         Check::WorldInternalOutsideJunction,
         Check::WorldLaneInBuilding,
         Check::WorldConflictingGreens,
+        Check::PedestrianOverlap,
+        Check::OccupiedCrosswalkEntry,
+        Check::PedestrianDontWalkEntry,
     ];
 
     /// A stable label.
@@ -218,6 +252,9 @@ impl Check {
             Check::WorldInternalOutsideJunction => "world-internal-outside-junction",
             Check::WorldLaneInBuilding => "world-lane-in-building",
             Check::WorldConflictingGreens => "world-conflicting-greens",
+            Check::PedestrianOverlap => "pedestrian-overlap",
+            Check::OccupiedCrosswalkEntry => "occupied-crosswalk-entry",
+            Check::PedestrianDontWalkEntry => "pedestrian-dont-walk-entry",
         }
     }
 }
@@ -374,6 +411,10 @@ pub struct AuditStats {
     pub mean_speed_mps: f64,
     /// Share of vehicle-steps at a standstill (speed ≤ 0.1 m/s).
     pub stopped_fraction: f64,
+    /// Pedestrian-steps observed ([`TrafficAuditor::observe_with_pedestrians`]).
+    pub pedestrian_steps: u64,
+    /// Of those, pedestrian-steps on a crossing lane: how much crossing the run did.
+    pub pedestrian_crossing_steps: u64,
     /// Sum of speeds, for the mean.
     #[serde(skip)]
     speed_sum: f64,
@@ -415,6 +456,10 @@ pub struct TrafficAuditor {
     flagged_standing: BTreeSet<ActorId>,
     /// Every junction's conflict zones.
     zones: ConflictZones,
+    /// The world's crosswalks and the driven lanes they cut.
+    crosswalks: crate::vru::CrosswalkIndex,
+    /// Every pedestrian at the previous step.
+    prev_peds: Vec<AuditPedestrian>,
 }
 
 impl TrafficAuditor {
@@ -434,6 +479,8 @@ impl TrafficAuditor {
             standing_since: BTreeMap::new(),
             flagged_standing: BTreeSet::new(),
             zones: ConflictZones::build(world),
+            crosswalks: crate::vru::CrosswalkIndex::build(world),
+            prev_peds: Vec::new(),
         }
     }
 
@@ -507,6 +554,33 @@ impl TrafficAuditor {
         self.check_despawns(world, t1, despawned);
 
         self.prev = actors.iter().map(|a| (a.actor, *a)).collect();
+    }
+
+    /// [`TrafficAuditor::observe`], and the vehicle-pedestrian checks: `pedestrians` is
+    /// every pedestrian at `t1`.
+    ///
+    /// The crosswalk check reads each vehicle's front at `t0` and `t1` and the pedestrians
+    /// at `t0` — the state the driver decided on — so a pedestrian who stepped out this
+    /// step is not charged to a driver who could not have seen them.
+    pub fn observe_with_pedestrians(
+        &mut self,
+        world: &World,
+        t0: SimTime,
+        t1: SimTime,
+        actors: &[AuditActor],
+        despawned: &[(ActorId, DespawnCause)],
+        pedestrians: &[AuditPedestrian],
+    ) {
+        self.stats.pedestrian_steps += pedestrians.len() as u64;
+        self.stats.pedestrian_crossing_steps += pedestrians
+            .iter()
+            .filter(|p| world.try_lane(p.lane).map(|l| l.kind) == Some(LaneKind::Crossing))
+            .count() as u64;
+        self.check_pedestrian_overlaps(t1, actors, pedestrians);
+        self.check_crosswalk_entries(world, t1, actors);
+        self.check_pedestrian_signals(world, t0, t1, pedestrians);
+        self.observe(world, t0, t1, actors, despawned);
+        self.prev_peds = pedestrians.to_vec();
     }
 
     /// The report so far.
@@ -615,6 +689,172 @@ impl TrafficAuditor {
                 ),
             );
             self.flag(Check::Overlap, ex);
+        }
+    }
+
+    fn check_pedestrian_overlaps(
+        &mut self,
+        t: SimTime,
+        actors: &[AuditActor],
+        pedestrians: &[AuditPedestrian],
+    ) {
+        if pedestrians.is_empty() {
+            return;
+        }
+        let shrink = self.params.footprint_shrink_m;
+        let cell = 12.0;
+        let key = |x: f64, y: f64| ((x / cell).floor() as i64, (y / cell).floor() as i64);
+        let mut grid: BTreeMap<(i64, i64), Vec<usize>> = BTreeMap::new();
+        for (i, p) in pedestrians.iter().enumerate() {
+            grid.entry(key(p.pos.x, p.pos.y)).or_default().push(i);
+        }
+        let mut found: Vec<(usize, usize, f64)> = Vec::new();
+        for (vi, a) in actors.iter().enumerate() {
+            let body = Obb::of(a, shrink);
+            let (cx, cy) = key(body.centre.0, body.centre.1);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    let Some(list) = grid.get(&(cx + dx, cy + dy)) else {
+                        continue;
+                    };
+                    for &pi in list {
+                        let p = &pedestrians[pi];
+                        if (a.pos.z - p.pos.z).abs() > UNDERGROUND_Z_M {
+                            continue;
+                        }
+                        let (sn, cs) = math::sin_cos(p.heading_rad);
+                        let person = Obb {
+                            centre: (p.pos.x, p.pos.y),
+                            axis: (cs, sn),
+                            half_len: 0.5 * p.length_m,
+                            half_wid: 0.5 * p.width_m,
+                        };
+                        if body.intersects(&person) {
+                            found.push((vi, pi, dist2(body.centre, person.centre)));
+                        }
+                    }
+                }
+            }
+        }
+        found.sort_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+        found.dedup_by(|x, y| x.0 == y.0 && x.1 == y.1);
+        for (vi, pi, d) in found {
+            let (a, p) = (&actors[vi], &pedestrians[pi]);
+            let ex = Self::example(
+                Check::PedestrianOverlap,
+                t,
+                a,
+                Some(p.actor),
+                format!(
+                    "vehicle on lane {}, pedestrian on lane {}, centres {d:.2} m apart",
+                    a.lane.index(),
+                    p.lane.index()
+                ),
+            );
+            self.flag(Check::PedestrianOverlap, ex);
+        }
+    }
+
+    /// A pedestrian who was on a pavement at `t0` and is on a crossing lane at `t1`
+    /// stepped off the kerb this step: the crossing's pedestrian signal at `t0`, the
+    /// instant the decision was taken, must have shown walk.
+    fn check_pedestrian_signals(
+        &mut self,
+        world: &World,
+        t0: SimTime,
+        t1: SimTime,
+        pedestrians: &[AuditPedestrian],
+    ) {
+        let before: BTreeMap<ActorId, LaneId> =
+            self.prev_peds.iter().map(|p| (p.actor, p.lane)).collect();
+        let t_s = ns_to_secs(t0);
+        let mut flagged: Vec<(usize, SignalState)> = Vec::new();
+        for (i, p) in pedestrians.iter().enumerate() {
+            let Some(was) = before.get(&p.actor) else {
+                continue;
+            };
+            if *was == p.lane
+                || world.try_lane(*was).map(|l| l.kind) == Some(LaneKind::Crossing)
+                || world.try_lane(p.lane).map(|l| l.kind) != Some(LaneKind::Crossing)
+            {
+                continue;
+            }
+            let state = world
+                .signals
+                .iter()
+                .find_map(|plan| v2xw_world::walk::crossing_state(plan, p.lane, t_s));
+            if let Some(state) = state
+                && state != SignalState::Green
+            {
+                flagged.push((i, state));
+            }
+        }
+        for (i, state) in flagged {
+            let p = &pedestrians[i];
+            self.flag(
+                Check::PedestrianDontWalkEntry,
+                Example {
+                    check: Check::PedestrianDontWalkEntry,
+                    t_s: ns_to_secs(t1),
+                    actor: Some(p.actor.index()),
+                    other: None,
+                    x_m: p.pos.x,
+                    y_m: p.pos.y,
+                    lane: Some(p.lane.index()),
+                    detail: format!("stepped onto the crossing on {state:?}"),
+                },
+            );
+        }
+    }
+
+    fn check_crosswalk_entries(&mut self, world: &World, t: SimTime, actors: &[AuditActor]) {
+        if self.crosswalks.is_empty() || self.prev_peds.is_empty() {
+            return;
+        }
+        let occupied = self
+            .crosswalks
+            .occupied(self.prev_peds.iter().map(|p| p.lane));
+        if occupied.is_empty() {
+            return;
+        }
+        let mut flagged: Vec<(usize, usize, f64)> = Vec::new();
+        for (i, a) in actors.iter().enumerate() {
+            let Some(before) = self.prev.get(&a.actor) else {
+                continue;
+            };
+            // Where the front was at `t0`, on this step's lane's arc length.
+            let front_before = if before.lane == a.lane
+                || a.changing
+                    .is_some_and(|(from, to)| from == before.lane && to == a.lane)
+            {
+                before.s_m
+            } else {
+                let behind = world
+                    .try_lane(before.lane)
+                    .map_or(0.0, |l| l.length_m - before.s_m);
+                -behind
+            };
+            for c in self.crosswalks.conflicts_on(a.lane) {
+                let edge = c.enter_s();
+                if front_before <= edge && a.s_m > edge && occupied.contains(&c.crosswalk) {
+                    flagged.push((i, c.crosswalk, edge));
+                }
+            }
+        }
+        for (i, k, edge) in flagged {
+            let a = &actors[i];
+            let ex = Self::example(
+                Check::OccupiedCrosswalkEntry,
+                t,
+                a,
+                None,
+                format!(
+                    "crosswalk {k} on lane {} at s = {edge:.2} m, entered at {:.2} m/s",
+                    a.lane.index(),
+                    a.speed_mps
+                ),
+            );
+            self.flag(Check::OccupiedCrosswalkEntry, ex);
         }
     }
 
@@ -1429,6 +1669,10 @@ pub fn audit_world(world: &World) -> Vec<(Check, Example)> {
             continue;
         };
         let row = |l: LaneId| j.internal.iter().position(|x| *x == l);
+        // Each conflicting pair once per plan, at the first phase that has it: a plan whose
+        // phases are split (the pedestrian intervals of `v2xw_world::walk` split them without
+        // changing a vehicle state) would otherwise count one defect once per piece.
+        let mut seen: BTreeSet<(LaneId, LaneId)> = BTreeSet::new();
         for (pi, phase) in plan.phases.iter().enumerate() {
             for (a, sa) in phase.states.iter().enumerate() {
                 for (b, sb) in phase.states.iter().enumerate().skip(a + 1) {
@@ -1452,7 +1696,7 @@ pub fn audit_world(world: &World) -> Vec<(Check, Example)> {
                     let (Some(ra), Some(rb)) = (row(la), row(lb)) else {
                         continue;
                     };
-                    if j.conflicts.is_foe(ra, rb) {
+                    if j.conflicts.is_foe(ra, rb) && seen.insert((la, lb)) {
                         out.push((
                             Check::WorldConflictingGreens,
                             example(
@@ -1519,6 +1763,177 @@ mod tests {
             heading_rad: l.heading_at(rear),
             min_path_radius_m: crate::VehicleClass::Passenger.min_path_radius_m(),
         }
+    }
+
+    /// A 3 x 3 grid with sidewalks, crossings and the pedestrian network.
+    fn walk_grid() -> World {
+        v2xw_world::procedural::grid(
+            &GridParams {
+                sidewalk_m: 2.0,
+                crossings: true,
+                ..GridParams::legacy().with_size(3, 3).with_signals(true)
+            },
+            &ImportOptions::default(),
+        )
+        .expect("grid")
+    }
+
+    fn pedestrian(id: u32, lane: LaneId, s: f64, pos: Vec3) -> AuditPedestrian {
+        AuditPedestrian {
+            actor: ActorId::new(id),
+            lane,
+            s_m: s,
+            pos,
+            heading_rad: 0.0,
+            length_m: 0.5,
+            width_m: 0.5,
+        }
+    }
+
+    #[test]
+    fn a_vehicle_on_a_pedestrian_is_a_pedestrian_overlap() {
+        let world = walk_grid();
+        let lane = straight_lane(&world).id;
+        let sidewalk = world
+            .roads
+            .lanes()
+            .iter()
+            .find(|l| l.kind == LaneKind::Sidewalk)
+            .expect("a sidewalk")
+            .id;
+        let car = at(&world, 0, lane, 20.0, 5.0);
+        let l = world.lane(lane);
+        let mut audit = TrafficAuditor::new(&world, AuditParams::default());
+        // Clean: the pedestrian 4 m to the side of the car's body centre.
+        let beside = l.offset_point(17.75, 4.0);
+        audit.observe_with_pedestrians(
+            &world,
+            0,
+            100_000_000,
+            &[car],
+            &[],
+            &[pedestrian(1, sidewalk, 0.0, beside)],
+        );
+        assert_eq!(audit.report().count(Check::PedestrianOverlap), 0);
+        // Fault: the pedestrian inside the car's footprint.
+        let under = l.offset_point(17.75, 0.3);
+        audit.observe_with_pedestrians(
+            &world,
+            100_000_000,
+            200_000_000,
+            &[at(&world, 0, lane, 20.5, 5.0)],
+            &[],
+            &[pedestrian(1, sidewalk, 0.0, under)],
+        );
+        let r = audit.report();
+        assert_eq!(r.count(Check::PedestrianOverlap), 1, "{r:?}");
+        assert_eq!(r.stats.pedestrian_steps, 2);
+    }
+
+    #[test]
+    fn driving_into_an_occupied_crosswalk_is_flagged_and_an_empty_one_is_not() {
+        let world = walk_grid();
+        let index = crate::vru::CrosswalkIndex::build(&world);
+        // A driven lane with a crosswalk at least 10 m along it.
+        let (lane, conflict) = world
+            .roads
+            .lanes()
+            .iter()
+            .filter(|l| l.kind == LaneKind::Driving)
+            .find_map(|l| {
+                index
+                    .conflicts_on(l.id)
+                    .iter()
+                    .find(|c| c.enter_s() > 10.0)
+                    .map(|c| (l.id, *c))
+            })
+            .expect("a crosswalk on a street lane");
+        let walker_lane = index
+            .crosswalk(conflict.crosswalk)
+            .expect("the crosswalk")
+            .lanes[0];
+        let edge = conflict.enter_s();
+        let on_crossing = pedestrian(7, walker_lane, 1.0, world.lane(walker_lane).point_at(1.0));
+        let run = |with_walker: bool| {
+            let mut audit = TrafficAuditor::new(&world, AuditParams::default());
+            let walkers: Vec<AuditPedestrian> = if with_walker {
+                vec![on_crossing]
+            } else {
+                Vec::new()
+            };
+            // t0: the car's front 0.4 m short of the band, the walker on the crosswalk.
+            audit.observe_with_pedestrians(
+                &world,
+                0,
+                100_000_000,
+                &[at(&world, 0, lane, edge - 0.4, 4.0)],
+                &[],
+                &walkers,
+            );
+            // t1: the front is 0.4 m into the band.
+            audit.observe_with_pedestrians(
+                &world,
+                100_000_000,
+                200_000_000,
+                &[at(&world, 0, lane, edge + 0.4, 4.0)],
+                &[],
+                &walkers,
+            );
+            audit.report()
+        };
+        let r = run(true);
+        assert_eq!(r.count(Check::OccupiedCrosswalkEntry), 1, "{r:?}");
+        assert_eq!(r.stats.pedestrian_crossing_steps, 2);
+        assert_eq!(run(false).count(Check::OccupiedCrosswalkEntry), 0);
+    }
+
+    #[test]
+    fn stepping_onto_a_crosswalk_on_dont_walk_is_flagged_and_on_walk_is_not() {
+        let world = walk_grid();
+        // A signalised crossing lane and the pavement lane that leads onto it.
+        let (plan, crossing) = world
+            .signals
+            .iter()
+            .find_map(|p| {
+                p.controlled
+                    .iter()
+                    .find(|l| world.lane(**l).kind == LaneKind::Crossing)
+                    .map(|l| (p, *l))
+            })
+            .expect("a signalised crossing");
+        let kerb = world
+            .roads
+            .connections()
+            .iter()
+            .find(|c| c.to_lane == crossing)
+            .expect("a pavement leads onto it")
+            .from_lane;
+        let at_state = |want: SignalState| -> SimTime {
+            (0..600u64)
+                .map(|k| k * 100_000_000)
+                .find(|t| {
+                    v2xw_world::walk::crossing_state(plan, crossing, ns_to_secs(*t)) == Some(want)
+                })
+                .expect("the state occurs in the cycle")
+        };
+        let run = |t0: SimTime| {
+            let mut audit = TrafficAuditor::new(&world, AuditParams::default());
+            let on_kerb = pedestrian(3, kerb, 0.0, world.lane(kerb).end());
+            let stepped = pedestrian(3, crossing, 0.2, world.lane(crossing).point_at(0.2));
+            audit.observe_with_pedestrians(
+                &world,
+                t0.saturating_sub(100_000_000),
+                t0,
+                &[],
+                &[],
+                &[on_kerb],
+            );
+            audit.observe_with_pedestrians(&world, t0, t0 + 100_000_000, &[], &[], &[stepped]);
+            audit.report().count(Check::PedestrianDontWalkEntry)
+        };
+        assert_eq!(run(at_state(SignalState::Red)), 1);
+        assert_eq!(run(at_state(SignalState::Amber)), 1);
+        assert_eq!(run(at_state(SignalState::Green)), 0);
     }
 
     #[test]

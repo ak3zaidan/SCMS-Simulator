@@ -80,6 +80,7 @@ use crate::views::{
     LaneChangeDecision, LaneNeighbors, LaneView, LeaderView, MobilityCommand, MobilityUpdate,
     PhaseState, Route, Side, TripRequest, VehicleView,
 };
+use crate::vru::crosswalk::{CrosswalkIndex, VehiclePath};
 use crate::vru::social_force::SocialForce;
 use v2xw_core::rng::{EntityRef, RngDomain};
 
@@ -154,6 +155,11 @@ pub struct VruPopulation {
 
 /// The model id VRU placement draws its streams under.
 const VRU_PLACEMENT_ID: &str = "mobility/vru/population";
+
+/// How far apart two connectors from one approach lane must be before a cyclist on one no
+/// longer occupies the other, metres: half a truck (2.6 m) plus half a bicycle (0.65 m)
+/// plus a margin, rounded up.
+const DIVERGED_M: f64 = 2.5;
 
 /// How many walkable lanes a pedestrian's walk strings together at most.
 const PEDESTRIAN_WALK_LANES: usize = 12;
@@ -230,6 +236,10 @@ pub struct EngineParams {
     /// movement, and does not enter a junction whose exit has no room for it. Not applied
     /// in the legacy parity mode. See [`crate::intersection::zones`].
     pub junction_clearance: bool,
+    /// Whether vehicles yield to pedestrians on a crosswalk and keep out of a crosswalk
+    /// they could not clear (`crate::vru::crosswalk`). On by default; off is the control
+    /// run that proves the auditor's crosswalk checks can fail.
+    pub crosswalk_yield: bool,
     /// **A test hook, not a model parameter.** Walks the decision pass in reverse actor
     /// order. Because the pass reads only the frozen snapshot, the published result must be
     /// bit-identical either way; that is the ADR 0004 Jacobi property, and this is how the
@@ -251,6 +261,7 @@ impl Default for EngineParams {
             no_change_zone_m: DEFAULT_NO_CHANGE_ZONE_M,
             turn_lateral_accel_mps2: DEFAULT_TURN_LATERAL_ACCEL_MPS2,
             junction_clearance: true,
+            crosswalk_yield: true,
             reverse_order: false,
         }
     }
@@ -310,6 +321,19 @@ struct Actor {
 }
 
 impl Actor {
+    /// Where the vehicle is, as the crosswalk rules read it.
+    fn crosswalk_path(&self) -> VehiclePath<'_> {
+        VehiclePath {
+            route: &self.route.lanes,
+            route_index: self.route_index,
+            lane: self.lane,
+            s_m: self.s_m,
+            prev_lane: self.trail.last().copied(),
+            length_m: self.class.spec().length_m,
+            speed_mps: self.speed_mps,
+        }
+    }
+
     fn view(&self, world: &World) -> VehicleView {
         let lane = world.lane(self.lane);
         VehicleView {
@@ -518,6 +542,12 @@ pub struct NativeMobility {
     /// The walkable lanes, and the lanes a bicycle may use, in id order (from `init`).
     walkable: Vec<LaneId>,
     bike_lanes: Vec<LaneId>,
+    /// The world's crosswalks, for the yield rule and the pedestrians' kerb decision
+    /// (`crate::vru::crosswalk`). Built in `init`.
+    crosswalks: CrosswalkIndex,
+    /// Each junction connector's siblings from the same approach lane, and where they
+    /// part (`diverging_connectors`). Built in `init`.
+    diverging: BTreeMap<LaneId, Vec<(LaneId, f64)>>,
     vru: Option<SocialForce>,
     clock: Option<Box<dyn ClockModel>>,
     actors: BTreeMap<ActorId, Actor>,
@@ -619,6 +649,8 @@ impl NativeMobility {
             vru_population: VruPopulation::default(),
             walkable: Vec::new(),
             bike_lanes: Vec::new(),
+            crosswalks: CrosswalkIndex::default(),
+            diverging: BTreeMap::new(),
             vru: None,
             clock: None,
             actors: BTreeMap::new(),
@@ -753,6 +785,29 @@ impl NativeMobility {
                     pos: k.pos,
                     heading_rad: k.heading_rad,
                     min_path_radius_m: a.class.min_path_radius_m(),
+                }
+            })
+            .collect()
+    }
+
+    /// Every pedestrian as the traffic auditor reads it, in actor-id order.
+    pub fn audit_pedestrians(&self, world: &World) -> Vec<crate::audit::AuditPedestrian> {
+        let Some(vru) = self.vru.as_ref() else {
+            return Vec::new();
+        };
+        let dims = VehicleClass::Pedestrian.dims();
+        vru.people()
+            .filter(|p| !p.arrived)
+            .map(|p| {
+                let k = self.published.get(&p.actor);
+                crate::audit::AuditPedestrian {
+                    actor: p.actor,
+                    lane: p.lane,
+                    s_m: p.s_m,
+                    pos: k.map_or_else(|| p.position(world), |k| k.pos),
+                    heading_rad: k.map_or(0.0, |k| k.heading_rad),
+                    length_m: dims.length_m,
+                    width_m: dims.width_m,
                 }
             })
             .collect()
@@ -1243,9 +1298,66 @@ impl NativeMobility {
                     snapshot.push_ghost(tr.from, a.s_m + tr.from_s_delta, a.id);
                 }
             }
+            // A cyclist on a junction connector still occupies the start of every sibling
+            // connector leaving the same approach lane, until the two paths are apart: a
+            // car turning right from behind a cyclist going straight on would otherwise
+            // not see it, because the cyclist is not on the car's route — and a bicycle
+            // accelerates and cruises slower than the car behind, so the car drove into
+            // it where the connectors diverge (the pedestrian_invariants gate measured
+            // it). Registering every class this way is the general fix; it is limited to
+            // bicycles so that motor traffic, which the auditor holds at zero overlaps
+            // without it, keeps its calibrated behaviour and its golden records.
+            for a in self
+                .actors
+                .values()
+                .filter(|a| a.class == VehicleClass::Bicycle)
+            {
+                let Some(siblings) = self.diverging.get(&a.lane) else {
+                    continue;
+                };
+                let rear = a.s_m - a.class.spec().length_m;
+                for (sibling, apart_s) in siblings {
+                    if rear < *apart_s {
+                        snapshot.push_ghost(*sibling, a.s_m, a.id);
+                    }
+                }
+            }
             snapshot.sort();
         }
         snapshot
+    }
+
+    /// For every junction connector, the other connectors that leave the same approach
+    /// lane, each with the arc length beyond which the two centrelines are at least
+    /// [`DIVERGED_M`] apart.
+    fn diverging_connectors(world: &World) -> BTreeMap<LaneId, Vec<(LaneId, f64)>> {
+        let mut by_approach: BTreeMap<LaneId, Vec<LaneId>> = BTreeMap::new();
+        for c in world.roads.connections() {
+            if let Some(via) = c.via {
+                let v = by_approach.entry(c.from_lane).or_default();
+                if !v.contains(&via) {
+                    v.push(via);
+                }
+            }
+        }
+        let mut out: BTreeMap<LaneId, Vec<(LaneId, f64)>> = BTreeMap::new();
+        for connectors in by_approach.values() {
+            for a in connectors {
+                for b in connectors {
+                    if a == b {
+                        continue;
+                    }
+                    let (la, lb) = (world.lane(*a), world.lane(*b));
+                    let end = la.length_m.min(lb.length_m);
+                    let mut s = 0.0;
+                    while s < end && la.point_at(s).distance_2d(lb.point_at(s)) < DIVERGED_M {
+                        s += 0.5;
+                    }
+                    out.entry(*a).or_default().push((*b, s.min(end)));
+                }
+            }
+        }
+        out
     }
 
     /// Pass 4: every signal plan's state at `t`.
@@ -2060,13 +2172,17 @@ impl Mobility for NativeMobility {
                 self.turn_speed = turn_speeds(world, self.params.turn_lateral_accel_mps2);
             }
         }
+        // Where a pedestrian may be placed: a pavement, never a crosswalk — putting someone
+        // down in the carriageway in front of a car is not a spawn, it is a collision.
         self.walkable = world
             .roads
             .lanes()
             .iter()
-            .filter(|l| SocialForce::is_walkable(world, l.id))
+            .filter(|l| SocialForce::is_walkable(world, l.id) && l.kind == LaneKind::Sidewalk)
             .map(|l| l.id)
             .collect();
+        self.crosswalks = CrosswalkIndex::build(world);
+        self.diverging = Self::diverging_connectors(world);
         self.bike_lanes = world
             .roads
             .lanes()
@@ -2155,6 +2271,12 @@ impl Mobility for NativeMobility {
         // --- pass 5: claims ------------------------------------------------
         let claims = self.claims(world, &snapshot, t0);
         let occupancy = self.occupancy(world);
+        // The crosswalks someone is walking on, from the start-of-step positions.
+        let crosswalks_in_use = self.crosswalks.occupied(
+            self.vru
+                .iter()
+                .flat_map(|v| v.people().filter(|p| !p.arrived).map(|p| p.lane)),
+        );
 
         // --- pass 6: decide -------------------------------------------------
         // Every input is the frozen snapshot; every output is buffered. The iteration order
@@ -2300,6 +2422,25 @@ impl Mobility for NativeMobility {
                 );
                 if leader != before {
                     binding_stop_line = None;
+                }
+            }
+            // Crosswalks: yield to anyone on one, and do not stop inside one
+            // (`crate::vru::crosswalk`, UVC §11-502(a), §11-202(a)1, §11-1003).
+            if along && self.params.crosswalk_yield && !self.crosswalks.is_empty() {
+                let path = actor.crosswalk_path();
+                let bands = self.crosswalks.ahead(world, &path);
+                if let Some(gap) = self.crosswalks.stop_gap(
+                    &bands,
+                    &crosswalks_in_use,
+                    &path,
+                    leader.map(|l| (l.gap_m, l.speed_mps)),
+                    actor.driver.min_gap_m,
+                ) {
+                    let before = leader;
+                    leader = Self::closest(leader, Some(LeaderView::virtual_obstacle(gap, 0.0)));
+                    if leader != before {
+                        binding_stop_line = None;
+                    }
                 }
             }
             // An external stop command is a virtual leader at zero gap.
@@ -2631,8 +2772,19 @@ impl Mobility for NativeMobility {
             .map(|a| (a.id, a.kinematics(world, t1, along)))
             .collect();
 
-        // VRUs read the same frozen snapshot the vehicles did.
+        // VRUs read the same frozen snapshot the vehicles did, and each crossing's permit:
+        // its pedestrian signal at the step's start, and whether a vehicle — where it is
+        // now, having moved this step — is on the crosswalk or too close to yield.
         if let Some(mut vru) = self.vru.take() {
+            if !self.crosswalks.is_empty() {
+                let mut hazards = std::collections::BTreeSet::new();
+                for a in self.actors.values() {
+                    let bands = self.crosswalks.ahead(world, &a.crosswalk_path());
+                    self.crosswalks
+                        .hazards_from(&bands, a.speed_mps, &mut hazards);
+                }
+                vru.set_crossing_permits(self.crosswalks.permits(&signal_states, &hazards));
+            }
             let mut people = vru.step(ctx, dt, &snapshot);
             states.append(&mut people);
             self.vru = Some(vru);

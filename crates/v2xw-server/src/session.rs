@@ -784,6 +784,24 @@ impl Session {
         if !out.recorded.is_empty() {
             return self.forward_recorded(out);
         }
+        // A step the greeting already covered. The greeting encodes the run's state at the
+        // instant it is sent, and the kernel can be a step or more past what this
+        // connection's step channel has yet delivered; the queued older steps then reach
+        // the encoder after a newer snapshot, which it rightly refuses as time going
+        // backwards. Refusing it here used to close the socket with 1011 — and every
+        // reconnect raced the same way, so a heavy run (Manhattan with 230 pedestrians and
+        // cyclists) never streamed. The state those steps carried is in the greeting.
+        // Only within this connection's own run: a step from a *new* run (a later generation)
+        // against this encoder is the regreet's business, and must still fail loudly rather
+        // than be skipped until its clock passes the old run's.
+        if out.generation == self.generation()
+            && self
+                .encoder
+                .last_time()
+                .is_some_and(|prev| out.snapshot.sim_time <= prev)
+        {
+            return Ok(effects);
+        }
         if self.resync_pending {
             self.encoder.request_keyframe();
         }

@@ -238,14 +238,8 @@ fn a_key_the_engine_cannot_act_on_is_refused_and_names_itself() {
                 s.radio.rat = v2xw_engine::scenario::schema::Rat::Hybrid;
             }),
         ),
-        // Pedestrians and cyclists now walk and ride; what the kernel still cannot host is
-        // their device, so that is the one field refused.
-        (
-            "actors.vru.device_fraction",
-            Box::new(|s: &mut Scenario| {
-                s.actors.vru.device_fraction = 0.5;
-            }),
-        ),
+        // `actors.vru.device_fraction` used to be here; the node phase hosts VRU devices
+        // now, and `vru::equipped_pedestrians_send_psms_that_other_nodes_hear` is its test.
         (
             "actors.vehicles.demand.kind",
             Box::new(|s: &mut Scenario| {

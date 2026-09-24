@@ -150,6 +150,43 @@ fn the_first_canonical_frame_after_a_fresh_hello_is_a_resync_keyframe() {
     assert_eq!(header.seq, 0, "the stream starts at seq 0");
 }
 
+/// A step older than one the connection has already encoded — the greeting's snapshot of a
+/// kernel that had run ahead of the step channel — is skipped, not refused. Refusing it
+/// closed the socket with 1011, and every reconnect raced the same way: Manhattan with 230
+/// pedestrians and cyclists never streamed in the page.
+#[test]
+fn a_step_the_greeting_already_covered_is_skipped_not_fatal() {
+    let mut engine = engine();
+    let d = engine.descriptor().clone();
+    let mut session = Session::new(ConnectParams::default(), &d);
+    session
+        .hello_frame(&d, RunState::Running, 0, "")
+        .expect("hello");
+    let first = engine.step().expect("step").expect("a step");
+    let second = engine.step().expect("step").expect("a step");
+    assert!(
+        !session
+            .encode_step(&second)
+            .expect("encode")
+            .frames
+            .is_empty()
+    );
+    // The older step arrives after the newer one.
+    let late = session
+        .encode_step(&first)
+        .expect("a late step is not an error");
+    assert!(late.frames.is_empty(), "nothing is sent for a covered step");
+    // And the stream carries on.
+    let third = engine.step().expect("step").expect("a step");
+    assert!(
+        !session
+            .encode_step(&third)
+            .expect("encode")
+            .frames
+            .is_empty()
+    );
+}
+
 #[test]
 fn seq_is_dense_and_monotonic_across_every_canonical_frame() {
     // Conformance H4. Telemetry and events are subscribed so that the stream carries more

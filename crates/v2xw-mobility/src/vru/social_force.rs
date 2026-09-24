@@ -69,6 +69,8 @@ use crate::ctx::MobCtx;
 use crate::error::{MobError, Result};
 use crate::snapshot::ActorSnapshot;
 use crate::traits::VruMobility;
+use crate::vru::crosswalk::CrossingPermit;
+use v2xw_world::SignalState;
 
 /// The model id.
 pub const MODEL_ID: &str = "vru/pedestrian/social-force";
@@ -78,6 +80,9 @@ pub const MODEL_VERSION: &str = "1.0.0";
 
 /// The vehicle-side blocking threshold, metres (SUMO `jmCrossingGap`, R10 §B13).
 pub const CROSSING_GAP_M: f64 = 10.0;
+
+/// The stream a pedestrian's decision to cross against the signal is drawn from.
+pub const JAYWALK_ID: &str = "vru/pedestrian/jaywalk";
 
 /// The model's parameters (§2.5).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -111,8 +116,23 @@ pub struct SocialForceParams {
     /// the potentials are exponential with a decay length of 0.3 m, so the force beyond a
     /// few metres is numerically zero, and this is where the query stops paying for it.
     pub interaction_radius_m: f64,
-    /// The vehicle-side blocking threshold on a crossing, metres.
+    /// SUMO's vehicle-side blocking threshold on a crossing, metres. **Superseded**: the
+    /// kerb decision is now the kinematic test of [`crate::vru::crosswalk`] (can the
+    /// approaching vehicle still stop?), which is what UVC §11-502(b) states. Kept so a
+    /// parameter file that sets it still loads, and on the card as the SUMO reference.
     pub crossing_gap_m: f64,
+    /// The probability that a pedestrian at the kerb facing a don't-walk crosses anyway,
+    /// when no vehicle makes it a hazard. **Off (zero) by default.** Drawn once per
+    /// pedestrian per crosswalk it waits at. This is crossing against the signal at a
+    /// crosswalk; crossing mid-block, away from any crosswalk, is not modelled.
+    pub jaywalk_probability: f64,
+    /// How long a pedestrian waits at one kerb before giving up the walk, seconds. Not a
+    /// cited value: a bound that keeps a pedestrian from waiting forever at a crosswalk
+    /// that never shows walk (two 60 s cycles).
+    pub max_wait_s: f64,
+    /// How far back from the end of the pavement lane a waiting pedestrian stands,
+    /// metres: the kerb edge.
+    pub kerb_margin_m: f64,
     /// Standard deviation of the fluctuation acceleration, m/s². **`TODO: calibrate`** —
     /// zero by default.
     pub fluctuation_mps2: f64,
@@ -136,6 +156,9 @@ impl Default for SocialForceParams {
             interaction_radius_m: 10.0,
             crossing_gap_m: CROSSING_GAP_M,
             fluctuation_mps2: 0.0,
+            jaywalk_probability: 0.0,
+            max_wait_s: 120.0,
+            kerb_margin_m: 0.3,
         }
     }
 }
@@ -161,6 +184,10 @@ pub struct Pedestrian {
     pub route_index: usize,
     /// True once it has walked off the end of its route.
     pub arrived: bool,
+    /// Since when it has been standing at a kerb, waiting to cross.
+    pub waiting_since: Option<v2xw_core::time::SimTime>,
+    /// Its decision to cross against the signal at one crossing lane, once drawn.
+    pub against_signal: Option<(LaneId, bool)>,
 }
 
 impl Pedestrian {
@@ -179,6 +206,11 @@ pub struct SocialForce {
     params: SocialForceParams,
     people: BTreeMap<ActorId, Pedestrian>,
     card: ModelCard,
+    /// Whether each crossing lane may be stepped onto now: its pedestrian signal and
+    /// whether a vehicle makes it a hazard. Set by the engine before each step
+    /// ([`SocialForce::set_crossing_permits`]); a crossing lane with no entry has no signal
+    /// and no hazard.
+    permits: BTreeMap<LaneId, CrossingPermit>,
 }
 
 impl Default for SocialForce {
@@ -194,12 +226,19 @@ impl SocialForce {
             card: card(&params),
             params,
             people: BTreeMap::new(),
+            permits: BTreeMap::new(),
         }
     }
 
     /// The parameters in force.
     pub fn params(&self) -> &SocialForceParams {
         &self.params
+    }
+
+    /// Hands the model this step's crossing permits (from
+    /// [`crate::vru::crosswalk::CrosswalkIndex::permits`]).
+    pub fn set_crossing_permits(&mut self, permits: BTreeMap<LaneId, CrossingPermit>) {
+        self.permits = permits;
     }
 
     /// True if `lane` is somewhere a pedestrian may walk.
@@ -262,6 +301,8 @@ impl SocialForce {
                 route,
                 route_index: 0,
                 arrived: false,
+                waiting_since: None,
+                against_signal: None,
             },
         );
         Ok(())
@@ -379,6 +420,11 @@ impl VruMobility for SocialForce {
             return Vec::new();
         }
         let now = ctx.now();
+        // The state this step computes is the state at the step's *end*, as a vehicle's
+        // is: stamping it at the start filed every pedestrian's `gt.kinematics` one step
+        // behind the vehicles', and a consumer that groups records by step (the live
+        // server does) saw each step's actor set split in two and lost the pedestrians.
+        let t_end = dt.after(now);
         // The start-of-step positions of every pedestrian: the same Jacobi discipline the
         // vehicles use, so one pedestrian's move cannot depend on another's having moved.
         let frozen: Vec<(ActorId, Vec3, Vec3)> = {
@@ -398,12 +444,22 @@ impl VruMobility for SocialForce {
             } else {
                 Vec3::ZERO
             };
+            // One draw per step whether or not it is used, so a decision does not depend
+            // on how many steps other pedestrians spent at a kerb. Only drawn at all when
+            // crossing against the signal is switched on, so the default run's streams are
+            // untouched.
+            let jaywalk_draw = if self.params.jaywalk_probability > 0.0 {
+                ctx.rng(RngDomain::plugin(JAYWALK_ID), EntityRef::Actor(actor))
+                    .uniform(0.0, 1.0)
+            } else {
+                1.0
+            };
             let world = ctx.world();
             let Some(person) = self.people.get(&actor) else {
                 continue;
             };
             if person.arrived {
-                out.push((actor, self.kinematics_of(person, world, now)));
+                out.push((actor, self.kinematics_of(person, world, t_end)));
                 continue;
             }
             let Some(lane) = world.try_lane(person.lane) else {
@@ -414,18 +470,41 @@ impl VruMobility for SocialForce {
             let (sin_h, cos_h) = math::sin_cos(heading);
             let forward = Vec3::new_2d(cos_h, sin_h);
 
-            // --- the desired-direction term -------------------------------
-            // A pedestrian waiting at a kerb has a desired speed of zero: the crossing is
-            // blocked while a vehicle is within `crossing_gap_m` of it.
-            let blocked = lane.kind == LaneKind::Crossing
-                || self.next_lane(person).is_some_and(|next| {
-                    world
-                        .try_lane(next)
-                        .is_some_and(|l| l.kind == LaneKind::Crossing)
-                });
-            let waiting = blocked && self.vehicle_within(vehicles, position);
-            let desired_speed = if waiting {
-                0.0
+            // --- the kerb ----------------------------------------------------
+            // A pedestrian whose next lane is a crossing steps onto it only on walk (or
+            // at an unsignalised crosswalk) and only when no vehicle is on it or too close
+            // to yield (UVC §11-502(b), §11-203): the permit says both. One already on a
+            // crossing always walks on — stopping in the carriageway is what a pedestrian
+            // caught by a change to don't-walk does not do.
+            let next = self.next_lane(person);
+            let mut against = person.against_signal;
+            let hold = match next {
+                Some(n)
+                    if lane.kind != LaneKind::Crossing
+                        && world
+                            .try_lane(n)
+                            .is_some_and(|l| l.kind == LaneKind::Crossing) =>
+                {
+                    let permit = self.permits.get(&n).copied().unwrap_or_default();
+                    let signal_ok = match permit.signal {
+                        None | Some(SignalState::Green) | Some(SignalState::Off) => true,
+                        Some(_) => match against {
+                            Some((l, d)) if l == n => d,
+                            _ => {
+                                let d = jaywalk_draw < self.params.jaywalk_probability;
+                                against = Some((n, d));
+                                d
+                            }
+                        },
+                    };
+                    permit.hazard || !signal_ok
+                }
+                _ => false,
+            };
+            let to_kerb = lane.length_m - self.params.kerb_margin_m - person.s_m;
+            // Slowing into the kerb over the last two metres rather than stopping on it.
+            let desired_speed = if hold {
+                person.desired_speed_mps * (to_kerb / 2.0).clamp(0.0, 1.0)
             } else {
                 person.desired_speed_mps
             };
@@ -496,6 +575,19 @@ impl VruMobility for SocialForce {
             // --- put it back on its lane -----------------------------------
             let projection = lane.project_point(moved);
             let mut s_m = projection.s_m;
+            let kerb = (lane.length_m - self.params.kerb_margin_m).max(0.0);
+            if hold && s_m > kerb {
+                // Standing at the kerb: no further along the pavement, and no velocity
+                // carrying it into the road.
+                s_m = kerb.max(person.s_m.min(kerb));
+                let along = velocity.x * forward.x + velocity.y * forward.y;
+                if along > 0.0 {
+                    velocity = Vec3::new_2d(
+                        velocity.x - along * forward.x,
+                        velocity.y - along * forward.y,
+                    );
+                }
+            }
             let mut lateral_m = projection.d_m.clamp(-walkable_half, walkable_half);
             let mut current = person.lane;
             let mut route_index = person.route_index;
@@ -517,16 +609,29 @@ impl VruMobility for SocialForce {
             } else if s_m < 0.0 {
                 s_m = 0.0;
             }
+            // Waiting: counted from the first step it stood at the kerb; a pedestrian who
+            // has waited `max_wait_s` gives the walk up (and is replaced).
+            let at_kerb = hold && s_m >= kerb - 0.5;
+            let waiting_since = if at_kerb {
+                Some(person.waiting_since.unwrap_or(now))
+            } else {
+                None
+            };
+            let gave_up = waiting_since.is_some_and(|since| {
+                Duration::between(since, now).as_secs_f64() >= self.params.max_wait_s
+            });
             let person = self.people.get_mut(&actor).expect("present above");
             person.lane = current;
             person.s_m = s_m;
             person.lateral_m = lateral_m;
             person.vel = velocity;
             person.route_index = route_index;
-            person.arrived = arrived;
+            person.arrived = arrived || gave_up;
+            person.waiting_since = waiting_since;
+            person.against_signal = against;
             let person = &self.people[&actor];
             let world = ctx.world();
-            out.push((actor, self.kinematics_of(person, world, now)));
+            out.push((actor, self.kinematics_of(person, world, t_end)));
         }
         out.sort_by_key(|(a, _)| *a);
         out
@@ -537,13 +642,6 @@ impl SocialForce {
     /// The lane after the pedestrian's current one, if its route continues.
     fn next_lane(&self, person: &Pedestrian) -> Option<LaneId> {
         person.route.get(person.route_index + 1).copied()
-    }
-
-    /// True if a vehicle is within the blocking threshold of `position`.
-    fn vehicle_within(&self, vehicles: &ActorSnapshot, position: Vec3) -> bool {
-        !vehicles
-            .actors_within(position, self.params.crossing_gap_m)
-            .is_empty()
     }
 
     /// The published kinematics of one pedestrian.
@@ -709,6 +807,35 @@ pub fn card(params: &SocialForceParams) -> ModelCard {
             helbing.clone(),
         ),
         Parameter::new(
+            "jaywalk_probability",
+            "1",
+            serde_json::json!(params.jaywalk_probability),
+            Source::new(
+                SourceKind::Code,
+                "a switch, off by default: no calibrated rate of crossing against the \
+                 signal is cited, so none is assumed",
+            ),
+        ),
+        Parameter::new(
+            "max_wait_s",
+            "s",
+            serde_json::json!(params.max_wait_s),
+            Source::new(
+                SourceKind::Code,
+                "an engineering bound, two 60 s cycles, so a pedestrian at a crosswalk \
+                 that never shows walk does not wait forever; not a behavioural value",
+            ),
+        ),
+        Parameter::new(
+            "kerb_margin",
+            "m",
+            serde_json::json!(params.kerb_margin_m),
+            Source::new(
+                SourceKind::Code,
+                "where a waiting pedestrian stands, back from the end of the pavement lane",
+            ),
+        ),
+        Parameter::new(
             "interaction_radius",
             "m",
             serde_json::json!(params.interaction_radius_m),
@@ -744,9 +871,15 @@ pub fn card(params: &SocialForceParams) -> ModelCard {
          kerb; the clamp makes \"pedestrians stay on walkable lanes\" an invariant rather \
          than a tendency."
             .to_string(),
-        "A pedestrian on or about to enter a crossing waits while any vehicle is within \
-         the crossing gap; the wait is expressed as a desired speed of zero, so the \
-         relaxation term brings it smoothly to a halt."
+        "A pedestrian about to step onto a crossing waits at the kerb unless its \
+         pedestrian signal shows walk (or it has none) and no vehicle is on the crosswalk \
+         or too close to yield (UVC §11-502(b), §11-203; the kinematic test of \
+         vru::crosswalk). One already on a crossing walks on. The wait is a desired speed \
+         that falls to zero over the last 2 m, and the kerb is a hard stop."
+            .to_string(),
+        "Crossing against the signal (`jaywalk_probability`) is off by default. It is \
+         drawn once per pedestrian per crosswalk and still requires no vehicle hazard; \
+         mid-block crossing away from a crosswalk is not modelled."
             .to_string(),
         "Every pedestrian reads the start-of-step positions of the others and of the \
          vehicles, so the update is the same Jacobi update the vehicles use."
@@ -769,6 +902,7 @@ pub fn card(params: &SocialForceParams) -> ModelCard {
         rng_domains: vec![
             RngDomain::DesiredSpeed.as_str().to_string(),
             RngDomain::plugin(MODEL_ID).as_str().to_string(),
+            RngDomain::plugin(JAYWALK_ID).as_str().to_string(),
         ],
     };
     card.validation = Validation {
@@ -975,75 +1109,183 @@ mod tests {
         assert_eq!(m.view_weight(facing, Vec3::new_2d(-1.0, 0.0)), 0.5);
     }
 
-    #[test]
-    fn a_pedestrian_waits_for_a_vehicle_at_a_crossing() {
-        // A crossing lane and a vehicle within the crossing gap: the pedestrian's desired
-        // speed goes to zero and it slows to a halt.
-        let base = ring(&RingParams {
-            circumference_m: 200.0,
-            segments: 4,
-            lane_width_m: 4.0,
-            ..RingParams::default()
-        })
-        .expect("a ring");
+    /// A pavement ring whose second quarter is a crossing: a pedestrian walking the first
+    /// quarter meets a kerb at its end.
+    fn kerb_ring() -> (World, Vec<LaneId>) {
+        let (base, cycle) = pavement_ring();
+        let crossing = cycle[1];
         let w = crate::worlds::rebuild(&base, |lanes, _| {
-            for lane in lanes.iter_mut() {
-                lane.kind = LaneKind::Crossing;
-                lane.allowed = ClassMask::PEDESTRIAN;
-            }
+            lanes[crossing.as_usize()].kind = LaneKind::Crossing;
         })
-        .expect("a crossing ring");
-        let cycle = crate::worlds::ring_cycle(&w, 0);
+        .expect("a ring with a crossing");
+        (w, cycle)
+    }
+
+    /// Walks one pedestrian from 90 m along the first quarter for `steps` steps under a
+    /// fixed permit for the crossing; returns the model.
+    fn walk_to_kerb(
+        params: SocialForceParams,
+        permit: CrossingPermit,
+        start_s: f64,
+        on: usize,
+        steps: u64,
+    ) -> (SocialForce, World, Vec<LaneId>) {
+        let (w, cycle) = kerb_ring();
         let rng = RngRegistry::new(5);
-        let mut m = SocialForce::default();
+        let mut m = SocialForce::new(params);
         {
             let mut ctx = MobilityCtx::new(0, &w, &rng);
-            m.spawn(&mut ctx, ActorId::new(1), cycle, 2.0)
+            m.spawn(&mut ctx, ActorId::new(1), cycle[on..].to_vec(), start_s)
                 .expect("spawned");
         }
-        // Get it walking first, with no vehicle about.
+        m.set_crossing_permits([(cycle[1], permit)].into_iter().collect());
         let empty = ActorSnapshot::new(0, 50.0);
         let dt = Duration::from_millis(100);
-        for k in 0..30u64 {
+        for k in 0..steps {
             let mut ctx = MobilityCtx::new(k * 100 * NS_PER_MS, &w, &rng);
             m.step(&mut ctx, dt, &empty);
         }
-        let walking = m.get(ActorId::new(1)).unwrap().vel.norm_2d();
-        assert!(walking > 0.5, "it was walking: {walking}");
-        // Now put a vehicle five metres away.
-        let position = m.get(ActorId::new(1)).unwrap().position(&w);
-        let mut snapshot = ActorSnapshot::new(0, 50.0);
-        let vehicle = crate::views::VehicleView {
-            actor: ActorId::new(99),
-            class: VehicleClass::Passenger,
-            lane: cycle_first(&w),
-            lane_index: 0,
-            s_m: 0.0,
-            lateral_m: 0.0,
-            speed_mps: 0.0,
-            accel_mps2: 0.0,
-            heading_rad: 0.0,
-            dims: VehicleClass::Passenger.dims(),
-            driver: crate::carfollowing::IdmPreset::Kesting2010.profile(VehicleClass::Passenger),
-        };
-        snapshot.push(
-            vehicle,
-            Kinematics::at_rest(0, Vec3::new(position.x + 5.0, position.y, 0.0)),
-        );
-        snapshot.sort();
-        for k in 30..60u64 {
-            let mut ctx = MobilityCtx::new(k * 100 * NS_PER_MS, &w, &rng);
-            m.step(&mut ctx, dt, &snapshot);
-        }
-        let waiting = m.get(ActorId::new(1)).unwrap().vel.norm_2d();
-        assert!(
-            waiting < walking / 2.0,
-            "it should slow: {waiting} from {walking}"
-        );
+        (m, w, cycle)
     }
 
-    fn cycle_first(w: &World) -> LaneId {
-        w.roads.lanes()[0].id
+    /// UVC §11-502(b) and §11-203: a pedestrian does not step off the kerb onto a crossing
+    /// while a vehicle makes it a hazard, nor on flashing or steady don't-walk; it stands
+    /// at the kerb, on the pavement, until the crossing is permitted.
+    #[test]
+    fn a_pedestrian_holds_at_the_kerb_until_the_crossing_is_permitted() {
+        for permit in [
+            CrossingPermit {
+                signal: None,
+                hazard: true,
+            },
+            CrossingPermit {
+                signal: Some(SignalState::Green),
+                hazard: true,
+            },
+            CrossingPermit {
+                signal: Some(SignalState::Red),
+                hazard: false,
+            },
+            CrossingPermit {
+                signal: Some(SignalState::Amber),
+                hazard: false,
+            },
+        ] {
+            let (m, w, cycle) = walk_to_kerb(SocialForceParams::default(), permit, 90.0, 0, 200);
+            let p = m.get(ActorId::new(1)).unwrap();
+            assert_eq!(p.lane, cycle[0], "{permit:?}: it stepped onto the crossing");
+            let kerb = w.lane(cycle[0]).length_m - SocialForceParams::default().kerb_margin_m;
+            assert!(
+                p.s_m <= kerb + 1e-9,
+                "{permit:?}: past the kerb at {}",
+                p.s_m
+            );
+            assert!(p.s_m > kerb - 1.0, "{permit:?}: it did not reach the kerb");
+            assert!(p.vel.norm_2d() < 0.05, "{permit:?}: still moving");
+            assert!(p.waiting_since.is_some());
+        }
+        // Walk, no vehicle: it crosses.
+        let (m, _, cycle) = walk_to_kerb(
+            SocialForceParams::default(),
+            CrossingPermit {
+                signal: Some(SignalState::Green),
+                hazard: false,
+            },
+            90.0,
+            0,
+            200,
+        );
+        assert_ne!(m.get(ActorId::new(1)).unwrap().lane, cycle[0]);
+    }
+
+    /// A pedestrian already on a crossing walks on whatever the permit says: stopping in
+    /// the carriageway is not what the kerb rule asks. (This replaces a test that had a
+    /// pedestrian *on* a crossing slow down when a vehicle came within 10 m, which left
+    /// pedestrians standing in the road.)
+    #[test]
+    fn a_pedestrian_on_a_crossing_walks_on() {
+        let (m, _, cycle) = walk_to_kerb(
+            SocialForceParams::default(),
+            CrossingPermit {
+                signal: Some(SignalState::Red),
+                hazard: true,
+            },
+            2.0,
+            1,
+            30,
+        );
+        let p = m.get(ActorId::new(1)).unwrap();
+        assert_eq!(p.lane, cycle[1]);
+        assert!(p.s_m > 4.0, "it stopped on the crossing at {}", p.s_m);
+        assert!(p.vel.norm_2d() > 0.8 * p.desired_speed_mps);
+    }
+
+    /// Crossing against the signal is a parameter, off by default; switched fully on, a
+    /// pedestrian crosses on don't-walk — but never into a vehicle hazard.
+    #[test]
+    fn crossing_against_the_signal_is_a_switch_that_never_overrides_a_hazard() {
+        let reckless = SocialForceParams {
+            jaywalk_probability: 1.0,
+            ..SocialForceParams::default()
+        };
+        let red = CrossingPermit {
+            signal: Some(SignalState::Red),
+            hazard: false,
+        };
+        let (m, _, cycle) = walk_to_kerb(reckless, red, 90.0, 0, 200);
+        assert_ne!(m.get(ActorId::new(1)).unwrap().lane, cycle[0]);
+        let (m, _, cycle) = walk_to_kerb(
+            reckless,
+            CrossingPermit {
+                signal: Some(SignalState::Red),
+                hazard: true,
+            },
+            90.0,
+            0,
+            200,
+        );
+        assert_eq!(m.get(ActorId::new(1)).unwrap().lane, cycle[0]);
+        // The default does not cross on red.
+        assert_eq!(SocialForceParams::default().jaywalk_probability, 0.0);
+    }
+
+    /// The state a step publishes is the state at the step's end, as a vehicle's is: the
+    /// engine files `gt.kinematics` at the state's own instant, and a pedestrian stamped at
+    /// the step's start landed one step behind every vehicle.
+    #[test]
+    fn a_step_publishes_the_state_at_its_end() {
+        let (w, cycle) = pavement_ring();
+        let rng = RngRegistry::new(3);
+        let mut m = SocialForce::default();
+        {
+            let mut ctx = MobilityCtx::new(0, &w, &rng);
+            m.spawn(&mut ctx, ActorId::new(1), cycle, 5.0)
+                .expect("spawned");
+        }
+        let snapshot = ActorSnapshot::new(0, 50.0);
+        let dt = Duration::from_millis(100);
+        for k in 0..5u64 {
+            let t0 = k * 100 * NS_PER_MS;
+            let mut ctx = MobilityCtx::new(t0, &w, &rng);
+            let out = m.step(&mut ctx, dt, &snapshot);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].1.t, t0 + 100 * NS_PER_MS, "step from {t0}");
+        }
+    }
+
+    /// A pedestrian who has waited `max_wait_s` at one kerb gives the walk up.
+    #[test]
+    fn a_pedestrian_gives_up_after_the_longest_wait() {
+        let impatient = SocialForceParams {
+            max_wait_s: 5.0,
+            ..SocialForceParams::default()
+        };
+        let red = CrossingPermit {
+            signal: Some(SignalState::Red),
+            hazard: false,
+        };
+        let (m, _, _) = walk_to_kerb(impatient, red, 95.0, 0, 150);
+        assert!(m.get(ActorId::new(1)).unwrap().arrived);
     }
 
     #[test]

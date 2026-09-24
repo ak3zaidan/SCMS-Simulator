@@ -37,7 +37,7 @@ import type {
 import { ActorRenderer, DEFAULT_ACTOR_CLASSES, classesFromHello } from "./actors.js";
 import { CameraController, type CameraMode } from "./cameras.js";
 import { PoseInterpolator, type PoseInterpolatorOptions } from "./interp.js";
-import { OverlayManager } from "./overlays.js";
+import { OverlayManager, VRU_MARK_SCALE } from "./overlays.js";
 import { Picker } from "./picking.js";
 import { FrameStats } from "./stats.js";
 import { DARK_THEME, themeByName, type ViewerTheme } from "./theme.js";
@@ -1274,6 +1274,7 @@ export class Viewer {
       this.#classRadii[i] = Math.hypot(d.lengthM, d.widthM, d.heightM) * 0.5;
     }
     this.overlays.locators.setClassRadii(this.#classRadii);
+    this.overlays.locators.setClassMarkScales(classes.map((d) => (d.category === 1 ? VRU_MARK_SCALE : 1)));
   }
 
   #resolveFollowSlot(): number {

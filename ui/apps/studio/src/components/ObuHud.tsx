@@ -117,7 +117,7 @@ export function ObuHud({ docked = false }: { docked?: boolean }): React.JSX.Elem
     <div className={`hud${docked ? " docked" : ""}`} data-testid="obu-hud">
       <div className="hud-head">
         <span className="id" data-testid="hud-identity">
-          {info?.kind === 2 ? "RSU" : "OBU"} {info?.label || `node ${telemetryNode}`}
+          {info?.kind === 2 ? "RSU" : info?.kind === 1 ? "VRU" : "OBU"} {info?.label || `node ${telemetryNode}`}
         </span>
         <span className="dim">node {telemetryNode}</span>
         {selectedActor !== null ? <span className="dim">actor {selectedActor}</span> : null}

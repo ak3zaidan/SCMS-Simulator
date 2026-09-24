@@ -113,6 +113,19 @@ const HOUSING_H = 1.05;
 const HOUSING_D = 0.26;
 const LAMP_SPACING = 0.32;
 const LAMP_SIZE = 0.24;
+/**
+ * A pedestrian head (§4.5 `kind` 1), MUTCD 2009 §4E.04: two sections, the UPRAISED HAND above the
+ * WALKING PERSON, each about 12 inches square. It shows walk while its crosswalk may be entered
+ * (J2735 movement-allowed), the hand flashing through the pedestrian change interval
+ * (clearance), and the hand steady for don't-walk; and it has no stop bar, because its lane is
+ * the crosswalk, not an approach.
+ */
+const PED_HOUSING_W = 0.34;
+const PED_HOUSING_H = 0.72;
+const PED_LAMP_SPACING = 0.34;
+/** The walking person is lunar white (MUTCD §4E.04). */
+const PED_WALK_COLOR = 0xf2f4f7;
+
 /** Stop bar depth along the lane, metres (MUTCD §3B.16: 12–24 inches). */
 const STOP_BAR_DEPTH = 0.5;
 /** Height of the stop bar above the lane centreline, metres: just above lane markings (0.24). */
@@ -133,6 +146,8 @@ export class SignalRenderer {
   #geometries: BufferGeometry[] = [];
 
   #count = 0;
+  /** 1 for a pedestrian head (§4.5 `kind` 1), 0 for a vehicle one. */
+  #pedestrian = new Uint8Array(0);
   #headSignal = new Uint32Array(0);
   #phase = new Uint8Array(0);
   #ttc = new Uint16Array(0);
@@ -186,6 +201,7 @@ export class SignalRenderer {
     this.#phase = new Uint8Array(n).fill(PHASE_NO_DATA);
     this.#ttc = new Uint16Array(n).fill(0xffff);
     this.#hasBar = new Uint8Array(n);
+    this.#pedestrian = new Uint8Array(n);
     this.#heads.clear();
     if (n === 0) return;
 
@@ -217,6 +233,8 @@ export class SignalRenderer {
     for (let i = 0; i < n; i++) {
       const s = world.signals.at(i);
       this.#headSignal[i] = s.signalId;
+      const ped = s.kind === 1;
+      this.#pedestrian[i] = ped ? 1 : 0;
       for (const key of [signalGroupWireId(s.signalId, s.group), s.signalId]) {
         let list = this.#heads.get(key);
         if (!list) {
@@ -228,8 +246,9 @@ export class SignalRenderer {
 
       let yaw = 0;
       let bar: { x: number; y: number; z: number; width: number } | null = null;
+      // (A pedestrian head gets its yaw from its crosswalk lane below, and no bar.)
       const li = laneIndex.get(s.laneId);
-      if (li !== undefined && world.lanes.pointCount[li] >= 2) {
+      if (li !== undefined && world.lanes.pointCount[li] >= 2 && !ped) {
         const off = world.lanes.pointOff[li];
         const last = off + world.lanes.pointCount[li] - 1;
         const dx = lx[last] - lx[last - 1];
@@ -247,24 +266,38 @@ export class SignalRenderer {
           };
         }
       }
+      if (ped && li !== undefined && world.lanes.pointCount[li] >= 2) {
+        // A pedestrian head stands at the far kerb of its crosswalk and faces back along it,
+        // at the people about to cross.
+        const off = world.lanes.pointOff[li];
+        const last = off + world.lanes.pointCount[li] - 1;
+        yaw = Math.atan2(ly[last] - ly[last - 1], lx[last] - lx[last - 1]);
+      }
       const c = Math.cos(yaw);
       const sn = Math.sin(yaw);
       // Housing: local +x along the approach's travel direction, so its −x face looks back at the
-      // drivers who have to read it.
+      // drivers (or the pedestrians) who have to read it. A pedestrian head is the two-section
+      // box, scaled from the vehicle housing's geometry.
+      const hy = ped ? PED_HOUSING_W / HOUSING_W : 1;
+      const hz = ped ? PED_HOUSING_H / HOUSING_H : 1;
       m.set(
-        c, -sn, 0, s.xM,
-        sn, c, 0, s.yM,
-        0, 0, 1, s.zM,
+        c, -sn * hy, 0, s.xM,
+        sn, c * hy, 0, s.yM,
+        0, 0, hz, s.zM,
         0, 0, 0, 1,
       );
       housing.setMatrixAt(i, m);
       for (let k = 0; k < 3; k++) {
-        const dz = (1 - k) * LAMP_SPACING;
+        // A pedestrian head has two sections: the hand in the red lamp's slot, the walking
+        // person in the green one's; the amber slot is not drawn.
+        const hidden = ped && k === 1;
+        const dz = ped ? (k === 0 ? 0.5 : -0.5) * PED_LAMP_SPACING : (1 - k) * LAMP_SPACING;
         const fx = -(HOUSING_D / 2 + 0.02);
+        const sc = hidden ? 0 : 1;
         m.set(
-          c, -sn, 0, s.xM + c * fx,
-          sn, c, 0, s.yM + sn * fx,
-          0, 0, 1, s.zM + dz,
+          c * sc, -sn * sc, 0, s.xM + c * fx,
+          sn * sc, c * sc, 0, s.yM + sn * fx,
+          0, 0, sc, s.zM + dz,
           0, 0, 0, 1,
         );
         lamps.setMatrixAt(i * 3 + k, m);
@@ -339,6 +372,11 @@ export class SignalRenderer {
     }
   }
 
+  /** True if head `i` is a pedestrian head (§4.5 `kind` 1). */
+  isPedestrianHead(i: number): boolean {
+    return i >= 0 && i < this.#count && this.#pedestrian[i] === 1;
+  }
+
   /** What head `i` shows. */
   headState(i: number): SignalHeadState | null {
     if (i < 0 || i >= this.#count) return null;
@@ -377,6 +415,25 @@ export class SignalRenderer {
     let flashing = false;
     for (let i = 0; i < this.#count; i++) {
       const aspect = aspectOf(this.#phase[i]);
+      if (this.#pedestrian[i]) {
+        // Walk (movement allowed) lights the walking person; clearance flashes the hand; stop
+        // shows it steady (MUTCD §4E.02). The hand is the amber theme colour, the nearest the
+        // palette has to Portland orange.
+        const clearing = (aspect.lamps & AMBER) !== 0;
+        if (clearing) flashing = true;
+        const hand = (aspect.lamps & (RED | AMBER)) !== 0 && !(clearing && !this.#flashOn);
+        c.copy(this.#colors.amber);
+        if (!hand) c.multiplyScalar(UNLIT);
+        lamps.setColorAt(i * 3, c);
+        c.setHex(off);
+        lamps.setColorAt(i * 3 + 1, c);
+        c.setHex(PED_WALK_COLOR);
+        if (!(aspect.lamps & GREEN)) c.multiplyScalar(UNLIT);
+        lamps.setColorAt(i * 3 + 2, c);
+        c.setHex(off);
+        bars.setColorAt(i, c);
+        continue;
+      }
       if (aspect.flashing) flashing = true;
       const lit = aspect.flashing && !this.#flashOn ? 0 : aspect.lamps;
       const lampColors = [this.#colors.red, this.#colors.amber, this.#colors.green];

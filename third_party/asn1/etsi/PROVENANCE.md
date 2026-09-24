@@ -21,7 +21,8 @@ Build decision references are to `docs/design/12-build-decisions.md`.
 | DENM is **TS 103 831 (Release 2)** | Same reason. Note the ASN.1 module inside `DENM-PDU-Descriptions.asn` is named `DENM-PDU-Description`, singular — upstream's spelling, which the generated Rust module name follows. |
 | IEEE 1609.2 comes from the **ETSI forge mirror**, not the copy bundled with SAE J2735 | The J2735 mirror's copies differ in line endings and comments, its `EtsiTs103097ExtensionModule.asn` is an older revision, and the whole J2735 bundle is unlicensed (build decision D3). The forge copies carry the forge's BSD-3-Clause repository licence. |
 | **No** ETSI TS 102 941 (PKI) | `rasn-compiler` 0.16 cannot parse `WITH COMPONENTS` inner subtyping on a CHOICE (`EtsiTs102941MessagesItss.asn:105:6`). PKI is a Phase 4 need, so it is deferred rather than worked around (build decision D5). |
-| **No** VAM, CPM, TS 103 301 | Out of this crate's current scope. VAM and CPM generate and compile cleanly and can be added by extending the `FACILITIES` unit in `build.rs`; TS 103 301 does **not** compile (it shares the J2735 regional-extension problem and needs the ISO TS 19321 IVI module, which ETSI does not publish). |
+| VAM is **TS 103 300-3 V2.2.1** (forge `master`) | The VRU devices' awareness message. It imports `ETSI-ITS-CDD` major-version-3 `WITH SUCCESSORS`, which the Release 2 CDD here (major-version-4) satisfies: every one of its 34 imported types is defined in it. Added to the `FACILITIES` unit on 2026-09-23. |
+| **No** CPM, TS 103 301 | Out of this crate's current scope. CPM generates and compiles cleanly and can be added by extending the `FACILITIES` unit in `build.rs`; TS 103 301 does **not** compile (it shares the J2735 regional-extension problem and needs the ISO TS 19321 IVI module, which ETSI does not publish). |
 | **No** SAE J2735 anywhere in this repository | Its embedded licence forbids redistribution, and the generated Rust does not compile anyway (build decisions D2 and D3). `third_party/asn1/j2735/` is git-ignored. |
 
 ## 2. The CP1252 problem and the `normalized-utf8/` copies
@@ -78,6 +79,18 @@ reproducible. `sha256` is of the file as committed here.
 | `denm_ts103831/DENM-PDU-Descriptions.asn` | `DENM-PDU-Description` | 19 606 | `c0fa1aef4cf89606582e6322064cebc9fcae4a8a702aa6d7ff6c7098b1af716f` | <https://forge.etsi.org/rep/ITS/asn1/denm_ts103831/-/raw/release2/DENM-PDU-Descriptions.asn> (commit `58472e2644a6`, 2025-10-17) |
 | `denm_ts103831/LICENSE.txt` | — | 1 476 | `a11e927c092fd9dd2de2129a76b3186f092760a06aee561a73425a79e9c60668` | repository `LICENSE`, BSD-3-Clause, "Copyright 2022 ETSI" |
 
+### 3.3a VAM — ETSI TS 103 300-3 V2.2.1
+
+| File | ASN.1 module | Bytes | sha256 | Source (pinned) |
+|---|---|---:|---|---|
+| `vam_ts103300_3/VAM-PDU-Descriptions.asn` | `VAM-PDU-Descriptions` | 12 589 | `5631c6d2534a7883fe329f9fe40f45b039e3c9d0611560ea7ef20d3a9ba3d11f` | <https://forge.etsi.org/rep/ITS/asn1/vam-ts103300_3> file `VAM-PDU-Descriptions.asn`, branch `master` (commit `c6db4d084c27`, 2023-01-24), fetched 2026-09-23 |
+| `vam_ts103300_3/LICENSE.txt` | — | 1 476 | `affd06519a9ec9ad6f0a3f6457a3772a12d609632e91ddfeb0ea5cab94b553e5` | repository `LICENSE`, BSD-3-Clause, "Copyright 2020 ETSI" |
+
+The file is UTF-8 as fetched, so it needs no `normalized-utf8/` copy. It still lists
+`SequenceOfTrajectoryInterceptionIndication` twice in its `IMPORTS`; `rasn-compiler` 0.16
+generates and compiles it regardless, so no patch is carried for it (the build would fail if
+that stopped being true).
+
 ### 3.4 Security header — ETSI TS 103 097, Release 2
 
 | File | ASN.1 module | Bytes | sha256 | Source (pinned) |
@@ -117,7 +130,7 @@ than silently ignored.
 |---|---|
 | `0001-ieee1609dot2-endentitytype-default.patch` | `rasn-compiler` 0.16 emits `EndEntityType([true, false].into_iter().collect())` for `PsidGroupPermissions.eeType DEFAULT {app}`; `FixedBitString<8>` is a `BitArray` and has no `FromIterator<bool>`. |
 
-Two further defects from build decision D5 are **not** carried here because their modules
-are out of scope: the duplicated `SequenceOfTrajectoryInterceptionIndication` import in
-`VAM-PDU-Descriptions.asn` (VAM is not generated), and the TS 102 941 `WITH COMPONENTS`
-parse failure (PKI is not generated). Adding either module means adding its patch.
+Build decision D5 also named the duplicated `SequenceOfTrajectoryInterceptionIndication`
+import in `VAM-PDU-Descriptions.asn`; with VAM generated (2026-09-23) it turned out to need
+no patch. The TS 102 941 `WITH COMPONENTS` parse failure is still out of scope (PKI is not
+generated); adding that module means adding its patch.

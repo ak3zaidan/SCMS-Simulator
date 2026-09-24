@@ -2622,6 +2622,15 @@ impl SignalPlan {
             .controlled
             .iter()
             .map(|l| {
+                // A pedestrian head faces the crossing lane it controls, which has no
+                // approach: it is found by the controlled lane itself.
+                if let Some(h) = self
+                    .heads
+                    .iter()
+                    .find(|h| h.lane == *l && h.kind == SignalHeadKind::Pedestrian)
+                {
+                    return Some(h.group);
+                }
                 let approach = approach_of(*l)?;
                 self.heads
                     .iter()

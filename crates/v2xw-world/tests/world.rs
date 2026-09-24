@@ -112,9 +112,25 @@ fn signal_plans_cover_their_cycle_and_control_every_movement() {
     assert_eq!(world.signals.len(), world.counts().junctions);
     for plan in &world.signals {
         let junction = world.junction(plan.junction);
-        assert_eq!(plan.controlled, junction.internal);
+        // The vehicle movements come first, in the junction's order; the crosswalk lanes
+        // the pedestrian intervals control (tr36885-urban has sidewalks and crossings)
+        // follow them.
+        let movements = junction.internal.len();
+        assert_eq!(plan.controlled[..movements], junction.internal[..]);
+        for l in &plan.controlled[movements..] {
+            assert_eq!(world.lane(*l).kind, LaneKind::Crossing);
+        }
         assert!((plan.total_phase_duration_s() - plan.cycle_s).abs() < 1e-9);
-        assert_eq!(plan.phases.len(), 4);
+        // Four vehicle phases: the pedestrian intervals split them without changing any
+        // vehicle state, so merging runs of identical vehicle states gives four again.
+        let mut vehicle_phases: Vec<&[v2xw_world::SignalState]> = Vec::new();
+        for ph in &plan.phases {
+            let v = &ph.states[..movements];
+            if vehicle_phases.last() != Some(&v) {
+                vehicle_phases.push(v);
+            }
+        }
+        assert_eq!(vehicle_phases.len(), 4);
         // Every movement is green at some point in the cycle, and never green at the
         // same time as a movement from a crossing street.
         for (i, _) in plan.controlled.iter().enumerate() {
@@ -131,7 +147,12 @@ fn signal_plans_cover_their_cycle_and_control_every_movement() {
         // A head for every approach lane that has a movement.
         assert!(!plan.heads.is_empty());
         for head in &plan.heads {
-            assert!(junction.incoming.contains(&head.lane));
+            if head.kind == v2xw_world::SignalHeadKind::Pedestrian {
+                // A pedestrian head faces the crossing lane it controls.
+                assert!(plan.controlled[movements..].contains(&head.lane));
+            } else {
+                assert!(junction.incoming.contains(&head.lane));
+            }
         }
     }
 }

@@ -911,6 +911,12 @@ export class StateMarkerOverlay {
 // ---------------------------------------------------------------------------------------------
 
 /**
+ * How much smaller a pedestrian's or a cyclist's aerial mark is than a vehicle's: 0.6, so the two
+ * read as different things at map altitude while keeping the same state colours.
+ */
+export const VRU_MARK_SCALE = 0.6;
+
+/**
  * Bounding radius assumed for a vehicle when no `Hello` class table has arrived, metres.
  *
  * Half the body diagonal of the 5.0 × 1.8 × 1.5 m passenger car that every class table so far
@@ -1023,6 +1029,11 @@ export class ActorLocatorOverlay {
   #stateColor = new Float32Array(5 * 3);
   /** Per-class bounding radius in metres, from `Hello`; empty means "assume a car". */
   #classRadius = new Float32Array(0);
+  /**
+   * Per-class mark scale: {@link VRU_MARK_SCALE} for a pedestrian or a cyclist, 1 for a vehicle.
+   * Empty means every class is a vehicle.
+   */
+  #classMarkScale = new Float32Array(0);
   /** Colour index last written into each dot/ring instance slot; `0xff` means "never written". */
   #dotKey: Uint8Array;
   #ringKey: Uint8Array;
@@ -1098,6 +1109,17 @@ export class ActorLocatorOverlay {
   setClassRadii(radii: readonly number[] | Float32Array): void {
     if (this.#classRadius.length !== radii.length) this.#classRadius = new Float32Array(radii.length);
     for (let i = 0; i < radii.length; i++) this.#classRadius[i] = radii[i];
+  }
+
+  /**
+   * Per-class mark scales, in class-index order: {@link VRU_MARK_SCALE} for the vulnerable road
+   * users (`Hello` category 1), 1 otherwise. A pedestrian's or a cyclist's dot keeps the state
+   * colours every mark carries, and is smaller than a vehicle's, so the two can be told apart at
+   * map altitude without a second palette — the legend says so.
+   */
+  setClassMarkScales(scales: readonly number[] | Float32Array): void {
+    if (this.#classMarkScale.length !== scales.length) this.#classMarkScale = new Float32Array(scales.length);
+    for (let i = 0; i < scales.length; i++) this.#classMarkScale[i] = scales[i];
   }
 
   setTheme(theme: ViewerTheme): void {
@@ -1257,8 +1279,9 @@ export class ActorLocatorOverlay {
       // every nearby vehicle kept a ring — clutter at street level, which is the opposite of what
       // the rule is for. The floor exists so a drawn mark cannot collapse; it must not also decide
       // whether there is one.
+      const scale = c < this.#classMarkScale.length ? this.#classMarkScale[c] : 1;
       const angularR = dist * this.angularRadius;
-      const markR = Math.max(this.minRadiusM, angularR);
+      const markR = Math.max(this.minRadiusM * scale, angularR * scale);
       const ratio = angularR > 0 ? vehicleR / angularR : Infinity;
       const isSelected = selected !== null && ids !== undefined && ids[slot] === (selected >>> 0);
 

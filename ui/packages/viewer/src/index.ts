@@ -42,7 +42,7 @@ export type { CameraControllerOptions, CameraState, CameraMode, InputTarget } fr
 
 export {
   OverlayManager, TxPulseOverlay, LinkOverlay, HeatmapOverlay, CoverageOverlay, StateMarkerOverlay,
-  ActorLocatorOverlay, GROUND_TRUTH_OVERLAYS, isGroundTruthOverlay, overlayLabel,
+  ActorLocatorOverlay, GROUND_TRUTH_OVERLAYS, isGroundTruthOverlay, overlayLabel, VRU_MARK_SCALE,
 } from "./overlays.js";
 export type {
   OverlayManagerOptions, OverlayEntry, OverlayUpdateContext, MarkerChannel,
@@ -60,7 +60,7 @@ export type { ViewerTheme, ActorStateColorKey } from "./theme.js";
 export {
   MeshBuilder, addRibbon, addPolygon, addDisc, addBox, addCylinder, addExtrudedRing, earClip,
   ringSignedArea, buildActorGeometry, discGeometry, ringGeometry, markerGeometry,
-  withUnitVertexColors,
+  withUnitVertexColors, isRiddenVru,
 } from "./geometry.js";
 export type { MeshBuilderOptions, MarkerShape, RingShading } from "./geometry.js";
 

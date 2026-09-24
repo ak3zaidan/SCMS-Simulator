@@ -303,30 +303,53 @@ fn a_device_with_a_battery_goes_quiet_when_it_is_spent() {
     assert_eq!(unlimited.power().remaining_j(), None);
 }
 
-/// Every frame carries the provenance of its payload length, and none of them claims to be
-/// real wire bytes.
+/// Every frame carries the provenance of its payload, and both are real: the PSM is SAE
+/// J2735 UPER and the VAM ETSI TS 103 300-3 UPER, each decoding to the device's own claim
+/// with the signing pseudonym's first four octets as its identifier.
 #[test]
-fn every_frame_says_where_its_length_came_from() {
+fn every_frame_says_where_its_payload_came_from() {
     let rng = RngRegistry::new(36);
-    let mut d = device(VruServices::BOTH);
-    let mut seen = 0;
-    for k in 0..=40u64 {
-        let now = k * 100 * NS_PER_MS;
-        d.set_belief(belief(Vec3::new(5.0 * k as f64, 0.0, 0.0), 1.4));
-        let mut ctx = NodeRuntimeCtx::new(now, &rng);
-        let out = d.step(&mut ctx, Vec::new(), 0.0);
-        assert_eq!(out.payload_provenance.len(), out.transmissions.len());
-        for ((ty, p), tx) in out.payload_provenance.iter().zip(&out.transmissions) {
-            assert_eq!(*ty, tx.msg_type);
-            assert!(!p.is_real(), "neither payload is encoder output yet");
-            match p {
-                PayloadProvenance::SizeModel { model, .. } => assert!(!model.is_empty()),
-                PayloadProvenance::Encoded { .. } => panic!("no encoder exists"),
+    let (mut psms, mut vams) = (0, 0);
+    // One stack per device: with both, a VAM on every step leaves the duty cycle's T_off in
+    // front of every PSM (`a_psm_and_a_vam_cannot_go_back_to_back`).
+    for services in [VruServices::SAE, VruServices::ETSI] {
+        let mut d = device(services);
+        for k in 0..=40u64 {
+            let now = k * 100 * NS_PER_MS;
+            d.set_belief(belief(Vec3::new(5.0 * k as f64, 0.0, 0.0), 1.4));
+            let mut ctx = NodeRuntimeCtx::new(now, &rng);
+            let out = d.step(&mut ctx, Vec::new(), 0.0);
+            assert_eq!(out.payload_provenance.len(), out.transmissions.len());
+            for ((ty, p), tx) in out.payload_provenance.iter().zip(&out.transmissions) {
+                assert_eq!(*ty, tx.msg_type);
+                match (ty, p) {
+                    (MsgType::Psm, PayloadProvenance::Encoded { codec }) => {
+                        assert_eq!(*codec, v2xw_msg::j2735::psm::PSM_CODEC_ID);
+                        let payload = &tx.signed.as_ref().expect("signed").payload;
+                        let m = v2xw_msg::j2735::psm::decode_message_frame(payload)
+                            .expect("a PSM that decodes");
+                        assert_eq!(m.id, tx.signer.0[..4]);
+                        assert_eq!(
+                            m.basic_type,
+                            v2xw_msg::j2735::psm::PersonalDeviceUserType::Pedestrian
+                        );
+                        assert_eq!(m.speed, v2xw_msg::j2735::bsm::speed(1.4));
+                        psms += 1;
+                    }
+                    (MsgType::Vam, PayloadProvenance::Encoded { codec }) => {
+                        assert_eq!(*codec, v2xw_msg::vam::VAM_CODEC_ID);
+                        let payload = &tx.signed.as_ref().expect("signed").payload;
+                        let m = v2xw_msg::vam::decode_vam(payload).expect("a VAM that decodes");
+                        assert_eq!(m.header.0.station_id.0.to_be_bytes(), tx.signer.0[..4]);
+                        assert_eq!(m.vam.vam_parameters.basic_container.station_type.0, 1);
+                        vams += 1;
+                    }
+                    other => panic!("unexpected payload provenance {other:?}"),
+                }
             }
-            seen += 1;
         }
     }
-    assert!(seen > 0, "the run must have transmitted something");
+    assert!(psms > 0 && vams > 0, "{psms} PSMs, {vams} VAMs");
 }
 
 /// A beacon has no receiver, and the frames it is handed are counted rather than silently

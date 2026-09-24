@@ -197,8 +197,9 @@ pub struct GridParams {
     pub lanes_per_direction: u32,
     /// Lane width, metres.
     pub lane_width_m: f64,
-    /// Sidewalk width on each side, metres. Buildings are inset by it; no sidewalk lanes
-    /// are generated.
+    /// Sidewalk width on each side, metres. Buildings are inset by it, and when it is
+    /// positive and [`GridParams::crossings`] is on, [`GridParams::pedestrian_lanes`]
+    /// generates the walkable network on it.
     pub sidewalk_m: f64,
     /// Speed limit on every street, m/s.
     pub speed_limit_mps: f64,
@@ -236,6 +237,16 @@ pub struct GridParams {
     /// for a 90° urban turn (15 ft, *Green Book* 2018 Ch. 9 — **secondary**, read from
     /// design guidance rather than re-verified against the table).
     pub corner_radius_m: f64,
+    /// Whether to generate the pedestrian network when there are sidewalks and crossings:
+    /// a sidewalk lane each way along every block face, a crosswalk lane each way across
+    /// every arm, short corner lanes joining them, and — at signalised junctions — the
+    /// pedestrian intervals of MUTCD 2009 §4E.06 (`crate::walk`). On by default; it
+    /// changes nothing on a grid without sidewalks (both presets but `tr36885-urban`).
+    pub pedestrian_lanes: bool,
+    /// Whether bicycles may ride the carriageway: every street lane and every junction
+    /// connector admits the bicycle class, as `OsmOptions::bicycles_on_roads` does for an
+    /// import. Off by default, so the reference layouts stay motor-only.
+    pub bicycles_on_roads: bool,
 }
 
 impl Default for GridParams {
@@ -271,6 +282,8 @@ impl GridParams {
             rsu_antenna_height_m: 6.0,
             rsu_antenna_gain_dbi: 5.0,
             corner_radius_m: 0.0,
+            pedestrian_lanes: true,
+            bicycles_on_roads: false,
         }
     }
 
@@ -304,6 +317,8 @@ impl GridParams {
             rsu_antenna_height_m: 6.0,
             rsu_antenna_gain_dbi: 5.0,
             corner_radius_m: 0.0,
+            pedestrian_lanes: true,
+            bicycles_on_roads: false,
         }
     }
 
@@ -623,6 +638,12 @@ pub fn grid(params: &GridParams, opts: &ImportOptions) -> Result<World> {
     let mut incoming_edge: BTreeMap<(u32, u8), EdgeId> = BTreeMap::new();
     let mut outgoing_edge: BTreeMap<(u32, u8), EdgeId> = BTreeMap::new();
 
+    // The classes a street lane and a junction connector admit.
+    let carriageway = if params.bicycles_on_roads {
+        ClassMask::MOTOR_TRAFFIC.union(ClassMask::BICYCLE)
+    } else {
+        ClassMask::MOTOR_TRAFFIC
+    };
     let add_street_edge = |from: (u32, u32),
                            to: (u32, u32),
                            d: Dir4,
@@ -650,7 +671,7 @@ pub fn grid(params: &GridParams, opts: &ImportOptions) -> Result<World> {
                 vec![start, end],
                 layout.width_m,
                 params.speed_limit_mps,
-                ClassMask::MOTOR_TRAFFIC,
+                carriageway,
             )?);
             lane_ids.push(lane_id);
             junctions[to_j.as_usize()].incoming.push(lane_id);
@@ -774,7 +795,7 @@ pub fn grid(params: &GridParams, opts: &ImportOptions) -> Result<World> {
                         geometry,
                         layout.width_m,
                         params.speed_limit_mps,
-                        ClassMask::MOTOR_TRAFFIC,
+                        carriageway,
                     )?);
                     internal_lane_ids.push(internal);
                     movements.push(Movement {
@@ -887,6 +908,15 @@ pub fn grid(params: &GridParams, opts: &ImportOptions) -> Result<World> {
 
     // --- Crossings ------------------------------------------------------------------
     let mut crossings: Vec<Crossing> = Vec::new();
+    let walk_network = params.pedestrian_lanes && params.sidewalk_m > 0.0 && params.crossings;
+    // How far from the junction centre a crossing's line is: the kerb line without a
+    // pedestrian network (the reference layouts), and the walk line with one, so the
+    // painted crossing is where the crosswalk lanes are.
+    let crossing_at = if walk_network {
+        walk_line_m(params)
+    } else {
+        layout.half_m
+    };
     if params.crossings {
         for jid in 0..junctions.len() as u32 {
             let (col, row) = layout.cell(JunctionId::new(jid));
@@ -898,16 +928,29 @@ pub fn grid(params: &GridParams, opts: &ImportOptions) -> Result<World> {
                 let (fx, fy) = d.forward();
                 let (rx, ry) = d.right_vector();
                 let h = layout.half_m;
+                let a = crossing_at;
                 crossings.push(Crossing {
                     id: CrossingId::new(crossings.len() as u32),
                     junction: JunctionId::new(jid),
-                    from: Vec3::new_2d(cx + fx * h + rx * h, cy + fy * h + ry * h),
-                    to: Vec3::new_2d(cx + fx * h - rx * h, cy + fy * h - ry * h),
+                    from: Vec3::new_2d(cx + fx * a + rx * h, cy + fy * a + ry * h),
+                    to: Vec3::new_2d(cx + fx * a - rx * h, cy + fy * a - ry * h),
                     width_m: params.crossing_width_m,
                     priority: true,
                 });
             }
         }
+    }
+
+    // --- The pedestrian network and its signal intervals --------------------------------
+    if walk_network {
+        add_walk_network(&layout, params, &mut lanes, &mut edges, &mut connections)?;
+        crate::walk::signalise_crossings(
+            &mut signals,
+            &lanes,
+            &connections,
+            |j| junctions[j.as_usize()].position,
+            &crate::walk::PedestrianTiming::mutcd(),
+        );
     }
 
     // --- Buildings, one per block ----------------------------------------------------
@@ -995,6 +1038,8 @@ pub fn grid(params: &GridParams, opts: &ImportOptions) -> Result<World> {
             .with("speed_limit_mps", params.speed_limit_mps)
             .with("signalised", params.signalised)
             .with("crossings", params.crossings)
+            .with("pedestrian_lanes", walk_network)
+            .with("bicycles_on_roads", params.bicycles_on_roads)
             .with("block_buildings", params.block_buildings),
     );
     provenance.record(
@@ -1043,6 +1088,228 @@ pub fn grid(params: &GridParams, opts: &ImportOptions) -> Result<World> {
         .provenance(provenance)
         .index_options(opts.index_options)
         .build()
+}
+
+/// The walking speed a pavement lane carries as its speed limit, m/s — the `footway` pace
+/// the OSM importer uses.
+const WALKING_PACE_MPS: f64 = 1.39;
+
+/// How far from a junction's centre its crosswalks' walking lines are, metres.
+///
+/// Where the two sidewalk bands meet (`h + sidewalk/2`), unless that would put the painted
+/// band over the crossing street's carriageway; then half a crossing width outside the kerb
+/// line, `h + crossing_width/2`. Short corner lanes join the two when they differ.
+fn walk_line_m(params: &GridParams) -> f64 {
+    let h = params.half_width_m();
+    (h + 0.5 * params.sidewalk_m).max(h + 0.5 * params.crossing_width_m)
+}
+
+/// Adds the pedestrian network: a sidewalk lane each way along every block face, a
+/// crosswalk lane each way across every arm that has a block on both sides, and a corner
+/// lane each way where a crosswalk's end and the sidewalk round the corner do not meet.
+///
+/// Only block faces get a sidewalk: the lattice's outer edge has none, because the world
+/// is the lattice's bounding box and D6 keeps every coordinate non-negative. Lanes are
+/// appended after every street and junction lane, so no existing id moves. Every walking
+/// lane that ends where another starts is connected to it, except to its own reverse
+/// unless that is the only way on.
+fn add_walk_network(
+    layout: &Layout,
+    params: &GridParams,
+    lanes: &mut Vec<Lane>,
+    edges: &mut Vec<Edge>,
+    connections: &mut Vec<Connection>,
+) -> Result<()> {
+    let h = layout.half_m;
+    let b = h + 0.5 * params.sidewalk_m;
+    let x_c = walk_line_m(params);
+    let first_walk_lane = lanes.len();
+    #[allow(clippy::too_many_arguments)]
+    fn add(
+        from_j: JunctionId,
+        to_j: JunctionId,
+        kind: LaneKind,
+        a: Vec3,
+        z: Vec3,
+        width: f64,
+        lanes: &mut Vec<Lane>,
+        edges: &mut Vec<Edge>,
+    ) -> Result<()> {
+        for (start, end, from, to) in [(a, z, from_j, to_j), (z, a, to_j, from_j)] {
+            let edge_id = EdgeId::new(edges.len() as u32);
+            let lane_id = LaneId::new(lanes.len() as u32);
+            lanes.push(Lane::new(
+                lane_id,
+                edge_id,
+                None,
+                0,
+                kind,
+                vec![start, end],
+                width,
+                WALKING_PACE_MPS,
+                ClassMask::PEDESTRIAN,
+            )?);
+            edges.push(Edge {
+                id: edge_id,
+                from,
+                to,
+                lanes: vec![lane_id],
+                name: None,
+                road_class: RoadClass::Footway,
+            });
+        }
+        // The junctions' `incoming` and `outgoing` lists stay the carriageway's: the gap
+        // acceptance model counts a junction's incoming lanes as its major lanes, and a
+        // pavement is not one. The walk network is reached through its connections.
+        Ok(())
+    }
+    let has = |col: u32, row: u32, dx: i64, dy: i64| -> bool {
+        let c = i64::from(col) + dx;
+        let r = i64::from(row) + dy;
+        c >= 0 && r >= 0 && c < i64::from(layout.cols) && r < i64::from(layout.rows)
+    };
+    // Sidewalks along the east-west streets, then the north-south ones.
+    for row in 0..layout.rows {
+        for col in 0..layout.cols - 1 {
+            let (xa, y) = layout.junction_xy(col, row);
+            let (xb, _) = layout.junction_xy(col + 1, row);
+            for sy in [-1i64, 1] {
+                if !has(col, row, 0, sy) {
+                    continue;
+                }
+                let yy = y + sy as f64 * b;
+                add(
+                    layout.junction_id(col, row),
+                    layout.junction_id(col + 1, row),
+                    LaneKind::Sidewalk,
+                    Vec3::new_2d(xa + x_c, yy),
+                    Vec3::new_2d(xb - x_c, yy),
+                    params.sidewalk_m,
+                    lanes,
+                    edges,
+                )?;
+            }
+        }
+    }
+    for col in 0..layout.cols {
+        for row in 0..layout.rows - 1 {
+            let (x, ya) = layout.junction_xy(col, row);
+            let (_, yb) = layout.junction_xy(col, row + 1);
+            for sx in [-1i64, 1] {
+                if !has(col, row, sx, 0) {
+                    continue;
+                }
+                let xx = x + sx as f64 * b;
+                add(
+                    layout.junction_id(col, row),
+                    layout.junction_id(col, row + 1),
+                    LaneKind::Sidewalk,
+                    Vec3::new_2d(xx, ya + x_c),
+                    Vec3::new_2d(xx, yb - x_c),
+                    params.sidewalk_m,
+                    lanes,
+                    edges,
+                )?;
+            }
+        }
+    }
+    // At each junction: the crosswalks across each arm with a block on both sides, then
+    // the corner lanes of each quadrant with a block in it.
+    for row in 0..layout.rows {
+        for col in 0..layout.cols {
+            let j = layout.junction_id(col, row);
+            let (cx, cy) = layout.junction_xy(col, row);
+            for sx in [1i64, -1] {
+                if has(col, row, sx, 0) && has(col, row, 0, -1) && has(col, row, 0, 1) {
+                    let xx = cx + sx as f64 * x_c;
+                    add(
+                        j,
+                        j,
+                        LaneKind::Crossing,
+                        Vec3::new_2d(xx, cy - b),
+                        Vec3::new_2d(xx, cy + b),
+                        params.crossing_width_m,
+                        lanes,
+                        edges,
+                    )?;
+                }
+            }
+            for sy in [1i64, -1] {
+                if has(col, row, 0, sy) && has(col, row, -1, 0) && has(col, row, 1, 0) {
+                    let yy = cy + sy as f64 * x_c;
+                    add(
+                        j,
+                        j,
+                        LaneKind::Crossing,
+                        Vec3::new_2d(cx - b, yy),
+                        Vec3::new_2d(cx + b, yy),
+                        params.crossing_width_m,
+                        lanes,
+                        edges,
+                    )?;
+                }
+            }
+            if x_c - b > 1e-3 {
+                for (sx, sy) in [(1i64, 1i64), (-1, 1), (-1, -1), (1, -1)] {
+                    if !(has(col, row, sx, 0) && has(col, row, 0, sy)) {
+                        continue;
+                    }
+                    let (fx, fy) = (sx as f64, sy as f64);
+                    add(
+                        j,
+                        j,
+                        LaneKind::Sidewalk,
+                        Vec3::new_2d(cx + fx * x_c, cy + fy * b),
+                        Vec3::new_2d(cx + fx * b, cy + fy * x_c),
+                        params.sidewalk_m,
+                        lanes,
+                        edges,
+                    )?;
+                }
+            }
+        }
+    }
+    // Connect every walking lane to every one that starts where it ends, but not to its
+    // own reverse unless that is the only way on (a dead end).
+    let key = |p: Vec3| {
+        (
+            (p.x / crate::quant::Q_POSITION_M).round() as i64,
+            (p.y / crate::quant::Q_POSITION_M).round() as i64,
+        )
+    };
+    let mut starting: BTreeMap<(i64, i64), Vec<usize>> = BTreeMap::new();
+    for (i, lane) in lanes.iter().enumerate().skip(first_walk_lane) {
+        starting.entry(key(lane.start())).or_default().push(i);
+    }
+    for i in first_walk_lane..lanes.len() {
+        let from = &lanes[i];
+        let Some(next) = starting.get(&key(from.end())) else {
+            continue;
+        };
+        let onward: Vec<usize> = next
+            .iter()
+            .copied()
+            .filter(|n| key(lanes[*n].end()) != key(from.start()))
+            .collect();
+        let targets = if onward.is_empty() {
+            next.clone()
+        } else {
+            onward
+        };
+        for n in targets {
+            let to = &lanes[n];
+            let delta =
+                crate::model::normalise_angle(to.heading_at(0.0) - from.heading_at(from.length_m));
+            connections.push(Connection {
+                from_lane: from.id,
+                to_lane: to.id,
+                via: None,
+                direction: TurnDirection::from_heading_change(delta),
+                permitted: true,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Builds a junction's conflict matrix from its movements.
@@ -1263,6 +1530,36 @@ pub fn card() -> ModelCard {
         ),
         "m",
         0.0.into(),
+    );
+    push(
+        Parameter::new(
+            "pedestrian_lanes",
+            "-",
+            true.into(),
+            Source::new(
+                SourceKind::Standard,
+                "MUTCD 2009 §4E.06 (walk ≥ 7 s, clearance at 3.5 ft/s, ≥ 3 s buffer) for \
+                 the pedestrian intervals; §3B.18 crosswalk placement at the corner. The \
+                 walk network itself is the generator's geometry, not a sourced value",
+            ),
+        ),
+        "-",
+        true.into(),
+    );
+    push(
+        Parameter::new(
+            "bicycles_on_roads",
+            "-",
+            false.into(),
+            Source::new(
+                SourceKind::Standard,
+                "UVC §11-1202: a person riding a bicycle upon a roadway has the rights and \
+                 duties of a driver; off in the presets, which reproduce motor-only \
+                 reference layouts",
+            ),
+        ),
+        "-",
+        false.into(),
     );
     push(
         todo(
