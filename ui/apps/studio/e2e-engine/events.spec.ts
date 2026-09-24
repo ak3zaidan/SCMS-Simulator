@@ -113,6 +113,7 @@ test("a closure added in the settings reaches the next run and traffic avoids th
   await runToEnd(page);
   const baseline = await entriesAfter(page, CLOSE_AT_S);
   const ranked = [...baseline.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+  // eslint-disable-next-line no-console -- the measured numbers are the evidence this test reports
   console.log(`streets entered after ${CLOSE_AT_S} s without a closure: ${JSON.stringify(ranked.slice(0, 8))}`);
   const [edge, before] = ranked[0] ?? [NaN, 0];
   expect(before, "the busiest street carries traffic without a closure, so the check can fail").toBeGreaterThanOrEqual(3);
@@ -149,6 +150,7 @@ test("a closure added in the settings reaches the next run and traffic avoids th
   await expect(page.getByTestId("event-fired").first()).toContainText("lanes closed");
   const fired = (done.engine as unknown as { timeline: { kind: string; lanes: number[]; effect: string }[] }).timeline;
   expect(fired.map((e) => e.kind)).toEqual(["closure"]);
+  // eslint-disable-next-line no-console -- the measured numbers are the evidence this test reports
   console.log(
     `closure of edge ${edge}: ${before} vehicles drove onto it after ${CLOSE_AT_S} s without the closure, ` +
       `${after.get(edge) ?? 0} with it; ${elsewhere} entries elsewhere. Engine: ${fired[0].effect}`,

@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { nearestEdge } from "../src/components/EventsEditor.js";
+import { nearestEdge } from "../src/lib/events.js";
 
 /** Three lanes along y = 0, y = 10 and y = 20; the middle one is a junction connector. */
 function world(): Parameters<typeof nearestEdge>[0] {

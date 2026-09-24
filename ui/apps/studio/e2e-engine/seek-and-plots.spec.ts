@@ -51,6 +51,7 @@ test("a seek past the kernel's lead lands, and a new run's plots start empty", a
   await expect.poll(async () => (await status(page)).t_ns, { timeout: 120_000 }).toBeGreaterThanOrEqual(59_000_000_000);
   await expect(page.getByTestId("time-notice")).toHaveCount(0);
   const landed = (await status(page)).t_ns;
+  // eslint-disable-next-line no-console -- the measured numbers are the evidence this test reports
   console.log(`seek to the end of a 60 s run from 0 s landed at ${landed / 1e9} s`);
 
   // --- 2. a long run, then a short one: the plots hold only the short one ----------------------
@@ -69,5 +70,6 @@ test("a seek past the kernel's lead lands, and a new run's plots start empty", a
     return Math.max(0, ...m.names().map((n) => Math.max(0, ...m.get(n)[0])));
   });
   expect(shortMax, "no plotted sample is later than the 16 s run").toBeLessThanOrEqual(16);
+  // eslint-disable-next-line no-console -- the measured numbers are the evidence this test reports
   console.log(`plots: the 60 s run's latest sample at ${longMax} s; after a 16 s run, ${shortMax} s`);
 });

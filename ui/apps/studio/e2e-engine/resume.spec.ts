@@ -135,6 +135,7 @@ test("a dropped connection resumes with no gap, no duplicate and no error", asyn
   });
   expect(errors).toEqual([]);
   expect(log.states).not.toContain("failed");
+  // eslint-disable-next-line no-console -- the measured numbers are the evidence this test reports
   console.log(
     `cut ${cut} connections; the page applied ${log.seqs.length} frames, seq ${log.seqs[0]} … ${log.seqs.at(-1)}, ` +
       `with no gap or duplicate; resumed at seq ${resumed[0].resumeSeq}; states ${log.states.join(" → ")}`,
