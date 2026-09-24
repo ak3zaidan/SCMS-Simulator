@@ -314,7 +314,7 @@ struct Attached {
 /// client has not seen that run's `Hello`, so it gets one — never a resume across runs.
 async fn attach(state: &AppState, params: ConnectParams) -> Result<Attached> {
     let claimed = match params.session.as_deref() {
-        Some(token) => state.sessions.claim(token).await,
+        Some(token) => state.sessions.claim(token, Instant::now()).await,
         None => None,
     };
     if let Some(d) = claimed {
@@ -355,7 +355,9 @@ async fn attach(state: &AppState, params: ConnectParams) -> Result<Attached> {
         }
         // A different profile is a different stream (§5.3): the retained session stays
         // retained for a client that asks for it as it was.
-        state.sessions.park(Arc::clone(&state.run), d);
+        state
+            .sessions
+            .park(Arc::clone(&state.run), d, Instant::now());
     }
 
     // Subscribed before the generation is read, so a run started between the two is seen
@@ -453,7 +455,9 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
         client_generation,
     });
     match exit {
-        Exit::Park => state.sessions.park(Arc::clone(&state.run), detached),
+        Exit::Park => state
+            .sessions
+            .park(Arc::clone(&state.run), detached, Instant::now()),
         Exit::Forget => state.sessions.forget(detached.session.session_token()),
         Exit::Handover(reply) => {
             // §1.4: "the server sends `Bye{reason = 4 (superseded)}` on the old socket and
@@ -467,7 +471,9 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
             let _ = close(&mut socket, 1012, "superseded by a resumed connection").await;
             if let Err(back) = reply.send(detached) {
                 // The claimant gave up waiting; the session is still resumable.
-                state.sessions.park(Arc::clone(&state.run), back);
+                state
+                    .sessions
+                    .park(Arc::clone(&state.run), back, Instant::now());
             }
         }
     }

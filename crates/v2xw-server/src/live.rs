@@ -109,6 +109,10 @@ use crate::engine::{
 use crate::error::{ParamError, Result, ServerError};
 use crate::introspect::{Introspect, MetricInfo};
 
+/// How many steps one `extend_to` slice takes before it returns to the transport, which then
+/// reports progress and gives the run lock back.
+const EXTEND_SLICE_STEPS: usize = 50;
+
 /// How a live run is started.
 #[derive(Debug, Clone)]
 pub struct LiveOptions {
@@ -3576,17 +3580,14 @@ impl Engine for LiveEngine {
         self.seek_goal = Some(goal);
         // A transport wait, like `pump_blocking`'s: the kernel's output is the same whenever
         // it is collected, so how long this waits changes nothing but when the seek lands.
-        let deadline = std::time::Instant::now() + budget;
-        loop {
+        // The slice is bounded by steps taken and by one wait of `budget` for the next step,
+        // so this module reads no clock: the transport (`http.rs`) is the one that does.
+        for _ in 0..EXTEND_SLICE_STEPS {
             self.pump();
             if self.produced > goal || self.report.is_some() || self.failure.is_some() {
                 break;
             }
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            match self.host.steps.recv_timeout(left) {
+            match self.host.steps.recv_timeout(budget) {
                 Ok(message) => {
                     if !self.absorb(message) {
                         break;

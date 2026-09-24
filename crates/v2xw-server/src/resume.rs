@@ -32,7 +32,9 @@
 //! # Wall clock
 //!
 //! The TTL is wall time, like every other transport timer in [`crate::http`]; no simulated
-//! quantity depends on it.
+//! quantity depends on it. The instant a session was parked, and the instant a claim is
+//! made, are read in `http.rs` — the one server module allowed to read a clock — and handed
+//! in, as `rpc::Context::received_at` is.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -153,8 +155,8 @@ impl Sessions {
     /// `None` when there is no such session, or its owner did not answer within
     /// [`CLAIM_TIMEOUT`] — in either case the caller starts a fresh session, which is
     /// §1.4 rule 2 and never an error.
-    pub async fn claim(&self, token: &str) -> Option<Box<Detached>> {
-        self.expire();
+    pub async fn claim(&self, token: &str, now: Instant) -> Option<Box<Detached>> {
+        self.expire(now);
         let sender = self.entries.lock().get(token).map(|e| e.claim.clone())?;
         let (reply, answer) = oneshot::channel();
         if sender.send(reply).await.is_err() {
@@ -199,7 +201,7 @@ impl Sessions {
     /// Spawns the task that keeps its ring current. Evicts the oldest parked session when
     /// [`MAX_PARKED`] would be exceeded; an evicted session's task ends when its claim
     /// channel closes.
-    pub fn park(self: &Arc<Self>, run: Arc<Run>, detached: Box<Detached>) {
+    pub fn park(self: &Arc<Self>, run: Arc<Run>, detached: Box<Detached>, now: Instant) {
         let token = detached.session.session_token().to_string();
         let epoch = {
             let mut entries = self.entries.lock();
@@ -207,7 +209,7 @@ impl Sessions {
                 // Forgotten while the socket was closing: nothing may resume it.
                 return;
             };
-            entry.parked_at = Some(Instant::now());
+            entry.parked_at = Some(now);
             let epoch = entry.epoch;
             let mut parked: Vec<(Instant, String)> = entries
                 .iter()
@@ -226,11 +228,12 @@ impl Sessions {
         });
     }
 
-    /// Drops every parked session older than [`RESUME_TTL`].
-    fn expire(&self) {
-        self.entries
-            .lock()
-            .retain(|_, e| e.parked_at.is_none_or(|at| at.elapsed() < RESUME_TTL));
+    /// Drops every parked session parked [`RESUME_TTL`] or more before `now`.
+    fn expire(&self, now: Instant) {
+        self.entries.lock().retain(|_, e| {
+            e.parked_at
+                .is_none_or(|at| now.saturating_duration_since(at) < RESUME_TTL)
+        });
     }
 
     fn remove_if(&self, token: &str, epoch: u64) {
@@ -307,7 +310,7 @@ async fn parked_task(
 }
 
 /// 32 bytes the process cannot predict: the OS generator where there is one, and the
-/// standard library's per-process hash keys mixed with the clock otherwise.
+/// standard library's per-process hash keys (themselves seeded from the OS) otherwise.
 fn salt() -> [u8; 32] {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
@@ -323,6 +326,5 @@ fn salt() -> [u8; 32] {
         hasher.write_u32(std::process::id());
         h.update(hasher.finish().to_le_bytes());
     }
-    h.update(format!("{:?}", Instant::now()).as_bytes());
     h.finalize().into()
 }
