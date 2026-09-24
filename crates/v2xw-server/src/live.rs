@@ -2121,6 +2121,34 @@ fn apply_reported(row: &mut NodeTelemetry, view: &NodeTelemetryView) {
         row.q_verify_p50 = u16::try_from(depth).unwrap_or(u16::MAX);
         row.q_verify_p95 = u16::try_from(depth).unwrap_or(u16::MAX);
     }
+    // The queues' own window percentiles, when the node published its window.
+    if let Some([p50, p95]) = view.q_rx {
+        (row.q_rx_p50, row.q_rx_p95) = (p50, p95);
+    }
+    if let Some([p50, p95]) = view.q_verify {
+        (row.q_verify_p50, row.q_verify_p95) = (p50, p95);
+    }
+    if let Some([p50, p95]) = view.q_app {
+        (row.q_app_p50, row.q_app_p95) = (p50, p95);
+    }
+    if let Some([p50, p95]) = view.q_tx {
+        (row.q_tx_p50, row.q_tx_p95) = (p50, p95);
+    }
+    if let Some([p50, p95]) = view.q_crl {
+        (row.q_crl_p50, row.q_crl_p95) = (p50, p95);
+    }
+    if let Some(ms) = view.verify_wait_p95_ms {
+        row.verify_wait_p95_ms = v2xw_record::grid::quantise_f32(ms, 1e-3);
+    }
+    if let Some(n) = view.cert_active {
+        row.cert_active = n;
+    }
+    if let Some(n) = view.nbr_total {
+        row.nbr_total = n;
+    }
+    if let Some(n) = view.nbr_verified {
+        row.nbr_verified = n;
+    }
 }
 
 /// The §6.5 `Visibility` code for a token.

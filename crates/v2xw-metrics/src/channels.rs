@@ -1071,6 +1071,33 @@ pub struct NodeTelemetryView {
     /// The verification queue's depth.
     #[serde(default)]
     pub verify_queue_depth: Option<u64>,
+    /// The receive queue's depth over the window, `[p50, p95]` (vwp-v1 §3.5.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_rx: Option<[u16; 2]>,
+    /// The verification queue's depth over the window, `[p50, p95]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_verify: Option<[u16; 2]>,
+    /// The application queue's depth over the window, `[p50, p95]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_app: Option<[u16; 2]>,
+    /// The transmit queue's depth over the window, `[p50, p95]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_tx: Option<[u16; 2]>,
+    /// The CRL task queue's depth over the window, `[p50, p95]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_crl: Option<[u16; 2]>,
+    /// The 95th percentile of the wait from enqueue to verification start, ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_wait_p95_ms: Option<f64>,
+    /// Own pseudonym certificates currently valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_active: Option<u16>,
+    /// Neighbours in the table, and how many of them are verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nbr_total: Option<u16>,
+    /// Neighbours in state *verified*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nbr_verified: Option<u16>,
 }
 
 impl ChannelView for NodeTelemetryView {

@@ -1725,6 +1725,23 @@ impl Engine {
             }
         }
 
+        // Each node's own telemetry window, when one closed at this step: its queues, its
+        // compute load and its stores. The node has always produced it (`StepOutcome::
+        // telemetry`) and nothing published it, so the page's HUD and inspector showed
+        // "n/a" for every queue and for the CPU of the vehicle being followed.
+        let windows: Vec<crate::records::NodeTelemetry> = results
+            .iter()
+            .filter_map(|(id, outcome, _, _)| {
+                outcome
+                    .telemetry
+                    .as_ref()
+                    .map(|t| telemetry_record(now, *id, t))
+            })
+            .collect();
+        for record in &windows {
+            self.emit(recorder, record);
+        }
+
         // Every received frame whose fate the node settled, joined back to its attempt and
         // recorded on `node.rx`, in (node, report) order.
         let mut fates: Vec<NodeRx> = Vec::new();
@@ -3542,6 +3559,45 @@ fn radio_class(class: VehicleClass) -> v2xw_radio::ActorClass {
 }
 
 /// The lower-case name a `node.tx` record carries for a message type.
+/// A node's closed telemetry window as a `node.telemetry` record.
+///
+/// §3.5.2's "unknown" sentinels become absent fields. The two utilisations are per-mille on
+/// the wire and fractions on the channel; every float is put on its key's record grid (D9).
+fn telemetry_record(
+    t: SimTime,
+    node: NodeId,
+    w: &v2xw_record::wire::telemetry::NodeTelemetry,
+) -> crate::records::NodeTelemetry {
+    use v2xw_record::wire::{U16_NONE, U32_NONE, U64_NONE};
+    // `cpu` and `hsm` carry no unit suffix, so their declared grid is the finest, 1e-6.
+    let frac = |pm: u16| {
+        (pm != U16_NONE).then(|| v2xw_core::math::quantize_to(f64::from(pm) / 1000.0, 1e-6))
+    };
+    let pair = |p50: u16, p95: u16| (p50 != U16_NONE || p95 != U16_NONE).then_some([p50, p95]);
+    let count = |v: u16| (v != U16_NONE).then_some(v);
+    crate::records::NodeTelemetry(v2xw_metrics::channels::NodeTelemetryView {
+        t,
+        node,
+        cpu: frac(w.cpu_util_pm),
+        hsm: frac(w.hsm_util_pm),
+        ram_bytes: (w.ram_used_kib != U32_NONE).then(|| u64::from(w.ram_used_kib) * 1024),
+        storage_bytes: (w.storage_used_b != U64_NONE).then_some(w.storage_used_b),
+        verify_queue_depth: (w.q_verify_p95 != U16_NONE).then_some(u64::from(w.q_verify_p95)),
+        q_rx: pair(w.q_rx_p50, w.q_rx_p95),
+        q_verify: pair(w.q_verify_p50, w.q_verify_p95),
+        q_app: pair(w.q_app_p50, w.q_app_p95),
+        q_tx: pair(w.q_tx_p50, w.q_tx_p95),
+        q_crl: pair(w.q_crl_p50, w.q_crl_p95),
+        verify_wait_p95_ms: w
+            .verify_wait_p95_ms
+            .is_finite()
+            .then(|| v2xw_core::math::quantize_to(f64::from(w.verify_wait_p95_ms), 1e-3)),
+        cert_active: count(w.cert_active),
+        nbr_total: count(w.nbr_total),
+        nbr_verified: count(w.nbr_verified),
+    })
+}
+
 /// Lower-case hex of an identifier's octets.
 fn hex_digest(bytes: &[u8]) -> String {
     use core::fmt::Write as _;
