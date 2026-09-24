@@ -1386,6 +1386,9 @@ struct Projector {
     /// the newest [`LINK_HISTORY`] observations of each pair, which is what an averaging
     /// window over the recent past needs and all it needs.
     links: BTreeMap<(u32, u32), std::collections::VecDeque<LinkObservation>>,
+    /// `scenario.event` records seen since the owner last took them: the scenario
+    /// timeline's items as they fired, with what each did.
+    scenario_events: Vec<Value>,
     last_index: u64,
 }
 
@@ -1448,6 +1451,7 @@ impl Projector {
             unprojected_channels: BTreeSet::new(),
             undecodable_channels: BTreeMap::new(),
             links: BTreeMap::new(),
+            scenario_events: Vec::new(),
             last_index: setup.duration / step_ns,
         }
     }
@@ -1691,6 +1695,12 @@ impl Projector {
                     }
                 }
                 "msg.latency" | "net.bytes" => {}
+                // A scenario timeline item firing: kept for `run.status` (`timeline`), which
+                // is how the page marks an event as having happened and says what it did.
+                "scenario.event" => match serde_json::from_slice::<Value>(&record.json) {
+                    Ok(v) => self.scenario_events.push(v),
+                    Err(_) => self.undecodable(record.channel),
+                },
                 "metric.sample" => match serde_json::from_slice::<MetricSample>(&record.json) {
                     Ok(sample) => self.push_metric(&sample, &mut metrics),
                     Err(_) => self.undecodable(record.channel),
@@ -2539,6 +2549,9 @@ pub struct LiveEngine {
     cursor: u64,
     /// One past the highest step index produced.
     produced: u64,
+    /// The scenario timeline's items as the kernel fired them, `(t_ns, record)`, in order.
+    /// Reported by `run.status` up to the stream position, not the kernel's frontier.
+    fired: Vec<(u64, Value)>,
     /// A step a seek is waiting for, beyond the bounded lead: while it is set, [`Self::pump`]
     /// takes steps past `lookahead_steps` until it is produced. Cleared by the seek.
     seek_goal: Option<u64>,
@@ -2722,6 +2735,7 @@ impl LiveEngine {
             base_index: 0,
             cursor: 0,
             produced: 0,
+            fired: Vec::new(),
             seek_goal: None,
             client_sync: false,
             report: None,
@@ -2919,6 +2933,10 @@ impl LiveEngine {
             HostMsg::Step(raw) => {
                 let index = raw.index;
                 let out = self.projector.project(&raw);
+                for event in self.projector.scenario_events.drain(..) {
+                    let t = event.get("t").and_then(Value::as_u64).unwrap_or(0);
+                    self.fired.push((t, event));
+                }
                 self.digest_step(&out);
                 self.stats.absorb(&out);
                 for row in &out.metrics {
@@ -3041,6 +3059,7 @@ impl LiveEngine {
         self.base_index = 0;
         self.cursor = 0;
         self.produced = 0;
+        self.fired.clear();
         self.seek_goal = None;
         self.report = None;
         self.failure = None;
@@ -3730,6 +3749,15 @@ impl Engine for LiveEngine {
             },
             "retained_steps": self.timeline.len(),
             "retain_limit_steps": self.options.retain_steps,
+            // The scenario timeline's items that have fired by the stream position, with
+            // what each did (`scenario.event`). The kernel is ahead of the stream, so an
+            // item it has fired but the page has not reached yet is not reported.
+            "timeline": self
+                .fired
+                .iter()
+                .filter(|(t, _)| *t <= self.sim_time())
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>(),
         })
     }
 }

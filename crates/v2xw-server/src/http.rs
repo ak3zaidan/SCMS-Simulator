@@ -982,6 +982,12 @@ pub fn bye_frame(
     Ok(Frame::new(MsgType::Bye, 0, 0, &body)?)
 }
 
+/// How many steps a connection may fall behind before a client-synchronised producer waits.
+///
+/// Well under the broadcast capacity (`run::STEP_CHANNEL_CAPACITY`, 64), so a paced run never
+/// reaches the lag that forces a resync.
+pub const SYNC_HIGH_WATER_STEPS: usize = 8;
+
 /// The producer task: advances the run and paces it against wall time (§1.5).
 ///
 /// `speed` is a multiple of real time and `0` means unthrottled. The loop never blocks on
@@ -990,9 +996,18 @@ pub fn bye_frame(
 pub async fn producer(run: Arc<Run>) {
     let step = run.descriptor().cadence.mobility_step;
     loop {
-        let (speed, _) = run.speed();
+        let (speed, client_sync) = run.speed();
         if run.state() != RunState::Running {
             tokio::time::sleep(WallDuration::from_millis(5)).await;
+            continue;
+        }
+        // §1.5 "Live pacing": with `sync: "client"` the producer waits while any connection
+        // is more than a few steps behind, so no connection ever lags and nothing is shed.
+        // The option was accepted and reported by `run.status` and did nothing: the producer
+        // read the speed and ignored the mode, so a "lossless" demo at speed 0 dropped
+        // deltas like any other.
+        if client_sync && run.step_backlog() >= SYNC_HIGH_WATER_STEPS {
+            tokio::time::sleep(WallDuration::from_millis(2)).await;
             continue;
         }
         match run.tick() {

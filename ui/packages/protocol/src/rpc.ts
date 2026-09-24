@@ -247,8 +247,33 @@ export interface RunStatusResult {
     output_digest?: string | null;
     digest_steps?: number;
     failure?: string | null;
+    /** The scenario timeline's items fired by the stream position (03-interfaces §13). */
+    timeline?: ScenarioEventRecord[];
     [key: string]: unknown;
   };
+}
+
+/**
+ * One scenario timeline item as the engine fired it: the `scenario.event` record
+ * (03-interfaces §14), as `run.status` reports it in `engine.timeline`.
+ */
+export interface ScenarioEventRecord {
+  /** When it took effect, simulated ns. */
+  t: number;
+  /** Its position in the scenario's `events`. */
+  index: number;
+  /** Its `type`, e.g. `closure`. */
+  kind: string;
+  /** `start`, or `end` when its `until` arrived. */
+  phase: "start" | "end";
+  /** What it did, as a sentence. */
+  effect: string;
+  lanes?: number[];
+  multiplier?: number;
+  path?: string;
+  /** The value a `param.change` set, as JSON text. */
+  value?: string;
+  populations?: number[];
 }
 
 // ---------------------------------------------------------------------------

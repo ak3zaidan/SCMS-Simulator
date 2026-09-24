@@ -180,6 +180,14 @@ impl Run {
         self.tx.subscribe()
     }
 
+    /// How many broadcast steps the slowest subscriber has not taken yet.
+    ///
+    /// What `run.speed {sync: "client"}` paces the producer on (§1.5 "Live pacing"): a
+    /// connection that encodes only as fast as its socket drains holds its steps here.
+    pub fn step_backlog(&self) -> usize {
+        self.tx.len()
+    }
+
     /// The current run state.
     pub fn state(&self) -> RunState {
         self.engine.lock().state()
