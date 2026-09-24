@@ -420,6 +420,11 @@ impl VruMobility for SocialForce {
             return Vec::new();
         }
         let now = ctx.now();
+        // The state this step computes is the state at the step's *end*, as a vehicle's
+        // is: stamping it at the start filed every pedestrian's `gt.kinematics` one step
+        // behind the vehicles', and a consumer that groups records by step (the live
+        // server does) saw each step's actor set split in two and lost the pedestrians.
+        let t_end = dt.after(now);
         // The start-of-step positions of every pedestrian: the same Jacobi discipline the
         // vehicles use, so one pedestrian's move cannot depend on another's having moved.
         let frozen: Vec<(ActorId, Vec3, Vec3)> = {
@@ -454,7 +459,7 @@ impl VruMobility for SocialForce {
                 continue;
             };
             if person.arrived {
-                out.push((actor, self.kinematics_of(person, world, now)));
+                out.push((actor, self.kinematics_of(person, world, t_end)));
                 continue;
             }
             let Some(lane) = world.try_lane(person.lane) else {
@@ -626,7 +631,7 @@ impl VruMobility for SocialForce {
             person.against_signal = against;
             let person = &self.people[&actor];
             let world = ctx.world();
-            out.push((actor, self.kinematics_of(person, world, now)));
+            out.push((actor, self.kinematics_of(person, world, t_end)));
         }
         out.sort_by_key(|(a, _)| *a);
         out
@@ -638,7 +643,6 @@ impl SocialForce {
     fn next_lane(&self, person: &Pedestrian) -> Option<LaneId> {
         person.route.get(person.route_index + 1).copied()
     }
-
 
     /// The published kinematics of one pedestrian.
     fn kinematics_of(
@@ -1167,12 +1171,15 @@ mod tests {
                 hazard: false,
             },
         ] {
-            let (m, w, cycle) =
-                walk_to_kerb(SocialForceParams::default(), permit, 90.0, 0, 200);
+            let (m, w, cycle) = walk_to_kerb(SocialForceParams::default(), permit, 90.0, 0, 200);
             let p = m.get(ActorId::new(1)).unwrap();
             assert_eq!(p.lane, cycle[0], "{permit:?}: it stepped onto the crossing");
             let kerb = w.lane(cycle[0]).length_m - SocialForceParams::default().kerb_margin_m;
-            assert!(p.s_m <= kerb + 1e-9, "{permit:?}: past the kerb at {}", p.s_m);
+            assert!(
+                p.s_m <= kerb + 1e-9,
+                "{permit:?}: past the kerb at {}",
+                p.s_m
+            );
             assert!(p.s_m > kerb - 1.0, "{permit:?}: it did not reach the kerb");
             assert!(p.vel.norm_2d() < 0.05, "{permit:?}: still moving");
             assert!(p.waiting_since.is_some());
@@ -1242,6 +1249,30 @@ mod tests {
         assert_eq!(SocialForceParams::default().jaywalk_probability, 0.0);
     }
 
+    /// The state a step publishes is the state at the step's end, as a vehicle's is: the
+    /// engine files `gt.kinematics` at the state's own instant, and a pedestrian stamped at
+    /// the step's start landed one step behind every vehicle.
+    #[test]
+    fn a_step_publishes_the_state_at_its_end() {
+        let (w, cycle) = pavement_ring();
+        let rng = RngRegistry::new(3);
+        let mut m = SocialForce::default();
+        {
+            let mut ctx = MobilityCtx::new(0, &w, &rng);
+            m.spawn(&mut ctx, ActorId::new(1), cycle, 5.0)
+                .expect("spawned");
+        }
+        let snapshot = ActorSnapshot::new(0, 50.0);
+        let dt = Duration::from_millis(100);
+        for k in 0..5u64 {
+            let t0 = k * 100 * NS_PER_MS;
+            let mut ctx = MobilityCtx::new(t0, &w, &rng);
+            let out = m.step(&mut ctx, dt, &snapshot);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].1.t, t0 + 100 * NS_PER_MS, "step from {t0}");
+        }
+    }
+
     /// A pedestrian who has waited `max_wait_s` at one kerb gives the walk up.
     #[test]
     fn a_pedestrian_gives_up_after_the_longest_wait() {
@@ -1256,7 +1287,6 @@ mod tests {
         let (m, _, _) = walk_to_kerb(impatient, red, 95.0, 0, 150);
         assert!(m.get(ActorId::new(1)).unwrap().arrived);
     }
-
 
     #[test]
     fn a_pedestrian_may_not_be_put_on_a_road() {
