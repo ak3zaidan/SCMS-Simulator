@@ -2750,7 +2750,12 @@ impl World {
                     timeline: plan
                         .phases
                         .iter()
-                        .map(|p| (p.states.first().copied().unwrap_or(SignalState::Off), p.duration_s))
+                        .map(|p| {
+                            (
+                                p.states.first().copied().unwrap_or(SignalState::Off),
+                                p.duration_s,
+                            )
+                        })
                         .collect(),
                     cycle_s: plan.cycle_s,
                     offset_s: plan.offset_s,
@@ -2774,7 +2779,10 @@ impl World {
                         return Some(h.group);
                     }
                     let approach = approach_of.get(l)?;
-                    plan.heads.iter().find(|h| h.lane == *approach).map(|h| h.group)
+                    plan.heads
+                        .iter()
+                        .find(|h| h.lane == *approach)
+                        .map(|h| h.group)
                 })
                 .collect();
             let mut ids: Vec<u16> = plan.heads.iter().map(|h| h.group).collect();
@@ -3908,7 +3916,9 @@ impl World {
 
     /// True if `lane` runs through `building` by the source's own account.
     pub fn is_passage(&self, lane: LaneId, building: BuildingId) -> bool {
-        self.passages_of(lane).iter().any(|p| p.building == building)
+        self.passages_of(lane)
+            .iter()
+            .any(|p| p.building == building)
     }
 
     /// The signal plan with this id, or `None`.

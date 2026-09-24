@@ -121,7 +121,9 @@ fn every_manhattan_head_shows_its_own_movements_state_over_a_cycle_and_after_see
     // A full cycle at the 0.1 s mobility step, then a seek forward to 1234.5 s and a
     // stretch after it, then a rewind to the start: the state is a function of time
     // alone, so where the playhead came from must not matter.
-    let mut times: Vec<f64> = (0..=(longest * 10.0) as u64).map(|k| k as f64 * 0.1).collect();
+    let mut times: Vec<f64> = (0..=(longest * 10.0) as u64)
+        .map(|k| k as f64 * 0.1)
+        .collect();
     times.extend((0..300).map(|k| 1234.5 + k as f64 * 0.1));
     times.extend((0..100).map(|k| k as f64 * 0.1 + 0.05));
     let (samples, changes) = check(&world, &times);
@@ -154,7 +156,12 @@ fn a_recorded_keyframe_carries_one_row_per_head_group_in_its_state() {
         for (row, g) in body.signals.iter().zip(&groups) {
             let (state, _) = g.at(t_s).expect("a state");
             assert_eq!(row.signal_id, g.wire_id);
-            assert_eq!(row.phase, state.j2735_phase(), "group {} at {t_s} s", g.wire_id);
+            assert_eq!(
+                row.phase,
+                state.j2735_phase(),
+                "group {} at {t_s} s",
+                g.wire_id
+            );
         }
     }
 }

@@ -64,9 +64,9 @@ use crate::model::{
     Building, ClassMask, ConflictMatrix, Connection, Crossing, CrossingId, Edge, GeoBbox,
     GeoOrigin, HeightSource, Junction, JunctionControl, LanduseClass, LanduseZone, Lane, LaneKind,
     LayerLicence, MaterialClass, Passage, PassageKind, Projection, RoadClass, RoadNetwork,
-    SignalHead, SignalHeadKind,
-    SignalPhase, SignalPlan, SignalState, SymbolId, SymbolTable, Terrain, Transformation,
-    TurnDirection, World, WorldProvenance, WorldSourceKind, ZoneId, normalise_angle, simplify_rdp,
+    SignalHead, SignalHeadKind, SignalPhase, SignalPlan, SignalState, SymbolId, SymbolTable,
+    Terrain, Transformation, TurnDirection, World, WorldProvenance, WorldSourceKind, ZoneId,
+    normalise_angle, simplify_rdp,
 };
 use crate::quant::{Q_ANGLE_RAD, Q_DEGREES, Q_POSITION_M, Q_TIME_S, quantise};
 use crate::{ImportOptions, WorldSource, WorldSourceSpec};
@@ -3800,7 +3800,11 @@ fn connector_geometry(start: Vec3, heading_in: f64, end: Vec3, heading_out: f64)
     if !control.is_finite() || u <= 0.0 || v <= 0.0 || u > reach || v > reach {
         return reverse_curve_connector(start, heading_in, end, heading_out);
     }
-    let control = Vec3::new(control.x, control.y, start.z + (end.z - start.z) * u / (u + v));
+    let control = Vec3::new(
+        control.x,
+        control.y,
+        start.z + (end.z - start.z) * u / (u + v),
+    );
     crate::curve::fillet_polyline(&[start, control, end], f64::INFINITY)
 }
 
@@ -3810,12 +3814,7 @@ fn connector_geometry(start: Vec3, heading_in: f64, end: Vec3, heading_out: f64)
 /// ([`crate::curve::fillet_polyline`]). It leaves along the approach heading, arrives along
 /// the departure heading, and never overshoots either end. Used where the corner of the
 /// two tangent lines lies outside the junction — two parallel lanes offset sideways.
-fn reverse_curve_connector(
-    start: Vec3,
-    heading_in: f64,
-    end: Vec3,
-    heading_out: f64,
-) -> Vec<Vec3> {
+fn reverse_curve_connector(start: Vec3, heading_in: f64, end: Vec3, heading_out: f64) -> Vec<Vec3> {
     let (sin_in, cos_in) = math::sin_cos(heading_in);
     let (sin_out, cos_out) = math::sin_cos(heading_out);
     let k = start.distance_2d(end) / 3.0;
@@ -5343,8 +5342,8 @@ fn protected_pair_conflicts(
     if !conflicts.is_foe(ia, ib) {
         return false;
     }
-    let lane_drop =
-        a.to_lane == b.to_lane && lanes[a.from_lane.as_usize()].edge == lanes[b.from_lane.as_usize()].edge;
+    let lane_drop = a.to_lane == b.to_lane
+        && lanes[a.from_lane.as_usize()].edge == lanes[b.from_lane.as_usize()].edge;
     !lane_drop
 }
 
@@ -5441,7 +5440,6 @@ fn approach_grade(lane: &Lane) -> f64 {
     ((end.z - from.z) / span).clamp(-0.15, 0.15)
 }
 
-
 /// Synthesises a fixed-time plan for every junction that has a `traffic_signals` node on
 /// it or near it, with the defaults of 04-models.md §2.3.
 ///
@@ -5516,12 +5514,9 @@ fn synthesise_signals(
             continue;
         }
         let reference = movements[0].approach_heading;
-        let groups = split_phases(
-            &movements,
-            &net.lanes,
-            &net.junctions[j].conflicts,
-            |m| phase_group(m.approach_heading, reference),
-        );
+        let groups = split_phases(&movements, &net.lanes, &net.junctions[j].conflicts, |m| {
+            phase_group(m.approach_heading, reference)
+        });
         let present: Vec<u16> = {
             let mut g = groups.clone();
             g.sort_unstable();
@@ -5802,7 +5797,8 @@ fn find_passages(
             if runs.is_empty() {
                 continue;
             }
-            let kinds: Vec<PassageKind> = sources.iter().map(|p| kind_of_plan(&plans[*p])).collect();
+            let kinds: Vec<PassageKind> =
+                sources.iter().map(|p| kind_of_plan(&plans[*p])).collect();
             let kind = kinds
                 .iter()
                 .copied()

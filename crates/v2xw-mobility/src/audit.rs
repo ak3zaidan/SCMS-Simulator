@@ -1338,8 +1338,9 @@ impl TrafficAuditor {
             // Along the path in three dimensions: the speed is along a ramp's slope.
             let moved_3d = a.pos.distance(p.pos);
             let expected = a.speed_mps * dt;
-            let tolerance =
-                self.params.step_speed_tolerance * expected + self.params.step_speed_slack_m + lateral;
+            let tolerance = self.params.step_speed_tolerance * expected
+                + self.params.step_speed_slack_m
+                + lateral;
             if (moved_3d - expected).abs() > tolerance {
                 let ex = Self::example(
                     Check::StepSpeed,

@@ -65,7 +65,13 @@ impl Record for SecCert {
 impl SecCert {
     /// One event.
     #[must_use]
-    pub fn new(t: SimTime, node: NodeId, event: &str, digest: Option<String>, bytes: Option<u64>) -> Self {
+    pub fn new(
+        t: SimTime,
+        node: NodeId,
+        event: &str,
+        digest: Option<String>,
+        bytes: Option<u64>,
+    ) -> Self {
         SecCert(SecCertView {
             t,
             node,

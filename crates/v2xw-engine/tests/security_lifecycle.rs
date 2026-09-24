@@ -97,14 +97,22 @@ fn a_pool_is_topped_up_over_the_link_and_runs_dry_without_one() {
     println!(
         "with a link: {} top-ups started, {} completed, {} certificates, {} starved \
          vehicles, {} starved node-steps",
-        p.topups_started, p.topups_completed, p.certs_topped_up, p.vehicles_starved,
+        p.topups_started,
+        p.topups_completed,
+        p.certs_topped_up,
+        p.vehicles_starved,
         p.starved_node_steps
     );
-    assert!(p.topups_started > 0, "no pool ever ran low in a 70 s run of 20 s periods");
+    assert!(
+        p.topups_started > 0,
+        "no pool ever ran low in a 70 s run of 20 s periods"
+    );
     assert!(p.topups_completed > 0, "no top-up batch was installed");
     assert!(p.certs_topped_up >= 3, "a top-up installs a whole period");
     assert!(
-        records(&rec, "sec.cert").iter().any(|r| r["event"] == "top-up"),
+        records(&rec, "sec.cert")
+            .iter()
+            .any(|r| r["event"] == "top-up"),
         "a top-up must be on sec.cert"
     );
     // The bytes of a top-up cross the cellular link, both ways.
@@ -126,7 +134,10 @@ fn a_pool_is_topped_up_over_the_link_and_runs_dry_without_one() {
         "offline: {} top-ups, {} starved vehicles, {} starved node-steps",
         q.topups_started, q.vehicles_starved, q.starved_node_steps
     );
-    assert_eq!(q.topups_started, 0, "a vehicle with no link started a top-up");
+    assert_eq!(
+        q.topups_started, 0,
+        "a vehicle with no link started a top-up"
+    );
     assert!(
         q.vehicles_starved > 0,
         "the pools expired and no vehicle was left unable to sign"
@@ -212,12 +223,21 @@ fn the_change_period_reaches_the_run_and_the_observer_measures_it() {
             report.phase2.privacy_links_claimed,
             report.phase2.privacy_links_correct
         );
-        per.insert(period as u32, (report.phase2.pseudonym_changes, rec.digest_hex()));
+        per.insert(
+            period as u32,
+            (report.phase2.pseudonym_changes, rec.digest_hex()),
+        );
     }
     let (fast, fast_digest) = &per[&10];
     let (slow, slow_digest) = &per[&30];
-    assert!(fast > slow, "a 10 s period changed no more often than a 30 s one");
-    assert_ne!(fast_digest, slow_digest, "two periods produced the same run");
+    assert!(
+        fast > slow,
+        "a 10 s period changed no more often than a 30 s one"
+    );
+    assert_ne!(
+        fast_digest, slow_digest,
+        "two periods produced the same run"
+    );
 }
 
 /// Honest traffic is never revoked at the default thresholds, and it is the authority's
@@ -241,11 +261,18 @@ fn honest_traffic_is_not_revoked_and_the_gate_is_why() {
     println!(
         "default gate: {} verdicts over {} messages, {} reports, {} at the authority, {} \
          revoke decisions, {} issued",
-        p.verdicts_fired, p.messages_checked, p.reports_sent, p.reports_at_ma,
-        p.ma_revoke_decisions, p.crls_issued
+        p.verdicts_fired,
+        p.messages_checked,
+        p.reports_sent,
+        p.reports_at_ma,
+        p.ma_revoke_decisions,
+        p.crls_issued
     );
     assert!(p.messages_checked > 0, "the detectors must run");
-    assert_eq!(p.ma_revoke_decisions, 0, "the authority decided to revoke an honest device");
+    assert_eq!(
+        p.ma_revoke_decisions, 0,
+        "the authority decided to revoke an honest device"
+    );
     assert_eq!(p.crls_issued, 0);
 
     // The control: the same fleet with the gate opened to one report from one reporter.
@@ -379,18 +406,38 @@ fn the_etsi_pki_revokes_passively_and_the_scms_actively() {
         a.revoked_attackers >= 1 && a.crls_installed > 0,
         "the SCMS path must issue a list the fleet installs"
     );
-    assert_eq!(b.crls_installed, 0, "the ETSI PKI installed a revocation list");
-    assert!(b.revoked_attackers >= 1, "the ETSI authority must decide on the attacker");
-    assert_eq!(b.crls_issued, 0, "the ETSI PKI has no per-vehicle revocation list");
-    assert_eq!(b.revoked_receptions, 0, "a passive revocation refused a reception");
+    assert_eq!(
+        b.crls_installed, 0,
+        "the ETSI PKI installed a revocation list"
+    );
+    assert!(
+        b.revoked_attackers >= 1,
+        "the ETSI authority must decide on the attacker"
+    );
+    assert_eq!(
+        b.crls_issued, 0,
+        "the ETSI PKI has no per-vehicle revocation list"
+    );
+    assert_eq!(
+        b.revoked_receptions, 0,
+        "a passive revocation refused a reception"
+    );
     let stages: BTreeSet<String> = records(&rec, "proto.revocation")
         .iter()
         .filter_map(|r| r["stage"].as_str().map(str::to_string))
         .collect();
-    for s in ["detect", "decision", "blocklisted", "last_valid_credential_expiry"] {
+    for s in [
+        "detect",
+        "decision",
+        "blocklisted",
+        "last_valid_credential_expiry",
+    ] {
         assert!(stages.contains(s), "ETSI stage {s} missing: {stages:?}");
     }
-    assert!(b.topups_completed > 0, "honest ETSI vehicles must top their tickets up");
+    assert!(
+        b.topups_completed > 0,
+        "honest ETSI vehicles must top their tickets up"
+    );
 }
 
 /// A vehicle with no modem reaches the backend through a roadside unit: the report goes on
@@ -438,18 +485,32 @@ fn a_vehicle_without_a_modem_relays_through_a_roadside_unit() {
     );
     assert_eq!(p.access.cellular_vehicles, 0);
     assert!(p.reports_uploaded_relay > 0, "no report was relayed");
-    assert!(p.reports_received > 0, "no relayed report reached the proxy");
-    assert!(p.access.backhaul_bytes > 0, "the backhaul carried nothing");
-    assert_eq!(p.access.uu_ul_bytes, 0, "a vehicle with no modem used the uplink");
     assert!(
-        records(&rec, "node.tx").iter().any(|r| r["msg_type"] == "mbr"),
+        p.reports_received > 0,
+        "no relayed report reached the proxy"
+    );
+    assert!(p.access.backhaul_bytes > 0, "the backhaul carried nothing");
+    assert_eq!(
+        p.access.uu_ul_bytes, 0,
+        "a vehicle with no modem used the uplink"
+    );
+    assert!(
+        records(&rec, "node.tx")
+            .iter()
+            .any(|r| r["msg_type"] == "mbr"),
         "a relayed report is a frame on the air"
     );
 
     let (cut, _) = run(base(Some("backhaul/none")));
     let q = &cut.phase2;
-    assert_eq!(q.reports_received, 0, "a report crossed a backhaul that is not there");
-    assert!(q.reports_sent > 0, "the detectors must still fire, or this proves nothing");
+    assert_eq!(
+        q.reports_received, 0,
+        "a report crossed a backhaul that is not there"
+    );
+    assert!(
+        q.reports_sent > 0,
+        "the detectors must still fire, or this proves nothing"
+    );
 }
 
 /// A roadside unit verifies what it hears and checks it with the detector suite. The unit
@@ -489,7 +550,13 @@ fn a_roadside_unit_verifies_and_checks_what_it_hears() {
          checked {} and {} messages",
         with_default.phase2.messages_checked, with_mk5.phase2.messages_checked
     );
-    assert!(a > 0, "no roadside unit delivered a frame to its applications");
-    assert_eq!(b, 0, "the control: the MK5 RSU profile prices no verification");
+    assert!(
+        a > 0,
+        "no roadside unit delivered a frame to its applications"
+    );
+    assert_eq!(
+        b, 0,
+        "the control: the MK5 RSU profile prices no verification"
+    );
     assert!(with_default.phase2.messages_checked > with_mk5.phase2.messages_checked);
 }

@@ -222,11 +222,17 @@ mod tests {
         // Every arc sample is 6 m from the centre (-6, -6).
         for q in &out[1..out.len() - 1] {
             let r = ((q.x + 6.0).powi(2) + (q.y + 6.0).powi(2)).sqrt();
-            assert!((r - 6.0).abs() < 1e-9, "sample {q:?} is {r} m from the centre");
+            assert!(
+                (r - 6.0).abs() < 1e-9,
+                "sample {q:?} is {r} m from the centre"
+            );
         }
         // The discrete curvature is that of a 6 m circle, not the vertex's infinite one.
         assert!(max_curvature(&out) < 1.0 / 5.9, "{}", max_curvature(&out));
-        assert!((tightest_fillet_radius(&[p(-10.0, 0.0), p(0.0, 0.0), p(0.0, -6.0)]) - 6.0).abs() < 1e-9);
+        assert!(
+            (tightest_fillet_radius(&[p(-10.0, 0.0), p(0.0, 0.0), p(0.0, -6.0)]) - 6.0).abs()
+                < 1e-9
+        );
     }
 
     #[test]
@@ -255,6 +261,9 @@ mod tests {
         let out = drop_short_segments(&pts, 0.5);
         assert_eq!(out, vec![p(0.0, 0.0), p(10.003, 0.002)]);
         let pts = [p(0.0, 0.0), p(0.001, 0.003), p(10.0, 0.0)];
-        assert_eq!(drop_short_segments(&pts, 0.5), vec![p(0.0, 0.0), p(10.0, 0.0)]);
+        assert_eq!(
+            drop_short_segments(&pts, 0.5),
+            vec![p(0.0, 0.0), p(10.0, 0.0)]
+        );
     }
 }

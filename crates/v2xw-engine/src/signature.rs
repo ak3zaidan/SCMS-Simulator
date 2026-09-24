@@ -59,7 +59,13 @@ pub fn resize(
     (
         spdu.saturating_add(extra),
         envelope.map(|e| e.saturating_add(extra)),
-        cert.map(|c| if c > 0 { c.saturating_add(cert_extra) } else { c }),
+        cert.map(|c| {
+            if c > 0 {
+                c.saturating_add(cert_extra)
+            } else {
+                c
+            }
+        }),
     )
 }
 
@@ -69,14 +75,23 @@ mod tests {
 
     #[test]
     fn p256_is_unchanged_and_a_hybrid_grows_by_its_published_sizes() {
-        assert_eq!(resize("ecdsa-p256", 200, Some(93), Some(0), false), (200, Some(93), Some(0)));
+        assert_eq!(
+            resize("ecdsa-p256", 200, Some(93), Some(0), false),
+            (200, Some(93), Some(0))
+        );
         // A digest-signed BSM under ML-DSA-44 hybrid: +2,420.
         assert_eq!(
             resize("hybrid-mldsa44-ecdsa-p256", 200, Some(93), Some(0), false),
             (2_620, Some(2_513), Some(0))
         );
         // With the certificate attached, the certificate's own growth too.
-        let (spdu, _, cert) = resize("hybrid-falcon512-ecdsa-p256", 300, Some(200), Some(117), true);
+        let (spdu, _, cert) = resize(
+            "hybrid-falcon512-ecdsa-p256",
+            300,
+            Some(200),
+            Some(117),
+            true,
+        );
         assert_eq!(spdu, 300 + 666 + 897 + 666);
         assert_eq!(cert, Some(117 + 897 + 666));
     }

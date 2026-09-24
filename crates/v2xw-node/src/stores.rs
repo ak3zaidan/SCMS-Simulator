@@ -1079,7 +1079,11 @@ mod tests {
         for k in 11..20u64 {
             assert_eq!(s.rotate(k * NS_PER_S), Some(ChangeReason::Expired));
         }
-        assert_eq!(s.changes(), 0, "a pool with nothing valid changed pseudonym");
+        assert_eq!(
+            s.changes(),
+            0,
+            "a pool with nothing valid changed pseudonym"
+        );
     }
 
     /// In the hour two i-periods overlap, a change moves to the period that has just

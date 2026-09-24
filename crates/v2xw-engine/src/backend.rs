@@ -37,11 +37,7 @@ use crate::error::{EngineError, Result};
 use crate::scenario::Scenario;
 
 /// `net.uu` model ids this build accepts.
-pub const UU_MODELS: [&str; 3] = [
-    FixedLatencyUu::ID,
-    CellCapacityUu::ID,
-    HandoverOutageUu::ID,
-];
+pub const UU_MODELS: [&str; 3] = [FixedLatencyUu::ID, CellCapacityUu::ID, HandoverOutageUu::ID];
 
 /// `actors.rsus[].backhaul` and `net.backhaul` ids this build accepts.
 pub const BACKHAUL_MODELS: [&str; 3] = ["backhaul/fixed", "backhaul/cellular", "backhaul/none"];
@@ -200,7 +196,9 @@ fn ms(v: f64) -> Duration {
 
 /// The Uu latency preset a scenario names, by its label.
 fn preset_named(label: &str) -> Option<UuLatencyPreset> {
-    UuLatencyPreset::ALL.into_iter().find(|p| p.label() == label)
+    UuLatencyPreset::ALL
+        .into_iter()
+        .find(|p| p.label() == label)
 }
 
 impl BackendAccess {
@@ -283,7 +281,10 @@ impl BackendAccess {
                 other => {
                     return Err(conflict(
                         "net.uu",
-                        format!("'{other}' is not a Uu model; allowed: {}", UU_MODELS.join(", ")),
+                        format!(
+                            "'{other}' is not a Uu model; allowed: {}",
+                            UU_MODELS.join(", ")
+                        ),
                     ));
                 }
             };
@@ -336,7 +337,12 @@ impl BackendAccess {
     }
 
     /// Gives a new vehicle its access, from a draw keyed by the node.
-    pub fn assign(&mut self, rng: &v2xw_core::rng::RngRegistry, node: NodeId, relay: bool) -> AccessKind {
+    pub fn assign(
+        &mut self,
+        rng: &v2xw_core::rng::RngRegistry,
+        node: NodeId,
+        relay: bool,
+    ) -> AccessKind {
         let kind = if self.uu.is_some()
             && rng
                 .checkout(RngDomain::Backend, EntityRef::Node(node))
@@ -358,7 +364,10 @@ impl BackendAccess {
     /// A vehicle's access.
     #[must_use]
     pub fn kind(&self, node: NodeId) -> AccessKind {
-        self.kinds.get(&node).copied().unwrap_or(AccessKind::Offline)
+        self.kinds
+            .get(&node)
+            .copied()
+            .unwrap_or(AccessKind::Offline)
     }
 
     /// Books bytes a backend transfer moved, by bucket — called wherever a `net.bytes`
@@ -464,7 +473,9 @@ impl BackendAccess {
 pub fn catalogue_cards() -> Vec<v2xw_core::card::ModelCard> {
     use v2xw_core::model::Model;
     vec![
-        FixedLatencyUu::new(UuLatencyPreset::Lte4gEastCoast).card().clone(),
+        FixedLatencyUu::new(UuLatencyPreset::Lte4gEastCoast)
+            .card()
+            .clone(),
         CellCapacityUu::new(CellPlan::urban_macro()).card().clone(),
         HandoverOutageUu::new(CellCapacityUu::new(CellPlan::urban_macro()))
             .card()

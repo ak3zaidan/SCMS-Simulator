@@ -778,7 +778,10 @@ impl ScmsRun {
     ) -> FlowRun {
         let run = self.new_run();
         let flow = FlowId::Report;
-        for (stage, t) in [(StageId::Detect, detected_at), (StageId::ReportSent, sent_at)] {
+        for (stage, t) in [
+            (StageId::Detect, detected_at),
+            (StageId::ReportSent, sent_at),
+        ] {
             self.kernel.stages.push(crate::stage::StageStamp {
                 t,
                 run,

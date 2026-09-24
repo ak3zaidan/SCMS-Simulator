@@ -20,9 +20,8 @@ use v2xw_world::osm::{
 };
 use v2xw_world::quant::is_on_grid;
 use v2xw_world::{
-    ClassMask, HeightSource, JunctionControl, LaneKind, PassageKind, SignalState,
-    TurnDirection, World, WorldSource,
-    WorldSourceSpec, serde_native, serde_vwp,
+    ClassMask, HeightSource, JunctionControl, LaneKind, PassageKind, SignalState, TurnDirection,
+    World, WorldSource, WorldSourceSpec, serde_native, serde_vwp,
 };
 
 /// The options every test uses: a fixed import date, so nothing reads a clock, and an
@@ -668,7 +667,10 @@ fn a_traffic_signals_node_synthesises_a_plan() {
     // junction from a stop line of the group, L = 6.1 m, v = 13.4112 m/s.
     for (g, phase) in [(0usize, 2usize), (1, 5)] {
         let red = &plan.phases[phase];
-        assert!(red.states.iter().all(|s| *s == SignalState::Red), "group {g}");
+        assert!(
+            red.states.iter().all(|s| *s == SignalState::Red),
+            "group {g}"
+        );
         let green = &plan.phases[phase - 2];
         let w = plan
             .controlled
@@ -712,8 +714,7 @@ fn conflicting_protected_greens(world: &World) -> Vec<String> {
                     let (la, lb) = (plan.controlled[a], plan.controlled[b]);
                     let (fa, fb) = (from_of[&la], from_of[&lb]);
                     if fa == fb
-                        || (world.lane(fa).edge == world.lane(fb).edge
-                            && to_of[&la] == to_of[&lb])
+                        || (world.lane(fa).edge == world.lane(fb).edge && to_of[&la] == to_of[&lb])
                     {
                         continue;
                     }
@@ -805,9 +806,8 @@ fn every_turn_at_a_crossroads_is_a_drivable_arc() {
         let (from, to) = (world.lane(c.from_lane), world.lane(c.to_lane));
         // Heading continuity at both joins, to the grid's resolution.
         let n = from.centreline.len();
-        let into = wrap(
-            heading(pts[0], pts[1]) - heading(from.centreline[n - 2], from.centreline[n - 1]),
-        );
+        let into =
+            wrap(heading(pts[0], pts[1]) - heading(from.centreline[n - 2], from.centreline[n - 1]));
         let m = pts.len();
         let out =
             wrap(heading(to.centreline[0], to.centreline[1]) - heading(pts[m - 2], pts[m - 1]));
@@ -866,12 +866,24 @@ fn roads_through_buildings_are_passages_by_their_tags() {
         way(
             10,
             &[1, 2],
-            &[("highway", "primary"), ("lanes", "2"), ("tunnel", "building_passage")],
+            &[
+                ("highway", "primary"),
+                ("lanes", "2"),
+                ("tunnel", "building_passage"),
+            ],
         ),
         way(11, &[3, 4], &[("highway", "service"), ("lanes", "2")]),
         way(12, &[5, 6], &[("highway", "primary"), ("lanes", "2")]),
-        way(20, &[100, 101, 102, 103, 100], &[("building", "office"), ("height", "60")]),
-        way(21, &[200, 201, 202, 203, 200], &[("building", "yes"), ("height", "30")]),
+        way(
+            20,
+            &[100, 101, 102, 103, 100],
+            &[("building", "office"), ("height", "60")],
+        ),
+        way(
+            21,
+            &[200, 201, 202, 203, 200],
+            &[("building", "yes"), ("height", "30")],
+        ),
         way(
             22,
             &[300, 301, 302, 303, 300],
@@ -883,7 +895,9 @@ fn roads_through_buildings_are_passages_by_their_tags() {
     let by_kind: BTreeSet<PassageKind> = world.passages.iter().map(|p| p.kind).collect();
     assert_eq!(
         by_kind,
-        [PassageKind::BuildingPassage, PassageKind::Untagged].into_iter().collect(),
+        [PassageKind::BuildingPassage, PassageKind::Untagged]
+            .into_iter()
+            .collect(),
         "passages: {:?}",
         world.passages
     );

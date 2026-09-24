@@ -2230,10 +2230,7 @@ pub fn install_provisioned(
 /// would be one pseudonym under two names — exactly the linkability a pool exists to
 /// prevent. The state follows the validity window, so a certificate for a later period
 /// is held `Preloaded` and becomes usable when its window opens.
-pub fn provisioned_handle(
-    node: NodeId,
-    cred: &crate::phase2::ProvisionedCred,
-) -> CredentialHandle {
+pub fn provisioned_handle(node: NodeId, cred: &crate::phase2::ProvisionedCred) -> CredentialHandle {
     let index = cred.i.wrapping_mul(64).wrapping_add(cred.j);
     CredentialHandle {
         digest: pseudo_signer(node, index),

@@ -263,7 +263,11 @@ fn geometry_report(world: &v2xw_world::World, args_verbose: bool) {
         let at = |s: f64| {
             let k = cum.partition_point(|c| *c <= s).clamp(1, pts.len() - 1);
             let seg = cum[k] - cum[k - 1];
-            let f = if seg > 0.0 { (s - cum[k - 1]) / seg } else { 0.0 };
+            let f = if seg > 0.0 {
+                (s - cum[k - 1]) / seg
+            } else {
+                0.0
+            };
             pts[k - 1].lerp(pts[k], f.clamp(0.0, 1.0))
         };
         // The circumradius of three points `STEP` apart along the path (Menger
@@ -305,22 +309,42 @@ fn geometry_report(world: &v2xw_world::World, args_verbose: bool) {
                 .iter()
                 .find(|c| c.via == Some(lane.id))
                 .map_or("none".to_string(), |c| format!("{:?}", c.direction));
-            let arms = lane.junction.map_or(0, |j| world.junction(j).incoming.len());
-            let row = by_turn.entry(format!("{dir} arms>=3:{}", arms >= 3)).or_insert([0usize; 6]);
+            let arms = lane
+                .junction
+                .map_or(0, |j| world.junction(j).incoming.len());
+            let row = by_turn
+                .entry(format!("{dir} arms>=3:{}", arms >= 3))
+                .or_insert([0usize; 6]);
             row[buckets.iter().position(|b| r < *b).unwrap_or(5)] += 1;
             if r < 5.4 && dir != "UTurn" && args_verbose {
-                if let Some(c) = world.roads.connections().iter().find(|c| c.via == Some(lane.id)) {
+                if let Some(c) = world
+                    .roads
+                    .connections()
+                    .iter()
+                    .find(|c| c.via == Some(lane.id))
+                {
                     let f = world.lane(c.from_lane);
                     let t = world.lane(c.to_lane);
                     println!(
                         "  tight {dir} connector {} r={r:.2} at ({x:.1},{y:.1}): from {} len {:.1}, to {} len {:.1}, connector len {:.1}",
-                        lane.id.index(), c.from_lane.index(), f.length_m, c.to_lane.index(), t.length_m, lane.length_m
+                        lane.id.index(),
+                        c.from_lane.index(),
+                        f.length_m,
+                        c.to_lane.index(),
+                        t.length_m,
+                        lane.length_m
                     );
                 }
             }
         }
         if r < 5.4 {
-            worst.push((r, lane.id.index(), if kind == 0 { "connector" } else { "lane" }, x, y));
+            worst.push((
+                r,
+                lane.id.index(),
+                if kind == 0 { "connector" } else { "lane" },
+                x,
+                y,
+            ));
         }
         // Joins: the last 3 m of this lane and the first 3 m of each successor.
         for next in world.successor_lanes(lane.id) {
@@ -330,7 +354,13 @@ fn geometry_report(world: &v2xw_world::World, args_verbose: bool) {
             }
             let gap = lane.end().distance_2d(nl.start());
             if gap > 0.05 {
-                worst.push((-gap, lane.id.index(), "disjoint join", lane.end().x, lane.end().y));
+                worst.push((
+                    -gap,
+                    lane.id.index(),
+                    "disjoint join",
+                    lane.end().x,
+                    lane.end().y,
+                ));
                 continue;
             }
             let mut pts = vec![lane.point_at((lane.length_m - 3.0).max(0.0))];

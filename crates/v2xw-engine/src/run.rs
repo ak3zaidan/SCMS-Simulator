@@ -1314,8 +1314,7 @@ impl Engine {
             // count is in the run report.
             match feed.spat_bytes(now, self.wall, framing) {
                 Ok(bytes) => {
-                    if let Some(runtime) = self.nodes.get_mut(&node).and_then(|n| n.as_obu_mut())
-                    {
+                    if let Some(runtime) = self.nodes.get_mut(&node).and_then(|n| n.as_obu_mut()) {
                         runtime.set_infra_payload(v2xw_msg::MsgType::Spat, bytes);
                     }
                 }
@@ -2827,7 +2826,9 @@ impl Engine {
         let _ = signature_valid;
         // The passive privacy observer hears the safety frame as it goes on the air.
         if matches!(tx.msg_type, v2xw_msg::MsgType::Bsm | v2xw_msg::MsgType::Cam)
-            && let Some(signer) = credential.as_ref().map(|c| crate::phase2::digest_bytes(&c.digest))
+            && let Some(signer) = credential
+                .as_ref()
+                .map(|c| crate::phase2::digest_bytes(&c.digest))
             && self.phase2.is_some()
         {
             let confidence = belief.map_or(5.0, |b| b.semi_major_m.max(0.0));
@@ -4577,7 +4578,10 @@ impl Engine {
         for (node, creds, bytes) in &tick.installs {
             if let Some(runtime) = self.nodes.get_mut(node) {
                 for c in creds {
-                    runtime.stores_mut().certs.insert(crate::wiring::provisioned_handle(*node, c));
+                    runtime
+                        .stores_mut()
+                        .certs
+                        .insert(crate::wiring::provisioned_handle(*node, c));
                 }
             }
             let rec = crate::sec_records::SecCert::new(now, *node, "top-up", None, Some(*bytes));
@@ -5002,7 +5006,9 @@ impl Engine {
                 .iter()
                 .filter(|c| c.is_valid_at(runtime.clock().believed_time(now)))
                 .count() as u32;
-            let digest = active.as_ref().map(|c| crate::phase2::digest_bytes(&c.digest));
+            let digest = active
+                .as_ref()
+                .map(|c| crate::phase2::digest_bytes(&c.digest));
             let Some(p) = self.phase2.as_mut() else {
                 return;
             };

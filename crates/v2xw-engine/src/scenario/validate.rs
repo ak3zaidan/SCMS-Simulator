@@ -1142,29 +1142,32 @@ fn security_backend(s: &Scenario, e: &mut Vec<ScenarioError>) {
             e.push(inner);
         }
     };
-    take(crate::backend::BackendAccess::from_scenario(s).and_then(|access| {
-        for (i, rsu) in s.actors.rsus.iter().enumerate() {
-            access.backhaul_of(rsu.backhaul.as_deref()).map_err(|_| {
-                crate::EngineError::Scenario(ScenarioError::conflict(
-                    &format!("actors.rsus[{i}].backhaul"),
-                    format!(
-                        "'{}' is not a backhaul model; allowed: {}",
-                        rsu.backhaul.as_deref().unwrap_or(""),
-                        crate::backend::BACKHAUL_MODELS.join(", ")
-                    ),
-                ))
-            })?;
-        }
-        Ok(())
-    }));
+    take(
+        crate::backend::BackendAccess::from_scenario(s).and_then(|access| {
+            for (i, rsu) in s.actors.rsus.iter().enumerate() {
+                access.backhaul_of(rsu.backhaul.as_deref()).map_err(|_| {
+                    crate::EngineError::Scenario(ScenarioError::conflict(
+                        &format!("actors.rsus[{i}].backhaul"),
+                        format!(
+                            "'{}' is not a backhaul model; allowed: {}",
+                            rsu.backhaul.as_deref().unwrap_or(""),
+                            crate::backend::BACKHAUL_MODELS.join(", ")
+                        ),
+                    ))
+                })?;
+            }
+            Ok(())
+        }),
+    );
     take(crate::phase2::LifecycleParams::from_scenario(s).map(|_| ()));
     for (i, a) in s.threats.attackers.iter().enumerate() {
-        if let Some(kind) = a
-            .id
-            .strip_prefix("threat/attacker/legacy/")
-            .and_then(v2xw_threat::AttackKind::parse)
-            && let Err(crate::EngineError::Scenario(ScenarioError::Conflict { field, conflict: why })) =
-                crate::phase2::attacker_params(kind, &a.params)
+        if let Some(kind) =
+            a.id.strip_prefix("threat/attacker/legacy/")
+                .and_then(v2xw_threat::AttackKind::parse)
+            && let Err(crate::EngineError::Scenario(ScenarioError::Conflict {
+                field,
+                conflict: why,
+            })) = crate::phase2::attacker_params(kind, &a.params)
         {
             e.push(conflict(
                 &field.replace("threats.attackers[]", &format!("threats.attackers[{i}]")),
@@ -1185,8 +1188,7 @@ fn security_backend(s: &Scenario, e: &mut Vec<ScenarioError>) {
         ));
     }
     let etsi = s.actors.backend.protocol.as_deref() == Some(crate::phase2::ETSI_PKI)
-        || s
-            .security
+        || s.security
             .protocol
             .as_ref()
             .is_some_and(|p| p.id == crate::phase2::ETSI_PKI);

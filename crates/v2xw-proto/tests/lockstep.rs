@@ -18,15 +18,25 @@ fn a_preloaded_pool_leaves_the_run_clock_untouched() {
     let mut run = ScmsRun::new(ScmsParams::default()).expect("encodes");
     run.preload(DEVICE_A, 0, 2, 3).expect("preloads");
     let dev = &run.state.devices[&DEVICE_A];
-    assert_eq!(dev.credentials.len(), 6, "two periods of three certificates");
+    assert_eq!(
+        dev.credentials.len(),
+        6,
+        "two periods of three certificates"
+    );
     // The LAs and the PCA hold what a later investigation needs.
     assert!(!run.state.pca.issued.is_empty());
     assert!(run.state.la.iter().all(|la| !la.chains.is_empty()));
     // With the cited one-day request shuffle a pool still arrives: the shuffle is in the
     // past, and a pre-run pool must not be held up by it.
     assert_eq!(run.kernel.now(), 0, "the run's clock moved");
-    assert!(run.kernel.stages.stamps().is_empty(), "the run's stage log is not empty");
-    assert!(run.kernel.steps.is_empty(), "the run's wire log is not empty");
+    assert!(
+        run.kernel.stages.stamps().is_empty(),
+        "the run's stage log is not empty"
+    );
+    assert!(
+        run.kernel.steps.is_empty(),
+        "the run's wire log is not empty"
+    );
     assert_eq!(
         run.state.params.shuffle_window,
         ScmsParams::default().shuffle_window,
@@ -59,18 +69,23 @@ fn a_decided_certificate_is_revoked_through_both_linkage_authorities() {
     let received = log
         .at(report_run, StageId::ReportReceived)
         .expect("the report reached the authority after the RA's shuffle");
-    assert!(received >= 60 * NS_PER_S, "the quick shuffle window is a minute");
+    assert!(
+        received >= 60 * NS_PER_S,
+        "the quick shuffle window is a minute"
+    );
     // The access leg is in the wire log with the transport the engine used.
     assert!(
-        run.kernel
-            .steps
-            .iter()
-            .any(|s| s.run == report_run && s.transport == Transport::CellularUu && s.bytes == 1_200)
+        run.kernel.steps.iter().any(|s| s.run == report_run
+            && s.transport == Transport::CellularUu
+            && s.bytes == 1_200)
     );
 
     let (resolution, issuance) = run.revoke(0, 0, 2).expect("a report is held");
     assert!(run.case_open());
-    assert!(run.revoke(0, 0, 2).is_none(), "cases are carried out one at a time");
+    assert!(
+        run.revoke(0, 0, 2).is_none(),
+        "cases are carried out one at a time"
+    );
     run.run_until(400 * NS_PER_S).expect("runs");
     let case = run.state.ma.case.as_ref().expect("the case");
     assert!(case.done && case.resolved);
@@ -107,7 +122,10 @@ fn a_decided_certificate_is_revoked_through_both_linkage_authorities() {
     broken.state.la[1].chains.clear();
     broken.revoke(0, 0, 2).expect("a report is held");
     broken.run_until(400 * NS_PER_S).expect("runs");
-    assert!(broken.state.crl_store.entries.is_empty(), "one LA's seed revoked a device");
+    assert!(
+        broken.state.crl_store.entries.is_empty(),
+        "one LA's seed revoked a device"
+    );
 }
 
 /// With a cadence, the CRL Generator holds an entry until the next boundary of the
@@ -146,6 +164,9 @@ fn the_crl_is_published_on_its_cadence() {
     // The fault the rule exists against: without the cadence the entry goes out at once,
     // so the check above is not satisfied by accident.
     let (issued, published) = publish(300, false);
-    assert!(published - issued < NS_PER_S, "on decision, publication is immediate");
+    assert!(
+        published - issued < NS_PER_S,
+        "on decision, publication is immediate"
+    );
     assert!(published < (issued / cadence + 1) * cadence);
 }

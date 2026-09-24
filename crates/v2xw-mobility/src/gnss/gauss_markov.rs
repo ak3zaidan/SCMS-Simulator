@@ -515,9 +515,7 @@ impl GnssModel for GaussMarkovGnss {
         {
             let coin = ctx.rng(RngDomain::Gnss, EntityRef::Node(node)).f64();
             let state = self.state.entry(node).or_default();
-            if now >= state.burst_until
-                && coin < event_probability(self.params.burst_rate, dt_s)
-            {
+            if now >= state.burst_until && coin < event_probability(self.params.burst_rate, dt_s) {
                 state.burst_until =
                     now.saturating_add(v2xw_core::time::secs_to_ns(self.params.burst_duration_s));
             }

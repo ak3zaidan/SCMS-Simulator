@@ -57,6 +57,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adapters;
+pub mod backend;
 pub mod ctx;
 pub mod error;
 pub mod event;
@@ -65,14 +66,13 @@ pub mod frag;
 pub mod hosted;
 pub mod infra;
 pub mod manifest;
-pub mod backend;
 pub mod phase2;
 pub mod privacy_metrics;
-pub mod sec_records;
-pub mod signature;
 pub mod records;
 pub mod run;
 pub mod scenario;
+pub mod sec_records;
+pub mod signature;
 pub mod snapshot;
 pub mod timeline;
 pub mod wiring;

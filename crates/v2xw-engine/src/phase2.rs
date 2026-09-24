@@ -71,14 +71,13 @@ use v2xw_proto::stage::{FlowRun, StageId};
 use v2xw_proto::{RevocationLatency, ScmsParams};
 use v2xw_sec::linkage::{CrlLinkageEntry, LinkageValue};
 use v2xw_threat::{
-    AttackKind, Attacker, AttackerView, DetectorParams, Emission, Evidence, HonestClaim,
-    Legacy12, LegacyAttacker, LegacyAttackerParams, LegacyWindow, MaAction, MaParams,
-    MisbehaviourReport, NoMap, ObservedKind, ObservedMessage, SelfBelief, StationType,
-    ThreatCtx, VerificationState,
+    AttackKind, Attacker, AttackerView, DetectorParams, Emission, Evidence, HonestClaim, Legacy12,
+    LegacyAttacker, LegacyAttackerParams, LegacyWindow, MaAction, MaParams, MisbehaviourReport,
+    NoMap, ObservedKind, ObservedMessage, SelfBelief, StationType, ThreatCtx, VerificationState,
 };
 use v2xw_world::World;
 
-use crate::backend::{AccessKind, Backhaul, BackendAccess};
+use crate::backend::{AccessKind, BackendAccess, Backhaul};
 use crate::error::{EngineError, Result};
 use crate::scenario::Scenario;
 
@@ -505,7 +504,12 @@ pub struct BackendTick {
     /// Backend-network and backhaul bytes moved since the last tick:
     /// `(t, bucket, bytes, node)`. The sidelink's own bytes are not here: a relayed
     /// report's air hop is a frame on `node.tx` like any other.
-    pub bytes: Vec<(SimTime, v2xw_metrics::channels::ByteBucket, u64, Option<NodeId>)>,
+    pub bytes: Vec<(
+        SimTime,
+        v2xw_metrics::channels::ByteBucket,
+        u64,
+        Option<NodeId>,
+    )>,
 }
 
 /// The Phase 2 state of one run.
@@ -646,14 +650,15 @@ impl Phase2 {
             }
             if let Some(map) = choice.params.as_object() {
                 for (key, value) in map {
-                    let v = value.as_f64().filter(|v| v.is_finite() && *v >= 0.0).ok_or_else(
-                        || {
+                    let v = value
+                        .as_f64()
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .ok_or_else(|| {
                             conflict(
                                 &format!("detection.local[].params.{key}"),
                                 format!("must be a finite number ≥ 0, got {value}"),
                             )
-                        },
-                    )?;
+                        })?;
                     if key == "report_interval_s" {
                         report_interval = secs(v);
                     } else if !apply_detector_param(&mut detector_params, key, v) {
@@ -929,11 +934,7 @@ impl Phase2 {
     pub fn report(&self) -> Phase2Report {
         let mut r = self.report.clone();
         r.access = self.access.report.clone();
-        r.reports_unsent = self
-            .nodes
-            .values()
-            .map(|n| n.outbox.len() as u64)
-            .sum();
+        r.reports_unsent = self.nodes.values().map(|n| n.outbox.len() as u64).sum();
         r
     }
 
@@ -991,7 +992,10 @@ impl Phase2 {
         rng: &v2xw_core::rng::RngRegistry,
     ) -> Vec<ProvisionedCred> {
         let relay = self.rsus.iter().any(|s| {
-            s.backhaul.connected && (s.roles.is_empty() || s.has_role("provisioning-proxy") || s.has_role("report-forward"))
+            s.backhaul.connected
+                && (s.roles.is_empty()
+                    || s.has_role("provisioning-proxy")
+                    || s.has_role("report-forward"))
         });
         let kind = self.access.assign(rng, node, relay);
         let device = device_of(node);
@@ -1238,7 +1242,10 @@ impl Phase2 {
             // honest vehicles were reported. A frozen or falsified claim is as visible at
             // one check a second as at ten.
             if let Some(last) = self.checked_at.get(&(node, key))
-                && m.received_at < interval.after(*last).saturating_sub(interval.as_nanos() / 10)
+                && m.received_at
+                    < interval
+                        .after(*last)
+                        .saturating_sub(interval.as_nanos() / 10)
             {
                 continue;
             }
@@ -1300,9 +1307,9 @@ impl Phase2 {
             self.filed.insert(pair, m.received_at);
             let evidence = Evidence::at(m.received_at, m.received_at, 5.0);
             let id = format!("r-{}-{}-{}", node.index(), verdict.subject, m.received_at);
-            let reporter = reporter_digest.clone().unwrap_or_else(|| {
-                v2xw_core::hash::hex_encode(&me.node.index().to_le_bytes())
-            });
+            let reporter = reporter_digest
+                .clone()
+                .unwrap_or_else(|| v2xw_core::hash::hex_encode(&me.node.index().to_le_bytes()));
             if self.rsu_nodes.contains(&node) {
                 self.ma.trust_infrastructure(reporter.clone());
             }
@@ -1526,10 +1533,7 @@ impl Phase2 {
             for s in &stamps {
                 if s.stage == StageId::Published || s.stage == StageId::FirstRsuBroadcast {
                     for case in &mut self.cases {
-                        if case
-                            .entry
-                            .as_ref()
-                            .is_some_and(|(_, v)| *v <= store)
+                        if case.entry.as_ref().is_some_and(|(_, v)| *v <= store)
                             && case.stamps_emitted.insert((s.stage as u8, s.t))
                         {
                             tick.stages.push(crate::sec_records::ProtoRevocation::stage(
@@ -1551,7 +1555,9 @@ impl Phase2 {
         let mut finished = Vec::new();
         for (node, n) in &self.nodes {
             let Some(run) = n.topup else { continue };
-            if log.at_node(run, StageId::Installed, device_of(*node)).is_some()
+            if log
+                .at_node(run, StageId::Installed, device_of(*node))
+                .is_some()
                 || log.at(run, StageId::Installed).is_some()
             {
                 finished.push((*node, run));
@@ -1560,7 +1566,14 @@ impl Phase2 {
         for (node, run) in finished {
             let next_i = self.nodes.get(&node).map_or(0, |n| n.last_period + 1);
             let fresh = self.creds_of_device(device_of(node), next_i);
-            let bytes = self.scms.kernel.steps.iter().filter(|s| s.run == run).map(|s| u64::from(s.bytes)).sum();
+            let bytes = self
+                .scms
+                .kernel
+                .steps
+                .iter()
+                .filter(|s| s.run == run)
+                .map(|s| u64::from(s.bytes))
+                .sum();
             if let Some(n) = self.nodes.get_mut(&node) {
                 n.topup = None;
                 if !fresh.is_empty() {
@@ -1570,7 +1583,10 @@ impl Phase2 {
             if !fresh.is_empty() {
                 self.report.topups_completed += 1;
                 self.report.certs_topped_up += fresh.len() as u64;
-                self.creds.entry(node).or_default().extend(fresh.iter().copied());
+                self.creds
+                    .entry(node)
+                    .or_default()
+                    .extend(fresh.iter().copied());
                 tick.installs.push((node, fresh, bytes));
             }
         }
@@ -1616,14 +1632,16 @@ impl Phase2 {
                 subject: r.subject_cert_digest.clone(),
                 detector: r.leading_reason().map(str::to_string),
             });
-            if let Some(MaAction::Revoke { subject }) = self.ma.ingest_evidence(&r, r.detection_time)
+            if let Some(MaAction::Revoke { subject }) =
+                self.ma.ingest_evidence(&r, r.detection_time)
             {
                 self.report.ma_revoke_decisions += 1;
-                tick.ma_decisions.push(v2xw_threat::records::MaDecisionRecord {
-                    t,
-                    subject: subject.clone(),
-                    decision: "revoke".to_string(),
-                });
+                tick.ma_decisions
+                    .push(v2xw_threat::records::MaDecisionRecord {
+                        t,
+                        subject: subject.clone(),
+                        decision: "revoke".to_string(),
+                    });
                 decisions.push((f.subject, subject, run, t));
             }
         }
@@ -1653,7 +1671,10 @@ impl Phase2 {
         };
         for s in &stamps {
             if s.stage == StageId::Blocklisted
-                && let Some(b) = self.blocks.iter_mut().find(|b| b.run == s.run && b.blocked.is_none())
+                && let Some(b) = self
+                    .blocks
+                    .iter_mut()
+                    .find(|b| b.run == s.run && b.blocked.is_none())
             {
                 b.blocked = Some(s.t);
                 tick.stages.push(crate::sec_records::ProtoRevocation::stage(
@@ -1767,7 +1788,10 @@ impl Phase2 {
             }
             self.report.topups_completed += 1;
             self.report.certs_topped_up += fresh.len() as u64;
-            self.creds.entry(node).or_default().extend(fresh.iter().copied());
+            self.creds
+                .entry(node)
+                .or_default()
+                .extend(fresh.iter().copied());
             tick.installs.push((node, fresh, 0));
         }
         let (steps, cursor) = {
@@ -1846,7 +1870,10 @@ impl Phase2 {
     /// The list the roadside broadcast path holds.
     #[must_use]
     pub fn broadcast_crl(&self) -> (u32, &[CrlLinkageEntry]) {
-        (self.broadcast_version, &self.scms.state.crl_broadcast.entries)
+        (
+            self.broadcast_version,
+            &self.scms.state.crl_broadcast.entries,
+        )
     }
 
     /// The CRL's size on the wire for `entries` entries.
@@ -1884,7 +1911,12 @@ impl Phase2 {
 
     /// Gives each vehicle's first poll a phase inside the interval, from a keyed draw, so
     /// a fleet does not poll in one instant.
-    pub fn phase_crl_poll(&mut self, node: NodeId, rng: &v2xw_core::rng::RngRegistry, now: SimTime) {
+    pub fn phase_crl_poll(
+        &mut self,
+        node: NodeId,
+        rng: &v2xw_core::rng::RngRegistry,
+        now: SimTime,
+    ) {
         let interval = self.params.crl_fetch_interval.as_nanos();
         if let Some(n) = self.nodes.get_mut(&node) {
             let u = rng
@@ -1918,7 +1950,10 @@ impl Phase2 {
         entries: &[CrlLinkageEntry],
         now: SimTime,
         cellular: bool,
-    ) -> (Vec<CrlLinkageEntry>, Vec<crate::sec_records::ProtoRevocation>) {
+    ) -> (
+        Vec<CrlLinkageEntry>,
+        Vec<crate::sec_records::ProtoRevocation>,
+    ) {
         let mut records = Vec::new();
         let Some(n) = self.nodes.get_mut(&node) else {
             return (Vec::new(), records);
@@ -2049,7 +2084,11 @@ impl Phase2 {
             }
             let remaining = n.last_period.saturating_add(1).saturating_sub(current);
             if below > 0 && remaining <= below {
-                out.push((*node, n.access.unwrap_or(AccessKind::Offline), n.last_period + 1));
+                out.push((
+                    *node,
+                    n.access.unwrap_or(AccessKind::Offline),
+                    n.last_period + 1,
+                ));
             }
         }
         out
@@ -2084,7 +2123,12 @@ impl Phase2 {
     }
 
     /// Notes a pseudonym change the engine saw, returning the previous digest.
-    pub fn note_change(&mut self, node: NodeId, changes: u32, digest: Option<[u8; 8]>) -> Option<Option<[u8; 8]>> {
+    pub fn note_change(
+        &mut self,
+        node: NodeId,
+        changes: u32,
+        digest: Option<[u8; 8]>,
+    ) -> Option<Option<[u8; 8]>> {
         let n = self.nodes.get_mut(&node)?;
         if changes == n.changes_seen && digest == n.active_digest {
             return None;
@@ -2125,7 +2169,11 @@ impl Phase2 {
         let n = self.nodes.get(&node)?;
         let active = certs.active();
         let hex = |d: &[u8]| v2xw_core::hash::hex_encode(d);
-        let valid = certs.credentials().iter().filter(|c| c.is_valid_at(t)).count();
+        let valid = certs
+            .credentials()
+            .iter()
+            .filter(|c| c.is_valid_at(t))
+            .count();
         let preloaded = certs
             .credentials()
             .iter()
@@ -2134,7 +2182,12 @@ impl Phase2 {
         Some(crate::sec_records::NodeSecurityView {
             t,
             node,
-            protocol: if self.etsi.is_some() { ETSI_PKI } else { CAMP_SCMS }.to_string(),
+            protocol: if self.etsi.is_some() {
+                ETSI_PKI
+            } else {
+                CAMP_SCMS
+            }
+            .to_string(),
             pseudonym: active.map(|c| hex(&c.digest.0[..])),
             temp_id: active.map(|c| hex(&c.digest.0[..4])),
             cert_i: active.map(|c| c.i_period),
@@ -2182,7 +2235,11 @@ impl Phase2 {
         let issued_unpublished = self
             .cases
             .iter()
-            .filter(|c| c.entry.as_ref().is_some_and(|(_, v)| *v > self.published_version))
+            .filter(|c| {
+                c.entry
+                    .as_ref()
+                    .is_some_and(|(_, v)| *v > self.published_version)
+            })
             .count() as u64;
         self.report.crl_past_horizon = self.report.crl_past_horizon.max(issued_unpublished);
     }
@@ -2230,33 +2287,35 @@ impl Phase2 {
             radio_range_m: f64::INFINITY,
         };
         if let Some(o) = self.observer.on_message(ctx, &me, &m) {
-            self.link_claims.push(v2xw_threat::records::PrivacyLinkClaim {
-                t: at,
-                observer: NodeId::new(u32::MAX),
-                predecessor: o.predecessor.clone().unwrap_or_default(),
-                successor: o.successor.clone(),
-                posterior: v2xw_core::math::quantize_to(o.posterior, 1e-6),
-                candidates: o.anonymity_set_size.saturating_sub(1),
-                anonymity_set_size: o.anonymity_set_size,
-                effective_anonymity_set_bits: v2xw_core::math::quantize_to(
-                    o.effective_anonymity_set_bits,
-                    1e-6,
-                ),
-                degree_of_anonymity: v2xw_core::math::quantize_to(o.degree_of_anonymity, 1e-6),
-                method: if o.predecessor.is_some() {
-                    v2xw_threat::privacy::METHOD.to_string()
-                } else {
-                    v2xw_threat::privacy::METHOD_UNLINKED.to_string()
-                },
-            });
+            self.link_claims
+                .push(v2xw_threat::records::PrivacyLinkClaim {
+                    t: at,
+                    observer: NodeId::new(u32::MAX),
+                    predecessor: o.predecessor.clone().unwrap_or_default(),
+                    successor: o.successor.clone(),
+                    posterior: v2xw_core::math::quantize_to(o.posterior, 1e-6),
+                    candidates: o.anonymity_set_size.saturating_sub(1),
+                    anonymity_set_size: o.anonymity_set_size,
+                    effective_anonymity_set_bits: v2xw_core::math::quantize_to(
+                        o.effective_anonymity_set_bits,
+                        1e-6,
+                    ),
+                    degree_of_anonymity: v2xw_core::math::quantize_to(o.degree_of_anonymity, 1e-6),
+                    method: if o.predecessor.is_some() {
+                        v2xw_threat::privacy::METHOD.to_string()
+                    } else {
+                        v2xw_threat::privacy::METHOD_UNLINKED.to_string()
+                    },
+                });
             if o.predecessor.is_some() {
                 self.report.privacy_links_claimed += 1;
                 let owner = |hex: &str| {
                     decode_hex8(hex).and_then(|d| self.by_digest.get(&d).map(|(n, ..)| *n))
                 };
-                if let (Some(a), Some(b)) =
-                    (o.predecessor.as_deref().and_then(owner), owner(&o.successor))
-                    && a == b
+                if let (Some(a), Some(b)) = (
+                    o.predecessor.as_deref().and_then(owner),
+                    owner(&o.successor),
+                ) && a == b
                 {
                     self.report.privacy_links_correct += 1;
                 }
@@ -2364,7 +2423,11 @@ fn apply_backend_net(scenario: &Scenario, p: &mut ScmsParams) -> Result<()> {
             ),
         ));
     }
-    if let Some(ms) = choice.params.get("latency_ms").and_then(serde_json::Value::as_f64) {
+    if let Some(ms) = choice
+        .params
+        .get("latency_ms")
+        .and_then(serde_json::Value::as_f64)
+    {
         p.backend_link_latency = Duration::from_nanos((ms * 1e6).round().max(0.0) as u64);
     }
     if let Some(mbps) = choice
@@ -2483,9 +2546,9 @@ fn apply_backend_topology(scenario: &Scenario, scms: &mut ScmsRun) -> Result<()>
             transport: Transport::BackendNet,
         });
         let link = v2xw_proto::Link {
-            latency: l
-                .latency_ms
-                .map_or(base.latency, |ms| Duration::from_nanos((ms * 1e6).round() as u64)),
+            latency: l.latency_ms.map_or(base.latency, |ms| {
+                Duration::from_nanos((ms * 1e6).round() as u64)
+            }),
             bandwidth_bps: l
                 .capacity_mbps
                 .map_or(base.bandwidth_bps, |m| (m * 1e6).round().max(1.0) as u64),

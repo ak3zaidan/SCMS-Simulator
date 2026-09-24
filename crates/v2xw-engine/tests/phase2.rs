@@ -112,25 +112,50 @@ fn a_report_becomes_a_vehicle_that_cannot_sign() {
     let p = &report.phase2;
     println!("{}", serde_json::to_string_pretty(p).unwrap_or_default());
 
-    assert_eq!(p.backend_errors, 0, "the backend refused: {}", p.first_backend_error);
+    assert_eq!(
+        p.backend_errors, 0,
+        "the backend refused: {}",
+        p.first_backend_error
+    );
     assert!(p.rsus > 1, "the roadside units were not created");
     assert_eq!(p.attackers, 1, "the attacker was not armed");
-    assert!(p.falsified_claims > 0, "the attacker never falsified anything");
-    assert!(p.messages_checked > 0, "the detector suite never saw a message");
+    assert!(
+        p.falsified_claims > 0,
+        "the attacker never falsified anything"
+    );
+    assert!(
+        p.messages_checked > 0,
+        "the detector suite never saw a message"
+    );
     assert!(p.verdicts_fired > 0, "no detector fired");
     assert!(p.reports_sent > 0, "no report was filed");
     assert!(
         p.reports_uploaded_cellular > 0,
         "no report crossed a cellular uplink, which is how this fleet reaches the backend"
     );
-    assert!(p.reports_received > 0, "no report reached the privacy proxy");
-    assert!(p.reports_at_ma > 0, "no report came through the RA's shuffle to the authority");
+    assert!(
+        p.reports_received > 0,
+        "no report reached the privacy proxy"
+    );
+    assert!(
+        p.reports_at_ma > 0,
+        "no report came through the RA's shuffle to the authority"
+    );
     assert!(p.ma_revoke_decisions > 0, "the authority never decided");
     assert!(p.cases_opened > 0, "the backend never opened a case");
     assert!(p.crls_issued >= 1, "the CRL Generator did not issue");
-    assert!(p.revoked_attackers >= 1, "the attacker was not the device revoked");
-    assert_eq!(p.revoked_honest, 0, "an honest device was revoked beside the attacker");
-    assert!(p.crl_versions_published >= 1, "the CRL Store never published");
+    assert!(
+        p.revoked_attackers >= 1,
+        "the attacker was not the device revoked"
+    );
+    assert_eq!(
+        p.revoked_honest, 0,
+        "an honest device was revoked beside the attacker"
+    );
+    assert!(
+        p.crl_versions_published >= 1,
+        "the CRL Store never published"
+    );
     assert!(
         p.crl_broadcasts > 0 || p.crl_downloads > 0,
         "the list was published and neither path distributed it"
@@ -152,8 +177,11 @@ fn the_revocation_latency_is_decomposed_by_stage() {
     let horizon_ns = (scenario.time.duration_s * 1e9).round() as u64;
     let (report, _) = path_run();
     let p = &report.phase2;
-    let stages: Vec<(&str, u64)> =
-        p.revocation_stages.iter().map(|(s, t)| (s.as_str(), *t)).collect();
+    let stages: Vec<(&str, u64)> = p
+        .revocation_stages
+        .iter()
+        .map(|(s, t)| (s.as_str(), *t))
+        .collect();
     println!("{stages:?}");
     let at = |name: &str| stages.iter().find(|(s, _)| *s == name).map(|(_, t)| *t);
     for name in [
@@ -176,7 +204,10 @@ fn the_revocation_latency_is_decomposed_by_stage() {
     // The report waited in the RA's shuffle: the window is a minute in this scenario.
     let shuffled = at("shuffled").unwrap() - at("report_sent").unwrap();
     assert!(shuffled > 0, "the report skipped the RA's shuffle");
-    assert!(shuffled <= 61_000_000_000, "the shuffle took longer than its window");
+    assert!(
+        shuffled <= 61_000_000_000,
+        "the shuffle took longer than its window"
+    );
     // The entry waited for the Generator's 60 s cadence boundary.
     assert!(at("published").unwrap() >= at("issued").unwrap());
     assert!(p.revocation_latency_ns < horizon_ns);
@@ -213,12 +244,18 @@ fn with_no_attacker_nothing_is_revoked() {
     }
     assert_eq!(p.attackers, 0);
     assert_eq!(p.falsified_claims, 0);
-    assert!(p.messages_checked > 0, "the detectors must still be running");
+    assert!(
+        p.messages_checked > 0,
+        "the detectors must still be running"
+    );
     assert_eq!(
         p.ma_revoke_decisions, 0,
         "the authority decided to revoke a device in a run with no attacker in it"
     );
-    assert_eq!(p.crls_issued, 0, "a device was revoked in a run with no attacker in it");
+    assert_eq!(
+        p.crls_issued, 0,
+        "a device was revoked in a run with no attacker in it"
+    );
     assert_eq!(p.revoked_honest, 0);
 }
 
@@ -237,7 +274,10 @@ fn without_either_distribution_path_the_revocation_never_reaches_a_vehicle() {
     assert!(p.reports_received > 0);
     assert!(p.crls_issued >= 1, "the authority must still issue");
     // And the second half is gone.
-    assert_eq!(p.crl_broadcasts, 0, "a unit with no `crl` role broadcast one");
+    assert_eq!(
+        p.crl_broadcasts, 0,
+        "a unit with no `crl` role broadcast one"
+    );
     assert_eq!(p.crl_downloads, 0, "a vehicle polled past its interval");
     assert_eq!(p.crls_installed, 0);
     assert_eq!(p.revoked_receptions, 0);
@@ -256,7 +296,10 @@ fn without_a_modem_or_a_relay_the_authority_hears_nothing() {
     }
     let (report, _) = run(scenario);
     let p = &report.phase2;
-    assert!(p.reports_sent > 0, "the detectors still have to fire, or this proves nothing");
+    assert!(
+        p.reports_sent > 0,
+        "the detectors still have to fire, or this proves nothing"
+    );
     assert_eq!(p.reports_uploaded_cellular, 0);
     assert_eq!(p.reports_uploaded_relay, 0);
     // The units still file their own reports over their backhaul: what reaches the
@@ -265,7 +308,10 @@ fn without_a_modem_or_a_relay_the_authority_hears_nothing() {
         p.reports_received, p.reports_from_rsus,
         "a vehicle's report reached the backend over nothing"
     );
-    assert!(p.reports_unsent > 0, "the vehicles' reports must be held, not dropped");
+    assert!(
+        p.reports_unsent > 0,
+        "the vehicles' reports must be held, not dropped"
+    );
 }
 
 /// The Phase 2 run is deterministic.
@@ -323,7 +369,11 @@ fn a_role_belongs_to_the_unit_that_declares_it_and_not_to_the_scenario() {
 #[test]
 #[ignore = "diagnostic"]
 fn diag_print_report() {
-    let mut s = if std::env::var("FULL").is_ok() { shipped() } else { phase2() };
+    let mut s = if std::env::var("FULL").is_ok() {
+        shipped()
+    } else {
+        phase2()
+    };
     if std::env::var("NO_ATTACKER").is_ok() {
         s.threats.attackers.clear();
     }
