@@ -1012,6 +1012,10 @@ pub fn register_generation_timing(
     Ok(())
 }
 
+/// One end's street direction, a horizontal vector along it (a vehicle's heading), when
+/// known.
+pub type StreetDir = Option<(f64, f64)>;
+
 /// What obstructs a radio link: the obstacle stack of 04-models.md §3.5, as far as this
 /// build composes it.
 ///
@@ -1118,7 +1122,7 @@ impl ObstacleStack {
         a: v2xw_core::geom::Vec3,
         b: v2xw_core::geom::Vec3,
         geometry: bool,
-        dirs: (Option<(f64, f64)>, Option<(f64, f64)>),
+        dirs: (StreetDir, StreetDir),
     ) -> v2xw_radio::LosResult {
         let mut parts = Vec::with_capacity(2);
         if let Some(buildings) = self.buildings.as_mut() {
