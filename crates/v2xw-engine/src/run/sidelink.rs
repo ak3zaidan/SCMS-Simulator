@@ -104,6 +104,10 @@ pub(crate) struct SidelinkAccess {
     pub(crate) mac: SpsEngine,
     pub(crate) channel: ChannelId,
     pub(crate) freq_hz: f64,
+    /// TR 36.885's UE transmit power. A frame's power is now its node's
+    /// `radio.devices` power (default the same 23 dBm), so this is the coupling card's
+    /// reference value only.
+    #[allow(dead_code)]
     pub(crate) tx_power_dbm: f64,
     /// Which nodes transmit in each recent slot, for the half-duplex test at the slot's
     /// end. Pruned to the last few slots as the run advances.
@@ -385,7 +389,9 @@ impl Engine {
         sl.slot_tx.entry(slot).or_default().insert(state.tx);
         sl.report.subchannel_slots_used += u64::from(resource.len);
 
-        // Sensing at every receiver in range.
+        // Sensing at every receiver in range. A faint arrival — under the noise floor less
+        // the `radio.range` margin — is energy in the receiver's S-RSSI window but carries
+        // no SCI it could decode, so it is measured and not sensed.
         for (&rx, &(power, _)) in &state.arrivals {
             for sc in resource.range() {
                 sl.mac.note_energy(rx, slot, sc, power);
@@ -394,8 +400,14 @@ impl Engine {
                 sl.mac.note_sensed(rx, resource, power, rri_slots);
             }
         }
+        for (&rx, &power) in &state.faint {
+            for sc in resource.range() {
+                sl.mac.note_energy(rx, slot, sc, power);
+            }
+        }
 
-        // Co-slot interference, both ways, at each shared receiver.
+        // Co-slot interference, both ways, at each shared receiver, whether the other
+        // transport block is a reception attempt there or only energy.
         let co_slot = sl.slot_frames.get(&slot).cloned().unwrap_or_default();
         sl.slot_frames
             .entry(slot)
@@ -405,11 +417,32 @@ impl Engine {
             let Some(other) = self.frames.get_mut(&other_id) else {
                 continue;
             };
-            for (&rx, &(power, _)) in &state.arrivals {
+            let receivers: std::collections::BTreeSet<NodeId> = state
+                .arrivals
+                .keys()
+                .chain(state.faint.keys())
+                .copied()
+                .collect();
+            for rx in receivers {
                 if rx == other.tx {
                     continue;
                 }
-                if let Some(&(other_power, _)) = other.arrivals.get(&rx) {
+                let mine = state
+                    .arrivals
+                    .get(&rx)
+                    .map(|&(p, _)| (p, true))
+                    .or_else(|| state.faint.get(&rx).map(|&p| (p, false)));
+                let theirs = other
+                    .arrivals
+                    .get(&rx)
+                    .map(|&(p, _)| (p, true))
+                    .or_else(|| other.faint.get(&rx).map(|&p| (p, false)));
+                let (Some((power, mine_attempt)), Some((other_power, theirs_attempt))) =
+                    (mine, theirs)
+                else {
+                    continue;
+                };
+                if mine_attempt {
                     state
                         .sl_interferers
                         .entry(rx)
@@ -419,6 +452,8 @@ impl Engine {
                             power_dbm: other_power,
                             resource: other_res,
                         });
+                }
+                if theirs_attempt {
                     other
                         .sl_interferers
                         .entry(rx)
@@ -432,7 +467,6 @@ impl Engine {
             }
         }
     }
-
     /// The sidelink reception decisions for one transport block, per receiver.
     ///
     /// Sequential, because [`SidelinkPhy::evaluate`] draws through a context; each draw is

@@ -130,11 +130,11 @@ pub mod testctx;
 pub use error::{RadioError, Result};
 pub use traits::{Dcc, Fading, Mac, ObstacleModel, Phy, Propagation};
 pub use types::{
-    AccessCategory, ActorClass, ActorObstacle, ActorSet, CcaState, ChannelId, CodeRate, CornerGeometry,
-    DccAlgorithm, DccState, DropCause, EdgeSource, FrameDescriptor, FrameKind, GateDecision,
-    KnifeEdge, LosClass, LosResult, LossBreakdown, LossCause, MacSdu, Mcs, Modulation, PatternRef,
-    RadioEndpoint, Rat, ReactiveState, ResourceModel, RxHandle, RxOutcome, SduRef, TxGrant,
-    TxHandle, TxRequest, timing,
+    AccessCategory, ActorClass, ActorObstacle, ActorSet, CcaState, ChannelId, CodeRate,
+    CornerGeometry, DccAlgorithm, DccState, DropCause, EdgeSource, FrameDescriptor, FrameKind,
+    GateDecision, KnifeEdge, LosClass, LosResult, LossBreakdown, LossCause, MacSdu, Mcs,
+    Modulation, PatternRef, RadioEndpoint, Rat, ReactiveState, ResourceModel, RxHandle, RxOutcome,
+    SduRef, TxGrant, TxHandle, TxRequest, timing,
 };
 
 pub use abstract_tier::{
@@ -159,9 +159,9 @@ pub use jamming::{
 };
 pub use mac::{Backoff, CbrMeter, EdcaOcbMac, SlottedMac};
 pub use obstacle::{
-    BuildingIndex, BuildingShadowing, CornerTracer, MultiEdgeRule, first_wall_m, segment_blocked, NlosvCase, SommerFit, TerrainDiffraction,
-    VehicleBlockage, knife_edge_loss_db, knife_edge_loss_exact_db, knife_edge_parameter,
-    multi_edge_loss_db,
+    BuildingIndex, BuildingShadowing, CornerTracer, MultiEdgeRule, NlosvCase, SommerFit,
+    TerrainDiffraction, VehicleBlockage, first_wall_m, knife_edge_loss_db,
+    knife_edge_loss_exact_db, knife_edge_parameter, multi_edge_loss_db, segment_blocked,
 };
 pub use per::{PerModel, PerPreset, coded_error_probability, data_field_bits, uncoded_ber};
 pub use phy::{

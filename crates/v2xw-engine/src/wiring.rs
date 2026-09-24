@@ -42,11 +42,12 @@ use crate::adapters::{BoxedFading, BoxedPropagation};
 use crate::error::{EngineError, Result};
 use crate::scenario::Scenario;
 
-/// The transmit power every OBU uses, dBm.
+/// SAE J2945/1's maximum radiated power, `vRPMax`, dBm EIRP [Rostami 2018 Table 1].
 ///
-/// 20 dBm EIRP is the SAE J2945/1 congestion-controlled default for a Class B device and
-/// the figure `NodeConfig::default()` already carries; it is named here so the link budget
-/// and the node configuration cannot drift apart.
+/// Before `radio.devices` existed this was the transmit power of every node and the link
+/// budget added the antenna gain on top of it, counting the gain twice for a J2945/1
+/// radiated power. Congestion control now sets the radiated power and `radio.devices`
+/// the hardware's conducted power; this constant is kept for callers that name it.
 pub const TX_POWER_DBM: f64 = 20.0;
 
 /// Builds the world the scenario names.
@@ -421,6 +422,7 @@ pub const RADIO_MODEL_FAMILIES: &[(&str, &[&str])] = &[
             v2xw_radio::TwoRayGround::ID,
             v2xw_radio::LogDistanceShadowing::ID,
             v2xw_radio::Tr37885::ID,
+            v2xw_radio::GeometricUrbanV2v::ID,
         ],
     ),
     (
@@ -444,6 +446,27 @@ pub enum PropagationChoice {
     LogDistance(Option<v2xw_radio::LogDistancePreset>),
     /// `propagation/tr37885`: the 3GPP LOS/NLOS/NLOSv state model with its own shadowing.
     Tr37885,
+    /// `propagation/v2v-urban-geometric`: TR 37.885 LOS, geometric NLOSv, the Mangel 2011
+    /// corner model round a traced corner and TR 37.885 NLOS elsewhere. The high tier's
+    /// default.
+    Geometric,
+}
+
+impl PropagationChoice {
+    /// Whether this law prices building obstruction itself, so the obstacle stack
+    /// classifies buildings for it but must not charge them again.
+    pub const fn owns_buildings(self) -> bool {
+        matches!(
+            self,
+            PropagationChoice::Tr37885 | PropagationChoice::Geometric
+        )
+    }
+
+    /// Whether this law needs the street corner a blocked link turns round, and the
+    /// vehicles on a clear one.
+    pub const fn traces_geometry(self) -> bool {
+        matches!(self, PropagationChoice::Geometric)
+    }
 }
 
 /// Which small-scale fading `radio.models.fading` selects.
@@ -557,6 +580,7 @@ pub fn radio_models(
                     v2xw_radio::FreeSpace::ID => PropagationChoice::FreeSpace,
                     v2xw_radio::TwoRayGround::ID => PropagationChoice::TwoRayGround,
                     v2xw_radio::Tr37885::ID => PropagationChoice::Tr37885,
+                    v2xw_radio::GeometricUrbanV2v::ID => PropagationChoice::Geometric,
                     _ => match params_of::<PresetParam<v2xw_radio::LogDistancePreset>>(
                         &choice.params,
                     ) {
@@ -607,6 +631,257 @@ pub fn radio_models(
     }
 }
 
+/// The world's propagation environment: the land-use class at its centre.
+pub fn world_env(world: &World) -> v2xw_world::model::EnvClass {
+    world.env_class_at(v2xw_core::geom::Vec3::new(
+        (world.bbox.min.x + world.bbox.max.x) * 0.5,
+        (world.bbox.min.y + world.bbox.max.y) * 0.5,
+        0.0,
+    ))
+}
+
+/// The propagation law a run uses at `tier`: `radio.models.propagation` when the scenario
+/// names one, else the tier's default — free space at `abstract`, the dual-slope
+/// log-distance law with correlated shadowing at `medium`, and the geometric city-street
+/// law (`propagation/v2v-urban-geometric`) at `high`.
+pub fn propagation_choice_at(
+    scenario: &Scenario,
+    tier: v2xw_core::card::Tier,
+) -> PropagationChoice {
+    let models = radio_models(scenario).unwrap_or_default();
+    models.propagation.unwrap_or(match tier {
+        v2xw_core::card::Tier::Abstract => PropagationChoice::FreeSpace,
+        v2xw_core::card::Tier::Medium => PropagationChoice::LogDistance(None),
+        _ => PropagationChoice::Geometric,
+    })
+}
+
+/// The radio one node carries, resolved from `radio.devices` for its class: what the link
+/// budget reads at both ends of every link (04-models.md §3.7).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DeviceRadio {
+    /// Conducted transmit power at the antenna port, dBm — the most the node transmits;
+    /// congestion control may lower it.
+    pub tx_power_dbm: f64,
+    /// Antenna gain, dBi.
+    pub antenna_gain_dbi: f64,
+    /// Cable loss between radio and antenna, dB.
+    pub cable_loss_db: f64,
+    /// Antenna height above the ground, metres; `None` takes the body class's default
+    /// (vehicles) or the site's mast (roadside units).
+    pub antenna_height_m: Option<f64>,
+}
+
+impl DeviceRadio {
+    /// The gain the link budget applies at this end, dB: the antenna's gain less the
+    /// cable's loss, which a received signal and a transmitted one both pass through.
+    pub fn net_gain_db(&self) -> f64 {
+        self.antenna_gain_dbi - self.cable_loss_db
+    }
+
+    /// The largest EIRP this device radiates, dBm: `P + G − L`.
+    pub fn max_eirp_dbm(&self) -> f64 {
+        self.tx_power_dbm + self.net_gain_db()
+    }
+}
+
+/// Which `radio.devices` entry a node class takes.
+pub fn device_for(scenario: &Scenario, class: v2xw_radio::ActorClass) -> DeviceRadio {
+    let d = &scenario.radio.devices;
+    match class {
+        v2xw_radio::ActorClass::Rsu | v2xw_radio::ActorClass::BaseStation => DeviceRadio {
+            tx_power_dbm: d.rsu.tx_power_dbm,
+            antenna_gain_dbi: d.rsu.antenna_gain_dbi,
+            cable_loss_db: d.rsu.cable_loss_db,
+            antenna_height_m: d.rsu.antenna_height_m,
+        },
+        v2xw_radio::ActorClass::Pedestrian | v2xw_radio::ActorClass::Bicycle => DeviceRadio {
+            tx_power_dbm: d.vru.tx_power_dbm,
+            antenna_gain_dbi: d.vru.antenna_gain_dbi,
+            cable_loss_db: d.vru.cable_loss_db,
+            antenna_height_m: Some(d.vru.antenna_height_m),
+        },
+        _ => DeviceRadio {
+            tx_power_dbm: d.obu.tx_power_dbm,
+            antenna_gain_dbi: d.obu.antenna_gain_dbi,
+            cable_loss_db: d.obu.cable_loss_db,
+            antenna_height_m: d.obu.antenna_height_m,
+        },
+    }
+}
+
+/// The best net receive gain any device in the run has, dB — what the candidate range is
+/// computed for, so no receiver that could hear a frame is left out.
+pub fn best_receive_gain_db(scenario: &Scenario) -> f64 {
+    [
+        v2xw_radio::ActorClass::Car,
+        v2xw_radio::ActorClass::Rsu,
+        v2xw_radio::ActorClass::Pedestrian,
+    ]
+    .into_iter()
+    .map(|c| device_for(scenario, c).net_gain_db())
+    .fold(f64::NEG_INFINITY, f64::max)
+}
+
+/// The noise floor the candidate range is measured against, dBm: the 802.11p receiver's
+/// (thermal noise in 10 MHz plus its noise figure) or, on a sidelink, a 10 MHz UE's with
+/// TR 36.885's 9 dB noise figure.
+pub fn range_noise_floor_dbm(scenario: &Scenario, phy: &v2xw_radio::OfdmPhy) -> f64 {
+    match scenario.radio.rat {
+        crate::scenario::schema::Rat::Dsrc80211p | crate::scenario::schema::Rat::Hybrid => {
+            phy.noise_floor()
+        }
+        _ => {
+            v2xw_radio::THERMAL_NOISE_DBM_PER_HZ
+                + 10.0 * v2xw_core::math::log10(10.0e6)
+                + v2xw_radio::UE_NOISE_FIGURE_DB
+        }
+    }
+}
+
+/// The deterministic line-of-sight loss of a propagation law at `d_m`, dB — no shadowing,
+/// no fading, no obstacle: the most a transmission can reach, which is what bounds the
+/// candidate range ([`CandidateRangePlan`]).
+pub fn los_mean_loss_db(
+    choice: PropagationChoice,
+    env: v2xw_world::model::EnvClass,
+    d_m: f64,
+    f_hz: f64,
+    h_t_m: f64,
+    h_r_m: f64,
+) -> f64 {
+    let urban = matches!(
+        env,
+        v2xw_world::model::EnvClass::Urban | v2xw_world::model::EnvClass::Suburban
+    );
+    match choice {
+        PropagationChoice::FreeSpace => v2xw_radio::friis_loss_db(d_m, f_hz),
+        PropagationChoice::TwoRayGround => {
+            v2xw_radio::two_ray_ground_loss_db(d_m, h_t_m, h_r_m, f_hz, 1.0)
+        }
+        PropagationChoice::LogDistance(Some(preset)) => preset.params().path_loss_db(d_m),
+        PropagationChoice::LogDistance(None) => {
+            v2xw_radio::LogDistancePreset::for_environment(env, false)
+                .params()
+                .path_loss_db(d_m)
+        }
+        PropagationChoice::Tr37885 | PropagationChoice::Geometric => {
+            if urban {
+                v2xw_radio::prop::tr37885_urban_los_db(d_m, f_hz / 1e9)
+            } else {
+                v2xw_radio::prop::tr37885_highway_los_db(d_m, f_hz / 1e9)
+            }
+        }
+    }
+}
+
+/// How far each transmission is followed (`radio.range`).
+///
+/// A transmission is followed to every receiver at which, in line of sight, it would still
+/// arrive at no less than the noise floor minus `radio.range.margin_db`: the distance `R`
+/// solving `EIRP + G_rx − PL_LOS(R) = N − margin` for the run's own line-of-sight law, its
+/// best receive gain and its receiver's noise floor. Within `R` every link gets the full
+/// budget — geometry, shadowing, fading. The 10 dB default margin covers the shadowing
+/// upside (about 2.5 σ of the 4 dB laws) and puts a single arrival left out at most 0.4 dB
+/// of noise rise.
+///
+/// `radio.range.max_m` caps the fully evaluated range for cost. Beyond the cap and out to
+/// `R`, a receiver still gets the transmission's energy as interference when the straight
+/// path is clear of buildings, priced with the deterministic line-of-sight law: blocked
+/// paths that far out are below the margin in every NLOS law this build has (TR 37.885's
+/// NLOS law reaches `N − 10 dB` at about 450 m from a 20 dBm EIRP).
+#[derive(Debug, Clone)]
+pub struct CandidateRangePlan {
+    choice: PropagationChoice,
+    env: v2xw_world::model::EnvClass,
+    f_hz: f64,
+    /// The receiver noise floor, dBm.
+    pub noise_floor_dbm: f64,
+    /// `radio.range.margin_db`.
+    pub margin_db: f64,
+    /// `radio.range.max_m`.
+    pub max_m: Option<f64>,
+    /// The best net receive gain, dB.
+    pub rx_gain_db: f64,
+    /// The world's diagonal, metres: no range is longer.
+    pub world_span_m: f64,
+    /// Solved ranges, keyed by the EIRP on a 0.01 dB grid.
+    cache: std::collections::BTreeMap<i64, f64>,
+}
+
+impl CandidateRangePlan {
+    /// The plan for a run.
+    pub fn new(scenario: &Scenario, world: &World, phy: &v2xw_radio::OfdmPhy, f_hz: f64) -> Self {
+        let span = world.bbox.min.distance_2d(world.bbox.max);
+        Self {
+            choice: propagation_choice_at(scenario, scenario.radio.tiers.propagation),
+            env: world_env(world),
+            f_hz,
+            noise_floor_dbm: range_noise_floor_dbm(scenario, phy),
+            margin_db: scenario.radio.range.margin_db,
+            max_m: scenario.radio.range.max_m,
+            rx_gain_db: best_receive_gain_db(scenario),
+            world_span_m: if span.is_finite() && span > 0.0 {
+                span
+            } else {
+                1_000.0
+            },
+            cache: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The weakest arrival worth following, dBm: `N − margin`.
+    pub fn floor_dbm(&self) -> f64 {
+        self.noise_floor_dbm - self.margin_db
+    }
+
+    /// The line-of-sight reach of a transmission radiated at `eirp_dbm`, metres: where the
+    /// deterministic LOS loss brings it down to [`CandidateRangePlan::floor_dbm`], found by
+    /// bisection (every law here is monotone in distance, 03-interfaces.md §17), and no
+    /// longer than the world's diagonal.
+    pub fn reach_m(&mut self, eirp_dbm: f64) -> f64 {
+        let key = (eirp_dbm * 100.0).round() as i64;
+        if let Some(r) = self.cache.get(&key) {
+            return *r;
+        }
+        let budget = eirp_dbm + self.rx_gain_db - self.floor_dbm();
+        let loss = |d: f64| los_mean_loss_db(self.choice, self.env, d, self.f_hz, 1.5, 1.5);
+        let span = self.world_span_m + 1.0;
+        let r = if loss(span) <= budget {
+            span
+        } else if loss(1.0) > budget {
+            1.0
+        } else {
+            let (mut lo, mut hi) = (1.0f64, span);
+            for _ in 0..60 {
+                let mid = 0.5 * (lo + hi);
+                if loss(mid) <= budget {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+        self.cache.insert(key, r);
+        r
+    }
+
+    /// The fully evaluated range for a transmission at `eirp_dbm`, metres: the reach,
+    /// capped by `radio.range.max_m`.
+    pub fn full_m(&mut self, eirp_dbm: f64) -> f64 {
+        let reach = self.reach_m(eirp_dbm);
+        self.max_m.map_or(reach, |cap| reach.min(cap))
+    }
+
+    /// The deterministic LOS received power at `d_m` from a transmitter radiating
+    /// `eirp_dbm`, at a receiver with net gain `rx_gain_db`, dBm — what an interferer
+    /// beyond the cap contributes.
+    pub fn los_power_dbm(&self, eirp_dbm: f64, rx_gain_db: f64, d_m: f64) -> f64 {
+        eirp_dbm + rx_gain_db - los_mean_loss_db(self.choice, self.env, d_m, self.f_hz, 1.5, 1.5)
+    }
+}
+
 /// The propagation and fading models the scenario names.
 ///
 /// `radio.models.propagation` and `radio.models.fading` choose them when present. The
@@ -626,28 +901,20 @@ pub fn build_radio_at(
     world: &World,
     tier: v2xw_core::card::Tier,
 ) -> (Box<dyn BoxedPropagation>, Box<dyn BoxedFading>) {
-    let models = radio_models(scenario).unwrap_or_default();
-    let env = world.env_class_at(v2xw_core::geom::Vec3::new(
-        (world.bbox.min.x + world.bbox.max.x) * 0.5,
-        (world.bbox.min.y + world.bbox.max.y) * 0.5,
-        0.0,
-    ));
-    let default_propagation = match tier {
-        v2xw_core::card::Tier::Abstract => PropagationChoice::FreeSpace,
-        _ => PropagationChoice::LogDistance(None),
+    let env = world_env(world);
+    let propagation: Box<dyn BoxedPropagation> = match propagation_choice_at(scenario, tier) {
+        PropagationChoice::FreeSpace => Box::new(v2xw_radio::FreeSpace::new(tier)),
+        PropagationChoice::TwoRayGround => Box::new(v2xw_radio::TwoRayGround::new(tier)),
+        PropagationChoice::Tr37885 => Box::new(v2xw_radio::Tr37885::new(tier, env)),
+        PropagationChoice::Geometric => Box::new(v2xw_radio::GeometricUrbanV2v::new(tier, env)),
+        PropagationChoice::LogDistance(None) => {
+            Box::new(v2xw_radio::LogDistanceShadowing::auto(tier, env))
+        }
+        PropagationChoice::LogDistance(Some(preset)) => {
+            Box::new(v2xw_radio::LogDistanceShadowing::new(tier, preset, env))
+        }
     };
-    let propagation: Box<dyn BoxedPropagation> =
-        match models.propagation.unwrap_or(default_propagation) {
-            PropagationChoice::FreeSpace => Box::new(v2xw_radio::FreeSpace::new(tier)),
-            PropagationChoice::TwoRayGround => Box::new(v2xw_radio::TwoRayGround::new(tier)),
-            PropagationChoice::Tr37885 => Box::new(v2xw_radio::Tr37885::new(tier, env)),
-            PropagationChoice::LogDistance(None) => {
-                Box::new(v2xw_radio::LogDistanceShadowing::auto(tier, env))
-            }
-            PropagationChoice::LogDistance(Some(preset)) => {
-                Box::new(v2xw_radio::LogDistanceShadowing::new(tier, preset, env))
-            }
-        };
+    let models = radio_models(scenario).unwrap_or_default();
     let default_fading = match tier {
         v2xw_core::card::Tier::Abstract => FadingChoice::None,
         _ => FadingChoice::Nakagami(v2xw_radio::NakagamiPreset::FixedMedium),
@@ -745,6 +1012,13 @@ pub fn register_generation_timing(
 ///   the propagation tier is `medium` or `high`, which is how the §3 tier table composes
 ///   it. Until this stack existed every link was evaluated as line of sight, so a signal
 ///   crossed a Midtown block of 40-storey towers as though it were open road.
+/// * **Street corners** — `v2xw_radio::CornerTracer`: for a law that prices a blocked link
+///   by the corner it turns round (`propagation/v2v-urban-geometric`), the junction both
+///   ends see and its Mangel geometry. On with the buildings, when such a law is in use.
+/// * **Vehicles** — `obstacle/vehicle/tr37885-nlosv`: the actual vehicles on a
+///   building-clear path, and TR 37.885's blockage loss for the antenna-height case they
+///   make. On when the geometric law is in use: it is the law that replaces the TR's
+///   random NLOSv state with the vehicles the engine actually places.
 /// * **Terrain** — `obstacle/terrain/knife-edge-p526`: ITU-R P.526 knife-edge diffraction
 ///   over the world's terrain profile, Deygout for multiple edges. On whenever the world
 ///   carries a terrain grid (`world.terrain.dem`) at the `medium` or `high` tier. The tier
@@ -753,31 +1027,62 @@ pub fn register_generation_timing(
 ///   world makes the model a no-op anyway.
 ///
 /// The abstract tier composes no obstacle: it is free-space by definition.
+///
+/// Whether the building *loss* is charged is decided per link, by the law that priced it
+/// ([`PropagationChoice::owns_buildings`]): TR 37.885 and the geometric law price
+/// building obstruction themselves, so under them the stack classifies buildings and does
+/// not charge them a second time. Per link rather than per run, because a focus region can
+/// put two laws in one run.
 #[derive(Debug, Default)]
 pub struct ObstacleStack {
     /// Building shadowing, when composed.
     pub buildings: Option<v2xw_radio::BuildingShadowing>,
+    /// The street-corner tracer, when a law that needs it is composed.
+    pub corners: Option<v2xw_radio::CornerTracer>,
+    /// Vehicle blockage, when a law that needs it is composed.
+    pub vehicles: Option<v2xw_radio::obstacle::VehicleBlockage>,
     /// Terrain diffraction, when composed.
     pub terrain: Option<v2xw_radio::TerrainDiffraction>,
-    /// Whether the building model's *loss* is charged, or only its geometry classified.
-    ///
-    /// `propagation/tr37885` decides its NLOS state from the geometry ("different streets:
-    /// geometric") and prices it with its own NLOS law, so under it the buildings are
-    /// classified and not charged a second time.
+    /// Whether the building model's *loss* is charged under the run's main law. Kept for
+    /// callers that compose one law; the engine decides per link.
     pub building_loss: bool,
 }
 
 impl ObstacleStack {
     /// The line-of-sight answer for one path between two antennas.
-    pub fn classify(
+    ///
+    /// `geometry` asks for the street corner of a building-blocked path, and `actors` are
+    /// the vehicles that may stand on a building-clear one; both only matter to a law that
+    /// traces geometry, and cost nothing when not asked for.
+    pub fn classify_with(
         &mut self,
         world: &World,
         a: v2xw_core::geom::Vec3,
         b: v2xw_core::geom::Vec3,
+        geometry: bool,
+        actors: Option<&v2xw_radio::ActorSet>,
     ) -> v2xw_radio::LosResult {
-        let mut parts = Vec::with_capacity(2);
+        let mut parts = Vec::with_capacity(3);
         if let Some(buildings) = self.buildings.as_mut() {
-            parts.push(buildings.los_cached(world, a, b));
+            let mut los = buildings.los_cached(world, a, b);
+            if geometry
+                && los.class.has_building()
+                && let Some(tracer) = self.corners.as_ref()
+            {
+                los.corner = tracer.trace(world, a, b);
+            }
+            parts.push(los);
+        }
+        let building_clear = parts.first().is_none_or(|p| !p.class.has_building());
+        if geometry
+            && building_clear
+            && let (Some(vehicles), Some(set)) = (self.vehicles.as_ref(), actors)
+        {
+            parts.push(
+                <v2xw_radio::obstacle::VehicleBlockage as v2xw_radio::ObstacleModel<
+                    crate::ctx::EngineCtx<'_>,
+                >>::los(vehicles, world, a, b, Some(set)),
+            );
         }
         if let Some(terrain) = self.terrain.as_ref() {
             parts.push(
@@ -793,11 +1098,40 @@ impl ObstacleStack {
         }
     }
 
+    /// The line-of-sight answer for one path, buildings and terrain only.
+    pub fn classify(
+        &mut self,
+        world: &World,
+        a: v2xw_core::geom::Vec3,
+        b: v2xw_core::geom::Vec3,
+    ) -> v2xw_radio::LosResult {
+        self.classify_with(world, a, b, false, None)
+    }
+
+    /// Whether any building stands on the straight path — the any-hit test the
+    /// interference beyond the capped range uses. `false` when buildings are not composed.
+    pub fn blocked_by_buildings(
+        &mut self,
+        world: &World,
+        a: v2xw_core::geom::Vec3,
+        b: v2xw_core::geom::Vec3,
+    ) -> bool {
+        if self.buildings.is_none() {
+            return false;
+        }
+        if self.corners.is_none() {
+            self.corners = Some(v2xw_radio::CornerTracer::build(world));
+        }
+        let tracer = self.corners.as_ref().expect("just built");
+        v2xw_radio::segment_blocked(world, tracer.buildings(), a, b)
+    }
+
     /// The obstacle loss for a classified path, dB, summed in the stack's fixed order.
     ///
     /// `los_path_db` is the line-of-sight path loss the propagation model charged, which
     /// the building model's street-canyon ceiling is measured against
-    /// ([`v2xw_radio::BuildingShadowing::loss_for_path`]).
+    /// ([`v2xw_radio::BuildingShadowing::loss_for_path`]). `charge_buildings` is false
+    /// under a law that prices buildings itself ([`PropagationChoice::owns_buildings`]).
     #[allow(clippy::too_many_arguments)]
     pub fn loss_db(
         &mut self,
@@ -807,15 +1141,22 @@ impl ObstacleStack {
         los: &v2xw_radio::LosResult,
         f_hz: f64,
         los_path_db: f64,
+        charge_buildings: bool,
     ) -> f64 {
-        let mut terms = [0.0f64; 2];
-        if self.building_loss
-            && let Some(buildings) = self.buildings.as_ref()
-        {
+        let mut terms = [0.0f64; 3];
+        if charge_buildings && let Some(buildings) = self.buildings.as_ref() {
             terms[0] = buildings.loss_for_path(los, tx.pos.distance(rx.pos), f_hz, los_path_db);
         }
+        // TR 37.885's NLOSv is a same-street state: a building-blocked link is priced by
+        // its NLOS law, and a vehicle on it adds nothing further.
+        if !los.class.has_building()
+            && let Some(vehicles) = self.vehicles.as_mut()
+        {
+            terms[1] =
+                v2xw_radio::ObstacleModel::obstacle_loss_db(vehicles, ctx, tx, rx, los, f_hz);
+        }
         if let Some(terrain) = self.terrain.as_mut() {
-            terms[1] = v2xw_radio::ObstacleModel::obstacle_loss_db(terrain, ctx, tx, rx, los, f_hz);
+            terms[2] = v2xw_radio::ObstacleModel::obstacle_loss_db(terrain, ctx, tx, rx, los, f_hz);
         }
         v2xw_core::math::sum_ordered(terms)
     }
@@ -829,6 +1170,9 @@ impl ObstacleStack {
         let mut cards = Vec::new();
         if let Some(b) = &self.buildings {
             cards.push(b.card().clone());
+        }
+        if let Some(v) = &self.vehicles {
+            cards.push(v.card().clone());
         }
         if let Some(t) = &self.terrain {
             cards.push(t.card().clone());
@@ -844,28 +1188,41 @@ impl ObstacleStack {
 
 /// The obstacle stack the scenario selects; see [`ObstacleStack`].
 ///
-/// `propagation/tr37885` decides its NLOS state from the same building geometry and
-/// prices it with its own NLOS law; charging the Sommer term on top would count every
-/// building twice, so under it the buildings are classified and not charged.
-/// `radio.models.obstacle` picks the Sommer fitted row.
+/// `propagation/tr37885` and `propagation/v2v-urban-geometric` decide their NLOS state
+/// from the same building geometry and price it with their own NLOS laws; charging the
+/// Sommer term on top would count every building twice, so under them the buildings are
+/// classified and not charged. `radio.models.obstacle` picks the Sommer fitted row.
 pub fn build_obstacles(scenario: &Scenario, world: &World) -> ObstacleStack {
     let tier = scenario.radio.tiers.propagation;
     let models = radio_models(scenario).unwrap_or_default();
     if tier == v2xw_core::card::Tier::Abstract {
         return ObstacleStack::default();
     }
-    let own_nlos_law = models.propagation == Some(PropagationChoice::Tr37885);
+    let main = propagation_choice_at(scenario, tier);
+    // The focus region's law, when it has one, may trace geometry the surrounding one
+    // does not.
+    let focus = scenario
+        .radio
+        .tiers
+        .focus
+        .as_ref()
+        .map(|f| propagation_choice_at(scenario, tier.max(f.tier)));
+    let traces = main.traces_geometry() || focus.is_some_and(PropagationChoice::traces_geometry);
     let fit = models
         .building_fit
         .unwrap_or(v2xw_radio::SommerFit::Default);
+    let buildings_on = scenario.world.buildings.enabled && !world.buildings.is_empty();
+    let stack_tier = tier;
     ObstacleStack {
-        building_loss: !own_nlos_law,
-        buildings: (scenario.world.buildings.enabled && !world.buildings.is_empty())
-            .then(|| v2xw_radio::BuildingShadowing::with_fit(tier, fit)),
+        building_loss: !main.owns_buildings(),
+        buildings: buildings_on.then(|| v2xw_radio::BuildingShadowing::with_fit(stack_tier, fit)),
+        corners: (buildings_on && traces).then(|| v2xw_radio::CornerTracer::build(world)),
+        vehicles: traces
+            .then(|| v2xw_radio::obstacle::VehicleBlockage::new(v2xw_core::card::Tier::High)),
         terrain: world
             .terrain
             .is_some()
-            .then(|| v2xw_radio::TerrainDiffraction::new(tier)),
+            .then(|| v2xw_radio::TerrainDiffraction::new(stack_tier)),
     }
 }
 
@@ -1209,8 +1566,18 @@ pub fn build_node(
         _ => Box::new(Prioritized::new(300.0)),
     };
     let (bsm_params, cam_params) = generator_params(scenario);
+    // The node's own record of its transmit power is its class's `radio.devices` power;
+    // the frame's actual power (congestion control, EIRP) is the engine's.
+    let device = device_for(
+        scenario,
+        if is_vru_class(class) {
+            v2xw_radio::ActorClass::Pedestrian
+        } else {
+            v2xw_radio::ActorClass::Car
+        },
+    );
     let config = NodeConfig {
-        tx_power_dbm: TX_POWER_DBM,
+        tx_power_dbm: device.tx_power_dbm,
         services: service_set(scenario),
         crypto_mode: crypto_mode(scenario),
         wall: env.wall,
@@ -1507,7 +1874,7 @@ pub fn build_rsu(
                 .clone()
         });
     let config = NodeConfig {
-        tx_power_dbm: TX_POWER_DBM,
+        tx_power_dbm: device_for(scenario, v2xw_radio::ActorClass::Rsu).tx_power_dbm,
         services: v2xw_node::ServiceSet {
             cam: false,
             bsm: false,

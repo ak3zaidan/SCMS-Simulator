@@ -211,11 +211,7 @@ pub fn first_wall_m(
     dir: (f64, f64),
     max_m: f64,
 ) -> Option<f64> {
-    let end = Vec3::new(
-        origin.x + dir.0 * max_m,
-        origin.y + dir.1 * max_m,
-        origin.z,
-    );
+    let end = Vec3::new(origin.x + dir.0 * max_m, origin.y + dir.1 * max_m, origin.z);
     let mut best: Option<f64> = None;
     for id in index.candidates_along(origin, end) {
         let Some(building) = world.building(id) else {
@@ -375,7 +371,11 @@ impl CornerTracer {
         let u = unit(j.x - tx.x, j.y - tx.y).unwrap_or((1.0, 0.0));
         let v = unit(rx.x - j.x, rx.y - j.y).unwrap_or((0.0, 1.0));
         // Which side of the transmitter's street the receiver's street leaves on.
-        let side = if u.0 * v.1 - u.1 * v.0 >= 0.0 { 1.0 } else { -1.0 };
+        let side = if u.0 * v.1 - u.1 * v.0 >= 0.0 {
+            1.0
+        } else {
+            -1.0
+        };
         let n_t = (-u.1 * side, u.0 * side);
         let x_t = first_wall_m(world, &self.buildings, tx, n_t, Self::MAX_WALL_M)
             .unwrap_or(Self::MAX_WALL_M)
@@ -383,8 +383,14 @@ impl CornerTracer {
         let n_r = (-v.1, v.0);
         let left = first_wall_m(world, &self.buildings, rx, n_r, Self::MAX_WALL_M)
             .unwrap_or(Self::MAX_WALL_M);
-        let right = first_wall_m(world, &self.buildings, rx, (-n_r.0, -n_r.1), Self::MAX_WALL_M)
-            .unwrap_or(Self::MAX_WALL_M);
+        let right = first_wall_m(
+            world,
+            &self.buildings,
+            rx,
+            (-n_r.0, -n_r.1),
+            Self::MAX_WALL_M,
+        )
+        .unwrap_or(Self::MAX_WALL_M);
         CornerGeometry {
             corner: j,
             d_t_m: d_t,
@@ -2405,7 +2411,13 @@ mod tests {
         // Along the street there is nothing within reach.
         assert!(first_wall_m(&world, &index, at(200.0, 257.0), (1.0, 0.0), 60.0).is_none());
         // A roof below the antenna is transparent.
-        let low = first_wall_m(&world, &index, Vec3::new(200.0, 257.0, 25.0), (0.0, 1.0), 60.0);
+        let low = first_wall_m(
+            &world,
+            &index,
+            Vec3::new(200.0, 257.0, 25.0),
+            (0.0, 1.0),
+            60.0,
+        );
         assert!(low.is_none());
     }
 
@@ -2419,8 +2431,13 @@ mod tests {
         let tx = at(390.0, 257.0);
         let rx = at(440.0, 307.0);
         let index = BuildingIndex::build(&world);
-        assert!(segment_blocked(&world, &index, tx, rx), "the corner tower blocks");
-        let c = tracer.trace(&world, tx, rx).expect("one corner connects them");
+        assert!(
+            segment_blocked(&world, &index, tx, rx),
+            "the corner tower blocks"
+        );
+        let c = tracer
+            .trace(&world, tx, rx)
+            .expect("one corner connects them");
         assert!((c.corner.x - 440.0).abs() < 1e-9 && (c.corner.y - 257.0).abs() < 1e-9);
         assert!((c.d_t_m - 50.0).abs() < 1e-9, "{c:?}");
         assert!((c.d_r_m - 50.0).abs() < 1e-9, "{c:?}");
@@ -2441,7 +2458,15 @@ mod tests {
     fn parallel_streets_have_no_single_corner() {
         let world = city();
         let tracer = CornerTracer::build(&world);
-        assert!(tracer.trace(&world, at(390.0, 257.0), at(390.0, 507.0)).is_none());
-        assert!(tracer.trace(&world, at(200.0, 257.0), at(300.0, 7.0)).is_none());
+        assert!(
+            tracer
+                .trace(&world, at(390.0, 257.0), at(390.0, 507.0))
+                .is_none()
+        );
+        assert!(
+            tracer
+                .trace(&world, at(200.0, 257.0), at(300.0, 7.0))
+                .is_none()
+        );
     }
 }

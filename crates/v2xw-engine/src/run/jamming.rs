@@ -42,7 +42,7 @@ use v2xw_radio::{
     SensedInterval,
 };
 
-use super::{Engine, MAX_RANGE_M};
+use super::Engine;
 use crate::ctx::EngineCtx;
 use crate::scenario::Scenario;
 
@@ -335,6 +335,7 @@ impl Engine {
         let tx_end: RadioEndpoint = self.endpoint(jammer, from, now);
         let rx_end = self.endpoint(rx, to, now);
         let los = self.obstacles.classify(&self.world, tx_end.pos, rx_end.pos);
+        let charge_owned = self.main_law.owns_buildings();
         let (loss, obstacle_db) = {
             let Engine {
                 scheduler,
@@ -353,17 +354,31 @@ impl Engine {
                 scheduler, rng, world, snapshot, provenance, params, &mut null,
             );
             let loss = propagation.loss_db(&mut ctx, &tx_end, &rx_end, freq_hz, &los, weather);
-            let obstacle_db =
-                obstacles.loss_db(&mut ctx, &tx_end, &rx_end, &los, freq_hz, loss.path_db);
+            let obstacle_db = obstacles.loss_db(
+                &mut ctx,
+                &tx_end,
+                &rx_end,
+                &los,
+                freq_hz,
+                loss.path_db,
+                !charge_owned,
+            );
             (loss, obstacle_db)
         };
         v2xw_core::math::sum_ordered([tx_dbm, -loss.total_db, -obstacle_db])
     }
 
-    /// Every node within the candidate range of `at`, with its position now.
-    fn nodes_near(&self, at: Vec3, now: SimTime) -> Vec<(NodeId, Vec3)> {
+    /// How far a jammer radiating `tx_dbm` from `at` is followed: the candidate range of
+    /// its EIRP (`radio.range`).
+    fn jammer_reach_m(&mut self, jammer: NodeId, at: Vec3, tx_dbm: f64, now: SimTime) -> f64 {
+        let gain = self.endpoint(jammer, at, now).gain_dbi;
+        self.range.full_m(tx_dbm + gain)
+    }
+
+    /// Every node within `range_m` of `at`, with its position now.
+    fn nodes_near(&self, at: Vec3, range_m: f64, now: SimTime) -> Vec<(NodeId, Vec3)> {
         let mut out: Vec<(NodeId, Vec3)> = Vec::new();
-        for actor in self.snapshot.actors_within(at, MAX_RANGE_M) {
+        for actor in self.snapshot.actors_within(at, range_m) {
             if let Some(rec) = self.actors.get(&actor)
                 && let Some(node) = rec.node
             {
@@ -371,7 +386,7 @@ impl Engine {
             }
         }
         for (&rsu, &pos) in &self.rsus {
-            if pos.distance(at) <= MAX_RANGE_M {
+            if pos.distance(at) <= range_m {
                 out.push((rsu, pos));
             }
         }
@@ -424,7 +439,9 @@ impl Engine {
                 continue;
             }
             let tx_dbm = self.jamming.jammers[k].profile.power_dbm();
-            for (node, node_pos) in self.nodes_near(pos, now) {
+            // A jammer reaches as far as its own link budget does (`radio.range`).
+            let reach = self.jammer_reach_m(id, pos, tx_dbm, now);
+            for (node, node_pos) in self.nodes_near(pos, reach, now) {
                 let power = self.jam_power_dbm(id, pos, tx_dbm, node, node_pos);
                 self.declare_at(node, id, power, channel, kind, &windows);
             }
@@ -481,8 +498,9 @@ impl Engine {
                 continue;
             }
             let tx_dbm = self.jamming.jammers[k].profile.power_dbm();
+            let reach = self.jammer_reach_m(id, pos, tx_dbm, start);
             for &(rx, rx_pos) in receivers {
-                if rx_pos.distance(pos) > MAX_RANGE_M {
+                if rx_pos.distance(pos) > reach {
                     continue;
                 }
                 let power = self.jam_power_dbm(id, pos, tx_dbm, rx, rx_pos);

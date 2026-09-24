@@ -151,15 +151,14 @@ const SAFETY_AC: AccessCategory = AccessCategory::Vo;
 /// for no modelling gain: `AIFS = SIFS + 2·slot = 32 µs + 2·13 µs = 58 µs`
 /// [IEEE 802.11-2020 Table 9-155, 10 MHz timing].
 const AIFS: Duration = Duration::from_micros(58);
-/// How far a candidate receiver may be. The grid cell size equals this (ADR 0004
-/// decision 6), so a neighbour query touches at most nine cells.
+/// The spatial grid's cell size (ADR 0004 decision 6), and the plausible-range figure the
+/// misbehaviour detectors are handed.
 ///
-/// It is **not** a radio horizon: a candidate beyond the receiver sensitivity is evaluated
-/// and lost as [`LossCause::BelowSensitivity`], which is what makes it appear in the
-/// denominator of the packet delivery ratio 08-measurement-and-data.md §2.1 defines. It is
-/// also the single biggest term in the cost of a dense run — see
-/// [`RunReport::reception_attempts`] — because the candidate set inside a 1 km disc grows
-/// with the square of the density.
+/// It used to be the radio candidate range as well: every transmission was followed to
+/// 1 km and no further, which truncated reception, interference and sensing — in line of
+/// sight 802.11p still arrives at about −84 dBm at 1 km. The candidate range is now the
+/// link budget's (`radio.range`, [`crate::wiring::CandidateRangePlan`]); this constant
+/// only sizes the grid, whose query cost depends on the cell size and not its answer.
 const MAX_RANGE_M: f64 = 1000.0;
 /// How many frames one [`Event::MacTimer`] may grant before it reschedules itself.
 ///
@@ -225,9 +224,16 @@ pub struct RunReport {
     ///
     /// This is the denominator of the packet delivery ratio (08-measurement-and-data.md
     /// §2.1) and the term that dominates the cost of a dense run: it grows with the number
-    /// of frames times the number of candidates inside [`CANDIDATE_RANGE_M`] of each, so
-    /// with the square of the vehicle count at fixed area.
+    /// of frames times the number of candidates inside the link-budget range of each
+    /// (`radio.range`), so with the square of the vehicle count at fixed area. An arrival
+    /// under the noise floor less the range margin is not an attempt: it is counted in
+    /// [`RunReport::faint_arrivals`] and enters the receivers' interference only.
     pub reception_attempts: u64,
+    /// How many (frame, receiver) pairs received a frame only as energy: under the noise
+    /// floor less `radio.range.margin_db`, or beyond `radio.range.max_m` in line of sight.
+    /// They are interference at the receivers they share with a reception attempt, and
+    /// energy in a sidelink receiver's sensing window; they are not reception attempts.
+    pub faint_arrivals: u64,
     /// How many of those attempts decoded — the numerator of the packet delivery ratio.
     pub receptions_ok: u64,
     /// The attempts that did not decode, by the single loss cause invariant I-R3 allows.
@@ -321,6 +327,19 @@ impl RunReport {
     }
 }
 
+/// The horizontal distance from `p` to the segment `a → b`, metres.
+fn distance_to_segment_2d(p: Vec3, a: Vec3, b: Vec3) -> f64 {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 {
+        (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let q = Vec3::new(a.x + t * dx, a.y + t * dy, p.z);
+    p.distance_2d(q)
+}
+
 /// The kebab-case name a `phy.rx` record carries for a loss cause.
 ///
 /// `LossCause` serialises kebab-case already, but a record field is a `&str` and going
@@ -388,6 +407,12 @@ struct FrameState {
     /// transmitter-to-receiver distance m). A `BTreeMap`, so every walk over the receiver
     /// set is in [`NodeId`] order without a sort.
     arrivals: BTreeMap<NodeId, (f64, f64)>,
+    /// Receivers the frame reaches only as energy: below the noise floor less the
+    /// `radio.range` margin, or beyond the capped range in line of sight. Receiver →
+    /// received power, dBm. They are not reception attempts — no receiver can detect a
+    /// frame that far under its noise — but they are interference at every receiver they
+    /// share with a frame that is, and energy in a sidelink receiver's sensing window.
+    faint: BTreeMap<NodeId, f64>,
     /// The i-period the signer's certificate belongs to, as the envelope states it.
     claimed_cert_period: u32,
     /// The linkage value the signer's certificate carries, when the credential the node
@@ -556,6 +581,23 @@ pub struct Engine {
     node_class: BTreeMap<NodeId, v2xw_radio::ActorClass>,
     /// What obstructs a link: buildings and terrain, as the scenario selected them.
     obstacles: crate::wiring::ObstacleStack,
+    /// How far each transmission is followed (`radio.range`), derived from the link
+    /// budget.
+    range: crate::wiring::CandidateRangePlan,
+    /// The law outside any focus region, and the focus region's, for the per-link
+    /// decisions of who charges buildings and who needs street geometry.
+    main_law: crate::wiring::PropagationChoice,
+    focus_law: Option<crate::wiring::PropagationChoice>,
+    /// Rain over the link (`weather/attenuation/itu-r-p838`), at the medium and high
+    /// propagation tiers.
+    rain: Option<v2xw_radio::RainAttenuation>,
+    /// The radio range a node's plausibility checks compare a sender's claimed distance
+    /// against (`acceptanceRangeThreshold`): the link budget's line-of-sight reach from the
+    /// strongest transmitter in the run. It was the fixed 1 km candidate range, which once
+    /// frames were followed as far as they physically reach flagged every honest sender
+    /// heard beyond 1 km — the legacy engine's own note is that a node must use *its*
+    /// range or it flags honest distant senders.
+    detector_range_m: f64,
     /// The LTE-V2X or NR-V2X sidelink access layer, when `radio.rat` selects one. `None`
     /// runs 802.11p through `phy`, `mac` and `dcc`.
     sidelink: Option<sidelink::SidelinkAccess>,
@@ -639,6 +681,51 @@ impl Engine {
         if let Some(sl) = sidelink.as_ref() {
             sl.register(&mut registry)?;
         }
+        // Rain over the link, once, whatever the law — at every tier but the abstract
+        // one, which is free space by definition.
+        let rain = (scenario.radio.tiers.propagation != Tier::Abstract)
+            .then(v2xw_radio::RainAttenuation::new);
+        if let Some(r) = rain.as_ref() {
+            let card = v2xw_core::model::Model::card(r).clone();
+            if !registry.contains(&card.id) {
+                registry.register(card)?;
+            }
+        }
+        let range = crate::wiring::CandidateRangePlan::new(
+            &scenario,
+            &world,
+            &crate::wiring::build_phy(&scenario),
+            sidelink.as_ref().map_or(SAFETY_FREQ_HZ, |sl| sl.freq_hz),
+        );
+        let mut range = range;
+        let detector_range_m = {
+            let dsrc = sidelink.is_none();
+            let eirp = [
+                v2xw_radio::ActorClass::Car,
+                v2xw_radio::ActorClass::Rsu,
+                v2xw_radio::ActorClass::Pedestrian,
+            ]
+            .into_iter()
+            .map(|c| {
+                let d = crate::wiring::device_for(&scenario, c);
+                if dsrc && c == v2xw_radio::ActorClass::Car {
+                    // J2945/1's radiated-power ceiling binds an on-board unit on 802.11p.
+                    d.max_eirp_dbm().min(crate::wiring::TX_POWER_DBM)
+                } else {
+                    d.max_eirp_dbm()
+                }
+            })
+            .fold(f64::NEG_INFINITY, f64::max);
+            range.reach_m(eirp)
+        };
+        let main_law =
+            crate::wiring::propagation_choice_at(&scenario, scenario.radio.tiers.propagation);
+        let focus_law = scenario.radio.tiers.focus.as_ref().map(|f| {
+            crate::wiring::propagation_choice_at(
+                &scenario,
+                scenario.radio.tiers.propagation.max(f.tier),
+            )
+        });
         let jammers = jamming::Jamming::for_scenario(
             &scenario,
             sidelink.as_ref().map_or(SAFETY_CHANNEL, |sl| sl.channel),
@@ -750,6 +837,11 @@ impl Engine {
             node_phase: BTreeMap::new(),
             node_class: BTreeMap::new(),
             obstacles,
+            range,
+            main_law,
+            focus_law,
+            rain,
+            detector_range_m,
             sidelink,
             focus,
             jamming: jammers,
@@ -1578,7 +1670,7 @@ impl Engine {
     /// J2945/1 rate control belongs: `MessageSchedule::due` already refuses to generate
     /// inside `t_off`. The engine does **not** also call [`Dcc::gate`], because that would
     /// apply the same inter-transmission time twice; what it does read from the model is
-    /// the transmit power, in [`Engine::dcc_power_dbm`].
+    /// the transmit power, in [`Engine::tx_power_dbm`].
     fn update_dcc(&mut self, node: NodeId, now: SimTime) {
         if self.dcc.is_none() {
             return;
@@ -1835,7 +1927,7 @@ impl Engine {
             believed_time: believed,
             x_m: belief.map_or(0.0, |b| b.pos.x),
             y_m: belief.map_or(0.0, |b| b.pos.y),
-            radio_range_m: MAX_RANGE_M,
+            radio_range_m: self.detector_range_m,
         };
         let reports = {
             let Engine {
@@ -2031,7 +2123,7 @@ impl Engine {
                 believed_time: believed,
                 x_m: claim.0.x,
                 y_m: claim.0.y,
-                radio_range_m: MAX_RANGE_M,
+                radio_range_m: self.detector_range_m,
             };
             let signer = credential
                 .as_ref()
@@ -2081,10 +2173,11 @@ impl Engine {
         // The transmit power is congestion control's, not the scenario's: J2945/1 controls
         // power as well as rate, and the SUPRA filter's output is what the link budget has
         // to be evaluated at. With no DCC model (the abstract tier) it is the profile's.
-        let (tx_power_dbm, channel) = match self.sidelink.as_ref() {
-            Some(sl) => (sl.tx_power_dbm, sl.channel),
-            None => (self.dcc_power_dbm(node), SAFETY_CHANNEL),
-        };
+        let channel = self
+            .sidelink
+            .as_ref()
+            .map_or(SAFETY_CHANNEL, |sl| sl.channel);
+        let tx_power_dbm = self.tx_power_dbm(node);
         // The frame on the air is the SPDU inside a network and transport header, LLC/SNAP,
         // the 802.11 MAC header and the FCS (`v2xw_net::frame`); the PHY's air time and the
         // MSDU cap are over all of it, not over the SPDU alone.
@@ -2147,6 +2240,7 @@ impl Engine {
                 descriptor,
                 tx_handle: None,
                 arrivals: BTreeMap::new(),
+                faint: BTreeMap::new(),
                 claimed_cert_period,
                 claimed_linkage,
                 app,
@@ -2206,12 +2300,35 @@ impl Engine {
         }
     }
 
-    /// The transmit power congestion control allows this node, dBm.
-    fn dcc_power_dbm(&self, node: NodeId) -> f64 {
-        self.dcc
-            .as_ref()
-            .and_then(|d| <SaeJ2945Dcc as Dcc<EngineCtx<'_>>>::state(d, node).power_dbm)
-            .unwrap_or(crate::wiring::TX_POWER_DBM)
+    /// The conducted transmit power this node puts on a frame, dBm.
+    ///
+    /// Every node transmits at its class's `radio.devices` power. A vehicle's on-board
+    /// unit on 802.11p is also under SAE J2945/1 congestion control, which sets a
+    /// *radiated* power `RP` and converts it to a conducted one as
+    /// `TxPower = RP − MinSectorAntGain + CLoss` [Rostami 2018, 04-models.md §6.4]: the
+    /// unit transmits at `min(P_max, RP − G + L)`, so its EIRP is `RP` whatever antenna and
+    /// cable it has, and never more than its hardware allows. Roadside units and VRU
+    /// devices are outside J2945/1's scope and transmit at their configured power; a
+    /// sidelink's congestion control is the access layer's (the CR limit), not a power
+    /// setting.
+    fn tx_power_dbm(&self, node: NodeId) -> f64 {
+        let device = self.device_of(node);
+        let is_obu = !self.rsus.contains_key(&node)
+            && !matches!(
+                self.node_class.get(&node),
+                Some(v2xw_radio::ActorClass::Pedestrian | v2xw_radio::ActorClass::Bicycle)
+            );
+        let rp = if is_obu {
+            self.dcc
+                .as_ref()
+                .and_then(|d| <SaeJ2945Dcc as Dcc<EngineCtx<'_>>>::state(d, node).power_dbm)
+        } else {
+            None
+        };
+        match rp {
+            Some(rp) => device.tx_power_dbm.min(rp - device.net_gain_db()),
+            None => device.tx_power_dbm,
+        }
     }
 
     /// One node's medium-access state machine advances (invariant I-R1's access half).
@@ -2595,10 +2712,20 @@ impl Engine {
             return;
         }
 
-        // Stage 1: the candidate set — every equipped actor within the modelled range, by
-        // the grid query ADR 0004 decision 6 sizes for exactly this.
+        // Stage 1: the candidate set — every equipped actor the transmission can reach, by
+        // the grid query ADR 0004 decision 6 sizes for exactly this. How far that is comes
+        // from the link budget (`radio.range`): the distance at which, in line of sight,
+        // this frame's EIRP would arrive at the noise floor less the margin. Within the
+        // full range every link gets its whole budget; between a `radio.range.max_m` cap
+        // and the reach, a receiver in line of sight still gets the frame's energy.
+        let tx_device = self.device_of(state.tx);
+        let eirp_dbm = state.descriptor.tx_power_dbm + tx_device.net_gain_db();
+        let reach_m = self.range.reach_m(eirp_dbm);
+        let full_m = self.range.full_m(eirp_dbm);
+        let floor_dbm = self.range.floor_dbm();
         let mut candidates: Vec<(NodeId, Vec3)> = Vec::new();
-        for actor in self.snapshot.actors_within(state.tx_pos, MAX_RANGE_M) {
+        let mut beyond: Vec<(NodeId, Vec3)> = Vec::new();
+        for actor in self.snapshot.actors_within(state.tx_pos, reach_m) {
             let Some(rec) = self.actors.get(&actor) else {
                 continue;
             };
@@ -2606,7 +2733,12 @@ impl Engine {
             if node == state.tx {
                 continue;
             }
-            candidates.push((node, rec.last.extrapolate(now).pos));
+            let pos = rec.last.extrapolate(now).pos;
+            if state.tx_pos.distance_2d(pos) <= full_m {
+                candidates.push((node, pos));
+            } else {
+                beyond.push((node, pos));
+            }
         }
         // The roadside units, which are nodes and not actors and so are not in the grid.
         // The walk is over a `BTreeMap`, and there are units rather than vehicles of them,
@@ -2615,21 +2747,48 @@ impl Engine {
             if rsu == state.tx {
                 continue;
             }
-            if state.tx_pos.distance(rsu_pos) <= MAX_RANGE_M {
+            let d = state.tx_pos.distance_2d(rsu_pos);
+            if d <= full_m {
                 candidates.push((rsu, rsu_pos));
+            } else if d <= reach_m {
+                beyond.push((rsu, rsu_pos));
             }
         }
         candidates.sort_by_key(|(n, _)| *n);
+        beyond.sort_by_key(|(n, _)| *n);
 
         // Stage 2: the link budgets, sequentially, because the models carry state — a
         // shadowing process is correlated along a trajectory, which is why it has state
-        // at all.
+        // at all. An arrival under the noise floor less the margin is not a reception
+        // attempt: no receiver detects a frame that far under its own noise. It stays as
+        // energy, which is what it is.
         for &(rx, rx_pos) in &candidates {
             let (rssi, dist, high) = self.link_budget(&state, rx, rx_pos);
+            if rssi < floor_dbm {
+                state.faint.insert(rx, rssi);
+                self.report.faint_arrivals += 1;
+                continue;
+            }
             state.arrivals.insert(rx, (rssi, dist));
             if high {
                 state.focus_high.insert(rx);
             }
+        }
+        // Beyond the cap: line-of-sight energy only, from the deterministic law. A path
+        // through buildings that far out is under the margin in every NLOS law.
+        let tx_antenna = self.endpoint(state.tx, state.tx_pos, now).pos;
+        for &(rx, rx_pos) in &beyond {
+            let rx_end = self.endpoint(rx, rx_pos, now);
+            if self
+                .obstacles
+                .blocked_by_buildings(&self.world, tx_antenna, rx_end.pos)
+            {
+                continue;
+            }
+            let d = tx_antenna.distance(rx_end.pos);
+            let power = self.range.los_power_dbm(eirp_dbm, rx_end.gain_dbi, d);
+            state.faint.insert(rx, power);
+            self.report.faint_arrivals += 1;
         }
         // A reactive jammer that hears this frame jams it at its receivers.
         self.react_to_frame(
@@ -2643,7 +2802,7 @@ impl Engine {
 
         if self.sidelink.is_some() {
             self.sidelink_register(frame, &mut state);
-            for &rx in state.arrivals.keys() {
+            for &rx in state.arrivals.keys().chain(state.faint.keys()) {
                 self.live_at_rx.entry(rx).or_default().push(frame);
             }
             self.scheduler
@@ -2653,11 +2812,28 @@ impl Engine {
         }
 
         // Stage 3: register the arrivals, and cross-declare interference with everything
-        // already in flight at each shared receiver. Gathered first and applied second,
+        // already in flight at each shared receiver — both ways, and whether either frame
+        // is a reception attempt there or only energy. Gathered first and applied second,
         // because the gather reads `self.frames` and the apply writes `self.phy`.
+        //
+        // `(receiver, interferer to add, the attempt it is added to)`.
         let mut overlaps: Vec<(NodeId, InterferenceSource, RxHandle)> = Vec::new();
-        for (&rx, &(power, _)) in &state.arrivals {
-            let _ = power;
+        let tx_id = state.tx_id();
+        let receivers: std::collections::BTreeSet<NodeId> = state
+            .arrivals
+            .keys()
+            .chain(state.faint.keys())
+            .copied()
+            .collect();
+        for &rx in &receivers {
+            let mine = state
+                .arrivals
+                .get(&rx)
+                .map(|&(p, _)| (p, true))
+                .or_else(|| state.faint.get(&rx).map(|&p| (p, false)));
+            let Some((my_power, my_attempt)) = mine else {
+                continue;
+            };
             for other in self.live_at_rx.get(&rx).into_iter().flatten() {
                 let Some(o) = self.frames.get(other) else {
                     continue;
@@ -2667,17 +2843,30 @@ impl Engine {
                 if o.start >= state.end || state.start >= o.end {
                     continue;
                 }
-                let Some(&(o_power, _)) = o.arrivals.get(&rx) else {
+                let theirs = o
+                    .arrivals
+                    .get(&rx)
+                    .map(|&(p, _)| (p, true))
+                    .or_else(|| o.faint.get(&rx).map(|&p| (p, false)));
+                let Some((o_power, o_attempt)) = theirs else {
                     continue;
                 };
-                overlaps.push((
-                    rx,
-                    InterferenceSource::new(o.tx, o_power, o.start, o.end),
-                    RxHandle { tx: o.tx_id(), rx },
-                ));
+                if my_attempt {
+                    overlaps.push((
+                        rx,
+                        InterferenceSource::new(o.tx, o_power, o.start, o.end),
+                        RxHandle { tx: tx_id, rx },
+                    ));
+                }
+                if o_attempt {
+                    overlaps.push((
+                        rx,
+                        InterferenceSource::new(state.tx, my_power, state.start, state.end),
+                        RxHandle { tx: o.tx_id(), rx },
+                    ));
+                }
             }
         }
-        let tx_id = state.tx_id();
         for (&rx, &(power, _)) in &state.arrivals {
             self.phy.register_arrival(Arrival {
                 tx_id,
@@ -2699,16 +2888,10 @@ impl Engine {
                 mac.note_busy(rx, SAFETY_CHANNEL, state.start, state.end);
             }
         }
-        for (rx, source, victim) in overlaps {
-            // The frame already in flight gains this one as an interferer …
-            let _ = self.phy.add_interferer(
-                victim,
-                InterferenceSource::new(state.tx, state.arrivals[&rx].0, state.start, state.end),
-            );
-            // … and this one gains it.
-            let _ = self.phy.add_interferer(RxHandle { tx: tx_id, rx }, source);
+        for (_, source, victim) in overlaps {
+            let _ = self.phy.add_interferer(victim, source);
         }
-        for &rx in state.arrivals.keys() {
+        for &rx in &receivers {
             self.live_at_rx.entry(rx).or_default().push(frame);
         }
 
@@ -2716,7 +2899,6 @@ impl Engine {
             .schedule(state.end, EventClass::PhyEnd, Event::PhyEnd { frame });
         self.frames.insert(frame, state);
     }
-
     /// The reception phase (ADR 0004 decision 5, invariant I-R2).
     ///
     /// The arrival set and every received power were fixed when the frame started; what
@@ -2948,6 +3130,8 @@ impl Engine {
             if dsrc {
                 self.phy.forget_arrival(RxHandle { tx: tx_id, rx });
             }
+        }
+        for &rx in state.arrivals.keys().chain(state.faint.keys()) {
             if let Some(live) = self.live_at_rx.get_mut(&rx) {
                 live.retain(|f| *f != frame);
                 if live.is_empty() {
@@ -3221,8 +3405,10 @@ impl Engine {
     /// One link's received power and distance.
     ///
     /// Sequential by necessity: the shadowing process and the fading model are stateful
-    /// per link. `rx_power = P_tx − total_loss + fading_gain`, summed with
+    /// per link. `rx_power = P_tx − total_loss − obstacle − rain + fading_gain`, summed with
     /// [`v2xw_core::math::sum_ordered`] so two builds cannot disagree about its last bit.
+    /// The antenna gains, net of each end's cable loss (`radio.devices`), are in
+    /// `total_loss` as the propagation model's `antenna_db`.
     ///
     /// The third value is whether a focus region puts this receiver under the high-tier
     /// PHY rule. With a focus region the stack is chosen per link by
@@ -3236,22 +3422,59 @@ impl Engine {
         let freq_hz = self.carrier_hz();
 
         // The antennas, not the ground points: a vehicle's phase centre stands at its
-        // class's default height above the road (1.5 m for a car, TR 36.885), and a
+        // class's antenna height above the road (1.5 m for a car, TR 36.885), and a
         // roadside unit's position already carries its mast height. The building test
         // below is 2.5-D and compares roof heights against these.
         let tx_end = self.endpoint(state.tx, state.tx_pos, now);
         let rx_end = self.endpoint(rx, rx_pos, now);
 
-        // What obstructs the path (04-models.md §3.5): building footprints crossed
-        // (Sommer 2011) and terrain knife edges (ITU-R P.526), each only when the scenario
-        // turned it on and the world has it. A clear link costs nothing but the index
-        // query.
-        let los = self.obstacles.classify(&self.world, tx_end.pos, rx_end.pos);
         let evaluation = self
             .focus
             .as_ref()
             .map(|f| f.plan.evaluate(tx_end.pos, rx_end.pos));
         let high = evaluation.is_some_and(|e| e.phy_tier == Tier::High);
+        let inside_focus = matches!(
+            evaluation.map(|e| e.placement),
+            Some(v2xw_radio::LinkPlacement::Inside)
+        );
+        // The law that prices this link, and so who charges buildings and whether the
+        // street geometry is needed.
+        let law = match (inside_focus, self.focus_law) {
+            (true, Some(l)) => l,
+            _ => self.main_law,
+        };
+
+        // What obstructs the path (04-models.md §3.5): building footprints crossed
+        // (Sommer 2011), and for the geometric law the corner a blocked path turns round
+        // and the vehicles on a clear one; terrain knife edges (ITU-R P.526). Each only
+        // when the scenario turned it on and the world has it. A clear link costs nothing
+        // but the index query.
+        let mut los = self.obstacles.classify_with(
+            &self.world,
+            tx_end.pos,
+            rx_end.pos,
+            law.traces_geometry(),
+            None,
+        );
+        // TR 37.885's NLOSv is a same-street state: the vehicles on the path are looked
+        // for only when no building is, and only near the line.
+        if law.traces_geometry()
+            && !los.class.has_building()
+            && let Some(vehicles) = self.obstacles.vehicles.as_ref()
+        {
+            let set = self.vehicles_between(state.tx, rx, tx_end.pos, rx_end.pos);
+            if !set.as_slice().is_empty() {
+                let blocked =
+                    <v2xw_radio::obstacle::VehicleBlockage as v2xw_radio::ObstacleModel<
+                        EngineCtx<'_>,
+                    >>::los(
+                        vehicles, &self.world, tx_end.pos, rx_end.pos, Some(&set)
+                    );
+                if blocked.class.has_vehicle() {
+                    los = v2xw_radio::merge_los(&[los, blocked]);
+                }
+            }
+        }
 
         let (loss, fade, obstacle_db) = {
             let Engine {
@@ -3283,8 +3506,15 @@ impl Engine {
                 _ => (propagation, fading, true),
             };
             let loss = prop.loss_db(&mut ctx, &tx_end, &rx_end, freq_hz, &los, weather);
-            let obstacle_db =
-                obstacles.loss_db(&mut ctx, &tx_end, &rx_end, &los, freq_hz, loss.path_db);
+            let obstacle_db = obstacles.loss_db(
+                &mut ctx,
+                &tx_end,
+                &rx_end,
+                &los,
+                freq_hz,
+                loss.path_db,
+                !law.owns_buildings(),
+            );
             let fade = if draw_fading {
                 fad.sample_db(&mut ctx, link, distance_m, now)
             } else {
@@ -3292,14 +3522,58 @@ impl Engine {
             };
             (loss, fade, obstacle_db)
         };
+        // Rain over the whole link (ITU-R P.838-3 at the carrier): hundredths of a
+        // decibel at 5.9 GHz, and charged once, whatever the law.
+        let rain_db = self.rain.as_ref().map_or(0.0, |r| {
+            r.attenuation_db(&self.weather, distance_m, freq_hz)
+        });
 
         let rssi_dbm = v2xw_core::math::sum_ordered([
             state.descriptor.tx_power_dbm,
             -loss.total_db,
             -obstacle_db,
+            -rain_db,
             fade,
         ]);
         (rssi_dbm, distance_m, high)
+    }
+
+    /// The vehicles that may stand between two antennas: every actor whose body centre is
+    /// within 8 m of the straight path (half a 13 m truck and a lane), less the two ends'
+    /// own bodies, as obstacles with their actual dimensions.
+    fn vehicles_between(&self, tx: NodeId, rx: NodeId, a: Vec3, b: Vec3) -> v2xw_radio::ActorSet {
+        let mid = Vec3::new(0.5 * (a.x + b.x), 0.5 * (a.y + b.y), 0.0);
+        let radius = 0.5 * a.distance_2d(b) + 10.0;
+        let mut set = Vec::new();
+        for actor in self.snapshot.actors_within(mid, radius) {
+            let Some(rec) = self.actors.get(&actor) else {
+                continue;
+            };
+            if rec.node == Some(tx) || rec.node == Some(rx) {
+                continue;
+            }
+            let Some(entry) = self.snapshot.get(actor) else {
+                continue;
+            };
+            let class = radio_class(entry.view.class);
+            // The published reference is the rear bumper; the body is centred half a
+            // length ahead of it along the heading.
+            let k = &entry.kinematics;
+            let half = 0.5 * entry.view.dims.length_m;
+            let (s, c) = v2xw_core::math::sin_cos(k.heading_rad);
+            let centre = Vec3::new(k.pos.x + half * c, k.pos.y + half * s, k.pos.z);
+            if distance_to_segment_2d(centre, a, b) > 8.0 {
+                continue;
+            }
+            set.push(v2xw_radio::ActorObstacle {
+                actor,
+                pos: centre,
+                dims: entry.view.dims,
+                heading_rad: k.heading_rad,
+                class,
+            });
+        }
+        v2xw_radio::ActorSet::from_iter_sorted(set)
     }
 
     /// The carrier the link budget is evaluated at, hertz.
@@ -3316,20 +3590,54 @@ impl Engine {
             return RadioEndpoint::isotropic(node, ground, v2xw_radio::ActorClass::Car, now);
         }
         if self.rsus.contains_key(&node) {
-            // A mast's position is its antenna's (`crate::phase2`'s mast height).
-            return RadioEndpoint::isotropic(node, ground, v2xw_radio::ActorClass::Rsu, now);
+            // A mast's position is its antenna's (`crate::phase2`'s mast height), unless
+            // `radio.devices.rsu.antenna_height_m` puts every roadside antenna at one
+            // height above the ground under it.
+            let device = crate::wiring::device_for(&self.scenario, v2xw_radio::ActorClass::Rsu);
+            let pos = match device.antenna_height_m {
+                Some(h) => Vec3::new(
+                    ground.x,
+                    ground.y,
+                    self.world.ground_height_at(ground.x, ground.y) + h,
+                ),
+                None => ground,
+            };
+            let mut end = RadioEndpoint::isotropic(node, pos, v2xw_radio::ActorClass::Rsu, now);
+            end.gain_dbi = device.net_gain_db();
+            return end;
         }
         let class = self
             .node_class
             .get(&node)
             .copied()
             .unwrap_or(v2xw_radio::ActorClass::Car);
+        // `radio.devices`: the class's antenna height, and its gain net of the cable
+        // between radio and antenna, at both ends of every link.
+        let device = crate::wiring::device_for(&self.scenario, class);
         let pos = Vec3::new(
             ground.x,
             ground.y,
-            ground.z + class.default_antenna_height_m(),
+            ground.z
+                + device
+                    .antenna_height_m
+                    .unwrap_or_else(|| class.default_antenna_height_m()),
         );
-        RadioEndpoint::isotropic(node, pos, class, now)
+        let mut end = RadioEndpoint::isotropic(node, pos, class, now);
+        end.gain_dbi = device.net_gain_db();
+        end
+    }
+
+    /// The radio a node carries (`radio.devices`), by its class.
+    fn device_of(&self, node: NodeId) -> crate::wiring::DeviceRadio {
+        let class = if self.rsus.contains_key(&node) {
+            v2xw_radio::ActorClass::Rsu
+        } else {
+            self.node_class
+                .get(&node)
+                .copied()
+                .unwrap_or(v2xw_radio::ActorClass::Car)
+        };
+        crate::wiring::device_for(&self.scenario, class)
     }
 
     /// The metric phase: every provider flushes its window, and the samples are recorded
@@ -3680,7 +3988,9 @@ fn msg_type_name(t: v2xw_msg::MsgType) -> &'static str {
     }
 }
 
-/// Re-exported so a caller can size a grid or a range the same way the engine does.
+/// The spatial grid's cell size, re-exported so a caller can size a grid the same way the
+/// engine does. It is no longer the radio candidate range, which the link budget decides
+/// (`radio.range`, [`crate::wiring::CandidateRangePlan`]).
 pub const CANDIDATE_RANGE_M: f64 = MAX_RANGE_M;
 
 /// The tier the radio stack runs at, for a caller's report.

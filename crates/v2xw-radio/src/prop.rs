@@ -750,7 +750,8 @@ pub fn rain_attenuation_db(w: &WeatherState, d_m: f64, f_hz: f64) -> f64 {
     if rate <= 0.0 {
         return 0.0;
     }
-    rain_specific_attenuation_at_db_km(rate, f_hz, Polarization::Vertical) * (d_m.max(0.0) / 1_000.0)
+    rain_specific_attenuation_at_db_km(rate, f_hz, Polarization::Vertical)
+        * (d_m.max(0.0) / 1_000.0)
 }
 
 impl Default for RainAttenuation {
@@ -789,7 +790,10 @@ fn rain_card() -> ModelCard {
              α = Σ a_j·exp(−((log10 f_GHz − b_j)/c_j)²) + m_α·log10 f_GHz + c_α; at 5.9 GHz \
              vertical k = 0.000441, α = 1.5797",
         ),
-        Equation::new("rain rate", "R = intensity × 50 mm/h for rain and sleet, else 0"),
+        Equation::new(
+            "rain rate",
+            "R = intensity × 50 mm/h for rain and sleet, else 0",
+        ),
     ];
     card.parameters = vec![
         Parameter::new(
@@ -828,8 +832,7 @@ fn rain_card() -> ModelCard {
         },
     ];
     card.assumptions = vec![
-        "Rain is uniform along the link: V2X links are far shorter than a rain cell."
-            .to_string(),
+        "Rain is uniform along the link: V2X links are far shorter than a rain cell.".to_string(),
         "Applied at the medium and high propagation tiers, whatever the path-loss law. \
          04-models.md §3's tier table leaves it to high alone because it is negligible; it \
          costs one multiplication, and applying it everywhere means a rain setting does \
@@ -2114,7 +2117,6 @@ fn tr37885_card() -> ModelCard {
     card
 }
 
-
 // =========================================================================================
 // The Mangel, Klemp and Hartenstein (2011) urban-intersection NLOS model
 // =========================================================================================
@@ -2339,10 +2341,7 @@ impl GeometricUrbanV2v {
                 ),
                 GeometricState::NlosCorner,
             ),
-            None => (
-                tr37885_nlos_db(d3d, f_hz / 1e9),
-                GeometricState::NlosStreet,
-            ),
+            None => (tr37885_nlos_db(d3d, f_hz / 1e9), GeometricState::NlosStreet),
         };
         let around = around.max(los_db);
         let through = los_db + self.sommer.loss_db(los.walls_crossed, los.obstructed_len_m);
@@ -2459,7 +2458,12 @@ fn geometric_card() -> ModelCard {
         ),
     ];
     card.parameters = vec![
-        Parameter::new("mangel_n_nlos", "-", serde_json::json!(MANGEL_N_NLOS), mangel_source()),
+        Parameter::new(
+            "mangel_n_nlos",
+            "-",
+            serde_json::json!(MANGEL_N_NLOS),
+            mangel_source(),
+        ),
         Parameter::new(
             "mangel_offset_db",
             "dB",
@@ -2515,8 +2519,7 @@ fn geometric_card() -> ModelCard {
         "It is a V2V model (both antennas about 1.5 m); a roadside unit on a mast uses it \
          unchanged."
             .to_string(),
-        "Two-corner paths have no cited validated law; they get TR 37.885's NLOS law."
-            .to_string(),
+        "Two-corner paths have no cited validated law; they get TR 37.885's NLOS law.".to_string(),
         "Heights in the breakpoint are the phase-centre z, clamped to 0.5-30 m: on a world \
          with terrain that is above the datum, not above the local ground."
             .to_string(),
@@ -2526,11 +2529,7 @@ fn geometric_card() -> ModelCard {
          the composition applies."
             .to_string(),
     ];
-    card.sources = vec![
-        tr.clone(),
-        mangel_source(),
-        sommer_source_for_prop(),
-    ];
+    card.sources = vec![tr.clone(), mangel_source(), sommer_source_for_prop()];
     card.validation = Validation {
         status: ValidationStatus::LiteratureChecked,
         references: vec![tr, mangel_source()],
@@ -3243,7 +3242,11 @@ mod tests {
         // Sleet is rain at this carrier; fog, snow and clear cost nothing.
         assert!(rain_attenuation_db(&rain(WeatherKind::Sleet, 1.0), 300.0, 5.9e9) > 0.0);
         for kind in [WeatherKind::Fog, WeatherKind::Snow, WeatherKind::Clear] {
-            assert_eq!(rain_attenuation_db(&rain(kind, 1.0), 300.0, 5.9e9), 0.0, "{kind:?}");
+            assert_eq!(
+                rain_attenuation_db(&rain(kind, 1.0), 300.0, 5.9e9),
+                0.0,
+                "{kind:?}"
+            );
         }
         // The model object agrees with the free function.
         let m = RainAttenuation::new();
@@ -3305,8 +3308,20 @@ mod tests {
     fn mangel_is_continuous_at_the_breakpoint_and_orders_its_geometry() {
         let f = 5.9e9;
         let d_b = mangel_breakpoint_m(1.5, 1.5, f);
-        let below = mangel_nlos_db(&corner(40.0, d_b * (1.0 - 1e-12), 8.0, 18.0), f, 1.5, 1.5, false);
-        let above = mangel_nlos_db(&corner(40.0, d_b * (1.0 + 1e-12), 8.0, 18.0), f, 1.5, 1.5, false);
+        let below = mangel_nlos_db(
+            &corner(40.0, d_b * (1.0 - 1e-12), 8.0, 18.0),
+            f,
+            1.5,
+            1.5,
+            false,
+        );
+        let above = mangel_nlos_db(
+            &corner(40.0, d_b * (1.0 + 1e-12), 8.0, 18.0),
+            f,
+            1.5,
+            1.5,
+            false,
+        );
         assert!((below - above).abs() < 1e-6, "{below} vs {above}");
         // Beyond the breakpoint the receiver-street slope doubles: 2·26.9 dB per decade.
         let a = mangel_nlos_db(&corner(40.0, 200.0, 8.0, 18.0), f, 1.5, 1.5, false);
@@ -3322,7 +3337,10 @@ mod tests {
         let near_tx = mangel_nlos_db(&corner(10.0, 150.0, 10.0, 20.0), f, 1.5, 1.5, false);
         let far_tx = mangel_nlos_db(&corner(150.0, 10.0, 10.0, 20.0), f, 1.5, 1.5, false);
         let expected = 26.9 * (1.0 - 0.957) * math::log10(15.0);
-        assert!((near_tx - far_tx - expected).abs() < 1e-9, "{near_tx} vs {far_tx}");
+        assert!(
+            (near_tx - far_tx - expected).abs() < 1e-9,
+            "{near_tx} vs {far_tx}"
+        );
     }
 
     /// Mangel, Michl, Klemp and Hartenstein measured 802.11p at Munich intersections with
@@ -3381,7 +3399,10 @@ mod tests {
         };
         let (v, s) = model.mean_loss_db(&tx, &rx, f, &vehicle);
         assert_eq!(s, GeometricState::Nlosv);
-        assert!((v - los_law).abs() < 1e-12, "the blockage is the obstacle stack's term");
+        assert!(
+            (v - los_law).abs() < 1e-12,
+            "the blockage is the obstacle stack's term"
+        );
 
         // A tower block on the corner: 2 walls, 30 m inside — the Sommer path costs 33 dB.
         let mut blocked = LosResult::blocked_by_buildings(2, 30.0);
@@ -3411,7 +3432,15 @@ mod tests {
         // antenna gain, and the shadowing with the state's σ.
         let mut ctx = TestCtx::new(9);
         let mut m = GeometricUrbanV2v::new(Tier::High, EnvClass::Urban);
-        let b = Propagation::<TestCtx>::loss_db(&mut m, &mut ctx, &tx, &rx, f, &blocked, &WeatherState::CLEAR);
+        let b = Propagation::<TestCtx>::loss_db(
+            &mut m,
+            &mut ctx,
+            &tx,
+            &rx,
+            f,
+            &blocked,
+            &WeatherState::CLEAR,
+        );
         assert!((b.path_db - los_law).abs() < 1e-12);
         assert!((b.obstacle_db - (mangel - los_law)).abs() < 1e-9);
         assert_eq!(b.antenna_db, 6.0);
@@ -3435,7 +3464,15 @@ mod tests {
         for i in 0..4_000u32 {
             let tx = ep(2 * i, 0.0, 0.0);
             let rx = ep(2 * i + 1, 50.0, 50.0);
-            let b = Propagation::<TestCtx>::loss_db(&mut m, &mut ctx, &tx, &rx, f, &blocked, &WeatherState::CLEAR);
+            let b = Propagation::<TestCtx>::loss_db(
+                &mut m,
+                &mut ctx,
+                &tx,
+                &rx,
+                f,
+                &blocked,
+                &WeatherState::CLEAR,
+            );
             xs.push(b.shadow_db);
         }
         let n = xs.len() as f64;

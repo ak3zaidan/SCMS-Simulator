@@ -532,6 +532,171 @@ pub struct Radio {
     /// The model chosen for each family, with its parameters.
     #[serde(default)]
     pub models: BTreeMap<String, ModelChoice>,
+    /// The radio each kind of node carries: transmit power, antenna gain, cable loss and
+    /// antenna height.
+    #[serde(default)]
+    pub devices: RadioDevices,
+    /// How far a transmission is followed: derived from the link budget.
+    #[serde(default)]
+    pub range: CandidateRange,
+}
+
+/// The radio hardware of each kind of node (04-models.md §3.7).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RadioDevices {
+    /// A vehicle's on-board unit.
+    #[serde(default)]
+    pub obu: ObuRadio,
+    /// A roadside unit.
+    #[serde(default)]
+    pub rsu: RsuRadio,
+    /// A pedestrian's or cyclist's device.
+    #[serde(default)]
+    pub vru: VruRadio,
+}
+
+/// A vehicle on-board unit's radio.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObuRadio {
+    /// Conducted transmit power at the antenna port, dBm; congestion control may lower it.
+    #[serde(default = "ObuRadio::tx_power")]
+    pub tx_power_dbm: f64,
+    /// Antenna gain, dBi, transmitting and receiving.
+    #[serde(default = "ObuRadio::gain")]
+    pub antenna_gain_dbi: f64,
+    /// Loss of the cable between radio and antenna, dB, transmitting and receiving.
+    #[serde(default)]
+    pub cable_loss_db: f64,
+    /// Antenna height above the road, metres; unset, 1.5 m on a car and 3 m on a truck or bus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antenna_height_m: Option<f64>,
+}
+
+impl ObuRadio {
+    fn tx_power() -> f64 {
+        23.0
+    }
+    fn gain() -> f64 {
+        3.0
+    }
+}
+
+impl Default for ObuRadio {
+    fn default() -> Self {
+        Self {
+            tx_power_dbm: Self::tx_power(),
+            antenna_gain_dbi: Self::gain(),
+            cable_loss_db: 0.0,
+            antenna_height_m: None,
+        }
+    }
+}
+
+/// A roadside unit's radio.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RsuRadio {
+    /// Conducted transmit power at the antenna port, dBm.
+    #[serde(default = "RsuRadio::tx_power")]
+    pub tx_power_dbm: f64,
+    /// Antenna gain, dBi, transmitting and receiving.
+    #[serde(default = "RsuRadio::gain")]
+    pub antenna_gain_dbi: f64,
+    /// Loss of the cable between radio and antenna, dB, transmitting and receiving.
+    #[serde(default)]
+    pub cable_loss_db: f64,
+    /// Antenna height above the ground, metres; unset, the site's own mast height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antenna_height_m: Option<f64>,
+}
+
+impl RsuRadio {
+    fn tx_power() -> f64 {
+        23.0
+    }
+    fn gain() -> f64 {
+        3.0
+    }
+}
+
+impl Default for RsuRadio {
+    fn default() -> Self {
+        Self {
+            tx_power_dbm: Self::tx_power(),
+            antenna_gain_dbi: Self::gain(),
+            cable_loss_db: 0.0,
+            antenna_height_m: None,
+        }
+    }
+}
+
+/// A vulnerable road user's device.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VruRadio {
+    /// Conducted transmit power at the antenna port, dBm.
+    #[serde(default = "VruRadio::tx_power")]
+    pub tx_power_dbm: f64,
+    /// Antenna gain, dBi, transmitting and receiving.
+    #[serde(default)]
+    pub antenna_gain_dbi: f64,
+    /// Loss of the cable between radio and antenna, dB, transmitting and receiving.
+    #[serde(default)]
+    pub cable_loss_db: f64,
+    /// Antenna height above the ground, metres.
+    #[serde(default = "VruRadio::height")]
+    pub antenna_height_m: f64,
+}
+
+impl VruRadio {
+    fn tx_power() -> f64 {
+        23.0
+    }
+    fn height() -> f64 {
+        1.5
+    }
+}
+
+impl Default for VruRadio {
+    fn default() -> Self {
+        Self {
+            tx_power_dbm: Self::tx_power(),
+            antenna_gain_dbi: 0.0,
+            cable_loss_db: 0.0,
+            antenna_height_m: Self::height(),
+        }
+    }
+}
+
+/// How far a transmission is followed (04-models.md §3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateRange {
+    /// How far below the receiver's noise floor a line-of-sight arrival may fall before
+    /// the transmission is no longer followed there, dB.
+    #[serde(default = "CandidateRange::margin")]
+    pub margin_db: f64,
+    /// A cap on the fully evaluated range, metres; beyond it only line-of-sight
+    /// interference is counted. Unset, the link budget alone decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_m: Option<f64>,
+}
+
+impl CandidateRange {
+    fn margin() -> f64 {
+        10.0
+    }
+}
+
+impl Default for CandidateRange {
+    fn default() -> Self {
+        Self {
+            margin_db: Self::margin(),
+            max_m: None,
+        }
+    }
 }
 
 /// Radio access technology (03-interfaces.md §13).

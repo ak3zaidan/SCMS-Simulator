@@ -213,6 +213,7 @@ const UNIT_SUFFIXES: &[(&str, &str)] = &[
     ("_mbps", "Mbit/s"),
     ("_kbps", "kbit/s"),
     ("_dbm", "dBm"),
+    ("_dbi", "dBi"),
     ("_deg", "°"),
     ("_ms", "ms"),
     ("_us", "µs"),
