@@ -5,7 +5,7 @@
   "master_seed": 26719282226331630,
   "end_ns": 10000000000,
   "records": 15914,
-  "record_digest": "476448876650d7adbe64f74d86bd95e443cb0307ac50aff415ae94d70a65d5a3",
+  "record_digest": "2d37766a5fb69289b2adb6e92d48765f7036894c04d403744813e5dd280a9cd5",
   "per_channel": {
     "gt.kinematics": [
       619,
@@ -29,7 +29,7 @@
     ],
     "node.tx": [
       616,
-      474118
+      474104
     ],
     "node.verify": [
       4139,
