@@ -43,8 +43,8 @@ use v2xw_msg::generator::DccState;
 use v2xw_node::stores::{CredState, CredentialHandle, NeighborTable};
 use v2xw_node::vru::{VruConfig, VruDeviceKind, VruDeviceRuntime, VruServices};
 use v2xw_node::{
-    HardwareProfile, NodeCtx, NodeSecurity, NodeState, ObuRuntime, RxFrame, RxStamp,
-    StepOutcome, Stores, VerifiedMessage,
+    HardwareProfile, NodeCtx, NodeSecurity, NodeState, ObuRuntime, RxFrame, RxStamp, StepOutcome,
+    Stores, VerifiedMessage,
 };
 
 use crate::scenario::Scenario;
@@ -181,8 +181,7 @@ impl HostedNode {
 
     /// SPDUs whose signature failed (zero for a VRU device, which does not count them).
     pub fn spdu_signature_failures(&self) -> u64 {
-        self.as_obu()
-            .map_or(0, ObuRuntime::spdu_signature_failures)
+        self.as_obu().map_or(0, ObuRuntime::spdu_signature_failures)
     }
 
     /// One node-phase step, with each frame's reception stamp. A VRU device's outcome is
@@ -241,6 +240,9 @@ impl NodeView for HostedNode {
         both!(self, n => n.received())
     }
 }
+
+/// The hardware profile every VRU device is built on (`vru-device/handset-generic`).
+pub const VRU_DEVICE_PROFILE: &str = v2xw_node::profiles::GENERIC_VRU_DEVICE;
 
 /// Which awareness services a VRU device runs under this scenario's message sets.
 pub fn vru_services(scenario: &Scenario) -> VruServices {

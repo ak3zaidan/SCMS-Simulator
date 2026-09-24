@@ -2835,10 +2835,16 @@ impl LiveEngine {
                         // for a car. A rendering offset, not a model input.
                         (pose.pos_m[2] + 1.5) as f32,
                     ],
-                    label: format!("veh_{:04}", pose.actor.index()),
-                    profile_id: self.setup.obu_profile.clone(),
+                    label: self.node_label(pose.actor, pose.class_idx),
+                    profile_id: self.node_profile(pose.class_idx),
                     flags: NODE_HAS_HSM,
-                    kind: 0,
+                    // §3.1.3 `kind`: a pedestrian's or a cyclist's handset is a
+                    // `vru-device` (1), everything else riding an actor an OBU (0).
+                    kind: if self.is_vru_class(pose.class_idx) {
+                        1
+                    } else {
+                        0
+                    },
                     class_idx: pose.class_idx,
                 })
             })
@@ -2959,15 +2965,52 @@ impl LiveEngine {
             .get(usize::try_from(index - self.base_index).unwrap_or(usize::MAX))
     }
 
+    /// True if the class at `class_idx` is a vulnerable road user, whose node is the VRU
+    /// device `v2xw_engine::hosted` builds rather than an OBU.
+    fn is_vru_class(&self, class_idx: u8) -> bool {
+        self.setup
+            .class_names
+            .get(usize::from(class_idx))
+            .is_some_and(|n| n == "pedestrian" || n == "bicycle")
+    }
+
+    /// A node's label: `ped_`, `bike_` or `veh_` and the actor id.
+    fn node_label(&self, actor: v2xw_core::ids::ActorId, class_idx: u8) -> String {
+        let prefix = match self
+            .setup
+            .class_names
+            .get(usize::from(class_idx))
+            .map(String::as_str)
+        {
+            Some("pedestrian") => "ped",
+            Some("bicycle") => "bike",
+            _ => "veh",
+        };
+        format!("{prefix}_{:04}", actor.index())
+    }
+
+    /// A node's hardware profile id: the handset profile for a VRU device, the scenario's
+    /// OBU profile otherwise.
+    fn node_profile(&self, class_idx: u8) -> String {
+        if self.is_vru_class(class_idx) {
+            v2xw_engine::hosted::VRU_DEVICE_PROFILE.to_string()
+        } else {
+            self.setup.obu_profile.clone()
+        }
+    }
+
     /// Appends any string the emitted step's node table needs and has not used before.
     fn intern_labels(&mut self, step: &StepOutput) {
-        let mut wanted: Vec<String> = vec![self.setup.obu_profile.clone()];
+        let mut wanted: Vec<String> = vec![
+            self.setup.obu_profile.clone(),
+            v2xw_engine::hosted::VRU_DEVICE_PROFILE.to_string(),
+        ];
         wanted.extend(
             step.snapshot
                 .actors
                 .iter()
                 .filter(|pose| pose.node.is_some())
-                .map(|pose| format!("veh_{:04}", pose.actor.index())),
+                .map(|pose| self.node_label(pose.actor, pose.class_idx)),
         );
         for string in wanted {
             if self
