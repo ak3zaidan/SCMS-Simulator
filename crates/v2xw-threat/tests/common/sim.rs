@@ -651,6 +651,9 @@ pub fn run(opts: &SimOptions) -> SimOut {
     let mut attackers: BTreeMap<NodeId, LegacyAttacker> = BTreeMap::new();
     let mut detectors: BTreeMap<NodeId, Legacy12> = BTreeMap::new();
     let mut inboxes: BTreeMap<NodeId, Vec<(RxFrame, OnAirClaim)>> = BTreeMap::new();
+    // Each receiver's on-air claims, kept across steps: see the join in the node phase.
+    let mut pending_claims: BTreeMap<NodeId, BTreeMap<([u8; 8], SimTime), OnAirClaim>> =
+        BTreeMap::new();
     let mut last_rx: BTreeMap<NodeId, Vec<ObservedMessage>> = BTreeMap::new();
     let mut ma = v2xw_threat::ma::LegacyWindow::new(opts.ma.clone());
     let mut next_node = 0u32;
@@ -816,7 +819,15 @@ pub fn run(opts: &SimOptions) -> SimOut {
             // repetition count from the MAC, the certificate window from the envelope, the
             // declared station type and the broadcast confidence — joined back by
             // (signer, generation time), which is what identifies a beacon on the air.
-            let mut claims: BTreeMap<([u8; 8], SimTime), OnAirClaim> = BTreeMap::new();
+            //
+            // The map outlives the step. The runtime verifies in continuous time and a
+            // message still waiting for the verifier at the end of a step is delivered at a
+            // later one, so a join against this step's inbox alone dropped every message
+            // that had queued: the detectors saw a sliver of the traffic, filed a twentieth
+            // of the reports, and caught none of the five attackers. Entries are dropped
+            // two seconds after they arrived, longer than any verification wait here.
+            let claims = pending_claims.entry(id).or_default();
+            claims.retain(|_, c| c.arrival.saturating_add(2_000_000_000) >= now);
             for (f, c) in &inbox {
                 let key = (
                     f.signer.as_ref().map_or([0u8; 8], id8_bytes),
