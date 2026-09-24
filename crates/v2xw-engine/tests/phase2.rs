@@ -128,6 +128,8 @@ fn a_report_becomes_a_vehicle_that_cannot_sign() {
     assert!(p.ma_revoke_decisions > 0, "the authority never decided");
     assert!(p.cases_opened > 0, "the backend never opened a case");
     assert!(p.crls_issued >= 1, "the CRL Generator did not issue");
+    assert!(p.revoked_attackers >= 1, "the attacker was not the device revoked");
+    assert_eq!(p.revoked_honest, 0, "an honest device was revoked beside the attacker");
     assert!(p.crl_versions_published >= 1, "the CRL Store never published");
     assert!(
         p.crl_broadcasts > 0 || p.crl_downloads > 0,
@@ -217,6 +219,7 @@ fn with_no_attacker_nothing_is_revoked() {
         "the authority decided to revoke a device in a run with no attacker in it"
     );
     assert_eq!(p.crls_issued, 0, "a device was revoked in a run with no attacker in it");
+    assert_eq!(p.revoked_honest, 0);
 }
 
 /// Without the `crl` role, and with the cellular poll pushed past the horizon, the list is

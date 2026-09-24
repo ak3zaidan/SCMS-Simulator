@@ -268,6 +268,8 @@ fn honest_traffic_is_not_revoked_and_the_gate_is_why() {
         q.ma_revoke_decisions > 0,
         "with no persistence gate the honest fleet's false reports should revoke someone"
     );
+    assert!(q.revoked_honest > 0, "the control revoked no honest device");
+    assert_eq!(p.revoked_honest, 0);
 }
 
 /// A report is backend traffic: with a modem it goes over the cellular uplink and never

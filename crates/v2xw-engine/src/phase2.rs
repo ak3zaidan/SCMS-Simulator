@@ -459,6 +459,12 @@ pub struct Phase2Report {
     pub starved_node_steps: u64,
     /// The access legs.
     pub access: crate::backend::AccessReport,
+    /// Revocations whose subject was an armed attacker (ground truth).
+    pub revoked_attackers: u64,
+    /// Revocations whose subject was honest (ground truth): false revocations.
+    pub revoked_honest: u64,
+    /// Decisions about a certificate the published list already revoked.
+    pub decisions_already_covered: u64,
     /// Backend deliveries the protocol kernel refused (modelling defects).
     pub backend_errors: u64,
     /// The first of them, for the report.
@@ -1319,10 +1325,31 @@ impl Phase2 {
             self.stage_cursor = cursor;
             v
         };
+        // The reports the authority received since the last tick, in the order their
+        // evidence was observed: a shuffle releases a batch at one instant, and the
+        // persistence gate dates evidence by observation, not by arrival.
+        let mut arrived: Vec<(SimTime, FlowRun, InFlightReport)> = Vec::new();
         for s in &stamps {
             if s.stage == StageId::ReportReceived
                 && let Some(f) = self.in_flight.remove(&s.run)
             {
+                arrived.push((s.t, s.run, f));
+            }
+        }
+        arrived.sort_by(|a, b| {
+            (a.2.report.detection_time, &a.2.report.report_id)
+                .cmp(&(b.2.report.detection_time, &b.2.report.report_id))
+        });
+        for (t_arrived, run, f) in arrived {
+            {
+                let s = v2xw_proto::stage::StageStamp {
+                    t: t_arrived,
+                    run,
+                    flow: v2xw_proto::stage::FlowId::Report,
+                    stage: StageId::ReportReceived,
+                    node: None,
+                    size: None,
+                };
                 self.report.reports_at_ma += 1;
                 let mut r = f.report;
                 r.ingest_time = s.t;
@@ -1332,7 +1359,9 @@ impl Phase2 {
                     subject: r.subject_cert_digest.clone(),
                     detector: r.leading_reason().map(str::to_string),
                 });
-                if let Some(MaAction::Revoke { subject }) = self.ma.ingest(&r) {
+                if let Some(MaAction::Revoke { subject }) =
+                    self.ma.ingest_evidence(&r, r.detection_time)
+                {
                     self.report.ma_revoke_decisions += 1;
                     tick.ma_decisions.push(v2xw_threat::records::MaDecisionRecord {
                         t: s.t,
@@ -1370,6 +1399,13 @@ impl Phase2 {
                 let _ = t;
                 if let Some(entry) = crlg_entries.last() {
                     self.report.crls_issued += 1;
+                    // The ground-truth join, for the run report only: whether the device
+                    // the authority revoked was the one that lied.
+                    if self.attackers.contains_key(&case.subject) {
+                        self.report.revoked_attackers += 1;
+                    } else {
+                        self.report.revoked_honest += 1;
+                    }
                     case.entry = Some((entry.clone(), crlg_entries.len() as u32));
                 }
             }
@@ -1524,6 +1560,17 @@ impl Phase2 {
                 continue;
             };
             let _ = now;
+            // A certificate the Generator's list already revokes needs no second case: the
+            // authority holds the list and checks it before spending lookups [BRECHT §VI-D:
+            // one entry revokes every certificate of the device from `i` on].
+            let mut covered = v2xw_sec::CrlStore::new();
+            for e in &self.scms.state.crlg.entries {
+                covered.add_linkage_entry(*e);
+            }
+            if covered.revokes_linkage_at_period(i, lv) {
+                self.report.decisions_already_covered += 1;
+                continue;
+            }
             // Revoke from the reported certificate's own period forward: its entry must
             // match the certificate that was reported, and forward-only linkage keeps
             // every earlier certificate unlinkable [BRECHT §VI-D].

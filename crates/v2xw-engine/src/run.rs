@@ -3817,10 +3817,13 @@ impl Engine {
                 out.push(crate::sec_records::SecPseudonymView {
                     t: now,
                     node: *id,
-                    reason: if active.is_none() {
-                        "exhausted".to_string()
-                    } else {
-                        "scheduled".to_string()
+                    reason: match (active.is_none(), certs.last_reason()) {
+                        (true, _) => "exhausted".to_string(),
+                        (false, Some(r)) => serde_json::to_value(r)
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_string))
+                            .unwrap_or_else(|| "scheduled".to_string()),
+                        (false, None) => "scheduled".to_string(),
                     },
                     old_digest: old.map(|d| hex(&d)),
                     new_digest: digest.map(|d| hex(&d)),

@@ -1934,6 +1934,26 @@ impl Projector {
                 // fill the fields a record stream cannot see. Take it whole.
                 apply_reported(&mut row, reported);
             }
+            // The node's security row fills the §3.5.2 credential fields the telemetry
+            // view does not carry: the valid pool, the stored pool, the CRL it holds and
+            // the reports waiting for connectivity.
+            if let Some((sec, _)) = self.security.get(&node)
+                && !sec.is_null()
+            {
+                let small = |v: &Value| v.as_u64().map(|n| n.min(u64::from(u16::MAX - 1)));
+                if let Some(n) = small(&sec["pool_valid"]) {
+                    row.cert_active = n as u16;
+                }
+                if let Some(n) = sec["pool_stored"].as_u64() {
+                    row.cert_stored = u32::try_from(n).unwrap_or(u32::MAX - 1);
+                }
+                if let Some(n) = sec["crl_entries"].as_u64() {
+                    row.crl_entries = u32::try_from(n).unwrap_or(u32::MAX - 1);
+                }
+                if let Some(n) = sec["outbox_reports"].as_u64() {
+                    row.outbox_msgs = u32::try_from(n).unwrap_or(u32::MAX - 1);
+                }
+            }
             row.msgs_out_per_s = counters.tx_msgs as f32;
             row.msgs_in_per_s = counters.rx_ok as f32;
             row.verifications_per_s = counters.verifies as f32;
@@ -1954,7 +1974,9 @@ impl Projector {
             if let Some(power) = counters.tx_power_cdbm {
                 row.tx_power_cdbm = power;
             }
-            if counters.certs_seen > 0 {
+            // `sec.cert` events (changes, top-ups, revocations) are not a store count; they
+            // stand in for one only when the node published no security row.
+            if counters.certs_seen > 0 && !self.security.contains_key(&node) {
                 row.cert_stored = counters.certs_seen;
             }
             // §3.5.2's `node_state`: the run only produces records for a node that is

@@ -167,6 +167,8 @@ pub struct CertStore {
     /// How many times each credential, keyed by `(i_period, j_index, valid_from)`, has been
     /// the active one. Rotation picks the least used, so a pool is used round-robin.
     activations: BTreeMap<(u32, u32, SimTime), u32>,
+    /// Why the last change happened.
+    last_reason: Option<ChangeReason>,
 }
 
 impl CertStore {
@@ -278,11 +280,15 @@ impl CertStore {
             let used = self.activations.entry(key(current)).or_insert(0);
             *used = (*used).max(1);
         }
-        // The next credential is the least used usable one, and among those the oldest,
-        // which drains the pool in issue order and then goes round it again. Picking the
-        // oldest alone went back to the lowest-numbered credential every second change, so
-        // a node alternated between two pseudonyms and never used the rest of its pool:
-        // exactly the reuse that makes two pseudonyms linkable.
+        // The next credential is the least used usable one, and among those the one of the
+        // newest i-period, then the lowest index: the pool is drained in issue order and
+        // then gone round again. Picking the oldest alone went back to the lowest-numbered
+        // credential every second change, so a node alternated between two pseudonyms and
+        // never used the rest of its pool: exactly the reuse that makes two pseudonyms
+        // linkable. Preferring the newest period matters in the hour two periods overlap
+        // (CAMP-EE §2.1.5.3.2): a change there moves to the period that has just begun,
+        // not to a certificate with minutes left, which would force a second change almost
+        // at once.
         let pick = self
             .creds
             .iter()
@@ -291,20 +297,31 @@ impl CertStore {
             .min_by_key(|(_, c)| {
                 (
                     self.activations.get(&key(c)).copied().unwrap_or(0),
-                    c.i_period,
+                    core::cmp::Reverse(c.i_period),
                     c.j_index,
                     c.valid_from,
                 )
             })
             .map(|(i, _)| i);
-        if let Some(i) = pick {
-            self.creds.swap(0, i);
-            *self.activations.entry(key(&self.creds[0])).or_insert(0) += 1;
-        }
+        let Some(i) = pick else {
+            // Nothing usable to move to: the node stops signing (the caller sees `active()`
+            // as `None`), and no change happened. Counting one here counted a change on
+            // every step of a revoked or exhausted node — hundreds of phantom pseudonym
+            // changes, each a `sec.pseudonym` record, from a node that was silent.
+            return Some(reason);
+        };
+        self.creds.swap(0, i);
+        *self.activations.entry(key(&self.creds[0])).or_insert(0) += 1;
         self.last_change = Some(now);
         self.distance_since_change_m = 0.0;
         self.changes = self.changes.saturating_add(1);
+        self.last_reason = Some(reason);
         Some(reason)
+    }
+
+    /// Why the last change happened, if one has.
+    pub fn last_reason(&self) -> Option<ChangeReason> {
+        self.last_reason
     }
 
     fn change_due(&self, now: SimTime) -> Option<ChangeReason> {
@@ -1051,6 +1068,46 @@ mod tests {
             seen.push(s.active().unwrap().j_index);
         }
         assert_eq!(seen, vec![0, 1, 2, 3, 4, 0, 1, 2, 3, 4]);
+    }
+
+    /// A node with nothing left to change to makes no change, however many steps it asks:
+    /// a revoked or exhausted pool is a silent node, not one changing pseudonym every step.
+    #[test]
+    fn an_exhausted_pool_counts_no_changes() {
+        let mut s = CertStore::new().with_policy(RotationPolicy::NYC_PILOT);
+        s.insert(cred(0, 0, 0, 10 * NS_PER_S));
+        for k in 11..20u64 {
+            assert_eq!(s.rotate(k * NS_PER_S), Some(ChangeReason::Expired));
+        }
+        assert_eq!(s.changes(), 0, "a pool with nothing valid changed pseudonym");
+    }
+
+    /// In the hour two i-periods overlap, a change moves to the period that has just
+    /// begun rather than to a certificate of the ending one, which would expire minutes
+    /// later and force a second change — and the change's reason is kept.
+    #[test]
+    fn a_change_in_the_overlap_moves_to_the_new_period() {
+        let policy = RotationPolicy {
+            min_age: Duration::from_secs(10),
+            min_distance_m: f64::INFINITY,
+            require_both: false,
+        };
+        let mut s = CertStore::new().with_policy(policy);
+        // Period 0 valid [0, 41 s), period 1 valid [40 s, 81 s): one second of overlap.
+        for j in 0..3 {
+            s.insert(cred(0, j, 0, 41 * NS_PER_S));
+        }
+        for j in 0..3 {
+            s.insert(cred(1, j, 40 * NS_PER_S, 81 * NS_PER_S));
+        }
+        assert_eq!(s.rotate(40_500_000_000), Some(ChangeReason::Age));
+        assert_eq!(s.last_reason(), Some(ChangeReason::Age));
+        let now = s.active().unwrap();
+        assert_eq!(
+            (now.i_period, now.j_index),
+            (1, 0),
+            "a certificate with half a second left was chosen over the new period"
+        );
     }
 
     /// A node whose own certificate is revoked has no active credential, which is what

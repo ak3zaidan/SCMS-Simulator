@@ -229,7 +229,10 @@ impl LegacyWindow {
             .map(|(_, r)| r.as_str())
             .collect();
         let seconds: BTreeSet<u64> = ev.iter().map(|(at, _)| at / NS_PER_S).collect();
-        let span = ev.last().map_or(0, |e| e.0) - ev.first().map_or(0, |e| e.0);
+        let span = ev
+            .last()
+            .map_or(0, |e| e.0)
+            .saturating_sub(ev.first().map_or(0, |e| e.0));
         let reporters = reporters.len();
         let persist = secs_to_ns(self.params.revoke_persist_s);
         if reporters >= self.params.report_threshold_k
@@ -255,6 +258,23 @@ impl LegacyWindow {
     /// wrapper that had to let this type emit first would put a revocation on the channel
     /// and then not perform it.
     pub fn ingest(&mut self, r: &MisbehaviourReport) -> Option<MaAction> {
+        self.ingest_evidence(r, r.ingest_time)
+    }
+
+    /// [`LegacyWindow::ingest`] with the evidence dated `at` rather than at the report's
+    /// arrival.
+    ///
+    /// The legacy engine's reports reached the authority within a network delay of the
+    /// detection, so arrival and observation were the same second. Behind a deployment's
+    /// report shuffle (the CAMP RA holds reports for up to a day, SCMS-765) a batch
+    /// arrives at one instant carrying evidence observed over the whole window, and a
+    /// persistence gate that dated it by arrival would see every batch as one second. The
+    /// gate is about how long the misbehaviour was *observed*, so a caller behind a
+    /// shuffle dates the evidence by the report's detection time.
+    ///
+    /// Evidence is kept in time order whatever order it arrives in, so the span is the
+    /// span of the observations.
+    pub fn ingest_evidence(&mut self, r: &MisbehaviourReport, at: SimTime) -> Option<MaAction> {
         *self
             .filed_by
             .entry(r.reporter_cert_digest.clone())
@@ -263,11 +283,14 @@ impl LegacyWindow {
             .reported
             .entry(r.subject_cert_digest.clone())
             .or_insert(0) += 1;
-        self.evidence
+        let ev = self
+            .evidence
             .entry(r.subject_cert_digest.clone())
-            .or_default()
-            .push((r.ingest_time, r.reporter_cert_digest.clone()));
-        self.correlate(&r.subject_cert_digest, r.ingest_time)
+            .or_default();
+        let pos = ev.partition_point(|(t, _)| *t <= at);
+        ev.insert(pos, (at, r.reporter_cert_digest.clone()));
+        let latest = ev.last().map_or(at, |e| e.0);
+        self.correlate(&r.subject_cert_digest, latest)
     }
 
     /// How many distinct reporter certificates the evidence about `subject` holds, and how
