@@ -64,6 +64,10 @@ function freshEngine(): StudioEngine {
     metricDims: {},
     pseudonym: null,
     seriesTick: 0,
+    // Projected from the engine's node table and the followed pose at each flush; a new engine
+    // starts from nothing, so the store must too, or its first flush reports the change.
+    radios: 0,
+    followedPose: null,
     run: PRISTINE.run,
   });
   return new StudioEngine();

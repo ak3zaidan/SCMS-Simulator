@@ -16,6 +16,8 @@
 import { create } from "zustand";
 import type {
   InspectMessages,
+  InspectNeighbor,
+  NodeFeedNotification,
   InspectNodeResult,
   NodeTelemetry,
   OverlayName,
@@ -24,6 +26,15 @@ import type {
   RunState,
 } from "@vwp/protocol";
 import type { CameraMode } from "@vwp/viewer";
+import {
+  EMPTY_FEED,
+  applyPush,
+  followFeed,
+  openMessage,
+  setPaused,
+  type FeedDir,
+  type FeedView,
+} from "../lib/feed.js";
 import type { ClientProvenance } from "../lib/provenance.js";
 import type { EngineFlavour, EngineProbe } from "../lib/target.js";
 import type { ThemeName } from "../lib/theme.js";
@@ -347,6 +358,15 @@ export interface CompareSync {
   readonly offsetNs: number;
 }
 
+/** The followed vehicle's pose in the stream: world-local metres, m/s, ENU heading in radians. */
+export interface FollowedPose {
+  readonly tNs: number;
+  readonly x: number;
+  readonly y: number;
+  readonly speed: number;
+  readonly headingRad: number;
+}
+
 const EMPTY_RUN: RunInfo = {
   state: "idle", tNs: 0, tEndNs: 0, speed: 1, actors: 0, nodes: 0, runId: "", profile: "full", live: true,
   generation: 0, stagedHash: null, outputDigest: null, kernelThreads: null,
@@ -381,6 +401,26 @@ interface StudioState {
    * (its height is the view's bottom inset) every second.
    */
   inspectMessages: InspectMessages | null;
+  /**
+   * The followed node's `node.feed` (vwp-v1 §6.7, §6.14): what it sent and heard, message by
+   * message, and its queues — pushed by the engine only while the node is followed (`lib/feed.ts`).
+   */
+  feed: FeedView;
+  /** Which of the message panel's three tabs is open. */
+  feedTab: "sent" | "received" | "queues";
+  /**
+   * The followed vehicle's pose in the stream at the last projection flush: world-local metres, m/s
+   * and an ENU heading. The HUD prints it beside what the vehicle's BSMs say.
+   */
+  followedPose: FollowedPose | null;
+  /**
+   * Radios in the stream now: the client's node table, which `Hello` seeds and every spawn and
+   * despawn in a `Delta` keeps current (§3.1.3, §3.4.5). `run.status.nodes` is a polled engine
+   * figure that counts only vehicles; this is the one the stream on screen carries.
+   */
+  radios: number;
+  /** The followed node's neighbour table, refreshed on its own every two seconds. */
+  neighbors: readonly InspectNeighbor[] | null;
   overlays: Partial<Record<OverlayName, boolean>>;
   serverOverlays: readonly ServerOverlay[];
   groundTruthLocked: boolean;
@@ -405,7 +445,7 @@ interface StudioState {
   metricProvenance: Readonly<Record<string, number>>;
   metricDims: Readonly<Record<string, string>>;
   why: WhySubject | null;
-  inspectorTab: "state" | "why" | "log";
+  inspectorTab: "state" | "messages" | "why" | "log";
   hudDocked: boolean;
   /**
    * Whether the interface shows protocol internals: wire field names, method names, frame counts
@@ -439,6 +479,17 @@ interface StudioState {
   notePseudonym: (p: PseudonymInfo) => void;
   setInspect: (r: InspectNodeResult | null) => void;
   setInspectMessages: (m: InspectMessages | null) => void;
+  /** Apply one `node.feed` push (ignored when it is for another node). */
+  applyFeed: (push: NodeFeedNotification) => void;
+  /** The engine answered that it has no feed, and why. */
+  setFeedUnavailable: (reason: string | null) => void;
+  setFeedPaused: (paused: boolean) => void;
+  openFeedMessage: (dir: FeedDir, key: string | null) => void;
+  setFeedFilter: (f: { types?: readonly string[]; outcome?: FeedView["outcome"] }) => void;
+  setFeedTab: (t: "sent" | "received" | "queues") => void;
+  setFollowedPose: (p: FollowedPose | null) => void;
+  setRadios: (n: number) => void;
+  setNeighbors: (n: readonly InspectNeighbor[] | null) => void;
   setOverlays: (o: Partial<Record<OverlayName, boolean>>) => void;
   setServerOverlays: (o: readonly ServerOverlay[]) => void;
   setGroundTruthLocked: (v: boolean) => void;
@@ -470,7 +521,7 @@ interface StudioState {
    */
   setMetricProjection: (provenance: Readonly<Record<string, number>>, dims: Readonly<Record<string, string>>) => void;
   setWhy: (w: WhySubject | null) => void;
-  setInspectorTab: (t: "state" | "why" | "log") => void;
+  setInspectorTab: (t: "state" | "messages" | "why" | "log") => void;
   setDevDetails: (v: boolean) => void;
   setHudDocked: (v: boolean) => void;
   bumpSeries: () => void;
@@ -596,6 +647,11 @@ export const useStudio = create<StudioState>((set) => ({
   pseudonym: null,
   inspect: null,
   inspectMessages: null,
+  feed: EMPTY_FEED,
+  feedTab: "sent",
+  followedPose: null,
+  radios: 0,
+  neighbors: null,
   overlays: {},
   serverOverlays: [],
   groundTruthLocked: false,
@@ -636,7 +692,19 @@ export const useStudio = create<StudioState>((set) => ({
   setHello: (h) => set({ hello: h, timeline: [] }),
   setWorldSummary: (w) => set({ world: w }),
   setRun: (r) => set((state) => (sameRun(state.run, r) ? state : { run: { ...state.run, ...r } })),
-  setSelection: (actorId, nodeId) => set({ selectedActor: actorId, selectedNode: nodeId, pseudonym: null, inspect: null, inspectMessages: null }),
+  setSelection: (actorId, nodeId) =>
+    set((state) => ({
+      selectedActor: actorId,
+      selectedNode: nodeId,
+      pseudonym: null,
+      inspect: null,
+      inspectMessages: null,
+      neighbors: null,
+      // The feed belongs to the node: a new node starts an empty one, the same node keeps its own
+      // (the page selects twice per click, before and after `view.follow` names the node).
+      feed: state.feed.node === nodeId ? state.feed : followFeed(state.feed, nodeId),
+      followedPose: actorId === state.selectedActor ? state.followedPose : null,
+    })),
   setTelemetry: (t, node, simTimeNs) =>
     set((state) =>
       state.telemetry === t && state.telemetryNode === node && state.simTimeNs === simTimeNs
@@ -652,6 +720,32 @@ export const useStudio = create<StudioState>((set) => ({
     }),
   setInspect: (r) => set({ inspect: r, ...(r?.messages ? { inspectMessages: r.messages } : {}) }),
   setInspectMessages: (m) => set({ inspectMessages: m }),
+  applyFeed: (push) =>
+    set((state) => {
+      const next = applyPush(state.feed, push);
+      return next === state.feed ? state : { feed: next };
+    }),
+  setFeedUnavailable: (reason) => set((state) => ({ feed: { ...state.feed, unavailable: reason } })),
+  setFeedPaused: (paused) => set((state) => ({ feed: setPaused(state.feed, paused) })),
+  openFeedMessage: (dir, key) => set((state) => ({ feed: openMessage(state.feed, dir, key) })),
+  setFeedFilter: (f) =>
+    set((state) => ({
+      feed: { ...state.feed, ...(f.types ? { types: f.types } : {}), ...(f.outcome ? { outcome: f.outcome } : {}) },
+    })),
+  setFeedTab: (t) => set({ feedTab: t }),
+  setFollowedPose: (p) =>
+    set((state) =>
+      p !== null &&
+      state.followedPose !== null &&
+      p.x === state.followedPose.x &&
+      p.y === state.followedPose.y &&
+      p.speed === state.followedPose.speed &&
+      p.headingRad === state.followedPose.headingRad
+        ? state
+        : { followedPose: p },
+    ),
+  setRadios: (n) => set((state) => (state.radios === n ? state : { radios: n })),
+  setNeighbors: (n) => set({ neighbors: n }),
   setOverlays: (o) => set((state) => ({ overlays: { ...state.overlays, ...o } })),
   setServerOverlays: (o) => set({ serverOverlays: o }),
   setGroundTruthLocked: (v) => set({ groundTruthLocked: v }),

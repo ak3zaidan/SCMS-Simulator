@@ -823,9 +823,66 @@ button.stat:focus-visible { outline: 2px solid var(--accent); outline-offset: 1p
 .runrow .name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .runrow .meta { font-size: 10px; color: var(--text-dim); font-family: var(--mono); }
 
-/* The followed vehicle's message log (components/MessageLog.tsx). */
-.msg-table td { vertical-align: top; }
-.msg-table tr.msg-lost td { color: var(--text-dim); }
-.msg-table tr.msg-rotated td { border-top: 1px solid var(--accent, #7aa2f7); }
-.msg-table .msg-badge { color: var(--accent, #7aa2f7); font-size: 10px; white-space: nowrap; }
-.msg-table tr.msg-detail td { text-align: left; background: var(--panel-2, transparent); }
+/*
+ * The followed vehicle's messages and queues (components/MessagePanel.tsx).
+ *
+ * The SPDU's spans are tinted with the Okabe-Ito palette the rest of the page uses (colour-blind
+ * safe), as a translucent background under text that keeps the theme's own colour, so every octet
+ * reads at the body text's contrast in both themes; the legend repeats each span's name, so the
+ * colour is never the only carrier.
+ */
+:root {
+  --span-header: #8fa3b8;
+  --span-payload: #56b4e9;
+  --span-info: #e69f00;
+  --span-signer: #009e73;
+  --span-signature: #cc79a7;
+}
+:root[data-theme="light"] {
+  --span-header: #7b8b9c;
+  --span-payload: #0072b2;
+  --span-info: #d55e00;
+  --span-signer: #009e73;
+  --span-signature: #aa4488;
+}
+.feed { display: flex; flex-direction: column; gap: 6px; }
+/* The panel body scrolls; no part of the panel shrinks under another (a shrunk table let the open
+   message draw over its rows). */
+.feed > * { flex-shrink: 0; }
+.feed-bar { display: flex; align-items: center; gap: 6px; justify-content: space-between; }
+.feed-tabs { display: flex; gap: 4px; }
+.feed-tabs button { font-size: 11px; padding: 2px 8px; }
+.feed-status { font-size: 10px; font-family: var(--mono); min-height: 14px; overflow-wrap: anywhere; }
+.feed-filters { display: flex; flex-wrap: wrap; gap: 4px; font-size: 11px; align-items: center; }
+.feed-filters .chip { cursor: pointer; backdrop-filter: none; color: var(--text-dim); }
+.feed-filters .chip.on { color: var(--text); border-color: var(--accent); }
+.feed-scroll { max-height: 38vh; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); }
+.feed-table { font-size: 10.5px; }
+.feed-table thead th { position: sticky; top: 0; background: var(--bg-panel); z-index: 1; }
+.feed-table tbody tr[tabindex] { cursor: pointer; }
+.feed-table tbody tr[tabindex]:hover td { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.feed-table tbody tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.feed-table tbody tr.open td { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.feed-table tbody tr.lost td { color: var(--text-dim); }
+.feed-table tbody tr.rotated td { border-bottom: 1px solid var(--accent); }
+.feed-badge { color: var(--accent); font-size: 9.5px; white-space: nowrap; }
+.feed-detail {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  background: var(--bg-raised);
+  font-size: 11px;
+}
+.feed-detail-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+.feed-detail h4 { margin: 8px 0 3px; font-size: 11px; color: var(--text-dim); font-weight: 600; }
+.feed-hex pre { margin: 4px 0 0; font-size: 10.5px; line-height: 1.5; white-space: pre; overflow-x: auto; }
+.feed-hex-legend { display: flex; flex-wrap: wrap; gap: 4px 8px; font-size: 10px; }
+.feed-hex-key { padding: 0 4px; border-radius: 3px; border-left: 3px solid transparent; }
+.feed-hex .span-1609-2-header { background: color-mix(in srgb, var(--span-header) 24%, transparent); border-left-color: var(--span-header); }
+.feed-hex .span-payload { background: color-mix(in srgb, var(--span-payload) 26%, transparent); border-left-color: var(--span-payload); }
+.feed-hex .span-headerinfo { background: color-mix(in srgb, var(--span-info) 24%, transparent); border-left-color: var(--span-info); }
+.feed-hex .span-signer { background: color-mix(in srgb, var(--span-signer) 24%, transparent); border-left-color: var(--span-signer); }
+.feed-hex .span-signature { background: color-mix(in srgb, var(--span-signature) 24%, transparent); border-left-color: var(--span-signature); }
+.feed-hex .span-envelope, .feed-hex .span-undecoded { background: color-mix(in srgb, var(--span-header) 18%, transparent); border-left-color: var(--span-header); }
+pre .feed-hex-key, pre span[class^="span-"] { border-left: none; }
+.warn-text { color: var(--warn); }
