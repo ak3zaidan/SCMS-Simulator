@@ -618,12 +618,19 @@ after despawn so that a late delta cannot be misapplied.
 
 | # | Type | Column | Meaning |
 |---|---|---|---|
-| 1 | `u32[S]` | `signal_id` | `SignalId` |
+| 1 | `u32[S]` | `signal_id` | the signal **group**: `(SignalId + 1) · 65536 + group`, where `group` is the §4.5 head row's `group`; a value below 65536 is a plain `SignalId` and applies to every head of that controller |
 | 2 | `u16[S]` | `time_to_change_ds` | deciseconds to the next phase change, `0xFFFF` unknown |
 | 3 | `u8[S]` | `phase` | SAE J2735 `MovementPhaseState`: `0` unavailable, `1` dark, `2` stop-then-proceed, `3` stop-and-remain, `4` pre-movement, `5` permissive-movement-allowed, `6` protected-movement-allowed, `7` permissive-clearance, `8` protected-clearance, `9` caution-conflicting-traffic |
 | 4 | `u8[S]` | `reserved` | 0 |
 
 Signals are PUBLIC: a vehicle sees the head with its eyes.
+
+A group's `phase` is the most permissive state among the movements whose approach lane carries
+one of its heads (a head over an approach shows the through movement's green while the left turn
+from it is permissive), and `time_to_change_ds` is the time to that **group's** next change. One
+state per controller cannot be drawn: a crossroads' two head groups show different colours at
+every instant of its cycle. (`v2xw_world::signal_group_wire_id` computes the id; the renderer
+keys each head row by both its group id and its plain controller id.)
 
 #### 3.3.4 The `state` byte
 
