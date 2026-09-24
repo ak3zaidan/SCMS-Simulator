@@ -380,7 +380,7 @@ pub const COVERAGE: &[Entry] = &[
         "the_node_only_export_contains_no_ground_truth",
     ),
     // --- §10.7 Control surface -----------------------------------------------------------------
-    Entry::here("R1", "r1_all_thirty_two_methods_are_implemented_and_discoverable"),
+    Entry::here("R1", "r1_all_thirty_three_methods_are_implemented_and_discoverable"),
     Entry::there(
         "R2",
         "crates/v2xw-server/tests/rpc.rs",

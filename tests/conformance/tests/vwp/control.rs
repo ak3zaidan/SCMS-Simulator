@@ -9,18 +9,22 @@ use v2xw_server::error::ServerError;
 use v2xw_server::openrpc;
 use v2xw_server::rpc::{CONNECTION_SCOPED, METHODS, parse};
 
-/// **R1** — "All 32 methods of §6.15 are implemented and appear in `rpc.discover`."
+/// **R1** — "All 33 methods of §6.15 are implemented and appear in `rpc.discover`."
+///
+/// 33 since `scenario.schema` (the generated settings surface) joined the inventory; §6.15
+/// lists it. The server's own `tests/rpc.rs` counts the same 33.
 ///
 /// The inventory and the self-description have to be the same set. A method in one and not
 /// the other is the failure a generated client hits first: `rpc.discover` is how every
 /// binding, stub and CLI completion is produced.
 #[test]
-fn r1_all_thirty_two_methods_are_implemented_and_discoverable() {
-    assert_eq!(METHODS.len(), 32, "§6.15 lists 31 methods plus rpc.discover");
+fn r1_all_thirty_three_methods_are_implemented_and_discoverable() {
+    assert_eq!(METHODS.len(), 33, "§6.15 lists 32 methods plus rpc.discover");
+    assert!(METHODS.contains(&"scenario.schema"), "§6.15 names scenario.schema");
     let mut unique = METHODS.to_vec();
     unique.sort_unstable();
     unique.dedup();
-    assert_eq!(unique.len(), 32, "the inventory has a duplicate");
+    assert_eq!(unique.len(), 33, "the inventory has a duplicate");
 
     let doc = openrpc::document(None);
     let described: Vec<&str> = doc["methods"]

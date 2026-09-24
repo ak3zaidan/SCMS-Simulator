@@ -20,7 +20,7 @@ is no `TBD`. Where the design documents left a choice open, the choice is made h
 | 3 | [Message layouts](#3-message-layouts) — `Hello`, quantisation, `Keyframe`, `Delta`, `Telemetry`, `Event`, `MetricSample`, `Provenance`, `WorldChunk`, `Error`, `Bye` |
 | 4 | [The world payload `vwp-world/1`](#4-the-world-payload--vwp-world1) |
 | 5 | [Visibility and the `NODE-only` profile](#5-visibility-and-the-node-only-profile) |
-| 6 | [JSON-RPC 2.0 control surface](#6-json-rpc-20-control-surface) — 32 methods, 8 notifications, error codes |
+| 6 | [JSON-RPC 2.0 control surface](#6-json-rpc-20-control-surface) — 33 methods, 8 notifications, error codes |
 | 7 | [Replay](#7-replay) — MCAP mapping, byte-identity, seek algorithm, 100 ms budget |
 | 8 | [Versioning](#8-versioning) |
 | 9 | [Worked example](#9-worked-example-unit-test-vectors) — annotated hex dumps (§9.1–§9.4, including the §9.4 vertical-delta vector) + reference decoders (§9.5) |
@@ -2554,14 +2554,16 @@ The server sends these as JSON-RPC notifications (no `id`, no reply expected).
 
 ### 6.15 Method inventory
 
-31 methods plus `rpc.discover` = **32**.
+32 methods plus `rpc.discover` = **33**. (`scenario.schema` was added on 2026-09-23 with the
+generated settings surface, 13-product-direction §2: every scenario field with its unit, default,
+range, description and implementation status. It is a property of the build, not of a run.)
 
 | Group | Methods |
 |---|---|
 | run (8) | `run.start`, `run.pause`, `run.resume`, `run.step`, `run.seek`, `run.speed`, `run.stop`, `run.status` |
 | view (3) | `view.follow`, `view.camera`, `overlay.set` |
 | inspect (4) | `inspect.node`, `inspect.link`, `inspect.entity`, `explain` |
-| scenario (6) | `scenario.get`, `scenario.set`, `scenario.validate`, `scenario.save`, `scenario.load`, `scenario.list` |
+| scenario (7) | `scenario.get`, `scenario.set`, `scenario.validate`, `scenario.save`, `scenario.load`, `scenario.list`, `scenario.schema` |
 | world (2) | `world.import_osm`, `world.generate` |
 | stream (1) | `events.set` |
 | metrics (2) | `metrics.query`, `metrics.plot` |
@@ -3434,7 +3436,7 @@ only, `B` = both. The test-kit ids match `tests/conformance/vwp/` (03-interfaces
 
 ### 10.7 Control surface
 
-- [ ] **S · R1** All 32 methods of §6.15 are implemented and appear in `rpc.discover`.
+- [ ] **S · R1** All 33 methods of §6.15 are implemented and appear in `rpc.discover`.
 - [ ] **S · R2** `rpc.discover` is a valid OpenRPC 1.3.2 document, and every params/result schema in it
       validates the corresponding example.
 - [ ] **S · R3** Invalid params return `-32602` with a `data` array of `{path, message, hint}`.

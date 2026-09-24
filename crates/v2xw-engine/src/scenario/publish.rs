@@ -443,7 +443,9 @@ impl Walk<'_> {
             self.with_meta(path, &mut out);
             return Value::Object(out);
         }
-        if let Some(args) = inner(ty, "BTreeMap").or_else(|| inner(ty, "HashMap"))
+        // Only the ordered map: the std hash map is forbidden in engine-facing code (the
+        // conformance kit's hash-order firewall), so no scenario field can have that type.
+        if let Some(args) = inner(ty, "BTreeMap")
             && let Some((_, value_ty)) = split_two(args)
         {
             out.insert("type".into(), json!("object"));
