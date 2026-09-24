@@ -63,7 +63,8 @@ use crate::error::{Result, WorldError};
 use crate::model::{
     Building, ClassMask, ConflictMatrix, Connection, Crossing, CrossingId, Edge, GeoBbox,
     GeoOrigin, HeightSource, Junction, JunctionControl, LanduseClass, LanduseZone, Lane, LaneKind,
-    LayerLicence, MaterialClass, Projection, RoadClass, RoadNetwork, SignalHead, SignalHeadKind,
+    LayerLicence, MaterialClass, Passage, PassageKind, Projection, RoadClass, RoadNetwork,
+    SignalHead, SignalHeadKind,
     SignalPhase, SignalPlan, SignalState, SymbolId, SymbolTable, Terrain, Transformation,
     TurnDirection, World, WorldProvenance, WorldSourceKind, ZoneId, normalise_angle, simplify_rdp,
 };
@@ -219,11 +220,17 @@ pub enum Anomaly {
     /// junction is there and the `from`/`to`/turn triple did not describe any movement
     /// through it (R3).
     RestrictionNoMovement,
+    /// A drivable way runs through a building's footprint, at the building's height, and
+    /// carries none of the tags that say it may (`tunnel=building_passage`, `covered=yes`,
+    /// `tunnel=*`, a `bridge` on a higher `layer`). The road is kept — it is mapped, so it
+    /// exists — and marked as an untagged passage; the missing tag is the source's defect,
+    /// the one the JOSM validator reports as "crossing highway/building".
+    UntaggedBuildingPassage,
 }
 
 impl Anomaly {
     /// Every anomaly category, in report order.
-    pub const ALL: [Anomaly; 41] = [
+    pub const ALL: [Anomaly; 42] = [
         Anomaly::MissingNode,
         Anomaly::WayTooShort,
         Anomaly::DuplicateNode,
@@ -265,6 +272,7 @@ impl Anomaly {
         Anomaly::ClippedGeometry,
         Anomaly::ClassDefaultsAboveTaggedSpeeds,
         Anomaly::RestrictionNoMovement,
+        Anomaly::UntaggedBuildingPassage,
     ];
 
     /// A stable kebab-case label, used by the report and the provenance record.
@@ -311,6 +319,7 @@ impl Anomaly {
             Anomaly::ClippedGeometry => "clipped-geometry",
             Anomaly::ClassDefaultsAboveTaggedSpeeds => "class-defaults-above-tagged-speeds",
             Anomaly::RestrictionNoMovement => "restriction-no-movement",
+            Anomaly::UntaggedBuildingPassage => "untagged-building-passage",
         }
     }
 }
@@ -2365,6 +2374,10 @@ pub struct WayPlan {
     pub bridge: bool,
     /// `tunnel=*` other than `no`. Recorded, and part of the merge key.
     pub tunnel: bool,
+    /// `tunnel=building_passage`: the way runs through a building at street level.
+    pub building_passage: bool,
+    /// `covered=*` other than `no`: the way runs under a roof or a building.
+    pub covered: bool,
     /// How many levels below ground the way runs: `-layer` for a tunnel (at least 1 for
     /// `tunnel=yes`), `0` at grade. A `tunnel=building_passage` runs *through* a building
     /// at street level and stays at grade.
@@ -2675,6 +2688,8 @@ pub fn classify_way(
             .unwrap_or(0),
         bridge: way.tags.get("bridge").is_some_and(|v| v != "no"),
         tunnel: way.tags.get("tunnel").is_some_and(|v| v != "no"),
+        building_passage: way.tags.is("tunnel", "building_passage"),
+        covered: way.tags.get("covered").is_some_and(|v| v != "no"),
         levels_below: {
             let tunnel = way.tags.get("tunnel").map(str::trim);
             let underground = tunnel.is_some_and(|v| v != "no" && v != "building_passage");
@@ -5636,6 +5651,145 @@ fn synthesise_signals(
 }
 
 // ---------------------------------------------------------------------------
+// Stage 9b: passages
+// ---------------------------------------------------------------------------
+
+/// Every stretch of motor lane that runs through a building's footprint within the
+/// building's vertical extent ([`crate::model::road_meets_building`]), classified by the
+/// tags of the way it came from ([`PassageKind`]).
+///
+/// The lane is sampled every half metre. A junction connector takes the kind of its
+/// approach or its departure, whichever is tagged. An untagged one is still a passage —
+/// the road is mapped there, so it is there — and is counted as
+/// [`Anomaly::UntaggedBuildingPassage`] against its way. A building raised on columns
+/// over the road (`min_height` above [`crate::model::ROAD_CLEARANCE_M`]), a tunnel
+/// below a building and a bridge over one are not passages: the road does not meet the
+/// building's volume at all.
+fn find_passages(
+    net: &Net,
+    plans: &[WayPlan],
+    buildings: &[Building],
+    report: &mut ImportReport,
+) -> Vec<Passage> {
+    const STEP_M: f64 = 0.5;
+    let mut plan_of: BTreeMap<LaneId, usize> = BTreeMap::new();
+    for info in &net.edge_info {
+        if info.family == WayFamily::Motor {
+            for l in &info.lanes {
+                plan_of.insert(*l, info.plan);
+            }
+        }
+    }
+    let kind_of_plan = |plan: &WayPlan| -> PassageKind {
+        if plan.building_passage {
+            PassageKind::BuildingPassage
+        } else if plan.covered {
+            PassageKind::Covered
+        } else if plan.tunnel || plan.levels_below > 0 {
+            PassageKind::Tunnel
+        } else if plan.bridge && plan.levels_above > 0 {
+            PassageKind::Viaduct
+        } else {
+            PassageKind::Untagged
+        }
+    };
+    // A connector's source is its approach, or its departure where only that is tagged.
+    let mut connector_plans: BTreeMap<LaneId, Vec<usize>> = BTreeMap::new();
+    for list in &net.movements {
+        for m in list {
+            let e = connector_plans.entry(m.internal).or_default();
+            for l in [m.from_lane, m.to_lane] {
+                if let Some(p) = plan_of.get(&l) {
+                    e.push(*p);
+                }
+            }
+        }
+    }
+    let boxes: Vec<(f64, f64, f64, f64)> = buildings
+        .iter()
+        .map(|b| {
+            let bb = b.bbox();
+            (bb.min.x, bb.min.y, bb.max.x, bb.max.y)
+        })
+        .collect();
+    let mut out: Vec<Passage> = Vec::new();
+    let mut untagged_ways: BTreeSet<i64> = BTreeSet::new();
+    for lane in &net.lanes {
+        let sources: Vec<usize> = if lane.kind == LaneKind::Internal {
+            connector_plans.get(&lane.id).cloned().unwrap_or_default()
+        } else if let Some(p) = plan_of.get(&lane.id) {
+            vec![*p]
+        } else {
+            continue;
+        };
+        if sources.is_empty() {
+            continue;
+        }
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::MIN, f64::MIN);
+        for p in &lane.centreline {
+            x0 = x0.min(p.x);
+            y0 = y0.min(p.y);
+            x1 = x1.max(p.x);
+            y1 = y1.max(p.y);
+        }
+        let n = ((lane.length_m / STEP_M).ceil() as usize).max(1);
+        for (bi, b) in buildings.iter().enumerate() {
+            let bb = boxes[bi];
+            if bb.2 < x0 || bb.0 > x1 || bb.3 < y0 || bb.1 > y1 {
+                continue;
+            }
+            let mut run: Option<(f64, f64)> = None;
+            let mut runs: Vec<(f64, f64)> = Vec::new();
+            for k in 0..=n {
+                let s = lane.length_m * k as f64 / n as f64;
+                let p = lane.point_at(s);
+                let inside = b.contains_2d(p) && crate::model::road_meets_building(b, p.z);
+                match (&mut run, inside) {
+                    (None, true) => run = Some((s, s)),
+                    (Some(r), true) => r.1 = s,
+                    (Some(r), false) => {
+                        runs.push(*r);
+                        run = None;
+                    }
+                    (None, false) => {}
+                }
+            }
+            if let Some(r) = run {
+                runs.push(r);
+            }
+            if runs.is_empty() {
+                continue;
+            }
+            let kinds: Vec<PassageKind> = sources.iter().map(|p| kind_of_plan(&plans[*p])).collect();
+            let kind = kinds
+                .iter()
+                .copied()
+                .filter(|k| *k != PassageKind::Untagged)
+                .min()
+                .unwrap_or(PassageKind::Untagged);
+            if kind == PassageKind::Untagged {
+                for p in &sources {
+                    untagged_ways.insert(plans[*p].osm_id);
+                }
+            }
+            for (from, to) in runs {
+                out.push(Passage {
+                    lane: lane.id,
+                    building: b.id,
+                    kind,
+                    s_from_m: from,
+                    s_to_m: to,
+                });
+            }
+        }
+    }
+    for way in untagged_ways {
+        report.note(Anomaly::UntaggedBuildingPassage, way);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Stage 9: crossings
 // ---------------------------------------------------------------------------
 
@@ -7370,6 +7524,9 @@ fn import_parsed(file: &OsmFile, options: &OsmOptions, report: &mut ImportReport
         Vec::new()
     };
 
+    // --- stage 9b: passages ----------------------------------------------------------
+    let passages = find_passages(&net, &plans, &buildings, report);
+
     // Junction lane lists are documented as being in id order.
     for junction in &mut net.junctions {
         junction.incoming.sort_unstable();
@@ -7415,6 +7572,7 @@ fn import_parsed(file: &OsmFile, options: &OsmOptions, report: &mut ImportReport
         .roads(roads)
         .buildings(buildings)
         .landuse(landuse)
+        .passages(passages)
         .signals(signals)
         .default_env(options.import.default_env)
         .symbols(symbols)

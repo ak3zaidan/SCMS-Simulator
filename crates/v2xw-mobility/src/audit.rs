@@ -61,7 +61,7 @@ use v2xw_core::ids::{ActorId, JunctionId, LaneId};
 use v2xw_core::math;
 use v2xw_core::time::{SimTime, ns_to_secs};
 use v2xw_world::model::{normalise_angle, point_in_ring, ring_distance_sq_2d};
-use v2xw_world::{JunctionControl, LaneKind, SignalState, World};
+use v2xw_world::{JunctionControl, LaneKind, SignalState, World, road_meets_building};
 
 use crate::intersection::zones::{ConflictZones, Zone};
 use crate::views::DespawnCause;
@@ -150,7 +150,8 @@ pub enum Check {
     MidRoadDespawn,
     /// World: an internal path that leaves its junction's area.
     WorldInternalOutsideJunction,
-    /// World: a lane centreline inside a building footprint.
+    /// World: a lane centreline inside a building's volume where the world marks no
+    /// passage.
     WorldLaneInBuilding,
     /// World: two conflicting movements given a protected green in the same phase.
     WorldConflictingGreens,
@@ -333,11 +334,11 @@ pub struct AuditStats {
     /// Steps at which two conflicting movements were both inside one junction (not a
     /// violation by itself: a permissive left waits inside the box).
     pub conflicting_occupancy_steps: u64,
-    /// Vehicle-steps with the body in a building while on a lane whose own centreline
-    /// runs through that building ([`Check::WorldLaneInBuilding`]): the source data puts
-    /// the road there, as a passage or a covered ramp. Not counted as
-    /// [`Check::InBuilding`], which is a vehicle off its road.
-    pub in_building_on_lanes_through_buildings: u64,
+    /// Vehicle-steps with the body in a building while on a lane the world marks as a
+    /// passage through that building ([`v2xw_world::Passage`]): the source puts the road
+    /// there — the Park Avenue portals, a covered ramp, a garage entrance. Not counted as
+    /// [`Check::InBuilding`], which is a vehicle where no road goes.
+    pub in_building_on_passages: u64,
     /// Largest |jerk| seen, m/s³.
     pub max_jerk_mps3: f64,
     /// Largest deceleration seen, m/s².
@@ -395,9 +396,6 @@ pub struct TrafficAuditor {
     flagged_standing: BTreeSet<ActorId>,
     /// Every junction's conflict zones.
     zones: ConflictZones,
-    /// Lanes whose own centreline passes through a building footprint in the source
-    /// data — a tunnel under one, a passage through one.
-    lanes_through_buildings: BTreeSet<LaneId>,
 }
 
 impl TrafficAuditor {
@@ -417,11 +415,6 @@ impl TrafficAuditor {
             standing_since: BTreeMap::new(),
             flagged_standing: BTreeSet::new(),
             zones: ConflictZones::build(world),
-            lanes_through_buildings: audit_world(world)
-                .into_iter()
-                .filter(|(c, _)| *c == Check::WorldLaneInBuilding)
-                .filter_map(|(_, e)| e.lane.map(LaneId::new))
-                .collect(),
         }
     }
 
@@ -702,18 +695,20 @@ impl TrafficAuditor {
                 let Some(building) = world.building(b) else {
                     continue;
                 };
+                // A building raised over the road, or a road on a viaduct over a low
+                // building, does not meet the vehicle at all.
+                if !road_meets_building(building, a.pos.z) {
+                    continue;
+                }
                 for p in &points {
                     if building.contains_2d(*p) {
-                        let on_data_lane = self.lanes_through_buildings.contains(&a.lane)
-                            || a.prev_lane
-                                .is_some_and(|l| self.lanes_through_buildings.contains(&l));
-                        if on_data_lane {
-                            // The source data runs this road through (or under) the
-                            // building — the Park Avenue portals of the Helmsley
-                            // Building, a covered tunnel ramp. That is the world's fact,
-                            // reported once per lane by `WorldLaneInBuilding`, not a
-                            // vehicle leaving its lane; it is counted as a statistic.
-                            self.stats.in_building_on_lanes_through_buildings += 1;
+                        let on_passage = world.is_passage(a.lane, b)
+                            || a.prev_lane.is_some_and(|l| world.is_passage(l, b));
+                        if on_passage {
+                            // The source runs this road through the building: the world
+                            // marks the lane a passage, and the renderer draws the
+                            // opening. A statistic, not a vehicle leaving its lane.
+                            self.stats.in_building_on_passages += 1;
                             break 'buildings;
                         }
                         let ex = Self::example(
@@ -1350,7 +1345,13 @@ pub fn audit_world(world: &World) -> Vec<(Check, Example)> {
             }
             if !building_reported && p.z >= -UNDERGROUND_Z_M {
                 for b in world.buildings_in_bbox(Bbox::new(p, p)) {
-                    if world.building(b).is_some_and(|bl| bl.contains_2d(p)) {
+                    if world.is_passage(lane.id, b) {
+                        continue;
+                    }
+                    if world
+                        .building(b)
+                        .is_some_and(|bl| bl.contains_2d(p) && road_meets_building(bl, p.z))
+                    {
                         building_reported = true;
                         out.push((
                             Check::WorldLaneInBuilding,
@@ -1889,6 +1890,61 @@ mod tests {
         );
         assert!(
             !audit_world(&world)
+                .iter()
+                .any(|(c, _)| *c == Check::WorldLaneInBuilding)
+        );
+        // The same building, with the world marking the lane a passage through it: the
+        // world check is clean, a vehicle on that lane inside the footprint is a
+        // statistic, and the same body on another lane is still a violation. And raised
+        // 10 m over the road (OSM `min_height`), the building meets no lane at all.
+        let passage = v2xw_world::Passage {
+            lane: lane.id,
+            building: v2xw_core::ids::BuildingId::new(0),
+            kind: v2xw_world::PassageKind::BuildingPassage,
+            s_from_m: 0.5 * lane.length_m - 3.0,
+            s_to_m: 0.5 * lane.length_m + 3.0,
+        };
+        let with_passage = World::builder(world.origin)
+            .roads(world.roads.clone())
+            .signals(world.signals.clone())
+            .buildings(with_building.buildings.clone())
+            .passages(vec![passage])
+            .provenance(world.provenance.clone())
+            .build()
+            .expect("a world");
+        assert!(
+            !audit_world(&with_passage)
+                .iter()
+                .any(|(c, _)| *c == Check::WorldLaneInBuilding)
+        );
+        let mut on = at(&with_passage, 0, lane.id, 0.5 * lane.length_m + 2.0, 5.0);
+        on.pos = mid;
+        let mut audit = TrafficAuditor::new(&with_passage, AuditParams::default());
+        audit.observe(&with_passage, 0, 100_000_000, &[on], &[]);
+        assert_eq!(audit.report().count(Check::InBuilding), 0);
+        assert_eq!(audit.report().stats.in_building_on_passages, 1);
+        let other = world
+            .roads
+            .lanes()
+            .iter()
+            .find(|l| l.kind == LaneKind::Driving && l.id != lane.id)
+            .expect("another lane")
+            .id;
+        let off = AuditActor { lane: other, ..on };
+        audit.observe(&with_passage, 100_000_000, 200_000_000, &[off], &[]);
+        assert_eq!(audit.report().count(Check::InBuilding), 1);
+        let mut raised_building = with_building.buildings[0].clone();
+        raised_building.min_height_m = 10.0;
+        raised_building.height_m = 30.0;
+        let raised = World::builder(world.origin)
+            .roads(world.roads.clone())
+            .signals(world.signals.clone())
+            .buildings(vec![raised_building])
+            .provenance(world.provenance.clone())
+            .build()
+            .expect("a world");
+        assert!(
+            !audit_world(&raised)
                 .iter()
                 .any(|(c, _)| *c == Check::WorldLaneInBuilding)
         );

@@ -20,8 +20,8 @@ use v2xw_world::osm::{
 };
 use v2xw_world::quant::is_on_grid;
 use v2xw_world::{
-    ClassMask, HeightSource, JunctionControl, LaneKind, SignalState, TurnDirection, World,
-    WorldSource,
+    ClassMask, HeightSource, JunctionControl, LaneKind, PassageKind, SignalState,
+    TurnDirection, World, WorldSource,
     WorldSourceSpec, serde_native, serde_vwp,
 };
 
@@ -832,6 +832,76 @@ fn every_turn_at_a_crossroads_is_a_drivable_arc() {
         }
     }
     assert!(turns >= 8, "{turns} turns checked");
+}
+
+/// A road through a building is a passage, classified by its tags; a building raised
+/// over the road is not in its way at all.
+///
+/// Three parallel east-west streets each pass through a building: one tagged
+/// `tunnel=building_passage` (the Helmsley Building's Park Avenue portals), one with no
+/// tag (a driveway into a garage, which the importer keeps and counts), and one under a
+/// building whose built part starts 10 m up. The first two become passages of their
+/// kind; the third is no passage and no lane in a building.
+#[test]
+fn roads_through_buildings_are_passages_by_their_tags() {
+    let block = |id: i64, lat: f64| {
+        [
+            node(id, lat - 0.00005, -0.0001),
+            node(id + 1, lat - 0.00005, 0.0001),
+            node(id + 2, lat + 0.00005, 0.0001),
+            node(id + 3, lat + 0.00005, -0.0001),
+        ]
+        .concat()
+    };
+    let body = [
+        node(1, 0.0, -0.001),
+        node(2, 0.0, 0.001),
+        node(3, 0.0005, -0.001),
+        node(4, 0.0005, 0.001),
+        node(5, -0.0005, -0.001),
+        node(6, -0.0005, 0.001),
+        block(100, 0.0),
+        block(200, 0.0005),
+        block(300, -0.0005),
+        way(
+            10,
+            &[1, 2],
+            &[("highway", "primary"), ("lanes", "2"), ("tunnel", "building_passage")],
+        ),
+        way(11, &[3, 4], &[("highway", "service"), ("lanes", "2")]),
+        way(12, &[5, 6], &[("highway", "primary"), ("lanes", "2")]),
+        way(20, &[100, 101, 102, 103, 100], &[("building", "office"), ("height", "60")]),
+        way(21, &[200, 201, 202, 203, 200], &[("building", "yes"), ("height", "30")]),
+        way(
+            22,
+            &[300, 301, 302, 303, 300],
+            &[("building", "yes"), ("height", "30"), ("min_height", "10")],
+        ),
+    ]
+    .concat();
+    let (world, report) = import(&document(&body));
+    let by_kind: BTreeSet<PassageKind> = world.passages.iter().map(|p| p.kind).collect();
+    assert_eq!(
+        by_kind,
+        [PassageKind::BuildingPassage, PassageKind::Untagged].into_iter().collect(),
+        "passages: {:?}",
+        world.passages
+    );
+    // Both directions of both streets, and no lane of the street under the raised
+    // building.
+    let raised = world
+        .buildings
+        .iter()
+        .find(|b| b.min_height_m > 0.0)
+        .expect("the raised building");
+    assert!(world.passages.iter().all(|p| p.building != raised.id));
+    assert!(world.passages.iter().all(|p| p.s_to_m > p.s_from_m));
+    assert_eq!(report.anomaly(Anomaly::UntaggedBuildingPassage), 1);
+    // The world round-trips through the native format with its passages.
+    let bytes = serde_native::to_bytes(&world).expect("writes");
+    let back = serde_native::from_bytes(&bytes).expect("reads back");
+    assert_eq!(back.passages, world.passages);
+    assert_eq!(back.content_hash, world.content_hash);
 }
 
 /// A signal node that is not itself a junction is attached to the nearest junction within

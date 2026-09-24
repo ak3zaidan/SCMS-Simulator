@@ -85,6 +85,9 @@ pub mod section {
     pub const LANDUSE: u16 = 12;
     /// The provenance record, as UTF-8 JSON.
     pub const PROVENANCE: u16 = 13;
+    /// Passages (lanes through buildings). Optional: written only when there are any, and
+    /// a file without the section reads as a world with none.
+    pub const PASSAGES: u16 = 14;
 }
 
 // ---------------------------------------------------------------------------
@@ -635,6 +638,19 @@ pub fn to_bytes(world: &World) -> Result<Vec<u8>> {
     }
     sections.push((section::LANDUSE, core::mem::take(&mut w.buf)));
 
+    if !world.passages.is_empty() {
+        let mut w = Writer::new();
+        w.count(world.passages.len());
+        for p in &world.passages {
+            w.u32(p.lane.index())
+                .u32(p.building.index())
+                .u8(p.kind.code())
+                .f64(p.s_from_m)
+                .f64(p.s_to_m);
+        }
+        sections.push((section::PASSAGES, core::mem::take(&mut w.buf)));
+    }
+
     let provenance = serde_json::to_vec(&world.provenance)?;
     sections.push((section::PROVENANCE, provenance));
 
@@ -1106,6 +1122,34 @@ pub fn from_bytes(bytes: &[u8]) -> Result<World> {
         });
     }
 
+    let passages = match slice(section::PASSAGES) {
+        None => Vec::new(),
+        Some(mut r) => {
+            let n = r.count()?;
+            let mut out = Vec::with_capacity(n.min(1 << 20));
+            for _ in 0..n {
+                let lane = LaneId::new(r.u32()?);
+                let building = v2xw_core::ids::BuildingId::new(r.u32()?);
+                let kind = crate::model::PassageKind::from_code(r.u8()?).ok_or_else(|| {
+                    WorldError::Malformed {
+                        offset: r.base + r.at,
+                        problem: "unknown passage kind".to_string(),
+                    }
+                })?;
+                let s_from_m = r.f64()?;
+                let s_to_m = r.f64()?;
+                out.push(crate::model::Passage {
+                    lane,
+                    building,
+                    kind,
+                    s_from_m,
+                    s_to_m,
+                });
+            }
+            out
+        }
+    };
+
     let mut r = require(section::PROVENANCE, "provenance")?;
     let provenance: WorldProvenance = serde_json::from_slice(r.take(r.bytes.len())?)?;
 
@@ -1118,6 +1162,7 @@ pub fn from_bytes(bytes: &[u8]) -> Result<World> {
         signals,
         sites,
         landuse,
+        passages,
         default_env,
         symbols,
         provenance,
