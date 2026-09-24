@@ -386,6 +386,9 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
 .hud-row .k { color: var(--text-dim); }
 .hud-row .v { color: var(--text); }
 .hud-field { display: inline-flex; gap: 5px; align-items: baseline; cursor: help; }
+/* The pose line reads the stream, not the node's telemetry, so it has no provenance to open and
+   is not a button; it is laid out like the values it sits among. */
+.hud-pose-field { display: inline-flex; gap: 5px; align-items: baseline; }
 .hud-field:hover .k { color: var(--accent); }
 /*
  * The clickable telemetry values are real buttons (09-ui §10 asks for keyboard control, and

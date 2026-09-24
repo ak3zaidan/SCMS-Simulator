@@ -253,7 +253,7 @@ function PoseRow({
   const g = toGeodetic(origin, pose.x, pose.y);
   return (
     <div className="hud-row" data-testid="hud-pose" title="the vehicle's pose in the stream (its true position, drawn at the body centre)">
-      <span className="hud-field">
+      <span className="hud-pose-field">
         <span className="k">position</span>
         <span className="v" data-testid="hud-pose-lat" data-value={g.lat}>
           {g.lat.toFixed(6)}°
@@ -262,13 +262,13 @@ function PoseRow({
           {g.lon.toFixed(6)}°
         </span>
       </span>
-      <span className="hud-field">
+      <span className="hud-pose-field">
         <span className="k">speed</span>
         <span className="v" data-testid="hud-pose-speed" data-value={pose.speed}>
           {pose.speed.toFixed(1)} m/s
         </span>
       </span>
-      <span className="hud-field">
+      <span className="hud-pose-field">
         <span className="k">heading</span>
         <span className="v" data-testid="hud-pose-heading" data-value={bearingDeg(pose.headingRad)}>
           {bearingDeg(pose.headingRad).toFixed(0)}°
