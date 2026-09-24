@@ -102,12 +102,12 @@ use v2xw_node::stores::VerificationState;
 use v2xw_node::{
     NodeConfig, ObuRuntime, RxDisposition, RxFrame, RxReport, RxStamp, StepOutcome, Transmission,
 };
-use v2xw_record::{Cadence, Profile};
 use v2xw_radio::{
     AccessCategory, Arrival, ChannelId, Dcc, EdcaOcbMac, FrameDescriptor, FrameKind,
-    InterferenceSource, LossCause, Mac, MacSdu, Mcs, OfdmPhy, Phy, RadioEndpoint,
-    RxHandle, SaeJ2945Dcc, SduRef, TxHandle,
+    InterferenceSource, LossCause, Mac, MacSdu, Mcs, OfdmPhy, Phy, RadioEndpoint, RxHandle,
+    SaeJ2945Dcc, SduRef, TxHandle,
 };
+use v2xw_record::{Cadence, Profile};
 use v2xw_world::World;
 
 use crate::adapters::{BoxedFading, BoxedPropagation};
@@ -521,7 +521,12 @@ pub struct Engine {
     /// carries.
     backhaul: BTreeMap<
         v2xw_core::ids::SduId,
-        (NodeId, Box<v2xw_threat::MisbehaviourReport>, NodeId, ReportJourney),
+        (
+            NodeId,
+            Box<v2xw_threat::MisbehaviourReport>,
+            NodeId,
+            ReportJourney,
+        ),
     >,
     /// The next backhaul SDU id.
     next_sdu: u32,
@@ -705,8 +710,16 @@ impl Engine {
             phy: crate::wiring::build_phy(&scenario_for_radio),
             // 802.11p's EDCA and J2945/1 congestion control belong to the DSRC stack; a
             // sidelink scenario runs the SPS engine in `sidelink` instead.
-            mac: if sidelink.is_some() { None } else { crate::wiring::build_mac(&scenario_for_radio) },
-            dcc: if sidelink.is_some() { None } else { crate::wiring::build_dcc(&scenario_for_radio) },
+            mac: if sidelink.is_some() {
+                None
+            } else {
+                crate::wiring::build_mac(&scenario_for_radio)
+            },
+            dcc: if sidelink.is_some() {
+                None
+            } else {
+                crate::wiring::build_dcc(&scenario_for_radio)
+            },
             actors: BTreeMap::new(),
             nodes: BTreeMap::new(),
             inboxes: BTreeMap::new(),
@@ -883,7 +896,9 @@ impl Engine {
         let Some(node) = self.focus.as_ref().and_then(|f| f.plan.follows) else {
             return;
         };
-        let centre = self.node_pos(node, now).unwrap_or(crate::wiring::FOCUS_NOWHERE);
+        let centre = self
+            .node_pos(node, now)
+            .unwrap_or(crate::wiring::FOCUS_NOWHERE);
         if let Some(f) = self.focus.as_mut() {
             f.plan.recentre(centre);
         }
@@ -1102,9 +1117,7 @@ impl Engine {
                 // run report instead of silent.
                 Event::NetDeliver { sdu, to } => self.on_net_deliver(recorder, sdu, to, horizon),
                 Event::FlowTimer { .. } => self.on_flow_timer(horizon),
-                Event::SignalPhase { .. }
-                | Event::NodeTask { .. }
-                | Event::Observe { .. } => {}
+                Event::SignalPhase { .. } | Event::NodeTask { .. } | Event::Observe { .. } => {}
             }
             self.report.end_ns = key.time;
         }
@@ -1317,7 +1330,12 @@ impl Engine {
                 if let Some(phase2) = self.phase2.as_mut() {
                     let creds = phase2.provision(id);
                     if !creds.is_empty() {
-                        crate::wiring::install_provisioned(&mut runtime, &self.scenario, id, &creds);
+                        crate::wiring::install_provisioned(
+                            &mut runtime,
+                            &self.scenario,
+                            id,
+                            &creds,
+                        );
                     }
                 }
                 self.nodes.insert(id, runtime);
@@ -1478,9 +1496,9 @@ impl Engine {
                 .node
                 .and_then(|n| self.nodes.get(&n))
                 .map_or(0, |runtime| runtime.stores().neighbors.counts().1 as u32);
-            let attacker = rec.node.is_some_and(|n| {
-                self.phase2.as_ref().is_some_and(|p| p.is_attacker(n))
-            });
+            let attacker = rec
+                .node
+                .is_some_and(|n| self.phase2.as_ref().is_some_and(|p| p.is_attacker(n)));
             let transmitting = rec
                 .node
                 .is_some_and(|n| self.transmitted_since_step.contains(&n));
@@ -1655,7 +1673,12 @@ impl Engine {
         let reverse = self.reverse_node_walk;
         let selected = move |id: &NodeId| only.is_none_or(|o| o == *id);
         let walk: Box<dyn Iterator<Item = (&NodeId, &mut ObuRuntime)>> = if reverse {
-            Box::new(self.nodes.iter_mut().rev().filter(move |(id, _)| selected(id)))
+            Box::new(
+                self.nodes
+                    .iter_mut()
+                    .rev()
+                    .filter(move |(id, _)| selected(id)),
+            )
         } else {
             Box::new(self.nodes.iter_mut().filter(move |(id, _)| selected(id)))
         };
@@ -1734,11 +1757,11 @@ impl Engine {
                 let revoked = outcome
                     .delivered
                     .iter()
-                    .filter(|m| {
-                        m.verification == v2xw_node::stores::VerificationState::Revoked
-                    })
+                    .filter(|m| m.verification == v2xw_node::stores::VerificationState::Revoked)
                     .count() as u64;
-                if revoked > 0 && let Some(phase2) = self.phase2.as_mut() {
+                if revoked > 0
+                    && let Some(phase2) = self.phase2.as_mut()
+                {
                     for _ in 0..revoked {
                         phase2.note_revoked_reception();
                     }
@@ -2029,7 +2052,11 @@ impl Engine {
                 })
             };
             if let Some(e) = emission {
-                claim = (Vec3::new(e.x_m, e.y_m, claim.0.z), e.speed_mps, e.heading_rad);
+                claim = (
+                    Vec3::new(e.x_m, e.y_m, claim.0.z),
+                    e.speed_mps,
+                    e.heading_rad,
+                );
                 signature_valid = e.signature_valid;
             }
         }
@@ -2132,7 +2159,10 @@ impl Engine {
             },
         );
         if self.mac.is_some() || self.sidelink.is_some() {
-            self.pending_tx.entry(node).or_default().push((ready, frame));
+            self.pending_tx
+                .entry(node)
+                .or_default()
+                .push((ready, frame));
             self.scheduler.schedule(
                 ready,
                 EventClass::MacTimer,
@@ -2440,7 +2470,11 @@ impl Engine {
             let Some(state) = self.frames.get(frame) else {
                 continue;
             };
-            if state.arrivals.get(&node).is_some_and(|&(p, _)| p >= threshold) {
+            if state
+                .arrivals
+                .get(&node)
+                .is_some_and(|&(p, _)| p >= threshold)
+            {
                 clear = clear.max(state.end);
             }
         }
@@ -2622,10 +2656,7 @@ impl Engine {
                 overlaps.push((
                     rx,
                     InterferenceSource::new(o.tx, o_power, o.start, o.end),
-                    RxHandle {
-                        tx: o.tx_id(),
-                        rx,
-                    },
+                    RxHandle { tx: o.tx_id(), rx },
                 ));
             }
         }
@@ -2797,8 +2828,7 @@ impl Engine {
             // The same attempt, on `node.rx`, with the sender's side of the journey. A PHY
             // loss is its fate already; a decoded frame's fate is the receiving node's to
             // decide, and it waits in `rx_pending` until the node reports it.
-            let arrival =
-                v2xw_radio::phy::propagation_delay(outcome.distance_m).after(state.end);
+            let arrival = v2xw_radio::phy::propagation_delay(outcome.distance_m).after(state.end);
             let attempt = NodeRx::attempt(
                 state.tx,
                 outcome.rx,
@@ -2837,27 +2867,30 @@ impl Engine {
                     self.emit(recorder, &attempt.lost(now, rx_cause::RECEIVER_OFF));
                 }
                 if let Some(inbox) = self.inboxes.get_mut(&outcome.rx) {
-                    inbox.push((RxFrame {
-                        signer: Some(state.signer.clone()),
-                        msg_type: state.msg_type,
-                        bytes: state.bytes,
-                        claimed_pos: Some(state.claimed_pos),
-                        claimed_speed_mps: state.claimed_speed_mps,
-                        claimed_heading_rad: state.claimed_heading_rad,
-                        claimed_generation_time: state.generation_time,
-                        full_certificate: state.full_certificate,
-                        // Modelled crypto: the engine knows the sender's key is genuine,
-                        // so the signature is valid. The receiver only learns it by
-                        // *spending* the verification time, which `ObuRuntime::step`
-                        // charges against its servers.
-                        signature_valid: true,
-                        claimed_cert_period: state.claimed_cert_period,
-                        claimed_linkage: state.claimed_linkage,
-                        spdu: state.spdu.clone(),
-                    }, RxStamp {
-                        token,
-                        arrived_at: Some(arrival),
-                    }));
+                    inbox.push((
+                        RxFrame {
+                            signer: Some(state.signer.clone()),
+                            msg_type: state.msg_type,
+                            bytes: state.bytes,
+                            claimed_pos: Some(state.claimed_pos),
+                            claimed_speed_mps: state.claimed_speed_mps,
+                            claimed_heading_rad: state.claimed_heading_rad,
+                            claimed_generation_time: state.generation_time,
+                            full_certificate: state.full_certificate,
+                            // Modelled crypto: the engine knows the sender's key is genuine,
+                            // so the signature is valid. The receiver only learns it by
+                            // *spending* the verification time, which `ObuRuntime::step`
+                            // charges against its servers.
+                            signature_valid: true,
+                            claimed_cert_period: state.claimed_cert_period,
+                            claimed_linkage: state.claimed_linkage,
+                            spdu: state.spdu.clone(),
+                        },
+                        RxStamp {
+                            token,
+                            arrived_at: Some(arrival),
+                        },
+                    ));
                 }
                 if state.app.is_some() {
                     delivered_app.push((outcome.rx, arrival));
@@ -3007,7 +3040,10 @@ impl Engine {
                 let Some(runtime) = self.nodes.get_mut(&rx) else {
                     return;
                 };
-                runtime.stores_mut().crl.add_linkage_entry((**entry).clone());
+                runtime
+                    .stores_mut()
+                    .crl
+                    .add_linkage_entry((**entry).clone());
                 // A node that finds one of its *own* certificates on the CRL stops
                 // transmitting [CAMP-EE §2.2.10.2]; `CertStore::sweep` does that on the
                 // node's next step, from the gate this has just written.
@@ -3026,10 +3062,7 @@ impl Engine {
                             mine.iter().any(|k| {
                                 k.i == c.i_period
                                     && k.j == c.j_index
-                                    && stores
-                                        .crl
-                                        .store()
-                                        .revokes_linkage_at_period(k.i, k.lv)
+                                    && stores.crl.store().revokes_linkage_at_period(k.i, k.lv)
                             })
                         })
                         .map(|c| c.digest.clone())
@@ -3104,8 +3137,11 @@ impl Engine {
         let _ = to;
         // `FlowTimer` is the class credential and backend protocol timers live at
         // (02-architecture.md §5.1). Flow 0 step 0 is this run's one revocation.
-        self.scheduler
-            .schedule(at, EventClass::FlowTimer, Event::FlowTimer { flow: 0, step: 0 });
+        self.scheduler.schedule(
+            at,
+            EventClass::FlowTimer,
+            Event::FlowTimer { flow: 0, step: 0 },
+        );
     }
 
     /// The roadside puts the CRL on the air.
@@ -3225,9 +3261,7 @@ impl Engine {
                 &mut Box<dyn BoxedFading>,
                 bool,
             ) = match (focus.as_mut(), evaluation.map(|e| e.placement)) {
-                (Some(f), Some(LinkPlacement::Inside)) => {
-                    (&mut f.propagation, &mut f.fading, true)
-                }
+                (Some(f), Some(LinkPlacement::Inside)) => (&mut f.propagation, &mut f.fading, true),
                 (_, Some(LinkPlacement::Inbound)) => (propagation, fading, false),
                 _ => (propagation, fading, true),
             };
@@ -3253,7 +3287,9 @@ impl Engine {
 
     /// The carrier the link budget is evaluated at, hertz.
     fn carrier_hz(&self) -> f64 {
-        self.sidelink.as_ref().map_or(SAFETY_FREQ_HZ, |sl| sl.freq_hz)
+        self.sidelink
+            .as_ref()
+            .map_or(SAFETY_FREQ_HZ, |sl| sl.freq_hz)
     }
 
     /// One node's radio endpoint at an instant: its antenna position and class.
@@ -3271,7 +3307,11 @@ impl Engine {
             .get(&node)
             .copied()
             .unwrap_or(v2xw_radio::ActorClass::Car);
-        let pos = Vec3::new(ground.x, ground.y, ground.z + class.default_antenna_height_m());
+        let pos = Vec3::new(
+            ground.x,
+            ground.y,
+            ground.z + class.default_antenna_height_m(),
+        );
         RadioEndpoint::isotropic(node, pos, class, now)
     }
 

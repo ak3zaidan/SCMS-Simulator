@@ -135,7 +135,12 @@ fn a_dense_signalised_grid_holds_every_traffic_invariant() {
     let steps = report.stats.vehicle_steps.max(1) as f64;
     for c in [Check::Jerk, Check::HeadingJump] {
         let share = report.count(c) as f64 / steps;
-        assert!(share < 1e-3, "{} on {:.4} % of vehicle-steps", c.label(), 100.0 * share);
+        assert!(
+            share < 1e-3,
+            "{} on {:.4} % of vehicle-steps",
+            c.label(),
+            100.0 * share
+        );
     }
 }
 

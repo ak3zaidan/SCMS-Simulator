@@ -590,8 +590,7 @@ pub fn card(p: &ResolutionParams) -> ModelCard {
          Investigate means here; an authority that kept accepting a suspect's reports \
          would need the correlator's trusted() to take case state as an argument."
             .to_string(),
-        "No service model: the authority's own processing cost is not charged here."
-            .to_string(),
+        "No service model: the authority's own processing cost is not charged here.".to_string(),
     ];
     card.determinism = Determinism {
         uses_rng: false,

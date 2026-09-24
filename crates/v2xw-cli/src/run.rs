@@ -183,12 +183,14 @@ pub fn run(opts: &RunOptions) -> Result<RunOutcome> {
     // Every exporter reads the recording, so a run that names one must record.
     let exporters = scenario.exporters.clone();
     if !exporters.is_empty() && !opts.record {
-        return Err(v2xw_engine::EngineError::Scenario(v2xw_engine::ScenarioError::conflict(
-            "exporters",
-            "names exporters, and every exporter reads the recording, which --no-recording \
+        return Err(
+            v2xw_engine::EngineError::Scenario(v2xw_engine::ScenarioError::conflict(
+                "exporters",
+                "names exporters, and every exporter reads the recording, which --no-recording \
              turns off",
-        ))
-        .into());
+            ))
+            .into(),
+        );
     }
 
     let build = Stopwatch::start();
@@ -306,7 +308,8 @@ pub fn run(opts: &RunOptions) -> Result<RunOutcome> {
     }
 
     if !exporters.is_empty() {
-        outcome.exports = v2xw_engine::export::run_exporters(&exporters, &recording_path, &out_dir)?;
+        outcome.exports =
+            v2xw_engine::export::run_exporters(&exporters, &recording_path, &out_dir)?;
     }
 
     // The deterministic artefacts are written before the manifest, because the manifest

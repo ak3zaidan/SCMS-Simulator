@@ -291,8 +291,9 @@ impl DatasetWriter {
         // declaration of which codec produced each message type's bytes.
         let byte_provenance =
             self::bytes::ByteProvenanceReport::new(&dataset.tx, &prov.message_encodings);
-        let manifest = DatasetManifest::new(profile, prov, dataset.counts(), outputs, lint.summary())
-            .with_byte_provenance(byte_provenance);
+        let manifest =
+            DatasetManifest::new(profile, prov, dataset.counts(), outputs, lint.summary())
+                .with_byte_provenance(byte_provenance);
         let manifest_bytes = manifest.to_bytes()?;
         let manifest_path = self.root.join("manifest.json");
         std::fs::write(&manifest_path, &manifest_bytes)

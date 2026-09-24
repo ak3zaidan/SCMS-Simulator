@@ -344,13 +344,21 @@ impl Projection {
 /// the two names are identical and only the crate path differs.
 impl From<GeoOrigin> for v2xw_core::GeoOrigin {
     fn from(o: GeoOrigin) -> Self {
-        Self { lat_deg: o.lat_deg, lon_deg: o.lon_deg, alt_m: o.alt_m }
+        Self {
+            lat_deg: o.lat_deg,
+            lon_deg: o.lon_deg,
+            alt_m: o.alt_m,
+        }
     }
 }
 
 impl From<v2xw_core::GeoOrigin> for GeoOrigin {
     fn from(o: v2xw_core::GeoOrigin) -> Self {
-        Self { lat_deg: o.lat_deg, lon_deg: o.lon_deg, alt_m: o.alt_m }
+        Self {
+            lat_deg: o.lat_deg,
+            lon_deg: o.lon_deg,
+            alt_m: o.alt_m,
+        }
     }
 }
 
@@ -2579,7 +2587,10 @@ impl SignalPlan {
             .iter()
             .map(|l| {
                 let approach = approach_of(*l)?;
-                self.heads.iter().find(|h| h.lane == approach).map(|h| h.group)
+                self.heads
+                    .iter()
+                    .find(|h| h.lane == approach)
+                    .map(|h| h.group)
             })
             .collect();
         let rank = |s: SignalState| match s {

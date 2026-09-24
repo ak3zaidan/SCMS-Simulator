@@ -825,7 +825,9 @@ fn render_panel(spec: &FigurePreset, panel: &PanelSpec, table: &ResultsTable) ->
             continue;
         };
         let series = match panel.series {
-            Some(axis) => axis.value_of(row, &dims).unwrap_or_else(|| "all".to_string()),
+            Some(axis) => axis
+                .value_of(row, &dims)
+                .unwrap_or_else(|| "all".to_string()),
             None => "all".to_string(),
         };
         let error = match (row.ci_lo, row.ci_hi) {

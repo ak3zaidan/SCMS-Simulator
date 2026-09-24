@@ -173,10 +173,10 @@ pub use attack::{
 pub use attack_ext::{ExtendedAttackKind, ExtendedAttacker, ExtendedAttackerParams, LaneHint};
 pub use attack_legacy::{LegacyAttacker, LegacyAttackerParams, Magnitudes};
 pub use attack_rsu::{CompromisedRsu, ForwardDecision, RsuAttackKind, RsuAttackParams};
-pub use catalog::CatalogEntry;
 pub use capability::{
     AttackSchedule, Capabilities, CoalitionId, CredentialAccess, Knowledge, RadioCaps,
 };
+pub use catalog::CatalogEntry;
 pub use ctx::{CollectingCtx, ThreatCtx, ThreatCtxExt};
 pub use detect::{
     Detector, DetectorCost, DetectorId, DetectorParams, Fingerprint, Legacy12, Observation, Verdict,
@@ -196,6 +196,6 @@ pub use records::{
 pub use report::{CertValidity, Evidence, ForgeryProfile, MisbehaviourReport, forge};
 pub use resolve::{Authority, Case, CaseOutcome, ResolutionParams, TwoAuthorityResolution};
 pub use ts103759::{
-    CrossCheckInputs, ObservationClass, Ts103759Check, Ts103759Params, Ts103759Suite, TsObservation,
-    TsVerdict,
+    CrossCheckInputs, ObservationClass, Ts103759Check, Ts103759Params, Ts103759Suite,
+    TsObservation, TsVerdict,
 };

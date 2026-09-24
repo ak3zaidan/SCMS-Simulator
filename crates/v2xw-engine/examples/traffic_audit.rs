@@ -106,7 +106,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("    ({:.2}, {:.2})", p.x, p.y);
             }
             for c in world.roads.connections() {
-                if c.from_lane.index() == id || c.to_lane.index() == id || c.via.map(|v| v.index()) == Some(id)
+                if c.from_lane.index() == id
+                    || c.to_lane.index() == id
+                    || c.via.map(|v| v.index()) == Some(id)
                 {
                     println!(
                         "  conn {} -> {} via {:?} {:?} permitted {}",
@@ -134,8 +136,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut auditor = TrafficAuditor::new(&world, AuditParams::default());
     auditor.audit_world(&world);
-    let trace: Option<Vec<u32>> = value("--trace")
-        .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
+    let trace: Option<Vec<u32>> =
+        value("--trace").map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
     let window: (f64, f64) = value("--window")
         .and_then(|v| {
             let mut it = v.split(',').filter_map(|x| x.trim().parse::<f64>().ok());
@@ -162,9 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if ts >= window.0 && ts <= window.1 {
                 let wanted = |a: &v2xw_mobility::audit::AuditActor| {
                     trace.as_ref().is_some_and(|l| l.contains(&a.actor.index()))
-                        || near.is_some_and(|(x, y, r)| {
-                            (a.pos.x - x).hypot(a.pos.y - y) <= r
-                        })
+                        || near.is_some_and(|(x, y, r)| (a.pos.x - x).hypot(a.pos.y - y) <= r)
                 };
                 for a in actors.iter().filter(|a| wanted(a)) {
                     println!(

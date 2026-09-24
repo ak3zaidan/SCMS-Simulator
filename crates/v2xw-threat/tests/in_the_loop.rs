@@ -31,7 +31,11 @@ fn an_attacker_changes_what_goes_on_the_air_and_the_ground_truth_channel_records
 
     eprintln!("{}", sim::summarize(&out));
 
-    assert!(out.nodes >= 10, "the fleet must be big enough: {}", out.nodes);
+    assert!(
+        out.nodes >= 10,
+        "the fleet must be big enough: {}",
+        out.nodes
+    );
     assert!(out.attackers > 0, "the run must have attackers");
     assert!(
         out.falsified_frames > 0,
@@ -271,12 +275,7 @@ fn an_honest_fleet_is_not_accused_wholesale() {
     eprintln!(
         "honest fleet: {} nodes, {} receptions, {} reports, {} revocations, \
          report-level fp {} tn {}",
-        out.nodes,
-        out.receptions,
-        out.reports,
-        out.revocations,
-        report.fp,
-        report.tn
+        out.nodes, out.receptions, out.reports, out.revocations, report.fp, report.tn
     );
     assert_eq!(
         out.revocations, 0,

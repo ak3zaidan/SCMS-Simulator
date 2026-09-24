@@ -110,10 +110,7 @@ impl CatalogEntry {
     /// How many attacks the catalogue holds.
     #[must_use]
     pub fn count() -> usize {
-        AttackKind::ALL.len()
-            + ExtendedAttackKind::ALL.len()
-            + RsuAttackKind::ALL.len()
-            + 2
+        AttackKind::ALL.len() + ExtendedAttackKind::ALL.len() + RsuAttackKind::ALL.len() + 2
     }
 
     /// Parses any name in the catalogue.

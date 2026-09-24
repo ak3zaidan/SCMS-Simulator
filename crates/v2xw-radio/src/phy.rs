@@ -2253,8 +2253,12 @@ mod tests {
         let mut phy = OfdmPhy::new(Tier::High);
         let mut a = arrival(0, 1, power, 0, f);
         let end = a.end;
-        a.interferers
-            .push(InterferenceSource::new(NodeId::new(4), power + 30.0, 0, end));
+        a.interferers.push(InterferenceSource::new(
+            NodeId::new(4),
+            power + 30.0,
+            0,
+            end,
+        ));
         let h = phy.register_arrival(a);
         let congested = Phy::finish_rx(&mut phy, &mut ctx, NodeId::new(1), h);
         assert_eq!(
@@ -2287,8 +2291,12 @@ mod tests {
         let mut a = arrival(0, 1, power, 0, f);
         let end = a.end;
         // An interferer that already destroys the frame on its own…
-        a.interferers
-            .push(InterferenceSource::new(NodeId::new(4), power + 30.0, 0, end));
+        a.interferers.push(InterferenceSource::new(
+            NodeId::new(4),
+            power + 30.0,
+            0,
+            end,
+        ));
         // …plus a jammer far too weak to matter.
         phy.note_jamming(
             NodeId::new(1),
@@ -2369,7 +2377,11 @@ mod tests {
         assert_eq!(clean.len(), 2);
         assert_eq!(clean[0].0, windows[0].0);
         assert_eq!(clean[1].0, windows[1].0);
-        assert_eq!(clean[0].2.to_bits(), clean[1].2.to_bits(), "no jammer, one SNR");
+        assert_eq!(
+            clean[0].2.to_bits(),
+            clean[1].2.to_bits(),
+            "no jammer, one SNR"
+        );
         // And the jammer's energy makes carrier sense report a busy medium, which is why
         // the loss cause and not the CBR is what distinguishes jamming from congestion.
         let energy = phy.energy_dbm(NodeId::new(1), ChannelId::CCH, mid + 1);

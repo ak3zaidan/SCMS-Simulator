@@ -252,18 +252,23 @@ pub const ITEMS: &[(&str, Side)] = &[
 pub const COVERAGE: &[Entry] = &[
     // --- §10.1 Framing -----------------------------------------------------------------
     Entry::here("F1", "f1_a_frame_whose_magic_is_wrong_is_refused"),
-    Entry::here("F2", "f2_an_unknown_message_type_is_ignored_rather_than_an_error"),
+    Entry::here(
+        "F2",
+        "f2_an_unknown_message_type_is_ignored_rather_than_an_error",
+    ),
     Entry::here("F3", "f3_body_len_is_the_uncompressed_body_length"),
     Entry::here("F4", "f4_every_scalar_on_the_wire_is_little_endian"),
     Entry::here("F5", "f5_every_array_offset_satisfies_the_alignment_rule"),
-    Entry::here("F6", "f6_reserved_bytes_are_written_zero_and_ignored_on_read"),
-    Entry::here("F7", "f7_hello_is_never_compressed"),
-    Entry::tripwire("F8", "f8_compression_is_not_applied_on_the_wire_in_this_build"),
-    Entry::there(
-        "F9",
-        "ui/packages/protocol/test/framing.test.ts",
-        "F9",
+    Entry::here(
+        "F6",
+        "f6_reserved_bytes_are_written_zero_and_ignored_on_read",
     ),
+    Entry::here("F7", "f7_hello_is_never_compressed"),
+    Entry::tripwire(
+        "F8",
+        "f8_compression_is_not_applied_on_the_wire_in_this_build",
+    ),
+    Entry::there("F9", "ui/packages/protocol/test/framing.test.ts", "F9"),
     // --- §10.2 Handshake, resume, backpressure ------------------------------------------
     Entry::gap(
         "H1",
@@ -275,8 +280,14 @@ pub const COVERAGE: &[Entry] = &[
         "the_first_canonical_frame_after_a_fresh_hello_is_a_resync_keyframe",
     ),
     Entry::there("H3", "ui/packages/protocol/test/client.test.ts", "H3"),
-    Entry::here("H4", "h4_seq_is_dense_and_monotonic_and_hello_carries_the_next_one"),
-    Entry::here("H5", "h5_a_resume_point_inside_the_ring_replays_without_a_gap"),
+    Entry::here(
+        "H4",
+        "h4_seq_is_dense_and_monotonic_and_hello_carries_the_next_one",
+    ),
+    Entry::here(
+        "H5",
+        "h5_a_resume_point_inside_the_ring_replays_without_a_gap",
+    ),
     Entry::there(
         "H6",
         "crates/v2xw-server/tests/session.rs",
@@ -335,8 +346,14 @@ pub const COVERAGE: &[Entry] = &[
         "crates/v2xw-record/tests/conformance.rs",
         "a_synthetic_v1_1_stream_parses_and_loses_only_what_is_new",
     ),
-    Entry::here("C3", "c3_an_unknown_event_channel_is_skipped_by_payload_len"),
-    Entry::here("C4", "c4_event_entries_are_sorted_and_payloads_are_eight_aligned"),
+    Entry::here(
+        "C3",
+        "c3_an_unknown_event_channel_is_skipped_by_payload_len",
+    ),
+    Entry::here(
+        "C4",
+        "c4_event_entries_are_sorted_and_payloads_are_eight_aligned",
+    ),
     Entry::there(
         "C5",
         "crates/v2xw-record/tests/conformance.rs",
@@ -346,7 +363,10 @@ pub const COVERAGE: &[Entry] = &[
         "C6",
         "`explain` resolving for every displayed value is a property of the viewer's why panel",
     ),
-    Entry::here("C7", "c7_the_symbol_table_is_append_only_within_a_connection"),
+    Entry::here(
+        "C7",
+        "c7_the_symbol_table_is_append_only_within_a_connection",
+    ),
     // --- §10.5 World ------------------------------------------------------------------------
     Entry::here("W1", "w1_the_payload_url_hash_is_the_digest_of_the_body"),
     Entry::gap(
@@ -355,7 +375,10 @@ pub const COVERAGE: &[Entry] = &[
     ),
     Entry::there("W3", "ui/packages/protocol/test/world.test.ts", "W3"),
     Entry::here("W4", "w4_world_json_binary_parity"),
-    Entry::here("W5", "w5_world_generate_is_a_pure_function_of_its_parameters"),
+    Entry::here(
+        "W5",
+        "w5_world_generate_is_a_pure_function_of_its_parameters",
+    ),
     Entry::gap(
         "W6",
         "handling `world_ref.mode` 1 and 2 is a property of the viewer's world loader",
@@ -366,8 +389,14 @@ pub const COVERAGE: &[Entry] = &[
         "crates/v2xw-record/tests/node_profile.rs",
         "every_ground_truth_field_of_the_exhaustive_list_is_blanked",
     ),
-    Entry::here("V2", "v2_an_unequipped_actor_occupies_an_empty_slot_in_the_node_profile"),
-    Entry::here("V3", "v3_a_ground_truth_channel_metric_or_overlay_is_refused_with_32040"),
+    Entry::here(
+        "V2",
+        "v2_an_unequipped_actor_occupies_an_empty_slot_in_the_node_profile",
+    ),
+    Entry::here(
+        "V3",
+        "v3_a_ground_truth_channel_metric_or_overlay_is_refused_with_32040",
+    ),
     Entry::here("V4", "v4_no_control_method_can_change_the_profile"),
     Entry::there(
         "V5",
@@ -380,7 +409,10 @@ pub const COVERAGE: &[Entry] = &[
         "the_node_only_export_contains_no_ground_truth",
     ),
     // --- §10.7 Control surface -----------------------------------------------------------------
-    Entry::here("R1", "r1_all_thirty_three_methods_are_implemented_and_discoverable"),
+    Entry::here(
+        "R1",
+        "r1_all_thirty_three_methods_are_implemented_and_discoverable",
+    ),
     Entry::there(
         "R2",
         "crates/v2xw-server/tests/rpc.rs",
@@ -403,7 +435,10 @@ pub const COVERAGE: &[Entry] = &[
         "R6",
         "`run.step {unit:\"event\"}` advancing exactly one DES event needs a running kernel behind the RPC layer",
     ),
-    Entry::here("R7", "r7_connection_scoped_methods_are_refused_on_the_http_path"),
+    Entry::here(
+        "R7",
+        "r7_connection_scoped_methods_are_refused_on_the_http_path",
+    ),
     Entry::gap(
         "R8",
         "the 2 s job threshold is measured against wall time on a live connection",

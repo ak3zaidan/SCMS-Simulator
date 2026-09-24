@@ -363,7 +363,11 @@ fn pause_holds_the_stream_and_resume_continues_from_the_same_step() {
     // `sim_time` is the instant of the last step sent, so the step after a pause is the
     // one right after it — nothing skipped, nothing repeated.
     let step_ns = engine.descriptor().cadence.mobility_step.as_nanos();
-    assert_eq!(next.sim_time, held + step_ns, "the next step is the one pause held");
+    assert_eq!(
+        next.sim_time,
+        held + step_ns,
+        "the next step is the one pause held"
+    );
 }
 
 /// Every channel the kernel emits is either projected onto a §3.6 payload or *reported*.

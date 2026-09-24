@@ -161,7 +161,6 @@ fn import_world(scenario: &Scenario) -> Result<World> {
     attach_terrain(scenario, world)
 }
 
-
 /// Reads `world.terrain.dem`, when the scenario names one, and attaches it to the world.
 ///
 /// The DEM is resampled onto the world's own frame and extent
@@ -183,12 +182,8 @@ fn attach_terrain(scenario: &Scenario, world: World) -> Result<World> {
         path,
         &v2xw_world::DemOptions::default(),
     )?;
-    let (world, _drape) = v2xw_world::dem::with_terrain(
-        &world,
-        terrain,
-        &v2xw_world::DrapeOptions::none(),
-        &report,
-    )?;
+    let (world, _drape) =
+        v2xw_world::dem::with_terrain(&world, terrain, &v2xw_world::DrapeOptions::none(), &report)?;
     Ok(world)
 }
 
@@ -428,7 +423,10 @@ pub const RADIO_MODEL_FAMILIES: &[(&str, &[&str])] = &[
             v2xw_radio::Tr37885::ID,
         ],
     ),
-    ("fading", &[v2xw_radio::NoFading::ID, v2xw_radio::NakagamiFading::ID]),
+    (
+        "fading",
+        &[v2xw_radio::NoFading::ID, v2xw_radio::NakagamiFading::ID],
+    ),
     ("per", &[v2xw_radio::PerModel::ID]),
     ("phy", &[v2xw_radio::OfdmPhy::ID]),
     ("obstacle", &[v2xw_radio::BuildingShadowing::ID]),
@@ -547,7 +545,12 @@ pub fn radio_models(
             ));
             continue;
         }
-        let bad = |e: String| (format!("{path}.params"), format!("do not fit {}: {e}", choice.id));
+        let bad = |e: String| {
+            (
+                format!("{path}.params"),
+                format!("do not fit {}: {e}", choice.id),
+            )
+        };
         match family.as_str() {
             "propagation" => {
                 let chosen = match choice.id.as_str() {
@@ -766,15 +769,22 @@ pub struct ObstacleStack {
 
 impl ObstacleStack {
     /// The line-of-sight answer for one path between two antennas.
-    pub fn classify(&mut self, world: &World, a: v2xw_core::geom::Vec3, b: v2xw_core::geom::Vec3) -> v2xw_radio::LosResult {
+    pub fn classify(
+        &mut self,
+        world: &World,
+        a: v2xw_core::geom::Vec3,
+        b: v2xw_core::geom::Vec3,
+    ) -> v2xw_radio::LosResult {
         let mut parts = Vec::with_capacity(2);
         if let Some(buildings) = self.buildings.as_mut() {
             parts.push(buildings.los_cached(world, a, b));
         }
         if let Some(terrain) = self.terrain.as_ref() {
-            parts.push(<v2xw_radio::TerrainDiffraction as v2xw_radio::ObstacleModel<
-                crate::ctx::EngineCtx<'_>,
-            >>::los(terrain, world, a, b, None));
+            parts.push(
+                <v2xw_radio::TerrainDiffraction as v2xw_radio::ObstacleModel<
+                    crate::ctx::EngineCtx<'_>,
+                >>::los(terrain, world, a, b, None),
+            );
         }
         match parts.len() {
             0 => v2xw_radio::LosResult::clear(),
@@ -845,7 +855,9 @@ pub fn build_obstacles(scenario: &Scenario, world: &World) -> ObstacleStack {
         return ObstacleStack::default();
     }
     let own_nlos_law = models.propagation == Some(PropagationChoice::Tr37885);
-    let fit = models.building_fit.unwrap_or(v2xw_radio::SommerFit::Default);
+    let fit = models
+        .building_fit
+        .unwrap_or(v2xw_radio::SommerFit::Default);
     ObstacleStack {
         building_loss: !own_nlos_law,
         buildings: (scenario.world.buildings.enabled && !world.buildings.is_empty())
@@ -880,7 +892,9 @@ pub struct FocusStack {
 
 impl core::fmt::Debug for FocusStack {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("FocusStack").field("plan", &self.plan).finish_non_exhaustive()
+        f.debug_struct("FocusStack")
+            .field("plan", &self.plan)
+            .finish_non_exhaustive()
     }
 }
 

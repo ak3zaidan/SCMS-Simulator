@@ -485,9 +485,7 @@ impl Signals {
                 _ => 0,
             }
         };
-        let point = |key: &str| -> Option<f64> {
-            metrics.get(key).and_then(|m| m.value.point())
-        };
+        let point = |key: &str| -> Option<f64> { metrics.get(key).and_then(|m| m.value.point()) };
         Signals {
             attackers: count("det_tp|level=vehicle|cell=tp")
                 + count("det_fn|level=vehicle|cell=fn"),
@@ -551,7 +549,11 @@ pub fn fitness(
 
 /// `x` clamped to `[0, 1]`, with a non-finite value read as zero.
 fn clamp01(x: f64) -> f64 {
-    if x.is_finite() { x.clamp(0.0, 1.0) } else { 0.0 }
+    if x.is_finite() {
+        x.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -912,8 +914,7 @@ impl MutationOperator for RandomMutation {
                 let current = number(parent, "actors.vehicles.demand.rate_veh_per_h", 6000.0);
                 // Multiplicative, because the band edges are an order of magnitude apart
                 // and an additive step would never cross both of them.
-                let next =
-                    quantise3((current * rng.uniform(0.4, 3.0)).clamp(300.0, 120_000.0));
+                let next = quantise3((current * rng.uniform(0.4, 3.0)).clamp(300.0, 120_000.0));
                 child.insert(
                     "actors.vehicles.demand.rate_veh_per_h".to_string(),
                     json!(next),
@@ -1142,7 +1143,12 @@ pub fn derive_candidate_seed(master_seed: u64, candidate: u64) -> u64 {
 /// [`ExperimentError::BadSweepPath`] if a genome path is not writable in the document,
 /// [`ExperimentError::Engine`] if the result is not a valid scenario, and
 /// [`ExperimentError::Json`] if the base will not serialise.
-pub fn materialise(base: &Scenario, genome: &Genome, seed: u64, candidate: u64) -> Result<Scenario> {
+pub fn materialise(
+    base: &Scenario,
+    genome: &Genome,
+    seed: u64,
+    candidate: u64,
+) -> Result<Scenario> {
     let mut document =
         serde_json::to_value(base).map_err(|e| ExperimentError::json("the scenario", e))?;
     for (path, value) in genome {
@@ -1226,10 +1232,15 @@ pub fn search<E: RunExecutor + ?Sized, M: MutationOperator + ?Sized>(
     std::fs::create_dir_all(&options.out)
         .map_err(|e| ExperimentError::io("cannot create the foundry directory", &options.out, e))?;
     let work_root = options.out.join(WORK_DIR);
-    std::fs::create_dir_all(&work_root)
-        .map_err(|e| ExperimentError::io("cannot create the foundry work directory", &work_root, e))?;
+    std::fs::create_dir_all(&work_root).map_err(|e| {
+        ExperimentError::io("cannot create the foundry work directory", &work_root, e)
+    })?;
 
-    let master = if options.seed == 0 { base.seed } else { options.seed };
+    let master = if options.seed == 0 {
+        base.seed
+    } else {
+        options.seed
+    };
     let registry = RngRegistry::new(master);
     let domain = RngDomain::plugin(FOUNDRY_MODEL_ID);
     let mut archive = Archive::new();
@@ -1815,7 +1826,10 @@ mod tests {
     fn an_operator_cannot_weaken_the_detector() {
         let mut hostile = Genome::new();
         hostile.insert("detection.local".to_string(), json!([]));
-        hostile.insert("security.verification_policy".to_string(), json!("on-demand"));
+        hostile.insert(
+            "security.verification_policy".to_string(),
+            json!("on-demand"),
+        );
         hostile.insert("nodes.default_obu".to_string(), json!("obu/cohda-mk5"));
         hostile.insert("threats.attackers[0].fraction".to_string(), json!(0.3));
         let (kept, refused) = sanitise(&hostile);
@@ -1966,13 +1980,7 @@ mod tests {
                 trials: 5,
             },
         );
-        put(
-            "time_to_detect",
-            RunValue::Scalar {
-                value: 12.5,
-                n: 2,
-            },
-        );
+        put("time_to_detect", RunValue::Scalar { value: 12.5, n: 2 });
         let read = Signals::read(&metrics);
         assert_eq!(read.attackers, 5);
         assert_eq!(read.reported_subjects, 5);
@@ -1986,12 +1994,7 @@ mod tests {
         assert_eq!(read.attackers, 0);
         assert_eq!(read.reported_subjects, 0);
         assert_eq!(read.recall_vehicle, None);
-        let (score, validity) = fitness(
-            &Objective::Evade,
-            &read,
-            &descriptor("position"),
-            60.0,
-        );
+        let (score, validity) = fitness(&Objective::Evade, &read, &descriptor("position"), 60.0);
         assert_eq!(score, 0.0);
         assert_eq!(validity, Validity::NoAttackers);
     }

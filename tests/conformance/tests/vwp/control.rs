@@ -19,8 +19,15 @@ use v2xw_server::rpc::{CONNECTION_SCOPED, METHODS, parse};
 /// binding, stub and CLI completion is produced.
 #[test]
 fn r1_all_thirty_three_methods_are_implemented_and_discoverable() {
-    assert_eq!(METHODS.len(), 33, "§6.15 lists 32 methods plus rpc.discover");
-    assert!(METHODS.contains(&"scenario.schema"), "§6.15 names scenario.schema");
+    assert_eq!(
+        METHODS.len(),
+        33,
+        "§6.15 lists 32 methods plus rpc.discover"
+    );
+    assert!(
+        METHODS.contains(&"scenario.schema"),
+        "§6.15 names scenario.schema"
+    );
     let mut unique = METHODS.to_vec();
     unique.sort_unstable();
     unique.dedup();
@@ -113,11 +120,16 @@ fn r10_a_json_rpc_batch_array_is_refused_with_32600() {
         .expect("a single request parses");
     assert_eq!(single.method, "run.status");
     assert_eq!(single.id, Some(json!(1)));
-    assert!(single.params.is_empty(), "an absent params member means {{}}");
+    assert!(
+        single.params.is_empty(),
+        "an absent params member means {{}}"
+    );
 
     // An empty array is still an array, which is the case a `len() > 1` check would miss.
     assert_eq!(
-        parse("[]").expect_err("an empty batch is still a batch").code(),
+        parse("[]")
+            .expect_err("an empty batch is still a batch")
+            .code(),
         -32600
     );
 }

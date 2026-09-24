@@ -53,7 +53,9 @@ fn reference_card() -> ModelCard {
 
 /// Four actors, which is enough for the reordering comparison to mean something.
 fn entities() -> Vec<EntityRef> {
-    (0..4u32).map(|i| EntityRef::Actor(ActorId::new(i))).collect()
+    (0..4u32)
+        .map(|i| EntityRef::Actor(ActorId::new(i)))
+        .collect()
 }
 
 /// One shadowing draw, quantised at the writer, keyed by the entity it is for.
@@ -238,7 +240,10 @@ fn the_reference_plugin_passes_the_suite() {
         !report.complete(),
         "`complete` must be false while three checks were skipped"
     );
-    assert_eq!(report.model, "conformance/reference/log-normal-shadowing@1.0.0");
+    assert_eq!(
+        report.model,
+        "conformance/reference/log-normal-shadowing@1.0.0"
+    );
 }
 
 /// **Injected fault: state carried between entities.**
@@ -457,9 +462,7 @@ fn a_card_that_says_nothing_about_what_it_leaves_out_fails_the_tier_contract() {
     top.ignores.clear();
     top.tier = vec![Tier::High];
     assert!(
-        card_checks(&top)
-            .iter()
-            .all(|c| c.verdict != Verdict::Fail),
+        card_checks(&top).iter().all(|c| c.verdict != Verdict::Fail),
         "a high-tier model need not list ignores"
     );
 }

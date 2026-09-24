@@ -307,8 +307,14 @@ fn a_spat_and_a_map_round_trip_through_the_seam_as_real_bytes() {
 
     let codec = J2735InfraCodec::new();
     for (ty, bytes) in [
-        (MsgType::Spat, spat::encode_spat(&spat).expect("encodes").bytes),
-        (MsgType::Map, map::encode_map(&map_data).expect("encodes").bytes),
+        (
+            MsgType::Spat,
+            spat::encode_spat(&spat).expect("encodes").bytes,
+        ),
+        (
+            MsgType::Map,
+            map::encode_map(&map_data).expect("encodes").bytes,
+        ),
     ] {
         let encoded = codec
             .encode(&Message::HandEncoded {
@@ -445,7 +451,10 @@ fn the_size_model_returns_placeholders_that_cannot_be_decoded() {
                 codec.id()
             );
             assert_eq!(encoded.bytes.len(), encoded.size as usize, "{ty}");
-            assert!(encoded.bytes.iter().all(|&b| b == 0xa5), "{ty} is a fill pattern");
+            assert!(
+                encoded.bytes.iter().all(|&b| b == 0xa5),
+                "{ty} is a fill pattern"
+            );
             assert!(codec.decode(&encoded.bytes, ty).is_err(), "{ty}");
         }
     }

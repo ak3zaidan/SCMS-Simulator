@@ -732,8 +732,10 @@ impl Ts103759Suite {
         } else {
             p.mgt_rng_down_mps * dt
         };
-        out.scores
-            .insert(Ts103759Check::SpeedConsistency, dv.abs() / allowed.max(1e-9));
+        out.scores.insert(
+            Ts103759Check::SpeedConsistency,
+            dv.abs() / allowed.max(1e-9),
+        );
         out.scores.insert(
             Ts103759Check::AccelerationPlausibility,
             (dv / dt).abs()
@@ -771,7 +773,11 @@ impl Ts103759Suite {
         );
         match (x.envelope.and_then(|e| e.cert_region), p.own_region) {
             (Some(stated), Some(own)) => {
-                let score = if stated == own { 0.0 } else { p.hard_fail_score };
+                let score = if stated == own {
+                    0.0
+                } else {
+                    p.hard_fail_score
+                };
                 out.scores.insert(Ts103759Check::ForeignRegion, score);
             }
             _ => self.skipped_no_region += 1,
@@ -800,16 +806,14 @@ impl Ts103759Suite {
         }
         self.class4_evaluated += 1;
         let gate = self.gate(m.claimed_pos_confidence_m);
-        let score = match x
-            .perception
-            .nearest_object_m(m.claimed_x_m, m.claimed_y_m)
-        {
+        let score = match x.perception.nearest_object_m(m.claimed_x_m, m.claimed_y_m) {
             // Nothing sensed anywhere, inside coverage: the strongest evidence this check
             // can produce, and it saturates rather than running to infinity.
             None => self.params.hard_fail_score,
             Some(d) => (d / gate.max(1e-9)).min(self.params.hard_fail_score),
         };
-        out.scores.insert(Ts103759Check::PerceptionCrossCheck, score);
+        out.scores
+            .insert(Ts103759Check::PerceptionCrossCheck, score);
     }
 
     /// The class-5 checks: this message against what other stations said.
@@ -1276,12 +1280,7 @@ pub fn card(p: &Ts103759Params) -> ModelCard {
             json!(p.proximity_range_l_m),
             f2md.clone(),
         ),
-        Parameter::new(
-            "max_delta_inter_s",
-            "s",
-            json!(p.max_delta_inter_s),
-            f2md,
-        ),
+        Parameter::new("max_delta_inter_s", "s", json!(p.max_delta_inter_s), f2md),
         legacy_param(
             "z_threshold",
             "-",

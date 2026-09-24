@@ -143,6 +143,11 @@ pub use abstract_tier::{
     LegacyParams, LoadAxis, ReceptionSample, TableEnvelope, calibrate,
 };
 pub use budget::{LinkBudget, classify, evaluate, merge_los};
+pub use dcc::{
+    AdaptiveDcc, AdaptiveParams, En302571Floor, J2945Params, ReactiveDcc, ReactiveTable,
+    SaeJ2945Dcc,
+};
+pub use fading::{NakagamiFading, NakagamiPreset, NoFading};
 pub use focus::{
     BOUNDARY_BIAS_TOLERANCE_PP, BoundaryBiasMeter, BoundaryBiasReport, BoundaryBinBias,
     BoundaryObservation, FocusPlan, FocusShape, FocusWarning, LinkEvaluation, LinkPlacement,
@@ -152,15 +157,6 @@ pub use jamming::{
     ConstantJammer, JamArrival, JamWindow, JammerKind, JammerProfile, JammingField, PulsedJammer,
     ReactiveJammer, SensedInterval, blind_area_radius_m, punal_rssi_to_sinr_db,
 };
-pub use terrain::{
-    EdgeExtraction, GroundProfile, ProfilePoint, TerrainProfile, any_edge_obstructs, knife_edges,
-    radio_line_height_m,
-};
-pub use dcc::{
-    AdaptiveDcc, AdaptiveParams, En302571Floor, J2945Params, ReactiveDcc, ReactiveTable,
-    SaeJ2945Dcc,
-};
-pub use fading::{NakagamiFading, NakagamiPreset, NoFading};
 pub use mac::{Backoff, CbrMeter, EdcaOcbMac, SlottedMac};
 pub use obstacle::{
     BuildingIndex, BuildingShadowing, MultiEdgeRule, NlosvCase, SommerFit, TerrainDiffraction,
@@ -175,6 +171,10 @@ pub use phy::{
 pub use prop::{
     DualSlope, FreeSpace, LogDistancePreset, LogDistanceShadowing, Polarization, ShadowProcess,
     SommerCoefficients, Tr37885, Tr37885State, TwoRayGround, friis_loss_db, two_ray_ground_loss_db,
+};
+pub use terrain::{
+    EdgeExtraction, GroundProfile, ProfilePoint, TerrainProfile, any_edge_obstructs, knife_edges,
+    radio_line_height_m,
 };
 
 pub use bler::{

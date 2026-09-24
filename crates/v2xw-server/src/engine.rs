@@ -183,8 +183,7 @@ impl StepOutput {
     pub fn approx_bytes(&self) -> usize {
         use core::mem::size_of;
         let poses = self.snapshot.actors.len() * size_of::<v2xw_record::encoder::ActorPose>();
-        let signals =
-            self.snapshot.signals.len() * size_of::<v2xw_record::encoder::SignalState>();
+        let signals = self.snapshot.signals.len() * size_of::<v2xw_record::encoder::SignalState>();
         // A `BTreeMap` node is bigger than its entries, so a per-entry estimate of the
         // key, the value and two pointers is a floor rather than a figure.
         let causes = (self.snapshot.spawn_causes.len() + self.snapshot.despawn_causes.len())
@@ -201,14 +200,7 @@ impl StepOutput {
             .iter()
             .map(|f| size_of::<v2xw_record::wire::Frame>() + f.as_bytes().len())
             .sum();
-        size_of::<StepOutput>()
-            + poses
-            + signals
-            + causes
-            + telemetry
-            + events
-            + metrics
-            + recorded
+        size_of::<StepOutput>() + poses + signals + causes + telemetry + events + metrics + recorded
     }
 }
 

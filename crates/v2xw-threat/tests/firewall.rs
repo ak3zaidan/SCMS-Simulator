@@ -230,9 +230,9 @@ fn every_model_in_the_crate_has_a_card_that_validates() {
             &v2xw_threat::RsuAttackParams::new(k, "rsu0"),
         ));
     }
-    cards.push(v2xw_threat::poison::card(
-        &v2xw_threat::PoisonParams::new("cafe"),
-    ));
+    cards.push(v2xw_threat::poison::card(&v2xw_threat::PoisonParams::new(
+        "cafe",
+    )));
     cards.push(v2xw_threat::privacy::card(
         &v2xw_threat::ObserverParams::default(),
     ));

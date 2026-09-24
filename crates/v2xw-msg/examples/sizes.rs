@@ -198,7 +198,9 @@ fn main() {
             elements: 8,
         })
         .expect("sized");
-    let real = spat::encode_message_frame(&spat_of(8)).expect("frames").size;
+    let real = spat::encode_message_frame(&spat_of(8))
+        .expect("frames")
+        .size;
     println!(
         "\n  The retired 8-phase SPaT row says {retired} B; the encoder that replaced it \
          says {real} B."
@@ -249,7 +251,10 @@ fn map_of(lanes: usize, nodes: usize) -> map::MapData {
         nodes: (0..nodes)
             .map(|n| map::NodeXy::offset(n as i32 * 20, n as i32 * 400).expect("fits"))
             .collect(),
-        connects_to: vec![map::Connection::signalised((id % 255) as u8, (id % 255) as u8)],
+        connects_to: vec![map::Connection::signalised(
+            (id % 255) as u8,
+            (id % 255) as u8,
+        )],
     };
     map::MapData {
         time_stamp: Some(123_456),

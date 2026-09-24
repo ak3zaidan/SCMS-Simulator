@@ -885,7 +885,10 @@ mod tests {
             ))
             .expect("registers");
         let report = run(&registry, &IssueRegister::empty());
-        assert!(report.passed(), "the roadmap's rule is about high-tier defaults");
+        assert!(
+            report.passed(),
+            "the roadmap's rule is about high-tier defaults"
+        );
         assert_eq!(report.todo_parameters, 1);
         assert_eq!(report.high_tier_todo_parameters, 0);
         assert_eq!(report.outside_gate.len(), 1, "and it is still visible");

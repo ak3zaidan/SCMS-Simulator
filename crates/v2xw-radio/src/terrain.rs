@@ -203,10 +203,7 @@ impl TerrainProfile {
             // cliff at the grid's edge and be reported blocked by it. A profile that is
             // not wholly inside the grid is `None` — assumption 4 of the module docs, and
             // the same answer the world-side query is expected to give.
-            points.push(ProfilePoint::new(
-                total_m * f,
-                terrain.height_at(p.x, p.y)?,
-            ));
+            points.push(ProfilePoint::new(total_m * f, terrain.height_at(p.x, p.y)?));
         }
         Some(Self { total_m, points })
     }
@@ -414,8 +411,7 @@ pub fn knife_edges<P: GroundProfile + ?Sized>(
         };
         let f = ((p.along_m - start_m) / total).clamp(0.0, 1.0);
         clearance.push(
-            p.ground_m
-                - radio_line_height_m(first.ground_m, tx_agl_m, last.ground_m, rx_agl_m, f),
+            p.ground_m - radio_line_height_m(first.ground_m, tx_agl_m, last.ground_m, rx_agl_m, f),
         );
     }
 
@@ -447,11 +443,7 @@ pub fn knife_edges<P: GroundProfile + ?Sized>(
 
     if edges.len() > opts.max_edges {
         // Keep the highest; ties by position, so the choice is total.
-        edges.sort_by(|a, b| {
-            b.h_m
-                .total_cmp(&a.h_m)
-                .then(a.d1_m.total_cmp(&b.d1_m))
-        });
+        edges.sort_by(|a, b| b.h_m.total_cmp(&a.h_m).then(a.d1_m.total_cmp(&b.d1_m)));
         edges.truncate(opts.max_edges);
     }
     edges.sort_by(|a, b| a.d1_m.total_cmp(&b.d1_m));
@@ -542,9 +534,7 @@ mod tests {
         assert!(nu < -0.78, "nu = {nu}");
         assert_eq!(knife_edge_loss_db(nu), 0.0);
         // Asking for above-line edges only drops it entirely.
-        assert!(
-            knife_edges(&profile, 60.0, 60.0, EdgeExtraction::above_line_only(8)).is_empty()
-        );
+        assert!(knife_edges(&profile, 60.0, 60.0, EdgeExtraction::above_line_only(8)).is_empty());
     }
 
     /// The grazing discontinuity `include_below_line` exists to remove: a summit a
@@ -557,9 +547,7 @@ mod tests {
             let edges = knife_edges(&profile, 1.5, 1.5, EdgeExtraction::default());
             match edges.first() {
                 None => 0.0,
-                Some(e) => {
-                    knife_edge_loss_db(knife_edge_parameter(e.h_m, e.d1_m, e.d2_m, lambda))
-                }
+                Some(e) => knife_edge_loss_db(knife_edge_parameter(e.h_m, e.d1_m, e.d2_m, lambda)),
             }
         };
         // Antennas at 1.5 m, so a 1.5 m hill grazes exactly.
@@ -709,8 +697,13 @@ mod tests {
     fn a_world_without_a_dem_has_no_profile() {
         let world = crate::testctx::tiny_world();
         assert!(
-            TerrainProfile::sample(&world, Vec3::new(0.0, 0.0, 1.5), Vec3::new(500.0, 0.0, 1.5), 64)
-                .is_none(),
+            TerrainProfile::sample(
+                &world,
+                Vec3::new(0.0, 0.0, 1.5),
+                Vec3::new(500.0, 0.0, 1.5),
+                64
+            )
+            .is_none(),
             "the zero plane cannot obstruct a link"
         );
     }

@@ -38,8 +38,8 @@ use v2xw_core::ids::NodeId;
 use v2xw_core::time::{Duration, SimTime};
 use v2xw_radio::jamming::JammerProfile;
 use v2xw_radio::{
-    ChannelId, ConstantJammer, JamWindow, JammerKind, PulsedJammer, RadioEndpoint,
-    ReactiveJammer, SensedInterval,
+    ChannelId, ConstantJammer, JamWindow, JammerKind, PulsedJammer, RadioEndpoint, ReactiveJammer,
+    SensedInterval,
 };
 
 use super::{Engine, MAX_RANGE_M};
@@ -322,7 +322,14 @@ impl Jamming {
 impl Engine {
     /// The deterministic large-scale power a jammer at `from` delivers to a node at `to`,
     /// dBm: path loss, shadowing and obstacles, no fast-fading draw.
-    fn jam_power_dbm(&mut self, jammer: NodeId, from: Vec3, tx_dbm: f64, rx: NodeId, to: Vec3) -> f64 {
+    fn jam_power_dbm(
+        &mut self,
+        jammer: NodeId,
+        from: Vec3,
+        tx_dbm: f64,
+        rx: NodeId,
+        to: Vec3,
+    ) -> f64 {
         let now = self.scheduler.now();
         let freq_hz = self.carrier_hz();
         let tx_end: RadioEndpoint = self.endpoint(jammer, from, now);
@@ -409,7 +416,9 @@ impl Engine {
                 let mut ctx = EngineCtx::new(
                     scheduler, rng, world, snapshot, provenance, params, &mut null,
                 );
-                jamming.jammers[k].profile.windows(&mut ctx, id, from, until, &[])
+                jamming.jammers[k]
+                    .profile
+                    .windows(&mut ctx, id, from, until, &[])
             };
             if windows.is_empty() {
                 continue;

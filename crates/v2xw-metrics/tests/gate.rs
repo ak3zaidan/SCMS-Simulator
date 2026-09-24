@@ -31,10 +31,13 @@ fn register_path() -> PathBuf {
 
 fn shipped_register() -> IssueRegister {
     let path = register_path();
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("the shipped register at {} is readable: {e}", path.display()));
-    IssueRegister::from_json(&text)
-        .unwrap_or_else(|e| panic!("the shipped register parses: {e}"))
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "the shipped register at {} is readable: {e}",
+            path.display()
+        )
+    });
+    IssueRegister::from_json(&text).unwrap_or_else(|e| panic!("the shipped register parses: {e}"))
 }
 
 #[test]

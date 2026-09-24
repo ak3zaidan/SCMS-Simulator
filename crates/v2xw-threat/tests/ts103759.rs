@@ -253,7 +253,10 @@ fn class_one_fires_on_an_oversized_message_and_is_unchecked_without_the_size() {
     for i in 0..2u64 {
         let m = beacon(A, 16.0 * i as f64, 16.0, i * NS_PER_S);
         let v = one(&mut suite, &mut ctx, &m, &OnRoad, &x);
-        assert_eq!(v.score(Ts103759Check::OversizedMessage), Some(5_000.0 / 2_304.0));
+        assert_eq!(
+            v.score(Ts103759Check::OversizedMessage),
+            Some(5_000.0 / 2_304.0)
+        );
         for o in &v.fired {
             fired.insert(o.check);
         }
@@ -348,13 +351,7 @@ fn class_three_fires_on_a_certificate_from_another_region_and_is_unchecked_witho
     // The same certificate, with the receiver's own region undeclared: unchecked.
     let mut ctx = CollectingCtx::new(1);
     let mut suite = Ts103759Suite::cited_defaults();
-    let v = one(
-        &mut suite,
-        &mut ctx,
-        &beacon(A, 0.0, 16.0, 0),
-        &OnRoad,
-        &x,
-    );
+    let v = one(&mut suite, &mut ctx, &beacon(A, 0.0, 16.0, 0), &OnRoad, &x);
     assert!(!v.evaluated(Ts103759Check::ForeignRegion));
     assert_eq!(suite.skipped_no_region(), 1);
 
@@ -418,13 +415,7 @@ fn a_corroborated_claim_does_not_fire_the_cross_check() {
     let x = CrossCheckInputs::with_perception(&sensor);
     let mut ctx = CollectingCtx::new(1);
     let mut suite = Ts103759Suite::cited_defaults();
-    let v = one(
-        &mut suite,
-        &mut ctx,
-        &beacon(A, 100.0, 0.0, 0),
-        &OnRoad,
-        &x,
-    );
+    let v = one(&mut suite, &mut ctx, &beacon(A, 100.0, 0.0, 0), &OnRoad, &x);
     assert_eq!(v.score(Ts103759Check::PerceptionCrossCheck), Some(0.0));
     assert!(!v.fired());
 }

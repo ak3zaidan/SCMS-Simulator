@@ -741,11 +741,7 @@ const F_MESSAGE_ID: Field = Field::new("messageFrame.messageId", "DSRCmsgID");
 
 fn write_position_3d(w: &mut BitWriter, p: &Position3D) -> Result<(), UperError> {
     // regional is never written.
-    write_preamble(
-        w,
-        EXT_POSITION_3D,
-        &[p.elevation.is_some(), false],
-    );
+    write_preamble(w, EXT_POSITION_3D, &[p.elevation.is_some(), false]);
     write_constrained_int(w, F_LAT, i64::from(p.lat), LATITUDE_MIN, LATITUDE_MAX)?;
     write_constrained_int(w, F_LON, i64::from(p.lon), LONGITUDE_MIN, LONGITUDE_MAX)?;
     if let Some(elevation) = p.elevation {
@@ -1103,7 +1099,13 @@ fn write_generic_lane(w: &mut BitWriter, lane: &GenericLane) -> Result<(), UperE
             false,
         ],
     );
-    write_constrained_int(w, F_LANE_ID, i64::from(lane.lane_id), LANE_ID_MIN, LANE_ID_MAX)?;
+    write_constrained_int(
+        w,
+        F_LANE_ID,
+        i64::from(lane.lane_id),
+        LANE_ID_MIN,
+        LANE_ID_MAX,
+    )?;
     if let Some(approach) = lane.ingress_approach {
         write_constrained_int(
             w,
@@ -1124,7 +1126,12 @@ fn write_generic_lane(w: &mut BitWriter, lane: &GenericLane) -> Result<(), UperE
     }
     write_lane_attributes(w, &lane.attributes)?;
     if let Some(maneuvers) = lane.maneuvers {
-        write_fixed_bit_string(w, F_MANEUVERS, u64::from(maneuvers.0), ALLOWED_MANEUVERS_BITS)?;
+        write_fixed_bit_string(
+            w,
+            F_MANEUVERS,
+            u64::from(maneuvers.0),
+            ALLOWED_MANEUVERS_BITS,
+        )?;
     }
     // nodeList: the `nodes` alternative of an extensible CHOICE.
     write_choice_index(
@@ -1252,13 +1259,7 @@ fn write_intersection_geometry(
     write_preamble(
         w,
         EXT_INTERSECTION_GEOMETRY,
-        &[
-            false,
-            g.lane_width_cm.is_some(),
-            false,
-            false,
-            false,
-        ],
+        &[false, g.lane_width_cm.is_some(), false, false, false],
     );
     crate::j2735::spat::write_reference_id_for(w, &g.id)?;
     write_constrained_int(
@@ -1423,7 +1424,8 @@ fn read_map(r: &mut BitReader<'_>) -> Result<MapData, UperError> {
     }
     let mut intersections = Vec::new();
     if pre.has(3) {
-        let count = read_constrained_length(r, F_INTERSECTIONS_LEN, 1, MAX_INTERSECTION_GEOMETRIES)?;
+        let count =
+            read_constrained_length(r, F_INTERSECTIONS_LEN, 1, MAX_INTERSECTION_GEOMETRIES)?;
         intersections.reserve(count);
         for _ in 0..count {
             intersections.push(read_intersection_geometry(r)?);
@@ -1767,15 +1769,14 @@ mod tests {
         // And it really is wider than the narrowest encoding.
         let mut narrow = map.clone();
         narrow.intersections[0].lanes[0].nodes[1] = NodeXy::offset(1, 1).expect("fits");
-        assert!(encode_map(&narrow).expect("encodes").size < encode_map(&map).expect("encodes").size);
+        assert!(
+            encode_map(&narrow).expect("encodes").size < encode_map(&map).expect("encodes").size
+        );
     }
 
     #[test]
     fn the_narrowest_alternative_is_chosen_and_the_widest_bounds_are_honoured() {
-        assert_eq!(
-            XyAlternative::narrowest_for(0, 0),
-            Some(XyAlternative::Xy1)
-        );
+        assert_eq!(XyAlternative::narrowest_for(0, 0), Some(XyAlternative::Xy1));
         assert_eq!(
             XyAlternative::narrowest_for(511, -512),
             Some(XyAlternative::Xy1)
@@ -1841,8 +1842,14 @@ mod tests {
             EXT_MAP_DATA,
             &[false, true, false, false, false, false, false, false],
         );
-        write_constrained_int(&mut w, F_MSG_ISSUE_REVISION, 0, MSG_COUNT_MIN, MSG_COUNT_MAX)
-            .expect("revision");
+        write_constrained_int(
+            &mut w,
+            F_MSG_ISSUE_REVISION,
+            0,
+            MSG_COUNT_MIN,
+            MSG_COUNT_MAX,
+        )
+        .expect("revision");
         let bytes = w.into_bytes();
         let err = decode_map(&bytes).expect_err("a layer type cannot be read");
         assert!(
@@ -1881,8 +1888,14 @@ mod tests {
             EXT_MAP_DATA,
             &[false, false, false, false, false, false, false, false],
         );
-        write_constrained_int(&mut w, F_MSG_ISSUE_REVISION, 1, MSG_COUNT_MIN, MSG_COUNT_MAX)
-            .expect("revision");
+        write_constrained_int(
+            &mut w,
+            F_MSG_ISSUE_REVISION,
+            1,
+            MSG_COUNT_MIN,
+            MSG_COUNT_MAX,
+        )
+        .expect("revision");
         let bytes = w.into_bytes();
         let err = decode_map(&bytes).expect_err("nothing to describe");
         assert!(

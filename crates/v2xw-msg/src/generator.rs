@@ -1229,13 +1229,18 @@ mod tests {
         // Keyed by the node: asking again, in a different order, gives the same answer.
         let rng2 = v2xw_core::rng::RngRegistry::new(7);
         for i in (0..n).rev().step_by(97) {
-            assert_eq!(t.phase(&rng2, NodeId::new(i)).as_nanos(), phases[i as usize]);
+            assert_eq!(
+                t.phase(&rng2, NodeId::new(i)).as_nanos(),
+                phases[i as usize]
+            );
         }
         // And the synchronised timing puts everyone at zero.
-        assert!((0..50).all(|i| GenerationTiming::SYNCHRONISED
-            .phase(&rng, NodeId::new(i))
-            .as_nanos()
-            == 0));
+        assert!((0..50).all(|i| {
+            GenerationTiming::SYNCHRONISED
+                .phase(&rng, NodeId::new(i))
+                .as_nanos()
+                == 0
+        }));
     }
 
     #[test]
@@ -1248,7 +1253,10 @@ mod tests {
             .collect();
         assert!(js.iter().all(|j| *j <= 10 * NS_PER_MS));
         let mean = js.iter().sum::<u64>() as f64 / js.len() as f64 / NS_PER_MS as f64;
-        assert!((4.5..5.5).contains(&mean), "mean jitter {mean} ms, expected about 5");
+        assert!(
+            (4.5..5.5).contains(&mean),
+            "mean jitter {mean} ms, expected about 5"
+        );
         // The same message asked twice gets the same jitter: the key is single-use and
         // embeds the generation instant, so no stream position leaks between messages.
         assert_eq!(

@@ -77,9 +77,9 @@ use v2xw_proto::stage::{FlowRun, StageId};
 use v2xw_proto::{RevocationLatency, ScmsParams};
 use v2xw_sec::linkage::{CrlLinkageEntry, LinkageValue};
 use v2xw_threat::{
-    AttackKind, Attacker, AttackerView, Emission, Evidence, HonestClaim, LegacyAttacker,
-    LegacyAttackerParams, Legacy12, MisbehaviourReport, NoMap, ObservedKind, ObservedMessage,
-    SelfBelief, StationType, ThreatCtx, VerificationState,
+    AttackKind, Attacker, AttackerView, Emission, Evidence, HonestClaim, Legacy12, LegacyAttacker,
+    LegacyAttackerParams, MisbehaviourReport, NoMap, ObservedKind, ObservedMessage, SelfBelief,
+    StationType, ThreatCtx, VerificationState,
 };
 use v2xw_world::World;
 
@@ -342,7 +342,10 @@ impl Phase2 {
             if choice.id != LEGACY_12 {
                 return Err(conflict(
                     "detection.local",
-                    format!("this build ships one local detector suite, {LEGACY_12}; got {}", choice.id),
+                    format!(
+                        "this build ships one local detector suite, {LEGACY_12}; got {}",
+                        choice.id
+                    ),
                 ));
             }
         }
@@ -407,21 +410,20 @@ impl Phase2 {
         // writes is `threat/attacker/legacy/<AttackKind>`.
         let mut specs = Vec::new();
         for a in &scenario.threats.attackers {
-            let kind = a
-                .id
-                .strip_prefix("threat/attacker/legacy/")
-                .and_then(AttackKind::parse)
-                .ok_or_else(|| {
-                    conflict(
-                        "threats.attackers[].id",
-                        format!(
-                            "{} is not an attacker this build ships: the legacy family is \
+            let kind =
+                a.id.strip_prefix("threat/attacker/legacy/")
+                    .and_then(AttackKind::parse)
+                    .ok_or_else(|| {
+                        conflict(
+                            "threats.attackers[].id",
+                            format!(
+                                "{} is not an attacker this build ships: the legacy family is \
                              `threat/attacker/legacy/<Kind>`, e.g. \
                              threat/attacker/legacy/ConstPos",
-                            a.id
-                        ),
-                    )
-                })?;
+                                a.id
+                            ),
+                        )
+                    })?;
             let mut params = LegacyAttackerParams::new(kind);
             if !a.params.is_null() {
                 if let Some(intensity) = a.params.get("intensity").and_then(|v| v.as_f64()) {
@@ -454,8 +456,12 @@ impl Phase2 {
         // number alone, which is what makes a sixty-second scenario able to reach a
         // revocation at all: the CAMP shuffle window is "10,000 requests or one day".
         let jmax = 2;
-        let scms = ScmsRun::new(ScmsParams::default().quick())
-            .map_err(|e| conflict("actors.backend", format!("the SCMS deployment refused to start: {e}")))?;
+        let scms = ScmsRun::new(ScmsParams::default().quick()).map_err(|e| {
+            conflict(
+                "actors.backend",
+                format!("the SCMS deployment refused to start: {e}"),
+            )
+        })?;
         Ok(Some(Phase2 {
             scms,
             jmax,
@@ -618,12 +624,7 @@ impl Phase2 {
     ///   count over nodes would spend the attacker budget on masts;
     /// * `fraction` draws per node from `(Attack, Node)`, a keyed stream, so whether a
     ///   vehicle is an attacker does not depend on how many spawned before it.
-    pub fn arm_attacker(
-        &mut self,
-        ctx: &mut dyn ThreatCtx,
-        node: NodeId,
-        actor: ActorId,
-    ) -> bool {
+    pub fn arm_attacker(&mut self, ctx: &mut dyn ThreatCtx, node: NodeId, actor: ActorId) -> bool {
         let index = self.vehicles;
         self.vehicles += 1;
         for spec in &self.specs {
@@ -900,13 +901,7 @@ impl Phase2 {
             if self.scms.run().is_err() {
                 continue;
             }
-            let resolved = self
-                .scms
-                .state
-                .ma
-                .case
-                .as_ref()
-                .is_some_and(|c| c.resolved);
+            let resolved = self.scms.state.ma.case.as_ref().is_some_and(|c| c.resolved);
             if !resolved {
                 // The two Linkage Authorities said the pseudonyms belong to different
                 // devices. No entry is issued, and the pair is not retried.

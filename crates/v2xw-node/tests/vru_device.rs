@@ -82,7 +82,10 @@ fn the_shipped_profile_publishes_no_compute_figures_and_still_signs() {
     assert!(p.hsm.ops.is_empty(), "rule H2");
     assert!(p.cpu.cores.is_missing(), "no core count is published");
     assert!(p.ram_bytes.is_missing());
-    assert!(p.power_w.is_missing(), "the field the whole question turns on");
+    assert!(
+        p.power_w.is_missing(),
+        "the field the whole question turns on"
+    );
 
     // But the software cost table has the flagged proxy figures, so the device can sign —
     // and it signs on the CPU, because rule H2 sends every operation there.
@@ -90,9 +93,10 @@ fn the_shipped_profile_publishes_no_compute_figures_and_still_signs() {
     assert_eq!(cost, Duration::from_micros(244));
     assert_eq!(where_, v2xw_node::profile::RunsOn::Cpu);
     assert_eq!(
-        p.software_crypto["ecdsa-p256-sign"].status.as_ref().map(
-            v2xw_node::profile::FieldStatus::as_str
-        ),
+        p.software_crypto["ecdsa-p256-sign"]
+            .status
+            .as_ref()
+            .map(v2xw_node::profile::FieldStatus::as_str),
         Some("proxy"),
         "the figure is a class match, not a device match, and must say so"
     );
@@ -283,7 +287,10 @@ fn a_device_with_a_battery_goes_quiet_when_it_is_spent() {
         let now = k * 100 * NS_PER_MS;
         unlimited.set_belief(belief(Vec3::new(5.0 * k as f64, 0.0, 0.0), 1.4));
         let mut ctx = NodeRuntimeCtx::new(now, &rng);
-        unlimited_sent += unlimited.step(&mut ctx, Vec::new(), 0.0).transmissions.len();
+        unlimited_sent += unlimited
+            .step(&mut ctx, Vec::new(), 0.0)
+            .transmissions
+            .len();
     }
     assert!(
         unlimited_sent > sent,

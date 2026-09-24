@@ -56,7 +56,10 @@ fn every_bsm_on_the_air_carries_its_pseudonym_and_its_decoded_content() {
         let v = c.speed_mps.expect("a speed was encoded");
         let claimed = c.claimed_speed_mps.expect("the claim is recorded");
         // J2735 speed has a 0.02 m/s LSB.
-        assert!((v - claimed).abs() <= 0.02 + 1e-9, "encoded {v} vs claimed {claimed}");
+        assert!(
+            (v - claimed).abs() <= 0.02 + 1e-9,
+            "encoded {v} vs claimed {claimed}"
+        );
         assert!(c.sec_mark_ms.is_some_and(|m| m < 60_000));
         counts
             .entry((t.node.index(), p.to_string()))
@@ -70,7 +73,13 @@ fn every_bsm_on_the_air_carries_its_pseudonym_and_its_decoded_content() {
     // msgCnt advances by one per message (mod 128) under one pseudonym.
     for ((node, _), c) in &counts {
         for w in c.windows(2) {
-            assert_eq!(w[1], (w[0] + 1) % 128, "node {node}: msgCnt {} then {}", w[0], w[1]);
+            assert_eq!(
+                w[1],
+                (w[0] + 1) % 128,
+                "node {node}: msgCnt {} then {}",
+                w[0],
+                w[1]
+            );
         }
     }
     assert!(

@@ -1533,10 +1533,7 @@ pub fn summarize(out: &SimOut) -> String {
     ));
     s.push_str(&format!(
         "reception: max {:.0} m, {} of {} receptions beyond the nominal {:.0} m range\n",
-        out.max_rx_distance_m,
-        out.rx_beyond_nominal_range,
-        out.receptions,
-        out.nominal_range_m
+        out.max_rx_distance_m, out.rx_beyond_nominal_range, out.receptions, out.nominal_range_m
     ));
     for d in DetectorId::ALL {
         let name = d.as_str();

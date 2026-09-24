@@ -236,11 +236,7 @@ impl NodeCrypto {
     }
 
     /// Generates a signing key for `owner` on the node's own deterministic stream.
-    pub fn keygen(
-        &mut self,
-        ctx: &mut dyn NodeCtx,
-        owner: NodeId,
-    ) -> Result<KeyHandle, SecError> {
+    pub fn keygen(&mut self, ctx: &mut dyn NodeCtx, owner: NodeId) -> Result<KeyHandle, SecError> {
         let mut c = SecCtx::new(ctx);
         match self {
             NodeCrypto::Modeled(b) => b.keygen(&mut c, SIGN_PRIMITIVE, owner),
@@ -257,11 +253,7 @@ impl NodeCrypto {
     }
 
     /// Imports a peer's public key from the 33 bytes a certificate carries.
-    pub fn import_public(
-        &mut self,
-        owner: NodeId,
-        material: &[u8],
-    ) -> Result<PubHandle, SecError> {
+    pub fn import_public(&mut self, owner: NodeId, material: &[u8]) -> Result<PubHandle, SecError> {
         match self {
             NodeCrypto::Modeled(b) => b.import_public(SIGN_PRIMITIVE, owner, material),
             NodeCrypto::Real(b) => b.import_public(SIGN_PRIMITIVE, owner, material),
@@ -309,9 +301,7 @@ impl NodeCrypto {
     ) -> Result<SecuredPdu, SecError> {
         let mut c = SecCtx::new(ctx);
         match self {
-            NodeCrypto::Modeled(b) => {
-                envelope.sign(&mut c, b.as_mut(), signer, payload, hdr, sid)
-            }
+            NodeCrypto::Modeled(b) => envelope.sign(&mut c, b.as_mut(), signer, payload, hdr, sid),
             NodeCrypto::Real(b) => envelope.sign(&mut c, b.as_mut(), signer, payload, hdr, sid),
         }
     }
@@ -782,7 +772,8 @@ mod tests {
         let sizes = |mode| {
             let mut ctx = NodeRuntimeCtx::new(0, &reg);
             let mut s = stack(mode);
-            s.provision(&mut ctx, NodeId::new(1), 0, 0, 0).expect("prov");
+            s.provision(&mut ctx, NodeId::new(1), 0, 0, 0)
+                .expect("prov");
             assert!(s.set_active(0, 0));
             let cert_len = s.signer().expect("signer").cert_coer().len();
             let (frame, pdu) = s

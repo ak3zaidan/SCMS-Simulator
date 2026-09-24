@@ -102,8 +102,16 @@ fn pedestrians_and_cyclists_walk_and_ride_on_an_osm_world() {
             })
             .count()
     };
-    assert!(moved(VehicleClass::Pedestrian) >= 15, "{} walkers moved", moved(VehicleClass::Pedestrian));
-    assert!(moved(VehicleClass::Bicycle) >= 3, "{} riders moved", moved(VehicleClass::Bicycle));
+    assert!(
+        moved(VehicleClass::Pedestrian) >= 15,
+        "{} walkers moved",
+        moved(VehicleClass::Pedestrian)
+    );
+    assert!(
+        moved(VehicleClass::Bicycle) >= 3,
+        "{} riders moved",
+        moved(VehicleClass::Bicycle)
+    );
 }
 
 #[test]
@@ -111,5 +119,8 @@ fn an_equipped_pedestrian_is_refused_until_the_kernel_hosts_a_vru_device() {
     let mut scenario = fixture_scenario(10, 0);
     scenario.actors.vru.device_fraction = 0.5;
     let err = scenario.validate().expect_err("no VRU device yet");
-    assert!(err.to_string().contains("actors.vru.device_fraction"), "{err}");
+    assert!(
+        err.to_string().contains("actors.vru.device_fraction"),
+        "{err}"
+    );
 }

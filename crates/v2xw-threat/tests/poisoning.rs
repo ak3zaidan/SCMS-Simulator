@@ -16,9 +16,7 @@ use v2xw_threat::capability::{AttackSchedule, Capabilities};
 use v2xw_threat::ctx::CollectingCtx;
 use v2xw_threat::detect::{DetectorId, Fingerprint, Observation, Verdict};
 use v2xw_threat::ma::{LegacyWindow, MaAction, MaParams, MaPipeline};
-use v2xw_threat::obs::{
-    ObservedKind, ObservedMessage, SelfBelief, StationType, VerificationState,
-};
+use v2xw_threat::obs::{ObservedKind, ObservedMessage, SelfBelief, StationType, VerificationState};
 use v2xw_threat::poison::{PoisonParams, ReportPoisoner};
 use v2xw_threat::records::MaCaseRecord;
 use v2xw_threat::report::{Evidence, MisbehaviourReport};
@@ -520,7 +518,10 @@ fn turning_the_reporter_gate_off_is_how_a_run_measures_it() {
     off.trust_infrastructure("rsu0");
     assert!(off.trusted("anything-at-all"));
     let on = LegacyWindow::legacy_defaults();
-    assert!(on.trusted("never-seen"), "an unknown reporter starts trusted");
+    assert!(
+        on.trusted("never-seen"),
+        "an unknown reporter starts trusted"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -528,11 +529,7 @@ fn turning_the_reporter_gate_off_is_how_a_run_measures_it() {
 // ---------------------------------------------------------------------------------------
 
 fn rsu(kind: RsuAttackKind) -> CompromisedRsu {
-    CompromisedRsu::new(
-        NodeId::new(7),
-        RsuAttackParams::new(kind, "rsu0"),
-        always(),
-    )
+    CompromisedRsu::new(NodeId::new(7), RsuAttackParams::new(kind, "rsu0"), always())
 }
 
 #[test]
@@ -697,7 +694,10 @@ fn an_authority_that_exempts_infrastructure_exempts_a_compromised_unit_too() {
     let mut ctx = CollectingCtx::new(1);
     let mut ma = LegacyWindow::legacy_defaults();
     ma.trust_infrastructure("rsu0");
-    for (i, digest) in ["rsu0", "rep0002", "rep0003", "rsu0"].into_iter().enumerate() {
+    for (i, digest) in ["rsu0", "rep0002", "rep0003", "rsu0"]
+        .into_iter()
+        .enumerate()
+    {
         let mut r = genuine_report(&format!("m{i}"), 9, VICTIM, i as u64 * NS_PER_S);
         r.reporter_cert_digest = digest.to_string();
         ma.on_report(&mut ctx, &r);

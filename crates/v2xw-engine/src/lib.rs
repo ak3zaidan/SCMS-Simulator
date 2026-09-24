@@ -73,5 +73,5 @@ pub use ctx::{DigestRecorder, EngineCtx, MemoryRecorder, NullRecorder, RunRecord
 pub use error::{EngineError, Result, ScenarioError};
 pub use event::{Event, NodeTask, Observe};
 pub use run::{Engine, RunReport};
-pub use snapshot::{ActorState, SnapshotStream, snapshot_cadence};
 pub use scenario::Scenario;
+pub use snapshot::{ActorState, SnapshotStream, snapshot_cadence};

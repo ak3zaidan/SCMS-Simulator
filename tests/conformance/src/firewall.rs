@@ -443,8 +443,7 @@ pub fn scan(check: &'static str, file: &str, src: &str, rules: &'static [Rule]) 
         let line = raw.trim();
         let opens = i32::try_from(raw.matches('{').count()).unwrap_or(i32::MAX);
         let closes = i32::try_from(raw.matches('}').count()).unwrap_or(i32::MAX);
-        let is_comment =
-            line.starts_with("//") || line.starts_with('*') || line.starts_with("/*");
+        let is_comment = line.starts_with("//") || line.starts_with('*') || line.starts_with("/*");
 
         // Guarded by `!is_comment` on purpose: a doc comment that *documents* the
         // attribute — as this module's own header does — must not arm the exemption for
@@ -510,8 +509,7 @@ pub fn scan_ground_truth_fields(file: &str, src: &str) -> Vec<Violation> {
         let line = raw.trim();
         let opens = i32::try_from(raw.matches('{').count()).unwrap_or(i32::MAX);
         let closes = i32::try_from(raw.matches('}').count()).unwrap_or(i32::MAX);
-        let is_comment =
-            line.starts_with("//") || line.starts_with('*') || line.starts_with("/*");
+        let is_comment = line.starts_with("//") || line.starts_with('*') || line.starts_with("/*");
 
         // Guarded by `!is_comment` on purpose: a doc comment that *documents* the
         // attribute — as this module's own header does — must not arm the exemption for
@@ -627,7 +625,12 @@ mod tests {
     /// Each rule fires on the line it is about, and a clean file produces nothing.
     #[test]
     fn the_scanner_finds_a_breach_and_leaves_honest_code_alone() {
-        let hit = scan("c", "src/x.rs", "fn f() {\n    let _ = FORBIDDEN;\n}\n", PROBE);
+        let hit = scan(
+            "c",
+            "src/x.rs",
+            "fn f() {\n    let _ = FORBIDDEN;\n}\n",
+            PROBE,
+        );
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].line, 2);
         assert!(scan("c", "src/y.rs", "fn f() {}\n", PROBE).is_empty());
@@ -687,6 +690,9 @@ mod tests {
                     fn decide(&self) -> bool {\n    self.gt_pos_error_m < 1.0\n}\n";
         let v = scan_ground_truth_fields("src/r.rs", leak);
         assert_eq!(v.len(), 1, "found {v:?}");
-        assert_eq!(v[0].line, 6, "the read after the test module must be caught");
+        assert_eq!(
+            v[0].line, 6,
+            "the read after the test module must be caught"
+        );
     }
 }

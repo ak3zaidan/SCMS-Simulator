@@ -642,9 +642,7 @@ impl CalibrationFit {
             worst_pdr_gap_pp: numeric::q_ratio(report.worst_pdr_gap * 100.0),
             abstract_mean_cbr: numeric::q_ratio(report.abstract_mean_cbr),
             high_mean_cbr: numeric::q_ratio(report.high_mean_cbr),
-            mean_cbr_gap: numeric::q_ratio(
-                (report.abstract_mean_cbr - report.high_mean_cbr).abs(),
-            ),
+            mean_cbr_gap: numeric::q_ratio((report.abstract_mean_cbr - report.high_mean_cbr).abs()),
             bins_compared: report.bins.len(),
             bins_failed: report.bins.iter().filter(|b| !b.within_tolerance).count(),
             samples,
@@ -806,7 +804,10 @@ impl CalibrationRequest {
                     .with_duration(self.warmup, self.duration)
                     // A seed per (density, seed) point. The mix is a multiply-add on the
                     // density index, not a hash, so the list is reproducible by hand.
-                    .with_seed(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(d_index as u64));
+                    .with_seed(
+                        seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                            .wrapping_add(d_index as u64),
+                    );
                 sweep.ring_m = self.ring_m;
                 sweep.payload_cycle = self.plan.packet_bytes.clone();
                 sweep.tx_power_dbm = self.plan.tx_power_dbm;
@@ -846,7 +847,8 @@ impl CalibrationRequest {
         let seed = self.plan.seeds.first().copied().unwrap_or(0);
         let (table, report) = calibrate(&self.plan, self.envelope(), samples, seed);
         let labels = reports.iter().map(|r| r.label.clone()).collect();
-        let fit = CalibrationFit::from_report(&report, &table, n, labels, self.engine_build.clone());
+        let fit =
+            CalibrationFit::from_report(&report, &table, n, labels, self.engine_build.clone());
         CalibratedAbstractTier {
             table,
             report,

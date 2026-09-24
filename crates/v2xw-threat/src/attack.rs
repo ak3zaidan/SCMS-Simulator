@@ -1166,7 +1166,12 @@ mod extended_tests {
         let h = honest();
         let mut region = Emission::honest([0; 8], h, 1_000_000_000, 0, 10_000_000_000);
         region.cert_region = Some(RegionId(276));
-        assert!(!is_falsified(&h, &region, 1_000_000_000, StationType::Vehicle));
+        assert!(!is_falsified(
+            &h,
+            &region,
+            1_000_000_000,
+            StationType::Vehicle
+        ));
         assert!(is_falsified_extended(
             &h,
             &region,
@@ -1222,13 +1227,19 @@ mod extended_tests {
     fn a_phantom_perception_payload_is_counted_as_a_falsified_message() {
         let h = honest();
         let mut e = Emission::honest([0; 8], h, 1_000_000_000, 0, 10_000_000_000);
-        assert_eq!(falsified_count(&h, &e, 1_000_000_000, StationType::Vehicle), 0);
+        assert_eq!(
+            falsified_count(&h, &e, 1_000_000_000, StationType::Vehicle),
+            0
+        );
         e.perceived
             .push(PerceivedObject::from_metres(1, 30.0, 0.0, 12.0, 10));
         e.perceived
             .push(PerceivedObject::from_metres(2, 60.0, 0.0, 12.0, 10));
         // One CPM, however many phantom objects it carries.
-        assert_eq!(falsified_count(&h, &e, 1_000_000_000, StationType::Vehicle), 1);
+        assert_eq!(
+            falsified_count(&h, &e, 1_000_000_000, StationType::Vehicle),
+            1
+        );
     }
 
     #[test]

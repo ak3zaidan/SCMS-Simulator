@@ -24,8 +24,7 @@ fn fixture() -> Arc<Run> {
         ..StubOptions::default()
     })
     .expect("fixture");
-    let world_json =
-        v2xw_world::serde_vwp::to_json_string(engine.geometry()).expect("world json");
+    let world_json = v2xw_world::serde_vwp::to_json_string(engine.geometry()).expect("world json");
     Run::new(Box::new(engine), world_json).expect("run")
 }
 
@@ -68,7 +67,10 @@ fn a_new_runs_first_step_cannot_be_encoded_against_the_old_runs_encoder() {
     assert!(run.tick().expect("tick"));
     let first = rx.try_recv().expect("the new run's first step");
     assert_eq!(first.sim_time, 0, "run.start rewinds");
-    assert_eq!(first.generation, 1, "and the step says which run it belongs to");
+    assert_eq!(
+        first.generation, 1,
+        "and the step says which run it belongs to"
+    );
     assert!(
         session.encode_step(&first).is_err(),
         "the failure the regreet exists for: a step that does not advance is refused"
@@ -88,8 +90,15 @@ fn a_regreeted_connection_gets_a_fresh_hello_and_streams_the_new_run() {
     let header = hello.header().expect("header");
     assert_eq!(header.msg_type, MsgType::Hello.id());
     let body = HelloBody::decode(hello.body()).expect("decode Hello");
-    assert_eq!(body.hello_flags & HELLO_RESUMED, 0, "a new run is never a resume");
-    assert_eq!(body.resume_seq, 0, "§1.4: seq starts again at 0 for a new run");
+    assert_eq!(
+        body.hello_flags & HELLO_RESUMED,
+        0,
+        "a new run is never a resume"
+    );
+    assert_eq!(
+        body.resume_seq, 0,
+        "§1.4: seq starts again at 0 for a new run"
+    );
     assert_eq!(session.generation(), run.generation());
 
     let mut rx = run.subscribe();
@@ -98,6 +107,10 @@ fn a_regreeted_connection_gets_a_fresh_hello_and_streams_the_new_run() {
     let first = rx.try_recv().expect("the new run's first step");
     let effects = session.encode_step(&first).expect("the new run encodes");
     let opening = effects.frames[0].header().expect("header");
-    assert_eq!(opening.msg_type, MsgType::Keyframe.id(), "the new run opens with a keyframe");
+    assert_eq!(
+        opening.msg_type,
+        MsgType::Keyframe.id(),
+        "the new run opens with a keyframe"
+    );
     assert_eq!(opening.seq, 0);
 }

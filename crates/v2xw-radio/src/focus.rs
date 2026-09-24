@@ -585,10 +585,7 @@ impl FocusPlan {
         let surrounding = self.outside.max_tier();
         let focus = self.inside.max_tier();
         if focus <= surrounding {
-            out.push(FocusWarning::FocusNotHigherThanSurroundings {
-                focus,
-                surrounding,
-            });
+            out.push(FocusWarning::FocusNotHigherThanSurroundings { focus, surrounding });
         }
         if self.inside.mac == Tier::High {
             out.push(FocusWarning::MacContentionUnderRepresented {
@@ -1007,10 +1004,9 @@ mod tests {
         let pl = plan();
         let warnings = pl.warnings();
         assert!(
-            warnings.iter().any(|w| matches!(
-                w,
-                FocusWarning::MacContentionUnderRepresented { .. }
-            )),
+            warnings
+                .iter()
+                .any(|w| matches!(w, FocusWarning::MacContentionUnderRepresented { .. })),
             "{warnings:?}"
         );
         assert!(
@@ -1025,10 +1021,11 @@ mod tests {
             RadioTierSet::uniform(Tier::Medium),
         )
         .with_range_max_m(1_000.0);
-        assert!(flat.warnings().iter().any(|w| matches!(
-            w,
-            FocusWarning::FocusNotHigherThanSurroundings { .. }
-        )));
+        assert!(
+            flat.warnings()
+                .iter()
+                .any(|w| matches!(w, FocusWarning::FocusNotHigherThanSurroundings { .. }))
+        );
         // A negative radius is not a region.
         let bad = FocusPlan::new(
             FocusShape::circle(p(0.0, 0.0), -1.0),
@@ -1129,7 +1126,11 @@ mod tests {
         };
         // 95 of 100 outside against 100 of 100 inside: exactly 5 pp, which passes.
         let at = make(95, 100);
-        assert!((at.worst_gap_pp - 5.0).abs() < 1e-6, "{:?}", at.worst_gap_pp);
+        assert!(
+            (at.worst_gap_pp - 5.0).abs() < 1e-6,
+            "{:?}",
+            at.worst_gap_pp
+        );
         assert!(at.accepted, "{}", at.summary());
         // 94 of 100: 6 pp, which does not.
         let over = make(94, 100);

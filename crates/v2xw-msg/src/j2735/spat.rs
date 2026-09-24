@@ -490,8 +490,10 @@ impl Spat {
 // =========================================================================================
 
 const F_SPAT_TIME_STAMP: Field = Field::new("spat.timeStamp", "MinuteOfTheYear");
-const F_INTERSECTIONS_LEN: Field =
-    Field::new("spat.intersections", "SEQUENCE (SIZE(1..32)) OF IntersectionState");
+const F_INTERSECTIONS_LEN: Field = Field::new(
+    "spat.intersections",
+    "SEQUENCE (SIZE(1..32)) OF IntersectionState",
+);
 const F_REGION: Field = Field::new("intersectionState.id.region", "RoadRegulatorID");
 const F_INTERSECTION_ID: Field = Field::new("intersectionState.id.id", "IntersectionID");
 const F_REVISION: Field = Field::new("intersectionState.revision", "MsgCount");
@@ -544,17 +546,18 @@ fn write_reference_id(w: &mut BitWriter, id: &IntersectionReferenceId) -> Result
 fn read_reference_id(r: &mut BitReader<'_>) -> Result<IntersectionReferenceId, UperError> {
     let pre = read_preamble(r, "IntersectionReferenceID", false, 1)?;
     let region = if pre.has(0) {
-        Some(read_constrained_int(
-            r,
-            F_REGION,
-            ROAD_REGULATOR_ID_MIN,
-            ROAD_REGULATOR_ID_MAX,
-        )? as u16)
+        Some(
+            read_constrained_int(r, F_REGION, ROAD_REGULATOR_ID_MIN, ROAD_REGULATOR_ID_MAX)? as u16,
+        )
     } else {
         None
     };
-    let id = read_constrained_int(r, F_INTERSECTION_ID, INTERSECTION_ID_MIN, INTERSECTION_ID_MAX)?
-        as u16;
+    let id = read_constrained_int(
+        r,
+        F_INTERSECTION_ID,
+        INTERSECTION_ID_MIN,
+        INTERSECTION_ID_MAX,
+    )? as u16;
     Ok(IntersectionReferenceId { region, id })
 }
 
@@ -603,7 +606,13 @@ fn write_time_change_details(w: &mut BitWriter, t: &TimeChangeDetails) -> Result
         TIME_MARK_MAX,
     )?;
     if let Some(v) = t.max_end_time {
-        write_constrained_int(w, F_MAX_END_TIME, i64::from(v), TIME_MARK_MIN, TIME_MARK_MAX)?;
+        write_constrained_int(
+            w,
+            F_MAX_END_TIME,
+            i64::from(v),
+            TIME_MARK_MIN,
+            TIME_MARK_MAX,
+        )?;
     }
     if let Some(v) = t.likely_time {
         write_constrained_int(w, F_LIKELY_TIME, i64::from(v), TIME_MARK_MIN, TIME_MARK_MAX)?;
@@ -694,12 +703,11 @@ fn write_movement_event(w: &mut BitWriter, e: &MovementEvent) -> Result<(), Uper
 fn read_movement_event(r: &mut BitReader<'_>) -> Result<MovementEvent, UperError> {
     let pre = read_preamble(r, "MovementEvent", true, 3)?;
     let index = read_enumerated(r, F_EVENT_STATE, MOVEMENT_PHASE_STATE_COUNT)?;
-    let event_state =
-        MovementPhaseState::from_index(index).ok_or(UperError::BadEnumIndex {
-            asn1_type: F_EVENT_STATE.asn1_type,
-            index,
-            count: MOVEMENT_PHASE_STATE_COUNT,
-        })?;
+    let event_state = MovementPhaseState::from_index(index).ok_or(UperError::BadEnumIndex {
+        asn1_type: F_EVENT_STATE.asn1_type,
+        index,
+        count: MOVEMENT_PHASE_STATE_COUNT,
+    })?;
     let timing = if pre.has(0) {
         Some(read_time_change_details(r)?)
     } else {
@@ -762,12 +770,8 @@ fn read_movement_state(r: &mut BitReader<'_>) -> Result<MovementState, UperError
                      synchronisation",
         });
     }
-    let signal_group = read_constrained_int(
-        r,
-        F_SIGNAL_GROUP,
-        SIGNAL_GROUP_ID_MIN,
-        SIGNAL_GROUP_ID_MAX,
-    )? as u8;
+    let signal_group =
+        read_constrained_int(r, F_SIGNAL_GROUP, SIGNAL_GROUP_ID_MIN, SIGNAL_GROUP_ID_MAX)? as u8;
     let count = read_constrained_length(r, F_EVENTS_LEN, 1, MAX_MOVEMENT_EVENTS)?;
     let mut events = Vec::with_capacity(count);
     for _ in 0..count {
@@ -865,12 +869,7 @@ fn read_intersection_state(r: &mut BitReader<'_>) -> Result<IntersectionState, U
     let revision = read_constrained_int(r, F_REVISION, MSG_COUNT_MIN, MSG_COUNT_MAX)? as u8;
     let status = IntersectionStatus(read_fixed_bit_string(r, INTERSECTION_STATUS_BITS)? as u16);
     let moy = if pre.has(1) {
-        Some(read_constrained_int(
-            r,
-            F_MOY,
-            MINUTE_OF_THE_YEAR_MIN,
-            MINUTE_OF_THE_YEAR_MAX,
-        )? as u32)
+        Some(read_constrained_int(r, F_MOY, MINUTE_OF_THE_YEAR_MIN, MINUTE_OF_THE_YEAR_MAX)? as u32)
     } else {
         None
     };
@@ -1345,7 +1344,10 @@ mod tests {
         w.write_bit(true); // SPAT's extension bit
         let bytes = w.into_bytes();
         let err = decode_spat(&bytes).expect_err("extension additions are not interpreted");
-        assert!(matches!(err, CodecError::UnsupportedConstruct { .. }), "{err}");
+        assert!(
+            matches!(err, CodecError::UnsupportedConstruct { .. }),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1354,9 +1356,11 @@ mod tests {
         let framed = encode_message_frame(&spat).expect("frames").bytes;
         // The BSM decoder must not accept a SPaT frame, and vice versa.
         assert!(crate::j2735::bsm::decode_message_frame(&framed).is_err());
-        let bsm = crate::j2735::bsm::encode_message_frame(&crate::j2735::bsm::BasicSafetyMessage::part_i(
-            crate::j2735::bsm::BsmCoreData::unavailable([1, 2, 3, 4]),
-        ))
+        let bsm = crate::j2735::bsm::encode_message_frame(
+            &crate::j2735::bsm::BasicSafetyMessage::part_i(
+                crate::j2735::bsm::BsmCoreData::unavailable([1, 2, 3, 4]),
+            ),
+        )
         .expect("frames")
         .bytes;
         assert!(decode_message_frame(&bsm).is_err());

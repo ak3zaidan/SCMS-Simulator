@@ -29,9 +29,10 @@ fn write(tag: &str, prov: &RunProvenance) -> (serde_json::Value, String) {
         .write(&ds, prov)
         .expect("write");
     assert!(out.lint.is_clean(), "the fixture must lint clean");
-    let manifest: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).expect("manifest"))
-            .expect("valid JSON");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("manifest.json")).expect("manifest"),
+    )
+    .expect("valid JSON");
     let sheet = std::fs::read_to_string(dir.join("DATASHEET.md")).expect("DATASHEET.md");
     (manifest, sheet)
 }
@@ -172,7 +173,10 @@ fn the_legacy_model_card_key_is_derived_when_only_the_richer_list_is_supplied() 
         ..provenance()
     };
     let (manifest, sheet) = write("provenance-derived-legacy", &prov);
-    assert_eq!(manifest["model_cards"][0]["id"], "radio/propagation/log-distance");
+    assert_eq!(
+        manifest["model_cards"][0]["id"],
+        "radio/propagation/log-distance"
+    );
     assert_eq!(manifest["model_cards"][0]["version"], "2.0.0");
     assert!(sheet.contains("`field-checked` — against measurements"));
 }

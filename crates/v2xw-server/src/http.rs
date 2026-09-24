@@ -338,7 +338,11 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
     {
         return;
     }
-    for frame in session.resume_backlog().into_iter().chain(rest.iter().cloned()) {
+    for frame in session
+        .resume_backlog()
+        .into_iter()
+        .chain(rest.iter().cloned())
+    {
         if socket
             .send(Message::Binary(frame.into_bytes().into()))
             .await

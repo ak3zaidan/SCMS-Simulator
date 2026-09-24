@@ -354,7 +354,8 @@ fn run_start(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
     }
     // Every connection hears it, not only the caller: a second tab watching the run has to
     // learn that a new one began as surely as the tab that pressed Run.
-    ctx.run.notify_state(outcome.state, outcome.t_ns, "run.start");
+    ctx.run
+        .notify_state(outcome.state, outcome.t_ns, "run.start");
     Ok(Outcome::of(result))
 }
 
@@ -384,7 +385,10 @@ fn seed_param(p: &Map<String, Value>) -> Result<Option<u64>> {
 /// Parses a seed written the way a scenario writes one.
 pub fn parse_seed(text: &str) -> Option<u64> {
     let clean: String = text.trim().chars().filter(|c| *c != '_').collect();
-    match clean.strip_prefix("0x").or_else(|| clean.strip_prefix("0X")) {
+    match clean
+        .strip_prefix("0x")
+        .or_else(|| clean.strip_prefix("0X"))
+    {
         Some(hex) => u64::from_str_radix(hex, 16).ok(),
         None => clean.parse().ok(),
     }
@@ -392,7 +396,8 @@ pub fn parse_seed(text: &str) -> Option<u64> {
 
 fn run_pause(ctx: &mut Context<'_>) -> Result<Outcome> {
     let outcome = ctx.run.control(Control::Pause)?;
-    ctx.run.notify_state(outcome.state, outcome.t_ns, "run.pause");
+    ctx.run
+        .notify_state(outcome.state, outcome.t_ns, "run.pause");
     // §6.6: "The server MUST have sent every frame up to and including `t_ns` before
     // replying." Draining the connection's own backlog here is what makes that true
     // (conformance R5).
@@ -406,7 +411,8 @@ fn run_pause(ctx: &mut Context<'_>) -> Result<Outcome> {
 
 fn run_resume(ctx: &mut Context<'_>) -> Result<Outcome> {
     let outcome = ctx.run.control(Control::Resume)?;
-    ctx.run.notify_state(outcome.state, outcome.t_ns, "run.resume");
+    ctx.run
+        .notify_state(outcome.state, outcome.t_ns, "run.resume");
     Ok(Outcome::of(
         json!({"state": outcome.state.as_str(), "t_ns": outcome.t_ns}),
     ))
@@ -563,7 +569,8 @@ fn run_stop(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
     for (key, value) in outcome.extra {
         result[key] = value;
     }
-    ctx.run.notify_state(outcome.state, outcome.t_ns, "run.stop");
+    ctx.run
+        .notify_state(outcome.state, outcome.t_ns, "run.stop");
     // The connection stays open. §6.6 used to end it with `Bye{reason = 1}`, which left a
     // page that pressed Stop with no socket to press Run on; the run is over, the
     // connection is not, and `run.start` on it sends the next run's `Hello`.
@@ -939,7 +946,14 @@ fn scenario_get(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome
         // the document for a client that only wants the form.
         let surface = v2xw_engine::scenario::publish::surface();
         result["schema"] = surface["schema"].clone();
-        for key in ["fields", "groups", "slots", "models", "statuses", "validator"] {
+        for key in [
+            "fields",
+            "groups",
+            "slots",
+            "models",
+            "statuses",
+            "validator",
+        ] {
             result[key] = surface[key].clone();
         }
     }
@@ -969,8 +983,16 @@ fn scenario_schema(_ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Out
         return Ok(Outcome::of(surface));
     }
     let known = [
-        "version", "engine", "generated_from", "validator", "groups", "statuses", "schema",
-        "fields", "slots", "models",
+        "version",
+        "engine",
+        "generated_from",
+        "validator",
+        "groups",
+        "statuses",
+        "schema",
+        "fields",
+        "slots",
+        "models",
     ];
     if let Some(bad) = wanted.iter().find(|w| !known.contains(&w.as_str())) {
         return Err(ServerError::param(

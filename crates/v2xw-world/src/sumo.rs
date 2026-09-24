@@ -2453,9 +2453,7 @@ fn import_parsed(
         for j in 0..junctions.len() {
             let mut controlled: Vec<(LaneId, u32)> = controlled_by_junction[j]
                 .iter()
-                .filter(|c| {
-                    c.link_index.is_some() && c.tl.as_deref() == Some(logic.id.as_str())
-                })
+                .filter(|c| c.link_index.is_some() && c.tl.as_deref() == Some(logic.id.as_str()))
                 .map(|c| (c.lane, c.link_index.unwrap_or(0)))
                 .collect();
             if controlled.is_empty() {

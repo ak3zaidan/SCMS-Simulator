@@ -10,7 +10,9 @@ use std::collections::BTreeSet;
 
 use v2xw_core::ids::NodeId;
 use v2xw_core::time::{NS_PER_S, SimTime};
-use v2xw_threat::attack::{AttackAction, Attacker, AttackerView, Emission, HonestClaim, JamProfile};
+use v2xw_threat::attack::{
+    AttackAction, Attacker, AttackerView, Emission, HonestClaim, JamProfile,
+};
 use v2xw_threat::attack_ext::{
     ExtendedAttackKind, ExtendedAttacker, ExtendedAttackerParams, LaneHint,
 };
@@ -124,7 +126,10 @@ fn assert_own_claim_untouched(e: &Emission, t: SimTime) {
     assert_eq!(e.x_m, h.x_m, "the attacker's own claimed x moved");
     assert_eq!(e.y_m, h.y_m, "the attacker's own claimed y moved");
     assert_eq!(e.speed_mps, h.speed_mps, "its own claimed speed moved");
-    assert_eq!(e.heading_rad, h.heading_rad, "its own claimed heading moved");
+    assert_eq!(
+        e.heading_rad, h.heading_rad,
+        "its own claimed heading moved"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -251,7 +256,11 @@ fn a_relay_does_not_capture_one_reception_twice() {
     let rx = vec![heard(1, 100.0, NS_PER_S)];
     h.step(NS_PER_S, &rx);
     h.step(2 * NS_PER_S, &rx);
-    assert_eq!(h.attacker.captured(), 1, "same signer, same generation time");
+    assert_eq!(
+        h.attacker.captured(),
+        1,
+        "same signer, same generation time"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -289,7 +298,10 @@ fn certificate_region_misuse_states_a_region_and_edits_nothing_else() {
     let (out, actions) = h.step(0, &[]);
     assert_eq!(out.cert_region, Some(RegionId(840)));
     assert_own_claim_untouched(&out, 0);
-    assert!(out.signature_valid, "the credential is valid; its region is not");
+    assert!(
+        out.signature_valid,
+        "the credential is valid; its region is not"
+    );
     assert_eq!(out.cert_valid_from, 0);
     assert_eq!(out.cert_valid_to, u64::MAX);
     assert_eq!(actions.len(), 1);
@@ -328,10 +340,7 @@ fn a_phantom_collective_perception_message_carries_objects_that_are_not_there() 
     assert_eq!(out.perceived[0].quality, 15, "an attacker asserts the best");
     assert_eq!(out.perceived[1].x_cm, 1_000);
     assert_eq!(out.perceived[1].y_cm, -200);
-    assert!(matches!(
-        actions[0],
-        AttackAction::ForgeObject { count: 5 }
-    ));
+    assert!(matches!(actions[0], AttackAction::ForgeObject { count: 5 }));
     // One CPM, however many objects: the label counts messages.
     assert_eq!(
         v2xw_threat::falsified_count(&honest_at(0), &out, 0, StationType::Vehicle),
@@ -352,7 +361,10 @@ fn a_jammer_without_the_capability_refuses_visibly() {
     ] {
         let mut h = Harness::new(kind, Capabilities::insider(20), Vec::new());
         let (out, actions) = h.step(0, &[heard(1, 50.0, 0)]);
-        assert!(out.raw_energy.is_none(), "{kind} jammed without declaring it");
+        assert!(
+            out.raw_energy.is_none(),
+            "{kind} jammed without declaring it"
+        );
         assert!(actions.is_empty());
         assert_eq!(h.attacker.refused(), 1, "{kind} refused silently");
     }

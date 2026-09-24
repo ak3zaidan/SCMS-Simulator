@@ -22,7 +22,8 @@ fn spec() -> String {
 fn suite_sources() -> BTreeMap<String, String> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vwp");
     let mut out = BTreeMap::new();
-    for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+    for entry in
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
     {
         let path = entry.expect("a directory entry").path();
         if path.extension().is_some_and(|e| e == "rs") {
@@ -207,8 +208,10 @@ fn the_gaps_and_the_unmet_items_are_the_ones_we_know_about() {
     // tested and did not.
     for id in &gaps {
         assert!(
-            ["H1", "H8", "H11", "Q7", "C6", "W2", "W6", "R4", "R5", "R6", "R8", "P2"]
-                .contains(id),
+            [
+                "H1", "H8", "H11", "Q7", "C6", "W2", "W6", "R4", "R5", "R6", "R8", "P2"
+            ]
+            .contains(id),
             "`{id}` became a gap without being written down as one"
         );
     }

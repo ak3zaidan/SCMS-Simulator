@@ -100,7 +100,10 @@ fn start_and_finish(run: &Run, start: Value) -> Value {
         }
     }
     let status = ok(run, "run.status", json!({}));
-    assert_eq!(status["state"], "finished", "the run did not finish: {status}");
+    assert_eq!(
+        status["state"], "finished",
+        "the run did not finish: {status}"
+    );
     status
 }
 
@@ -127,7 +130,10 @@ fn an_edited_duration_is_the_next_runs_horizon() {
     let first = run_to_end(&run);
     assert_eq!(first["t_end_ns"], 4_000_000_000u64);
 
-    let set = patch(&run, json!([{"op": "replace", "path": "/time/duration_s", "value": 2}]));
+    let set = patch(
+        &run,
+        json!([{"op": "replace", "path": "/time/duration_s", "value": 2}]),
+    );
     assert_eq!(set["requires_restart"], json!(["/time/duration_s"]));
     let staged = set["hash"].as_str().expect("hash").to_string();
     assert_ne!(
@@ -141,8 +147,14 @@ fn an_edited_duration_is_the_next_runs_horizon() {
     assert_eq!(get["running_hash"], first["scenario_hash"]);
 
     let second = run_to_end(&run);
-    assert_eq!(second["t_end_ns"], 2_000_000_000u64, "the edit did not reach the run");
-    assert_eq!(second["t_ns"], 2_000_000_000u64, "the clock stops at the horizon, not past it");
+    assert_eq!(
+        second["t_end_ns"], 2_000_000_000u64,
+        "the edit did not reach the run"
+    );
+    assert_eq!(
+        second["t_ns"], 2_000_000_000u64,
+        "the clock stops at the horizon, not past it"
+    );
     assert_eq!(second["scenario_hash"], staged);
     assert_eq!(run.descriptor().duration, 2_000_000_000);
     // Consumed: the next run of the page is the edited scenario, with nothing pending.
@@ -154,16 +166,25 @@ fn the_master_seed_moves_the_digest_and_the_same_seed_reproduces_it() {
     let run = serve(&scenario("seed", 3, 3000));
     let a = digest(&run_to_end(&run));
     let a_again = digest(&run_to_end(&run));
-    assert_eq!(a, a_again, "the same scenario and seed must reproduce the run");
+    assert_eq!(
+        a, a_again,
+        "the same scenario and seed must reproduce the run"
+    );
 
-    patch(&run, json!([{"op": "replace", "path": "/seed", "value": "0x1234"}]));
+    patch(
+        &run,
+        json!([{"op": "replace", "path": "/seed", "value": "0x1234"}]),
+    );
     let b = digest(&run_to_end(&run));
     assert_ne!(a, b, "a different master seed must give a different run");
     let b_again = digest(&run_to_end(&run));
     assert_eq!(b, b_again, "the edited seed reproduces too");
 
     // `run.start`'s own `seed` override reaches the run the same way.
-    let c = digest(&start_and_finish(&run, json!({"paused": true, "speed": 0, "seed": 99})));
+    let c = digest(&start_and_finish(
+        &run,
+        json!({"paused": true, "speed": 0, "seed": 99}),
+    ));
     assert_ne!(c, b, "run.start's seed override must reach the run");
     assert_eq!(
         ok(&run, "scenario.get", json!({}))["scenario"]["seed"],
@@ -175,12 +196,16 @@ fn the_master_seed_moves_the_digest_and_the_same_seed_reproduces_it() {
 #[test]
 fn the_arrival_rate_moves_the_fleet() {
     let run = serve(&scenario("rate", 20, 30));
-    let few = stats(&run_to_end(&run))["actors_seen"].as_u64().expect("actors_seen");
+    let few = stats(&run_to_end(&run))["actors_seen"]
+        .as_u64()
+        .expect("actors_seen");
     patch(
         &run,
         json!([{"op": "replace", "path": "/actors/vehicles/demand/rate_veh_per_h", "value": 6000}]),
     );
-    let many = stats(&run_to_end(&run))["actors_seen"].as_u64().expect("actors_seen");
+    let many = stats(&run_to_end(&run))["actors_seen"]
+        .as_u64()
+        .expect("actors_seen");
     assert!(
         many > few * 3,
         "raising the arrival rate 200x must spawn more vehicles: {few} -> {many}"
@@ -224,7 +249,10 @@ fn a_radio_setting_changes_what_is_received() {
         "scenario.set",
         json!({"patch": [{"op": "replace", "path": "/radio/tiers/propagation", "value": "abstract"}]}),
     );
-    assert!(refused.is_err(), "abstract propagation with a high PHY must be refused");
+    assert!(
+        refused.is_err(),
+        "abstract propagation with a high PHY must be refused"
+    );
     assert_eq!(digest(&run_to_end(&run)), digest(&high));
 }
 
@@ -232,12 +260,24 @@ fn a_radio_setting_changes_what_is_received() {
 fn the_message_family_is_what_goes_on_the_air() {
     let run = serve(&scenario("family", 3, 3000));
     let bsm = run_to_end(&run);
-    assert!(stats(&bsm)["tx_by_type"]["bsm"].as_u64().unwrap_or(0) > 0, "{bsm}");
-    patch(&run, json!([{"op": "replace", "path": "/messages/sets", "value": ["cam"]}]));
+    assert!(
+        stats(&bsm)["tx_by_type"]["bsm"].as_u64().unwrap_or(0) > 0,
+        "{bsm}"
+    );
+    patch(
+        &run,
+        json!([{"op": "replace", "path": "/messages/sets", "value": ["cam"]}]),
+    );
     let cam = run_to_end(&run);
     let by_type = &stats(&cam)["tx_by_type"];
-    assert!(by_type["cam"].as_u64().unwrap_or(0) > 0, "no CAM was sent: {cam}");
-    assert!(by_type.get("bsm").is_none(), "a BSM was sent after the set became [cam]: {cam}");
+    assert!(
+        by_type["cam"].as_u64().unwrap_or(0) > 0,
+        "no CAM was sent: {cam}"
+    );
+    assert!(
+        by_type.get("bsm").is_none(),
+        "a BSM was sent after the set became [cam]: {cam}"
+    );
 }
 
 #[test]
@@ -266,7 +306,12 @@ fn the_exporters_write_their_files_after_the_run() {
         json!({"patch": [{"op": "add", "path": "/exporters", "value": [{"id": "ma-dataset-v9"}]}]}),
     )
     .expect_err("an unknown exporter is refused");
-    assert!(refused.to_string().contains("not an exporter this build has"), "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("not an exporter this build has"),
+        "{refused}"
+    );
 
     patch(
         &run,
@@ -284,17 +329,23 @@ fn the_exporters_write_their_files_after_the_run() {
         std::thread::sleep(std::time::Duration::from_millis(10));
         exports = ok(&run, "run.status", json!({}))["engine"]["exports"].clone();
     }
-    let list = exports.as_array().unwrap_or_else(|| panic!("exports reported: {exports}"));
+    let list = exports
+        .as_array()
+        .unwrap_or_else(|| panic!("exports reported: {exports}"));
     assert_eq!(list.len(), 2);
     assert_eq!(list[0]["exporter"], "recording");
     let tables = list[1]["files"].as_array().expect("files");
     assert!(
-        tables.iter().any(|f| f["path"].as_str().is_some_and(|p| p.ends_with("node_tx.jsonl"))
+        tables.iter().any(|f| f["path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("node_tx.jsonl"))
             && f["rows"].as_u64().unwrap_or(0) > 0),
         "a node.tx table with rows: {exports}"
     );
     assert!(
-        !tables.iter().any(|f| f["path"].as_str().is_some_and(|p| p.contains("gt_"))),
+        !tables
+            .iter()
+            .any(|f| f["path"].as_str().is_some_and(|p| p.contains("gt_"))),
         "the node profile drops ground-truth channels: {exports}"
     );
     assert!(out.join("jsonl").is_dir());
@@ -312,8 +363,13 @@ fn the_time_keys_reach_the_run() {
                 "value": [{"from_s": 5.0, "to_s": 15.0}]}]),
     );
     let dilated = run_to_end(&run);
-    let suppressed = dilated["engine"]["suppressed_frames"].as_u64().expect("suppressed");
-    assert!(suppressed > 0, "frames inside the window are suppressed: {dilated}");
+    let suppressed = dilated["engine"]["suppressed_frames"]
+        .as_u64()
+        .expect("suppressed");
+    assert!(
+        suppressed > 0,
+        "frames inside the window are suppressed: {dilated}"
+    );
     assert!(
         stats(&dilated)["tx_frames"].as_u64() < stats(&plain)["tx_frames"].as_u64(),
         "fewer frames go on the air with a dilation window"
@@ -338,10 +394,21 @@ fn the_time_keys_reach_the_run() {
     );
     let first = run_to_end(&run);
     let entries = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
-    assert_eq!(entries, 1, "the imported world is kept in the cache directory");
+    assert_eq!(
+        entries, 1,
+        "the imported world is kept in the cache directory"
+    );
     let second = run_to_end(&run);
-    assert_eq!(digest(&first), digest(&second), "a cached world is the same world");
-    assert_eq!(digest(&first), digest(&plain), "and the same run as without the cache");
+    assert_eq!(
+        digest(&first),
+        digest(&second),
+        "a cached world is the same world"
+    );
+    assert_eq!(
+        digest(&first),
+        digest(&plain),
+        "and the same run as without the cache"
+    );
 }
 
 #[test]
@@ -368,7 +435,11 @@ fn a_document_round_tripped_through_a_browser_is_not_an_edit() {
     assert_eq!(set["requires_restart"], json!([]), "{set}");
     doc["time"]["duration_s"] = json!(1);
     let set = ok(&run, "scenario.set", json!({"scenario": doc}));
-    assert_eq!(set["requires_restart"], json!(["/time/duration_s"]), "{set}");
+    assert_eq!(
+        set["requires_restart"],
+        json!(["/time/duration_s"]),
+        "{set}"
+    );
 }
 
 #[test]
@@ -400,8 +471,14 @@ fn an_invalid_edit_is_reported_and_not_held() {
     let mut bad = doc.clone();
     bad["radio"]["tiers"]["phy"] = json!("high");
     let verdict = ok(&run, "scenario.validate", json!({"scenario": bad}));
-    assert_eq!(verdict["valid"], false, "phy high with mac medium is a loader conflict: {verdict}");
-    assert_eq!(ok(&run, "scenario.validate", json!({"scenario": doc}))["valid"], true);
+    assert_eq!(
+        verdict["valid"], false,
+        "phy high with mac medium is a loader conflict: {verdict}"
+    );
+    assert_eq!(
+        ok(&run, "scenario.validate", json!({"scenario": doc}))["valid"],
+        true
+    );
 }
 
 #[test]
@@ -427,8 +504,17 @@ fn a_preset_can_be_loaded_and_run() {
     let loaded = ok(&run, "scenario.load", json!({"path": id}));
     assert_eq!(loaded["valid"], true);
     let status = run_to_end(&run);
-    assert_eq!(status["t_end_ns"], 3_000_000_000u64, "the loaded preset is what ran");
-    assert_eq!(run.descriptor().hello.strings.get(run.descriptor().hello.str_scenario_name), Some("presets-other"));
+    assert_eq!(
+        status["t_end_ns"], 3_000_000_000u64,
+        "the loaded preset is what ran"
+    );
+    assert_eq!(
+        run.descriptor()
+            .hello
+            .strings
+            .get(run.descriptor().hello.str_scenario_name),
+        Some("presets-other")
+    );
 }
 
 #[test]
@@ -437,9 +523,13 @@ fn run_seek_over_http_is_refused_without_moving_the_run() {
     ok(&run, "run.start", json!({"paused": true}));
     ok(&run, "run.step", json!({"count": 10}));
     let before = ok(&run, "run.status", json!({}));
-    let err = call(&run, "run.seek", json!({"t_ns": 100_000_000u64})).expect_err("refused over HTTP");
+    let err =
+        call(&run, "run.seek", json!({"t_ns": 100_000_000u64})).expect_err("refused over HTTP");
     assert_eq!(err["code"], -32009);
     let after = ok(&run, "run.status", json!({}));
-    assert_eq!(before["t_ns"], after["t_ns"], "a refused seek moved the run");
+    assert_eq!(
+        before["t_ns"], after["t_ns"],
+        "a refused seek moved the run"
+    );
     assert_eq!(before["state"], after["state"]);
 }

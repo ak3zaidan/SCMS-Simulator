@@ -18,9 +18,9 @@ use v2xw_world::{serde_native, serde_vwp};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let source = args.next().ok_or(
-        "usage: import_osm <extract.osm.xml> [out-dir] [imported-at] [speed-preset]",
-    )?;
+    let source = args
+        .next()
+        .ok_or("usage: import_osm <extract.osm.xml> [out-dir] [imported-at] [speed-preset]")?;
     let out = PathBuf::from(args.next().unwrap_or_else(|| ".".to_string()));
     let imported_at = args
         .next()

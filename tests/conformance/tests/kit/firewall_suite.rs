@@ -23,10 +23,7 @@ const PROBE: &[Rule] = &[Rule {
 
 /// A throwaway source tree: one file at the top, one inside a subdirectory, both offending.
 fn build_probe_tree(tag: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "v2xw-conformance-{}-{tag}",
-        std::process::id()
-    ));
+    let root = std::env::temp_dir().join(format!("v2xw-conformance-{}-{tag}", std::process::id()));
     let nested = root.join("wire").join("inner");
     std::fs::create_dir_all(&nested).expect("a scratch tree");
     std::fs::write(
@@ -179,8 +176,8 @@ fn no_std_transcendental_is_called() {
 #[test]
 fn a_ground_truth_field_reaches_only_the_telemetry_record() {
     let root = repo_root();
-    let files = walk_rust_sources(&root.join("crates/v2xw-node/src"), &root)
-        .expect("the node crate reads");
+    let files =
+        walk_rust_sources(&root.join("crates/v2xw-node/src"), &root).expect("the node crate reads");
     let mut violations = Vec::new();
     for file in &files {
         if file.rel == "crates/v2xw-node/src/firewall.rs" {
@@ -279,7 +276,10 @@ fn every_exemption_names_a_file_that_exists_and_a_reason() {
             total += 1;
         }
     }
-    assert_eq!(total, 5, "the exemption list changed; it should only shrink");
+    assert_eq!(
+        total, 5,
+        "the exemption list changed; it should only shrink"
+    );
 }
 
 /// The rule tables are non-empty and free of duplicate needles.

@@ -86,8 +86,7 @@ use v2xw_record::wire::telemetry::NodeTelemetry;
 use crate::clock::ClockModel;
 use crate::ctx::{NodeCtx, NodeCtxExt};
 use crate::policy::{
-    PolicyView, RxSummary, VerificationPolicy, VerifyAll, VerifyDecision,
-    VerifyDecisionRecord,
+    PolicyView, RxSummary, VerificationPolicy, VerifyAll, VerifyDecision, VerifyDecisionRecord,
 };
 use crate::profile::{HardwareProfile, RunsOn};
 use crate::queue::{Admission, DropCause, DropLedger, NodeQueue, QueueKind, Queued};
@@ -1622,7 +1621,8 @@ impl VruDeviceRuntime {
             }
             return;
         };
-        if !self.provision_all(ctx, believed) || !self.security.set_active(cred.i_period, cred.j_index)
+        if !self.provision_all(ctx, believed)
+            || !self.security.set_active(cred.i_period, cred.j_index)
         {
             for r in &requests {
                 self.suppress(ctx, believed, r.msg_type, 0, "no-credential", out);
@@ -2185,7 +2185,10 @@ fn card(profile: &HardwareProfile, config: &VruConfig) -> ModelCard {
     ];
     card.sources = vec![
         Source::new(SourceKind::Standard, "ETSI EN 302 571 V2.1.1 §4.2.10.2"),
-        Source::new(SourceKind::Standard, "ETSI TS 103 300-3 V2.2.1 §6.2, §6.4, §6.5"),
+        Source::new(
+            SourceKind::Standard,
+            "ETSI TS 103 300-3 V2.2.1 §6.2, §6.4, §6.5",
+        ),
         Source::new(
             SourceKind::Standard,
             "SAE J2945/9 (PSM from VRU devices over DSRC/1609; scope VERIFIED secondary, \
@@ -2285,8 +2288,12 @@ mod tests {
         let dcc = DccState::UNRESTRICTED;
         assert_eq!(s.due(0, &belief_at(Vec3::ZERO, 0.0), &dcc).len(), 1);
         assert!(
-            s.due(200 * NS_PER_MS, &belief_at(Vec3::new(3.9, 0.0, 0.0), 0.0), &dcc)
-                .is_empty()
+            s.due(
+                200 * NS_PER_MS,
+                &belief_at(Vec3::new(3.9, 0.0, 0.0), 0.0),
+                &dcc
+            )
+            .is_empty()
         );
         let out = s.due(
             300 * NS_PER_MS,
@@ -2415,8 +2422,7 @@ mod tests {
             ..p
         };
         assert!(
-            (ideal.energy_of(Duration::from_micros(512)) * (1.0 / DEFAULT_PA_EFFICIENCY) - e)
-                .abs()
+            (ideal.energy_of(Duration::from_micros(512)) * (1.0 / DEFAULT_PA_EFFICIENCY) - e).abs()
                 < 1e-12
         );
     }
@@ -2500,13 +2506,16 @@ mod tests {
             }
             // A secured VAM is a published 235-350 B, so a payload anywhere near or above
             // that would be counting the envelope twice.
-            assert!(bytes < 235, "{ty} payload {bytes} B is at secured-message scale");
+            assert!(
+                bytes < 235,
+                "{ty} payload {bytes} B is at secured-message scale"
+            );
         }
         // An element count overrides the row's nominal one, and it is per-element linear.
-        let (a, _) = modelled_payload(MsgType::Vam, ContentProfile::Typical, Some(0))
-            .expect("a VAM row");
-        let (b, _) = modelled_payload(MsgType::Vam, ContentProfile::Typical, Some(1))
-            .expect("a VAM row");
+        let (a, _) =
+            modelled_payload(MsgType::Vam, ContentProfile::Typical, Some(0)).expect("a VAM row");
+        let (b, _) =
+            modelled_payload(MsgType::Vam, ContentProfile::Typical, Some(1)).expect("a VAM row");
         assert!(b > a);
         // Nothing else is sized here, which is what makes the `no-payload` suppression a
         // real branch.

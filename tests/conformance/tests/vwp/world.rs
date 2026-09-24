@@ -131,7 +131,9 @@ fn w4_world_json_binary_parity() {
     let bbox = json["bbox"]
         .as_object()
         .expect("the json form carries the bounding box");
-    for key in ["min_x_m", "min_y_m", "max_x_m", "max_y_m", "min_z_m", "max_z_m"] {
+    for key in [
+        "min_x_m", "min_y_m", "max_x_m", "max_y_m", "min_z_m", "max_z_m",
+    ] {
         assert!(
             bbox.get(key).is_some_and(serde_json::Value::is_number),
             "bbox.{key} is missing or is not a number"

@@ -100,7 +100,10 @@ fn h5_a_resume_point_inside_the_ring_replays_without_a_gap() {
 
     // The injected fault: a sequence number the ring never held must not resume, or a
     // client would silently continue from the wrong place.
-    assert!(!ring.can_resume(10_000), "a seq past the head cannot resume");
+    assert!(
+        !ring.can_resume(10_000),
+        "a seq past the head cannot resume"
+    );
     assert!(
         ring.replay_from(10_000).is_empty(),
         "an unresumable point must hand back nothing rather than the whole ring"

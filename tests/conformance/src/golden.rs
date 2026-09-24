@@ -134,14 +134,22 @@ impl RunDigest {
             self.scenario_hash.clone(),
             other.scenario_hash.clone(),
         );
-        note("world_hash", self.world_hash.clone(), other.world_hash.clone());
+        note(
+            "world_hash",
+            self.world_hash.clone(),
+            other.world_hash.clone(),
+        );
         note(
             "master_seed",
             self.master_seed.to_string(),
             other.master_seed.to_string(),
         );
         note("end_ns", self.end_ns.to_string(), other.end_ns.to_string());
-        note("records", self.records.to_string(), other.records.to_string());
+        note(
+            "records",
+            self.records.to_string(),
+            other.records.to_string(),
+        );
         note(
             "record_digest",
             self.record_digest.clone(),
@@ -156,9 +164,7 @@ impl RunDigest {
             let a = self.per_channel.get(channel);
             let b = other.per_channel.get(channel);
             if a != b {
-                out.push(format!(
-                    "channel {channel}: golden {a:?}, this run {b:?}"
-                ));
+                out.push(format!("channel {channel}: golden {a:?}, this run {b:?}"));
             }
         }
         out
@@ -206,9 +212,8 @@ pub fn digest_of(case: &Case) -> Result<RunDigest, GoldenError> {
 /// # Errors
 /// As [`digest_of`].
 pub fn digest_of_scenario(case_name: &str, path: &Path) -> Result<RunDigest, GoldenError> {
-    let scenario = Scenario::load(path).map_err(|e| {
-        GoldenError::Engine(format!("loading {}: {e}", path.display()))
-    })?;
+    let scenario = Scenario::load(path)
+        .map_err(|e| GoldenError::Engine(format!("loading {}: {e}", path.display())))?;
     let mut engine = Engine::build(scenario, BUILD_UTC)
         .map_err(|e| GoldenError::Engine(format!("building {case_name}: {e}")))?;
     let manifest = engine.manifest().clone();
@@ -383,14 +388,16 @@ mod tests {
 
         let mut b = sample("x");
         b.record_digest = "dd".repeat(32);
-        b.per_channel
-            .insert("phy.rx".to_string(), (12, 34));
+        b.per_channel.insert("phy.rx".to_string(), (12, 34));
         let diff = a.differences(&b);
         assert!(
             diff.iter().any(|l| l.starts_with("record_digest:")),
             "{diff:?}"
         );
-        assert!(diff.iter().any(|l| l.contains("channel phy.rx")), "{diff:?}");
+        assert!(
+            diff.iter().any(|l| l.contains("channel phy.rx")),
+            "{diff:?}"
+        );
         assert_eq!(diff.len(), 2, "{diff:?}");
     }
 

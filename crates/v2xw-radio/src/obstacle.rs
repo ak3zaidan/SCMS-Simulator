@@ -694,26 +694,29 @@ fn building_card(fit: SommerFit, ceiling: bool) -> ModelCard {
          in-building path, from the world's building footprints.",
     );
     card.tier = vec![Tier::Medium, Tier::High];
-    card.equations = vec![Equation {
-        name: "street-canyon ceiling".to_string(),
-        latex_or_text: "L_obs = min(β·n + γ·d_m, max(0, PL_NLOS(d3D, fc) − PL_LOS)), \
+    card.equations = vec![
+        Equation {
+            name: "street-canyon ceiling".to_string(),
+            latex_or_text: "L_obs = min(β·n + γ·d_m, max(0, PL_NLOS(d3D, fc) − PL_LOS)), \
                         PL_NLOS = 36.85 + 30·log10(d3D) + 18.9·log10(fc_GHz)"
-            .to_string(),
-        notes: Some(
-            "3GPP TR 37.885 Table 6.2.1-1 urban NLOS ('blocked by buildings'): the \
+                .to_string(),
+            notes: Some(
+                "3GPP TR 37.885 Table 6.2.1-1 urban NLOS ('blocked by buildings'): the \
              around-the-corner path a receiver hears when the straight one runs through \
              buildings. Applied when the ceiling is on."
-                .to_string(),
-        ),
-    }, Equation {
-        name: "obstacle loss".to_string(),
-        latex_or_text: "L_obs[dB] = β·n + γ·d_m".to_string(),
-        notes: Some(
-            "n exterior walls crossed, d_m metres of path inside buildings; combined with \
+                    .to_string(),
+            ),
+        },
+        Equation {
+            name: "obstacle loss".to_string(),
+            latex_or_text: "L_obs[dB] = β·n + γ·d_m".to_string(),
+            notes: Some(
+                "n exterior walls crossed, d_m metres of path inside buildings; combined with \
              the path loss as P_r = P_t + 10·log10(G_t·G_r·λ²/(16π²·d^α)) − β·n − γ·d_m."
-                .to_string(),
-        ),
-    }];
+                    .to_string(),
+            ),
+        },
+    ];
     card.parameters = vec![
         Parameter {
             name: "fit".to_string(),
@@ -1291,7 +1294,12 @@ impl TerrainDiffraction {
     /// Delegated to [`crate::terrain::TerrainProfile::sample`], which is the one place
     /// that knows the shape of the world-side query.
     #[must_use]
-    pub fn profile(&self, world: &World, a: Vec3, b: Vec3) -> Option<crate::terrain::TerrainProfile> {
+    pub fn profile(
+        &self,
+        world: &World,
+        a: Vec3,
+        b: Vec3,
+    ) -> Option<crate::terrain::TerrainProfile> {
         crate::terrain::TerrainProfile::sample(world, a, b, self.profile_samples)
     }
 
@@ -1502,10 +1510,7 @@ fn terrain_card(rule: MultiEdgeRule, exact: bool) -> ModelCard {
             name: "include_below_line".to_string(),
             unit: "-".to_string(),
             default: serde_json::json!(true),
-            range: Some(vec![
-                serde_json::json!(false),
-                serde_json::json!(true),
-            ]),
+            range: Some(vec![serde_json::json!(false), serde_json::json!(true)]),
             source: itu.clone(),
             calibration: None,
         },
@@ -1604,8 +1609,14 @@ mod tests {
         );
 
         let bare = BuildingShadowing::new(Tier::Medium).with_street_canyon_ceiling(false);
-        assert_eq!(bare.loss_for_path(&blocked, 300.0, 5.9e9, los_path_db), through);
-        assert_eq!(m.loss_for_path(&LosResult::clear(), 300.0, 5.9e9, los_path_db), 0.0);
+        assert_eq!(
+            bare.loss_for_path(&blocked, 300.0, 5.9e9, los_path_db),
+            through
+        );
+        assert_eq!(
+            m.loss_for_path(&LosResult::clear(), 300.0, 5.9e9, los_path_db),
+            0.0
+        );
     }
     use crate::types::ActorClass;
     use v2xw_core::geom::Dims;

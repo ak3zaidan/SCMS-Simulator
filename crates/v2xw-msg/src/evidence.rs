@@ -385,7 +385,13 @@ mod tests {
             assert!(!byte_exactness(ty).is_byte_exact(), "{ty}");
             assert!(byte_exactness(ty).has_real_bytes(), "{ty}");
         }
-        for ty in [MsgType::Psm, MsgType::Srm, MsgType::Ssm, MsgType::Cpm, MsgType::Vam] {
+        for ty in [
+            MsgType::Psm,
+            MsgType::Srm,
+            MsgType::Ssm,
+            MsgType::Cpm,
+            MsgType::Vam,
+        ] {
             assert!(!byte_exactness(ty).has_real_bytes(), "{ty}");
         }
         for ty in [MsgType::Bsm, MsgType::Cam, MsgType::Denm] {
@@ -420,7 +426,10 @@ mod tests {
                     elements: 3,
                 }))
                 .unwrap_or_else(|e| panic!("{ty} should be sizable: {e}"));
-            assert!(matches!(encoded.size_source, SizeSource::SizeModel(_)), "{ty}");
+            assert!(
+                matches!(encoded.size_source, SizeSource::SizeModel(_)),
+                "{ty}"
+            );
             assert!(!encoded.is_real(), "{ty}");
         }
     }

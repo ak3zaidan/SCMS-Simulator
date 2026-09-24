@@ -43,14 +43,14 @@ use crate::error::{EngineError, Result, ScenarioError};
 
 pub use merge::merge as merge_documents;
 pub use migrate::{Chain, Migration};
+pub use publish::{schema as scenario_schema, surface as scenario_surface};
 pub use schema::{
     Actors, Attacker, Backend, BackendEntity, BackendLink, BuildingOptions, CURRENT_SCHEMA,
     CryptoModeSpec, DemandSpec, Detection, DilationWindow, Experiment, ExporterSpec, Focus,
-    FocusRegion, Messages, Meta, ModelChoice, Net, Nodes, Radio, RadioTiers, Rat, Rsu, Scenario,
-    PseudonymChangeSpec, Security, SignerIdPolicySpec, TerrainOptions, Threats, Time,
-    TimelineItem, TimelineKind, VehicleClassSpec, Vehicles, Vru, Weather, WorldSpec,
+    FocusRegion, Messages, Meta, ModelChoice, Net, Nodes, PseudonymChangeSpec, Radio, RadioTiers,
+    Rat, Rsu, Scenario, Security, SignerIdPolicySpec, TerrainOptions, Threats, Time, TimelineItem,
+    TimelineKind, VehicleClassSpec, Vehicles, Vru, Weather, WorldSpec,
 };
-pub use publish::{surface as scenario_surface, schema as scenario_schema};
 pub use validate::{resolve_path, validate};
 
 /// How many `meta.base` references may chain before the loader gives up.

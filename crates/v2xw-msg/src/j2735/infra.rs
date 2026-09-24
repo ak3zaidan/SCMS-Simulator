@@ -238,8 +238,7 @@ fn card() -> ModelCard {
         "SRM, SSM and PSM, which remain in the validated size model \
          codec/size-model/j2735 with placeholder bytes."
             .to_string(),
-        "The IEEE 1609.2 security envelope, which v2xw-sec puts around these payloads."
-            .to_string(),
+        "The IEEE 1609.2 security envelope, which v2xw-sec puts around these payloads.".to_string(),
     ];
 
     // The unverified structural choices, as registry parameters, so they appear on the
@@ -360,8 +359,7 @@ fn card() -> ModelCard {
         tests: vec![
             "j2735::spat::tests::a_minimal_spat_is_eleven_octets".to_string(),
             "j2735::spat::tests::round_trip_is_exact".to_string(),
-            "j2735::spat::tests::an_unmodelled_element_is_refused_rather_than_skipped"
-                .to_string(),
+            "j2735::spat::tests::an_unmodelled_element_is_refused_rather_than_skipped".to_string(),
             "j2735::map::tests::a_minimal_map_is_twenty_eight_octets".to_string(),
             "j2735::map::tests::round_trip_is_exact".to_string(),
             "j2735::map::tests::a_node_offset_keeps_its_alternative_so_the_bytes_are_stable"
@@ -476,7 +474,10 @@ mod tests {
         );
         // And the unverified structural choices must be on the todo-calibrate report.
         let todo: Vec<&str> = card.todo_calibrate().map(|p| p.name.as_str()).collect();
-        assert!(todo.iter().any(|n| n.contains("extension_marker")), "{todo:?}");
+        assert!(
+            todo.iter().any(|n| n.contains("extension_marker")),
+            "{todo:?}"
+        );
         assert!(
             todo.iter()
                 .any(|n| *n == "spat_movement_phase_state_index_bits"),
@@ -510,8 +511,10 @@ mod tests {
             assert_eq!(encoded.size_source, SizeSource::Uper, "{ty}");
             assert!(encoded.is_real(), "{ty}");
 
-            let Message::HandEncoded { ty: back_ty, bytes: back } =
-                codec.decode(&bytes, ty).expect("decodes")
+            let Message::HandEncoded {
+                ty: back_ty,
+                bytes: back,
+            } = codec.decode(&bytes, ty).expect("decodes")
             else {
                 unreachable!("this codec returns HandEncoded")
             };

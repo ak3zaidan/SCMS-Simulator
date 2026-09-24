@@ -119,7 +119,10 @@ fn v3_a_ground_truth_channel_metric_or_overlay_is_refused_with_32040() {
         "every overlay is ground truth, so the node profile can render nothing"
     );
     for name in &gt {
-        assert!(name.ends_with("_gt"), "{name} is classified GT but is not named so");
+        assert!(
+            name.ends_with("_gt"),
+            "{name} is classified GT but is not named so"
+        );
     }
     assert!(gt.contains(&"attackers_gt"), "{gt:?}");
     assert!(ordinary.contains(&"links"), "{ordinary:?}");
@@ -150,7 +153,9 @@ fn v4_no_control_method_can_change_the_profile() {
         Profile::NodeOnly
     );
     assert_eq!(
-        ConnectParams::parse("").expect("the default parses").profile,
+        ConnectParams::parse("")
+            .expect("the default parses")
+            .profile,
         Profile::Full,
         "§1.1: profile defaults to full"
     );

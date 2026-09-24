@@ -156,7 +156,11 @@ fn the_etsi_plug_in_declares_both_halves_of_its_revocation() {
     // A CA-CRL entry is a HashedId8 with an expiry: twelve bytes, against the SCMS's
     // ~40 B of linkage seeds. That asymmetry is the point of comparing the two.
     assert_eq!(active.entry.bytes(), 12);
-    assert!(active.stages.contains(&v2xw_proto::stage::StageId::Enforced));
+    assert!(
+        active
+            .stages
+            .contains(&v2xw_proto::stage::StageId::Enforced)
+    );
     assert!(
         passive
             .stages

@@ -1287,6 +1287,9 @@ mod tests {
         // And an index the root does not have is refused by name rather than clamped.
         let mut w = BitWriter::new();
         let err = write_choice_index(&mut w, field, false, 8, 8).expect_err("no such index");
-        assert!(matches!(err, UperError::BadEnumIndex { count: 8, .. }), "{err}");
+        assert!(
+            matches!(err, UperError::BadEnumIndex { count: 8, .. }),
+            "{err}"
+        );
     }
 }

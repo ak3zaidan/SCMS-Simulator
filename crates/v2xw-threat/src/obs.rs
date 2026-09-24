@@ -376,7 +376,8 @@ pub trait LocalPerception {
         }
         if d > 0.0 {
             let bearing = v2xw_core::math::atan2(dy, dx);
-            if crate::capability::angle_diff_rad(bearing, self.boresight_rad()) > self.half_fov_rad()
+            if crate::capability::angle_diff_rad(bearing, self.boresight_rad())
+                > self.half_fov_rad()
             {
                 return false;
             }

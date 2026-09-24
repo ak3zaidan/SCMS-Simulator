@@ -104,7 +104,10 @@ fn a_closing_vehicle_ahead_warns_at_the_computed_ttc() {
     // The required deceleration is 15² / (2·20) = 5.625 m/s².
     assert_eq!(out[0].surrogates.required_decel_mps2, 5.625);
     assert_eq!(out[0].surrogates.closing_mps, 15.0);
-    assert!(out[0].surrogates.pet_s.is_nan(), "a rear-end pair has no PET");
+    assert!(
+        out[0].surrogates.pet_s.is_nan(),
+        "a rear-end pair has no PET"
+    );
     assert_eq!(out[0].severity, Severity::Warning);
 }
 
@@ -133,9 +136,15 @@ fn a_vehicle_in_the_next_lane_is_not_a_rear_end_conflict() {
     let app = Fcw::default();
     let ego = belief(Vec3::ZERO, 30.0, 0.0);
     // 3.5 m to the left is one lane over; the corridor is one vehicle width.
-    assert!(app.evaluate(&ego, Vec3::new(10.0, 3.5, 0.0), 0.0, 0.0).is_none());
+    assert!(
+        app.evaluate(&ego, Vec3::new(10.0, 3.5, 0.0), 0.0, 0.0)
+            .is_none()
+    );
     // Directly ahead, it is.
-    assert!(app.evaluate(&ego, Vec3::new(10.0, 0.0, 0.0), 0.0, 0.0).is_some());
+    assert!(
+        app.evaluate(&ego, Vec3::new(10.0, 0.0, 0.0), 0.0, 0.0)
+            .is_some()
+    );
 }
 
 /// Two vehicles that reach the same point at the same moment have a post-encroachment time
@@ -213,7 +222,10 @@ fn two_paths_that_cross_at_different_times_are_not_a_conflict() {
         )
         .expect("the paths do cross");
     assert_eq!(s.pet_s, 2.8);
-    assert!(s.ttc_s.is_finite(), "inside pet_conflict_s, so a TTC exists");
+    assert!(
+        s.ttc_s.is_finite(),
+        "inside pet_conflict_s, so a TTC exists"
+    );
 }
 
 /// Parallel paths never cross, so a platoon on a straight road produces no intersection
@@ -222,10 +234,19 @@ fn two_paths_that_cross_at_different_times_are_not_a_conflict() {
 fn parallel_paths_never_produce_a_crossing_conflict() {
     let app = Ima::default();
     let ego = belief(Vec3::ZERO, 20.0, 0.0);
-    assert!(app.evaluate(&ego, Vec3::new(20.0, 0.0, 0.0), 20.0, 0.0).is_none());
-    assert!(app.evaluate(&ego, Vec3::new(20.0, 3.5, 0.0), 15.0, 0.0).is_none());
+    assert!(
+        app.evaluate(&ego, Vec3::new(20.0, 0.0, 0.0), 20.0, 0.0)
+            .is_none()
+    );
+    assert!(
+        app.evaluate(&ego, Vec3::new(20.0, 3.5, 0.0), 15.0, 0.0)
+            .is_none()
+    );
     // And a stationary peer has no path to cross.
-    assert!(app.evaluate(&ego, Vec3::new(0.0, -20.0, 0.0), 0.0, 1.0).is_none());
+    assert!(
+        app.evaluate(&ego, Vec3::new(0.0, -20.0, 0.0), 0.0, 1.0)
+            .is_none()
+    );
 }
 
 /// A peer ahead whose claimed speed falls by 0.4 g between two claims raises an EEBL
@@ -348,7 +369,13 @@ fn the_relevance_scores_reach_the_on_demand_policy() {
         // 15 m ahead, stationary: a 0.75 s time to collision.
         neighbour(0, Vec3::new(15.0, 0.0, 0.0), 0.0, 0.0, 0),
         // Far behind, going the other way: nothing any application cares about.
-        neighbour(1, Vec3::new(-200.0, 0.0, 0.0), 20.0, core::f64::consts::PI, 0),
+        neighbour(
+            1,
+            Vec3::new(-200.0, 0.0, 0.0),
+            20.0,
+            core::f64::consts::PI,
+            0,
+        ),
     ]);
 
     let out = set.run(&mut ctx, EGO, 0, &t, &ego);
@@ -446,7 +473,12 @@ fn the_warnings_are_deterministic_in_order() {
         }
         set.run(&mut ctx, EGO, 0, &table(entries), &ego)
             .into_iter()
-            .map(|w| (v2xw_node::safety::digest_hex(&w.subject), w.surrogates.ttc_s))
+            .map(|w| {
+                (
+                    v2xw_node::safety::digest_hex(&w.subject),
+                    w.surrogates.ttc_s,
+                )
+            })
             .collect()
     }
     let a = run(false);

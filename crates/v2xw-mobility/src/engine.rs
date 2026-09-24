@@ -403,12 +403,18 @@ impl Actor {
     fn rear_point(&self, world: &World, s_rear: f64) -> (Vec3, LaneId, f64) {
         let lane = world.lane(self.lane);
         if s_rear >= 0.0 {
-            return (smooth_offset_point(lane, s_rear, self.lateral_m), self.lane, s_rear);
+            return (
+                smooth_offset_point(lane, s_rear, self.lateral_m),
+                self.lane,
+                s_rear,
+            );
         }
         let mut behind = -s_rear;
         let mut earliest = lane;
         for id in self.trail.iter().rev() {
-            let Some(prev) = world.try_lane(*id) else { break };
+            let Some(prev) = world.try_lane(*id) else {
+                break;
+            };
             if behind <= prev.length_m {
                 let s = prev.length_m - behind;
                 return (smooth_offset_point(prev, s, self.lateral_m), prev.id, s);
@@ -442,7 +448,9 @@ impl Actor {
             if behind <= 0.0 {
                 break;
             }
-            let Some(prev) = world.try_lane(*id) else { break };
+            let Some(prev) = world.try_lane(*id) else {
+                break;
+            };
             if prev.kind == LaneKind::Internal {
                 out.push((
                     prev.id,
@@ -925,10 +933,13 @@ impl NativeMobility {
         reserved: Option<ActorId>,
     ) -> Insertion {
         let costs = self.costs(world);
-        let Some(route) = self
-            .router_for(trip.class)
-            .replan(world, trip.origin, trip.destination, trip.t, &costs)
-        else {
+        let Some(route) = self.router_for(trip.class).replan(
+            world,
+            trip.origin,
+            trip.destination,
+            trip.t,
+            &costs,
+        ) else {
             return Insertion::Unroutable;
         };
         // An occupied origin: drop the trip rather than overlap two vehicles.
@@ -990,7 +1001,9 @@ impl NativeMobility {
             // The same for traffic about to arrive from the lanes that feed this one.
             for c in world.predecessors(trip.origin) {
                 let from = c.via.unwrap_or(c.from_lane);
-                let Some(up) = world.try_lane(from) else { continue };
+                let Some(up) = world.try_lane(from) else {
+                    continue;
+                };
                 for a in self.actors.values().filter(|a| a.lane == from) {
                     let gap = (up.length_m - a.s_m) + (front - length);
                     let need = a.driver.min_gap_m + a.speed_mps * a.driver.time_headway_s;
@@ -1075,7 +1088,8 @@ impl NativeMobility {
                 let (route, s_m) = {
                     let world = ctx.world();
                     let walkable = &self.walkable;
-                    let mut rng = ctx.rng(RngDomain::plugin(VRU_PLACEMENT_ID), EntityRef::Actor(id));
+                    let mut rng =
+                        ctx.rng(RngDomain::plugin(VRU_PLACEMENT_ID), EntityRef::Actor(id));
                     let first = walkable[rng.below(walkable.len() as u64) as usize];
                     let mut route = vec![first];
                     while route.len() < PEDESTRIAN_WALK_LANES {
@@ -1093,7 +1107,9 @@ impl NativeMobility {
                     let length = world.lane(first).length_m;
                     (route, rng.uniform(0.0, length))
                 };
-                let Some(mut vru) = self.vru.take() else { break };
+                let Some(mut vru) = self.vru.take() else {
+                    break;
+                };
                 let placed = vru.spawn(ctx, id, route.clone(), s_m).is_ok();
                 if placed && let Some(p) = vru.get(id) {
                     let world = ctx.world();
@@ -1141,7 +1157,11 @@ impl NativeMobility {
                     let o = lanes[rng.below(lanes.len() as u64) as usize];
                     let d = lanes[rng.below(lanes.len() as u64) as usize];
                     let length = ctx.world().lane(o).length_m;
-                    (o, d, rng.uniform(VehicleClass::Bicycle.spec().length_m, length))
+                    (
+                        o,
+                        d,
+                        rng.uniform(VehicleClass::Bicycle.spec().length_m, length),
+                    )
                 };
                 if origin == destination {
                     continue;
@@ -1616,7 +1636,11 @@ impl NativeMobility {
                 let Some(o) = self.actors.get(other) else {
                     return false;
                 };
-                let (lead, follow) = if o.s_m >= actor.s_m { (o, actor) } else { (actor, o) };
+                let (lead, follow) = if o.s_m >= actor.s_m {
+                    (o, actor)
+                } else {
+                    (actor, o)
+                };
                 let gap = lead.s_m - lead.class.spec().length_m - follow.s_m;
                 gap < follow.driver.min_gap_m + follow.speed_mps * 1.0
             });
@@ -1668,7 +1692,9 @@ impl NativeMobility {
         while k < old.len() {
             let o = world.lane(old[k]);
             let (via, exit_edge, want_exit) = if o.kind == LaneKind::Internal {
-                let Some(exit) = old.get(k + 1).copied() else { break };
+                let Some(exit) = old.get(k + 1).copied() else {
+                    break;
+                };
                 (true, world.lane(exit).edge, exit)
             } else {
                 (false, o.edge, old[k])
@@ -1677,9 +1703,7 @@ impl NativeMobility {
                 .successors(cur)
                 .iter()
                 .filter(|c| {
-                    c.permitted
-                        && c.via.is_some() == via
-                        && world.lane(c.to_lane).edge == exit_edge
+                    c.permitted && c.via.is_some() == via && world.lane(c.to_lane).edge == exit_edge
                 })
                 .min_by_key(|c| (c.to_lane != want_exit, c.via != Some(old[k]), c.to_lane));
             let Some(c) = pick.copied() else {
@@ -1719,7 +1743,10 @@ impl NativeMobility {
     /// A route over `lanes`, with its length and free-flow cost.
     fn route_of(world: &World, lanes: Vec<LaneId>) -> Route {
         let length_m = math::sum_ordered(
-            lanes.iter().map(|l| world.lane(*l).length_m).collect::<Vec<_>>(),
+            lanes
+                .iter()
+                .map(|l| world.lane(*l).length_m)
+                .collect::<Vec<_>>(),
         );
         let cost_s = math::sum_ordered(
             lanes
@@ -1864,7 +1891,10 @@ impl NativeMobility {
             .map_or(&[], Vec::as_slice);
         for z in self.zones.of(movement).iter().filter(|z| z.merge) {
             let len_o = world.lane(z.other).length_m;
-            for c in approaching.iter().filter(|c| c.movement_lane == Some(z.other)) {
+            for c in approaching
+                .iter()
+                .filter(|c| c.movement_lane == Some(z.other))
+            {
                 if c.actor == actor.id {
                     continue;
                 }
@@ -2346,8 +2376,7 @@ impl Mobility for NativeMobility {
                 if actor.transition.is_some() || t0 < actor.cooldown_until {
                     continue;
                 }
-                if self.along_path() && !self.may_consider_lane_change(ctx.world(), actor, &mobil)
-                {
+                if self.along_path() && !self.may_consider_lane_change(ctx.world(), actor, &mobil) {
                     continue;
                 }
                 let Some((ego, nbrs)) = neighbours.get(&decision.actor) else {
@@ -2701,7 +2730,10 @@ fn turn_speeds(world: &World, a_lat_mps2: f64) -> BTreeMap<LaneId, f64> {
             continue;
         }
         let radius = lane.length_m / turned;
-        out.insert(lane.id, math::sqrt(a_lat_mps2 * radius).min(lane.speed_limit_mps));
+        out.insert(
+            lane.id,
+            math::sqrt(a_lat_mps2 * radius).min(lane.speed_limit_mps),
+        );
     }
     out
 }
@@ -2743,7 +2775,11 @@ pub fn static_obstacle_accel(
     if to_line <= 0.05 {
         return a_model;
     }
-    let tight = if room > 0.05 { need(room) } else { f64::NEG_INFINITY };
+    let tight = if room > 0.05 {
+        need(room)
+    } else {
+        f64::NEG_INFINITY
+    };
     a_model.max(tight.max(need(to_line)))
 }
 

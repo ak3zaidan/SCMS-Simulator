@@ -94,8 +94,7 @@ impl ConflictZones {
                     if ra == rb || !j.conflicts.is_foe(ra, rb) {
                         continue;
                     }
-                    if approach_of.get(la).is_some() && approach_of.get(la) == approach_of.get(lb)
-                    {
+                    if approach_of.get(la).is_some() && approach_of.get(la) == approach_of.get(lb) {
                         continue;
                     }
                     let (a, b) = (world.lane(*la), world.lane(*lb));

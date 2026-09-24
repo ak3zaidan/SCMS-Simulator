@@ -213,7 +213,12 @@ struct Longitudinal {
 ///
 /// Pure arithmetic apart from the two trigonometric calls, which go through
 /// [`v2xw_core::math`] so the result is identical on every platform (ADR 0003).
-fn resolve(ego: &PositionEstimate, peer_pos: Vec3, peer_speed: f64, peer_heading: f64) -> Longitudinal {
+fn resolve(
+    ego: &PositionEstimate,
+    peer_pos: Vec3,
+    peer_speed: f64,
+    peer_heading: f64,
+) -> Longitudinal {
     let (sin_h, cos_h) = math::sin_cos(ego.heading_rad);
     let rel_x = peer_pos.x - ego.pos.x;
     let rel_y = peer_pos.y - ego.pos.y;
@@ -666,7 +671,13 @@ impl Fcw {
         peer_speed_mps: f64,
         peer_heading_rad: f64,
     ) -> Option<Surrogates> {
-        rear_end_surrogates(&self.params, ego, peer_pos, peer_speed_mps, peer_heading_rad)
+        rear_end_surrogates(
+            &self.params,
+            ego,
+            peer_pos,
+            peer_speed_mps,
+            peer_heading_rad,
+        )
     }
 }
 

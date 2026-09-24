@@ -34,10 +34,7 @@ fn main() -> ExitCode {
     let cases: Vec<&Case> = if wanted.is_empty() {
         CASES.iter().collect()
     } else {
-        CASES
-            .iter()
-            .filter(|c| wanted.contains(&c.name))
-            .collect()
+        CASES.iter().filter(|c| wanted.contains(&c.name)).collect()
     };
 
     if cases.is_empty() {

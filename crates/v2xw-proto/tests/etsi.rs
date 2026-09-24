@@ -279,10 +279,7 @@ fn a_blocklisted_station_cannot_download_a_batch_it_was_already_certified() {
         "a refused download must not stamp `downloaded`"
     );
     assert!(
-        run.kernel
-            .stages
-            .at(download, StageId::Requested)
-            .is_some(),
+        run.kernel.stages.at(download, StageId::Requested).is_some(),
         "but the attempt is still on the record"
     );
     assert!(run.refused >= 1);

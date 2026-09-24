@@ -108,7 +108,6 @@ impl<R: RunRecorder> RunRecorder for Tally<R> {
         self.inner.write(at, record);
     }
 
-
     // Forwarded, not defaulted. `RunRecorder::write_wire_frame` discards by default so a
     // record-only recorder need not know the binary path exists, but a WRAPPER that
     // forwards `write` and not this one silently drops the normative binary stream and

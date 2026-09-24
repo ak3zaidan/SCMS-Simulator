@@ -105,7 +105,8 @@ fn generation_is_desynchronised_and_that_removes_the_synchronised_collisions() {
     );
     assert!(desync.reception_attempts > 500 && sync.reception_attempts > 500);
 
-    let contention = |r: &RunReport| loss_fraction(r, "collision") + loss_fraction(r, "half-duplex");
+    let contention =
+        |r: &RunReport| loss_fraction(r, "collision") + loss_fraction(r, "half-duplex");
     assert!(
         contention(&sync) > 0.10,
         "the synchronised fleet lost only {:.3} to contention, so this fleet cannot show \
@@ -181,10 +182,16 @@ fn each_radio_technology_runs_its_own_access_layer() {
     let (nr, nr_rec) = run_recorded(with_rat(fleet, "nr-v2x-pc5"));
 
     let channels = |r: &MemoryRecorder| -> BTreeSet<u16> {
-        views::<NodeTxView>(r).iter().filter_map(|v| v.channel).collect()
+        views::<NodeTxView>(r)
+            .iter()
+            .filter_map(|v| v.channel)
+            .collect()
     };
     let airtimes = |r: &MemoryRecorder| -> BTreeSet<u64> {
-        views::<NodeTxView>(r).iter().filter_map(|v| v.airtime_us).collect()
+        views::<NodeTxView>(r)
+            .iter()
+            .filter_map(|v| v.airtime_us)
+            .collect()
     };
     assert_eq!(channels(&dsrc_rec), BTreeSet::from([172]));
     assert_eq!(channels(&lte_rec), BTreeSet::from([183]));
@@ -194,12 +201,26 @@ fn each_radio_technology_runs_its_own_access_layer() {
         dsrc_air.iter().all(|a| (150..600).contains(a)) && dsrc_air.len() > 1,
         "802.11p air time follows the frame length: {dsrc_air:?}"
     );
-    assert_eq!(airtimes(&lte_rec), BTreeSet::from([1000]), "one LTE subframe");
-    assert_eq!(airtimes(&nr_rec), BTreeSet::from([500]), "one NR slot at 30 kHz");
+    assert_eq!(
+        airtimes(&lte_rec),
+        BTreeSet::from([1000]),
+        "one LTE subframe"
+    );
+    assert_eq!(
+        airtimes(&nr_rec),
+        BTreeSet::from([500]),
+        "one NR slot at 30 kHz"
+    );
 
     assert!(dsrc.sidelink.is_none());
-    let lte_sl = lte.sidelink.as_ref().expect("an LTE run reports its sidelink");
-    let nr_sl = nr.sidelink.as_ref().expect("an NR run reports its sidelink");
+    let lte_sl = lte
+        .sidelink
+        .as_ref()
+        .expect("an LTE run reports its sidelink");
+    let nr_sl = nr
+        .sidelink
+        .as_ref()
+        .expect("an NR run reports its sidelink");
     assert_eq!(lte_sl.rat, "lte-v2x-mode4");
     assert_eq!(nr_sl.rat, "nr-v2x-mode2");
     assert!(lte_sl.selections.values().sum::<u64>() > 0 && lte_sl.grants > 0);
@@ -217,8 +238,14 @@ fn each_radio_technology_runs_its_own_access_layer() {
         mean_access_delay_ns(&nr),
     );
     assert!(d < 1.0e6, "802.11p access delay {d} ns");
-    assert!((10.0e6..100.0e6).contains(&l), "LTE SPS access delay {l} ns");
-    assert!(n < l, "NR's 16.5 ms selection window gives less delay than LTE's: {n} vs {l}");
+    assert!(
+        (10.0e6..100.0e6).contains(&l),
+        "LTE SPS access delay {l} ns"
+    );
+    assert!(
+        n < l,
+        "NR's 16.5 ms selection window gives less delay than LTE's: {n} vs {l}"
+    );
 
     // The sidelinks lose frames to causes 802.11p has no word for.
     let sl_causes: BTreeSet<&String> = lte.rx_losses.keys().chain(nr.rx_losses.keys()).collect();
@@ -250,13 +277,19 @@ fn buildings_obstruct_links_and_the_switch_turns_them_off() {
     let (_, open) = run_recorded(open_air(fleet));
     let city_mid = pdr_between(&city, 200.0, 500.0).expect("links at 200-500 m");
     let open_mid = pdr_between(&open, 200.0, 500.0).expect("links at 200-500 m");
-    assert!(open_mid > 0.9, "open-air delivery at 200-500 m is {open_mid:.3}");
+    assert!(
+        open_mid > 0.9,
+        "open-air delivery at 200-500 m is {open_mid:.3}"
+    );
     assert!(
         city_mid < 0.5 * open_mid,
         "buildings changed 200-500 m delivery only from {open_mid:.3} to {city_mid:.3}"
     );
     let city_near = pdr_between(&city, 0.0, 100.0).expect("links within 100 m");
-    assert!(city_near > 0.7, "same-street delivery within 100 m is {city_near:.3}");
+    assert!(
+        city_near > 0.7,
+        "same-street delivery within 100 m is {city_near:.3}"
+    );
 }
 
 // -----------------------------------------------------------------------------------------
@@ -410,7 +443,10 @@ fn a_focus_region_runs_its_receivers_at_the_focus_tier() {
         tier: v2xw_core::card::Tier::High,
     });
     let errors = v2xw_engine::scenario::validate(&focused);
-    assert!(errors.is_empty(), "a focus region no longer loads: {errors:?}");
+    assert!(
+        errors.is_empty(),
+        "a focus region no longer loads: {errors:?}"
+    );
     let (hi, _) = run_recorded(focused);
     assert!(
         hi.rx_losses.get("preamble-missed").copied().unwrap_or(0) > 0,
@@ -484,7 +520,13 @@ fn a_dem_ridge_obstructs_a_link_across_it() {
     );
     for _ in 0..nrows {
         let row: Vec<&str> = (0..ncols)
-            .map(|c| if c.abs_diff(ridge_col) <= 1 { "150" } else { "0" })
+            .map(|c| {
+                if c.abs_diff(ridge_col) <= 1 {
+                    "150"
+                } else {
+                    "0"
+                }
+            })
             .collect();
         text.push_str(&row.join(" "));
         text.push('\n');
@@ -498,7 +540,10 @@ fn a_dem_ridge_obstructs_a_link_across_it() {
     let world = v2xw_engine::wiring::build_world(&scenario).expect("the world with a DEM builds");
     assert!(world.terrain.is_some(), "the DEM was not attached");
     let mut stack = v2xw_engine::wiring::build_obstacles(&scenario, &world);
-    assert!(stack.terrain.is_some(), "no terrain model was composed over the DEM");
+    assert!(
+        stack.terrain.is_some(),
+        "no terrain model was composed over the DEM"
+    );
 
     let at = |dx: f64, dy: f64| v2xw_core::geom::Vec3::new(mid_x + dx, mid_y + dy, 1.5);
     let across = stack.classify(&world, at(-400.0, 0.0), at(400.0, 0.0));
@@ -509,7 +554,10 @@ fn a_dem_ridge_obstructs_a_link_across_it() {
         v2xw_radio::MultiEdgeRule::Deygout,
         false,
     );
-    assert!(loss > 20.0, "a 150 m ridge between the antennas costs only {loss:.1} dB");
+    assert!(
+        loss > 20.0,
+        "a 150 m ridge between the antennas costs only {loss:.1} dB"
+    );
     let beside = stack.classify(&world, at(-400.0, -200.0), at(-400.0, 200.0));
     assert_eq!(beside.class, v2xw_radio::LosClass::Los);
 

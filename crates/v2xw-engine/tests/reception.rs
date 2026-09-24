@@ -40,7 +40,6 @@ fn rooted(mut scenario: Scenario) -> Scenario {
     scenario
 }
 
-
 fn run(scenario: Scenario) -> (RunReport, String) {
     let mut engine = Engine::build(scenario, "").expect("builds");
     let mut recorder = DigestRecorder::new();
@@ -164,10 +163,7 @@ fn the_far_bins_are_lost_below_sensitivity_and_the_near_bins_are_not() {
         let view: v2xw_metrics::channels::PhyRxView =
             v2xw_metrics::channels::decode(rec).expect("decodes");
         let Some(d) = view.dist_m else { continue };
-        let sensitivity = view
-            .all_causes()
-            .iter()
-            .any(|c| *c == "below-sensitivity") as u64;
+        let sensitivity = view.all_causes().iter().any(|c| *c == "below-sensitivity") as u64;
         if d < 200.0 {
             near_total += 1;
             near_sensitivity += sensitivity;
@@ -176,7 +172,10 @@ fn the_far_bins_are_lost_below_sensitivity_and_the_near_bins_are_not() {
             far_sensitivity += sensitivity;
         }
     }
-    assert!(near_total > 0 && far_total > 0, "both halves must have links");
+    assert!(
+        near_total > 0 && far_total > 0,
+        "both halves must have links"
+    );
     let near = near_sensitivity as f64 / near_total as f64;
     let far = far_sensitivity as f64 / far_total as f64;
     assert!(

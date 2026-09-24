@@ -58,7 +58,11 @@ fn root() -> PathBuf {
 
 /// The frozen reference's interpreter, or `None`.
 fn python() -> Option<PathBuf> {
-    let p = root().join("legacy").join(".venv").join("bin").join("python");
+    let p = root()
+        .join("legacy")
+        .join(".venv")
+        .join("bin")
+        .join("python");
     p.exists().then_some(p)
 }
 
@@ -180,7 +184,9 @@ fn trace_one(kind: Option<AttackKind>, i0: usize, sender: u8) -> (Vec<TraceMsg>,
                 to: u64::MAX,
                 ..AttackSchedule::default()
             },
-            (0..6u8).map(|i| [0xB0 | i, sender, 2, 3, 4, 5, 6, 7]).collect(),
+            (0..6u8)
+                .map(|i| [0xB0 | i, sender, 2, 3, 4, 5, 6, 7])
+                .collect(),
         )
     });
     let _ = RngRegistry::new(1);
@@ -455,7 +461,10 @@ fn the_ported_detection_pass_agrees_with_the_legacy_one_on_one_trace() {
         let ldet = lrow["det"].as_object().unwrap();
         for k in &keys {
             let a = row.det.get(k).copied().unwrap_or(0.0);
-            let b = ldet.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+            let b = ldet
+                .get(k)
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
             let d = (a - b).abs();
             // The legacy writes `round(x, 3)` and so does this crate's `SCORE_Q`, so the
             // tolerance is half a quantum and not an epsilon.
@@ -499,7 +508,10 @@ fn the_ported_detection_pass_agrees_with_the_legacy_one_on_one_trace() {
         }
     }
 
-    eprintln!("--- level A: per-message score diff over {} messages ---", rust.len());
+    eprintln!(
+        "--- level A: per-message score diff over {} messages ---",
+        rust.len()
+    );
     for k in &keys {
         let n = mismatched.get(k).copied().unwrap_or(0);
         let w = worst
@@ -670,7 +682,9 @@ fn the_two_engines_agree_on_which_attacks_are_detectable() {
                     .map(|(k, x)| (k, x.as_i64().unwrap_or(0)))
                     .collect();
                 v.sort_by_key(|(_, n)| -n);
-                v.first().map(|(k, n)| format!("{k}={n}")).unwrap_or_default()
+                v.first()
+                    .map(|(k, n)| format!("{k}={n}"))
+                    .unwrap_or_default()
             })
             .unwrap_or_default();
         let r = rust_rates(kind, true);
@@ -702,7 +716,10 @@ fn the_two_engines_agree_on_which_attacks_are_detectable() {
             ));
         }
     }
-    eprintln!("detectability agreement: {agree} of {}", AttackKind::LEGACY_CATALOG.len());
+    eprintln!(
+        "detectability agreement: {agree} of {}",
+        AttackKind::LEGACY_CATALOG.len()
+    );
     for d in &disagree {
         eprintln!("  DISAGREE {d}");
     }

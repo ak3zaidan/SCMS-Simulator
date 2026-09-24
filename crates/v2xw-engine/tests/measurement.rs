@@ -99,7 +99,11 @@ fn a_real_run_satisfies_every_measurement_invariant() {
     }
     let ranges = v2xw_metrics::invariants::check_metric_ranges(&samples, &catalog);
     assert!(ranges.held(), "{:?}", ranges.violations);
-    assert!(ranges.checked > 100, "only {} values range-checked", ranges.checked);
+    assert!(
+        ranges.checked > 100,
+        "only {} values range-checked",
+        ranges.checked
+    );
 
     // One fate per attempt, and the counts are the run report's own.
     assert_eq!(ledger.node_rx.len() as u64, report.reception_attempts);
@@ -135,7 +139,11 @@ fn the_decomposed_latency_is_the_right_size_for_802_11p() {
             st["airtime"]
         );
         // 1 km at the speed of light is 3.34 µs; the candidate range is 1 km.
-        assert!(st["propagation"] <= 3_400, "propagation {} ns", st["propagation"]);
+        assert!(
+            st["propagation"] <= 3_400,
+            "propagation {} ns",
+            st["propagation"]
+        );
         // AC_VO's AIFS is 58 µs, unless the frame was granted in less.
         assert!(st["mac_aifs"] <= 58_000);
         e2e.push(trace.total_ns().expect("a total"));
@@ -255,6 +263,9 @@ fn every_metric_of_the_communication_families_is_sampled() {
             .next_back()
     };
     for name in ["pdr", "e2e_latency", "channel_load", "security_overhead"] {
-        assert!(point(name).is_some(), "{name} has no estimate in any window");
+        assert!(
+            point(name).is_some(),
+            "{name} has no estimate in any window"
+        );
     }
 }

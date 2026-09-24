@@ -555,7 +555,6 @@ impl v2xw_engine::RunRecorder for StepRecorder {
         }
     }
 
-
     // Forwarded, not defaulted. `RunRecorder::write_wire_frame` discards by default so a
     // record-only recorder need not know the binary path exists, but a WRAPPER that
     // forwards `write` and not this one silently drops the normative binary stream and
@@ -622,9 +621,9 @@ fn spawn_host(
             // of them imported the map again — on Manhattan, most of the wait after Run.
             let key = v2xw_engine::wiring::world_cache_key(&scenario).ok();
             let kept = match (memo, key.as_ref()) {
-                (Some(m), Some(k)) if &m.key == k => {
-                    v2xw_world::serde_native::from_bytes(&m.bytes).ok().map(|w| (w, m.bytes))
-                }
+                (Some(m), Some(k)) if &m.key == k => v2xw_world::serde_native::from_bytes(&m.bytes)
+                    .ok()
+                    .map(|w| (w, m.bytes)),
                 _ => None,
             };
             let (world, bytes) = match kept {
@@ -643,26 +642,34 @@ fn spawn_host(
             // `world.cache` names a directory to keep the world in across processes; a kept
             // world still belongs there, so it is written when the entry is missing.
             if let (Some(dir), Some(k), Some(b)) = (
-                scenario.world.cache.as_deref().map(str::trim).filter(|d| !d.is_empty()),
+                scenario
+                    .world
+                    .cache
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty()),
                 key.as_ref(),
                 bytes.as_ref(),
             ) {
                 let entry = std::path::Path::new(dir).join(format!("{k}.v2xwworld"));
                 if !entry.exists() && std::fs::create_dir_all(dir).is_ok() {
                     let partial = entry.with_extension(format!("{}.partial", std::process::id()));
-                    if std::fs::write(&partial, b).is_ok() && std::fs::rename(&partial, &entry).is_err() {
+                    if std::fs::write(&partial, b).is_ok()
+                        && std::fs::rename(&partial, &entry).is_err()
+                    {
                         let _ = std::fs::remove_file(&partial);
                     }
                 }
             }
             let world_memo = key.zip(bytes).map(|(key, bytes)| WorldMemo { key, bytes });
-            let mut engine = match v2xw_engine::Engine::build_with_world(scenario, world, &build_utc) {
-                Ok(e) => e,
-                Err(e) => {
-                    let _ = setup_tx.send(Err(e.to_string()));
-                    return;
-                }
-            };
+            let mut engine =
+                match v2xw_engine::Engine::build_with_world(scenario, world, &build_utc) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        let _ = setup_tx.send(Err(e.to_string()));
+                        return;
+                    }
+                };
             let setup = match assemble_setup(
                 &engine,
                 &label,
@@ -949,7 +956,11 @@ fn assemble_setup(
     let mut metric_aliases: Vec<(String, String)> = Vec::new();
     for def in providers.catalog() {
         let visibility = crate::visibility_name(def.visibility).to_string();
-        let source = def.source.as_ref().map(|s| s.reference.clone()).unwrap_or_default();
+        let source = def
+            .source
+            .as_ref()
+            .map(|s| s.reference.clone())
+            .unwrap_or_default();
         for series in metric_series(&def) {
             match series {
                 Series::Alias { from, to } => metric_aliases.push((from, to)),
@@ -1354,7 +1365,13 @@ struct Projector {
     /// Per node, the most recent frames it put on the air and the most recent receptions
     /// it resolved, as the evidence `inspect.node`'s `messages` section shows for a
     /// followed vehicle. Bounded at [`MESSAGE_LOG`] each.
-    messages: BTreeMap<NodeId, (std::collections::VecDeque<Value>, std::collections::VecDeque<Value>)>,
+    messages: BTreeMap<
+        NodeId,
+        (
+            std::collections::VecDeque<Value>,
+            std::collections::VecDeque<Value>,
+        ),
+    >,
     /// Channels seen in the stream that this projector has no §3.6 payload for.
     unprojected_channels: BTreeSet<String>,
     /// Channels whose records the channel's own reader-side view could not decode.
@@ -1964,8 +1981,7 @@ impl Projector {
             _ => return,
         }
         for (series, value) in rows {
-            let Some((str_metric, agg, visibility)) = self.metric_ids.get(&series).copied()
-            else {
+            let Some((str_metric, agg, visibility)) = self.metric_ids.get(&series).copied() else {
                 // A breakdown the metric does not declare is left to the recording and
                 // `metrics.json` on purpose. Only a metric the table does not know at all is
                 // the defect `unnamed_metrics` exists to surface.
@@ -3022,10 +3038,12 @@ impl LiveEngine {
     ///
     /// `meta.base` is resolved against the directory of the scenario this engine was
     /// opened on, which is where a document the page edited came from.
-    fn scenario_from_document(&self, doc: &Value) -> std::result::Result<Scenario, Vec<ParamError>> {
-        let text = serde_json::to_string(doc).map_err(|e| {
-            vec![ParamError::new("/", e.to_string(), "pass a JSON object")]
-        })?;
+    fn scenario_from_document(
+        &self,
+        doc: &Value,
+    ) -> std::result::Result<Scenario, Vec<ParamError>> {
+        let text = serde_json::to_string(doc)
+            .map_err(|e| vec![ParamError::new("/", e.to_string(), "pass a JSON object")])?;
         let base = self.source.as_ref().and_then(|p| p.parent());
         match Scenario::parse(&text, base) {
             Ok(s) => Ok(s),
@@ -3090,7 +3108,11 @@ fn scenario_error(e: &v2xw_engine::ScenarioError) -> ParamError {
         .field()
         .map(|f| format!("/{}", f.replace('.', "/")))
         .unwrap_or_else(|| "/".to_string());
-    ParamError::new(path, e.to_string(), "see the field's help text for its allowed values")
+    ParamError::new(
+        path,
+        e.to_string(),
+        "see the field's help text for its allowed values",
+    )
 }
 
 /// An engine error from the loader as a `{path, message, hint}` row.
@@ -3123,7 +3145,11 @@ fn changed_pointers(a: &Value, b: &Value) -> Vec<String> {
             // type), and inside an opaque `Value` block — a world generator's parameters —
             // nothing re-types it, so a plain `==` reported untouched fields as edits.
             (Some(Value::Number(x)), Some(Value::Number(y))) if x.as_f64() == y.as_f64() => {}
-            _ => out.push(if at.is_empty() { "/".to_string() } else { at.to_string() }),
+            _ => out.push(if at.is_empty() {
+                "/".to_string()
+            } else {
+                at.to_string()
+            }),
         }
     }
     let mut out = Vec::new();
@@ -3139,7 +3165,10 @@ fn apply_patch(doc: &mut Value, ops: &[Value]) -> std::result::Result<(), ParamE
             ParamError::new(format!("/patch/{i}/path"), "required", "a JSON Pointer")
         })?;
         let (parent, key) = match path.rfind('/') {
-            Some(at) => (&path[..at], path[at + 1..].replace("~1", "/").replace("~0", "~")),
+            Some(at) => (
+                &path[..at],
+                path[at + 1..].replace("~1", "/").replace("~0", "~"),
+            ),
             None => {
                 return Err(ParamError::new(
                     format!("/patch/{i}/path"),
@@ -3298,9 +3327,9 @@ impl Engine for LiveEngine {
                     return Err(ServerError::RunAlreadyRunning);
                 }
                 let mut next = match scenario {
-                    Some(ScenarioSource::Document(doc)) => {
-                        self.scenario_from_document(&doc).map_err(ServerError::ScenarioInvalid)?
-                    }
+                    Some(ScenarioSource::Document(doc)) => self
+                        .scenario_from_document(&doc)
+                        .map_err(ServerError::ScenarioInvalid)?,
                     Some(ScenarioSource::Preset(id)) => self.load_preset(&id)?,
                     None => self.next_scenario(),
                 };
@@ -3474,8 +3503,9 @@ impl Engine for LiveEngine {
             },
             StageRequest::Patch(ops) => {
                 let mut doc = match &self.staged {
-                    Some(s) => serde_json::to_value(s)
-                        .map_err(|e| ServerError::Internal(e.to_string()))?,
+                    Some(s) => {
+                        serde_json::to_value(s).map_err(|e| ServerError::Internal(e.to_string()))?
+                    }
                     None => running.clone(),
                 };
                 apply_patch(&mut doc, &ops).map_err(|e| ServerError::InvalidParams(vec![e]))?;
@@ -3495,7 +3525,11 @@ impl Engine for LiveEngine {
                 let changed = changed_pointers(&running, &document);
                 // Staging the scenario that is already running is un-staging: nothing
                 // differs, and the form should say "no pending edits".
-                self.staged = if changed.is_empty() { None } else { Some(scenario) };
+                self.staged = if changed.is_empty() {
+                    None
+                } else {
+                    Some(scenario)
+                };
                 Ok(Staged {
                     document,
                     hash,

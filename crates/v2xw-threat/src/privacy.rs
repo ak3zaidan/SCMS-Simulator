@@ -449,10 +449,7 @@ impl PrivacyObserver {
 
         let total = math::sum_ordered(candidates.iter().map(|(_, w)| *w));
         let posteriors: Vec<([u8; 8], f64)> = if total > 0.0 {
-            candidates
-                .iter()
-                .map(|(d, w)| (*d, w / total))
-                .collect()
+            candidates.iter().map(|(d, w)| (*d, w / total)).collect()
         } else {
             Vec::new()
         };
@@ -471,13 +468,14 @@ impl PrivacyObserver {
         };
         // The best hypothesis: the largest posterior, ties to the lower digest, which the
         // digest-ordered iteration gives for free.
-        let best = posteriors
-            .iter()
-            .copied()
-            .fold(None::<([u8; 8], f64)>, |acc, (d, p)| match acc {
-                Some((_, bp)) if bp >= p => acc,
-                _ => Some((d, p)),
-            });
+        let best =
+            posteriors
+                .iter()
+                .copied()
+                .fold(None::<([u8; 8], f64)>, |acc, (d, p)| match acc {
+                    Some((_, bp)) if bp >= p => acc,
+                    _ => Some((d, p)),
+                });
 
         let successor_hex = m.signer_hex();
         let outcome = match best {
@@ -485,10 +483,15 @@ impl PrivacyObserver {
                 // The chain continues: the successor inherits the predecessor's origin and
                 // start, and the predecessor's own track is retired into it.
                 let prev = self.tracks.remove(&predecessor);
-                let (origin, chain_start, links, chain_fixes) = prev.map_or(
-                    (m.signer, t, 0, 0),
-                    |p| (p.origin, p.chain_start, p.links.saturating_add(1), p.chain_fixes),
-                );
+                let (origin, chain_start, links, chain_fixes) =
+                    prev.map_or((m.signer, t, 0, 0), |p| {
+                        (
+                            p.origin,
+                            p.chain_start,
+                            p.links.saturating_add(1),
+                            p.chain_fixes,
+                        )
+                    });
                 self.links += 1;
                 if links > self.longest_chain_links {
                     self.longest_chain_links = links;
@@ -660,8 +663,7 @@ pub fn card(p: &ObserverParams) -> ModelCard {
             json!(p.min_fixes_for_velocity),
             Source {
                 kind: SourceKind::Code,
-                reference: "structural: one reception gives a position and no velocity"
-                    .to_string(),
+                reference: "structural: one reception gives a position and no velocity".to_string(),
                 accessed: Some(crate::cards::LEGACY_ACCESSED.to_string()),
                 note: None,
             },
@@ -686,13 +688,17 @@ pub fn card(p: &ObserverParams) -> ModelCard {
     ];
     card.sources = vec![
         design("07-threats-and-detection.md §6 (observer model, the four privacy metrics)"),
-        design("08-measurement-and-data.md §2.6 (linkability_rate, anonymity_set_size, \
-                degree_of_anonymity, tracking_duration)"),
+        design(
+            "08-measurement-and-data.md §2.6 (linkability_rate, anonymity_set_size, \
+                degree_of_anonymity, tracking_duration)",
+        ),
         design("05-protocols.md §2.4 (the change strategies this observer is run against)"),
         wons.clone(),
         standard("ETSI TR 103 415 §5.1.2 (effective anonymity-set size, degree of anonymity)"),
-        standard("ETSI TR 103 415 §8 (the Sybil surface grows with the concurrent-pseudonym \
-                  count, reported alongside)"),
+        standard(
+            "ETSI TR 103 415 §8 (the Sybil surface grows with the concurrent-pseudonym \
+                  count, reported alongside)",
+        ),
     ];
     card.assumptions = vec![
         "It transmits nothing and reads only its own receptions, so a tracking result here \

@@ -66,7 +66,7 @@ use serde_json::{Map, Value, json};
 use v2xw_core::rng::RngStream;
 
 use v2xw_msg::j2735::map::{
-    self, AllowedManeuvers, Connection, ConnectingLane, GenericLane, IntersectionGeometry,
+    self, AllowedManeuvers, ConnectingLane, Connection, GenericLane, IntersectionGeometry,
     LaneAttributes, LaneDirection, LaneSharing, MapData, NodeOffset, NodeXy, Position3D,
     VehicleLaneAttributes, XyAlternative, XyOffset,
 };
@@ -181,8 +181,7 @@ fn spat_json(spat: &Spat) -> Value {
     map.insert(
         "intersections".into(),
         Value::Array(
-            spat
-                .intersections
+            spat.intersections
                 .iter()
                 .map(intersection_state_json)
                 .collect(),
@@ -199,9 +198,7 @@ fn node_offset_json(offset: &NodeOffset) -> Value {
         ),
         // Node-LLmD-64b declares lon before lat; the JSON is a mapping, so the order here
         // is documentation rather than encoding — the encoder is what fixes the order.
-        NodeOffset::LatLon { lon, lat } => {
-            choice("node-LatLon", json!({ "lon": lon, "lat": lat }))
-        }
+        NodeOffset::LatLon { lon, lat } => choice("node-LatLon", json!({ "lon": lon, "lat": lat })),
     }
 }
 
@@ -309,10 +306,7 @@ fn map_json(data: &MapData) -> Value {
     if let Some(ts) = data.time_stamp {
         map.insert("timeStamp".into(), json!(ts));
     }
-    map.insert(
-        "msgIssueRevision".into(),
-        json!(data.msg_issue_revision),
-    );
+    map.insert("msgIssueRevision".into(), json!(data.msg_issue_revision));
     map.insert(
         "intersections".into(),
         Value::Array(data.intersections.iter().map(geometry_json).collect()),
@@ -343,10 +337,7 @@ fn nominal_spat() -> Spat {
                         TimeChangeDetails::fixed(120, 275),
                     ),
                 ),
-                MovementState::current(
-                    2,
-                    MovementEvent::phase(MovementPhaseState::StopAndRemain),
-                ),
+                MovementState::current(2, MovementEvent::phase(MovementPhaseState::StopAndRemain)),
             ],
         }],
     }
@@ -620,7 +611,11 @@ fn pick(rng: &mut RngStream, min: i64, max: i64) -> i64 {
 /// Takes a closure rather than a value because the value itself usually needs the same
 /// `rng`, and `maybe(rng, pick(rng, …))` would borrow it twice in one call expression.
 fn maybe<T>(rng: &mut RngStream, f: impl FnOnce(&mut RngStream) -> T) -> Option<T> {
-    if rng.below(2) == 1 { Some(f(rng)) } else { None }
+    if rng.below(2) == 1 {
+        Some(f(rng))
+    } else {
+        None
+    }
 }
 
 /// A `TimeMark`, boundary-biased.
@@ -670,8 +665,7 @@ fn random_spat(rng: &mut RngStream) -> Spat {
                 timing,
             });
         }
-        let signal_group =
-            pick(rng, spat::SIGNAL_GROUP_ID_MIN, spat::SIGNAL_GROUP_ID_MAX) as u8;
+        let signal_group = pick(rng, spat::SIGNAL_GROUP_ID_MIN, spat::SIGNAL_GROUP_ID_MAX) as u8;
         states.push(MovementState {
             signal_group,
             events,
@@ -680,11 +674,7 @@ fn random_spat(rng: &mut RngStream) -> Spat {
 
     let time_stamp = maybe(rng, moy);
     let region = maybe(rng, |r| {
-        pick(
-            r,
-            spat::ROAD_REGULATOR_ID_MIN,
-            spat::ROAD_REGULATOR_ID_MAX,
-        ) as u16
+        pick(r, spat::ROAD_REGULATOR_ID_MIN, spat::ROAD_REGULATOR_ID_MAX) as u16
     });
     let id = pick(rng, spat::INTERSECTION_ID_MIN, spat::INTERSECTION_ID_MAX) as u16;
     let revision = pick(rng, 0, 127) as u8;

@@ -11,9 +11,7 @@
 use v2xw_core::ids::NodeId;
 use v2xw_core::time::{NS_PER_S, SimTime, secs_to_ns};
 use v2xw_threat::ctx::CollectingCtx;
-use v2xw_threat::obs::{
-    ObservedKind, ObservedMessage, SelfBelief, StationType, VerificationState,
-};
+use v2xw_threat::obs::{ObservedKind, ObservedMessage, SelfBelief, StationType, VerificationState};
 use v2xw_threat::privacy::{METHOD_UNLINKED, ObserverParams, PrivacyObserver};
 use v2xw_threat::records::{PrivacyLinkClaim, PrivacyTrackSegment};
 
@@ -88,7 +86,11 @@ fn a_pseudonym_change_with_no_silence_is_linked() {
     let mut ctx = CollectingCtx::new(1);
     let mut o = PrivacyObserver::cited_defaults(OBS);
     for i in 0..4u64 {
-        feed(&mut o, &mut ctx, &beacon(A, 15.0 * i as f64, 0.0, i * NS_PER_S));
+        feed(
+            &mut o,
+            &mut ctx,
+            &beacon(A, 15.0 * i as f64, 0.0, i * NS_PER_S),
+        );
     }
     let outcome = feed(&mut o, &mut ctx, &beacon(B, 60.0, 0.0, 4 * NS_PER_S))
         .expect("a first reception from B is a linkage decision");
@@ -121,7 +123,11 @@ fn a_long_enough_silent_period_defeats_the_observer() {
     let mut ctx = CollectingCtx::new(1);
     let mut o = PrivacyObserver::cited_defaults(OBS);
     for i in 0..4u64 {
-        feed(&mut o, &mut ctx, &beacon(A, 15.0 * i as f64, 0.0, i * NS_PER_S));
+        feed(
+            &mut o,
+            &mut ctx,
+            &beacon(A, 15.0 * i as f64, 0.0, i * NS_PER_S),
+        );
     }
     let outcome = feed(
         &mut o,
@@ -143,7 +149,11 @@ fn a_teleporting_claim_is_outside_the_gate() {
     let mut ctx = CollectingCtx::new(1);
     let mut o = PrivacyObserver::cited_defaults(OBS);
     for i in 0..4u64 {
-        feed(&mut o, &mut ctx, &beacon(A, 15.0 * i as f64, 0.0, i * NS_PER_S));
+        feed(
+            &mut o,
+            &mut ctx,
+            &beacon(A, 15.0 * i as f64, 0.0, i * NS_PER_S),
+        );
     }
     let outcome = feed(&mut o, &mut ctx, &beacon(B, 560.0, 0.0, 4 * NS_PER_S)).unwrap();
     assert_eq!(outcome.predecessor, None);
@@ -221,7 +231,11 @@ fn a_linked_change_is_a_record_with_two_digests_and_a_posterior() {
     let mut ctx = CollectingCtx::new(1);
     let mut o = PrivacyObserver::cited_defaults(OBS);
     for i in 0..4u64 {
-        feed(&mut o, &mut ctx, &beacon(A, 15.0 * i as f64, 0.0, i * NS_PER_S));
+        feed(
+            &mut o,
+            &mut ctx,
+            &beacon(A, 15.0 * i as f64, 0.0, i * NS_PER_S),
+        );
     }
     feed(&mut o, &mut ctx, &beacon(B, 60.0, 0.0, 4 * NS_PER_S));
     let claims = links(&ctx);
@@ -249,7 +263,11 @@ fn a_chain_the_observer_gives_up_on_is_a_tracking_duration_sample() {
     let mut ctx = CollectingCtx::new(1);
     let mut o = PrivacyObserver::cited_defaults(OBS);
     for i in 0..4u64 {
-        feed(&mut o, &mut ctx, &beacon(A, 15.0 * i as f64, 0.0, i * NS_PER_S));
+        feed(
+            &mut o,
+            &mut ctx,
+            &beacon(A, 15.0 * i as f64, 0.0, i * NS_PER_S),
+        );
     }
     feed(&mut o, &mut ctx, &beacon(B, 60.0, 0.0, 4 * NS_PER_S));
     // Twenty seconds of silence: the observer gives up.
@@ -291,13 +309,20 @@ fn the_observer_writes_only_on_its_own_channels_and_never_on_a_ground_truth_one(
     let mut ctx = CollectingCtx::new(1);
     let mut o = PrivacyObserver::cited_defaults(OBS);
     for i in 0..4u64 {
-        feed(&mut o, &mut ctx, &beacon(A, 15.0 * i as f64, 0.0, i * NS_PER_S));
+        feed(
+            &mut o,
+            &mut ctx,
+            &beacon(A, 15.0 * i as f64, 0.0, i * NS_PER_S),
+        );
     }
     feed(&mut o, &mut ctx, &beacon(B, 60.0, 0.0, 4 * NS_PER_S));
     o.finish(&mut ctx);
     assert!(ctx.on_channel("gt.attack.action").is_empty());
     assert!(ctx.on_channel("node.tx").is_empty(), "it transmits nothing");
-    assert!(ctx.on_channel("det.observation").is_empty(), "it accuses nobody");
+    assert!(
+        ctx.on_channel("det.observation").is_empty(),
+        "it accuses nobody"
+    );
     assert_eq!(
         ctx.records().len(),
         links(&ctx).len() + tracks(&ctx).len(),
@@ -389,7 +414,11 @@ fn a_short_silence_inside_the_gate_is_still_bridged() {
     let mut ctx = CollectingCtx::new(1);
     let mut o = PrivacyObserver::cited_defaults(OBS);
     for i in 0..4u64 {
-        feed(&mut o, &mut ctx, &beacon(A, 15.0 * i as f64, 0.0, i * NS_PER_S));
+        feed(
+            &mut o,
+            &mut ctx,
+            &beacon(A, 15.0 * i as f64, 0.0, i * NS_PER_S),
+        );
     }
     // Five seconds later, where a constant-velocity prediction says it should be.
     let t = 8 * NS_PER_S;
@@ -408,19 +437,22 @@ fn the_gate_grows_with_the_silence_but_not_without_limit() {
         let mut ctx = CollectingCtx::new(1);
         let mut o = PrivacyObserver::cited_defaults(OBS);
         for i in 0..4u64 {
-            feed(&mut o, &mut ctx, &beacon(A, 15.0 * i as f64, 0.0, i * NS_PER_S));
+            feed(
+                &mut o,
+                &mut ctx,
+                &beacon(A, 15.0 * i as f64, 0.0, i * NS_PER_S),
+            );
         }
         let t = 3 * NS_PER_S + secs_to_ns(gap_s);
         let predicted = 45.0 + 15.0 * gap_s;
-        feed(
-            &mut o,
-            &mut ctx,
-            &beacon(B, predicted + offset_m, 0.0, t),
-        )
-        .unwrap()
-        .predecessor
-        .is_some()
+        feed(&mut o, &mut ctx, &beacon(B, predicted + offset_m, 0.0, t))
+            .unwrap()
+            .predecessor
+            .is_some()
     };
     assert!(!build(1.0, 40.0), "40 m off after 1 s must not link");
-    assert!(build(5.0, 40.0), "40 m off after 5 s is inside the grown gate");
+    assert!(
+        build(5.0, 40.0),
+        "40 m off after 5 s is inside the grown gate"
+    );
 }

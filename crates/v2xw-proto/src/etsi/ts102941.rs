@@ -667,10 +667,7 @@ impl EtsiSizes {
                 "etsi-butterfly-acknowledgement",
                 self.butterfly_acknowledgement(),
             ),
-            (
-                "etsi-butterfly-cert-request",
-                self.butterfly_cert_request(),
-            ),
+            ("etsi-butterfly-cert-request", self.butterfly_cert_request()),
             (
                 "etsi-butterfly-cert-response",
                 self.butterfly_cert_response(),
@@ -1067,12 +1064,7 @@ impl EtsiRun {
             bandwidth_bps: self.params.link_bandwidth_bps,
             transport: Transport::CellularUu,
         };
-        let (ea, aa, cpoc, ma) = (
-            self.nodes.ea,
-            self.nodes.aa,
-            self.nodes.cpoc,
-            self.nodes.ma,
-        );
+        let (ea, aa, cpoc, ma) = (self.nodes.ea, self.nodes.aa, self.nodes.cpoc, self.nodes.ma);
         {
             let net = self.kernel.net_mut();
             net.connect(station, ea, link);
@@ -1416,7 +1408,8 @@ impl EtsiRun {
             Ts102941Msg::ButterflyAuthorizationRequest { station } => {
                 verify(out, 2);
                 sign(out, 1);
-                let granted = self.enrolled.contains(&station) && !self.blocklist.contains(&station);
+                let granted =
+                    self.enrolled.contains(&station) && !self.blocklist.contains(&station);
                 let current_i = self.current_i;
                 if !granted {
                     self.refused += 1;
@@ -2013,8 +2006,7 @@ fn card(p: &EtsiParams) -> ModelCard {
     card.validation.tests = vec![
         "flows::etsi_flows_emit_their_declared_stages_in_order".to_string(),
         "etsi::the_butterfly_variant_costs_one_uplink_request_instead_of_twenty".to_string(),
-        "etsi::a_blocklisted_station_cannot_download_a_batch_it_was_already_certified"
-            .to_string(),
+        "etsi::a_blocklisted_station_cannot_download_a_batch_it_was_already_certified".to_string(),
         "etsi::a_trust_list_grows_with_the_certificates_in_it".to_string(),
         "etsi::a_report_blocks_the_subjects_enrolment_credential".to_string(),
         "wire_sizes::every_etsi_message_size_has_a_provenance_the_card_backs".to_string(),

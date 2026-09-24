@@ -456,18 +456,20 @@ pub fn card_checks(card: &ModelCard) -> Vec<CheckOutcome> {
 
     // §17's tier contract: a model that does not implement the top tier says what it leaves
     // out relative to the tier above it.
-    out.push(if card.implements_tier(Tier::High) || !card.ignores.is_empty() {
-        CheckOutcome::pass(
-            "card-tier-contract",
-            format!("tiers {:?}, {} ignores", card.tier, card.ignores.len()),
-        )
-    } else {
-        CheckOutcome::fail(
-            "card-tier-contract",
-            "the card implements no high tier and lists nothing under `ignores`, so a \
+    out.push(
+        if card.implements_tier(Tier::High) || !card.ignores.is_empty() {
+            CheckOutcome::pass(
+                "card-tier-contract",
+                format!("tiers {:?}, {} ignores", card.tier, card.ignores.len()),
+            )
+        } else {
+            CheckOutcome::fail(
+                "card-tier-contract",
+                "the card implements no high tier and lists nothing under `ignores`, so a \
              reader cannot tell what it leaves out relative to the tier above",
-        )
-    });
+            )
+        },
+    );
 
     out
 }
@@ -493,7 +495,10 @@ pub fn behaviour_checks(subject: &dyn PluginUnderTest, seed: u64) -> Vec<CheckOu
     out.push(if forward.values == again.values {
         CheckOutcome::pass(
             "determinism",
-            format!("{} value(s) identical across two runs", count(&forward.values)),
+            format!(
+                "{} value(s) identical across two runs",
+                count(&forward.values)
+            ),
         )
     } else {
         CheckOutcome::fail(
@@ -631,7 +636,10 @@ pub fn behaviour_checks(subject: &dyn PluginUnderTest, seed: u64) -> Vec<CheckOu
     } else {
         CheckOutcome::pass(
             "recorder-discipline",
-            format!("{} record(s), none ground-truth tainted", forward.records.len()),
+            format!(
+                "{} record(s), none ground-truth tainted",
+                forward.records.len()
+            ),
         )
     });
 

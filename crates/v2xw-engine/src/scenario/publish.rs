@@ -113,24 +113,96 @@ const MAX_DEPTH: usize = 12;
 /// build if a section is added to the schema and not placed here, so the grouping cannot
 /// silently fall back to "Other".
 const GROUPS: &[(&str, &str, &str)] = &[
-    ("meta", "Run", "What this scenario is, who wrote it, and what it is based on."),
-    ("schema", "Run", "What this scenario is, who wrote it, and what it is based on."),
-    ("seed", "Run", "What this scenario is, who wrote it, and what it is based on."),
-    ("time", "Run", "What this scenario is, who wrote it, and what it is based on."),
-    ("world", "World", "The map: where it comes from, its buildings and its terrain."),
-    ("actors", "Traffic", "What moves and what transmits: the fleet, its size, roadside units and the backend."),
-    ("weather", "Environment", "The weather the run starts in and what it does to the radio."),
-    ("radio", "Radio", "The radio stack: which technology, at which fidelity, with which models."),
-    ("net", "Network", "The network layer between the application and the radio."),
-    ("messages", "Messages", "Which V2X messages are generated and how they are encoded."),
-    ("security", "Security", "The security envelope, the cryptography and the privacy policies."),
-    ("nodes", "Nodes", "Which hardware the on-board units run on."),
-    ("threats", "Threats", "Attackers, jammers and compromised infrastructure."),
-    ("detection", "Detection", "Misbehaviour detectors and the authority that acts on them."),
-    ("metrics", "Measurement", "What is measured, exported and swept."),
-    ("exporters", "Measurement", "What is measured, exported and swept."),
-    ("events", "Timeline", "Things that happen at a stated instant during the run."),
-    ("experiment", "Measurement", "What is measured, exported and swept."),
+    (
+        "meta",
+        "Run",
+        "What this scenario is, who wrote it, and what it is based on.",
+    ),
+    (
+        "schema",
+        "Run",
+        "What this scenario is, who wrote it, and what it is based on.",
+    ),
+    (
+        "seed",
+        "Run",
+        "What this scenario is, who wrote it, and what it is based on.",
+    ),
+    (
+        "time",
+        "Run",
+        "What this scenario is, who wrote it, and what it is based on.",
+    ),
+    (
+        "world",
+        "World",
+        "The map: where it comes from, its buildings and its terrain.",
+    ),
+    (
+        "actors",
+        "Traffic",
+        "What moves and what transmits: the fleet, its size, roadside units and the backend.",
+    ),
+    (
+        "weather",
+        "Environment",
+        "The weather the run starts in and what it does to the radio.",
+    ),
+    (
+        "radio",
+        "Radio",
+        "The radio stack: which technology, at which fidelity, with which models.",
+    ),
+    (
+        "net",
+        "Network",
+        "The network layer between the application and the radio.",
+    ),
+    (
+        "messages",
+        "Messages",
+        "Which V2X messages are generated and how they are encoded.",
+    ),
+    (
+        "security",
+        "Security",
+        "The security envelope, the cryptography and the privacy policies.",
+    ),
+    (
+        "nodes",
+        "Nodes",
+        "Which hardware the on-board units run on.",
+    ),
+    (
+        "threats",
+        "Threats",
+        "Attackers, jammers and compromised infrastructure.",
+    ),
+    (
+        "detection",
+        "Detection",
+        "Misbehaviour detectors and the authority that acts on them.",
+    ),
+    (
+        "metrics",
+        "Measurement",
+        "What is measured, exported and swept.",
+    ),
+    (
+        "exporters",
+        "Measurement",
+        "What is measured, exported and swept.",
+    ),
+    (
+        "events",
+        "Timeline",
+        "Things that happen at a stated instant during the run.",
+    ),
+    (
+        "experiment",
+        "Measurement",
+        "What is measured, exported and swept.",
+    ),
 ];
 
 /// Unit suffixes, longest first: the schema puts a field's unit in its name on purpose
@@ -208,48 +280,132 @@ pub struct Slot {
 /// cannot explain why the thing the owner asked for is missing. Its status says what
 /// happens if it is set.
 pub static SLOTS: &[Slot] = &[
-    Slot { path: "world.source.generator", label: "World generator",
-           family: Family::World, bare_id: true },
-    Slot { path: "actors.vehicles.demand.kind", label: "Demand model",
-           family: Family::Mobility, bare_id: true },
-    Slot { path: "nodes.default_obu", label: "On-board unit",
-           family: Family::HardwareProfile, bare_id: true },
-    Slot { path: "nodes.per_class.*", label: "On-board unit, per vehicle class",
-           family: Family::HardwareProfile, bare_id: true },
-    Slot { path: "actors.rsus[].profile", label: "Roadside unit hardware",
-           family: Family::HardwareProfile, bare_id: true },
-    Slot { path: "actors.backend.entities.*.profile", label: "Backend entity hardware",
-           family: Family::HardwareProfile, bare_id: true },
-    Slot { path: "actors.backend.entities.*.service_model", label: "Backend service model",
-           family: Family::ServiceModel, bare_id: true },
-    Slot { path: "actors.backend.entities.*.net", label: "Backend network model",
-           family: Family::BackendNet, bare_id: true },
-    Slot { path: "actors.backend.protocol", label: "Credential-management protocol",
-           family: Family::Protocol, bare_id: true },
-    Slot { path: "actors.rsus[].backhaul", label: "Roadside backhaul",
-           family: Family::Backhaul, bare_id: true },
-    Slot { path: "net.fragmenter", label: "Fragmenter", family: Family::Fragmenter,
-           bare_id: false },
-    Slot { path: "net.backhaul", label: "Backhaul link", family: Family::Backhaul,
-           bare_id: false },
-    Slot { path: "net.uu", label: "Cellular uplink", family: Family::Cellular,
-           bare_id: false },
-    Slot { path: "net.backend_net", label: "Backend network", family: Family::BackendNet,
-           bare_id: false },
-    Slot { path: "messages.generator", label: "Message generator",
-           family: Family::Generator, bare_id: false },
-    Slot { path: "security.protocol", label: "Credential protocol model",
-           family: Family::Protocol, bare_id: false },
-    Slot { path: "threats.attackers[].id", label: "Attacker model",
-           family: Family::Attacker, bare_id: true },
-    Slot { path: "threats.jammers[]", label: "Jammer", family: Family::Phy,
-           bare_id: false },
-    Slot { path: "detection.local[]", label: "Local detector", family: Family::Detector,
-           bare_id: false },
-    Slot { path: "detection.ma", label: "Misbehaviour-authority pipeline",
-           family: Family::MaPipeline, bare_id: false },
-    Slot { path: "detection.responder", label: "Response model",
-           family: Family::Responder, bare_id: false },
+    Slot {
+        path: "world.source.generator",
+        label: "World generator",
+        family: Family::World,
+        bare_id: true,
+    },
+    Slot {
+        path: "actors.vehicles.demand.kind",
+        label: "Demand model",
+        family: Family::Mobility,
+        bare_id: true,
+    },
+    Slot {
+        path: "nodes.default_obu",
+        label: "On-board unit",
+        family: Family::HardwareProfile,
+        bare_id: true,
+    },
+    Slot {
+        path: "nodes.per_class.*",
+        label: "On-board unit, per vehicle class",
+        family: Family::HardwareProfile,
+        bare_id: true,
+    },
+    Slot {
+        path: "actors.rsus[].profile",
+        label: "Roadside unit hardware",
+        family: Family::HardwareProfile,
+        bare_id: true,
+    },
+    Slot {
+        path: "actors.backend.entities.*.profile",
+        label: "Backend entity hardware",
+        family: Family::HardwareProfile,
+        bare_id: true,
+    },
+    Slot {
+        path: "actors.backend.entities.*.service_model",
+        label: "Backend service model",
+        family: Family::ServiceModel,
+        bare_id: true,
+    },
+    Slot {
+        path: "actors.backend.entities.*.net",
+        label: "Backend network model",
+        family: Family::BackendNet,
+        bare_id: true,
+    },
+    Slot {
+        path: "actors.backend.protocol",
+        label: "Credential-management protocol",
+        family: Family::Protocol,
+        bare_id: true,
+    },
+    Slot {
+        path: "actors.rsus[].backhaul",
+        label: "Roadside backhaul",
+        family: Family::Backhaul,
+        bare_id: true,
+    },
+    Slot {
+        path: "net.fragmenter",
+        label: "Fragmenter",
+        family: Family::Fragmenter,
+        bare_id: false,
+    },
+    Slot {
+        path: "net.backhaul",
+        label: "Backhaul link",
+        family: Family::Backhaul,
+        bare_id: false,
+    },
+    Slot {
+        path: "net.uu",
+        label: "Cellular uplink",
+        family: Family::Cellular,
+        bare_id: false,
+    },
+    Slot {
+        path: "net.backend_net",
+        label: "Backend network",
+        family: Family::BackendNet,
+        bare_id: false,
+    },
+    Slot {
+        path: "messages.generator",
+        label: "Message generator",
+        family: Family::Generator,
+        bare_id: false,
+    },
+    Slot {
+        path: "security.protocol",
+        label: "Credential protocol model",
+        family: Family::Protocol,
+        bare_id: false,
+    },
+    Slot {
+        path: "threats.attackers[].id",
+        label: "Attacker model",
+        family: Family::Attacker,
+        bare_id: true,
+    },
+    Slot {
+        path: "threats.jammers[]",
+        label: "Jammer",
+        family: Family::Phy,
+        bare_id: false,
+    },
+    Slot {
+        path: "detection.local[]",
+        label: "Local detector",
+        family: Family::Detector,
+        bare_id: false,
+    },
+    Slot {
+        path: "detection.ma",
+        label: "Misbehaviour-authority pipeline",
+        family: Family::MaPipeline,
+        bare_id: false,
+    },
+    Slot {
+        path: "detection.responder",
+        label: "Response model",
+        family: Family::Responder,
+        bare_id: false,
+    },
 ];
 
 /// The reflected type called `name`.
@@ -431,7 +587,10 @@ impl Walk<'_> {
         }
         if let Some(t) = inner(ty, "Vec") {
             out.insert("type".into(), json!("array"));
-            out.insert("items".into(), self.node(t, &format!("{path}[]"), "", depth + 1));
+            out.insert(
+                "items".into(),
+                self.node(t, &format!("{path}[]"), "", depth + 1),
+            );
             self.with_meta(path, &mut out);
             return Value::Object(out);
         }
@@ -439,7 +598,10 @@ impl Walk<'_> {
             out.insert("type".into(), json!("array"));
             out.insert("minItems".into(), json!(len));
             out.insert("maxItems".into(), json!(len));
-            out.insert("items".into(), self.node(elem, &format!("{path}[]"), "", depth + 1));
+            out.insert(
+                "items".into(),
+                self.node(elem, &format!("{path}[]"), "", depth + 1),
+            );
             self.with_meta(path, &mut out);
             return Value::Object(out);
         }
@@ -472,7 +634,11 @@ impl Walk<'_> {
                 out.insert("type".into(), json!(kind));
             }
             self.with_meta(path, &mut out);
-            let widget = if out.contains_key("enum") { "enum" } else { kind };
+            let widget = if out.contains_key("enum") {
+                "enum"
+            } else {
+                kind
+            };
             self.push_leaf(path, widget, &out);
             return Value::Object(out);
         }
@@ -539,7 +705,13 @@ impl Walk<'_> {
 
     /// The node for an enum: a string with a closed list of values when every variant is a
     /// unit, and a tagged `oneOf` otherwise.
-    fn enum_node(&mut self, t: &RType, path: &str, mut out: Map<String, Value>, depth: usize) -> Value {
+    fn enum_node(
+        &mut self,
+        t: &RType,
+        path: &str,
+        mut out: Map<String, Value>,
+        depth: usize,
+    ) -> Value {
         let unit_only = t.variants.iter().all(|v| v.fields.is_empty());
         if unit_only {
             out.insert("type".into(), json!("string"));
@@ -697,7 +869,10 @@ impl Walk<'_> {
 /// the leaves the schema walk found.
 fn walk() -> (Value, Vec<Value>) {
     let defaults = serde_json::to_value(crate::Scenario::minimal()).unwrap_or(Value::Null);
-    let mut walk = Walk { defaults: &defaults, leaves: Vec::new() };
+    let mut walk = Walk {
+        defaults: &defaults,
+        leaves: Vec::new(),
+    };
     let mut root = walk.node("Scenario", "", "", 0);
     if let Value::Object(map) = &mut root {
         map.insert(
@@ -985,9 +1160,24 @@ mod tests {
         );
         assert!(scenario.deny_unknown, "`Scenario` denies unknown fields");
         for name in [
-            "Time", "WorldSpec", "Actors", "Radio", "Net", "Messages", "Security", "Nodes",
-            "Threats", "Detection", "TimelineItem", "Experiment", "WeatherKind", "Tier",
-            "WorldSourceSpec", "GeoBbox", "HighwayPreset", "SurfaceCondition",
+            "Time",
+            "WorldSpec",
+            "Actors",
+            "Radio",
+            "Net",
+            "Messages",
+            "Security",
+            "Nodes",
+            "Threats",
+            "Detection",
+            "TimelineItem",
+            "Experiment",
+            "WeatherKind",
+            "Tier",
+            "WorldSourceSpec",
+            "GeoBbox",
+            "HighwayPreset",
+            "SurfaceCondition",
         ] {
             assert!(type_of(name).is_some(), "{name} is reflected");
         }
@@ -1036,7 +1226,11 @@ mod tests {
             if kind != "number" && kind != "integer" {
                 continue;
             }
-            let path = f.get("x-path").and_then(Value::as_str).unwrap_or("").to_string();
+            let path = f
+                .get("x-path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let unit = f.get("unit").and_then(Value::as_str).unwrap_or("");
             if unit.is_empty() && !DIMENSIONLESS.contains(&path.as_str()) {
                 missing.push(path);
@@ -1153,7 +1347,10 @@ mod tests {
                 set += 1;
             }
         }
-        assert!(set > 30, "only {set} defaults were replayed into the document");
+        assert!(
+            set > 30,
+            "only {set} defaults were replayed into the document"
+        );
         let scenario = crate::Scenario::from_document(doc)
             .expect("a document of the published defaults must deserialise");
         scenario
@@ -1179,9 +1376,10 @@ mod tests {
                     // that has to describe it.
                     let tag = node.get("x-tag").and_then(Value::as_str).unwrap_or("kind");
                     let chosen = fields.get(tag).and_then(Value::as_str).unwrap_or("");
-                    if let Some(branch) = branches.iter().find(|b| {
-                        b.get("title").and_then(Value::as_str) == Some(chosen)
-                    }) {
+                    if let Some(branch) = branches
+                        .iter()
+                        .find(|b| b.get("title").and_then(Value::as_str) == Some(chosen))
+                    {
                         describes(branch, doc, path, missing);
                     }
                     return;
@@ -1239,7 +1437,12 @@ mod tests {
                 Err(_) => continue,
             };
             let doc = serde_json::to_value(&scenario).expect("a scenario serialises");
-            describes(&schema, &doc, path.display().to_string().as_str(), &mut missing);
+            describes(
+                &schema,
+                &doc,
+                path.display().to_string().as_str(),
+                &mut missing,
+            );
             checked += 1;
         }
         assert!(checked >= 4, "only {checked} shipped scenarios loaded");
@@ -1362,8 +1565,16 @@ mod tests {
     fn the_surface_carries_every_section() {
         let s = surface();
         for key in [
-            "version", "engine", "generated_from", "validator", "groups", "statuses",
-            "schema", "fields", "slots", "models",
+            "version",
+            "engine",
+            "generated_from",
+            "validator",
+            "groups",
+            "statuses",
+            "schema",
+            "fields",
+            "slots",
+            "models",
         ] {
             assert!(s.get(key).is_some(), "the surface has no `{key}`");
         }

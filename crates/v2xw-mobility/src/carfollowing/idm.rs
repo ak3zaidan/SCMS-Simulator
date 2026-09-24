@@ -1207,7 +1207,12 @@ mod tests {
             v2xw_core::weather::SurfaceCondition::Ice,
         );
         let obstacle = LeaderView::virtual_obstacle(5.0, 0.0);
-        let dry = m.accel(&ego(15.0, d), Some(&obstacle), &lane(15.0), &WeatherState::CLEAR);
+        let dry = m.accel(
+            &ego(15.0, d),
+            Some(&obstacle),
+            &lane(15.0),
+            &WeatherState::CLEAR,
+        );
         let icy = m.accel(&ego(15.0, d), Some(&obstacle), &lane(15.0), &ice);
         assert!(dry < -3.0, "{dry}");
         assert!((icy + 0.980_665).abs() < 1e-9, "{icy}");

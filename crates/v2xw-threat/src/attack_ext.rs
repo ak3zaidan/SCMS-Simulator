@@ -119,10 +119,7 @@ impl LaneHint {
             return math::hypot(x_m - self.x0_m, y_m - self.y0_m);
         }
         let t = (((x_m - self.x0_m) * dx + (y_m - self.y0_m) * dy) / len2).clamp(0.0, 1.0);
-        math::hypot(
-            x_m - (self.x0_m + t * dx),
-            y_m - (self.y0_m + t * dy),
-        )
+        math::hypot(x_m - (self.x0_m + t * dx), y_m - (self.y0_m + t * dy))
     }
 }
 
@@ -183,7 +180,9 @@ impl ExtendedAttackKind {
     /// Parses a name. `None` for anything not in [`ExtendedAttackKind::ALL`].
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
-        ExtendedAttackKind::ALL.into_iter().find(|k| k.as_str() == name)
+        ExtendedAttackKind::ALL
+            .into_iter()
+            .find(|k| k.as_str() == name)
     }
 
     /// The behavioural family, on the same taxonomy the legacy feature pipeline uses.
@@ -430,10 +429,7 @@ impl ExtendedAttacker {
         } else {
             -self.params.ghost_lateral_m
         };
-        (
-            x_m + along * c - lateral * s,
-            y_m + along * s + lateral * c,
-        )
+        (x_m + along * c - lateral * s, y_m + along * s + lateral * c)
     }
 
     /// The jam burst this kind puts on the channel at `t`, or `None` when it is not

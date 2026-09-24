@@ -1660,11 +1660,13 @@ fn an_import_without_a_speed_preset_is_refused() {
     assert!(message.contains("urban-us-nyc"), "{message}");
 
     // And the refusal is the import's, not just the option check's.
-    let xml = document(&[
-        crossroads_nodes(),
-        way(10, &[1, 2, 3], &[("highway", "secondary")]),
-    ]
-    .concat());
+    let xml = document(
+        &[
+            crossroads_nodes(),
+            way(10, &[1, 2, 3], &[("highway", "secondary")]),
+        ]
+        .concat(),
+    );
     assert!(import_osm_bytes(xml.as_bytes(), "fixture", &options).is_err());
 
     // Naming one imports.
@@ -1848,7 +1850,10 @@ fn the_speed_default_is_a_named_preset_and_a_tag_still_wins() {
     };
 
     let (german, report) = import_with(&xml, &opts());
-    assert_eq!(report.highway_preset.map(HighwayPreset::label), Some("sumo-german"));
+    assert_eq!(
+        report.highway_preset.map(HighwayPreset::label),
+        Some("sumo-german")
+    );
     assert!(report.to_text().contains("preset sumo-german"));
     // Two lanes on the tagged avenue; two each on the two untagged streets.
     assert_eq!(report.counts.speeds_tagged, 2, "{}", report.to_text());
@@ -3142,7 +3147,11 @@ fn midtown_landmarks_are_as_tall_as_the_city() {
     );
     assert!(volume > 0.15e9, "built volume {volume} m^3");
     assert!(tall > 120, "buildings 150 m or taller: {tall}");
-    assert!(report.counts.heights_from_parts > 300, "{}", report.to_text());
+    assert!(
+        report.counts.heights_from_parts > 300,
+        "{}",
+        report.to_text()
+    );
 
     // V10: and no thin mast is left standing as solid building mass. The tallest thing in
     // the world was a 55 m^2, 443.2 m prism — the Empire State Building's spire.

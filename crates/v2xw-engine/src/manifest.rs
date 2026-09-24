@@ -402,9 +402,7 @@ mod tests {
             );
         }
         assert!(
-            m.warnings
-                .iter()
-                .any(|w| w.contains("comparison_digest")),
+            m.warnings.iter().any(|w| w.contains("comparison_digest")),
             "the warning does not say how to compare two manifests: {:?}",
             m.warnings
         );

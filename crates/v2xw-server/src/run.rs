@@ -166,7 +166,11 @@ impl Run {
             Some(json) => Arc::new(json),
             None => Arc::clone(&previous.world_json),
         };
-        let shape = Shape::of(engine.descriptor().clone(), Arc::clone(engine.world()), world_json);
+        let shape = Shape::of(
+            engine.descriptor().clone(),
+            Arc::clone(engine.world()),
+            world_json,
+        );
         *self.shape.write() = Arc::new(shape);
         self.generation.send_modify(|g| *g += 1);
     }

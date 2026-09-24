@@ -36,7 +36,10 @@ fn a_cached_world_is_the_same_world() {
     let dir = scratch("same");
     let scenario = grid(&dir);
     let imported = build_world(&scenario).expect("import");
-    let entry = dir.join(format!("{}.v2xwworld", world_cache_key(&scenario).expect("key")));
+    let entry = dir.join(format!(
+        "{}.v2xwworld",
+        world_cache_key(&scenario).expect("key")
+    ));
     assert!(entry.exists(), "the import was written to the cache");
     let cached = build_world(&scenario).expect("from the cache");
     assert_eq!(
@@ -81,10 +84,18 @@ fn a_changed_world_section_is_a_different_key_and_a_damaged_entry_is_repaired() 
     let key = world_cache_key(&scenario).expect("key");
     let mut moved = scenario.clone();
     moved.world.imported_at = "2026-09-19T00:00:00Z".to_string();
-    assert_ne!(key, world_cache_key(&moved).expect("key"), "any world input moves the key");
+    assert_ne!(
+        key,
+        world_cache_key(&moved).expect("key"),
+        "any world input moves the key"
+    );
     let mut elsewhere = scenario.clone();
     elsewhere.world.cache = Some("/somewhere/else".to_string());
-    assert_eq!(key, world_cache_key(&elsewhere).expect("key"), "where the cache lives is not an input");
+    assert_eq!(
+        key,
+        world_cache_key(&elsewhere).expect("key"),
+        "where the cache lives is not an input"
+    );
 
     std::fs::create_dir_all(&dir).expect("dir");
     let entry = dir.join(format!("{key}.v2xwworld"));

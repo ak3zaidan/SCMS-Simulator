@@ -100,7 +100,11 @@ fn every_transition_is_clean_and_there_is_never_a_second_kernel() {
     .expect("build");
     let world_json = engine.world_json().to_string();
     let run: Arc<Run> = Run::new(Box::new(engine), world_json).expect("run");
-    assert_eq!(kernel_threads(), 1, "one kernel for the run that was opened");
+    assert_eq!(
+        kernel_threads(),
+        1,
+        "one kernel for the run that was opened"
+    );
 
     // --- the state machine, transition by transition ---------------------------------
     assert_eq!(state(&run), "paused");
@@ -114,13 +118,18 @@ fn every_transition_is_clean_and_there_is_never_a_second_kernel() {
     }
     ok(&run, "run.pause", json!({}));
     assert_eq!(state(&run), "paused");
-    let before = ok(&run, "run.status", json!({}))["t_ns"].as_u64().expect("t_ns");
+    let before = ok(&run, "run.status", json!({}))["t_ns"]
+        .as_u64()
+        .expect("t_ns");
     let stepped = ok(&run, "run.step", json!({"count": 5}));
     assert_eq!(stepped["stepped"], 5);
     assert_eq!(stepped["t_ns"].as_u64(), Some(before + 5 * 100_000_000));
     // A seek needs a connection; over HTTP it is refused and the run does not move.
     refused(&run, "run.seek", json!({"t_ns": 0}), -32009);
-    assert_eq!(ok(&run, "run.status", json!({}))["t_ns"].as_u64(), Some(before + 500_000_000));
+    assert_eq!(
+        ok(&run, "run.status", json!({}))["t_ns"].as_u64(),
+        Some(before + 500_000_000)
+    );
     // A page attaching to a paused run — a reload, a second tab — is sent the state at the
     // stream position, not an empty city until somebody presses play.
     let descriptor = run.descriptor();
@@ -189,20 +198,36 @@ fn every_transition_is_clean_and_there_is_never_a_second_kernel() {
                     ok(&run, "run.pause", json!({}));
                 }
                 let target = if i % 8 == 3 { &short } else { &path };
-                let loaded = ok(&run, "scenario.load", json!({"path": target.display().to_string()}));
+                let loaded = ok(
+                    &run,
+                    "scenario.load",
+                    json!({"path": target.display().to_string()}),
+                );
                 assert_eq!(loaded["valid"], true);
             }
         }
-        assert!(kernel_threads() <= 1, "cycle {i}: {} kernels", kernel_threads());
+        assert!(
+            kernel_threads() <= 1,
+            "cycle {i}: {} kernels",
+            kernel_threads()
+        );
     }
 
     // --- a run that ends by itself lets its kernel go ------------------------------------
-    ok(&run, "scenario.load", json!({"path": short.display().to_string()}));
+    ok(
+        &run,
+        "scenario.load",
+        json!({"path": short.display().to_string()}),
+    );
     if state(&run) == "running" {
         ok(&run, "run.pause", json!({}));
     }
     ok(&run, "run.start", json!({"paused": false, "speed": 0}));
-    assert_eq!(run.descriptor().duration, 2_000_000_000, "the switched scenario is running");
+    assert_eq!(
+        run.descriptor().duration,
+        2_000_000_000,
+        "the switched scenario is running"
+    );
     for _ in 0..10_000 {
         if !run.tick().expect("tick") && run.state() == RunState::Finished {
             break;

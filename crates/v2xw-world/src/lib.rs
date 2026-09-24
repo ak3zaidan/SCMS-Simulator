@@ -90,10 +90,10 @@ pub use model::{
     GeoOrigin, HeightSource, Interpolation, Junction, JunctionControl, LanduseClass, LanduseZone,
     Lane, LaneKind, LaneProjection, LayerLicence, LodHint, MaterialClass, NetworkCounts,
     Projection, RoadClass, RoadNetwork, SignalHead, SignalHeadKind, SignalPhase, SignalPlan,
-    signal_group_wire_id,
     SignalState, Site, SiteId, SiteKind, SymbolId, SymbolTable, Terrain, Transformation,
     TurnDirection, World, WorldBuilder, WorldParts, WorldProvenance, WorldSourceKind, ZoneId,
-    convex_hull_ring, point_in_ring, ring_distance_sq_2d, ring_signed_area_2x, simplify_rdp,
+    convex_hull_ring, point_in_ring, ring_distance_sq_2d, ring_signed_area_2x,
+    signal_group_wire_id, simplify_rdp,
 };
 pub use serde_vwp::WorldPayload;
 pub use sumo::{SumoAnomaly, SumoImportReport, SumoOptions};

@@ -72,8 +72,7 @@ use v2xw_record::wire::telemetry::NodeTelemetry;
 use crate::clock::ClockModel;
 use crate::ctx::{NodeCtx, NodeCtxExt};
 use crate::policy::{
-    PolicyView, RxSummary, VerificationPolicy, VerifyAll, VerifyDecision,
-    VerifyDecisionRecord,
+    PolicyView, RxSummary, VerificationPolicy, VerifyAll, VerifyDecision, VerifyDecisionRecord,
 };
 use crate::profile::{HardwareProfile, RunsOn};
 use crate::queue::{Admission, DropCause, DropLedger, NodeQueue, QueueKind, Queued};
@@ -1514,7 +1513,8 @@ impl RsuRuntime {
             self.drops.record_n(DropCause::TxOverflow, due.len() as u32);
             return;
         };
-        if !self.provision_all(ctx, believed) || !self.security.set_active(cred.i_period, cred.j_index)
+        if !self.provision_all(ctx, believed)
+            || !self.security.set_active(cred.i_period, cred.j_index)
         {
             self.drops.record_n(DropCause::TxOverflow, due.len() as u32);
             return;
@@ -1610,7 +1610,10 @@ impl RsuRuntime {
             _ => None,
         };
         let entry = v2xw_msg::size_model::lookup(msg_type, self.config.content_profile)?;
-        Some((entry.bytes(elements.unwrap_or(entry.nominal_elements)), true))
+        Some((
+            entry.bytes(elements.unwrap_or(entry.nominal_elements)),
+            true,
+        ))
     }
 
     /// The scenario-supplied length for `msg_type`, if one was set.
@@ -1818,11 +1821,7 @@ fn plan(name: &str, unit: &str, default: serde_json::Value, why: &str, how: &str
     p
 }
 
-fn backhaul_card(
-    kind: BackhaulKind,
-    latency: Duration,
-    bandwidth_bps: Option<u64>,
-) -> ModelCard {
+fn backhaul_card(kind: BackhaulKind, latency: Duration, bandwidth_bps: Option<u64>) -> ModelCard {
     let mut card = ModelCard::new(
         BACKHAUL_ID,
         Family::Backhaul,
@@ -2298,7 +2297,11 @@ mod tests {
     fn a_held_item_ages_out_after_a_week() {
         let mut q = ForwardQueue::default();
         q.store(ForwardKind::MisbehaviourReport, 100, 0);
-        assert_eq!(q.sweep(FORWARD_MAX_AGE.as_nanos()), 0, "exactly a week is in");
+        assert_eq!(
+            q.sweep(FORWARD_MAX_AGE.as_nanos()),
+            0,
+            "exactly a week is in"
+        );
         assert_eq!(q.sweep(FORWARD_MAX_AGE.as_nanos() + 1), 1);
         assert_eq!(q.dropped_aged(), 1);
         assert!(q.is_empty());

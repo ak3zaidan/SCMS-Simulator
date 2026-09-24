@@ -70,9 +70,7 @@ impl RoadContext {
     /// The rows a lane with limit `limit_mps` takes.
     pub fn resolve(self, limit_mps: f64) -> RoadContext {
         match self {
-            RoadContext::BySpeedLimit if limit_mps >= FREEWAY_MIN_LIMIT_MPS => {
-                RoadContext::Freeway
-            }
+            RoadContext::BySpeedLimit if limit_mps >= FREEWAY_MIN_LIMIT_MPS => RoadContext::Freeway,
             RoadContext::BySpeedLimit => RoadContext::Arterial,
             other => other,
         }
@@ -368,9 +366,23 @@ mod scenario_weather_tests {
 
     #[test]
     fn the_surface_caps_braking_and_a_dry_road_does_not() {
-        let dry = WeatherState::new(WeatherKind::Clear, 0.0, f64::INFINITY, SurfaceCondition::Dry);
-        assert!(fhwa_driving_effects(&dry, RoadContext::Arterial).max_decel_mps2.is_infinite());
-        let ice = WeatherState::new(WeatherKind::Clear, 0.0, f64::INFINITY, SurfaceCondition::Ice);
+        let dry = WeatherState::new(
+            WeatherKind::Clear,
+            0.0,
+            f64::INFINITY,
+            SurfaceCondition::Dry,
+        );
+        assert!(
+            fhwa_driving_effects(&dry, RoadContext::Arterial)
+                .max_decel_mps2
+                .is_infinite()
+        );
+        let ice = WeatherState::new(
+            WeatherKind::Clear,
+            0.0,
+            f64::INFINITY,
+            SurfaceCondition::Ice,
+        );
         let cap = fhwa_driving_effects(&ice, RoadContext::Arterial).max_decel_mps2;
         assert!((cap - 0.980_665).abs() < 1e-9, "{cap}");
         let wet = WeatherState::new(WeatherKind::Rain, 0.2, f64::INFINITY, SurfaceCondition::Wet);
@@ -379,8 +391,14 @@ mod scenario_weather_tests {
 
     #[test]
     fn a_city_street_takes_the_arterial_rows_and_an_expressway_the_freeway_rows() {
-        assert_eq!(RoadContext::BySpeedLimit.resolve(11.176), RoadContext::Arterial);
-        assert_eq!(RoadContext::BySpeedLimit.resolve(22.352), RoadContext::Freeway);
+        assert_eq!(
+            RoadContext::BySpeedLimit.resolve(11.176),
+            RoadContext::Arterial
+        );
+        assert_eq!(
+            RoadContext::BySpeedLimit.resolve(22.352),
+            RoadContext::Freeway
+        );
         assert_eq!(RoadContext::Freeway.resolve(5.0), RoadContext::Freeway);
         // Rain slows a 25 mph street by the arterial band's midpoint, 17.5 %.
         let rain = WeatherState::new(WeatherKind::Rain, 0.2, f64::INFINITY, SurfaceCondition::Wet);

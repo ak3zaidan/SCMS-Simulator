@@ -824,10 +824,7 @@ fn modeled_directory() -> &'static RwLock<BTreeMap<[u8; PUBLIC_MATERIAL_BYTES], 
 }
 
 /// Records a generated key's commitment against its public material.
-fn record_modeled_commitment(
-    public_material: [u8; PUBLIC_MATERIAL_BYTES],
-    commitment: [u8; 32],
-) {
+fn record_modeled_commitment(public_material: [u8; PUBLIC_MATERIAL_BYTES], commitment: [u8; 32]) {
     if let Ok(mut d) = modeled_directory().write() {
         d.insert(public_material, commitment);
     }

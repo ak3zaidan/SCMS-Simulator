@@ -125,44 +125,119 @@ impl Bound {
 /// A number that belongs in a range belongs here and nowhere else. `world.imported_at`,
 /// `time.t0` and the cross-field rules are not ranges and stay as rules below.
 pub static BOUNDS: &[Bound] = &[
-    Bound { path: "time.duration_s", lo: 0.0, hi: f64::INFINITY, exclusive_lo: true,
-            what: "the run length" },
+    Bound {
+        path: "time.duration_s",
+        lo: 0.0,
+        hi: f64::INFINITY,
+        exclusive_lo: true,
+        what: "the run length",
+    },
     // ADR 0004 decision 2: below 10 ms no mobility provider is calibrated for the step,
     // and above 100 ms the constant-velocity extrapolation between steps stops being
     // accurate enough for frame-level radio.
-    Bound { path: "time.mobility_step_ms", lo: 10.0, hi: 100.0, exclusive_lo: false,
-            what: "the mobility period" },
-    Bound { path: "world.buildings.metres_per_level", lo: 1.5, hi: 10.0,
-            exclusive_lo: false, what: "the storey height" },
-    Bound { path: "actors.vehicles.equipped_fraction", lo: 0.0, hi: 1.0,
-            exclusive_lo: false, what: "the equipped fraction" },
-    Bound { path: "actors.vehicles.classes.*.fraction", lo: 0.0, hi: 1.0,
-            exclusive_lo: false, what: "the class share" },
-    Bound { path: "actors.vehicles.demand.rate_veh_per_h", lo: 0.0, hi: f64::INFINITY,
-            exclusive_lo: false, what: "the arrival rate" },
-    Bound { path: "actors.vru.device_fraction", lo: 0.0, hi: 1.0, exclusive_lo: false,
-            what: "the device fraction" },
-    Bound { path: "actors.backend.links[].latency_ms", lo: 0.0, hi: f64::INFINITY,
-            exclusive_lo: false, what: "the one-way latency" },
-    Bound { path: "actors.backend.links[].capacity_mbps", lo: 0.0, hi: f64::INFINITY,
-            exclusive_lo: true, what: "the link capacity" },
+    Bound {
+        path: "time.mobility_step_ms",
+        lo: 10.0,
+        hi: 100.0,
+        exclusive_lo: false,
+        what: "the mobility period",
+    },
+    Bound {
+        path: "world.buildings.metres_per_level",
+        lo: 1.5,
+        hi: 10.0,
+        exclusive_lo: false,
+        what: "the storey height",
+    },
+    Bound {
+        path: "actors.vehicles.equipped_fraction",
+        lo: 0.0,
+        hi: 1.0,
+        exclusive_lo: false,
+        what: "the equipped fraction",
+    },
+    Bound {
+        path: "actors.vehicles.classes.*.fraction",
+        lo: 0.0,
+        hi: 1.0,
+        exclusive_lo: false,
+        what: "the class share",
+    },
+    Bound {
+        path: "actors.vehicles.demand.rate_veh_per_h",
+        lo: 0.0,
+        hi: f64::INFINITY,
+        exclusive_lo: false,
+        what: "the arrival rate",
+    },
+    Bound {
+        path: "actors.vru.device_fraction",
+        lo: 0.0,
+        hi: 1.0,
+        exclusive_lo: false,
+        what: "the device fraction",
+    },
+    Bound {
+        path: "actors.backend.links[].latency_ms",
+        lo: 0.0,
+        hi: f64::INFINITY,
+        exclusive_lo: false,
+        what: "the one-way latency",
+    },
+    Bound {
+        path: "actors.backend.links[].capacity_mbps",
+        lo: 0.0,
+        hi: f64::INFINITY,
+        exclusive_lo: true,
+        what: "the link capacity",
+    },
     // The same `[0, 1]` scale `v2xw_core::WeatherState::intensity` uses; each model's
     // card declares what its own 1.0 means.
-    Bound { path: "weather.intensity", lo: 0.0, hi: 1.0, exclusive_lo: false,
-            what: "the weather intensity" },
-    Bound { path: "weather.visibility_m", lo: 0.0, hi: f64::INFINITY, exclusive_lo: true,
-            what: "the meteorological visibility" },
-    Bound { path: "radio.tiers.focus.region.radius_m", lo: 0.0, hi: f64::INFINITY,
-            exclusive_lo: true, what: "the follow radius" },
-    Bound { path: "security.pseudonym_change.period_s", lo: 1.0, hi: 86_400.0,
-            exclusive_lo: false, what: "the rotation period" },
+    Bound {
+        path: "weather.intensity",
+        lo: 0.0,
+        hi: 1.0,
+        exclusive_lo: false,
+        what: "the weather intensity",
+    },
+    Bound {
+        path: "weather.visibility_m",
+        lo: 0.0,
+        hi: f64::INFINITY,
+        exclusive_lo: true,
+        what: "the meteorological visibility",
+    },
+    Bound {
+        path: "radio.tiers.focus.region.radius_m",
+        lo: 0.0,
+        hi: f64::INFINITY,
+        exclusive_lo: true,
+        what: "the follow radius",
+    },
+    Bound {
+        path: "security.pseudonym_change.period_s",
+        lo: 1.0,
+        hi: 86_400.0,
+        exclusive_lo: false,
+        what: "the rotation period",
+    },
     // A rotation distance below a metre is not a distance and above a hundred kilometres
     // is longer than any trip this simulator places, so either is an author error rather
     // than a study.
-    Bound { path: "security.pseudonym_change.distance_m", lo: 1.0, hi: 100_000.0,
-            exclusive_lo: false, what: "the rotation distance" },
-    Bound { path: "threats.attackers[].fraction", lo: 0.0, hi: 1.0, exclusive_lo: false,
-            what: "the attacker fraction" },
+    Bound {
+        path: "security.pseudonym_change.distance_m",
+        lo: 1.0,
+        hi: 100_000.0,
+        exclusive_lo: false,
+        what: "the rotation distance",
+    },
+    Bound {
+        path: "threats.attackers[].fraction",
+        lo: 0.0,
+        hi: 1.0,
+        exclusive_lo: false,
+        what: "the attacker fraction",
+    },
 ];
 
 /// One closed set of values the loader accepts and the published schema offers.
@@ -188,7 +263,13 @@ pub struct Choices {
 
 /// A choice set with no conditional narrowing.
 const fn choices(path: &'static str, values: &'static [&'static str]) -> Choices {
-    Choices { path, values, narrowed_by: "", narrowed_when: "", narrowed_to: &[] }
+    Choices {
+        path,
+        values,
+        narrowed_by: "",
+        narrowed_when: "",
+        narrowed_to: &[],
+    }
 }
 
 /// Every closed value set in the schema whose members are fixed strings.
@@ -260,179 +341,316 @@ pub struct KeyStatus {
 /// reach the page unclassified.
 pub static KEY_STATUS: &[KeyStatus] = &[
     // --- the run -----------------------------------------------------------
-    KeyStatus { path: "schema", status: Status::Wired,
-        note: "The schema version. The loader migrates by it." },
-    KeyStatus { path: "meta", status: Status::Descriptive,
+    KeyStatus {
+        path: "schema",
+        status: Status::Wired,
+        note: "The schema version. The loader migrates by it.",
+    },
+    KeyStatus {
+        path: "meta",
+        status: Status::Descriptive,
         note: "Describes the scenario: shown with it in the page's scenario list and kept \
                with the scenario in every recording and in the scenario digest. By design \
-               it changes nothing the run computes." },
-    KeyStatus { path: "meta.name", status: Status::Wired,
-        note: "Names the output directory, the recording's run label and the manifest." },
-    KeyStatus { path: "meta.base", status: Status::Wired,
+               it changes nothing the run computes.",
+    },
+    KeyStatus {
+        path: "meta.name",
+        status: Status::Wired,
+        note: "Names the output directory, the recording's run label and the manifest.",
+    },
+    KeyStatus {
+        path: "meta.base",
+        status: Status::Wired,
         note: "The scenario this one overlays; resolved by the loader before anything \
-               else." },
-    KeyStatus { path: "seed", status: Status::Wired,
-        note: "The master seed. Every random draw in the run derives from it." },
-    KeyStatus { path: "time.t0", status: Status::Wired,
+               else.",
+    },
+    KeyStatus {
+        path: "seed",
+        status: Status::Wired,
+        note: "The master seed. Every random draw in the run derives from it.",
+    },
+    KeyStatus {
+        path: "time.t0",
+        status: Status::Wired,
         note: "The civil instant simulated time zero is; every 1609.2 generationTime is \
-               stamped from it." },
-    KeyStatus { path: "time.duration_s", status: Status::Wired,
-        note: "The run horizon." },
-    KeyStatus { path: "time.mobility_step_ms", status: Status::Wired,
+               stamped from it.",
+    },
+    KeyStatus {
+        path: "time.duration_s",
+        status: Status::Wired,
+        note: "The run horizon.",
+    },
+    KeyStatus {
+        path: "time.mobility_step_ms",
+        status: Status::Wired,
         note: "The mobility period, and the step the stream and run.seek are quantised \
-               to." },
-    KeyStatus { path: "time.des_resolution", status: Status::Refused,
+               to.",
+    },
+    KeyStatus {
+        path: "time.des_resolution",
+        status: Status::Refused,
         note: "The resolution the run promises its models. The kernel keeps nanoseconds \
                whatever this says; the loader refuses a resolution the run cannot keep — \
                '1ms' with a PHY or MAC that times frames in microseconds, or a \
-               time-dilation window off the promised grid." },
-    KeyStatus { path: "time.time_dilation", status: Status::Partial,
+               time-dilation window off the promised grid.",
+    },
+    KeyStatus {
+        path: "time.time_dilation",
+        status: Status::Partial,
         note: "Inside a window no radio frame is generated: the frames are counted as \
                suppressed in the run report and in run.status. The mobility tier is not \
-               lowered inside a window, and no metric is marked not-observed for one." },
+               lowered inside a window, and no metric is marked not-observed for one.",
+    },
     // --- the world ---------------------------------------------------------
-    KeyStatus { path: "world.source", status: Status::Wired,
+    KeyStatus {
+        path: "world.source",
+        status: Status::Wired,
         note: "Where the world comes from. Procedural grids and OpenStreetMap XML are \
-               built; the other source kinds return an unsupported-source error." },
-    KeyStatus { path: "world.imported_at", status: Status::Wired,
+               built; the other source kinds return an unsupported-source error.",
+    },
+    KeyStatus {
+        path: "world.imported_at",
+        status: Status::Wired,
         note: "The import date the world's provenance records. Supplied here because no \
-               part of the engine may read a clock." },
-    KeyStatus { path: "world.buildings.enabled", status: Status::Wired,
+               part of the engine may read a clock.",
+    },
+    KeyStatus {
+        path: "world.buildings.enabled",
+        status: Status::Wired,
         note: "Whether buildings obstruct radio links. On, a link through a building \
                loses 9 dB per wall and 0.4 dB per metre inside (Sommer 2011), capped at \
                the around-the-corner street-canyon loss of 3GPP TR 37.885's urban NLOS \
                law; off, every link is line of sight. Buildings are imported and drawn \
-               either way. Applies at the medium and high propagation tiers." },
-    KeyStatus { path: "world.buildings.keep_holes", status: Status::Wired,
-        note: "Whether interior courtyards stay holes in a footprint." },
-    KeyStatus { path: "world.buildings.metres_per_level", status: Status::Wired,
+               either way. Applies at the medium and high propagation tiers.",
+    },
+    KeyStatus {
+        path: "world.buildings.keep_holes",
+        status: Status::Wired,
+        note: "Whether interior courtyards stay holes in a footprint.",
+    },
+    KeyStatus {
+        path: "world.buildings.metres_per_level",
+        status: Status::Wired,
         note: "Overrides the importer's storey height for buildings tagged with levels \
-               rather than a height." },
-    KeyStatus { path: "world.terrain", status: Status::Wired,
+               rather than a height.",
+    },
+    KeyStatus {
+        path: "world.terrain",
+        status: Status::Wired,
         note: "A digital elevation model (an SRTM .hgt tile or a geographic ESRI ASCII \
                grid) is read, resampled onto the world, and obstructs radio links by \
                ITU-R P.526 knife-edge diffraction over the ground profile. Roads and \
-               buildings are not lifted onto it. No file: the world is flat." },
-    KeyStatus { path: "world.cache", status: Status::Wired,
+               buildings are not lifted onto it. No file: the world is flat.",
+    },
+    KeyStatus {
+        path: "world.cache",
+        status: Status::Wired,
         note: "A directory: the imported world is kept there, keyed by the world section \
                and the source file's contents, and read back exactly on the next run \
-               instead of importing again." },
-    KeyStatus { path: "world.highway_preset", status: Status::Wired,
+               instead of importing again.",
+    },
+    KeyStatus {
+        path: "world.highway_preset",
+        status: Status::Wired,
         note: "Which jurisdiction's fallback speed limits the OpenStreetMap importer \
-               uses. An OSM import is refused without it." },
+               uses. An OSM import is refused without it.",
+    },
     // --- what moves --------------------------------------------------------
-    KeyStatus { path: "actors.vehicles.demand.kind", status: Status::Wired,
+    KeyStatus {
+        path: "actors.vehicles.demand.kind",
+        status: Status::Wired,
         note: "Which demand model runs: 'mobility/demand/none', 'mobility/demand/poisson' \
                (the thinned-Poisson model) or 'mobility/demand/tr36885-drop' (the 3GPP \
-               TR 36.885 vehicle drop). Any other id is refused." },
-    KeyStatus { path: "actors.vehicles.demand.rate_veh_per_h", status: Status::Wired,
-        note: "Vehicles per hour offered to the network." },
-    KeyStatus { path: "actors.vehicles.demand.params", status: Status::Wired,
+               TR 36.885 vehicle drop). Any other id is refused.",
+    },
+    KeyStatus {
+        path: "actors.vehicles.demand.rate_veh_per_h",
+        status: Status::Wired,
+        note: "Vehicles per hour offered to the network.",
+    },
+    KeyStatus {
+        path: "actors.vehicles.demand.params",
+        status: Status::Wired,
         note: "The named model's own parameters: the Poisson model's (with an optional \
                'od' object for the origin-destination law) or the drop model's. \
-               'max_total_vehicles' asks the Poisson model for an exact fleet size." },
-    KeyStatus { path: "actors.vehicles.equipped_fraction", status: Status::Wired,
-        note: "What share of vehicles carry a radio. 0 is a legal pure-traffic run." },
-    KeyStatus { path: "actors.vehicles.classes", status: Status::Wired,
+               'max_total_vehicles' asks the Poisson model for an exact fleet size.",
+    },
+    KeyStatus {
+        path: "actors.vehicles.equipped_fraction",
+        status: Status::Wired,
+        note: "What share of vehicles carry a radio. 0 is a legal pure-traffic run.",
+    },
+    KeyStatus {
+        path: "actors.vehicles.classes",
+        status: Status::Wired,
         note: "The fleet mix: each vehicle's class is drawn with these shares, and its \
                size, driver, hardware profile and CAM station type follow from the class. \
-               Only motorised classes; cyclists and pedestrians are actors.vru." },
-    KeyStatus { path: "actors.vru", status: Status::Partial,
+               Only motorised classes; cyclists and pedestrians are actors.vru.",
+    },
+    KeyStatus {
+        path: "actors.vru",
+        status: Status::Partial,
         note: "Pedestrians walk the sidewalk and crossing lanes (social-force model) and \
                cyclists ride the lanes that admit bicycles (car-following on the SUMO \
                bicycle vType); each one who finishes is replaced, so the count holds. \
                Both need such lanes: an OpenStreetMap import has them, the procedural \
                grid does not. device_fraction must be 0: no VRU device (PSM/VAM) is \
-               hosted by the kernel yet." },
-    KeyStatus { path: "actors.rsus", status: Status::Wired,
-        note: "Roadside units. Placed, given a profile and a role set, and they transmit." },
-    KeyStatus { path: "actors.rsus[].backhaul", status: Status::NotImplemented,
+               hosted by the kernel yet.",
+    },
+    KeyStatus {
+        path: "actors.rsus",
+        status: Status::Wired,
+        note: "Roadside units. Placed, given a profile and a role set, and they transmit.",
+    },
+    KeyStatus {
+        path: "actors.rsus[].backhaul",
+        status: Status::NotImplemented,
         note: "The backhaul latency in force is a fixed constant from the SCMS \
-               parameters; this id is read by nothing." },
-    KeyStatus { path: "actors.backend.protocol", status: Status::Wired,
+               parameters; this id is read by nothing.",
+    },
+    KeyStatus {
+        path: "actors.backend.protocol",
+        status: Status::Wired,
         note: "The credential-management protocol. Naming the CAMP SCMS is what turns the \
-               whole backend on." },
-    KeyStatus { path: "actors.backend.entities", status: Status::NotImplemented,
+               whole backend on.",
+    },
+    KeyStatus {
+        path: "actors.backend.entities",
+        status: Status::NotImplemented,
         note: "The backend runs on fixed built-in parameters. Per-entity profiles, \
-               service models and network models are read by nothing." },
-    KeyStatus { path: "actors.backend.links", status: Status::NotImplemented,
+               service models and network models are read by nothing.",
+    },
+    KeyStatus {
+        path: "actors.backend.links",
+        status: Status::NotImplemented,
         note: "Validated as a topology and then ignored: every backend hop uses one \
-               constant latency and no capacity limit." },
+               constant latency and no capacity limit.",
+    },
     // --- environment -------------------------------------------------------
-    KeyStatus { path: "weather.initial", status: Status::Wired,
+    KeyStatus {
+        path: "weather.initial",
+        status: Status::Wired,
         note: "The weather drivers, the radio and the GNSS model start in. Rain, snow and \
                fog lower desired speeds and stretch headways by the FHWA Road Weather \
                Management bands (arterial rows on city streets, freeway rows at 50 mph \
-               and over); a weather-front event changes it and its end restores it." },
-    KeyStatus { path: "weather.intensity", status: Status::Wired,
+               and over); a weather-front event changes it and its end restores it.",
+    },
+    KeyStatus {
+        path: "weather.intensity",
+        status: Status::Wired,
         note: "Heavy (0.5 and over) takes the FHWA heavy-rain and heavy-snow rows for \
                drivers; the high-tier propagation model reads it for rain and sleet. The \
-               0.5 threshold is an uncalibrated choice, stated on the card." },
-    KeyStatus { path: "weather.visibility_m", status: Status::Wired,
+               0.5 threshold is an uncalibrated choice, stated on the card.",
+    },
+    KeyStatus {
+        path: "weather.visibility_m",
+        status: Status::Wired,
         note: "Drivers keep to a speed they can stop from within what they can see: the \
                AASHTO stopping sight distance (2.5 s reaction, 3.4 m/s^2) solved for \
-               speed." },
-    KeyStatus { path: "weather.surface", status: Status::Partial,
+               speed.",
+    },
+    KeyStatus {
+        path: "weather.surface",
+        status: Status::Partial,
         note: "Caps braking at the surface's grip, mu*g (wet 0.5, snow 0.25, ice 0.1; \
                secondary friction figures), which also shrinks the comfortable braking \
-               the car-following model plans with. A dry surface is not capped." },
+               the car-following model plans with. A dry surface is not capped.",
+    },
     // --- radio -------------------------------------------------------------
-    KeyStatus { path: "radio.rat", status: Status::Wired,
+    KeyStatus {
+        path: "radio.rat",
+        status: Status::Wired,
         note: "The radio access technology. dsrc-80211p runs CSMA/CA with J2945/1 \
                congestion control on channel 172; lte-v2x-pc5 runs Mode 4 sensing-based \
                semi-persistent scheduling on a 10 MHz, four-sub-channel pool in channel \
                183; nr-v2x-pc5 runs Mode 2 at 30 kHz with re-evaluation and pre-emption. \
-               'hybrid' is refused: it needs a per-message policy no key states." },
-    KeyStatus { path: "radio.tiers.propagation", status: Status::Wired,
+               'hybrid' is refused: it needs a per-message policy no key states.",
+    },
+    KeyStatus {
+        path: "radio.tiers.propagation",
+        status: Status::Wired,
         note: "Path-loss fidelity. Abstract is free-space; medium and high are \
-               log-distance with shadowing." },
-    KeyStatus { path: "radio.tiers.phy", status: Status::Wired,
+               log-distance with shadowing.",
+    },
+    KeyStatus {
+        path: "radio.tiers.phy",
+        status: Status::Wired,
         note: "Physical-layer fidelity. Medium decides each frame from its SINR over time \
                with the 802.11p error model; high adds preamble capture, which only \
                changes frames that overlap another at the receiver, so a sparse run gives \
-               the same result at either." },
-    KeyStatus { path: "radio.tiers.mac", status: Status::Wired,
+               the same result at either.",
+    },
+    KeyStatus {
+        path: "radio.tiers.mac",
+        status: Status::Wired,
         note: "Medium-access fidelity. Abstract has no MAC (reception comes from a \
                table); medium and high run the same 802.11p EDCA/OCB CSMA model with \
-               J2945/1 congestion control, so high adds nothing over medium." },
-    KeyStatus { path: "radio.tiers.focus", status: Status::Partial,
+               J2945/1 congestion control, so high adds nothing over medium.",
+    },
+    KeyStatus {
+        path: "radio.tiers.focus",
+        status: Status::Partial,
         note: "A region — a disc following one node, or a map box — whose links run the \
                propagation and the receiver at the focus tier (at high: weather \
                attenuation and preamble capture). Links entering it use the surrounding \
                propagation with no fading draw. Medium access stays one model for the \
-               whole world, and 802.11p only: a sidelink run ignores the region's PHY tier." },
-    KeyStatus { path: "radio.models", status: Status::Wired,
+               whole world, and 802.11p only: a sidelink run ignores the region's PHY tier.",
+    },
+    KeyStatus {
+        path: "radio.models",
+        status: Status::Wired,
         note: "Picks a model per radio family, overriding the tier's default: \
                propagation (free-space, two-ray-ground, log-distance with a named preset, \
                tr37885), fading (none, nakagami-m with a preset), per (the 802.11p error \
                model's implementation loss), phy (the 802.11p sensitivity table) and \
-               obstacle (the Sommer building row). Unknown families and ids are refused." },
+               obstacle (the Sommer building row). Unknown families and ids are refused.",
+    },
     // --- network -----------------------------------------------------------
-    KeyStatus { path: "net.layer", status: Status::Wired,
+    KeyStatus {
+        path: "net.layer",
+        status: Status::Wired,
         note: "The network and transport header every frame carries: 'wsmp' (IEEE 1609.3, \
                5 octets for a BSM) or 'gn-btp' (ETSI GeoNetworking with BTP, 44 octets for a \
                CAM). LLC/SNAP, the 802.11 MAC header and the FCS are added below either, \
                and the air time and the overhead metrics are computed over the whole \
-               frame." },
-    KeyStatus { path: "net.fragmenter", status: Status::Refused,
+               frame.",
+    },
+    KeyStatus {
+        path: "net.fragmenter",
+        status: Status::Refused,
         note: "Only 'fragmenter/none' loads, and it is enforced: a signed message larger \
                than the network layer's MTU (1,400 octets for WSMP, 1,398 for \
                GeoNetworking) is refused before the MAC and counted in the run report. The \
                splitting fragmenters are refused because no message this build signs \
                comes near the MTU (a CAM with a certificate is about 400 octets), so they \
                would have nothing to split; they matter once post-quantum signatures can \
-               be selected, which security.signature does not yet offer." },
-    KeyStatus { path: "net.backhaul", status: Status::NotImplemented,
-        note: "Read by nothing." },
-    KeyStatus { path: "net.uu", status: Status::NotImplemented,
-        note: "Read by nothing: there is no cellular uplink in this build." },
-    KeyStatus { path: "net.backend_net", status: Status::NotImplemented,
-        note: "Read by nothing." },
+               be selected, which security.signature does not yet offer.",
+    },
+    KeyStatus {
+        path: "net.backhaul",
+        status: Status::NotImplemented,
+        note: "Read by nothing.",
+    },
+    KeyStatus {
+        path: "net.uu",
+        status: Status::NotImplemented,
+        note: "Read by nothing: there is no cellular uplink in this build.",
+    },
+    KeyStatus {
+        path: "net.backend_net",
+        status: Status::NotImplemented,
+        note: "Read by nothing.",
+    },
     // --- messages ----------------------------------------------------------
-    KeyStatus { path: "messages.sets", status: Status::Refused,
+    KeyStatus {
+        path: "messages.sets",
+        status: Status::Refused,
         note: "Which message sets the nodes generate. Only the BSM and the CAM have a \
-               generator, so anything else is refused rather than silently unsent." },
-    KeyStatus { path: "messages.generator", status: Status::Wired,
+               generator, so anything else is refused rather than silently unsent.",
+    },
+    KeyStatus {
+        path: "messages.generator",
+        status: Status::Wired,
         note: "Tunes the generators. Under any id, params.phase_window_ms (each node's \
                phase is uniform over it; default 100) and params.max_jitter_ms (a \
                per-message delay before the radio; default 10) place every node's \
@@ -441,94 +659,173 @@ pub static KEY_STATUS: &[KeyStatus] = &[
                time between BSMs, and 'generator/cam-en302637-2' the EN 302 637-2 CAM \
                triggering intervals and thresholds; the other generator keeps the \
                standard's defaults. Nodes run at the mobility step, so an interval shorter \
-               than it is refused." },
-    KeyStatus { path: "messages.codec_tier", status: Status::Refused,
+               than it is refused.",
+    },
+    KeyStatus {
+        path: "messages.codec_tier",
+        status: Status::Refused,
         note: "Only 'uper' loads, and it is what runs: every BSM and CAM is encoded for \
                real. The size-model tier (build decision D2) covers SPaT, MAP, PSM, SRM, \
                SSM, CPM and VAM — messages no node in this build generates — so selecting \
-               it would change no frame and is refused rather than ignored." },
+               it would change no frame and is refused rather than ignored.",
+    },
     // --- security ----------------------------------------------------------
-    KeyStatus { path: "security.envelope", status: Status::Wired,
-        note: "Which secured-message envelope the nodes use." },
-    KeyStatus { path: "security.protocol", status: Status::NotImplemented,
+    KeyStatus {
+        path: "security.envelope",
+        status: Status::Wired,
+        note: "Which secured-message envelope the nodes use.",
+    },
+    KeyStatus {
+        path: "security.protocol",
+        status: Status::NotImplemented,
         note: "The credential protocol is selected by actors.backend.protocol. This key \
-               is read by nothing." },
-    KeyStatus { path: "security.signature", status: Status::NotImplemented,
+               is read by nothing.",
+    },
+    KeyStatus {
+        path: "security.signature",
+        status: Status::NotImplemented,
         note: "Cross-checked against the crypto mode and then ignored: the primitive is \
-               fixed in the security crate." },
-    KeyStatus { path: "security.crypto_mode", status: Status::Wired,
+               fixed in the security crate.",
+    },
+    KeyStatus {
+        path: "security.crypto_mode",
+        status: Status::Wired,
         note: "Whether signing and verification are costed or actually computed. Both \
-               produce the same event log; only the manifest and the timing differ." },
-    KeyStatus { path: "security.verification_policy", status: Status::Partial,
+               produce the same event log; only the manifest and the timing differ.",
+    },
+    KeyStatus {
+        path: "security.verification_policy",
+        status: Status::Partial,
         note: "The policy is selected, but its threshold is a fixed number: there is no \
                scenario key for the on-demand relevance threshold or the prioritised \
-               range." },
-    KeyStatus { path: "security.signer_id_policy", status: Status::Wired,
-        note: "How often a full certificate is attached instead of an eight-byte digest." },
-    KeyStatus { path: "security.pseudonym_change.strategy", status: Status::Partial,
+               range.",
+    },
+    KeyStatus {
+        path: "security.signer_id_policy",
+        status: Status::Wired,
+        note: "How often a full certificate is attached instead of an eight-byte digest.",
+    },
+    KeyStatus {
+        path: "security.pseudonym_change.strategy",
+        status: Status::Partial,
         note: "time changes pseudonym at period_s of age and distance after distance_m of \
                travel (v2xw_proto::pseudonym); silent makes no scheduled change. \
                mix-zone changes only on leaving a mix zone, and no world has mix zones yet, \
                so it behaves as silent. Expiry and revocation force a change under every \
-               strategy." },
-    KeyStatus { path: "security.pseudonym_change.period_s", status: Status::Wired,
+               strategy.",
+    },
+    KeyStatus {
+        path: "security.pseudonym_change.period_s",
+        status: Status::Wired,
         note: "The age at which the time strategy changes pseudonym (default 300 s, the \
                J2945/1 CERTCHG interval). Each vehicle holds a batch of 20 pseudonyms and \
-               uses every one before reusing any." },
-    KeyStatus { path: "security.pseudonym_change.distance_m", status: Status::Wired,
+               uses every one before reusing any.",
+    },
+    KeyStatus {
+        path: "security.pseudonym_change.distance_m",
+        status: Status::Wired,
         note: "The travel after which the distance strategy changes pseudonym (default \
-               2 km, the NYC pilot's rule)." },
+               2 km, the NYC pilot's rule).",
+    },
     // --- nodes -------------------------------------------------------------
-    KeyStatus { path: "nodes.default_obu", status: Status::Wired,
+    KeyStatus {
+        path: "nodes.default_obu",
+        status: Status::Wired,
         note: "The hardware profile every equipped vehicle runs on: its compute, its \
-               security module and its radio." },
-    KeyStatus { path: "nodes.per_class", status: Status::Wired,
-        note: "Per-vehicle-class overrides of the profile above." },
-    KeyStatus { path: "nodes.compute_tier", status: Status::Partial,
+               security module and its radio.",
+    },
+    KeyStatus {
+        path: "nodes.per_class",
+        status: Status::Wired,
+        note: "Per-vehicle-class overrides of the profile above.",
+    },
+    KeyStatus {
+        path: "nodes.compute_tier",
+        status: Status::Partial,
         note: "abstract: signing and verification cost a microsecond and no node is ever \
                compute-bound. medium and high: every operation costs the hardware \
                profile's service time and queues behind the node's servers; high adds \
-               nothing over medium yet." },
-    KeyStatus { path: "nodes.backend_tier", status: Status::NotImplemented,
-        note: "Read by nothing." },
+               nothing over medium yet.",
+    },
+    KeyStatus {
+        path: "nodes.backend_tier",
+        status: Status::NotImplemented,
+        note: "Read by nothing.",
+    },
     // --- threats and detection --------------------------------------------
-    KeyStatus { path: "threats.attackers", status: Status::Wired,
-        note: "Attacker populations: which model, how many, and when they are active." },
-    KeyStatus { path: "threats.attackers[].params", status: Status::Partial,
+    KeyStatus {
+        path: "threats.attackers",
+        status: Status::Wired,
+        note: "Attacker populations: which model, how many, and when they are active.",
+    },
+    KeyStatus {
+        path: "threats.attackers[].params",
+        status: Status::Partial,
         note: "Only 'intensity' and 'dt_s' are read; any other key in the object is \
-               silently dropped." },
-    KeyStatus { path: "threats.jammers", status: Status::Wired,
+               silently dropped.",
+    },
+    KeyStatus {
+        path: "threats.jammers",
+        status: Status::Wired,
         note: "Fixed-position jammers: constant, pulsed (period_ms, duty) or reactive \
                (trigger_dbm), with position_m, power_dbm and an active window. Their \
                energy raises the noise at every receiver in range, holds 802.11p carrier \
                sense busy, counts as channel load, and a frame they kill is reported \
-               'jammed'." },
-    KeyStatus { path: "threats.compromised_rsus", status: Status::NotImplemented,
-        note: "Read by nothing." },
-    KeyStatus { path: "detection.local", status: Status::Partial,
-        note: "The detector suite is installed by id. Its parameters are not read." },
-    KeyStatus { path: "detection.ma", status: Status::NotImplemented,
+               'jammed'.",
+    },
+    KeyStatus {
+        path: "threats.compromised_rsus",
+        status: Status::NotImplemented,
+        note: "Read by nothing.",
+    },
+    KeyStatus {
+        path: "detection.local",
+        status: Status::Partial,
+        note: "The detector suite is installed by id. Its parameters are not read.",
+    },
+    KeyStatus {
+        path: "detection.ma",
+        status: Status::NotImplemented,
         note: "The misbehaviour authority runs on built-in parameters; naming a pipeline \
-               model selects nothing." },
-    KeyStatus { path: "detection.responder", status: Status::NotImplemented,
-        note: "Read by nothing." },
-    KeyStatus { path: "detection.perception_tier", status: Status::NotImplemented,
-        note: "Read by nothing: there is no perception model in this build." },
+               model selects nothing.",
+    },
+    KeyStatus {
+        path: "detection.responder",
+        status: Status::NotImplemented,
+        note: "Read by nothing.",
+    },
+    KeyStatus {
+        path: "detection.perception_tier",
+        status: Status::NotImplemented,
+        note: "Read by nothing: there is no perception model in this build.",
+    },
     // --- measurement -------------------------------------------------------
-    KeyStatus { path: "metrics", status: Status::Wired,
-        note: "Which metric providers to install; 'all' selects every registered one." },
-    KeyStatus { path: "exporters", status: Status::Wired,
+    KeyStatus {
+        path: "metrics",
+        status: Status::Wired,
+        note: "Which metric providers to install; 'all' selects every registered one.",
+    },
+    KeyStatus {
+        path: "exporters",
+        status: Status::Wired,
         note: "Written after the run, over its recording: 'recording' keeps the MCAP, \
                'jsonl', 'parquet' and 'arrow' write one table per recorded channel. \
                opts.profile 'node' drops every ground-truth channel and column. Naming \
-               any exporter makes the run record." },
-    KeyStatus { path: "events", status: Status::Partial,
+               any exporter makes the run record.",
+    },
+    KeyStatus {
+        path: "events",
+        status: Status::Partial,
         note: "Timeline items are scheduled and fire. Only 'outage' and 'weather.front' \
                do anything; a demand multiplier, an attack wave, a parameter change and a \
-               closure are counted and change nothing." },
-    KeyStatus { path: "experiment", status: Status::Wired,
+               closure are counted and change nothing.",
+    },
+    KeyStatus {
+        path: "experiment",
+        status: Status::Wired,
         note: "The parameter sweep. Expanded by the experiment runner, not by a single \
-               run: the engine clears it before running a cell." },
+               run: the engine clears it before running a cell.",
+    },
 ];
 
 /// The status entry that governs `path`: the longest matching prefix.
@@ -562,7 +859,6 @@ pub fn bound_of(path: &str) -> Option<&'static Bound> {
 pub fn choices_of(path: &str) -> Option<&'static Choices> {
     CHOICES.iter().find(|c| c.path == path)
 }
-
 
 /// Every problem with `s`, in schema order. Empty means the scenario is loadable.
 pub fn validate(s: &Scenario) -> Vec<ScenarioError> {
@@ -637,12 +933,13 @@ fn unreachable_keys(s: &Scenario, e: &mut Vec<ScenarioError>) {
                 ),
             ));
         }
-        if let Err(ScenarioError::Conflict { field, conflict: why }) =
-            crate::export::profile_of(x, i).map_err(|err| match err {
-                crate::EngineError::Scenario(inner) => inner,
-                other => ScenarioError::conflict("exporters", other.to_string()),
-            })
-        {
+        if let Err(ScenarioError::Conflict {
+            field,
+            conflict: why,
+        }) = crate::export::profile_of(x, i).map_err(|err| match err {
+            crate::EngineError::Scenario(inner) => inner,
+            other => ScenarioError::conflict("exporters", other.to_string()),
+        }) {
             e.push(conflict(&field, why));
         }
     }
@@ -785,8 +1082,7 @@ fn time(s: &Scenario, e: &mut Vec<ScenarioError>) {
     // SIFS 32 µs in a 10 MHz channel (IEEE 802.11-2020 §17.4, Table 17-21) — and a millisecond
     // grid cannot hold either.
     if s.time.des_resolution == "1ms"
-        && (s.radio.tiers.phy != Tier::Abstract
-            || s.radio.tiers.mac != Tier::Abstract)
+        && (s.radio.tiers.phy != Tier::Abstract || s.radio.tiers.mac != Tier::Abstract)
     {
         e.push(conflict(
             "time.des_resolution",
@@ -1065,7 +1361,12 @@ fn actors(s: &Scenario, e: &mut Vec<ScenarioError>) {
 /// 40 and the propagation model would be handed it. A generated form would have offered
 /// an unbounded number box for a `[0, 1]` quantity.
 fn weather(s: &Scenario, e: &mut Vec<ScenarioError>) {
-    bounded_at("weather.intensity", "weather.intensity", s.weather.intensity, e);
+    bounded_at(
+        "weather.intensity",
+        "weather.intensity",
+        s.weather.intensity,
+        e,
+    );
     if let Some(v) = s.weather.visibility_m {
         bounded_at("weather.visibility_m", "weather.visibility_m", v, e);
     }
@@ -1136,8 +1437,7 @@ fn radio(s: &Scenario, e: &mut Vec<ScenarioError>) {
                 ),
             ));
         }
-        if let crate::scenario::schema::FocusRegion::Follow { radius_m, .. } = f.region
-        {
+        if let crate::scenario::schema::FocusRegion::Follow { radius_m, .. } = f.region {
             bounded_at(
                 "radio.tiers.focus.region.radius_m",
                 "radio.tiers.focus.region.radius_m",
@@ -1283,13 +1583,22 @@ fn generator(s: &Scenario, g: &crate::scenario::ModelChoice, e: &mut Vec<Scenari
                 .collect();
             e.push(conflict(
                 &format!("messages.generator.params.{key}"),
-                format!("is not a parameter of '{}'; it has {}", g.id, all.join(", ")),
+                format!(
+                    "is not a parameter of '{}'; it has {}",
+                    g.id,
+                    all.join(", ")
+                ),
             ));
         }
     }
     let get = |n: &str| values.iter().find(|(k, _)| k == n).and_then(|(_, v)| *v);
     // A node is stepped once per mobility step, so it cannot send more often than that.
-    for n in ["nominal_itt_ms", "min_itt_ms", "t_gen_cam_min_ms", "t_check_cam_gen_ms"] {
+    for n in [
+        "nominal_itt_ms",
+        "min_itt_ms",
+        "t_gen_cam_min_ms",
+        "t_check_cam_gen_ms",
+    ] {
         if let Some(v) = get(n)
             && v < step_ms
         {

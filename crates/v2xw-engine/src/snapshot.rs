@@ -57,7 +57,7 @@ use v2xw_core::time::Duration;
 use v2xw_mobility::VehicleClass;
 use v2xw_record::wire::Frame;
 use v2xw_record::wire::snapshot::{ST_ATTACKER, ST_EQUIPPED, ST_TRANSMITTING};
-use v2xw_record::{ActorPose, Cadence, Profile, Snapshot, SlotAllocator, SnapshotEncoder};
+use v2xw_record::{ActorPose, Cadence, Profile, SlotAllocator, Snapshot, SnapshotEncoder};
 
 use crate::error::Result;
 
@@ -191,11 +191,7 @@ impl SnapshotStream {
     /// engine bug rather than a scenario error, and each is reported rather than
     /// swallowed: a run that silently stopped writing the wire stream is the defect this
     /// module was written to close.
-    pub fn encode(
-        &mut self,
-        at: v2xw_core::time::SimTime,
-        states: &[ActorState],
-    ) -> Result<Frame> {
+    pub fn encode(&mut self, at: v2xw_core::time::SimTime, states: &[ActorState]) -> Result<Frame> {
         let mut actors: Vec<ActorPose> = Vec::with_capacity(states.len());
         for s in states {
             let slot = self.slots.allocate(s.actor, at);

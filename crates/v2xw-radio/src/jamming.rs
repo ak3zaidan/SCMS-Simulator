@@ -632,7 +632,11 @@ impl PulsedJammer {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            card: pulsed_card(PUNAL_JAMMER_TX_POWER_DBM, PULSED_DEFAULT_PERIOD_NS, PULSED_DEFAULT_DUTY),
+            card: pulsed_card(
+                PUNAL_JAMMER_TX_POWER_DBM,
+                PULSED_DEFAULT_PERIOD_NS,
+                PULSED_DEFAULT_DUTY,
+            ),
             tx_power_dbm: PUNAL_JAMMER_TX_POWER_DBM,
             channel: ChannelId::CCH,
             period_ns: PULSED_DEFAULT_PERIOD_NS,
@@ -1399,7 +1403,10 @@ mod tests {
         assert!(!field.is_empty());
         // Two equal powers sum to +3 dB.
         let both = field.power_dbm_at(rx, ChannelId::CCH, 700);
-        assert!((both - (-60.0 + 3.010_299_956_639_812)).abs() < 1e-9, "{both}");
+        assert!(
+            (both - (-60.0 + 3.010_299_956_639_812)).abs() < 1e-9,
+            "{both}"
+        );
         // One only.
         let one = field.power_dbm_at(rx, ChannelId::CCH, 100);
         assert!((one - (-60.0)).abs() < 1e-12, "{one}");

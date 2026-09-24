@@ -432,8 +432,8 @@ fn reflect_file(text: &str) -> Vec<RItem> {
                     .next()
                     .unwrap_or("")
                     .to_string();
-                let wire = attr_str(&fattrs, "rename")
-                    .unwrap_or_else(|| rename_all(&vname, &policy));
+                let wire =
+                    attr_str(&fattrs, "rename").unwrap_or_else(|| rename_all(&vname, &policy));
                 let mut variant = RVariant {
                     wire_name: wire,
                     doc: join_doc(&fdocs),
@@ -543,7 +543,10 @@ fn emit_reflection() {
         out.push_str("        ],\n        variants: &[\n");
         for v in &it.variants {
             out.push_str("            RVariant {\n");
-            out.push_str(&format!("                wire_name: {},\n", lit(&v.wire_name)));
+            out.push_str(&format!(
+                "                wire_name: {},\n",
+                lit(&v.wire_name)
+            ));
             out.push_str(&format!("                doc: {},\n", lit(&v.doc)));
             out.push_str("                fields: &[\n");
             for f in &v.fields {

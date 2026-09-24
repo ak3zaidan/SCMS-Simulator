@@ -122,7 +122,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_bytes += bytes;
         println!("  {channel:22} {count:>12} records {bytes:>14} json bytes");
     }
-    println!("  {:22} {:>12} records {total_bytes:>14} json bytes", "TOTAL", digest.written());
+    println!(
+        "  {:22} {:>12} records {total_bytes:>14} json bytes",
+        "TOTAL",
+        digest.written()
+    );
     println!("content digest  {}", digest.digest_hex());
 
     for i in 1..repeat {
@@ -132,7 +136,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let same_digest = again.digest_hex() == digest.digest_hex();
         println!(
             "repeat {i:<3}      digest {} | report {}",
-            if same_digest { "IDENTICAL" } else { "DIFFERENT" },
+            if same_digest {
+                "IDENTICAL"
+            } else {
+                "DIFFERENT"
+            },
             if report_again == report {
                 "IDENTICAL"
             } else {
@@ -242,7 +250,10 @@ fn print_curve(memory: &MemoryRecorder) {
         }
     }
     println!("\n-- packet delivery ratio vs distance ----------------------");
-    println!("  {:>12}  {:>10}  {:>10}  {:>7}  dominant loss", "distance m", "attempts", "decoded", "pdr");
+    println!(
+        "  {:>12}  {:>10}  {:>10}  {:>7}  dominant loss",
+        "distance m", "attempts", "decoded", "pdr"
+    );
     for (bin, (attempts, ok)) in &bins {
         let lo = *bin as f64 * BIN_M;
         let dominant = causes

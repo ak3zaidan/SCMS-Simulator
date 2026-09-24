@@ -48,7 +48,11 @@ fn c3_an_unknown_event_channel_is_skipped_by_payload_len() {
     );
 
     let decoded = EventBody::decode(&body.encode()).expect("the batch decodes");
-    assert_eq!(decoded.entries.len(), 3, "an unknown channel is not dropped");
+    assert_eq!(
+        decoded.entries.len(),
+        3,
+        "an unknown channel is not dropped"
+    );
 
     let known: Vec<u16> = decoded.entries.iter().map(|e| e.channel_id).collect();
     assert_eq!(known, vec![10, 11, 0x7F01], "sorted by (time, channel_id)");
@@ -112,7 +116,10 @@ fn c4_event_entries_are_sorted_and_payloads_are_eight_aligned() {
     let mut sorted = order.clone();
     sorted.sort_unstable();
     assert_eq!(order, sorted, "the index is not sorted by (time, channel)");
-    assert_eq!(order, vec![(1_000, 10), (1_000, 30), (2_000, 1), (2_000, 11)]);
+    assert_eq!(
+        order,
+        vec![(1_000, 10), (1_000, 30), (2_000, 1), (2_000, 11)]
+    );
 
     // The prefix offsets are where the index and the payload area start (§3.6.1).
     assert_eq!(
@@ -165,7 +172,11 @@ fn c7_the_symbol_table_is_append_only_within_a_connection() {
     assert!(second > first, "ids are assigned in append order");
     assert_eq!(table.get(first), Some("metric/pdr"));
     assert_eq!(table.get(second), Some("metric/ttc"));
-    assert_eq!(table.get(9_999), None, "an id past the end resolves to nothing");
+    assert_eq!(
+        table.get(9_999),
+        None,
+        "an id past the end resolves to nothing"
+    );
 
     // Nothing ever changes the meaning of an id that has been handed out.
     let before: Vec<String> = table.strings.clone();

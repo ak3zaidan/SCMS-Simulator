@@ -535,7 +535,11 @@ impl SpsEngine {
     #[must_use]
     pub fn latency_budget_slots(&self) -> u64 {
         let rri = self.params.rri.slots(self.pool.mu);
-        if rri > 0 { rri } else { self.params.t2_slots.max(1) }
+        if rri > 0 {
+            rri
+        } else {
+            self.params.t2_slots.max(1)
+        }
     }
 
     /// The SDUs dropped for their latency budget since the last call, oldest first.
@@ -1177,15 +1181,12 @@ impl<C: Ctx + ?Sized> Mac<C> for SpsEngine {
         let budget = self.latency_budget_slots();
         {
             let pool_slot = |t: SimTime| self.pool.slot_of(t);
-            let expired_heads = self
-                .ues
-                .get(&node.index())
-                .map_or(0, |s| {
-                    s.queue
-                        .iter()
-                        .take_while(|q| pool_slot(q.enqueued_at) + budget < now_slot)
-                        .count()
-                });
+            let expired_heads = self.ues.get(&node.index()).map_or(0, |s| {
+                s.queue
+                    .iter()
+                    .take_while(|q| pool_slot(q.enqueued_at) + budget < now_slot)
+                    .count()
+            });
             if expired_heads > 0 {
                 let st = self.state(node);
                 let gone: Vec<MacSdu> = st.queue.drain(..expired_heads).collect();
@@ -1222,9 +1223,7 @@ impl<C: Ctx + ?Sized> Mac<C> for SpsEngine {
         let reason = match self.reservation(node) {
             None => Some(SelectionReason::NoReservation),
             Some(r) if r.len < len => Some(SelectionReason::SizeChange),
-            Some(r) if r.next_slot > arrival_slot + budget => {
-                Some(SelectionReason::LatencyBudget)
-            }
+            Some(r) if r.next_slot > arrival_slot + budget => Some(SelectionReason::LatencyBudget),
             Some(_) if self.is_preempted(node, now_slot) => Some(SelectionReason::Preemption),
             Some(_) if self.needs_reevaluation(node, now_slot) => {
                 Some(SelectionReason::Reevaluation)
@@ -1765,7 +1764,10 @@ mod tests {
             Some(SelectionReason::SizeChange)
         );
         assert_eq!(e.last_selection(node).map(|s| s.resource.len), Some(2));
-        assert_eq!(e.selections_by_reason().get(&SelectionReason::SizeChange), Some(&1));
+        assert_eq!(
+            e.selections_by_reason().get(&SelectionReason::SizeChange),
+            Some(&1)
+        );
     }
 
     /// A transport block still queued when its latency budget has passed is dropped and

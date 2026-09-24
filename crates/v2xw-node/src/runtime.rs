@@ -55,13 +55,12 @@ use v2xw_record::wire::telemetry::NodeTelemetry;
 use crate::clock::ClockModel;
 use crate::ctx::{NodeCtx, NodeCtxExt};
 use crate::generate::{MessageSchedule, ServiceSet};
-use crate::secure::{CryptoMode, NodeSecurity, PSID_SAFETY, SignedFrame, SpduVerdict};
 use crate::policy::{
-    PolicyView, Prioritized, RxSummary, VerificationPolicy, VerifyDecision,
-    VerifyDecisionRecord,
+    PolicyView, Prioritized, RxSummary, VerificationPolicy, VerifyDecision, VerifyDecisionRecord,
 };
 use crate::profile::{HardwareProfile, RunsOn};
 use crate::queue::{Admission, DropCause, DropLedger, NodeQueue, QueueKind, Queued};
+use crate::secure::{CryptoMode, NodeSecurity, PSID_SAFETY, SignedFrame, SpduVerdict};
 use crate::server::{OpDescriptor, ProfileServiceModel, ServerBank, ServiceModel};
 use crate::stores::{
     CredentialHandle, Neighbor, NeighborTable, PeerCertCache, Stores, VerificationState,
@@ -626,10 +625,7 @@ impl ObuRuntime {
         inbox: Vec<RxFrame>,
         distance_travelled_m: f64,
     ) -> StepOutcome {
-        let stamped = inbox
-            .into_iter()
-            .map(|f| (f, RxStamp::default()))
-            .collect();
+        let stamped = inbox.into_iter().map(|f| (f, RxStamp::default())).collect();
         self.step_timed(ctx, stamped, distance_travelled_m)
     }
 
@@ -668,7 +664,9 @@ impl ObuRuntime {
             // A switched-off radio hears nothing; the frames it was handed are reported as
             // such rather than vanishing.
             for (_, stamp) in inbox {
-                let at = stamp.arrived_at.map_or(believed, |t| self.clock.believed_time(t));
+                let at = stamp
+                    .arrived_at
+                    .map_or(believed, |t| self.clock.believed_time(t));
                 out.rx_reports.push(RxReport {
                     token: stamp.token,
                     disposition: RxDisposition::NodeOff,
@@ -911,7 +909,12 @@ impl ObuRuntime {
     /// if that is after `until` it is still waiting and so is everything behind it. A check
     /// that starts is charged to its server, classified, delivered, and reported with the
     /// instants it really started and finished.
-    fn advance_verifications(&mut self, ctx: &mut dyn NodeCtx, until: SimTime, out: &mut StepOutcome) {
+    fn advance_verifications(
+        &mut self,
+        ctx: &mut dyn NodeCtx,
+        until: SimTime,
+        out: &mut StepOutcome,
+    ) {
         let probe = OpDescriptor::verify(self.config.verify_op, 0);
         if self.service.service_time(ctx, &probe).is_none() {
             // The profile costs no verification. Nothing is verified and nothing is
@@ -1214,10 +1217,7 @@ impl ObuRuntime {
                 continue;
             };
             let sid = self.security.signer_id_for(r.msg_type, believed);
-            let Ok((frame, pdu)) =
-                self.security
-                    .sign(ctx, r.msg_type, &payload, sid, None)
-            else {
+            let Ok((frame, pdu)) = self.security.sign(ctx, r.msg_type, &payload, sid, None) else {
                 self.drops.record(DropCause::TxOverflow);
                 continue;
             };

@@ -1522,7 +1522,10 @@ fn a_signal_groups_timeline_is_its_movements_most_permissive_state() {
         assert!(timelines.len() >= 2, "a crossroads has two head groups");
         for (group, timeline) in &timelines {
             let total: f64 = timeline.iter().map(|(_, d)| d).sum();
-            assert!((total - plan.cycle_s).abs() < 1e-6, "the timeline covers the cycle");
+            assert!(
+                (total - plan.cycle_s).abs() < 1e-6,
+                "the timeline covers the cycle"
+            );
             // Walk the cycle in 0.1 s steps and compare with the movements.
             for k in 0..(plan.cycle_s * 10.0) as usize {
                 let t = k as f64 * 0.1 + 0.05;

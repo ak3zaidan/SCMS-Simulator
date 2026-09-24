@@ -547,9 +547,11 @@ impl TrafficAuditor {
             };
             if state == SignalState::Amber {
                 still.insert(a.actor);
-                self.amber_onset
-                    .entry(a.actor)
-                    .or_insert((next, lane.length_m - a.s_m, a.speed_mps));
+                self.amber_onset.entry(a.actor).or_insert((
+                    next,
+                    lane.length_m - a.s_m,
+                    a.speed_mps,
+                ));
             }
         }
         self.amber_onset.retain(|a, _| still.contains(a));
@@ -1049,7 +1051,10 @@ impl TrafficAuditor {
                     t,
                     a,
                     None,
-                    format!("speed {:.2} -> {:.2} m/s in {dt:.2} s", p.speed_mps, a.speed_mps),
+                    format!(
+                        "speed {:.2} -> {:.2} m/s in {dt:.2} s",
+                        p.speed_mps, a.speed_mps
+                    ),
                 );
                 self.flag(Check::SpeedJump, ex);
             }
@@ -1107,11 +1112,14 @@ impl TrafficAuditor {
                 // lane change adds its own heading swing, which the engine caps at 12°.
                 let travelled = 0.5 * (a.speed_mps + p.speed_mps) * dt;
                 let bound = travelled / self.params.min_turn_radius_m + 0.02;
-                if turn > bound + if a.changing.is_some() || p.changing.is_some() {
-                    0.21
-                } else {
-                    0.0
-                } {
+                if turn
+                    > bound
+                        + if a.changing.is_some() || p.changing.is_some() {
+                            0.21
+                        } else {
+                            0.0
+                        }
+                {
                     let ex = Self::example(
                         Check::HeadingJump,
                         t,
@@ -1142,8 +1150,7 @@ impl TrafficAuditor {
             let since = *self.standing_since.entry(a.actor).or_insert(t);
             let standing = ns_to_secs(t.saturating_sub(since));
             self.stats.max_standstill_s = self.stats.max_standstill_s.max(standing);
-            if standing > self.params.standstill_limit_s && self.flagged_standing.insert(a.actor)
-            {
+            if standing > self.params.standstill_limit_s && self.flagged_standing.insert(a.actor) {
                 let ex = Self::example(
                     Check::Standstill,
                     t,
@@ -1156,12 +1163,7 @@ impl TrafficAuditor {
         }
     }
 
-    fn check_despawns(
-        &mut self,
-        world: &World,
-        t: SimTime,
-        despawned: &[(ActorId, DespawnCause)],
-    ) {
+    fn check_despawns(&mut self, world: &World, t: SimTime, despawned: &[(ActorId, DespawnCause)]) {
         for (actor, cause) in despawned {
             if *cause == DespawnCause::TripComplete {
                 self.stats.trips_completed += 1;
@@ -1480,7 +1482,10 @@ mod tests {
             &world,
             0,
             100_000_000,
-            &[at(&world, 0, lane, 10.0, 0.0), at(&world, 1, lane, 24.5, 0.0)],
+            &[
+                at(&world, 0, lane, 10.0, 0.0),
+                at(&world, 1, lane, 24.5, 0.0),
+            ],
             &[],
         );
         assert_eq!(audit.report().count(Check::Overlap), 0);
@@ -1490,7 +1495,10 @@ mod tests {
             &world,
             100_000_000,
             200_000_000,
-            &[at(&world, 0, lane, 21.0, 0.0), at(&world, 1, lane, 24.5, 0.0)],
+            &[
+                at(&world, 0, lane, 21.0, 0.0),
+                at(&world, 1, lane, 24.5, 0.0),
+            ],
             &[],
         );
         let r = audit.report();
@@ -1503,12 +1511,36 @@ mod tests {
         let world = grid();
         let lane = straight_lane(&world).id;
         let mut audit = TrafficAuditor::new(&world, AuditParams::default());
-        audit.observe(&world, 0, 100_000_000, &[at(&world, 0, lane, 10.0, 5.0)], &[]);
-        audit.observe(&world, 100_000_000, 200_000_000, &[at(&world, 0, lane, 10.5, 5.0)], &[]);
+        audit.observe(
+            &world,
+            0,
+            100_000_000,
+            &[at(&world, 0, lane, 10.0, 5.0)],
+            &[],
+        );
+        audit.observe(
+            &world,
+            100_000_000,
+            200_000_000,
+            &[at(&world, 0, lane, 10.5, 5.0)],
+            &[],
+        );
         assert_eq!(audit.report().count(Check::Teleport), 0);
-        audit.observe(&world, 200_000_000, 300_000_000, &[at(&world, 0, lane, 20.0, 5.0)], &[]);
+        audit.observe(
+            &world,
+            200_000_000,
+            300_000_000,
+            &[at(&world, 0, lane, 20.0, 5.0)],
+            &[],
+        );
         assert_eq!(audit.report().count(Check::Teleport), 1);
-        audit.observe(&world, 300_000_000, 400_000_000, &[at(&world, 0, lane, 20.5, 9.0)], &[]);
+        audit.observe(
+            &world,
+            300_000_000,
+            400_000_000,
+            &[at(&world, 0, lane, 20.5, 9.0)],
+            &[],
+        );
         assert_eq!(audit.report().count(Check::SpeedJump), 1);
     }
 
@@ -1527,7 +1559,13 @@ mod tests {
             .id;
         let mut audit = TrafficAuditor::new(&world, AuditParams::default());
         audit.observe(&world, 0, 100_000_000, &[at(&world, 0, a, 10.0, 5.0)], &[]);
-        audit.observe(&world, 100_000_000, 200_000_000, &[at(&world, 0, far, 10.0, 5.0)], &[]);
+        audit.observe(
+            &world,
+            100_000_000,
+            200_000_000,
+            &[at(&world, 0, far, 10.0, 5.0)],
+            &[],
+        );
         assert_eq!(audit.report().count(Check::IllegalTransition), 1);
     }
 
@@ -1555,7 +1593,13 @@ mod tests {
         let len = world.lane(approach).length_m;
         for (t0, expect) in [(green, 0u64), (red, 1u64)] {
             let mut audit = TrafficAuditor::new(&world, AuditParams::default());
-            audit.observe(&world, t0, t0 + 100_000_000, &[at(&world, 0, approach, len - 0.2, 5.0)], &[]);
+            audit.observe(
+                &world,
+                t0,
+                t0 + 100_000_000,
+                &[at(&world, 0, approach, len - 0.2, 5.0)],
+                &[],
+            );
             let mut inside = at(&world, 0, internal, 0.3, 5.0);
             inside.prev_lane = Some(approach);
             audit.observe(&world, t0 + 100_000_000, t0 + 200_000_000, &[inside], &[]);
@@ -1630,11 +1674,9 @@ mod tests {
 
     #[test]
     fn a_body_inside_a_building_is_flagged() {
-        let world = v2xw_world::procedural::grid(
-            &GridParams::tr36885_urban(),
-            &ImportOptions::default(),
-        )
-        .expect("grid");
+        let world =
+            v2xw_world::procedural::grid(&GridParams::tr36885_urban(), &ImportOptions::default())
+                .expect("grid");
         let building = world.buildings.first().expect("block buildings");
         let ring = building.open_ring();
         let cx = ring.iter().map(|p| p.x).sum::<f64>() / ring.len() as f64;
@@ -1687,7 +1729,11 @@ mod tests {
         let mut b = at(&world, 0, lane, 10.5, 4.8);
         b.accel_mps2 = -2.5;
         audit.observe(&world, 100_000_000, 200_000_000, &[b], &[]);
-        assert_eq!(audit.report().count(Check::Jerk), 0, "5 m/s³ is within the bound");
+        assert_eq!(
+            audit.report().count(Check::Jerk),
+            0,
+            "5 m/s³ is within the bound"
+        );
         assert_eq!(audit.report().count(Check::AccelBound), 0);
         let mut c = at(&world, 0, lane, 11.0, 4.0);
         c.accel_mps2 = -9.5; // beyond the tyre-road limit, and 70 m/s³ of jerk
@@ -1753,11 +1799,16 @@ mod tests {
             .iter()
             .filter(|l| l.kind == LaneKind::Driving && l.length_m > 60.0)
             .find_map(|l| {
-                world.edge(l.edge).lanes.iter().copied().find(|o| {
-                    let o = world.lane(*o);
-                    o.id != l.id && (i32::from(o.index) - i32::from(l.index)).abs() == 1
-                })
-                .map(|o| (l.id, o))
+                world
+                    .edge(l.edge)
+                    .lanes
+                    .iter()
+                    .copied()
+                    .find(|o| {
+                        let o = world.lane(*o);
+                        o.id != l.id && (i32::from(o.index) - i32::from(l.index)).abs() == 1
+                    })
+                    .map(|o| (l.id, o))
             })
             .expect("a two-lane edge");
         let len = world.lane(from).length_m;
@@ -1771,7 +1822,10 @@ mod tests {
             moved.lateral_m = -3.4;
             audit.observe(&world, 100_000_000, 200_000_000, &[moved, queued], &[]);
             let r = audit.report();
-            (r.count(Check::LaneChangeNearJunction), r.count(Check::QueueJump))
+            (
+                r.count(Check::LaneChangeNearJunction),
+                r.count(Check::QueueJump),
+            )
         };
         // 20 m before the end, beside a queue at the line: both.
         assert_eq!(change(len - 20.0), (1, 1));

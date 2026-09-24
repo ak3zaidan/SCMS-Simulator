@@ -39,7 +39,6 @@ fn rooted(mut scenario: Scenario) -> Scenario {
     scenario
 }
 
-
 fn run(scenario: Scenario) -> (RunReport, String) {
     let mut engine = Engine::build(scenario, "").expect("builds");
     let mut recorder = DigestRecorder::new();
@@ -112,7 +111,10 @@ fn without_the_crl_role_the_revocation_never_reaches_a_vehicle() {
     assert!(p.reports_received > 0);
     assert_eq!(p.crls_issued, 1);
     // And the second half is gone.
-    assert_eq!(p.crl_broadcasts, 0, "a unit with no `crl` role broadcast one");
+    assert_eq!(
+        p.crl_broadcasts, 0,
+        "a unit with no `crl` role broadcast one"
+    );
     assert_eq!(p.crls_installed, 0);
     assert_eq!(p.revoked_receptions, 0);
 }
@@ -131,7 +133,10 @@ fn without_the_report_forward_role_the_authority_hears_nothing() {
         p.reports_sent > 0,
         "the detectors still have to fire, or this proves nothing"
     );
-    assert_eq!(p.reports_received, 0, "a report crossed a backhaul that is not there");
+    assert_eq!(
+        p.reports_received, 0,
+        "a report crossed a backhaul that is not there"
+    );
     assert_eq!(p.crls_issued, 0);
 }
 
@@ -151,7 +156,10 @@ fn with_no_attacker_nothing_is_revoked() {
     let p = &report.phase2;
     assert_eq!(p.attackers, 0);
     assert_eq!(p.falsified_claims, 0);
-    assert!(p.messages_checked > 0, "the detectors must still be running");
+    assert!(
+        p.messages_checked > 0,
+        "the detectors must still be running"
+    );
     assert_eq!(
         p.crls_issued, 0,
         "a device was revoked in a run with no attacker in it"
@@ -216,7 +224,10 @@ fn the_phase_2_run_is_deterministic() {
     let (second_report, second) = run(phase2());
     assert_eq!(first, second, "the content digests differ");
     assert_eq!(first_report, second_report, "the run reports differ");
-    assert!(first_report.phase2.crls_issued > 0, "nothing happened to be deterministic about");
+    assert!(
+        first_report.phase2.crls_issued > 0,
+        "nothing happened to be deterministic about"
+    );
 }
 
 /// A role belongs to the unit that declares it, not to the scenario.

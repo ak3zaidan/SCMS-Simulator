@@ -365,7 +365,10 @@ mod tests {
 
     #[test]
     fn a_modelled_message_makes_an_overhead_result_uncitable() {
-        let tally = TxTally::of(&[tx(Some("cam"), 400, Some(289)), tx(Some("psm"), 100, Some(39))]);
+        let tally = TxTally::of(&[
+            tx(Some("cam"), 400, Some(289)),
+            tx(Some("psm"), 100, Some(39)),
+        ]);
         let report = ByteProvenanceReport::new(&tally, &declared());
         assert!(!report.all_real());
         assert_eq!(report.real_bytes, 400);

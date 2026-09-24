@@ -73,7 +73,9 @@ fn the_run_writes_keyframes_and_deltas() {
 
     let mut kinds = Vec::new();
     for frame in recorder.frames() {
-        let header = frame.header().expect("a frame this crate wrote has a header");
+        let header = frame
+            .header()
+            .expect("a frame this crate wrote has a header");
         let kind = header.kind().expect("a known message type");
         assert!(
             matches!(kind, MsgType::Keyframe | MsgType::Delta),

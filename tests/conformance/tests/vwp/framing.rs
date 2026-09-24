@@ -5,11 +5,11 @@
 
 use v2xw_record::RecordError;
 use v2xw_record::fixture::{RunShape, live_frames};
+use v2xw_record::wire::hello::NodeRow;
 use v2xw_record::wire::snapshot::{
     ABS_STRIDE, ACTOR_STRIDE, DELTA_PREFIX_BYTES, DESPAWN_STRIDE, DeltaBody, KEYFRAME_PREFIX_BYTES,
     KeyframeBody, LANE_STRIDE, MOVED_STRIDE, SIGNAL_STRIDE, SPAWN_STRIDE, is_aligned,
 };
-use v2xw_record::wire::hello::NodeRow;
 use v2xw_record::wire::{
     FLAG_COMPRESSED, Frame, HEADER_BYTES, MAGIC, MsgType, TRANSPORT_FLAG_MASK, VERSION_MAJOR,
     get_u32, put_u16, put_u32, put_u64,
@@ -37,7 +37,11 @@ fn hand_built(msg_type: u16, body: &[u8]) -> Vec<u8> {
     put_u32(&mut bytes, 0, MAGIC);
     put_u16(&mut bytes, 4, VERSION_MAJOR);
     put_u16(&mut bytes, 6, msg_type);
-    put_u32(&mut bytes, 8, u32::try_from(body.len()).expect("small body"));
+    put_u32(
+        &mut bytes,
+        8,
+        u32::try_from(body.len()).expect("small body"),
+    );
     put_u16(&mut bytes, 12, 0);
     put_u16(&mut bytes, 14, 0);
     put_u64(&mut bytes, 16, 7);
@@ -199,7 +203,10 @@ fn f5_every_array_offset_satisfies_the_alignment_rule() {
                     (d.despawns.len(), DESPAWN_STRIDE),
                     (d.signals.len(), SIGNAL_STRIDE),
                 ] {
-                    assert!(is_aligned(at, 4), "a block starts at {at}, which is not 4-aligned");
+                    assert!(
+                        is_aligned(at, 4),
+                        "a block starts at {at}, which is not 4-aligned"
+                    );
                     at += stride * count;
                 }
                 assert!(at <= body.len(), "the blocks run past the body");

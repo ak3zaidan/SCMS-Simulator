@@ -476,9 +476,12 @@ mod tests {
             ),
             ..k
         };
-        let view: GtKinematicsView =
-            decode(&GtKinematics::new(ActorId::new(7), &braking, "car").to_owned_record().expect("serialises"))
-                .expect("decodes");
+        let view: GtKinematicsView = decode(
+            &GtKinematics::new(ActorId::new(7), &braking, "car")
+                .to_owned_record()
+                .expect("serialises"),
+        )
+        .expect("decodes");
         assert!(
             view.acc_mps2.is_some_and(|a| (a + 3.0).abs() < 2e-3),
             "a car braking at 3 m/s² recorded {:?}",

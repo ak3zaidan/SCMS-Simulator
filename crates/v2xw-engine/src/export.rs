@@ -68,7 +68,11 @@ pub fn profile_of(spec: &ExporterSpec, index: usize) -> Result<v2xw_record::Expo
 /// # Errors
 /// [`EngineError::Io`] if the recording cannot be read or a file cannot be written, and a
 /// scenario conflict for an id this build does not implement.
-pub fn run_exporters(specs: &[ExporterSpec], recording: &Path, out_dir: &Path) -> Result<Vec<Exported>> {
+pub fn run_exporters(
+    specs: &[ExporterSpec],
+    recording: &Path,
+    out_dir: &Path,
+) -> Result<Vec<Exported>> {
     let mut out = Vec::new();
     let mut records = None;
     for (i, spec) in specs.iter().enumerate() {
@@ -77,7 +81,11 @@ pub fn run_exporters(specs: &[ExporterSpec], recording: &Path, out_dir: &Path) -
                 let bytes = std::fs::metadata(recording).map(|m| m.len()).unwrap_or(0);
                 out.push(Exported {
                     exporter: spec.id.clone(),
-                    files: vec![ExportedPath { path: recording.to_path_buf(), rows: 0, bytes }],
+                    files: vec![ExportedPath {
+                        path: recording.to_path_buf(),
+                        rows: 0,
+                        bytes,
+                    }],
                 });
                 continue;
             }
@@ -87,12 +95,16 @@ pub fn run_exporters(specs: &[ExporterSpec], recording: &Path, out_dir: &Path) -
             other => {
                 return Err(EngineError::Scenario(crate::ScenarioError::conflict(
                     format!("exporters[{i}].id"),
-                    format!("'{other}' is not an exporter this build has; one of {}", EXPORTERS.join(", ")),
+                    format!(
+                        "'{other}' is not an exporter this build has; one of {}",
+                        EXPORTERS.join(", ")
+                    ),
                 )));
             }
         };
         if records.is_none() {
-            let mut reader = v2xw_record::Reader::open(recording).map_err(record_error(recording))?;
+            let mut reader =
+                v2xw_record::Reader::open(recording).map_err(record_error(recording))?;
             records = Some(reader.records(None).map_err(record_error(recording))?);
         }
         let dir = out_dir.join(&spec.id);
@@ -100,7 +112,8 @@ pub fn run_exporters(specs: &[ExporterSpec], recording: &Path, out_dir: &Path) -
             path: dir.display().to_string(),
             source: e,
         })?;
-        let exporter = v2xw_record::Exporter::new(&dir, profile_of(spec, i)?).map_err(record_error(&dir))?;
+        let exporter =
+            v2xw_record::Exporter::new(&dir, profile_of(spec, i)?).map_err(record_error(&dir))?;
         let files = exporter
             .export_all(records.as_deref().unwrap_or(&[]), format)
             .map_err(record_error(&dir))?;
@@ -108,7 +121,11 @@ pub fn run_exporters(specs: &[ExporterSpec], recording: &Path, out_dir: &Path) -
             exporter: spec.id.clone(),
             files: files
                 .into_iter()
-                .map(|f| ExportedPath { path: f.path, rows: f.rows, bytes: f.bytes })
+                .map(|f| ExportedPath {
+                    path: f.path,
+                    rows: f.rows,
+                    bytes: f.bytes,
+                })
                 .collect(),
         });
     }

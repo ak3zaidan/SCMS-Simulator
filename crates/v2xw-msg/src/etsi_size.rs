@@ -453,10 +453,9 @@ impl MessageCodec for EtsiSizeCodec {
 
     fn encode(&self, msg: &Message) -> Result<Encoded, CodecError> {
         match msg {
-            Message::Modeled(request) => Ok(Encoded::size_model(
-                self.size_of(request)?,
-                ETSI_VERSION,
-            )),
+            Message::Modeled(request) => {
+                Ok(Encoded::size_model(self.size_of(request)?, ETSI_VERSION))
+            }
             other => Err(CodecError::Unsupported {
                 codec: ETSI_SIZE_MODEL_ID.to_string(),
                 ty: other.msg_type(),
@@ -542,7 +541,9 @@ mod tests {
             "the CPM rows come from a measured table and must not be flagged: {todo:?}"
         );
         assert!(
-            !todo.iter().any(|n| n.ends_with("per_element_b") && n.starts_with("vam_")),
+            !todo
+                .iter()
+                .any(|n| n.ends_with("per_element_b") && n.starts_with("vam_")),
             "the VAM increment is cited (TR 2052 §3.1) and must not be flagged: {todo:?}"
         );
     }

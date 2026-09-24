@@ -291,8 +291,9 @@ fn a_key_the_engine_cannot_act_on_is_refused_and_names_itself() {
         (
             "messages.generator.id",
             Box::new(|s: &mut Scenario| {
-                s.messages.generator =
-                    Some(v2xw_engine::scenario::ModelChoice::new("generator/nonexistent"));
+                s.messages.generator = Some(v2xw_engine::scenario::ModelChoice::new(
+                    "generator/nonexistent",
+                ));
             }),
         ),
         (
@@ -348,7 +349,10 @@ fn gn_btp_and_a_generator_override_validate() {
     let (bsm, cam) = v2xw_engine::wiring::generator_params(&s);
     assert_eq!(bsm.nominal_itt.as_nanos(), 200_000_000);
     assert_eq!(bsm.max_itt.as_nanos(), 600_000_000);
-    assert_eq!(bsm.min_itt, v2xw_msg::generator::BsmGenParams::j2945_1().min_itt);
+    assert_eq!(
+        bsm.min_itt,
+        v2xw_msg::generator::BsmGenParams::j2945_1().min_itt
+    );
     assert_eq!(cam, v2xw_msg::generator::CamGenParams::en302637_2());
 }
 

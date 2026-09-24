@@ -636,7 +636,8 @@ impl ImportReport {
             s,
             "speed limits      preset {}: {} drivable lanes tagged, {} took the class \
              default",
-            self.highway_preset.map_or("(none selected)", HighwayPreset::label),
+            self.highway_preset
+                .map_or("(none selected)", HighwayPreset::label),
             c.speeds_tagged,
             c.speeds_defaulted
         );
@@ -657,7 +658,8 @@ impl ImportReport {
                 a.threshold_mps,
                 SPEED_AUDIT_FACTOR,
                 a.tagged_p95_mps,
-                self.highway_preset.map_or("(none selected)", HighwayPreset::label),
+                self.highway_preset
+                    .map_or("(none selected)", HighwayPreset::label),
             );
         } else {
             let _ = writeln!(
@@ -4488,7 +4490,8 @@ fn build_movements(
                         .copied();
                     if let Some((b, turn, _)) = best {
                         let departure = &net.edge_info[b];
-                        let to_lane = departure.lanes[target_lane(turn, k, &[k], departure.lanes.len())];
+                        let to_lane =
+                            departure.lanes[target_lane(turn, k, &[k], departure.lanes.len())];
                         add_movement(
                             net,
                             &mut movements,

@@ -53,8 +53,8 @@ use v2xw_core::event::EventClass;
 use v2xw_core::ids::{FrameSeq, NodeId};
 use v2xw_core::time::{Duration, SimTime};
 use v2xw_radio::{
-    AccessCategory, ChannelId, Mac, MacSdu, PoolConfig, RxOutcome, SidelinkPhy,
-    SlArrival, SlInterferer, SlResource, SpsEngine, SpsParams,
+    AccessCategory, ChannelId, Mac, MacSdu, PoolConfig, RxOutcome, SidelinkPhy, SlArrival,
+    SlInterferer, SlResource, SpsEngine, SpsParams,
 };
 
 use super::{Engine, FrameState, LinkOutcome};
@@ -318,7 +318,10 @@ impl Engine {
             if let Some(sl) = self.sidelink.as_mut() {
                 sl.report.grants += 1;
             }
-            let air_ok = self.frames.get(&frame).is_some_and(|f| f.air.after(now) <= horizon);
+            let air_ok = self
+                .frames
+                .get(&frame)
+                .is_some_and(|f| f.air.after(now) <= horizon);
             if let Some(state) = self.frames.get_mut(&frame) {
                 state.start = now;
                 state.end = state.air.after(now);
@@ -407,16 +410,24 @@ impl Engine {
                     continue;
                 }
                 if let Some(&(other_power, _)) = other.arrivals.get(&rx) {
-                    state.sl_interferers.entry(rx).or_default().push(SlInterferer {
-                        node: other.tx,
-                        power_dbm: other_power,
-                        resource: other_res,
-                    });
-                    other.sl_interferers.entry(rx).or_default().push(SlInterferer {
-                        node: state.tx,
-                        power_dbm: power,
-                        resource,
-                    });
+                    state
+                        .sl_interferers
+                        .entry(rx)
+                        .or_default()
+                        .push(SlInterferer {
+                            node: other.tx,
+                            power_dbm: other_power,
+                            resource: other_res,
+                        });
+                    other
+                        .sl_interferers
+                        .entry(rx)
+                        .or_default()
+                        .push(SlInterferer {
+                            node: state.tx,
+                            power_dbm: power,
+                            resource,
+                        });
                 }
             }
         }
@@ -449,11 +460,10 @@ impl Engine {
         };
         // Whether any other transport block of this slot shared a sub-channel with this
         // one — counted once per transport block, when its slot ends.
-        if sl
-            .slot_frames
-            .get(&slot)
-            .is_some_and(|v| v.iter().any(|(_, tx, r)| *tx != state.tx && r.overlaps(&resource)))
-        {
+        if sl.slot_frames.get(&slot).is_some_and(|v| {
+            v.iter()
+                .any(|(_, tx, r)| *tx != state.tx && r.overlaps(&resource))
+        }) {
             sl.report.overlapping_transmissions += 1;
         }
         let sl = &*sl;
@@ -542,7 +552,9 @@ pub const SIDELINK_ACCESS_ID: &str = "access/sidelink/engine-coupling";
 /// The card of what this module adds on top of the radio crate's sidelink models: the
 /// pool and profile a scenario gets, and the approximations the coupling makes.
 fn coupling_card(pool: &PoolConfig, params: &SpsParams) -> v2xw_core::card::ModelCard {
-    use v2xw_core::card::{Family, ModelCard, Parameter, Source, SourceKind, Validation, ValidationStatus};
+    use v2xw_core::card::{
+        Family, ModelCard, Parameter, Source, SourceKind, Validation, ValidationStatus,
+    };
     let std_src = |r: &str| Source::new(SourceKind::Standard, r);
     let mut card = ModelCard::new(
         SIDELINK_ACCESS_ID,

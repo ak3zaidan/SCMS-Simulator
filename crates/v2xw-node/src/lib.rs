@@ -130,8 +130,8 @@ pub use stores::{
 };
 pub use telemetry::{NodeState, TelemetryInputs, TelemetryWindow};
 pub use vru::{
-    DutyCycle, DutyVerdict, PayloadProvenance, PowerBudget, PsmGenParams, VruConfig,
-    VruDeviceKind, VruDeviceRuntime, VruServices, VruStepOutcome,
+    DutyCycle, DutyVerdict, PayloadProvenance, PowerBudget, PsmGenParams, VruConfig, VruDeviceKind,
+    VruDeviceRuntime, VruServices, VruStepOutcome,
 };
 
 /// Registers every model this crate provides with a [`Registry`].

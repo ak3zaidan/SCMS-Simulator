@@ -551,7 +551,11 @@ fn byte_provenance_section(s: &mut String, report: Option<&ByteProvenanceReport>
             row.provenance.label(),
             row.bytes.messages,
             row.bytes.bytes_on_wire,
-            partial_sum(row.bytes.payload_bytes, row.bytes.payload_stated, row.bytes.messages),
+            partial_sum(
+                row.bytes.payload_bytes,
+                row.bytes.payload_stated,
+                row.bytes.messages
+            ),
             partial_sum(
                 row.bytes.envelope_bytes,
                 row.bytes.envelope_stated,
@@ -893,16 +897,12 @@ mod tests {
                 envelope_stated: 10,
             },
         );
-        let real = BTreeMap::from([(
-            "cam".to_string(),
-            ByteProvenance::Real("uper".to_string()),
-        )]);
+        let real = BTreeMap::from([("cam".to_string(), ByteProvenance::Real("uper".to_string()))]);
         let ds = MaDataset::default();
         let citable = render(
             &ds,
-            &manifest(DatasetProfile::V2).with_byte_provenance(
-                ByteProvenanceReport::new(&tally, &real),
-            ),
+            &manifest(DatasetProfile::V2)
+                .with_byte_provenance(ByteProvenanceReport::new(&tally, &real)),
             &LeakageReport::default(),
         );
         assert!(citable.contains("citable as one"), "{citable}");
@@ -914,9 +914,8 @@ mod tests {
         )]);
         let uncitable = render(
             &ds,
-            &manifest(DatasetProfile::V2).with_byte_provenance(
-                ByteProvenanceReport::new(&tally, &modelled),
-            ),
+            &manifest(DatasetProfile::V2)
+                .with_byte_provenance(ByteProvenanceReport::new(&tally, &modelled)),
             &LeakageReport::default(),
         );
         assert!(uncitable.contains("size model 1.0.0"), "{uncitable}");
@@ -928,9 +927,8 @@ mod tests {
         // An undeclared message type cannot buy citability by omission.
         let undeclared = render(
             &ds,
-            &manifest(DatasetProfile::V2).with_byte_provenance(
-                ByteProvenanceReport::new(&tally, &BTreeMap::new()),
-            ),
+            &manifest(DatasetProfile::V2)
+                .with_byte_provenance(ByteProvenanceReport::new(&tally, &BTreeMap::new())),
             &LeakageReport::default(),
         );
         assert!(undeclared.contains("**undeclared**"), "{undeclared}");

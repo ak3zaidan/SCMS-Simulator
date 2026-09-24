@@ -28,8 +28,8 @@ use v2xw_core::ctx::Visibility;
 use v2xw_engine::Scenario;
 use v2xw_engine::scenario::{Attacker, DilationWindow, ModelChoice};
 use v2xw_experiment::foundry::{
-    ARCHIVE_FILE, Archive, FoundryOptions, Genome, MutationOperator, Objective, RandomMutation,
-    REPORT_FILE, Validity, fitness, search,
+    ARCHIVE_FILE, Archive, FoundryOptions, Genome, MutationOperator, Objective, REPORT_FILE,
+    RandomMutation, Validity, fitness, search,
 };
 use v2xw_experiment::plan::PlannedRun;
 use v2xw_experiment::runner::{RunArtifacts, RunExecutor};
@@ -38,9 +38,7 @@ use v2xw_metrics::{Agg, Dim, DimValue, Dims, MetricDef, MetricSample, Quantum, S
 
 /// A directory of this test's own, removed first so a rerun does not read a stale archive.
 fn out_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir()
-        .join("v2xw-foundry-tests")
-        .join(name);
+    let dir = std::env::temp_dir().join("v2xw-foundry-tests").join(name);
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
@@ -183,7 +181,11 @@ impl RunExecutor for Fixture {
         // A silent fixture files no reports at all, which is what the validity gate is
         // there to catch: without it such a run scores a perfect evasion for the wrong
         // reason.
-        let reported_tp = if self.mood == Mood::Silent { 0 } else { attackers };
+        let reported_tp = if self.mood == Mood::Silent {
+            0
+        } else {
+            attackers
+        };
 
         let samples = vec![
             MetricSample::new(
@@ -215,8 +217,7 @@ impl RunExecutor for Fixture {
                 1_000_000_000,
                 dims("vehicle", None),
                 SampleValue::Ratio(
-                    Proportion::from_counts(tp, attackers.max(1))
-                        .estimate(1, ConfidenceLevel::P95),
+                    Proportion::from_counts(tp, attackers.max(1)).estimate(1, ConfidenceLevel::P95),
                 ),
             ),
         ];
@@ -294,10 +295,7 @@ impl MutationOperator for Climber {
         // The top of the built-in operator's own range, on the same three-decimal grid:
         // two genomes that differed only in floating-point noise would be two genomes,
         // and the archive would fill with near-duplicates.
-        child.insert(
-            "threats.attackers[0].fraction".to_string(),
-            json!(0.6_f64),
-        );
+        child.insert("threats.attackers[0].fraction".to_string(), json!(0.6_f64));
         Some(child)
     }
 }
@@ -464,7 +462,10 @@ fn the_archive_document_round_trips() {
     let cells = document["cells"].as_object().expect("a cell map");
     assert_eq!(cells.len(), archive.coverage());
     for key in archive.cells.keys() {
-        assert!(cells.contains_key(key), "{key} is missing from the document");
+        assert!(
+            cells.contains_key(key),
+            "{key} is missing from the document"
+        );
     }
     // Every float in the document sits on the declared grid (build decision D9).
     let quantum = document["quantum"].as_f64().expect("a declared quantum");

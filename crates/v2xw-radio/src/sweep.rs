@@ -1493,7 +1493,10 @@ fn sweep_dsrc_inner(
     };
     let offered_air = math::sum_ordered(committed.iter().map(|c| (c.end - c.start) as f64)) / span;
     // The per-receiver run-average CBR, which is the load axis of the calibrated table.
-    let per_rx_cbr: Vec<f64> = busy_ns.iter().map(|b| (*b as f64 / span).min(1.0)).collect();
+    let per_rx_cbr: Vec<f64> = busy_ns
+        .iter()
+        .map(|b| (*b as f64 / span).min(1.0))
+        .collect();
     let samples: Vec<ReceptionSample> = raw_samples
         .into_iter()
         .map(|(rx, distance_m, received)| ReceptionSample {
