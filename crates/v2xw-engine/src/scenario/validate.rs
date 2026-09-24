@@ -821,7 +821,8 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus {
         path: "detection.local",
         status: Status::Wired,
-        note: "'detect/legacy-12' on every honest vehicle. params override the suite's \
+        note: "'detect/legacy-12' on every honest vehicle and every roadside unit (a \
+               unit is trusted infrastructure to the authority). params override the suite's \
                thresholds by name (consistency_threshold_m, heading_threshold_deg, \
                detector_lag_s, z_threshold, min_consecutive, sybil_min_certs, art_max_m, \
                max_accel_mps2, stale_max_s, …) and report_interval_s (default 1: a \

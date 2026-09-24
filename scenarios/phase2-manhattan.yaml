@@ -87,7 +87,10 @@ actors:
   #
   # Each unit relays reports for a vehicle with no modem (`report-forward`), carries
   # certificate top-ups (`provisioning-proxy`) and broadcasts the CRL it holds (`crl`).
-  # Its backhaul is `net.backhaul`'s.
+  # It also verifies what it hears and runs the detector suite: the legacy authority counts
+  # a unit as trusted infrastructure, and its reports go straight onto its backhaul. Its
+  # backhaul is `net.backhaul`'s, and its hardware the default roadside profile
+  # (rsu/commsignia-its-rs4, the one whose datasheet publishes a verification rate).
   rsus:
     - {position_m: [190.4, 7.5, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 27th Street / West 27th Street
     - {position_m: [228.0, 75.3, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 28th Street / West 28th Street
