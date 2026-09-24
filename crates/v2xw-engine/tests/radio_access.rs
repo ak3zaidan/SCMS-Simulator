@@ -242,7 +242,10 @@ fn each_radio_technology_runs_its_own_access_layer() {
 /// same street — are unaffected either way.
 #[test]
 fn buildings_obstruct_links_and_the_switch_turns_them_off() {
-    let fleet = manhattan_fleet(30, 2.0);
+    // Sixty trips, of which the lane-insertion gap realises about 39 vehicles. With thirty
+    // (18 realised) the traffic track's corrected Manhattan world put no two vehicles
+    // within 100 m of each other, so the near band had no links to measure at all.
+    let fleet = manhattan_fleet(60, 2.0);
     let (_, city) = run_recorded(fleet.clone());
     let (_, open) = run_recorded(open_air(fleet));
     let city_mid = pdr_between(&city, 200.0, 500.0).expect("links at 200-500 m");
