@@ -616,8 +616,26 @@ fn run_status(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> 
 }
 
 fn view_follow(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
-    let node = uint(p, "node").map(|n| u32::try_from(n).unwrap_or(u32::MAX));
-    let clear = flag(p, "clear", false);
+    let mut node = uint(p, "node").map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+    let mut clear = flag(p, "clear", false);
+    // §6.7 lets a client follow an *actor*. The page does exactly that when it clicks a car
+    // whose node it does not know, which is every car in a run whose vehicles spawn after
+    // t = 0: the Hello node table is taken at t = 0 and is empty for them. The parameter was
+    // in the schema and ignored here, so such a click followed nothing and the page said
+    // "No radio selected". The actor is resolved to the node mounted on it now; an actor with
+    // no radio follows no radio.
+    if node.is_none()
+        && !clear
+        && let Some(actor) = uint(p, "actor").map(|a| u32::try_from(a).unwrap_or(u32::MAX))
+    {
+        node = ctx
+            .run
+            .nodes()
+            .iter()
+            .find(|r| r.actor_id == actor)
+            .map(|r| r.node_id);
+        clear = node.is_none();
+    }
     let telemetry = flag(p, "telemetry", true);
     let radius_m = bounded(p, "radius_m", 0.0, 5_000.0, 0.0)?;
     if let Some(node) = node {
