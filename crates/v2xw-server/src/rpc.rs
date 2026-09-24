@@ -494,16 +494,18 @@ fn run_seek(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
             "pass {\"t_ns\": <nanoseconds>}",
         )]));
     };
-    if t_ns < min_ns || t_ns > max_ns {
-        return Err(ServerError::SeekOutOfRange { min_ns, max_ns });
-    }
     // Refused *before* the run is touched. The check used to come after `Run::seek`, so a
     // seek over HTTP moved the run's cursor and paused it, and then reported that it could
-    // not be done — a refusal with a side effect.
+    // not be done — a refusal with a side effect. It also comes before the range check: the
+    // kernel runs ahead of the stream on its own clock, so whether a target is inside the
+    // produced range yet is a race, and HTTP's answer must not depend on it.
     if ctx.session.is_none() {
         return Err(ServerError::NotSupportedHere(
             "run.seek streams its result over the connection; call it on the socket".to_string(),
         ));
+    }
+    if t_ns < min_ns || t_ns > max_ns {
+        return Err(ServerError::SeekOutOfRange { min_ns, max_ns });
     }
     let before = ctx.run.state();
     let outputs = ctx.run.seek(t_ns)?;

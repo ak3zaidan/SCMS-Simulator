@@ -526,6 +526,12 @@ fn run_seek_over_http_is_refused_without_moving_the_run() {
     let err =
         call(&run, "run.seek", json!({"t_ns": 100_000_000u64})).expect_err("refused over HTTP");
     assert_eq!(err["code"], -32009);
+    // Whether a target is inside the produced range yet is a race with the kernel, which
+    // runs ahead on its own clock; HTTP's refusal must not depend on it. A target no kernel
+    // has reached is refused for the transport too, not as out of range.
+    let err = call(&run, "run.seek", json!({"t_ns": 1_000_000_000_000u64}))
+        .expect_err("refused over HTTP");
+    assert_eq!(err["code"], -32009, "{err}");
     let after = ok(&run, "run.status", json!({}));
     assert_eq!(
         before["t_ns"], after["t_ns"],
