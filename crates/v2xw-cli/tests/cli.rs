@@ -345,7 +345,12 @@ fn a_transposed_bounding_box_is_refused_by_name() {
 /// world that builds but is empty would satisfy the weaker reading.
 #[test]
 fn the_manhattan_scenario_builds_a_real_osm_world() {
-    let scenario = v2xw_engine::Scenario::load(manhattan_scenario()).expect("it loads");
+    let mut scenario = v2xw_engine::Scenario::load(manhattan_scenario()).expect("it loads");
+    // The scenario names its extract relative to the repository root, which is where the
+    // tool is run from; `cargo test` runs in the crate's own directory instead.
+    if let v2xw_world::WorldSourceSpec::OsmXml { path, .. } = &mut scenario.world.source {
+        *path = repo_root().join(&*path).to_string_lossy().into_owned();
+    }
     let engine = v2xw_engine::Engine::build(scenario, "2026-09-22T00:00:00Z")
         .expect("the engine builds an OSM world");
     let world = engine.world();
