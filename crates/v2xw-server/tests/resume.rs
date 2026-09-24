@@ -520,3 +520,64 @@ fn a_resumed_hello_carries_the_table_the_client_had_and_the_replay_extends_it() 
         "nothing to replay at the head"
     );
 }
+
+/// A retained session that cannot be resumed falls back to §1.4 rule 2, and the client that
+/// gets that fresh `Hello` resets its symbol table — so the run's provenance, whose strings
+/// name every metric, must follow the resync keyframe again. The session sent it once
+/// already, on its first keyframe; a fallback that did not send it again left the page's
+/// metrics resolving to nothing.
+#[test]
+fn a_fallback_to_a_fresh_hello_sends_the_provenance_again() {
+    use v2xw_server::engine::Control;
+    use v2xw_server::{Run, Session, StubEngine};
+
+    let engine = StubEngine::new(StubOptions {
+        actors: 6,
+        grid: 3,
+        duration_s: 30,
+        paused: true,
+        ..StubOptions::default()
+    })
+    .expect("fixture");
+    let world_json = v2xw_world::serde_vwp::to_json_string(engine.geometry()).expect("world");
+    let run = Run::new(Box::new(engine), world_json).expect("run");
+    let descriptor = run.descriptor();
+    let mut session = Session::new(Default::default(), &descriptor);
+    session.bind(run.generation(), "0123456789abcdef0123456789abcdef");
+    session.greet(&run, &descriptor).expect("greet");
+    let mut rx = run.subscribe();
+    run.control(Control::Resume).expect("resume");
+    let has_provenance = |frames: &[Frame]| {
+        frames
+            .iter()
+            .any(|f| f.header().expect("header").msg_type == MsgType::Provenance.id())
+    };
+    assert!(run.tick().expect("tick"));
+    let first = session
+        .encode_step(&rx.try_recv().expect("step"))
+        .expect("encode")
+        .frames;
+    assert!(
+        has_provenance(&first),
+        "the first keyframe carries the provenance"
+    );
+
+    // A resume the ring cannot serve: a fresh Hello, a resync keyframe — and the provenance.
+    session.reattach(Some(99_999_999));
+    let again = session.greet(&run, &descriptor).expect("greet again");
+    let hello = HelloBody::decode(again[0].body()).expect("Hello");
+    assert_eq!(hello.hello_flags & HELLO_RESUMED, 0);
+    assert!(run.tick().expect("tick"));
+    let next = session
+        .encode_step(&rx.try_recv().expect("step"))
+        .expect("encode")
+        .frames;
+    assert_eq!(
+        next[0].header().expect("header").msg_type,
+        MsgType::Keyframe.id()
+    );
+    assert!(
+        has_provenance(&next),
+        "the fallback's keyframe carries the provenance again"
+    );
+}

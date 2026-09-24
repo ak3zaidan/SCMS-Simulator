@@ -596,6 +596,11 @@ impl Session {
         if !self.resumed {
             self.strings = descriptor.hello.strings.clone();
             self.string_marks.clear();
+            // The client throws its table away on a non-resumed `Hello` (§2.5), including the
+            // strings the run's provenance appended, so the provenance goes out again after
+            // the resync keyframe. A retained session that falls back to §1.4 rule 2 has
+            // already sent it once; without this its metrics would name nothing.
+            self.provenance = descriptor.provenance.clone();
         }
 
         let mut body = descriptor.hello.clone();
