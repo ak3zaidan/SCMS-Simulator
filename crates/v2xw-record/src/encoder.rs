@@ -267,6 +267,11 @@ impl SnapshotEncoder {
 
     /// Requests a keyframe at the next step, whatever the cadence says.
     ///
+    /// The simulated instant of the last snapshot encoded, if any.
+    pub fn last_time(&self) -> Option<SimTime> {
+        self.last_time
+    }
+
     /// §1.5's resync path: a keyframe is an idempotent snapshot, so synthesising one is
     /// always legal. It still consumes a `seq` and still carries the canonical body, so a
     /// client recording the stream gets a valid if denser GOP structure.
