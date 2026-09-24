@@ -35,7 +35,6 @@ import {
   type WorldChunkMessage,
   type ParamsOf,
   type ResultOf,
-  type InspectNodeParams,
 } from "@vwp/protocol";
 import { CAMERA_MODES, Viewer, type CameraMode, type OverlayEntry } from "@vwp/viewer";
 import type { OverlayName } from "@vwp/protocol";
@@ -875,23 +874,27 @@ export class StudioEngine {
    * §6.8 — pull the inspector payload for the followed node, including its `messages` section:
    * what it most recently broadcast (with each message's content and pseudonym) and what it heard.
    *
-   * `quiet` is the once-a-second refresh while something is followed. It goes straight to the
+   * `quiet` is the once-a-second refresh while something is followed. It asks for the `messages`
+   * section alone and stores it on its own (`inspectMessages`), so the refresh re-renders the log
+   * and not the OBU HUD, whose height is the chase camera's bottom inset. It goes straight to the
    * socket so it does not fill the Calls-made list, keeps the last answer when one poll fails, and
    * drops an answer for a node that is no longer the followed one.
    */
   async inspectFollowed(quiet = false): Promise<void> {
     const node = this.#followedNode;
     if (node === null || !this.client) return;
-    const params = {
-      node,
-      include: ["telemetry", "stores", "queues", "neighbors", "certs", "crl", "provenance", "messages"] as InspectNodeParams["include"],
-      limit: 50,
-    };
     try {
-      const res =
-        quiet && this.streaming
-          ? await this.client.request("inspect.node", params)
-          : await this.request("inspect.node", params);
+      if (quiet) {
+        if (!this.streaming) return;
+        const res = await this.client.request("inspect.node", { node, include: ["messages"], limit: 50 });
+        if (this.#followedNode === node) useStudio.getState().setInspectMessages(res.messages ?? null);
+        return;
+      }
+      const res = await this.request("inspect.node", {
+        node,
+        include: ["telemetry", "stores", "queues", "neighbors", "certs", "crl", "provenance", "messages"],
+        limit: 50,
+      });
       if (this.#followedNode !== node) return;
       useStudio.getState().setInspect(res);
     } catch {

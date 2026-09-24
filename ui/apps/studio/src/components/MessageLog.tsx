@@ -18,9 +18,8 @@ import { receivedRows, sentRows, shortPseudonym } from "../lib/messages.js";
 const SHOWN = 12;
 
 export function MessageLog(): React.JSX.Element | null {
-  const inspect = useStudio((s) => s.inspect);
+  const messages = useStudio((s) => s.inspectMessages);
   const [open, setOpen] = useState<string | null>(null);
-  const messages = inspect?.messages;
   if (!messages) return null;
   const sent = sentRows(messages.sent);
   const received = receivedRows(messages.received);

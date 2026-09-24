@@ -15,6 +15,7 @@
 
 import { create } from "zustand";
 import type {
+  InspectMessages,
   InspectNodeResult,
   NodeTelemetry,
   OverlayName,
@@ -373,6 +374,13 @@ interface StudioState {
   simTimeNs: number;
   pseudonym: PseudonymInfo | null;
   inspect: InspectNodeResult | null;
+  /**
+   * The followed node's message log (`inspect.node` `messages`), refreshed once a second on its
+   * own. Kept apart from `inspect` so the refresh re-renders the log and nothing else: the OBU HUD
+   * reads `inspect`, and a HUD whose height changed every second moved the chase camera's framing
+   * (its height is the view's bottom inset) every second.
+   */
+  inspectMessages: InspectMessages | null;
   overlays: Partial<Record<OverlayName, boolean>>;
   serverOverlays: readonly ServerOverlay[];
   groundTruthLocked: boolean;
@@ -430,6 +438,7 @@ interface StudioState {
   setTelemetry: (t: NodeTelemetry | null, node: number | null, simTimeNs: number) => void;
   notePseudonym: (p: PseudonymInfo) => void;
   setInspect: (r: InspectNodeResult | null) => void;
+  setInspectMessages: (m: InspectMessages | null) => void;
   setOverlays: (o: Partial<Record<OverlayName, boolean>>) => void;
   setServerOverlays: (o: readonly ServerOverlay[]) => void;
   setGroundTruthLocked: (v: boolean) => void;
@@ -586,6 +595,7 @@ export const useStudio = create<StudioState>((set) => ({
   simTimeNs: 0,
   pseudonym: null,
   inspect: null,
+  inspectMessages: null,
   overlays: {},
   serverOverlays: [],
   groundTruthLocked: false,
@@ -626,7 +636,7 @@ export const useStudio = create<StudioState>((set) => ({
   setHello: (h) => set({ hello: h, timeline: [] }),
   setWorldSummary: (w) => set({ world: w }),
   setRun: (r) => set((state) => (sameRun(state.run, r) ? state : { run: { ...state.run, ...r } })),
-  setSelection: (actorId, nodeId) => set({ selectedActor: actorId, selectedNode: nodeId, pseudonym: null, inspect: null }),
+  setSelection: (actorId, nodeId) => set({ selectedActor: actorId, selectedNode: nodeId, pseudonym: null, inspect: null, inspectMessages: null }),
   setTelemetry: (t, node, simTimeNs) =>
     set((state) =>
       state.telemetry === t && state.telemetryNode === node && state.simTimeNs === simTimeNs
@@ -640,7 +650,8 @@ export const useStudio = create<StudioState>((set) => ({
       if (p.source === "node.tx" && state.pseudonym?.source === "sec.cert" && state.pseudonym.digest === p.digest) return state;
       return { pseudonym: p };
     }),
-  setInspect: (r) => set({ inspect: r }),
+  setInspect: (r) => set({ inspect: r, ...(r?.messages ? { inspectMessages: r.messages } : {}) }),
+  setInspectMessages: (m) => set({ inspectMessages: m }),
   setOverlays: (o) => set((state) => ({ overlays: { ...state.overlays, ...o } })),
   setServerOverlays: (o) => set({ serverOverlays: o }),
   setGroundTruthLocked: (v) => set({ groundTruthLocked: v }),
