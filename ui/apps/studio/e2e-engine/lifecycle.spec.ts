@@ -83,10 +83,17 @@ test("an edited setting reaches the next run: duration, seed, arrival rate, radi
     sparse.engine.stats.actors_seen * 3,
   );
 
-  // --- radio: the PHY and MAC tiers change the reception outcome --------------------------------
+  // --- radio: the radio models change the reception outcome -------------------------------------
+  // This used to switch the PHY and MAC tiers to high. Since every vehicle generates at its own
+  // phase, frames on this grid do not overlap, and the high PHY's only addition (preamble capture)
+  // decides overlapping frames alone, while the high MAC is the medium one: the tiers are correctly
+  // inert here, and the engine's KEY_STATUS says so. `radio.models` changes every received power.
   expect(dense.engine.stats.rx_attempts, "the dense run has receptions to compare").toBeGreaterThan(0);
-  await setField(page, "/radio/tiers/phy", "high");
-  await setField(page, "/radio/tiers/mac", "high");
+  await setField(
+    page,
+    "/radio/models",
+    '{"propagation": {"id": "propagation/free-space"}, "fading": {"id": "fading/none"}}',
+  );
   const high = await runToEnd(page);
   expect([high.engine.stats.rx_ok, high.engine.output_digest]).not.toEqual([
     dense.engine.stats.rx_ok,
@@ -102,7 +109,7 @@ test("an edited setting reaches the next run: duration, seed, arrival rate, radi
   } else {
     test.info().annotations.push({
       type: "not tested",
-      description: "this engine publishes no transmit-power setting yet; the PHY/MAC tier is the radio proof",
+      description: "this engine publishes no transmit-power setting yet; radio.models is the radio proof",
     });
   }
 
@@ -113,10 +120,13 @@ test("an edited setting reaches the next run: duration, seed, arrival rate, radi
   expect(cam.engine.stats.tx_by_type.bsm, "no BSM once the set is [cam]").toBeUndefined();
 
   // --- a setting the engine does not act on is marked, and an edit to it is called out ---------
-  await page.getByTestId("settings-filter").fill("visibility_m");
-  const inert = page.locator('[data-testid="setting"][data-pointer="/weather/visibility_m"]');
+  // (weather.visibility_m was the example until the traffic track wired it: drivers now keep to
+  // their sight distance. nodes.backend_tier is still read by nothing.)
+  await page.getByTestId("settings-filter").fill("backend_tier");
+  const inert = page.locator('[data-testid="setting"][data-pointer="/nodes/backend_tier"]');
   await expect(inert.getByTestId("field-status")).toHaveText("not applied");
-  await inert.locator("input").fill("250");
+  const current = await inert.locator("select").inputValue();
+  await inert.locator("select").selectOption(current === "high" ? "abstract" : "high");
   await expect(page.getByTestId("inert-edits")).toContainText("nothing in this build");
   await page.getByTestId("discard-edits").click();
   await page.getByTestId("settings-filter").fill("");
