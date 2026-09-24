@@ -112,6 +112,17 @@ export function ObuHud({ docked = false }: { docked?: boolean }): React.JSX.Elem
     );
   }
 
+  // A node that joined after the Hello is not in the Hello's node table (every vehicle that
+  // spawns during a run), so its kind and profile come from the engine's own inspect.node
+  // answer for it — the one the inspector's state tab shows. Without this the header read
+  // "OBU … profile: n/a" for every such node, beside a state tab naming its profile.
+  const inspected = inspect && Number(inspect.node) === Number(telemetryNode) ? inspect : null;
+  const hudKind =
+    info?.kind === 2 || inspected?.kind === "rsu"
+      ? "RSU"
+      : info?.kind === 1 || inspected?.kind === "vru-device"
+        ? "VRU"
+        : "OBU";
   const drops = totalDrops(telemetry);
   const evidence = MISSING_FROM_WIRE[0];
   const evidenceValue = inspect ? getPointer(inspect, `/${evidence.inspectPath.join("/")}`) : undefined;
@@ -120,7 +131,7 @@ export function ObuHud({ docked = false }: { docked?: boolean }): React.JSX.Elem
     <div className={`hud${docked ? " docked" : ""}`} data-testid="obu-hud">
       <div className="hud-head">
         <span className="id" data-testid="hud-identity">
-          {info?.kind === 2 ? "RSU" : info?.kind === 1 ? "VRU" : "OBU"} {info?.label || `node ${telemetryNode}`}
+          {hudKind} {info?.label || `node ${telemetryNode}`}
         </span>
         <span className="dim">node {telemetryNode}</span>
         {selectedActor !== null ? <span className="dim">actor {selectedActor}</span> : null}
@@ -137,7 +148,7 @@ export function ObuHud({ docked = false }: { docked?: boolean }): React.JSX.Elem
             <span className="hud-na">not yet seen transmitting</span>
           )}
         </span>
-        <span className="dim">profile: {info?.profileId || NA}</span>
+        <span className="dim">profile: {info?.profileId || inspected?.profile_id || NA}</span>
         <span className="spacer grow" />
         <span className="dim" data-testid="hud-simtime">
           t {simClock(simTimeNs)}
