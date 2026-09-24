@@ -24,7 +24,9 @@ describe("WorldRenderer", () => {
     expect(r.crossings).toBe(grid.world.crossings.count);
     expect(w.tiles.children.length).toBeGreaterThan(0);
     expect(w.markings.children.length).toBeGreaterThan(0);
-    expect(w.signalsGroup.children.length).toBe(1);
+    // Housings, lamps (three per head) and stop bars: three instanced drawables whatever the count.
+    expect(w.signalsGroup.children.length).toBe(3);
+    expect(w.signals.count).toBe(grid.world.signals.count);
     expect(w.sitesGroup.children.length).toBe(1);
     expect(w.siteCount).toBe(grid.world.sites.count);
     expect(w.sitePositions.length).toBe(grid.world.sites.count * 3);
@@ -90,13 +92,16 @@ describe("WorldRenderer", () => {
       phase: Uint8Array.from([6, 3, 8]),
       reserved: new Uint8Array(3),
     });
-    const mesh = w.signalsGroup.children[0] as { instanceColor?: { array: ArrayLike<number> } | null };
-    expect(mesh.instanceColor).toBeTruthy();
-    const green = Array.from((mesh.instanceColor?.array ?? []) as ArrayLike<number>).slice(0, 3);
-    const red = Array.from((mesh.instanceColor?.array ?? []) as ArrayLike<number>).slice(3, 6);
-    expect(green).not.toEqual(red);
+    // Head 0 is green (its green lamp, index 2, lit) and head 1 red (its red lamp, index 0, lit).
+    const sum = (c: [number, number, number] | null): number => (c ? c[0] + c[1] + c[2] : 0);
+    expect(w.signals.headState(0)?.aspect.name).toBe("green");
+    expect(w.signals.headState(1)?.aspect.name).toBe("red");
+    expect(sum(w.signals.lampColor(0, 2))).toBeGreaterThan(sum(w.signals.lampColor(0, 0)) * 5);
+    expect(sum(w.signals.lampColor(1, 0))).toBeGreaterThan(sum(w.signals.lampColor(1, 2)) * 5);
     w.setTheme(LIGHT_THEME);
     expect(w.report.lanes).toBe(grid.world.lanes.count);
+    // The rebuild a theme swap does keeps what the lamps show.
+    expect(w.signals.headState(0)?.aspect.name).toBe("green");
     w.dispose();
   });
 });

@@ -572,7 +572,7 @@ export class CompareController {
     // A seek is a discontinuity: interpolating across it would slide every actor from where it was
     // before the jump to where it is after, over the smoothing window.
     viewer.interpolator.reset();
-    if (replay.signals) viewer.worldRenderer.updateSignalPhases(replay.signals);
+    if (replay.signals) viewer.worldRenderer.applySignalKeyframe(replay.signals);
     viewer.capture(replay.poses);
     // Captured twice on purpose: the interpolator samples *between* two snapshots, and one
     // snapshot leaves it with nothing to interpolate from, so a seeked recording would render

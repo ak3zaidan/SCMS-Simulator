@@ -44,6 +44,12 @@ export interface GridWorldOptions {
   readonly lanesPerDirection?: number;
   /** Buildings per block. Default 1. */
   readonly buildingsPerBlock?: number;
+  /**
+   * One `signal_id` per junction shared by its four heads, as the engine writes it (a controller
+   * with heads on four approaches, `crates/v2xw-world/src/serde_vwp.rs`), instead of one per head.
+   * Default false.
+   */
+  readonly controllerSignals?: boolean;
 }
 
 /** A decoded synthetic world plus the axis positions its streets sit on. */
@@ -66,6 +72,7 @@ export function makeGridWorld(options: GridWorldOptions = {}): GridWorld {
     blockM: options.blockM ?? 120,
     lanesPerDirection: options.lanesPerDirection ?? 2,
     buildingsPerBlock: options.buildingsPerBlock ?? 1,
+    controllerSignals: options.controllerSignals ?? false,
   };
   const n = o.blocks;
   const pitch = o.blockM;
@@ -142,7 +149,7 @@ export function makeGridWorld(options: GridWorldOptions = {}): GridWorld {
       for (let s = 0; s < 4; s++) {
         const a = (s / 4) * Math.PI * 2;
         signals.push({
-          signalId: signalId++, junctionId, laneId: 0,
+          signalId: o.controllerSignals ? junctionId : signalId++, junctionId, laneId: 0,
           xM: x + Math.cos(a) * 9, yM: y + Math.sin(a) * 9, zM: 5.2,
           kind: 0, group: s,
         });

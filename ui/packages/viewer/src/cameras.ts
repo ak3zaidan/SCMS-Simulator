@@ -52,6 +52,16 @@ export interface CameraControllerOptions {
   /** Clearance kept above a roof the camera would otherwise be inside, metres. Default 3. */
   readonly buildingClearanceM?: number;
   /**
+   * Lowest the camera may be above the ground it is looking at, metres. Default 0.6.
+   *
+   * Dragging the chase camera's pitch below the horizon used to put it under the road — the
+   * orbit allowed −20° at up to 400 m — and a camera under a double-sided ground plane sees
+   * nothing but the plane's underside: the black frame the owner reported.
+   */
+  readonly groundClearanceM?: number;
+  /** Chase-yaw smoothing rate, `1 − exp(−λ·dt)`. Default 4. */
+  readonly yawLambda?: number;
+  /**
    * Longest camera-to-target distance at which the occlusion march runs, metres. Default 60 — a
    * chase or dashboard working distance. Beyond it only the roof lift applies; see
    * {@link CameraController.keepCameraOutsideBuildings}.
@@ -93,6 +103,15 @@ export interface CameraState {
 export type InputTarget = Pick<EventTarget, "addEventListener" | "removeEventListener">;
 
 const DEG = Math.PI / 180;
+
+/** Zero velocity and zero acceleration at both ends of [0, 1]. */
+function smootherstep(u: number): number {
+  return u * u * u * (u * (u * 6 - 15) + 10);
+}
+
+function finite3(v: Vector3): boolean {
+  return Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z);
+}
 
 /**
  * Keep `v` such that `[v − half, v + half]` stays inside `[lo, hi]`; centre it when it cannot fit.
@@ -153,7 +172,15 @@ export class CameraController {
   #chaseLookHeight: number;
   #eyeHeight: number;
   #clearance: number;
+  #groundClearance: number;
   #occlusionRange: number;
+  /** The heading the chase camera sits behind, smoothed; see `update`. NaN until seeded. */
+  #chaseYaw = Number.NaN;
+  readonly yawLambda: number;
+  /** Where the visible part of the viewport sits inside the canvas; see {@link setViewInsets}. */
+  #insets = { top: 0, right: 0, bottom: 0, left: 0 };
+  /** Frames on which the camera had to be recovered from a non-finite state (diagnostic). */
+  recoveries = 0;
   #freeVelocity = new Vector3();
   #freeYaw = 0;
   #freePitch = -0.3;
@@ -166,6 +193,13 @@ export class CameraController {
   #flyT = 0;
   #flyDuration = 0;
   #flyStart = new Vector3();
+  /** Cruise height of a flight to street level, or NaN for a straight flight; see `#beginFlight`. */
+  #flyCruise = Number.NaN;
+  /**
+   * Set when the followed subject changes in a street-level mode: the next update flies to the new
+   * subject instead of sliding there at street level through every building in between.
+   */
+  #pendingFlight = false;
   #flyStartLook = new Vector3();
   #fovMap: number;
   #fovChase: number;
@@ -194,6 +228,8 @@ export class CameraController {
     this.#minAltitude = options.minAltitudeM ?? 12;
     this.#maxAltitude = options.maxAltitudeM ?? 20_000;
     this.#clearance = options.buildingClearanceM ?? 3;
+    this.#groundClearance = Math.max(0.1, options.groundClearanceM ?? 0.6);
+    this.yawLambda = options.yawLambda ?? 4;
     this.#occlusionRange = options.occlusionRangeM ?? 60;
     this.#flyMaxSeconds = Math.max(0.05, options.flyMaxSeconds ?? 2.4);
     this.#fovMap = options.fovMapDeg ?? 45;
@@ -246,6 +282,11 @@ export class CameraController {
     return this.#flyT < this.#flyDuration;
   }
 
+  /** Whether a flight is in progress or will start on the next update (a change of subject). */
+  get inTransit(): boolean {
+    return this.#pendingFlight || this.#flyT < this.#flyDuration;
+  }
+
   /** Whether the user has panned, orbited or zoomed. Automatic framing must not override them. */
   get userHasMoved(): boolean {
     return this.#userMoved;
@@ -257,7 +298,21 @@ export class CameraController {
   }
 
   set altitudeM(v: number) {
-    this.#altitude = MathUtils.clamp(v, this.#minAltitude, this.#maxAltitude);
+    if (!Number.isFinite(v)) return;
+    this.#altitude = MathUtils.clamp(v, this.#minAltitude, this.#altitudeCeiling());
+  }
+
+  /**
+   * The highest useful map altitude: the one at which the plan view covers the world two and a half
+   * times over, or the configured maximum if that is lower. Zooming out to the 20 km maximum on a
+   * 2 km world left a 5 % speck in a frame of flat background — the camera fuzz's "flat frame".
+   */
+  #altitudeCeiling(): number {
+    const b = this.#world?.world?.bbox;
+    if (!b) return this.#maxAltitude;
+    const span = Math.max(b.maxXM - b.minXM, b.maxYM - b.minYM, 100);
+    const half = Math.tan((this.camera.fov * DEG) / 2);
+    return Math.max(this.#minAltitude + 1, Math.min(this.#maxAltitude, (span * 2.5) / 2 / Math.max(0.05, half)));
   }
 
   /** Chase/orbit distance in metres. */
@@ -287,7 +342,51 @@ export class CameraController {
   setViewportSize(width: number, height: number): void {
     this.#viewportW = Math.max(1, width);
     this.#viewportH = Math.max(1, height);
-    this.camera.aspect = this.#viewportW / this.#viewportH;
+    this.#applyProjectionWindow();
+  }
+
+  /**
+   * Keep the part of the viewport under an interface panel out of the framing.
+   *
+   * The point the camera looks at is put in the middle of the *unobstructed* rectangle by shifting
+   * the lens, and everything else about the projection — field of view, scale — is left alone, so
+   * the map does not zoom when a panel opens. A chase camera puts its vehicle a little below the
+   * centre of the frame, which is exactly where the floating OBU HUD sits; with the HUD's height as
+   * the bottom inset the vehicle is a little below the centre of what the user can see instead.
+   * CSS pixels, clamped so at least a quarter of the viewport stays framed.
+   */
+  setViewInsets(insets: { top?: number; right?: number; bottom?: number; left?: number }): void {
+    const w = this.#viewportW;
+    const h = this.#viewportH;
+    const clamp = (v: number | undefined, max: number): number =>
+      Math.max(0, Math.min(max, v !== undefined && Number.isFinite(v) ? v : 0));
+    const top = clamp(insets.top, h * 0.75);
+    const bottom = clamp(insets.bottom, h * 0.75 - top);
+    const left = clamp(insets.left, w * 0.75);
+    const right = clamp(insets.right, w * 0.75 - left);
+    const i = this.#insets;
+    if (i.top === top && i.bottom === bottom && i.left === left && i.right === right) return;
+    this.#insets = { top, right, bottom, left };
+    this.#applyProjectionWindow();
+  }
+
+  /** The insets currently applied, CSS pixels. */
+  get viewInsets(): { readonly top: number; readonly right: number; readonly bottom: number; readonly left: number } {
+    return this.#insets;
+  }
+
+  #applyProjectionWindow(): void {
+    const { top, right, bottom, left } = this.#insets;
+    const w = this.#viewportW;
+    const h = this.#viewportH;
+    this.camera.aspect = w / h;
+    if (top === 0 && right === 0 && bottom === 0 && left === 0) {
+      this.camera.clearViewOffset();
+    } else {
+      // A lens shift: the projection keeps its scale — the map's zoom, the marks' pixel sizes — and
+      // its principal point moves to the middle of the unobstructed rectangle.
+      this.camera.setViewOffset(w, h, (right - left) / 2, (bottom - top) / 2, w, h);
+    }
     this.camera.updateProjectionMatrix();
   }
 
@@ -347,7 +446,14 @@ export class CameraController {
   follow(actorId: number | null): void {
     // A different subject invalidates the remembered pose; re-following the same one keeps it, so
     // re-selecting a parked vehicle does not throw away the only place the camera can stand.
-    if (actorId !== this.#followActorId) this.#followPosKnown = false;
+    if (actorId !== this.#followActorId) {
+      this.#followPosKnown = false;
+      this.#chaseYaw = Number.NaN;
+      // Switching subject in a street mode is a journey across the city. The tracking law would
+      // slide the camera there at street level — measured by the camera fuzz: lifted onto a 138 m
+      // roof on the way, the frame one flat grey — so it is flown instead, over the roofs.
+      this.#pendingFlight = actorId !== null && CameraController.needsFollowSubject(this.#mode);
+    }
     this.#followActorId = actorId;
     this.#followValid = false;
   }
@@ -395,9 +501,15 @@ export class CameraController {
 
   /** Feed the followed actor's interpolated pose. Call once per frame before {@link update}. */
   setFollowPose(x: number, y: number, z: number, headingRad: number, speedMps: number): void {
+    // A non-finite pose must never reach the camera: one NaN in the position and every matrix
+    // downstream is NaN, which draws nothing at all — a black frame.
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return;
+    const heading = Number.isFinite(headingRad) ? headingRad : this.#followHeading;
+    const speed = Number.isFinite(speedMps) ? speedMps : 0;
+    if (!Number.isFinite(this.#chaseYaw)) this.#chaseYaw = heading;
     this.#followPos.set(x, y, z);
-    this.#followHeading = headingRad;
-    this.#followSpeed = speedMps;
+    this.#followHeading = heading;
+    this.#followSpeed = speed;
     this.#followValid = true;
     this.#followPosKnown = true;
     if (this.#mode !== "free" && this.#mode !== "rsu") this.target.set(x, y, z);
@@ -423,7 +535,10 @@ export class CameraController {
   /** Cut to the desired pose with no animation. */
   snap(): void {
     this.#flyT = this.#flyDuration; // a cut is not a flight
+    if (this.#followPosKnown) this.#chaseYaw = this.#followHeading;
     this.#computeDesired();
+    // The building and ground constraints are applied by `update`, which always runs before a
+    // frame is drawn; a cut only places the camera.
     this.camera.position.copy(this.#desiredPosition);
     this.look.copy(this.#desiredLook);
     this.camera.fov = this.#desiredFov;
@@ -439,11 +554,27 @@ export class CameraController {
    * frame took 4 ms or 40 ms, which a bare `lerp(x, 0.1)` does not give.
    */
   update(dt: number): void {
-    const step = Math.max(0, Math.min(0.25, dt));
+    const step = Math.max(0, Math.min(0.25, Number.isFinite(dt) ? dt : 0));
     if (this.#mode === "free") this.#integrateFree(step);
+    // The chase camera sits behind a *smoothed* heading. Behind the raw one it rode every tenth of
+    // a degree of heading noise at nine metres' lever arm, and a U-turn swung it straight through
+    // the car; the smoothed yaw orbits round instead.
+    if (Number.isFinite(this.#chaseYaw)) {
+      const ky = 1 - Math.exp(-step * this.yawLambda);
+      let d = this.#followHeading - this.#chaseYaw;
+      d -= Math.floor(d / (2 * Math.PI) + 0.5) * 2 * Math.PI;
+      this.#chaseYaw += d * ky;
+    } else if (this.#followPosKnown) {
+      this.#chaseYaw = this.#followHeading;
+    }
     this.#computeDesired();
     this.keepCameraOutsideBuildings(this.#desiredPosition, this.#desiredLook);
+    this.#keepAboveGround(this.#desiredPosition);
 
+    if (this.#pendingFlight && this.#followPosKnown && this.#followValid) {
+      this.#pendingFlight = false;
+      this.#beginFlight();
+    }
     if (this.#flyT < this.#flyDuration) {
       this.#advanceFlight(step);
     } else {
@@ -454,16 +585,72 @@ export class CameraController {
     }
     const kf = 1 - Math.exp(-step * this.fovLambda);
 
-    // The smoothed position can still clip a roof on the way down; fix it after the lerp too.
+    // The smoothed position can still clip a roof, or the ground, on the way; fix it after the lerp.
     this.keepCameraOutsideBuildings(this.camera.position, this.look);
+    this.#keepAboveGround(this.camera.position);
 
     const fov = this.camera.fov + (this.#desiredFov - this.camera.fov) * kf;
     if (Math.abs(fov - this.camera.fov) > 1e-4) {
       this.camera.fov = fov;
       this.camera.updateProjectionMatrix();
     }
+    this.#guardFinite();
+    // `lookAt` along a zero-length direction is degenerate; nudge the target rather than let the
+    // basis collapse.
+    if (this.camera.position.distanceToSquared(this.look) < 1e-6) this.look.z -= 0.01;
     this.camera.lookAt(this.look);
     this.camera.updateMatrixWorld();
+  }
+
+  /**
+   * Keep `pos` at least {@link CameraControllerOptions.groundClearanceM} above the ground under the
+   * subject: the followed vehicle's own height in the street modes, the world's floor otherwise.
+   */
+  #keepAboveGround(pos: Vector3): boolean {
+    let ground = -Infinity;
+    const world = this.#world?.world;
+    if (world) ground = world.bbox.minZM;
+    if ((this.#mode === "chase" || this.#mode === "dashboard") && this.#followPosKnown) {
+      ground = Math.max(ground, this.#followPos.z);
+    } else if (this.#mode === "rsu" || this.#mode === "free") {
+      ground = Math.max(ground, Math.min(this.target.z, this.look.z));
+    }
+    if (!Number.isFinite(ground)) return false;
+    const floor = ground + this.#groundClearance;
+    if (pos.z < floor) {
+      pos.z = floor;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Last line of defence: a camera with a non-finite position, target or field of view draws a
+   * black frame and never recovers by itself. Put it back on the desired pose, or over the world.
+   */
+  #guardFinite(): void {
+    const p = this.camera.position;
+    const l = this.look;
+    if (finite3(p) && finite3(l) && Number.isFinite(this.camera.fov) && this.camera.fov > 1) return;
+    this.recoveries++;
+    this.#flyT = this.#flyDuration;
+    if (!Number.isFinite(this.camera.fov) || this.camera.fov <= 1) this.camera.fov = this.#desiredFov;
+    if (finite3(this.#desiredPosition) && finite3(this.#desiredLook)) {
+      p.copy(this.#desiredPosition);
+      l.copy(this.#desiredLook);
+    } else {
+      const b = this.#world?.world?.bbox;
+      const cx = b ? (b.minXM + b.maxXM) / 2 : 0;
+      const cy = b ? (b.minYM + b.maxYM) / 2 : 0;
+      const cz = b ? b.minZM : 0;
+      if (!finite3(this.target)) this.target.set(cx, cy, cz);
+      if (!Number.isFinite(this.#altitude)) this.#altitude = 700;
+      this.#mode = "map";
+      this.#computeDesired();
+      p.copy(this.#desiredPosition);
+      l.copy(this.#desiredLook);
+    }
+    this.camera.updateProjectionMatrix();
   }
 
   /**
@@ -494,16 +681,100 @@ export class CameraController {
     const dist = this.#flyStart.distanceTo(this.#desiredPosition);
     this.#flyDuration = MathUtils.clamp(0.35 + 0.055 * Math.sqrt(dist), 0.35, this.#flyMaxSeconds);
     this.#flyT = 0;
+    // A flight that ends at street level is planned, not lerped: to cruise height (clear of every
+    // roof on the way), across, and straight down onto the destination, which is in the street.
+    // The straight line from the plan view into a street canyon crossed the building beside the
+    // street, and the roof rule then parked the camera on that roof looking at it — the camera
+    // fuzz measured frames of one flat colour at the end of the fly-down and of every change of
+    // subject. A flight to anywhere else keeps the straight eased line.
+    this.#flyCruise = CameraController.needsFollowSubject(this.#mode)
+      ? this.#cruiseFor(this.#flyStart, this.#desiredPosition)
+      : Number.NaN;
+  }
+
+  /**
+   * Cruise height for a flight to street level: fifteen metres over the tallest roof between the
+   * ends, and for a flight that starts low, a gentle arc besides (a quarter of the distance, at
+   * most 600 m). A flight that starts above that simply descends to it.
+   */
+  #cruiseFor(from: Vector3, to: Vector3): number {
+    const world = this.#world;
+    const hd = Math.hypot(to.x - from.x, to.y - from.y);
+    let top = world?.world ? world.world.bbox.minZM : Math.min(from.z, to.z);
+    if (world) {
+      const samples = Math.min(64, Math.max(8, Math.ceil(hd / 15)));
+      for (let i = 0; i <= samples; i++) {
+        const t = i / samples;
+        const h = world.buildingTopAt(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
+        if (h > top) top = h;
+      }
+    }
+    let cruise = Math.max(top + 15, to.z + 10);
+    if (from.z < cruise) cruise = Math.max(cruise, Math.min(Math.min(from.z, to.z) + 0.25 * hd, to.z + 600));
+    return cruise;
   }
 
   /** One step of the flight begun by {@link #beginFlight}. */
   #advanceFlight(step: number): void {
     this.#flyT += step;
     const u = MathUtils.clamp(this.#flyT / this.#flyDuration, 0, 1);
-    // Smootherstep: zero velocity *and* zero acceleration at both ends.
-    const e = u * u * u * (u * (u * 6 - 15) + 10);
-    this.camera.position.lerpVectors(this.#flyStart, this.#desiredPosition, e);
-    this.look.lerpVectors(this.#flyStartLook, this.#desiredLook, e);
+    const p = this.camera.position;
+    const cruise = this.#flyCruise;
+    if (!Number.isFinite(cruise)) {
+      // Smootherstep: zero velocity *and* zero acceleration at both ends.
+      const e = smootherstep(u);
+      p.lerpVectors(this.#flyStart, this.#desiredPosition, e);
+      this.look.lerpVectors(this.#flyStartLook, this.#desiredLook, e);
+      return;
+    }
+    const startLow = this.#flyStart.z < cruise - 1;
+    // From a low start: climb to cruise, across, then straight down. From the plan view: the eased
+    // straight descent, but never below cruise until the camera is over its destination, then
+    // straight down.
+    const a0 = startLow ? 0.2 : 0;
+    const c2 = startLow ? 0.75 : 0.8;
+    const across = smootherstep(MathUtils.clamp((u - a0) / (c2 - a0), 0, 1));
+    let z: number;
+    if (startLow) {
+      if (u < 0.2) z = this.#flyStart.z + (cruise - this.#flyStart.z) * smootherstep(u / 0.2);
+      else if (u < c2) z = cruise;
+      else z = cruise + (this.#desiredPosition.z - cruise) * smootherstep((u - c2) / (1 - c2));
+    } else {
+      const straight = (v: number): number => this.#flyStart.z + (this.#desiredPosition.z - this.#flyStart.z) * smootherstep(v);
+      const atC2 = Math.max(straight(c2), cruise);
+      z = u < c2 ? Math.max(straight(u), cruise) : atC2 + (this.#desiredPosition.z - atC2) * smootherstep((u - c2) / (1 - c2));
+    }
+    p.x = this.#flyStart.x + (this.#desiredPosition.x - this.#flyStart.x) * across;
+    p.y = this.#flyStart.y + (this.#desiredPosition.y - this.#flyStart.y) * across;
+    p.z = z;
+    this.look.lerpVectors(this.#flyStartLook, this.#desiredLook, across);
+    // While climbing out of a street, look ahead along the flight 30° below the horizon instead of
+    // straight down at a subject beside the building the camera is passing: straight down, the
+    // roof a few metres below filled the frame.
+    if (startLow && u < c2) {
+      const w = Math.min(smootherstep(MathUtils.clamp(u / 0.2, 0, 1)), smootherstep(MathUtils.clamp((c2 - u) / 0.15, 0, 1)));
+      let hx = this.#desiredPosition.x - this.#flyStart.x;
+      let hy = this.#desiredPosition.y - this.#flyStart.y;
+      const hl = Math.hypot(hx, hy);
+      if (hl > 1e-3 && w > 0) {
+        hx /= hl;
+        hy /= hl;
+        // Never past the destination (at the world's edge that was a view of the void beyond it).
+        const remaining = Math.hypot(this.#desiredPosition.x - p.x, this.#desiredPosition.y - p.y);
+        const ahead = Math.max(30, Math.min((p.z - this.#desiredPosition.z) * 1.5, remaining));
+        let ax = p.x + hx * ahead;
+        let ay = p.y + hy * ahead;
+        const b = this.#world?.world?.bbox;
+        if (b) {
+          ax = MathUtils.clamp(ax, b.minXM, b.maxXM);
+          ay = MathUtils.clamp(ay, b.minYM, b.maxYM);
+        }
+        const drop = Math.max(Math.hypot(ax - p.x, ay - p.y), 1) * Math.tan(30 * DEG);
+        this.look.x += (ax - this.look.x) * w;
+        this.look.y += (ay - this.look.y) * w;
+        this.look.z += (p.z - drop - this.look.z) * w;
+      }
+    }
   }
 
   /**
@@ -528,36 +799,85 @@ export class CameraController {
     if (!world || this.#mode === "map") return false;
     let moved = false;
 
-    // `#liftAboveRoof` is a method rather than a closure over `pos`/`moved`: this runs twice a
-    // frame, and a fresh arrow function each time is the second-largest per-frame allocation in
-    // the render loop (finding Q17).
-    if (this.#liftAboveRoof(pos)) moved = true;
-
+    // 1. Within working distance, march from the target to the camera and stop short of the first
+    //    wall. `buildingTopAt` ignores a building the viewer has ghosted — the passage the followed
+    //    vehicle is driving through — so the camera stays behind the car instead of being thrown
+    //    onto the roof above it, where the roof hides the very car it is following.
     const dir = this.#scratchB.copy(pos).sub(lookAt);
     const dist = dir.length();
-    if (dist < 1e-3 || dist > this.#occlusionRange) return moved;
-    dir.multiplyScalar(1 / dist);
-
-    const steps = Math.min(24, Math.max(4, Math.ceil(dist / 2)));
-    let hitT = -1;
-    for (let i = 1; i <= steps; i++) {
-      const t = (dist * i) / steps;
-      const x = lookAt.x + dir.x * t;
-      const y = lookAt.y + dir.y * t;
-      const z = lookAt.z + dir.z * t;
-      const top = world.buildingTopAt(x, y);
-      if (top > -Infinity && z < top) {
-        hitT = t;
-        break;
+    if (dist >= 1e-3 && dist <= this.#occlusionRange) {
+      dir.multiplyScalar(1 / dist);
+      const steps = Math.min(48, Math.max(4, Math.ceil(dist)));
+      let hitT = -1;
+      // A target inside a building (the smoothed look point trailing a vehicle out of a passage,
+      // or cutting a corner past a façade) is not a reason to pull the camera onto the target and
+      // lift it onto that roof — measured: a frame of that roof and nothing else. The march starts
+      // where the ray leaves the target's own building.
+      const own = world.buildingTopAt(lookAt.x, lookAt.y) > lookAt.z ? world.buildingIndexAt(lookAt.x, lookAt.y) : -1;
+      for (let i = 1; i <= steps; i++) {
+        const t = (dist * i) / steps;
+        const x = lookAt.x + dir.x * t;
+        const y = lookAt.y + dir.y * t;
+        const z = lookAt.z + dir.z * t;
+        if (own >= 0 && world.buildingIndexAt(x, y) === own) continue;
+        const top = world.buildingTopAt(x, y);
+        if (top > -Infinity && z < top) {
+          hitT = t;
+          break;
+        }
       }
+      if (hitT > 0) {
+        const pull = Math.max(0.5, hitT - dist / steps);
+        pos.set(lookAt.x + dir.x * pull, lookAt.y + dir.y * pull, lookAt.z + dir.z * pull);
+        moved = true;
+      }
+    } else if (dist > this.#occlusionRange && !this.isFlying && CameraController.needsFollowSubject(this.#mode)) {
+      // 1b. Zoomed out beyond working distance: pulling in would throw the zoom away, and lifting
+      //     onto whichever roof the camera is in leaves it looking across that roof — measured by
+      //     the camera fuzz, a frame of one flat grey. Raise the camera instead, just enough that
+      //     the line of sight clears every roof between it and the subject.
+      if (this.#raiseToClear(pos, lookAt)) moved = true;
     }
-    if (hitT > 0) {
-      const pull = Math.max(0.5, hitT - dist / steps);
-      pos.set(lookAt.x + dir.x * pull, lookAt.y + dir.y * pull, lookAt.z + dir.z * pull);
-      moved = true;
-      this.#liftAboveRoof(pos);
-    }
+    // 2. Anything still inside a solid building — the fly-down at long range, or a target inside a
+    //    building the viewer could not ghost — goes above its roof (jevpilot's rule, 09-ui §3).
+    if (this.#liftAboveRoof(pos)) moved = true;
     return moved;
+  }
+
+  /**
+   * Raise `pos` (keeping its x and y) to the lowest height from which the segment to `lookAt` passes
+   * `buildingClearanceM` over every roof in between. Samples inside the target's own building are
+   * skipped — a subject inside a building cannot be seen over its walls, and the viewer ghosts that
+   * building anyway. Bounded at three times the distance above the target.
+   */
+  #raiseToClear(pos: Vector3, lookAt: Vector3): boolean {
+    const world = this.#world;
+    if (!world) return false;
+    const hx = pos.x - lookAt.x;
+    const hy = pos.y - lookAt.y;
+    const hd = Math.hypot(hx, hy);
+    if (hd < 1e-3) return false;
+    const steps = Math.min(64, Math.max(8, Math.ceil(hd / 4)));
+    let need = pos.z;
+    let ownBuilding = world.buildingTopAt(lookAt.x, lookAt.y) > lookAt.z;
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const top = world.buildingTopAt(lookAt.x + hx * t, lookAt.y + hy * t);
+      if (ownBuilding) {
+        if (top > lookAt.z) continue;
+        ownBuilding = false;
+      }
+      if (top === -Infinity) continue;
+      // The ray's height at t is lookAt.z + (Z − lookAt.z)·t; it must clear top + clearance.
+      const z = lookAt.z + (top + this.#clearance - lookAt.z) / t;
+      if (z > need) need = z;
+    }
+    need = Math.min(need, lookAt.z + 3 * Math.hypot(hd, pos.z - lookAt.z));
+    if (need > pos.z) {
+      pos.z = need;
+      return true;
+    }
+    return false;
   }
 
   /** Raise `pos` to the roof plus the clearance if it is inside a building. Returns true if moved. */
@@ -610,7 +930,8 @@ export class CameraController {
         // `#followPos`, not the map focus: see `clearFollowPose`. `setMode` guarantees a subject
         // exists before this mode can be entered, so the pose is always one of this vehicle's.
         const base = this.#followPos;
-        const yaw = this.#followHeading + Math.PI + this.#orbitYaw;
+        const heading = Number.isFinite(this.#chaseYaw) ? this.#chaseYaw : this.#followHeading;
+        const yaw = heading + Math.PI + this.#orbitYaw;
         // A little extra trail at speed; 0 at rest, +40 % at 30 m/s.
         const dist = this.#chaseDistance * (1 + Math.min(0.4, this.#followSpeed / 75));
         const cp = Math.cos(this.#orbitPitch);

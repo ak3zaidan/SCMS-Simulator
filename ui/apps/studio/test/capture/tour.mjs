@@ -15,6 +15,15 @@
  *   6. dashboard         from the driver's seat
  *   7. back-out          returned to the map with the follow kept
  *
+ * And, beside the pictures, the numbers the rendering track is held to (`motion` in tour.json):
+ *
+ *   - the followed vehicle's frame-to-frame jitter in chase, measured on the real page over three
+ *     seconds: the second difference of its screen position (px) and of its heading (degrees);
+ *   - signal heads that disagree with the state the stream says held at the drawn instant;
+ *   - vehicle samples drawn inside a building footprint, split into the viewer's share and the
+ *     engine's (a stream pose already inside it);
+ *   - the camera's near plane and the view insets the HUD imposes.
+ *
  * Stops 4 and 5 are the pair that settles an argument. The chase camera can be geometrically
  * perfect and the picture can still have no car in it, because the floating OBU HUD is anchored to
  * the bottom of the viewport and a chase camera puts the car it follows just below the centre line.
@@ -167,7 +176,114 @@ function readFacts() {
     drawCalls: snap.drawCalls,
     subjectNdc: ndc ? [Math.round(ndc[0] * 1000) / 1000, Math.round(ndc[1] * 1000) / 1000] : null,
     subjectCoveredBy: topmost,
+    near: round(v.camera.near),
+    insets: v.cameras.viewInsets ? `${Math.round(v.cameras.viewInsets.top)}/${Math.round(v.cameras.viewInsets.bottom)}` : null,
   };
+}
+
+/**
+ * Three seconds of the followed vehicle as drawn: screen-position and heading jitter (second
+ * differences, per frame), plus every live vehicle against the building footprints.
+ */
+async function measureMotion() {
+  const engine = window.__vwpStudio.engine;
+  const v = engine.viewer;
+  const it = v.interpolator;
+  const w = v.worldRenderer;
+  const id = v.cameras.followActorId;
+  const px = [];
+  const hs = [];
+  let samples = 0;
+  let viewerInside = 0;
+  let engineInside = 0;
+  const inside = (x, y, z) => {
+    const b = w.buildingIndexAt(x, y);
+    return b >= 0 && b !== w.ghostBuilding && z < w.buildingTopOf(b);
+  };
+  const history = [];
+  const snap = () => {
+    const p = engine.client.poses;
+    const m = new Map();
+    for (let i = 0; i < p.count; i++) if (p.occupied[i] === 1) m.set(p.actorId[i], [p.positions[i * 3], p.positions[i * 3 + 1], p.positions[i * 3 + 2]]);
+    history.push(m);
+    if (history.length > 3) history.shift();
+  };
+  snap();
+  const off = engine.client.onDelta(snap);
+  const t0 = performance.now();
+  while (performance.now() - t0 < 3000) {
+    await new Promise((r) => requestAnimationFrame(r));
+    for (let i = 0; i < it.count; i++) {
+      if (it.outOccupied[i] !== 1) continue;
+      const x = it.outPosition[i * 3];
+      const y = it.outPosition[i * 3 + 1];
+      const z = it.outPosition[i * 3 + 2];
+      samples++;
+      if (inside(x, y, z)) {
+        const aid = it.outActorId[i];
+        if (history.some((h) => { const q = h.get(aid); return q !== undefined && inside(q[0], q[1], q[2]); })) engineInside++;
+        else viewerInside++;
+      }
+      if (id !== null && it.outActorId[i] === id >>> 0) {
+        const cam = v.camera;
+        const m1 = cam.matrixWorldInverse.elements;
+        const m2 = cam.projectionMatrix.elements;
+        const mul = (m, q) => [m[0] * q[0] + m[4] * q[1] + m[8] * q[2] + m[12] * q[3], m[1] * q[0] + m[5] * q[1] + m[9] * q[2] + m[13] * q[3], m[2] * q[0] + m[6] * q[1] + m[10] * q[2] + m[14] * q[3], m[3] * q[0] + m[7] * q[1] + m[11] * q[2] + m[15] * q[3]];
+        const c = mul(m2, mul(m1, [x, y, z + 0.7, 1]));
+        px.push([((c[0] / c[3] + 1) / 2) * v.size.width, ((1 - c[1] / c[3]) / 2) * v.size.height]);
+        hs.push(it.outHeading[i]);
+      }
+    }
+  }
+  off();
+  const d2 = [];
+  for (let i = 2; i < px.length; i++) d2.push(Math.hypot(px[i][0] - 2 * px[i - 1][0] + px[i - 2][0], px[i][1] - 2 * px[i - 1][1] + px[i - 2][1]));
+  const wrap = (d) => d - Math.floor(d / (2 * Math.PI) + 0.5) * 2 * Math.PI;
+  const yaw = [];
+  for (let i = 2; i < hs.length; i++) yaw.push((Math.abs(wrap(wrap(hs[i] - hs[i - 1]) - wrap(hs[i - 1] - hs[i - 2]))) * 180) / Math.PI);
+  const stat = (a) => {
+    if (a.length === 0) return null;
+    const s = [...a].sort((x, y) => x - y);
+    return { rms: Math.round(Math.sqrt(a.reduce((q, x) => q + x * x, 0) / a.length) * 1000) / 1000, p95: Math.round(s[Math.floor(s.length * 0.95)] * 1000) / 1000, max: Math.round(s[s.length - 1] * 1000) / 1000 };
+  };
+  return { frames: px.length, jitterPx: stat(d2), yawJerkDeg: stat(yaw), vehicleSamples: samples, insideBuildingViewer: viewerInside, insideBuildingEngine: engineInside };
+}
+
+/** Signal heads that disagree with the stream's state at the drawn instant (keyframe + deltas). */
+async function signalAgreement() {
+  const engine = window.__vwpStudio.engine;
+  const v = engine.viewer;
+  const log = [];
+  const take = (keyframe) => (m) => {
+    if (!keyframe && m.signals.count === 0) return;
+    log.push({ t: Number(m.simTimeNs) / 1e9, keyframe, ids: Array.from(m.signals.signalId.subarray(0, m.signals.count)), phases: Array.from(m.signals.phase.subarray(0, m.signals.count)) });
+  };
+  const offK = engine.client.onKeyframe(take(true));
+  const offD = engine.client.onDelta(take(false));
+  let checks = 0;
+  let wrong = 0;
+  let heads = 0;
+  const t0 = performance.now();
+  while (performance.now() - t0 < 6000) {
+    await new Promise((r) => setTimeout(r, 250));
+    const at = v.interpolator.renderSimSeconds;
+    let start = -1;
+    for (let i = 0; i < log.length; i++) if (log[i].keyframe && log[i].t <= at + 1e-6) start = i;
+    if (start < 0) continue;
+    const state = new Map();
+    for (let i = start; i < log.length && log[i].t <= at + 1e-6; i++) log[i].ids.forEach((id, k) => state.set(id, log[i].phases[k]));
+    const s = v.worldRenderer.signals;
+    heads = s.count;
+    checks++;
+    for (let i = 0; i < s.count; i++) {
+      const h = s.headState(i);
+      const want = state.has(h.signalId) ? state.get(h.signalId) : 0xff;
+      if (h.phase !== want) wrong++;
+    }
+  }
+  offK();
+  offD();
+  return { heads, checks, headChecks: heads * checks, wrong };
 }
 
 async function main() {
@@ -282,6 +398,8 @@ async function main() {
 
   const chaseResidual = await settle();
   await shot("chase", `behind vehicle ${followed}, settled (camera moving ${chaseResidual.toFixed(1)} m per 600 ms)`);
+  const motion = await page.evaluate(measureMotion);
+  const signals = await page.evaluate(signalAgreement);
 
   // 5. The same frame with the HUD out of the way, through the app's own "HUD dock" control rather
   //    than by hiding DOM from underneath it: if the car appears here and not in the picture
@@ -308,18 +426,24 @@ async function main() {
     window: `${OPTIONS.width}x${OPTIONS.height}`,
     followed,
     problems,
+    motion,
+    signals,
     stops,
   };
   await writeFile(join(OPTIONS.out, "tour.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 
   // A one-screen summary on stdout, because the numbers are what turn the pictures into evidence.
-  const columns = ["file", "mode", "live", "drawn", "culled", "subjectNdc", "subjectCoveredBy", "fps"];
+  const columns = ["file", "mode", "live", "drawn", "culled", "subjectNdc", "subjectCoveredBy", "near", "insets", "fps"];
   const rows = stops.map((s) => columns.map((c) => String(s[c] ?? "—")));
   const widths = columns.map((c, i) => Math.max(c.length, ...rows.map((r) => r[i].length)));
   const line = (cells) => cells.map((cell, i) => cell.padEnd(widths[i])).join("  ");
   console.log(line(columns));
   console.log(widths.map((w) => "-".repeat(w)).join("  "));
   for (const row of rows) console.log(line(row));
+
+  console.log(`\nchase motion over 3 s (${motion.frames} frames): jitter ${JSON.stringify(motion.jitterPx)} px, heading ${JSON.stringify(motion.yawJerkDeg)} deg`);
+  console.log(`vehicles inside buildings: ${motion.insideBuildingViewer} viewer-caused, ${motion.insideBuildingEngine} engine-placed, of ${motion.vehicleSamples} samples`);
+  console.log(`signal heads: ${signals.wrong} wrong of ${signals.headChecks} head-checks (${signals.heads} heads, ${signals.checks} checks)`);
 
   let bytes = 0;
   for (const name of await readdir(OPTIONS.out)) bytes += (await stat(join(OPTIONS.out, name))).size;

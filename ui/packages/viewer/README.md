@@ -32,7 +32,7 @@ import { VwpClient, decodeWorld } from "@vwp/protocol";
 
 const viewer = new Viewer({ canvas, theme: "dark", timeOfDay: 11 });
 const client = new VwpClient({ url: "ws://127.0.0.1:8787" });
-viewer.attachClient(client);                 // Hello → classes, Keyframe → signals, both → poses
+viewer.attachClient(client);                 // Hello → classes; Keyframe and Delta → poses and signals
 
 const hello = await client.connect();
 const res = await fetch(`/world/${bytesToHex(hello.worldHash)}.vwb`);
@@ -48,10 +48,11 @@ viewer.overlays.set("tx_pulses", true);
 | Module | What it owns |
 |---|---|
 | `scene.ts` | `Viewer`: the one `Scene`, `WebGLRenderer` and `PerspectiveCamera`, and the rAF loop |
-| `world-render.ts` | `WorldRenderer`: merged per-tile roads/markings/junctions/landuse, buildings in one `BatchedMesh` with three LODs, signals, RSU masts, ground, sky, sun |
+| `world-render.ts` | `WorldRenderer`: merged per-tile roads/markings/junctions/landuse, buildings in one `BatchedMesh` (each its exact footprint at every distance), the building a followed vehicle drives through ghosted, RSU masts, ground, sky, a sun whose shadow frustum moves in whole texels |
+| `signals.ts` | `SignalRenderer`: a three-aspect lantern per §4.5 head facing its approach, plus a stop bar on the controlled lane; keyframe = whole state, delta = changes, every head of a controller lit by its row |
 | `actors.ts` | `ActorRenderer`: one `InstancedMesh` per (class × LOD), CPU frustum culling by `count`, per-instance state colour |
-| `interp.ts` | `PoseInterpolator`: two snapshots, smooth motion at 60 fps from any delta cadence, keyed on sim time, with an extrapolation ease |
-| `cameras.ts` | `CameraController`: `map`/`chase`/`dashboard`/`free`/`rsu`, exponential smoothing, `flyTo`, `keepCameraOutsideBuildings` |
+| `interp.ts` | `PoseInterpolator`: four snapshots, a chord-limited cubic Hermite through the reported velocities (fitted once per slot per step, evaluated per frame), wrap-aware heading, CTRV dead reckoning with an extrapolation ease, seeks and repeats handled as discontinuities, corrections blended out, a hold for paused runs |
+| `cameras.ts` | `CameraController`: `map`/`chase`/`dashboard`/`free`/`rsu`, exponential smoothing, arched `flyTo`, `keepCameraOutsideBuildings` (march, raise-to-clear, roof lift), ground clamp, non-finite recovery, view insets for interface panels |
 | `overlays.ts` | `OverlayManager` and the five overlays, keyed by `OVERLAY_NAMES` from the protocol, with the `GT` lock; the non-GT state-marker channels start enabled, because a shape channel that has to be switched on is not redundancy |
 | `picking.ts` | `Picker`: grid broad phase + exact ray/OBB narrow phase over actors, plus sites and the ground plane |
 | `stats.ts` | `FrameStats`: frame time, CPU/render split, draw calls, instance counts |
@@ -100,10 +101,11 @@ stubbed so the numbers are the **CPU half** of the frame:
 
 | | |
 |---|---|
-| 5,000 vehicles, all inside the frustum, 600 frames | mean **0.78 ms/frame** wall, p95 1.74 ms, p99 1.93 ms |
-| viewer CPU (interpolate + cull + LOD + instance write) | mean **0.56 ms** |
-| draw calls, whole scene | **113** (103 static + 8 actor buckets + 2 state-marker channels; 675 buildings are 1) |
-| heap delta over 600 frames, forced GC | **0.07 MB** |
+| 5,000 vehicles, all inside the frustum, 600 frames | mean **1.59 ms/frame** wall, p50 1.27 ms, p95 3.01 ms, p99 3.26 ms (2026-09-23, machine shared with other builds, load average ~6) |
+| viewer CPU (interpolate + cull + LOD + instance write) | mean **1.30 ms** |
+| same scene, original two-snapshot linear viewer, interleaved runs | plan view 1.40 ms → 1.59 ms; chase 0.59 ms → 0.77 ms (the Hermite fit is cached per slot per mobility step; before the cache it was 10x the linear sampler) |
+| draw calls, whole scene | **67** (buildings one multi-draw, signals three instanced meshes) |
+| heap delta over 600 frames, forced GC | **0.17 MB** |
 | CPU frustum culling, 450 m map view | 418 drawn of 5,000 live |
 
 09-ui §4 budgets "1–2 ms in JS" for pose sampling and matrix writes at 5,000 vehicles; the measurement

@@ -31,7 +31,10 @@ export function StateLegend(): React.JSX.Element {
     <div
       className="chip legend"
       data-testid="state-legend"
-      style={{ position: "absolute", right: 8, top: 46, flexDirection: "column", alignItems: "flex-start", gap: 2 }}
+      // Below the toolbar wherever it ends: the toolbar wraps onto more rows in a narrow viewport,
+      // and a legend at a fixed 46 px then sat on top of its buttons (measured at 960 x 600: the
+      // HUD-dock button unclickable under a legend row). `Viewport` publishes the toolbar's bottom.
+      style={{ position: "absolute", right: 8, top: "calc(var(--vp-toolbar-bottom, 38px) + 6px)", flexDirection: "column", alignItems: "flex-start", gap: 2 }}
     >
       {palette.map((p) => (
         <span className="item" key={p.key}>

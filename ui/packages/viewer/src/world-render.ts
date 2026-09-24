@@ -12,12 +12,14 @@
  *   and saves a material switch.
  * - **Lane markings** are a second mesh per tile (unlit, polygon-offset) so `overlay.set
  *   {lane_markings: false}` is one `visible = false` per tile and nothing else.
- * - **Buildings** go into a single `THREE.BatchedMesh` holding three geometries per building (near:
- *   walls + roof + parapet, mid: walls + roof, far: the footprint's bounding box). LOD is a
- *   `setGeometryIdAt` on the one instance, so switching LOD never moves an instance between meshes
- *   and the whole town stays one multi-draw call. If `BatchedMesh` cannot be built — the vertex
- *   budget is exceeded, or a three build without multi-draw support throws — the builder falls back
- *   to baking the mid-LOD building shells into the per-tile meshes and reports
+ * - **Buildings** go into a single `THREE.BatchedMesh`, one geometry per building: its real
+ *   footprint extruded, with a roof and a parapet. There used to be three LODs, and the far one was
+ *   the footprint's *axis-aligned bounding box* — on Manhattan's grid, which runs 29° off north, a
+ *   box that swallows half of every street around the block, so from 700 m out the traffic drove
+ *   through solid walls. The near/mid switch popped the parapet at 180 m. One exact geometry
+ *   costs fewer vertices than the three did together and cannot pop. If `BatchedMesh` cannot be
+ *   built — the vertex budget is exceeded, or a three build without multi-draw support throws —
+ *   the builder falls back to baking the shells into the per-tile meshes and reports
  *   {@link WorldRenderer.buildingBackend} as `"merged"`.
  *
  * Also here: the ground plane, the gradient sky, and a sun/hemisphere rig driven by a time-of-day
@@ -46,6 +48,7 @@ import {
   type Material,
 } from "three";
 import type { SignalBlock, VwpWorld } from "@vwp/protocol";
+import { SignalRenderer } from "./signals.js";
 import { MeshBuilder, addBox, addCylinder, addDisc, addExtrudedRing, addPolygon, addRibbon } from "./geometry.js";
 import type { RingShading } from "./geometry.js";
 import type { ViewerTheme } from "./theme.js";
@@ -64,8 +67,10 @@ const LANE_CROSSING = 6;
 const Z_LANDUSE = 0.02;
 const Z_ROAD = 0.1;
 const Z_JUNCTION = 0.16;
-const Z_CROSSING = 0.24;
-const Z_MARKING = 0.3;
+const Z_CROSSING = 0.2;
+const Z_MARKING = 0.24;
+/** Width of a painted lane line, metres: `addOffsetLine`'s half-width 0.09 twice. */
+const MARKING_WIDTH_M = 0.18;
 
 /** Tuning for {@link WorldRenderer}. */
 export interface WorldRendererOptions {
@@ -76,7 +81,11 @@ export interface WorldRendererOptions {
   readonly buildings?: boolean;
   /** Build lane markings. Default true. */
   readonly laneMarkings?: boolean;
-  /** `[near→mid, mid→far]` building LOD switch distances in metres. Default `[180, 700]`. */
+  /**
+   * `[near→mid, mid→far]` building LOD switch distances in metres. Default `[180, 700]`. Kept for
+   * compatibility: every LOD is now the same exact footprint geometry (see the file header), so
+   * these only decide which id is recorded, never what is drawn.
+   */
   readonly buildingLodDistancesM?: readonly [number, number];
   /** Refuse `BatchedMesh` above this many vertices and fall back to merged tiles. Default 1,500,000. */
   readonly maxBuildingVertices?: number;
@@ -143,25 +152,6 @@ export interface WorldBuildReport {
   readonly buildMs: number;
 }
 
-/** SAE J2735 `MovementPhaseState` → a colour bucket. */
-function phaseBucket(phase: number): 0 | 1 | 2 | 3 {
-  switch (phase) {
-    case 2:
-    case 3:
-      return 1; // red
-    case 4:
-    case 7:
-    case 8:
-    case 9:
-      return 2; // amber
-    case 5:
-    case 6:
-      return 3; // green
-    default:
-      return 0; // dark / unavailable
-  }
-}
-
 /**
  * How far up-sun of its target the `DirectionalLight` is placed, metres.
  *
@@ -219,7 +209,9 @@ export class WorldRenderer {
   readonly tiles = new Group();
   readonly markings = new Group();
   readonly buildingsGroup = new Group();
-  readonly signalsGroup = new Group();
+  /** Signal lanterns and stop bars; see `signals.ts`. */
+  readonly signals: SignalRenderer;
+  readonly signalsGroup: Group;
   readonly sitesGroup = new Group();
   readonly lights = new Group();
 
@@ -242,7 +234,6 @@ export class WorldRenderer {
   #surfaceMaterial: MeshLambertMaterial;
   #markingMaterial: MeshBasicMaterial;
   #buildingMaterial: MeshLambertMaterial;
-  #signalMaterial: MeshLambertMaterial;
   #siteMaterial: MeshLambertMaterial;
   #disposables: (BufferGeometry | Material)[] = [];
 
@@ -256,6 +247,12 @@ export class WorldRenderer {
   /** Building centroid x, y, top z, and footprint radius. */
   #buildingCentroid = new Float32Array(0);
   #buildingCount = 0;
+  /** Buildings hidden this frame because the followed vehicle is inside them; see {@link setGhostBuilding}. */
+  #ghost = -1;
+  /** A second ghosted building: the one the camera itself is in; see {@link setGhostBuildings}. */
+  #ghost2 = -1;
+  /** The `lane_markings` overlay's choice; {@link fadeMarkings} only ever hides on top of it. */
+  #markingsWanted = true;
   #buildingBackend: BuildingBackend = "none";
   #buildError: string | null = null;
 
@@ -268,16 +265,6 @@ export class WorldRenderer {
   #gridStart = new Int32Array(0);
   #gridItems = new Int32Array(0);
 
-  #signals: InstancedMesh<BufferGeometry, Material> | null = null;
-  /**
-   * Stream signal id → the head rows it colours. A head group's id is
-   * `(controller + 1) · 65536 + group` (vwp-v1 §3.3.3); a plain controller id (< 65536)
-   * colours every head of that controller.
-   */
-  #signalIndexById = new Map<number, number[]>();
-  #signalPhase = new Uint8Array(0);
-  #signalColors = new Float32Array(4 * 3);
-  #signalColor = new Color();
 
   /** Site positions, three floats each, at antenna height. */
   #sitePos = new Float32Array(0);
@@ -317,17 +304,23 @@ export class WorldRenderer {
     this.tiles.name = "world/tiles";
     this.markings.name = "world/lane-markings";
     this.buildingsGroup.name = "world/buildings";
-    this.signalsGroup.name = "world/signals";
+    this.signals = new SignalRenderer(options.theme);
+    this.signalsGroup = this.signals.group;
     this.sitesGroup.name = "world/sites";
     this.lights.name = "world/lights";
 
     this.#surfaceMaterial = new MeshLambertMaterial({ vertexColors: true, name: "world-surface" });
+    // Markings test depth against the road but never write it, and draw after it: where two
+    // markings overlap — the edge lines of the two directions meet on the centre line, a white and a
+    // yellow strip at exactly the same height — the later one wins, every frame, instead of the two
+    // trading places as the camera moves (measured: 1.8 % of a 1,680 x 1,050 plan view changing
+    // under a 1 cm camera move, all of it markings).
     this.#markingMaterial = new MeshBasicMaterial({
       vertexColors: true, name: "lane-markings", polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
-      toneMapped: false,
+      toneMapped: false, depthWrite: false,
     });
+    this.markings.renderOrder = 1;
     this.#buildingMaterial = new MeshLambertMaterial({ vertexColors: true, name: "buildings" });
-    this.#signalMaterial = new MeshLambertMaterial({ vertexColors: true, name: "signal-heads", toneMapped: false });
     this.#siteMaterial = new MeshLambertMaterial({ vertexColors: true, name: "sites" });
 
     const groundGeom = new PlaneGeometry(1, 1);
@@ -495,17 +488,44 @@ export class WorldRenderer {
     this.ground.material.color.setHex(theme.ground);
     this.hemisphere.color.setHex(theme.skyHorizon);
     this.hemisphere.groundColor.setHex(theme.ground);
-    this.#signalColors.set([
-      ...colorTriple(theme.signalDark), ...colorTriple(theme.signalRed),
-      ...colorTriple(theme.signalAmber), ...colorTriple(theme.signalGreen),
-    ]);
+    this.signals.setTheme(theme);
     this.setTimeOfDay(this.#timeOfDay);
     if (this.#world) this.setWorld(this.#world);
   }
 
   /** Where the sun's shadow frustum is centred; follow the camera focus to keep texels small. */
   setShadowFocus(x: number, y: number, z: number): void {
-    this.sun.target.position.set(x, y, z);
+    // Snap the focus to the shadow map's texel grid, in the light's own frame. A frustum that
+    // slides by a fraction of a texel every frame re-rasterises every shadow edge at a new phase,
+    // and the edges crawl and shimmer as the chase camera drives along — the classic "shadow
+    // swimming" (Dimitrov 2007, "Cascaded Shadow Maps", NVIDIA, §"Moving the light texel-sized
+    // increments"). Along the light direction nothing needs snapping.
+    const texel = (2 * this.#options.shadowExtentM) / Math.max(1, this.#options.shadowMapSize);
+    const d = this.#sunDir;
+    // Light-space basis: `u` horizontal and perpendicular to the sun, `v = d × u`.
+    let ux = -d.y;
+    let uy = d.x;
+    const ul = Math.hypot(ux, uy);
+    if (ul < 1e-6) {
+      ux = 1;
+      uy = 0;
+    } else {
+      ux /= ul;
+      uy /= ul;
+    }
+    const vx = d.y * 0 - d.z * uy;
+    const vy = d.z * ux - d.x * 0;
+    const vz = d.x * uy - d.y * ux;
+    const pu = x * ux + y * uy;
+    const pv = x * vx + y * vy + z * vz;
+    const pd = x * d.x + y * d.y + z * d.z;
+    const su = Math.round(pu / texel) * texel;
+    const sv = Math.round(pv / texel) * texel;
+    this.sun.target.position.set(
+      su * ux + sv * vx + pd * d.x,
+      su * uy + sv * vy + pd * d.y,
+      sv * vz + pd * d.z,
+    );
     this.sun.target.updateMatrixWorld();
     this.#placeSun();
   }
@@ -732,10 +752,10 @@ export class WorldRenderer {
       }
     }
 
-    this.#buildSignals(world);
+    this.signals.build(world);
     this.#buildSites(world);
     if (this.#buildings) drawables++;
-    if (this.#signals) drawables++;
+    if (this.signals.count > 0) drawables += 3;
     drawables += this.sitesGroup.children.length + 2; // ground and sky
 
     this.#report = {
@@ -790,15 +810,13 @@ export class WorldRenderer {
       const n = b.ringCount[i];
       if (n < 3) continue;
       shading.tone = toneOf(i);
-      for (let lod = 0; lod < 3; lod++) {
-        probe.reset();
-        addExtrudedRing(probe, ring.x, ring.y, b.ringOff[i], n, b.baseZM[i], Math.max(1, b.heightM[i]),
-          lod as LodLevel, scratch, wr, wg, wb, rr, rg, rb, shading);
-        perLodV[i * 3 + lod] = probe.vertexCount;
-        perLodI[i * 3 + lod] = probe.indexCount;
-        totalV += probe.vertexCount;
-        totalI += probe.indexCount;
-      }
+      probe.reset();
+      addExtrudedRing(probe, ring.x, ring.y, b.ringOff[i], n, b.baseZM[i], Math.max(1, b.heightM[i]),
+        0, scratch, wr, wg, wb, rr, rg, rb, shading);
+      perLodV[i * 3] = probe.vertexCount;
+      perLodI[i * 3] = probe.indexCount;
+      totalV += probe.vertexCount;
+      totalI += probe.indexCount;
     }
 
     this.#buildingCount = B;
@@ -847,15 +865,17 @@ export class WorldRenderer {
           const n = b.ringCount[i];
           if (n < 3) continue;
           shading.tone = toneOf(i);
-          for (let lod = 0; lod < 3; lod++) {
-            builder.reset();
-            addExtrudedRing(builder, ring.x, ring.y, b.ringOff[i], n, b.baseZM[i], Math.max(1, b.heightM[i]),
-              lod as LodLevel, scratch, wr, wg, wb, rr, rg, rb, shading);
-            const g = builder.toGeometry();
-            if (!g) continue;
-            this.#buildingGeomIds[i * 3 + lod] = mesh.addGeometry(g);
-            g.dispose();
-          }
+          builder.reset();
+          addExtrudedRing(builder, ring.x, ring.y, b.ringOff[i], n, b.baseZM[i], Math.max(1, b.heightM[i]),
+            0, scratch, wr, wg, wb, rr, rg, rb, shading);
+          const g = builder.toGeometry();
+          if (!g) continue;
+          const id = mesh.addGeometry(g);
+          g.dispose();
+          // Every LOD slot names the one exact geometry; see the file header.
+          this.#buildingGeomIds[i * 3] = id;
+          this.#buildingGeomIds[i * 3 + 1] = id;
+          this.#buildingGeomIds[i * 3 + 2] = id;
           const g0 = this.#buildingGeomIds[i * 3 + 1];
           if (g0 < 0) continue;
           const inst = mesh.addInstance(g0);
@@ -893,7 +913,7 @@ export class WorldRenderer {
       const t = tileIndex(ring.x[off], ring.y[off]);
       shading.tone = toneOf(i);
       addExtrudedRing(surfaceOf(t), ring.x, ring.y, off, n, b.baseZM[i], Math.max(1, b.heightM[i]),
-        1, scratch, wr, wg, wb, rr, rg, rb, shading);
+        0, scratch, wr, wg, wb, rr, rg, rb, shading);
     }
     this.#report = { ...this.#report, buildingVertices: totalV, buildingIndices: totalI };
   }
@@ -956,73 +976,108 @@ export class WorldRenderer {
    * footprint. `cameras.ts` calls this to keep the chase camera out of geometry.
    */
   buildingTopAt(x: number, y: number): number {
+    const i = this.#buildingAt(x, y, true);
+    return i < 0 ? -Infinity : this.#buildingCentroid[i * 4 + 2];
+  }
+
+  /**
+   * Index of the tallest building whose footprint covers `(x, y)`, or −1. Unlike
+   * {@link buildingTopAt} this also reports a ghosted building.
+   */
+  buildingIndexAt(x: number, y: number): number {
+    return this.#buildingAt(x, y, false);
+  }
+
+  /** The `building_id` of building `i`, or −1. */
+  buildingIdOf(i: number): number {
+    const w = this.#world;
+    return w && i >= 0 && i < w.buildings.count ? w.buildings.buildingId[i] : -1;
+  }
+
+  /** Roof height of building `i` (base + height), or −∞. */
+  buildingTopOf(i: number): number {
+    return i >= 0 && i < this.#buildingCount ? this.#buildingCentroid[i * 4 + 2] : -Infinity;
+  }
+
+  /** The building currently ghosted, or −1. */
+  get ghostBuilding(): number {
+    return this.#ghost;
+  }
+
+  /**
+   * Hide one building — the one the followed vehicle is driving *through*.
+   *
+   * The engine's lanes pass through building footprints where the map has a road under a building
+   * (a passage, an arcade, a ramp into a terminal: measured on Manhattan, 39 of 2,406 drive lanes
+   * cross a footprint for 1.7 km in all). A chase camera behind a car in such a passage used to be
+   * thrown onto the roof — 172 m up for one of them — looking down at a roof that hid the car. The
+   * building is hidden instead, and the camera logic treats it as open space, for as long as the
+   * followed vehicle is inside it. Only the batched backend can hide one building; with the merged
+   * fallback this is a no-op and the old roof rule applies.
+   */
+  setGhostBuilding(index: number): void {
+    this.setGhostBuildings(index, -1);
+  }
+
+  /**
+   * Hide up to two buildings: the one the followed vehicle is inside and the one a street-level
+   * camera is inside (it followed that vehicle in, and a change of subject flies it out). Both are
+   * open space to the camera logic while hidden.
+   */
+  setGhostBuildings(first: number, second: number): void {
+    const norm = (i: number): number => (i >= 0 && i < this.#buildingCount && this.#buildingInstanceIds[i] >= 0 ? i : -1);
+    const a = norm(first);
+    let b = norm(second);
+    if (b === a) b = -1;
+    if (a === this.#ghost && b === this.#ghost2) return;
+    const mesh = this.#buildings;
+    if (!mesh) {
+      this.#ghost = -1;
+      this.#ghost2 = -1;
+      return;
+    }
+    for (const prev of [this.#ghost, this.#ghost2]) {
+      if (prev >= 0 && prev !== a && prev !== b) mesh.setVisibleAt(this.#buildingInstanceIds[prev], true);
+    }
+    for (const next of [a, b]) if (next >= 0) mesh.setVisibleAt(this.#buildingInstanceIds[next], false);
+    this.#ghost = a;
+    this.#ghost2 = b;
+  }
+
+  /** The second ghosted building, or −1. */
+  get ghostBuilding2(): number {
+    return this.#ghost2;
+  }
+
+  #buildingAt(x: number, y: number, skipGhost: boolean): number {
     const world = this.#world;
-    if (!world || this.#gridItems.length === 0) return -Infinity;
+    if (!world || this.#gridItems.length === 0) return -1;
     const gx = Math.floor((x - this.#gridMinX) / this.#gridCell);
     const gy = Math.floor((y - this.#gridMinY) / this.#gridCell);
-    if (gx < 0 || gy < 0 || gx >= this.#gridW || gy >= this.#gridH) return -Infinity;
+    if (!(gx >= 0 && gy >= 0 && gx < this.#gridW && gy < this.#gridH)) return -1;
     const c = gy * this.#gridW + gx;
     const start = this.#gridStart[c];
     const end = this.#gridStart[c + 1];
     const b = world.buildings;
     const ring = world.ringPoints;
     let top = -Infinity;
+    let best = -1;
     for (let k = start; k < end; k++) {
       const i = this.#gridItems[k];
+      if (skipGhost && (i === this.#ghost || i === this.#ghost2)) continue;
       const dx = x - this.#buildingCentroid[i * 4];
       const dy = y - this.#buildingCentroid[i * 4 + 1];
       const r = this.#buildingCentroid[i * 4 + 3];
       if (dx * dx + dy * dy > r * r) continue;
       if (pointInRing(ring.x, ring.y, b.ringOff[i], b.ringCount[i], x, y)) {
         const t = this.#buildingCentroid[i * 4 + 2];
-        if (t > top) top = t;
+        if (t > top) {
+          top = t;
+          best = i;
+        }
       }
     }
-    return top;
-  }
-
-  #buildSignals(world: VwpWorld): void {
-    const n = world.signals.count;
-    this.#signalIndexById.clear();
-    this.#signalPhase = new Uint8Array(n);
-    if (n === 0) {
-      this.#signals = null;
-      return;
-    }
-    const builder = new MeshBuilder({ color: true, vertexCapacity: 64, indexCapacity: 128 });
-    // A head: a dark housing with a bright lens facing -x. The lens is what instanceColor tints.
-    addBox(builder, 0, 0, 0, 0.34, 0.34, 0.95, 0, 0.16, 0.17, 0.19);
-    addBox(builder, -0.19, 0, 0, 0.06, 0.26, 0.82, 0, 1, 1, 1);
-    const geom = builder.toGeometry();
-    if (!geom) {
-      this.#signals = null;
-      return;
-    }
-    this.#disposables.push(geom);
-    const mesh = new InstancedMesh<BufferGeometry, Material>(geom, this.#signalMaterial, n);
-    mesh.name = "world/signal-heads";
-    mesh.castShadow = false;
-    mesh.frustumCulled = true;
-    const m = this.#scratchMatrix;
-    this.#scratchColor.setRGB(1, 1, 1);
-    for (let i = 0; i < n; i++) {
-      const s = world.signals.at(i);
-      m.identity().setPosition(s.xM, s.yM, s.zM);
-      mesh.setMatrixAt(i, m);
-      mesh.setColorAt(i, this.#scratchColor);
-      const groupKey = (s.signalId + 1) * 65536 + s.group;
-      for (const key of [groupKey, s.signalId]) {
-        const rows = this.#signalIndexById.get(key);
-        if (rows) rows.push(i);
-        else this.#signalIndexById.set(key, [i]);
-      }
-      this.#signalPhase[i] = 0;
-    }
-    mesh.instanceMatrix.needsUpdate = true;
-    mesh.computeBoundingSphere();
-    this.#signals = mesh;
-    this.signalsGroup.add(mesh);
-    this.updateSignalPhases(null);
+    return best;
   }
 
   #buildSites(world: VwpWorld): void {
@@ -1058,28 +1113,24 @@ export class WorldRenderer {
   }
 
   /**
-   * Apply a keyframe's signal block (§3.3.3). Pass `null` to reset every head to dark.
-   * Signals not present in the block keep their last phase.
+   * Apply signal rows on top of the current state, keyed by controller (`signal_id`), to every head
+   * of that controller. Pass `null` to forget every state. Kept for callers that hold a lone block
+   * (the replay path); a stream should use {@link applySignalKeyframe} and {@link applySignalDelta},
+   * which is what makes a seek or a reconnect come out right.
    */
   updateSignalPhases(block: SignalBlock | null): void {
-    const mesh = this.#signals;
-    if (!mesh) return;
-    if (block) {
-      for (let i = 0; i < block.count; i++) {
-        const rows = this.#signalIndexById.get(block.signalId[i]);
-        if (rows === undefined) continue;
-        for (const idx of rows) this.#signalPhase[idx] = block.phase[i];
-      }
-    } else {
-      this.#signalPhase.fill(0);
-    }
-    const c = this.#signalColor;
-    for (let i = 0; i < this.#signalPhase.length; i++) {
-      const bucket = phaseBucket(this.#signalPhase[i]);
-      c.setRGB(this.#signalColors[bucket * 3], this.#signalColors[bucket * 3 + 1], this.#signalColors[bucket * 3 + 2]);
-      mesh.setColorAt(i, c);
-    }
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    if (block) this.signals.applyDelta(block);
+    else this.signals.resetStates();
+  }
+
+  /** A keyframe's signal block: the complete state (§3.3.3); unmentioned heads have no data. */
+  applySignalKeyframe(block: SignalBlock | null): void {
+    this.signals.applyKeyframe(block);
+  }
+
+  /** A delta's signal block: only the rows that changed (§3.4.7). */
+  applySignalDelta(block: SignalBlock | null): void {
+    this.signals.applyDelta(block);
   }
 
   /** Convenience alias matching the message name. */
@@ -1131,6 +1182,39 @@ export class WorldRenderer {
     return visible;
   }
 
+  /**
+   * Fade the lane markings out as they shrink below a pixel.
+   *
+   * A marking is 0.18 m wide. From the plan view's 1.4 km that is a sixth of a pixel, and a line
+   * that thin is rasterised as a scatter of pixels that changes with every sub-pixel camera move:
+   * measured at 1,680 x 1,050, a one-pixel pan changed 8.5 % of the frame, all of it markings (the
+   * road surfaces alone: 0.04 %). Full strength from about one pixel wide, gone below a third.
+   * `distanceM` is the camera's distance to what it looks at, `fovDeg` and `viewportPx` its
+   * vertical field and height.
+   */
+  fadeMarkings(distanceM: number, fovDeg: number, viewportPx: number): void {
+    const mPerPx = (2 * Math.max(1, distanceM) * Math.tan((fovDeg * Math.PI) / 360)) / Math.max(1, viewportPx);
+    const coverage = MARKING_WIDTH_M / mPerPx;
+    const t = Math.min(1, Math.max(0, (coverage - 0.35) / (0.9 - 0.35)));
+    const opacity = t * t * (3 - 2 * t);
+    const m = this.#markingMaterial;
+    this.markings.visible = this.#markingsWanted && opacity > 0.02;
+    if (Math.abs(m.opacity - opacity) > 0.01) {
+      m.opacity = opacity;
+      m.transparent = opacity < 0.999;
+    }
+  }
+
+  /** Whether lane markings are wanted at all (the `lane_markings` overlay). */
+  get markingsEnabled(): boolean {
+    return this.#markingsWanted;
+  }
+
+  set markingsEnabled(v: boolean) {
+    this.#markingsWanted = v;
+    this.markings.visible = v;
+  }
+
   /** Keep the sky centred on the camera so its radius never has to cover the whole world. */
   followCamera(camera: Camera): void {
     const e = camera.matrixWorld.elements;
@@ -1139,7 +1223,9 @@ export class WorldRenderer {
   }
 
   #clearWorld(): void {
-    for (const g of [this.tiles, this.markings, this.buildingsGroup, this.signalsGroup, this.sitesGroup]) {
+    // The signal renderer rebuilds itself in `setWorld`, keeping what the lamps showed when the
+    // world is the same one (a theme swap).
+    for (const g of [this.tiles, this.markings, this.buildingsGroup, this.sitesGroup]) {
       for (let i = g.children.length - 1; i >= 0; i--) {
         const child = g.children[i];
         g.remove(child);
@@ -1149,7 +1235,8 @@ export class WorldRenderer {
     for (const d of this.#disposables) d.dispose();
     this.#disposables = [];
     this.#buildings = null;
-    this.#signals = null;
+    this.#ghost = -1;
+    this.#ghost2 = -1;
     this.#buildingCount = 0;
     this.#buildingBackend = "none";
     this.#buildError = null;
@@ -1175,7 +1262,7 @@ export class WorldRenderer {
     this.#surfaceMaterial.dispose();
     this.#markingMaterial.dispose();
     this.#buildingMaterial.dispose();
-    this.#signalMaterial.dispose();
+    this.signals.dispose();
     this.#siteMaterial.dispose();
     this.group.removeFromParent();
   }

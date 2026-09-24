@@ -58,6 +58,12 @@ export interface ActorRendererOptions {
   readonly cullMarginM?: number;
   /** Let LOD-0 actors cast shadows. Default false — 5,000 shadow casters is not a 60 fps budget. */
   readonly castShadows?: boolean;
+  /**
+   * Height added to every actor's z, metres. Default 0.1 — the height the world renderer draws the
+   * road surface at above the lane centreline (`Z_ROAD` in `world-render.ts`), so a vehicle's tyres
+   * sit on the asphalt instead of 10 cm into it.
+   */
+  readonly groundOffsetM?: number;
   /** Draw ground-truth-only state (the `ATTACKER` bit) in the actor colour. Default true. */
   readonly showGroundTruth?: boolean;
   /**
@@ -261,6 +267,7 @@ export class ActorRenderer {
   #lod0 = 90;
   #lod1 = 400;
   #cullMargin: number;
+  #groundOffset: number;
   #castShadows: boolean;
   #showGroundTruth: boolean;
   #benignByClass: boolean;
@@ -283,6 +290,7 @@ export class ActorRenderer {
     this.#maxActors = Math.max(1, options.maxActors ?? 20_000);
     this.#initialCapacity = Math.max(8, options.initialCapacity ?? 128);
     this.#cullMargin = options.cullMarginM ?? 1;
+    this.#groundOffset = options.groundOffsetM ?? 0.1;
     this.#castShadows = options.castShadows ?? false;
     this.#showGroundTruth = options.showGroundTruth ?? true;
     this.#benignByClass = options.colorBenignByClass ?? false;
@@ -320,6 +328,12 @@ export class ActorRenderer {
   set lodDistancesM(v: readonly [number, number]) {
     this.#lod0 = v[0];
     this.#lod1 = v[1];
+  }
+
+  /** Set the two LOD switch distances without allocating (the frame loop calls this every frame). */
+  setLodDistances(lod0: number, lod1: number): void {
+    this.#lod0 = lod0;
+    this.#lod1 = lod1;
   }
 
   /** Whether the ground-truth `ATTACKER` bit colours actors (09-ui §6: GT overlays can be locked off). */
@@ -578,6 +592,7 @@ export class ActorRenderer {
     const ids = ctx.actorId;
     const nClasses = this.#classes.length;
     const planes = this.#planes;
+    const lift = this.#groundOffset;
     const stateColor = this.#stateColor;
     const classColor = this.#classColor;
     const selected = this.#selectedActorId;
@@ -606,7 +621,7 @@ export class ActorRenderer {
       const p = s * 3;
       const x = pos[p];
       const y = pos[p + 1];
-      const z = pos[p + 2];
+      const z = pos[p + 2] + lift;
       const dx = x - camX;
       const dy = y - camY;
       const dz = z - camZ;

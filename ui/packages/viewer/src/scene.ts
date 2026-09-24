@@ -31,7 +31,9 @@ import {
   Scene,
   WebGLRenderer,
 } from "three";
-import type { HelloMessage, KeyframeMessage, PoseBuffer, VwpClientApi, VwpWorld } from "@vwp/protocol";
+import type {
+  DeltaMessage, HelloMessage, KeyframeMessage, PoseBuffer, SignalBlock, VwpClientApi, VwpWorld,
+} from "@vwp/protocol";
 import { ActorRenderer, DEFAULT_ACTOR_CLASSES, classesFromHello } from "./actors.js";
 import { CameraController, type CameraMode } from "./cameras.js";
 import { PoseInterpolator, type PoseInterpolatorOptions } from "./interp.js";
@@ -247,6 +249,16 @@ export class Viewer {
   /** Set by {@link setFog}, after which the mode stops driving the fog. */
   #fogUserSet = false;
   #detachClient: (() => void) | null = null;
+  /**
+   * Signal blocks waiting for the render clock to reach their sim time. Poses are drawn about one
+   * mobility step in the past (`interp.ts`); a lamp applied the moment its frame arrives would
+   * change colour a step before the vehicles it controls reach the instant it changed at, which on
+   * a stop line is the difference between a car crossing on green and on red.
+   */
+  #signalQueue: { simSeconds: number; keyframe: boolean; block: SignalBlock }[] = [];
+  #lastSignalSim = Number.NaN;
+  /** The `Hello` whose run the signal state belongs to; a re-attach with the same one keeps it. */
+  #signalHello: HelloMessage | null = null;
   #lastReport: FrameReport = {
     dtSeconds: 0, clockSeconds: 0, fixedSteps: 0, actorsDrawn: 0, actorsCulled: 0,
     interpolationAlpha: 0, stalled: true,
@@ -475,11 +487,87 @@ export class Viewer {
     const stepSeconds = Number(hello.mobilityStepNs) / 1e9;
     if (stepSeconds > 0) this.interpolator.setNominalIntervalSeconds(stepSeconds);
     this.interpolator.reset();
+    // A different Hello is a different run (or a non-resumed reconnect, §1.4 case 2): nothing the
+    // lamps showed belongs to it. The *same* Hello re-applied — the Studio re-attaching the viewer
+    // — keeps them, because a paused run sends its one keyframe once and never again.
+    if (hello !== this.#signalHello) {
+      // A different *run* — not a reconnect to the same one — has different vehicles under the
+      // same ids and possibly a different world: a chase camera kept on the old subject would sit
+      // wherever that id's last pose was, which in a new world can be the void.
+      const previous = this.#signalHello;
+      if (previous && !sameBytes(previous.runId, hello.runId)) {
+        this.cameras.follow(null);
+        this.select(null);
+        if (this.cameras.mode !== "map") this.cameras.setMode("map", true);
+      }
+      this.#signalHello = hello;
+      this.#signalQueue.length = 0;
+      this.#lastSignalSim = Number.NaN;
+      this.worldRenderer.signals.resetStates();
+    }
   }
 
-  /** Apply a keyframe's signal block; poses come through {@link capture}. */
+  /** Apply a keyframe's signal block, at the sim time the scene is drawn at; poses come through {@link capture}. */
   applyKeyframe(kf: KeyframeMessage): void {
-    this.worldRenderer.updateSignalPhases(kf.signals);
+    this.#queueSignals(Number(kf.simTimeNs) / 1e9, kf.signals, true);
+  }
+
+  /** Apply a delta's signal rows (§3.4.7: only the ones that changed), time-aligned like the poses. */
+  applyDelta(delta: DeltaMessage): void {
+    if (delta.signals.count === 0) return;
+    this.#queueSignals(Number(delta.simTimeNs) / 1e9, delta.signals, false);
+  }
+
+  /**
+   * Hold the scene at the newest snapshot (the run is paused, finished or stopped) or release it.
+   * See {@link PoseInterpolator.setHeld}.
+   */
+  setStreamHeld(held: boolean): void {
+    this.interpolator.setHeld(held);
+  }
+
+  #queueSignals(simSeconds: number, block: SignalBlock, keyframe: boolean): void {
+    const copy: SignalBlock = {
+      count: block.count,
+      signalId: block.signalId.slice(0, block.count),
+      timeToChangeDs: block.timeToChangeDs.slice(0, block.count),
+      phase: block.phase.slice(0, block.count),
+      reserved: block.reserved.slice(0, block.count),
+    };
+    const last = this.#lastSignalSim;
+    // Earlier than what came before, or far later: a seek, a rewind or a new run. What is queued
+    // belongs to a stretch of the run that will not be drawn, and a keyframe is the whole state.
+    const discontinuous = Number.isFinite(last) && (simSeconds < last - 1e-6 || simSeconds > last + 5);
+    this.#lastSignalSim = simSeconds;
+    if (discontinuous) {
+      this.#signalQueue.length = 0;
+      if (keyframe) this.worldRenderer.applySignalKeyframe(copy);
+      else this.worldRenderer.applySignalDelta(copy);
+      return;
+    }
+    this.#signalQueue.push({ simSeconds, keyframe, block: copy });
+    // A stalled render clock must not let the queue grow without bound.
+    while (this.#signalQueue.length > 256) this.#applyQueuedSignal();
+  }
+
+  #applyQueuedSignal(): void {
+    const q = this.#signalQueue.shift();
+    if (!q) return;
+    if (q.keyframe) this.worldRenderer.applySignalKeyframe(q.block);
+    else this.worldRenderer.applySignalDelta(q.block);
+  }
+
+  /** Apply every queued signal block the render clock has reached. */
+  #flushSignals(): void {
+    const q = this.#signalQueue;
+    if (q.length === 0) return;
+    const at = this.interpolator.renderSimSeconds;
+    // No render time yet (no poses): the lamps are all there is to draw, so draw them now.
+    if (!Number.isFinite(at)) {
+      while (q.length > 0) this.#applyQueuedSignal();
+      return;
+    }
+    while (q.length > 0 && q[0].simSeconds <= at + 1e-6) this.#applyQueuedSignal();
   }
 
   /**
@@ -508,7 +596,10 @@ export class Viewer {
       this.applyKeyframe(kf);
       this.capture(client.poses);
     });
-    const offDelta = client.onDelta(() => this.capture(client.poses));
+    const offDelta = client.onDelta((delta) => {
+      this.applyDelta(delta);
+      this.capture(client.poses);
+    });
     const detach = (): void => {
       offHello();
       offKeyframe();
@@ -695,6 +786,14 @@ export class Viewer {
     return id;
   }
 
+  /**
+   * Keep the part of the canvas under interface panels out of the camera's framing; see
+   * {@link CameraController.setViewInsets}. CSS pixels.
+   */
+  setViewInsets(insets: { top?: number; right?: number; bottom?: number; left?: number }): void {
+    this.cameras.setViewInsets(insets);
+  }
+
   /** Hand the controller `actorId`'s current pose if it is in the stream. */
   #seedFollowPose(actorId: number): boolean {
     const ids = this.interpolator.outActorId;
@@ -865,12 +964,15 @@ export class Viewer {
     }
     const renderClock = this.#fixedClock + this.#accumulator;
 
-    // 1. Poses.
+    // 1. Poses, and the signal states for the instant they are drawn at.
     const sample = this.interpolator.sample(renderClock);
+    this.#flushSignals();
+    this.worldRenderer.signals.update(renderClock);
 
     // 2. Camera. Exponential smoothing on the true frame dt (frame-rate independent by construction).
     this.#trackTraffic(dt);
     this.#followSlot = this.#resolveFollowSlot();
+    this.#updateGhost();
     if (this.#followSlot >= 0) {
       const p = this.#followSlot * 3;
       this.cameras.setFollowPose(
@@ -886,6 +988,8 @@ export class Viewer {
     this.cameras.update(dt);
 
     // 3. Static scene follow-ups.
+    this.#syncClipPlanes();
+    this.worldRenderer.fadeMarkings(this.camera.position.distanceTo(this.cameras.look), this.camera.fov, this.#height);
     this.#syncDepthCueing();
     this.worldRenderer.followCamera(this.camera);
     this.worldRenderer.setShadowFocus(this.cameras.look.x, this.cameras.look.y, this.cameras.look.z);
@@ -894,6 +998,7 @@ export class Viewer {
     // 4. Actors: cull, LOD, instance write. When the camera is inside the followed car's own body,
     // that one instance is not written.
     this.actors.hiddenActorId = this.#cameraInsideFollowed() ? this.cameras.followActorId ?? -1 : -1;
+    this.#syncActorLod();
     const actorStats = this.actors.update({
       position: this.interpolator.outPosition,
       heading: this.interpolator.outHeading,
@@ -955,6 +1060,103 @@ export class Viewer {
       stalled: sample.stalled,
     };
     return this.#lastReport;
+  }
+
+  /**
+   * Hide the building the followed vehicle is inside, if it is inside one below the roof — a road
+   * through a building. See {@link WorldRenderer.setGhostBuilding}.
+   */
+  #updateGhost(): void {
+    const slot = this.#followSlot;
+    const w = this.worldRenderer;
+    const mode = this.cameras.mode;
+    if (!CameraController.needsFollowSubject(mode)) {
+      if (w.ghostBuilding >= 0 || w.ghostBuilding2 >= 0) w.setGhostBuildings(-1, -1);
+      return;
+    }
+    let vehicle = -1;
+    if (slot >= 0) {
+      const p = slot * 3;
+      const x = this.interpolator.outPosition[p];
+      const y = this.interpolator.outPosition[p + 1];
+      const z = this.interpolator.outPosition[p + 2];
+      const b = w.buildingIndexAt(x, y);
+      if (b >= 0 && z < w.buildingTopOf(b)) vehicle = b;
+    }
+    // The camera's own building, when it is below that roof: it followed a vehicle through a
+    // passage, and after a change of subject it is flying out of it. Hidden, not jumped over.
+    // The same for the smoothed look target, which trails the vehicle out of a passage: the car is
+    // out, the point the camera aims at is still inside, and the march from it met the wall.
+    const inside = (x: number, y: number, z: number): number => {
+      const b = w.buildingIndexAt(x, y);
+      return b >= 0 && z < w.buildingTopOf(b) ? b : -1;
+    };
+    const ghosted = (b: number): boolean => b >= 0 && (b === w.ghostBuilding || b === w.ghostBuilding2);
+    const c = this.camera.position;
+    const l = this.cameras.look;
+    const cb = inside(c.x, c.y, c.z);
+    const lb = inside(l.x, l.y, l.z);
+    let camera = ghosted(cb) ? cb : ghosted(lb) ? lb : -1;
+    // And for the whole of a flight out of it: the camera looks back at where it was until it is
+    // well on its way, and that roof then filled the frame (measured: σ 3.0, one flat colour).
+    if (camera < 0 && this.cameras.inTransit) {
+      if (w.ghostBuilding2 >= 0) camera = w.ghostBuilding2;
+      else if (w.ghostBuilding >= 0 && w.ghostBuilding !== vehicle) camera = w.ghostBuilding;
+    }
+    w.setGhostBuildings(vehicle, camera);
+  }
+
+  /**
+   * Put the near and far planes where the depth buffer can resolve the road's layers.
+   *
+   * A 24-bit depth buffer resolves `d² / (near · 2²⁴)` metres at distance `d`. With the near plane
+   * at 0.35 m that is 0.38 m at the 1.4 km the plan view looks down from — six times the 6 cm
+   * between the road, junction and crossing layers, so they z-fought across the whole map as it
+   * moved. Nothing in the world is above its bounding box (plus the selected-vehicle stem), so a
+   * camera above that can push its near plane to most of the gap: 0.2 mm at the same distance.
+   * At street level the near plane follows the camera's height, capped at a metre.
+   */
+  #syncClipPlanes(): void {
+    const cam = this.camera;
+    const world = this.worldRenderer.world;
+    const base = this.#options.nearM ?? 0.35;
+    let near = base;
+    let far = this.#options.farM ?? 12_000;
+    if (world) {
+      const look = this.cameras.look;
+      const dist = cam.position.distanceTo(look);
+      const top = Math.max(world.bbox.maxZM, look.z + dist * 0.08 + 12);
+      const above = cam.position.z - top;
+      if (above > 0) {
+        near = Math.max(base, above * 0.8);
+      } else if (this.cameras.mode !== "dashboard") {
+        const height = cam.position.z - world.bbox.minZM;
+        near = Math.min(1, Math.max(base, height * 0.2));
+      }
+      far = Math.max(far, this.worldRenderer.sky.scale.x * 1.05);
+    }
+    if (!Number.isFinite(near) || near <= 0) near = base;
+    if (Math.abs(near - cam.near) > cam.near * 0.02 || far !== cam.far) {
+      cam.near = near;
+      cam.far = Math.max(far, near * 10);
+      cam.updateProjectionMatrix();
+    }
+  }
+
+  /**
+   * Switch actor detail where the detail stops being visible, not at a fixed distance.
+   *
+   * At the old fixed 90 m a car's wheels (0.7 m, 6 px at 90 m in an 800 px, 55° view) popped in
+   * and out in the middle of an ordinary street view. Here LOD 0 holds until half a metre of detail
+   * is 1.5 px, and LOD 1 until a metre is: about 280 m and 560 m at that view, further in a taller
+   * window, nearer in a wider field.
+   */
+  #syncActorLod(): void {
+    const fovRad = (this.camera.fov * Math.PI) / 180;
+    const pxPerRad = this.#height / Math.max(1e-3, fovRad);
+    const d0 = Math.round(Math.min(600, Math.max(60, (0.5 * pxPerRad) / 1.5)));
+    const d1 = Math.round(Math.min(2000, Math.max(d0 + 50, (1.0 * pxPerRad) / 1.5)));
+    this.actors.setLodDistances(d0, d1);
   }
 
   /** Advance by an explicit `dt`, for tests and deterministic captures. */
@@ -1050,4 +1252,10 @@ export class Viewer {
     }
     return -1;
   }
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }

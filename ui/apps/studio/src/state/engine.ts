@@ -518,7 +518,7 @@ export class StudioEngine {
     const viewer = this.viewer;
     if (viewer) {
       viewer.interpolator.reset();
-      if (replay.signals) viewer.worldRenderer.updateSignalPhases(replay.signals);
+      if (replay.signals) viewer.worldRenderer.applySignalKeyframe(replay.signals);
       // Twice: the interpolator samples between two snapshots, and one leaves it nothing to
       // interpolate from, so a seeked recording would render an empty scene until the next seek.
       viewer.capture(replay.poses);
