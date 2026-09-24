@@ -4,7 +4,7 @@ Living record of what is built and what has actually been *measured*, as against
 the plan in `10-roadmap.md` and the decisions in `12-build-decisions.md`. Claims
 here carry their evidence; anything unmeasured says so.
 
-Last updated 2026-09-18. **The crate table below is stale**: `v2xw-record`,
+Last updated 2026-09-24 (QA section below). **The crate table below is stale**: `v2xw-record`,
 `v2xw-metrics`, `v2xw-node` and `v2xw-engine` are no longer stubs, and the line counts
 predate several waves. It is left as written rather than rewritten from memory, because a
 status file whose numbers were re-estimated rather than re-measured is worse than one that
@@ -14,6 +14,213 @@ For the current release position — what must be true for a 1.0 tag, what is no
 what each gap would take — see [`docs/RELEASE-CHECKLIST.md`](../RELEASE-CHECKLIST.md)
 (2026-09-22). The Phase 1 acceptance table below is still accurate and the checklist cites
 it.
+
+## 2026-09-24 — QA of the website on the release build: final state
+
+The QA lead drove the page as the owner would — `v2xw-server` built with
+`cargo build --release -p v2xw-server -p v2xw-cli` on ports 8787 (behind a TCP proxy that can
+cut every connection) and the Studio's dev server on 5173 — and fixed what could be fixed
+directly. Every number below comes from a command or a Playwright script run on this
+machine; the scenarios were copies of `manhattan-5min.yaml` (`qa-manhattan`: 20 s at
+6,000 veh/h) and of `revocation-latency.yaml` (`qa-secure`: 40 s, one roadside unit,
+attackers from 10 s, 30 s pseudonyms, a 20 s CRL cadence).
+
+### Fixed during QA, one commit each
+
+| Commit | What was wrong, as found on the page |
+|---|---|
+| `69d0c14` | Loading a ready-made scenario kept unapplied edits (a refused one included) and rebased them onto it, so the next Run was refused for a field the form no longer showed as edited. |
+| `0a2466a` | `nodes.default_obu: obu/cohda-mk5`, offered by the page, ran 20 s of Manhattan with 22 vehicles and sent no frame: the profile publishes no P-256 signing cost. The loader now refuses such a profile by name and lists the ones that sign. |
+| `d672594` | The chase HUD said `profile: n/a` for every vehicle, beside a state tab naming its profile: vehicles that spawn after the Hello are not in its node table. It now reads `inspect.node`. |
+| `b236001` | **Honest traffic rejected at every i-period boundary.** `CrlGate` derived `Default` with `skew: 0`, and every node's gate comes from `Stores::default()`. A certificate one period away was refused, the signature detector reported it, and the authority revoked honest vehicles. Found with the lifecycle compressed to 60 s periods: 3,645 of 33,361 verifications invalid and 2 honest devices revoked, no attacker. Default is now `CrlGate::new(0)`. |
+| `b0cf71e` | The `rsu` camera on a run with no roadside unit logged "needs a vehicle to follow … click a vehicle first". |
+| `97f0f11` | `v2xw run --duration-s` was applied after validation: a valid override was refused and a shortening one was not checked. |
+| `ac3047d`, `ce6bbb6` | Three settings change nothing on a BSM run by design (`radio.tiers.phy: abstract` under a medium MAC, `security.envelope: etsi103097`, `messages.codec_tier: size-model`), and the page gave no reason. Their engine notes now say so, and a fully applied field shows its note once edited. |
+
+Each Rust fix has a test shown red without it. After the fixes: `v2xw-node` 192 pass,
+`security_lifecycle` 9/9, engine `scenario` 13/13 and lib 46/46, `v2xw-cli` 16/16,
+`v2xw-conformance` 69/69 (the `grid-traffic` golden reproduces unchanged), Studio vitest
+165/165, typecheck clean. The release binaries were rebuilt at `ac3047d` (`ce6bbb6` changes only
+the page) and the page re-checked.
+
+### What was checked, and what it showed
+
+- **Every control.** A scripted pass over the header, settings panel, transport bar,
+  viewport toolbar, inspector, message panel, measurements strip and the Runs, Compare
+  and Commands tabs, on a live Manhattan run. All behaved as labelled. Details:
+  - The scrub bar moved 8.8 s to 30.8 s on a click at 10 %.
+  - 14 of 19 overlays toggle. The other 5 are disabled and labelled "not available in
+    this build".
+  - The metric picker lists 223 metrics.
+  - The engine-backed suite (`e2e-engine`, 9 tests, including its own 18-row control
+    table) passed 9/9, twice, on the final release binary.
+- **Every settings field.** 111 edits covering 106 of the page's 114 fields. For each, a
+  base preset was loaded, the field was edited in the page and Run was pressed. The rest
+  were covered separately: the focus-region fields through the page, `events` by
+  `events.spec.ts`.
+  - 54 moved the run's digest in the expected direction. Examples: OBU 10 dBm, mean RSSI
+    −107.5 → −114.5 dBm; buildings off, 1,902 → 27,504 receptions; `time_dilation`, 424
+    suppressed frames.
+  - 25 were refused, each with the engine's reason. Four refusals are phrased
+    "internal error": a missing map or DEM file, an RSU `site` on an imported city, and a
+    wrong `net.backend_net` id.
+  - 31 left the digest unchanged, each for a stated reason: descriptive fields; the
+    default value; nothing in a 40 s run reached the backend; or the three notes above.
+  - `keep_holes` and `metres_per_level` changed nothing in a 20 s run and were not
+    investigated further.
+  - The TR 36.885 drop put 1,250 vehicles on Manhattan and did not finish 20 s within
+    240 s.
+- **Soak, 20 runs through the page.**
+  - The runs included seed, radio and rate edits, two scenario switches, and Run pressed
+    twice while a run was playing at 1×.
+  - 20/20 finished and streamed to their last instant. The connection stayed streaming,
+    with no page or Studio errors.
+  - Engine RSS was 67 / 282 / 273 MB at runs 1 / 10 / 20. RSS is compressed on this
+    machine; the physical footprint was 506 / 447 / 541 MB.
+  - Tab heap was 499 / 454 / 453 MB.
+- **Network drop.** All 6 connections were cut at 12.1 s into a 1× run. The page was
+  streaming again 1.6 s later, with `HELLO_RESUMED` at seq 135. It applied 441 frames,
+  seq 0–440, with no gap, no duplicate and no error.
+- **Rendering suites against the mock.**
+  - Camera fuzz: 36 steps, 0 failures. Scene validation: 15/15. Studio and regressions:
+    8/8.
+  - Capture tour: 0 vehicles drawn inside a building (1,600 samples), 0 wrong signal
+    heads (14,400 head-checks), chase jitter RMS 7.5 px. All seven pictures were read.
+- **Traffic auditor, release, Manhattan with VRUs at 6,000 veh/h for 300 s.**
+  - Two runs gave identical counts. The run had 340 vehicles, 538,926 vehicle-steps and
+    599,834 pedestrian-steps, 46,517 of them on crosswalks.
+  - Zero counts: overlap, teleport, red and amber entry, conflict zone, illegal
+    transition, lane change near a junction, queue jump, speed jump, heading flip, accel
+    bound, standstill, mid-road despawn, occupied-crosswalk entry, pedestrian
+    don't-walk entry, and all three world checks.
+  - Non-zero: heading jump 147, gap below s0 217 (one follower creeping at 0.2 m/s to
+    1.85 m behind a stopped leader, s0 2.0 m), jerk 37, step-speed 18, in-building 12
+    (the newsstand), and **pedestrian overlap 15**.
+  - Steps on passages through buildings: 5,834.
+  - Without VRUs at the same rate, gap below s0 is 23 and heading jump 143. The
+    junction track reported 0 and 177 before wave B.
+- **Metrics on a dense run** (227 vehicles, 90 s).
+  - Delivery: `pdr` 0.334, `pdr[100m]` 0.916; `per` = 1 − `pdr`. By distance: 0.999 at
+    0–50 m, 0.864 at 50–100 m, 0.535 at 100–150 m, falling to about 0.04–0.08 beyond
+    400 m. Line-of-sight avenues keep 0.072 beyond 1 km.
+  - End-to-end latency: p50 14.69, p95 19.19, p99 19.60 ms. The ten stages sum to
+    exactly the 14.708 ms mean, and their shares sum to 1.0000.
+  - Loss causes plus delivery sum to 1.0003.
+  - Bytes: the buckets sum to `bytes_total` (212,822 B/s), and the per-vehicle-hour
+    buckets sum to their total. Offered load 1.703 Mbit/s against carried 1.7026.
+  - Channel: CBR 0.015.
+  - Overheads: security 0.564, link 0.200, full-certificate share 0.102 (one in ten, as
+    J2945/1 says).
+  - Awareness: time-weighted AoI 289 ms against a per-delivery peak AoI of 140 ms, which
+    is consistent because the two are weighted differently. NAR 0.98 at 100 m and 0.45
+    at 300 m.
+- **Radio**, the same 60 s Manhattan run:
+
+  | | mean RSSI | PDR 100 m | PDR 300 m | e2e p50 / p95 | air time |
+  |---|---|---|---|---|---|
+  | DSRC | −107.9 dBm | 0.922 | 0.313 | 14.7 / 19.1 ms | 0.30 ms |
+  | LTE-V2X | −99.0 dBm | 0.967 | 0.532 | 63.8 / 102.8 ms | 1 ms |
+  | NR-V2X | −98.9 dBm | 0.980 | 0.518 | 25.0 / 50.4 ms | 0.5 ms |
+
+  - Transmit power 10 dBm: DSRC −114.9 dBm, LTE −111.9 dBm. LTE drops exactly the
+    13 dB it lost; DSRC was at a mean of 17 dBm under J2945/1 power control.
+  - Medium propagation: DSRC −109.4 dBm. Buildings off: −79.2 dBm.
+- **Message sets.**
+  - In 30 s: SPaT 300 (10 Hz), MAP 30 (1 Hz), PSM 1,501 from 50 VRU devices. On
+    GN/BTP: CAM 2,813 and VAM 5,263.
+  - DENM: 100 from hard braking in a dense 60 s run.
+  - Fragmentation: 1,600 B padding with `generic-sdu` doubled the frames and gave SDU
+    loss 0.81 against fragment loss 0.80.
+  - A hybrid Falcon signature with no fragmenter: the certificate-carrying frames above
+    the MTU were refused (2,241 → 2,008 frames).
+  - Engine tests: `message_sets` 5/5 (including SPaT against the lamps), `fragmentation`
+    7/7, `timeline` 9/9, `attack_wave` 1/1, `phase2` 8/8.
+- **Scenario events** on Manhattan, 90 s at 15,000 veh/h.
+  - Closing FDR Drive at 15 s wrote the record "43 lanes closed". Entries onto its
+    busiest edge fell from 5 to 0.
+  - `param.change` of the arrival rate to 0 at 45 s: vehicles first seen after 45.2 s
+    fell from 113 to 1.
+- **Security.**
+  - Pseudonyms: 600 changes at exactly 30.000 s intervals. Certificate, temporary ID and
+    link-layer address changed together 600/600, and the chain was consistent 416/416.
+  - Top-up with a compressed lifecycle: 93 started and 91 completed, 455 certificates,
+    312 kB up and 123 kB down over cellular Uu.
+  - Revocation, seven ConstPos attackers over 180 s:
+    - 6 of 7 were revoked, in 11.19 s from detection to enforcement. Stage times: report
+      9 ms, shuffle 1.74 s, decision 1.76 s, issue 1.84 s, publish 11.10 s.
+    - 567 CRL downloads and 24 RSU broadcasts; 24,952 receptions from revoked senders
+      were rejected.
+    - **1 honest vehicle was also revoked.**
+- **Chase inspector.** A clicked or chase-adopted vehicle lists its sent BSMs, each
+  decoded field by field with the 1609.2 header and the octets by layer. It also lists
+  received messages with fate, RSSI/SINR, distance and delay by stage, and queues whose
+  depths change between reads.
+
+### Still open, most important first
+
+1. **Honest vehicles are revoked with no attacker in dense traffic.**
+   - The shipped `revocation-latency.yaml` with its attackers removed revoked 21 honest
+     vehicles in 300 s. Its detectors fired 1,040 positionSpeedInconsistency, 611
+     headingInconsistency and 204 positionJump verdicts, which became 1,582 reports.
+   - `qa-secure` without attackers revoked 1 in 180 s on the fixed binary.
+   - Mechanism: the GNSS model's outliers (1 %/s, 12 m) and 3 s bursts deliberately
+     under-report their accuracy. The receiver's detector uses a constant 5 m confidence
+     rather than the BSM's. At 6,000 veh/h, one burst is seen by enough neighbours to
+     pass the authority's gate: 3 reporters over 4 s within 15 s.
+   - `phase2.rs::with_no_attacker_nothing_is_revoked` passes only at 600 veh/h. This
+     needs a calibrated decision, not a QA patch.
+2. **Vehicles hit pedestrians.** There were 15 vehicle–pedestrian overlaps, down to 0.69 m
+   between centres.
+   - The pedestrians were on sidewalk lanes that lie on the roadway: 811 of 7,741 sidewalk
+     lanes overlap a drive lane by more than 0.3 m, about 10.7 km in all.
+   - Example: sidewalk 2714 runs 0.73 m from 6th Avenue's lane 1339.
+   - This is importer geometry.
+3. **The "sign" latency stage includes the J2945/1 hand-off jitter.**
+   - `t_signed` is stamped after the jitter (`Engine::hand_down`), so `sign` reads 13.9 ms
+     for a 9 ms HSM signature.
+   - With `compute_tier: abstract` (1 µs signing) it still reads 4.94 ms.
+   - The total is right; the split is not. The fix needs a stage and a record field of
+     its own, which moves the golden.
+4. **Traffic:**
+   - Heading jumps: 147.
+   - Gap below s0: 217. One follower creeps to 1.85 m. This was 0 in the junction
+     track's report and is 23 without VRUs.
+   - Jerk: 37. Step-speed: 18.
+5. **Sidelink runs have no `cbr` metric.** It is empty for LTE-V2X and NR-V2X, though the
+   chase view shows CBR on a sidelink frame.
+6. **Page:**
+   - The stats chip says "0 RSUs" on a run with a roadside unit placed by `position_m`.
+   - The inspector says "radios 82" beside "106 vehicles or roadside units".
+   - The HUD shows "(indices pending — node.tx)" even under the SCMS lifecycle.
+   - A page reloaded after a run finished shows no measurements.
+   - The tab heap is about 450 MB on Manhattan.
+   - One page load in about 10 fell back to the built-in settings list under heavy CPU.
+     It was not reproduced in 3 further loads.
+7. **Wording:**
+   - Four run-time refusals are prefixed "internal error" although the cause is the
+     user's input.
+   - `TimelineKind::Closure`'s doc says `lane` or `edge`; the loader wants
+     `target: "edge:N" | "street:NAME"`.
+
+### Completeness against the owner's request
+
+| Asked for | State | Evidence |
+|---|---|---|
+| Parameters applied actually take effect | delivered | 106 fields through the page; 54 change the run, 25 refused with a reason, 31 unchanged with a stated reason; two carry-over and note fixes |
+| Every button, config and feature works | delivered, with the open items above | control pass; `e2e-engine` 9/9 twice |
+| Runs keep working after a while | delivered | 20-run soak, Run pressed mid-run twice, memory flat from run 10 |
+| Traffic smooth and correct | partial | 0 overlaps, teleports and red entries; 147 heading jumps, 37 jerk events and 217 gap steps remain |
+| Cars through buildings | partial | 12 steps at one newsstand; 0 drawn in buildings by the viewer |
+| Camera blacks out or goes underground | delivered | fuzz 36/0; scene validation 15/15 |
+| Cars touch each other | partial | vehicle–vehicle overlap 0; 15 vehicle–pedestrian overlaps from sidewalk geometry |
+| A car goes round one stopped at the junction | delivered | queue-jump 0; conflict-zone 0 |
+| Clean rendering, lights green only sometimes | delivered | 0 wrong heads of 14,400; `signal_heads.rs` |
+| Network load, e2e delay, overhead metrics | delivered, one split wrong | stages tile the mean exactly; the sign stage includes the hand-off jitter; no sidelink CBR |
+| Certificate lifecycle, pseudonym rotation, CRL distribution | delivered | 30.000 s rotation with every identifier; top-up 91/93; CRL by download and RSU broadcast |
+| Backend over cellular, not C-V2X | delivered | reports and top-ups over Uu (2.67 MB up in the attack run); RSU relay path; backhaul |
+| Appropriate to protocol and deployment | partial | honest revocations in dense traffic; ETSI butterfly and ECTL not driven |
+| Chase view shows the messages, content and queue | delivered | sent and received decoded with octets; queues live |
+| The engine improved end to end | partial | the open list above |
 
 ## 2026-09-24 — junction geometry, signal timing, passages (junction track)
 
