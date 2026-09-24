@@ -815,10 +815,21 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     },
     KeyStatus {
         path: "events",
-        status: Status::Partial,
-        note: "Timeline items are scheduled and fire. Only 'outage' and 'weather.front' \
-               do anything; a demand multiplier, an attack wave, a parameter change and a \
-               closure are counted and change nothing.",
+        status: Status::Wired,
+        note: "Every kind acts, at control priority so everything at that instant sees it, \
+               and writes a scenario.event record of what it did. weather.front: the \
+               weather drivers and links see. outage: the node goes off. \
+               demand.multiplier: the Poisson arrival rate is scaled (the candidate process \
+               is sized to the timeline's peak). closure: the lanes of a lane, an edge or a \
+               named street cost infinity to every router and every vehicle re-plans; one \
+               already on a closed lane finishes it, and one that cannot avoid it leaves \
+               the run at the barrier. param.change: weather.*, \
+               actors.vehicles.demand.rate_veh_per_h (now), and \
+               actors.vehicles.equipped_fraction, actors.vru.device_fraction, \
+               security.verification_policy, security.pseudonym_change.*, \
+               nodes.default_obu (vehicles that enter after the change); any other path is \
+               refused. attack.wave: the named attacker populations act only inside the \
+               wave, and a population may be in one wave.",
     },
     KeyStatus {
         path: "experiment",
@@ -1949,6 +1960,117 @@ fn timeline(s: &Scenario, e: &mut Vec<ScenarioError>) {
                 format!("{v} is not a non-negative demand multiplier"),
             ));
         }
+        live_timeline_item(s, i, item, e);
+    }
+    // One window per population: the threat crate's `AttackSchedule` carries a single
+    // `[from, to)`, so a population two waves name has no schedule that is both.
+    let mut named: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    for (i, item) in s.events.iter().enumerate() {
+        if item.kind != TimelineKind::AttackWave {
+            continue;
+        }
+        for p in crate::timeline::wave_populations(s, item.params.get("ids")).unwrap_or_default() {
+            if let Some(first) = named.insert(p, i) {
+                e.push(conflict(
+                    &format!("events[{i}].ids"),
+                    format!(
+                        "names attacker population {p}, which events[{first}] already names; \
+                         a population acts in one wave (the threat model's schedule is one \
+                         window), so give the second wave its own population"
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+/// The rules the four kinds that act on a running kernel add: a `param.change` names a
+/// parameter that can change mid-run and a value that fits it, a `closure` names a target in
+/// a form the engine reads, a `demand.multiplier` has an arrival process to scale, and an
+/// `attack.wave` names populations that exist.
+fn live_timeline_item(
+    s: &Scenario,
+    i: usize,
+    item: &crate::scenario::schema::TimelineItem,
+    e: &mut Vec<ScenarioError>,
+) {
+    let field = format!("events[{i}]");
+    match item.kind {
+        TimelineKind::ParamChange => {
+            let Some(Value::String(path)) = item.params.get("path") else {
+                return;
+            };
+            if crate::timeline::live_param(path).is_none() {
+                e.push(conflict(
+                    &format!("{field}.path"),
+                    format!(
+                        "'{path}' cannot change during a run: the model that reads it is built \
+                         when the run starts, so a change at t = {} s would be accepted and do \
+                         nothing. A param.change may set {}",
+                        item.t,
+                        crate::timeline::live_param_list()
+                    ),
+                ));
+                return;
+            }
+            let Some(value) = item.params.get("value") else {
+                return;
+            };
+            match crate::timeline::with_param(s, path, value) {
+                Err(why) => e.push(conflict(&format!("{field}.value"), why)),
+                Ok(next) => {
+                    // The changed scenario is held to every rule the loaded one is, less its
+                    // own timeline (which is this one, and would recurse).
+                    let mut probe = next;
+                    probe.events.clear();
+                    for err in validate(&probe) {
+                        e.push(conflict(
+                            &format!("{field}.value"),
+                            format!("{value} for '{path}' would make the scenario invalid: {err}"),
+                        ));
+                    }
+                }
+            }
+        }
+        TimelineKind::Closure => {
+            if let Some(target) = item.params.get("target")
+                && let Err(why) = crate::timeline::ClosureTarget::parse(target)
+            {
+                e.push(conflict(&format!("{field}.target"), why));
+            }
+        }
+        TimelineKind::DemandMultiplier => {
+            let kind = s.actors.vehicles.demand.kind.as_str();
+            let poisson = kind == "mobility/demand/poisson"
+                || kind == v2xw_mobility::demand::poisson::MODEL_ID;
+            if !poisson {
+                e.push(conflict(
+                    &format!("{field}.type"),
+                    format!(
+                        "is a demand multiplier, and actors.vehicles.demand.kind is '{kind}', \
+                         which has no arrival process to scale; use mobility/demand/poisson"
+                    ),
+                ));
+            }
+        }
+        TimelineKind::AttackWave => {
+            if let Err(why) = crate::timeline::wave_populations(s, item.params.get("ids")) {
+                e.push(conflict(&format!("{field}.ids"), why));
+            }
+        }
+        _ => {}
+    }
+    if item.kind == TimelineKind::ParamChange
+        && let Some(Value::String(path)) = item.params.get("path")
+        && path == "actors.vehicles.demand.rate_veh_per_h"
+        && crate::timeline::base_rate_veh_per_h(s).is_none_or(|r| r <= 0.0)
+    {
+        e.push(conflict(
+            &format!("{field}.path"),
+            "changes the arrival rate, and the scenario states none to change it from: set \
+             actors.vehicles.demand.rate_veh_per_h"
+                .to_string(),
+        ));
     }
 }
 

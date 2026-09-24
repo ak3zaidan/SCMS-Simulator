@@ -112,7 +112,7 @@ use v2xw_world::World;
 
 use crate::adapters::{BoxedFading, BoxedPropagation};
 use crate::ctx::{EngineCtx, RunRecorder};
-use crate::error::{EngineError, Result};
+use crate::error::{EngineError, Result, ScenarioError};
 use crate::event::{Event, Observe};
 use crate::records::{GtKinematics, MacCbr, NetBytes, NodeRx, NodeTx, PhyRx};
 use crate::scenario::Scenario;
@@ -217,6 +217,10 @@ pub struct RunReport {
     pub mobility_steps: u64,
     /// How many actors were ever spawned.
     pub actors_spawned: u64,
+    /// Why actors left the run, by cause (`TripComplete`, `RouteBlocked`, ...), in cause
+    /// order. A closure on the timeline shows here: a vehicle that could not avoid it
+    /// leaves at the barrier as `RouteBlocked`.
+    pub despawn_causes: BTreeMap<String, u64>,
     /// How many nodes were ever created.
     pub nodes_created: u64,
     /// How many frames went on the air.
@@ -563,7 +567,33 @@ pub struct Engine {
     focus: Option<crate::wiring::FocusStack>,
     /// The jammers `threats.jammers` declared.
     jamming: jamming::Jamming,
+    /// The scenario timeline's state: which lanes are closed and by whom, which demand
+    /// multipliers are in force. See [`crate::timeline`].
+    timeline: TimelineState,
     report: RunReport,
+}
+
+/// What the scenario timeline has put in force, as the control events leave it.
+#[derive(Debug, Default)]
+struct TimelineState {
+    /// The lanes each `closure` item closes, resolved against the world at build.
+    closures: BTreeMap<usize, Vec<v2xw_core::ids::LaneId>>,
+    /// How many active closures hold each lane shut: two overlapping closures of one lane
+    /// reopen it when the second ends, not the first.
+    closed: BTreeMap<v2xw_core::ids::LaneId, u32>,
+    /// The `demand.multiplier` items in force, by item.
+    multipliers: BTreeMap<usize, f64>,
+    /// The ratio of the arrival rate a `param.change` set to the scenario's own.
+    rate_ratio: f64,
+    /// The scenario's own arrival rate, veh/h, when its demand model takes one.
+    base_rate: Option<f64>,
+}
+
+impl TimelineState {
+    /// The demand multiplier in force: every active multiplier and the rate ratio.
+    fn demand_multiplier(&self) -> f64 {
+        self.rate_ratio * self.multipliers.values().product::<f64>()
+    }
 }
 
 impl core::fmt::Debug for Engine {
@@ -753,7 +783,15 @@ impl Engine {
             sidelink,
             focus,
             jamming: jammers,
+            timeline: TimelineState::default(),
             report: RunReport::default(),
+        };
+        engine.timeline = TimelineState {
+            closures: resolve_closures(&engine.scenario, &engine.world)?,
+            closed: BTreeMap::new(),
+            multipliers: BTreeMap::new(),
+            rate_ratio: 1.0,
+            base_rate: crate::timeline::base_rate_veh_per_h(&engine.scenario),
         };
         let phase2 = crate::phase2::Phase2::build(&engine.scenario, &engine.world)?;
         engine.phase2 = phase2;
@@ -1087,7 +1125,7 @@ impl Engine {
             }
             self.report.count(event.class());
             match event {
-                Event::Control { item, end } => self.on_control(item as usize, end),
+                Event::Control { item, end } => self.on_control(recorder, item as usize, end),
                 Event::MobilityStep => {
                     self.on_mobility_step(recorder, step, horizon)?;
                 }
@@ -1137,11 +1175,18 @@ impl Engine {
     }
 
     /// A scenario timeline item takes effect, or stops taking effect.
-    fn on_control(&mut self, index: usize, end: bool) {
+    ///
+    /// Dispatched at control priority (`EventClass::Control`, priority 0), so every other
+    /// event at this instant — the mobility step, the node phase, a frame ending — sees the
+    /// change. Each item writes one `scenario.event` record saying what it did, which is how
+    /// the page shows a timeline marker as fired and a test checks the effect.
+    fn on_control(&mut self, recorder: &mut dyn RunRecorder, index: usize, end: bool) {
         let Some(item) = self.scenario.events.get(index).cloned() else {
             return;
         };
         use crate::scenario::TimelineKind;
+        let now = self.scheduler.now();
+        let mut note = crate::records::ScenarioEventView::new(now, index, item.kind, end);
         match item.kind {
             TimelineKind::WeatherFront => {
                 if end {
@@ -1168,34 +1213,206 @@ impl Engine {
                 }
                 // And the drivers feel it, from the next mobility step.
                 self.mobility.set_weather(self.weather);
+                note.effect = format!(
+                    "the weather is now {:?} at intensity {}",
+                    self.weather.kind, self.weather.intensity
+                );
             }
             TimelineKind::Outage => {
                 // `target` names a node by index. An outage turns the node off, which is
                 // the state `ObuRuntime::step` returns from immediately, so it stops both
                 // transmitting and receiving without being removed.
-                if let Some(node) = item
+                let node = item
                     .params
                     .get("target")
                     .and_then(serde_json::Value::as_u64)
-                    .map(|n| NodeId::new(n as u32))
-                    && let Some(runtime) = self.nodes.get_mut(&node)
-                {
-                    runtime.set_state(if end {
-                        v2xw_node::NodeState::Active
-                    } else {
-                        v2xw_node::NodeState::Off
-                    });
+                    .map(|n| NodeId::new(n as u32));
+                match node.and_then(|n| self.nodes.get_mut(&n).map(|r| (n, r))) {
+                    Some((node, runtime)) => {
+                        runtime.set_state(if end {
+                            v2xw_node::NodeState::Active
+                        } else {
+                            v2xw_node::NodeState::Off
+                        });
+                        note.effect = format!(
+                            "node {} is {}",
+                            node.index(),
+                            if end { "back on" } else { "off" }
+                        );
+                    }
+                    None => {
+                        note.effect = "the target node is not in the run at this instant, so \
+                                       nothing was switched"
+                            .to_string();
+                    }
                 }
             }
-            // `demand.multiplier`, `attack.wave`, `param.change` and `closure` need a
-            // demand model that takes a multiplier, an attacker set, a live parameter
-            // store and a mobility command respectively. Each is a model this build does
-            // not have; the events fire, are counted, and change nothing, which is what
-            // the run report shows.
-            TimelineKind::DemandMultiplier
-            | TimelineKind::AttackWave
-            | TimelineKind::ParamChange
-            | TimelineKind::Closure => {}
+            TimelineKind::DemandMultiplier => {
+                if end {
+                    self.timeline.multipliers.remove(&index);
+                } else {
+                    let value = item
+                        .params
+                        .get("value")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(1.0);
+                    self.timeline.multipliers.insert(index, value);
+                }
+                let m = self.timeline.demand_multiplier();
+                let honoured = self.mobility.set_demand_multiplier(m);
+                note.multiplier = Some(v2xw_core::math::q3(m));
+                note.effect = if honoured {
+                    format!("vehicle demand is now {m} times the scenario's rate")
+                } else {
+                    "the demand model has no arrival process to scale; nothing changed".to_string()
+                };
+            }
+            TimelineKind::Closure => {
+                let lanes = self
+                    .timeline
+                    .closures
+                    .get(&index)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut changed = Vec::new();
+                for lane in &lanes {
+                    let count = self.timeline.closed.entry(*lane).or_insert(0);
+                    let was_closed = *count > 0;
+                    if end {
+                        *count = count.saturating_sub(1);
+                    } else {
+                        *count += 1;
+                    }
+                    let is_closed = *count > 0;
+                    if !is_closed {
+                        self.timeline.closed.remove(lane);
+                    }
+                    if was_closed != is_closed {
+                        changed.push(v2xw_mobility::MobilityCommand::Closure {
+                            lane: *lane,
+                            closed: is_closed,
+                        });
+                    }
+                }
+                let on_them = self
+                    .actors
+                    .values()
+                    .filter(|a| a.last.lane.is_some_and(|l| lanes.contains(&l.lane)))
+                    .count();
+                self.command_mobility(changed);
+                note.lanes = lanes.iter().map(|l| l.index()).collect();
+                note.effect = if end {
+                    format!("{} lanes reopened", lanes.len())
+                } else {
+                    format!(
+                        "{} lanes closed; the {on_them} vehicles on them finish their lane, and \
+                         every other vehicle re-plans around them",
+                        lanes.len()
+                    )
+                };
+            }
+            TimelineKind::ParamChange => {
+                let path = item
+                    .params
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let value = item
+                    .params
+                    .get("value")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                note.path = Some(path.clone());
+                note.value = Some(value.to_string());
+                // `validate` refused any path not in the table and any value that does not
+                // fit, so the error branch is unreachable from a loaded scenario; it is
+                // reported rather than unwrapped.
+                match crate::timeline::with_param(&self.scenario, &path, &value) {
+                    Err(why) => note.effect = format!("not applied: {why}"),
+                    Ok(next) => {
+                        self.scenario = next;
+                        note.effect = self.apply_live_param(&path);
+                    }
+                }
+            }
+            TimelineKind::AttackWave => {
+                // The wave's window is each named population's schedule (see
+                // `crate::timeline::attack_windows`, applied where Phase 2 arms attackers),
+                // so the threat models gate on it themselves; this records the instant.
+                let populations =
+                    crate::timeline::wave_populations(&self.scenario, item.params.get("ids"))
+                        .unwrap_or_default();
+                note.populations = populations.iter().map(|p| *p as u32).collect();
+                let armed = self.phase2.as_ref().map_or(0, |p| p.report().attackers);
+                note.effect = format!(
+                    "attacker populations {populations:?} {} ({armed} vehicles armed as \
+                     attackers so far)",
+                    if end { "stop acting" } else { "start acting" }
+                );
+            }
+        }
+        self.emit(recorder, &crate::records::ScenarioEvent(note));
+    }
+
+    /// Applies a parameter a `param.change` has just written into `self.scenario`.
+    ///
+    /// What each path reaches is [`crate::timeline::LIVE_PARAMS`]'s `reach`. The
+    /// new-arrivals paths need nothing here: the spawn path reads them from the scenario
+    /// each time a vehicle or a device enters.
+    fn apply_live_param(&mut self, path: &str) -> String {
+        let reach = crate::timeline::live_param(path).map_or("new-arrivals", |p| p.reach.label());
+        if path.starts_with("weather.") {
+            self.weather = crate::wiring::initial_weather(&self.scenario);
+            self.mobility.set_weather(self.weather);
+            return format!(
+                "the weather is now {:?} at intensity {} ({reach})",
+                self.weather.kind, self.weather.intensity
+            );
+        }
+        if path == "actors.vehicles.demand.rate_veh_per_h" {
+            let rate = self.scenario.actors.vehicles.demand.rate_veh_per_h;
+            return match (rate, self.timeline.base_rate) {
+                (Some(rate), Some(base)) if base > 0.0 => {
+                    self.timeline.rate_ratio = rate / base;
+                    let m = self.timeline.demand_multiplier();
+                    if self.mobility.set_demand_multiplier(m) {
+                        format!("vehicle demand is now {rate} veh/h ({reach})")
+                    } else {
+                        "the demand model has no arrival process to scale; nothing changed"
+                            .to_string()
+                    }
+                }
+                _ => {
+                    "the scenario's demand model has no rate to scale; nothing changed".to_string()
+                }
+            };
+        }
+        format!("{path} set; it applies to what enters the run from now on ({reach})")
+    }
+
+    /// Hands commands to the mobility model, which applies them at its next step.
+    fn command_mobility(&mut self, commands: Vec<v2xw_mobility::MobilityCommand>) {
+        if commands.is_empty() {
+            return;
+        }
+        let Engine {
+            scheduler,
+            rng,
+            world,
+            snapshot,
+            provenance,
+            params,
+            mobility,
+            ..
+        } = self;
+        let mut null = crate::ctx::NullRecorder::new();
+        let mut ctx = EngineCtx::new(
+            scheduler, rng, world, snapshot, provenance, params, &mut null,
+        );
+        let mut adapter = crate::adapters::mobility(&mut ctx);
+        for command in commands {
+            mobility.command(&mut adapter, command);
         }
     }
 
@@ -1376,7 +1593,12 @@ impl Engine {
                 },
             );
         }
-        for (actor, _) in &update.despawned {
+        for (actor, cause) in &update.despawned {
+            *self
+                .report
+                .despawn_causes
+                .entry(format!("{cause:?}"))
+                .or_default() += 1;
             // The wire slot goes into its cooling-off period here, one step before the
             // frame whose row set no longer holds it. §3.3.1 forbids reusing a slot for
             // one keyframe period after a despawn, so a delta that arrives late cannot be
@@ -3692,4 +3914,41 @@ pub fn radio_tier(scenario: &Scenario) -> Tier {
 /// node outside a run.
 pub fn default_node_config() -> NodeConfig {
     NodeConfig::default()
+}
+
+/// The lanes every `closure` item of the timeline closes, resolved against the world.
+///
+/// Resolved at build, so a target that names nothing in this world is an error when the run
+/// is built, naming the item — not a closure that fires at minute ten and closes nothing.
+fn resolve_closures(
+    scenario: &Scenario,
+    world: &World,
+) -> Result<BTreeMap<usize, Vec<v2xw_core::ids::LaneId>>> {
+    let mut out = BTreeMap::new();
+    for (i, item) in scenario.events.iter().enumerate() {
+        if item.kind != crate::scenario::TimelineKind::Closure {
+            continue;
+        }
+        let field = format!("events[{i}].target");
+        let Some(value) = item.params.get("target") else {
+            return Err(EngineError::Scenario(ScenarioError::conflict(
+                field,
+                "is missing, and a 'closure' event needs it",
+            )));
+        };
+        let target = crate::timeline::ClosureTarget::parse(value)
+            .map_err(|why| EngineError::Scenario(ScenarioError::conflict(field.clone(), why)))?;
+        let lanes = target.lanes(world);
+        if lanes.is_empty() {
+            return Err(EngineError::Scenario(ScenarioError::conflict(
+                field,
+                format!(
+                    "{value} names no vehicle lane of this world, so the closure would close \
+                     nothing"
+                ),
+            )));
+        }
+        out.insert(i, lanes);
+    }
+    Ok(out)
 }

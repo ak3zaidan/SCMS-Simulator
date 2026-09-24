@@ -409,7 +409,12 @@ impl Phase2 {
         // The attackers. `LegacyAttacker` is the ported legacy family; the id a scenario
         // writes is `threat/attacker/legacy/<AttackKind>`.
         let mut specs = Vec::new();
-        for a in &scenario.threats.attackers {
+        // An `attack.wave` on the timeline is the schedule of every population it names
+        // (`crate::timeline::attack_windows`): the population acts inside the wave and not
+        // outside it. The threat crate's `AttackSchedule` carries one window, which is why
+        // `validate` refuses a population named by two waves.
+        let waves = crate::timeline::attack_windows(scenario);
+        for (population, a) in scenario.threats.attackers.iter().enumerate() {
             let kind =
                 a.id.strip_prefix("threat/attacker/legacy/")
                     .and_then(AttackKind::parse)
@@ -434,12 +439,16 @@ impl Phase2 {
                 }
             }
             let horizon = (scenario.time.duration_s * 1e9).round().max(0.0) as u64;
-            let (from, to) = match &a.schedule {
-                Some(w) => (
+            let (from, to) = match (waves.get(&population), &a.schedule) {
+                (Some((from_s, to_s)), _) => (
+                    (from_s * 1e9).round().max(0.0) as u64,
+                    (to_s * 1e9).round().max(0.0) as u64,
+                ),
+                (None, Some(w)) => (
                     (w.from_s * 1e9).round().max(0.0) as u64,
                     (w.to_s * 1e9).round().max(0.0) as u64,
                 ),
-                None => (0, horizon),
+                (None, None) => (0, horizon),
             };
             specs.push(AttackerSpec {
                 id: a.id.clone(),
