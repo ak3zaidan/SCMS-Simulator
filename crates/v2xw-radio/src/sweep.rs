@@ -896,9 +896,11 @@ pub fn sweep_sidelink(sweep: &HighwaySweep, pool: PoolConfig, params: SpsParams)
             if let Some(grant) = Mac::poll(&mut mac, &mut ctx, node, ChannelId::CCH) {
                 let bytes = grant.sdu.frame.bytes;
                 let len = pool.subchannels_for(bytes).unwrap_or(1);
+                // The resource the grant is on: the MAC's own record of it, which for a
+                // blind retransmission is not the selection's initial resource.
                 let res = mac
-                    .last_selection(node)
-                    .map(|s| s.resource)
+                    .last_grant(node)
+                    .map(|g| g.resource)
                     .unwrap_or_else(|| SlResource::new(slot, 0, len));
                 let resource = SlResource::new(slot, res.subch.min(subchannels - len), len);
                 mac.note_transmitted(node, resource);
@@ -970,24 +972,28 @@ pub fn sweep_sidelink(sweep: &HighwaySweep, pool: PoolConfig, params: SpsParams)
             }
         }
 
-        // 5. Sensing: every vehicle that heard a transmission above the exclusion
-        //    threshold records the SCI's reservation and the energy.
+        // 5. Sensing: every vehicle in range measures the energy, a share per
+        //    sub-channel, and one that heard a transmission's RSRP (per resource element,
+        //    TS 36.214 §5.1.29) above the exclusion threshold records the SCI's
+        //    reservation.
         //
         //    The decodability of the SCI is approximated by the RSRP threshold, which is
         //    what the published simulators do: a UE that hears a control channel above
         //    the threshold it would exclude on is assumed to have decoded it. The harness
         //    says so here rather than in a comment on the engine, because it is the
-        //    harness's approximation and not the engine's.
+        //    harness's approximation; the engine draws the SCI against its own BLER.
         let rri_slots = params.rri.slots(pool.mu) as u32;
         for (k, tx) in slot_txs.iter().enumerate() {
             for &(rx, _d) in &in_range[k] {
                 let p = power_grid[k][rx];
                 let node = NodeId::new(rx as u32);
+                let per_subch = p - 10.0 * math::log10(f64::from(tx.resource.len.max(1)));
                 for sc in tx.resource.range() {
-                    mac.note_energy(node, slot, sc, p);
+                    mac.note_energy(node, slot, sc, per_subch);
                 }
-                if p >= params.rsrp_threshold_dbm {
-                    mac.note_sensed(node, tx.resource, p, rri_slots);
+                let rsrp = pool.rsrp_dbm(p, tx.resource.len);
+                if rsrp >= params.rsrp_threshold_dbm {
+                    mac.note_sensed(node, tx.resource, rsrp, rri_slots);
                 }
             }
         }

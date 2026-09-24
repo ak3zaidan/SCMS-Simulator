@@ -305,13 +305,52 @@ pub const LTE_MCS7_BAZZI: SlMcsSpec = SlMcsSpec::new("lte-mcs7-bazzi", 2, 460);
 /// than a printed value, and every model card that offers it records that.
 pub const LTE_MCS14_BAZZI: SlMcsSpec = SlMcsSpec::new("lte-mcs14-bazzi", 4, 490);
 
+/// SAE J3161/1 low-speed PSSCH parameter set, LTE MCS 5 (QPSK).
+///
+/// J3161/1 (2022, rev. 2024) admits MCS 5, 6, 7 and 11 below 120 km/h and maps each
+/// packet size to an `(MCS, RB)` pair in its Table 16. That table is not public; what is
+/// public is the allocation it implies for four packet sizes, reproduced in Abrar et al.
+/// 2026 (arXiv 2608.05087) Table 3: a 301 B SPDU takes 3 ten-PRB sub-channels at MCS 5
+/// and at MCS 7 and 2 at MCS 11; a 741 B one takes 7, 5 and 4; a 1,739 B one takes 7 at
+/// MCS 11. The TS 36.213 transport-block-size table is not transcribed here, so the code
+/// rate of each preset is one that reproduces every printed allocation through
+/// [`PoolConfig::payload_bits`] (`j3161_presets_reproduce_the_published_allocations`):
+/// MCS 5 needs `R` in `[0.405, 0.475)`, MCS 7 in `[0.574, 0.626)`, MCS 11 in
+/// `[0.4744, 0.4979)`. The value shipped is inside each bracket; the bracket, not the
+/// value, is what the source supports.
+pub const LTE_MCS5_J3161: SlMcsSpec = SlMcsSpec::new("lte-mcs5-j3161", 2, 450);
+/// SAE J3161/1 low-speed set, LTE MCS 7 (QPSK); see [`LTE_MCS5_J3161`].
+pub const LTE_MCS7_J3161: SlMcsSpec = SlMcsSpec::new("lte-mcs7-j3161", 2, 614);
+/// SAE J3161/1 low-speed set, LTE MCS 11 (16-QAM); see [`LTE_MCS5_J3161`]. The same
+/// source prints 19,848 bits as its largest transport block in 98 PRB, which the shipped
+/// rate also holds.
+pub const LTE_MCS11_J3161: SlMcsSpec = SlMcsSpec::new("lte-mcs11-j3161", 4, 490);
+
+/// The LTE MCS index a preset stands for, where it stands for one: the index the
+/// WiLabV2Xsim operating points ([`crate::bler::WILAB_LTE_SINR_AT_10PC`]) are keyed by.
+#[must_use]
+pub fn lte_mcs_index(mcs: SlMcsSpec) -> Option<u8> {
+    match mcs.label {
+        "lte-mcs4-bazzi" => Some(4),
+        "lte-mcs7-bazzi" => Some(7),
+        "lte-mcs14-bazzi" => Some(14),
+        "lte-mcs5-j3161" => Some(5),
+        "lte-mcs7-j3161" => Some(7),
+        "lte-mcs11-j3161" => Some(11),
+        _ => None,
+    }
+}
+
 /// Every LTE preset, in a fixed order.
-pub const LTE_PRESETS: [SlMcsSpec; 5] = [
+pub const LTE_PRESETS: [SlMcsSpec; 8] = [
     LTE_QPSK_R070,
     LTE_QPSK_R050,
     LTE_MCS4_BAZZI,
     LTE_MCS7_BAZZI,
     LTE_MCS14_BAZZI,
+    LTE_MCS5_J3161,
+    LTE_MCS7_J3161,
+    LTE_MCS11_J3161,
 ];
 
 // =========================================================================================
@@ -400,6 +439,8 @@ impl ProbResourceKeep {
     pub const ZERO: ProbResourceKeep = ProbResourceKeep(0);
     /// Bazzi's choice.
     pub const P040: ProbResourceKeep = ProbResourceKeep(2);
+    /// SAE J3161/1's value (via Abrar et al. 2026).
+    pub const P080: ProbResourceKeep = ProbResourceKeep(4);
 
     /// The five legal values, in order.
     pub const ALL: [ProbResourceKeep; 5] = [
@@ -654,6 +695,10 @@ pub struct PoolConfig {
     pub ibe: IbeMask,
     /// The centre frequency, Hz.
     pub centre_hz: f64,
+    /// The fewest sub-channels a transport block may occupy: 1 unless a deployment
+    /// profile says otherwise (SAE J3161/1's minimum allocation is 2,
+    /// `minSubChannel-NumberPSSCH-r14`).
+    pub min_subchannels: u32,
 }
 
 impl PoolConfig {
@@ -713,7 +758,32 @@ impl PoolConfig {
     #[must_use]
     pub fn subchannels_for(&self, bytes: u32) -> Option<u32> {
         let want = bytes * 8;
-        (1..=self.subchannels()).find(|&len| self.payload_bits(len) >= want)
+        let from = self.min_subchannels.clamp(1, self.subchannels().max(1));
+        (from..=self.subchannels()).find(|&len| self.payload_bits(len) >= want)
+    }
+
+    /// The PSSCH-RSRP of a transmission received at `total_dbm` over an allocation of
+    /// `len` sub-channels, dBm.
+    ///
+    /// RSRP is a *per-resource-element* power: "the linear average over the power
+    /// contributions of the resource elements that carry demodulation reference signals
+    /// associated with PSSCH" [TS 36.214 §5.1.29; TS 38.215 §5.1.21 for NR]. The link
+    /// budget gives the power over the whole allocation, `10·log10(12·N_PRB)` dB above the
+    /// per-RE power — 20.8 dB for one ten-PRB sub-channel. The exclusion thresholds of
+    /// TS 36.213 §14.1.1.6 and TS 38.214 §8.1.4 are RSRP thresholds, so comparing the
+    /// total power against them excludes resources heard about 21 dB weaker than the
+    /// threshold means.
+    #[must_use]
+    pub fn rsrp_dbm(&self, total_dbm: f64, len: u32) -> f64 {
+        let prb = f64::from((self.subchannel_prb * len.max(1)).max(1));
+        total_dbm - 10.0 * v2xw_core::math::log10(12.0 * prb)
+    }
+
+    /// The share of a wideband emission over the whole channel that lands in one
+    /// sub-channel, linear: `subchannel_prb / bandwidth_prb`.
+    #[must_use]
+    pub fn subchannel_share(&self) -> f64 {
+        f64::from(self.subchannel_prb) / f64::from(self.bandwidth_prb.max(1))
     }
 
     /// The SCI the pool's control channel carries.
@@ -783,6 +853,34 @@ impl PoolConfig {
             mcs: LTE_QPSK_R070,
             ibe: IbeMask::todo_calibrate_default(),
             centre_hz: 5_900e6,
+            min_subchannels: 1,
+        }
+    }
+
+    /// The SAE J3161/1 LTE-V2X deployment profile's pool: the 20 MHz channel 183
+    /// (5.905-5.925 GHz, centre 5.915 GHz), 100 PRB in ten sub-channels of 10 PRB with an
+    /// adjacent 2-PRB PSCCH, a minimum allocation of two sub-channels, at `mcs` — one of
+    /// [`LTE_MCS5_J3161`], [`LTE_MCS7_J3161`], [`LTE_MCS11_J3161`].
+    ///
+    /// Source: SAE J3161/1 (2022, rev. 2024), through Abrar et al. 2026 (arXiv
+    /// 2608.05087) §"SAE J3161 Deployment Profile", which quotes the channel, the pool
+    /// geometry, the admitted MCS set, the minimum and maximum allocation, 23 dBm,
+    /// `probResourceKeep` 0.8 and the CR limits. The standard's own text is paywalled and
+    /// was not read, so every value here is second-hand and the cards say so.
+    #[must_use]
+    pub fn sae_j3161(mcs: SlMcsSpec) -> Self {
+        Self {
+            rat: SlRat::LteMode4,
+            mu: Numerology::Mu0,
+            bandwidth_prb: 100,
+            subchannel_prb: 10,
+            pscch_prb: 2,
+            pscch_adjacent: true,
+            data_symbols: 9,
+            mcs,
+            ibe: IbeMask::todo_calibrate_default(),
+            centre_hz: 5_915e6,
+            min_subchannels: 2,
         }
     }
 
@@ -821,6 +919,7 @@ impl PoolConfig {
             mcs,
             ibe: IbeMask::todo_calibrate_default(),
             centre_hz: 5_900e6,
+            min_subchannels: 1,
         }
     }
 }
@@ -848,8 +947,9 @@ pub struct SidelinkOccupancy {
     cr_past_slots: u64,
     /// `(slot, subchannel)` seen busy, in slot order. Pruned to the CBR window.
     busy: std::collections::BTreeSet<(u64, u32)>,
-    /// `(slot, subchannel)` this UE used or was granted, in slot order.
-    used: std::collections::BTreeSet<(u64, u32)>,
+    /// `(slot, subchannel)` this UE used or was granted, in slot order, with the priority
+    /// of the packet that used it.
+    used: std::collections::BTreeMap<(u64, u32), u8>,
 }
 
 impl SidelinkOccupancy {
@@ -867,8 +967,43 @@ impl SidelinkOccupancy {
             cr_window_slots: 1000 * scale,
             cr_past_slots: 500 * scale,
             busy: std::collections::BTreeSet::new(),
-            used: std::collections::BTreeSet::new(),
+            used: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// The CR window's past part `a` and future part `b`, slots.
+    #[must_use]
+    pub const fn cr_split(&self) -> (u64, u64) {
+        (
+            self.cr_past_slots,
+            self.cr_window_slots - self.cr_past_slots - 1,
+        )
+    }
+
+    /// Sub-channels in the whole CR window: the denominator of CR.
+    #[must_use]
+    pub const fn cr_capacity(&self) -> u64 {
+        self.cr_window_slots * self.subchannels as u64
+    }
+
+    /// Notes that this UE transmitted on a sub-channel in a slot with a packet of priority
+    /// `k`.
+    pub fn note_used_by(&mut self, slot: u64, subch: u32, k: Pppp) {
+        let e = self.used.entry((slot, subch)).or_insert(k.0);
+        *e = (*e).min(k.0);
+    }
+
+    /// Sub-channels used in `[from, to)` by packets of priority `k` or lower (PPPP ≥ k):
+    /// the `Σ_{i≥k}` of TS 36.213 §14.1.1.4C.
+    #[must_use]
+    pub fn used_at_or_below(&self, from: u64, to: u64, k: Pppp) -> u64 {
+        if to <= from {
+            return 0;
+        }
+        self.used
+            .range((from, 0)..(to, 0))
+            .filter(|(_, p)| **p >= k.0)
+            .count() as u64
     }
 
     /// Notes that a sub-channel was above the S-RSSI threshold in a slot.
@@ -878,7 +1013,7 @@ impl SidelinkOccupancy {
 
     /// Notes that this UE transmitted on, or was granted, a sub-channel in a slot.
     pub fn note_used(&mut self, slot: u64, subch: u32) {
-        self.used.insert((slot, subch));
+        self.note_used_by(slot, subch, Pppp(8));
     }
 
     /// Drops everything that has fallen out of the longer of the two windows.
@@ -936,6 +1071,9 @@ pub const CR_LIMIT_R1_1611594: [(f64, f64); 10] = [
 ];
 
 /// The CR limit the illustrative table gives at a CBR.
+///
+/// Superseded for running scenarios by [`CrLimitTable`], which carries the published
+/// ETSI and SAE tables per priority; kept because the hybrid selector's card cites it.
 #[must_use]
 pub fn cr_limit(cbr: f64) -> f64 {
     for (upper, limit) in CR_LIMIT_R1_1611594 {
@@ -945,6 +1083,146 @@ pub fn cr_limit(cbr: f64) -> f64 {
     }
     0.8e-3
 }
+
+/// The ProSe per-packet priority (PPPP) of LTE-V2X, and the SCI priority field of NR
+/// (1 to 8; the lower the number, the higher the priority) [TS 36.300 §23.10.3;
+/// TS 38.212 §8.3.1.1].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Pppp(pub u8);
+
+impl Pppp {
+    /// The priority SAE J3161/1 gives an essential V2V message such as the BSM
+    /// (via Abrar et al. 2026 §"SAE J3161 Deployment Profile").
+    pub const BSM: Pppp = Pppp(5);
+
+    /// The priority a packet of an 802.11 access category is given on the sidelink.
+    ///
+    /// **An assumption, not a citation.** No source read maps EDCA categories to PPPP;
+    /// this mapping keeps the BSM (queued at AC_VI on the sidelink) at J3161/1's PPPP 5
+    /// and puts event messages (AC_VO) at PPPP 2, the top class of ETSI TS 103 574
+    /// Table 1, with best effort and background below the awareness traffic.
+    #[must_use]
+    pub const fn of_access_category(ac: crate::types::AccessCategory) -> Pppp {
+        match ac {
+            crate::types::AccessCategory::Vo => Pppp(2),
+            crate::types::AccessCategory::Vi => Pppp(5),
+            crate::types::AccessCategory::Be => Pppp(6),
+            crate::types::AccessCategory::Bk => Pppp(8),
+        }
+    }
+}
+
+/// Which way a CBR range's boundary is closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RangeClosure {
+    /// `lower < CBR ≤ upper`, as ETSI TS 103 574 Table 1 prints its ranges.
+    UpperInclusive,
+    /// `lower ≤ CBR < upper`, as SAE J3161/1's zones are quoted.
+    LowerInclusive,
+}
+
+/// A sidelink congestion-control table: CBR ranges, and per priority class the limit on
+/// the channel-occupancy ratio in each range (`sl-CR-Limit` of
+/// `SL-CBR-PSSCH-TxConfigList-r14` / `-r16`).
+///
+/// The 3GPP procedure is fixed — "the UE shall ensure `Σ_{i≥k} CR(i) ≤ CR_Limit(k)`",
+/// the sum over the priorities as low as or lower than the packet's own
+/// [TS 36.213 §14.1.1.4C; TS 38.214 §8.1.6] — and the *values* are pre-configured per
+/// region. Two published value sets ship.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CrLimitTable {
+    /// The table's id, as a scenario names it.
+    pub id: &'static str,
+    /// Where the numbers come from.
+    pub source: &'static str,
+    /// The upper bound of each CBR range, ascending; the last is 1.0.
+    pub cbr_bounds: &'static [f64],
+    /// How the range boundaries are closed.
+    pub closure: RangeClosure,
+    /// `(first PPPP, last PPPP, limit per range)`; `f64::INFINITY` is "no limit".
+    pub classes: &'static [(u8, u8, &'static [f64])],
+}
+
+impl CrLimitTable {
+    /// ETSI TS 103 574 V1.1.1 (2018-11) Table 1, "CR limit values", verbatim:
+    ///
+    /// | CBR measured | PPPP 1-2 | PPPP 3-5 | PPPP 6-8 |
+    /// |---|---|---|---|
+    /// | 0 ≤ CBR ≤ 0.3 | no limit | no limit | no limit |
+    /// | 0.3 < CBR ≤ 0.65 | no limit | 0.03 | 0.02 |
+    /// | 0.65 < CBR ≤ 0.8 | 0.02 | 0.006 | 0.004 |
+    /// | 0.8 < CBR ≤ 1 | 0.02 | 0.003 | 0.002 |
+    pub const ETSI_TS_103_574: CrLimitTable = CrLimitTable {
+        id: "etsi-ts-103-574",
+        source: "ETSI TS 103 574 V1.1.1 (2018-11) Table 1, read from the ETSI PDF",
+        cbr_bounds: &[0.3, 0.65, 0.8, 1.0],
+        closure: RangeClosure::UpperInclusive,
+        classes: &[
+            (1, 2, &[f64::INFINITY, f64::INFINITY, 0.02, 0.02]),
+            (3, 5, &[f64::INFINITY, 0.03, 0.006, 0.003]),
+            (6, 8, &[f64::INFINITY, 0.02, 0.004, 0.002]),
+        ],
+    };
+
+    /// SAE J3161/1's three CBR zones (`CBR < 0.30`, `0.30 ≤ CBR < 0.65`, `CBR ≥ 0.65`)
+    /// and the BSM's (PPPP 5) CR limits in them, 8 %, 3 % and 1.5 %.
+    ///
+    /// Second-hand: quoted by Abrar et al. 2026 (arXiv 2608.05087) from SAE J3161/1
+    /// (2024), which was not read. Only the PPPP 5 row is published there, so every
+    /// priority gets it; the card says so.
+    pub const SAE_J3161: CrLimitTable = CrLimitTable {
+        id: "sae-j3161",
+        source: "SAE J3161/1 (2024) via Abrar et al. 2026 (arXiv 2608.05087): CBR zones \
+                 0.30 and 0.65, PPPP 5 limits 0.08, 0.03, 0.015; other priorities not \
+                 published there and given the PPPP 5 row",
+        cbr_bounds: &[0.30, 0.65, 1.0],
+        closure: RangeClosure::LowerInclusive,
+        classes: &[(1, 8, &[0.08, 0.03, 0.015])],
+    };
+
+    /// The table a scenario names, or `None`.
+    #[must_use]
+    pub fn by_id(id: &str) -> Option<CrLimitTable> {
+        [Self::ETSI_TS_103_574, Self::SAE_J3161]
+            .into_iter()
+            .find(|t| t.id == id)
+    }
+
+    /// Which CBR range a measurement falls in.
+    #[must_use]
+    pub fn range_of(&self, cbr: f64) -> usize {
+        let last = self.cbr_bounds.len().saturating_sub(1);
+        for (i, &upper) in self.cbr_bounds.iter().enumerate() {
+            let inside = match self.closure {
+                RangeClosure::UpperInclusive => cbr <= upper,
+                RangeClosure::LowerInclusive => cbr < upper,
+            };
+            if inside {
+                return i;
+            }
+        }
+        last
+    }
+
+    /// `CR_Limit(k)` at a measured CBR, `f64::INFINITY` for "no limit".
+    #[must_use]
+    pub fn limit(&self, cbr: f64, k: Pppp) -> f64 {
+        let r = self.range_of(cbr);
+        self.classes
+            .iter()
+            .find(|(lo, hi, _)| (*lo..=*hi).contains(&k.0))
+            .and_then(|(_, _, limits)| limits.get(r).copied())
+            .unwrap_or(f64::INFINITY)
+    }
+}
+
+/// The S-RSSI threshold above which a sub-channel counts as busy in the CBR, dBm:
+/// "for PSSCH, CBR is the fraction of sub-channels whose S-RSSI exceeds a threshold
+/// −94 dBm", measured over subframes `[n−100, n−1]` [ETSI TS 103 574 V1.1.1 §5.2; the
+/// measurement itself TS 36.214 §5.1.30]. The same note gives the reason: −90.4 dBm
+/// sensitivity with about 4 dB of margin.
+pub const CBR_SRSSI_THRESHOLD_DBM: f64 = -94.0;
 
 /// The RSRP thresholds LTE and NR admit, as the (index, dBm) pairs their IEs define.
 ///
@@ -1245,5 +1523,100 @@ mod tests {
         for p in ProbResourceKeep::ALL {
             assert!((0.0..=0.8).contains(&p.probability()));
         }
+    }
+
+    #[test]
+    fn the_etsi_cr_limit_table_is_the_published_one() {
+        // ETSI TS 103 574 V1.1.1 Table 1, cell by cell, with its upper-inclusive ranges.
+        let t = CrLimitTable::ETSI_TS_103_574;
+        let cases = [
+            (0.30, 1, f64::INFINITY),
+            (0.30, 5, f64::INFINITY),
+            (0.31, 2, f64::INFINITY),
+            (0.31, 3, 0.03),
+            (0.65, 5, 0.03),
+            (0.65, 8, 0.02),
+            (0.66, 1, 0.02),
+            (0.66, 4, 0.006),
+            (0.80, 7, 0.004),
+            (0.81, 2, 0.02),
+            (0.81, 5, 0.003),
+            (1.00, 6, 0.002),
+        ];
+        for (cbr, k, want) in cases {
+            let got = t.limit(cbr, Pppp(k));
+            assert!(
+                got == want,
+                "CBR {cbr}, PPPP {k}: limit {got}, the table prints {want}"
+            );
+        }
+        // A lower priority never gets a larger limit than a higher one in the same range.
+        for cbr in [0.1, 0.5, 0.7, 0.9] {
+            for k in 1..8u8 {
+                assert!(t.limit(cbr, Pppp(k + 1)) <= t.limit(cbr, Pppp(k)));
+            }
+        }
+    }
+
+    #[test]
+    fn the_j3161_zones_are_lower_inclusive_and_carry_the_bsm_limits() {
+        let t = CrLimitTable::SAE_J3161;
+        assert_eq!(t.limit(0.29, Pppp::BSM), 0.08);
+        assert_eq!(t.limit(0.30, Pppp::BSM), 0.03, "0.30 opens the second zone");
+        assert_eq!(t.limit(0.64, Pppp::BSM), 0.03);
+        assert_eq!(t.limit(0.65, Pppp::BSM), 0.015, "0.65 opens the third zone");
+        assert_eq!(t.limit(1.0, Pppp::BSM), 0.015);
+        assert_eq!(
+            CrLimitTable::by_id("sae-j3161"),
+            Some(CrLimitTable::SAE_J3161)
+        );
+        assert_eq!(CrLimitTable::by_id("nope"), None);
+    }
+
+    #[test]
+    fn rsrp_is_the_power_per_resource_element() {
+        // One ten-PRB sub-channel: 120 sub-carriers, 20.79 dB below the total.
+        let pool = PoolConfig::sae_j3161(LTE_MCS7_J3161);
+        assert!((pool.rsrp_dbm(-80.0, 1) - (-100.792)).abs() < 1e-3);
+        // Two sub-channels: 3 dB further down for the same total power.
+        assert!((pool.rsrp_dbm(-80.0, 2) - (-103.802)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn j3161_presets_reproduce_the_published_allocations() {
+        // Abrar et al. 2026 Table 3 (via SAE J3161/1 Table 16): sub-channels needed per
+        // SPDU size and MCS. The table does not apply the two-sub-channel minimum (its
+        // 139 B digest SPDU takes one at MCS 11), so the check uses the bare geometry.
+        let bare = |mcs| PoolConfig {
+            min_subchannels: 1,
+            ..PoolConfig::sae_j3161(mcs)
+        };
+        let cases = [
+            (LTE_MCS5_J3161, 301u32, Some(3u32)),
+            (LTE_MCS7_J3161, 301, Some(3)),
+            (LTE_MCS11_J3161, 301, Some(2)),
+            (LTE_MCS5_J3161, 741, Some(7)),
+            (LTE_MCS7_J3161, 741, Some(5)),
+            (LTE_MCS11_J3161, 741, Some(4)),
+            (LTE_MCS11_J3161, 1739, Some(7)),
+            (LTE_MCS11_J3161, 139, Some(1)),
+        ];
+        for (mcs, bytes, want) in cases {
+            assert_eq!(
+                bare(mcs).subchannels_for(bytes),
+                want,
+                "{} at {bytes} B",
+                mcs.label
+            );
+        }
+        // And the largest transport block the source prints for MCS 11: 19,848 bits in
+        // the 98 data PRB of ten sub-channels.
+        assert!(bare(LTE_MCS11_J3161).payload_bits(10) >= 19_848);
+        // The profile's own pool: 20 MHz, ten sub-channels, never fewer than two.
+        let pool = PoolConfig::sae_j3161(LTE_MCS7_J3161);
+        assert!(pool.is_legal());
+        assert_eq!(pool.subchannels(), 10);
+        assert_eq!(pool.subchannels_for(100), Some(2));
+        assert_eq!(lte_mcs_index(LTE_MCS7_J3161), Some(7));
     }
 }

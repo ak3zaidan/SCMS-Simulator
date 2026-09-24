@@ -459,21 +459,68 @@ impl SidelinkPhy {
     /// declared geometry and writes nothing, so receivers may be evaluated in parallel
     /// (invariant I-R2).
     pub fn evaluate<C: Ctx + ?Sized>(&self, ctx: &mut C, arrival: &SlArrival) -> RxOutcome {
-        // 1. Half duplex: a UE cannot receive in a subframe it transmits in
-        //    (04-models.md §5.1, TR 36.885 Annex A.1).
+        self.decode(ctx, arrival, 0.0).outcome
+    }
+
+    /// Whether this PHY requires the SCI before the transport block (the high tier).
+    #[must_use]
+    pub const fn decodes_sci(&self) -> bool {
+        self.decode_sci
+    }
+
+    /// The same PHY at another tier: the focus region's receiver.
+    #[must_use]
+    pub fn at_tier(&self, tier: Tier) -> Self {
+        let mut p = self.clone();
+        p.tier = tier;
+        p.decode_sci = tier == Tier::High;
+        p.card = card(tier, &p.pool, &p.error);
+        p
+    }
+
+    /// Decodes one copy of a transport block, stage by stage.
+    ///
+    /// The chain, in order:
+    ///
+    /// 1. **Half duplex**: a UE hears nothing in a slot it transmits in.
+    /// 2. **The SCI**, drawn at the control channel's SINR against its own BLER
+    ///    ([`SidelinkErrorModel::sci_bler`]), at every tier. Its result is what the
+    ///    sensing of step 3 of TS 36.213 §14.1.1.6 may use: a UE records a neighbour's
+    ///    reservation only from an SCI it decoded, not from any energy above a threshold.
+    /// 3. **Sensitivity** of the shared channel.
+    /// 4. At the high tier, an undecoded SCI loses the transport block (04-models.md §5.1).
+    /// 5. **The transport block**, drawn at the SINR of this copy combined with
+    ///    `prior_soft_sinr_lin`, the soft buffer of earlier copies of the same transport
+    ///    block: chase combining adds the copies' linear SINRs (maximum-ratio combining of
+    ///    identical transmissions; Chase 1985). LTE's blind retransmission uses another
+    ///    redundancy version, so incremental redundancy would gain more; that gain is not
+    ///    credited, which errs on the pessimistic side and is on the card.
+    ///
+    /// Two draws, from one stream keyed by `(link, slot)`: the SCI first, the transport
+    /// block second, so the pair is a pure function of the link and the slot whatever
+    /// else the run did.
+    pub fn decode<C: Ctx + ?Sized>(
+        &self,
+        ctx: &mut C,
+        arrival: &SlArrival,
+        prior_soft_sinr_lin: f64,
+    ) -> SlDecode {
         if arrival.rx_transmitting || self.transmitted_in(arrival.rx, arrival.resource.slot) {
-            return RxOutcome::Lost(LossCause::HalfDuplex);
-        }
-        // 2. Sensitivity.
-        if arrival.power_dbm < self.sensitivity_dbm {
-            return RxOutcome::Lost(LossCause::BelowSensitivity);
+            return SlDecode {
+                sci_decoded: false,
+                data_sinr_db: f64::NEG_INFINITY,
+                effective_sinr_db: f64::NEG_INFINITY,
+                soft_sinr_lin: 0.0,
+                outcome: RxOutcome::Lost(LossCause::HalfDuplex),
+            };
         }
         let split = self.interference_split(arrival);
         let data_sinr = arrival.power_dbm - numeric::mw_to_dbm(split.total_mw());
-
-        // Two draws at most, from one stream keyed by (link, frame): the SCI first, the
-        // transport block second. The key embeds the slot, so the pair is a pure function
-        // of the link and the slot whatever else the run did.
+        let sci_sinr = {
+            let noise = numeric::dbm_to_mw(self.control_noise_dbm());
+            let total = math::sum_ordered([noise, split.co_channel_mw, split.emission_mw]);
+            arrival.power_dbm - numeric::mw_to_dbm(total)
+        };
         let mut rng = ctx.rng(
             self.error_domain(),
             EntityRef::LinkFrame {
@@ -481,39 +528,76 @@ impl SidelinkPhy {
                 frame: arrival.resource.slot,
             },
         );
-
-        // 4. SCI decoding first: an SCI failure loses the transport block
-        //    (04-models.md §5.1, high tier).
-        if self.decode_sci {
-            let sci_sinr = {
-                let noise = numeric::dbm_to_mw(self.control_noise_dbm());
-                let total = math::sum_ordered([noise, split.co_channel_mw, split.emission_mw]);
-                arrival.power_dbm - numeric::mw_to_dbm(total)
-            };
-            if rng.bool(self.error.sci_bler(sci_sinr)) {
-                return RxOutcome::Lost(if split.is_noise_only() {
-                    LossCause::Fading
-                } else {
-                    split.cause()
-                });
+        let sci_decoded = !rng.bool(self.error.sci_bler(sci_sinr));
+        let cause = if split.is_noise_only() {
+            // No interferer: propagation and noise alone, which is Gonzalez-Martin's
+            // P_PRO and what LossCause::Fading names.
+            LossCause::Fading
+        } else {
+            split.cause()
+        };
+        let lost = |c: LossCause| SlDecode {
+            sci_decoded,
+            data_sinr_db: data_sinr,
+            effective_sinr_db: data_sinr,
+            soft_sinr_lin: 0.0,
+            outcome: RxOutcome::Lost(c),
+        };
+        if self.decode_sci && !sci_decoded {
+            return lost(cause);
+        }
+        // A copy whose SCI failed cannot be located for combining at the high tier, where
+        // the SCI is modelled; at the medium tier the SCI is not, and every copy combines.
+        let soft = numeric::db_to_linear(data_sinr);
+        let effective_lin = soft + prior_soft_sinr_lin.max(0.0);
+        let effective = 10.0 * math::log10(effective_lin.max(1e-30));
+        // Sensitivity is the power at which one copy meets the reference SNR. With earlier
+        // copies in the buffer, what has to meet it is the combined SNR: two copies each
+        // 3 dB below sensitivity decode together what neither does alone.
+        if arrival.power_dbm < self.sensitivity_dbm {
+            let reference = self.sensitivity_dbm - self.noise_dbm(arrival.resource.len);
+            if prior_soft_sinr_lin <= 0.0 || effective < reference {
+                return SlDecode {
+                    soft_sinr_lin: soft,
+                    ..lost(LossCause::BelowSensitivity)
+                };
             }
         }
-
-        // 5. The LUT draw for the transport block.
-        if rng.bool(self.error.tb_bler(data_sinr)) {
-            return RxOutcome::Lost(if split.is_noise_only() {
-                // No interferer: propagation and noise alone, which is Gonzalez-Martin's
-                // P_PRO and what LossCause::Fading names.
-                LossCause::Fading
-            } else {
-                split.cause()
-            });
+        if rng.bool(self.error.tb_bler(effective)) {
+            return SlDecode {
+                effective_sinr_db: effective,
+                soft_sinr_lin: soft,
+                ..lost(cause)
+            };
         }
-        RxOutcome::Received {
-            sinr_db: numeric::q_db(data_sinr),
-            rssi_dbm: numeric::q_db(arrival.power_dbm),
+        SlDecode {
+            sci_decoded,
+            data_sinr_db: data_sinr,
+            effective_sinr_db: effective,
+            soft_sinr_lin: soft,
+            outcome: RxOutcome::Received {
+                sinr_db: numeric::q_db(effective),
+                rssi_dbm: numeric::q_db(arrival.power_dbm),
+            },
         }
     }
+}
+
+/// What decoding one copy of a sidelink transport block produced.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlDecode {
+    /// Whether the control channel (SCI) was decoded — what sensing may record.
+    pub sci_decoded: bool,
+    /// This copy's shared-channel SINR, dB.
+    pub data_sinr_db: f64,
+    /// The SINR the transport-block draw was taken at, after combining, dB.
+    pub effective_sinr_db: f64,
+    /// The linear SINR this copy adds to the receiver's soft buffer; zero when it could
+    /// not be combined (half duplex, below sensitivity, or an undecoded SCI at the high
+    /// tier).
+    pub soft_sinr_lin: f64,
+    /// The outcome.
+    pub outcome: RxOutcome,
 }
 
 impl Model for SidelinkPhy {
@@ -742,6 +826,26 @@ fn card(tier: Tier, pool: &PoolConfig, error: &SidelinkErrorModel) -> ModelCard 
             serde_json::json!(tier == Tier::High),
             primary.clone(),
         ),
+        Parameter {
+            name: "sci_control_advantage_db".to_string(),
+            unit: "dB".to_string(),
+            default: serde_json::json!(SidelinkErrorModel::CONTROL_ADVANTAGE_DB),
+            range: None,
+            source: Source {
+                kind: SourceKind::TodoCalibrate,
+                reference: "No PSCCH BLER curve is printed in 04-models.md §5.1; the SCI curve \
+                            is the shared channel's shifted by this much. Sensing records a \
+                            neighbour's reservation only from an SCI this curve decodes."
+                    .to_string(),
+                accessed: None,
+                note: None,
+            },
+            calibration: Some(
+                "Regenerate a PSCCH (SCI format 1 over 2 PRB, and SCI 1-A) BLER curve at \
+                 link level under the §3.3 channel models."
+                    .to_string(),
+            ),
+        },
     ];
     c.assumptions = vec![
         "Air time is one slot regardless of the transport-block size; `air_time`'s \
@@ -760,15 +864,20 @@ fn card(tier: Tier, pool: &PoolConfig, error: &SidelinkErrorModel) -> ModelCard 
         "Above −22 dBm received power the front end is in compression and no shipped \
          curve applies; such arrivals are counted in `overloads` and still evaluated."
             .to_string(),
-        "PSFCH is not modelled as a decoded channel: a Mode 2 pool with feedback \
-         configured spends its PSFCH symbols (they are absent from `data_symbols`) but \
-         HARQ combining gain across retransmissions is not credited."
+        "PSFCH is not modelled as a decoded channel: broadcast HARQ is blind, with no \
+         feedback, so a Mode 2 pool spends no PSFCH symbols here."
+            .to_string(),
+        "Blind retransmissions are combined by chase combining (the copies' linear SINRs \
+         add); the extra gain of LTE's and NR's incremental-redundancy versions is not \
+         credited, so a retransmitted block is decoded slightly less often than a real \
+         receiver would."
             .to_string(),
     ];
     c.ignores = match tier {
         Tier::Medium => vec![
-            "Half-duplex sensing gaps in the SPS engine, SCI decoding, symbol-group SINR, \
-             PSFCH (04-models.md §5.4 medium row)."
+            "SCI decoding as a condition for the transport block (the SCI is still drawn, \
+             and sensing records only decoded SCIs), symbol-group SINR, PSFCH \
+             (04-models.md §5.4 medium row)."
                 .to_string(),
         ],
         _ => vec![
@@ -1221,5 +1330,73 @@ mod tests {
         // The two PHYs draw from different plug-in domains, so an LTE run and an NR run
         // of the same scenario do not consume each other's streams.
         assert_ne!(lte.error_domain().code(), nr.error_domain().code());
+    }
+
+    #[test]
+    fn chase_combining_decodes_blocks_neither_copy_decodes_alone() {
+        let p = phy();
+        let mut ctx = TestCtx::new(8);
+        // −70 dBm under a same-resource interferer at −74 dBm: a data SINR of about 4 dB,
+        // where one copy fails seven times in ten on the r0.7 curve and two combined
+        // (about 7 dB) about one time in five.
+        let mut alone = 0;
+        let mut combined = 0;
+        for slot in 0..400u64 {
+            let mut a = arrival(-70.0);
+            a.resource = SlResource::new(slot, 0, 1);
+            a.interferers.push(SlInterferer {
+                node: NodeId::new(3),
+                power_dbm: -74.0,
+                resource: SlResource::new(slot, 0, 1),
+            });
+            let prior = numeric::db_to_linear(p.data_sinr_db(&a));
+            if matches!(
+                p.decode(&mut ctx, &a, 0.0).outcome,
+                RxOutcome::Received { .. }
+            ) {
+                alone += 1;
+            }
+            let d = p.decode(&mut ctx, &a, prior);
+            if matches!(d.outcome, RxOutcome::Received { .. }) {
+                combined += 1;
+                assert!(d.effective_sinr_db > d.data_sinr_db + 2.9);
+            }
+        }
+        assert!(
+            combined > alone + 100,
+            "combining decoded {combined} of 400 against {alone} alone"
+        );
+    }
+
+    #[test]
+    fn the_sci_is_drawn_against_the_control_bler_not_a_threshold() {
+        let p = phy();
+        let mut ctx = TestCtx::new(12);
+        let rate = |power: f64, ctx: &mut TestCtx| {
+            let mut ok = 0;
+            for slot in 0..400u64 {
+                let mut a = arrival(power);
+                a.resource = SlResource::new(slot, 0, 1);
+                if p.decode(ctx, &a, 0.0).sci_decoded {
+                    ok += 1;
+                }
+            }
+            f64::from(ok) / 400.0
+        };
+        // The PSCCH's 2 PRB see −109.4 dBm of noise; at −110 dBm the SCI is a coin toss,
+        // at −60 dBm certain, at −125 dBm hopeless. "Heard above −110 dBm" would have
+        // called the first all decoded and the last all missed alike.
+        let mid = rate(-110.0, &mut ctx);
+        assert!(
+            (0.2..0.8).contains(&mid),
+            "SCI decode rate at −110 dBm: {mid}"
+        );
+        assert!(rate(-60.0, &mut ctx) > 0.99);
+        assert!(rate(-125.0, &mut ctx) < 0.01);
+        // Half duplex: nothing decoded, nothing to combine.
+        let mut hd = arrival(-60.0);
+        hd.rx_transmitting = true;
+        let d = p.decode(&mut ctx, &hd, 0.0);
+        assert!(!d.sci_decoded && d.soft_sinr_lin == 0.0);
     }
 }

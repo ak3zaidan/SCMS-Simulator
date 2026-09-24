@@ -636,6 +636,15 @@ impl SidelinkErrorModel {
             Self::r1_160284_qpsk_r050()
         } else if mcs == sl::LTE_MCS4_BAZZI {
             Self::wilab("bazzi-300b", 4, 300).expect("the Bazzi MCS 4 row is in the table")
+        } else if mcs == sl::LTE_MCS5_J3161 {
+            // The J3161/1 presets are LTE MCS indices, which is what the WiLabV2Xsim rows
+            // are keyed by: urban line-of-sight at 350 B where the table has it, the
+            // only MCS 11 row (highway line-of-sight, 550 B) otherwise.
+            Self::wilab("urban-los", 5, 350).expect("the urban MCS 5 row is in the table")
+        } else if mcs == sl::LTE_MCS7_J3161 {
+            Self::wilab("urban-los", 7, 350).expect("the urban MCS 7 row is in the table")
+        } else if mcs == sl::LTE_MCS11_J3161 {
+            Self::wilab("highway-los", 11, 550).expect("the MCS 11 row is in the table")
         } else {
             Self::se_fit(mcs)
         }

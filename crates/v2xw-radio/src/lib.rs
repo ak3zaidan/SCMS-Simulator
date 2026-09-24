@@ -188,7 +188,7 @@ pub use cellular::{
 };
 pub use cv2x::{
     InterferenceSplit, SIDELINK_SENSITIVITY_DBM, SIDELINK_TX_POWER_DBM, SidelinkPhy, SlArrival,
-    SlInterferer, THERMAL_NOISE_DBM_PER_HZ, UE_NOISE_FIGURE_DB,
+    SlDecode, SlInterferer, THERMAL_NOISE_DBM_PER_HZ, UE_NOISE_FIGURE_DB,
 };
 pub use hybrid::{
     Destination, HybridDecision, HybridPolicy, HybridReason, HybridRequest, HybridSelector,
@@ -199,8 +199,8 @@ pub use sidelink::{
     SlMcsSpec, SlRat, SlResource, TxPercentage, cr_limit, nr_mcs, rsrp_threshold_dbm,
 };
 pub use sps::{
-    Reservation, SelectionOutcome, SelectionReason, SensingHistory, SpsEngine, SpsParams,
-    slot_air_time,
+    Reservation, SelectionOutcome, SelectionReason, SensingHistory, SlGrantInfo, SpsEngine,
+    SpsParams, slot_air_time,
 };
 pub use sweep::{
     BinStats, ChannelModel, DsrcConfig, HighwaySweep, SweepCtx, SweepReport, molina_masegosa_sweep,
