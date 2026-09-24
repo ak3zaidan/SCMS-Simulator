@@ -80,6 +80,12 @@ pub trait Mobility: Model {
     /// native engine overrides it. Until the kernel called it, `weather.*` reached the
     /// radio and the GNSS models and no driver: a snowstorm changed nothing on the road.
     fn set_weather(&mut self, _weather: v2xw_core::weather::WeatherState) {}
+
+    /// Passes a demand multiplier to the demand model (see [`Demand::set_multiplier`]).
+    /// Returns whether it was honoured; a tier with no demand model returns `false`.
+    fn set_demand_multiplier(&mut self, _m: f64) -> bool {
+        false
+    }
 }
 
 /// Longitudinal acceleration from the gap and the speed difference to the leader
@@ -171,6 +177,14 @@ pub trait Demand: Model {
     /// process of §2.4) must keep its own cursor so the draw sequence does not depend on
     /// how the caller chopped time up.
     fn spawns_in(&mut self, ctx: &mut dyn MobCtx, from: SimTime, to: SimTime) -> Vec<TripRequest>;
+
+    /// Multiplies the offered demand by `m` from the next window on, for a scenario
+    /// timeline's `demand.multiplier` (03-interfaces.md §13). Returns whether this model
+    /// honours it: one with no arrival process to scale — a one-shot drop — returns `false`
+    /// and the caller says so rather than pretending.
+    fn set_multiplier(&mut self, _m: f64) -> bool {
+        false
+    }
 }
 
 /// Vulnerable road users (03-interfaces.md §3, 04-models.md §2.5).
