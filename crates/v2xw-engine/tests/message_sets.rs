@@ -293,7 +293,13 @@ fn a_spat_reports_the_light_the_drivers_see_and_when_it_changes() {
         plan.controlled
             .iter()
             .filter(|via| {
-                approach_of
+                // A pedestrian head faces the crosswalk lane it controls, which has no
+                // approach (`SignalPlan::group_timelines`).
+                plan.heads.iter().any(|h| {
+                    h.lane == **via
+                        && h.group == group
+                        && h.kind == v2xw_world::SignalHeadKind::Pedestrian
+                }) || approach_of
                     .get(via)
                     .is_some_and(|a| plan.heads.iter().any(|h| h.lane == *a && h.group == group))
             })
