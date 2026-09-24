@@ -99,9 +99,7 @@ use v2xw_mobility::{
 };
 use v2xw_msg::generator::DccState;
 use v2xw_node::stores::VerificationState;
-use v2xw_node::{
-    NodeConfig, RxDisposition, RxFrame, RxReport, RxStamp, StepOutcome, Transmission,
-};
+use v2xw_node::{NodeConfig, RxDisposition, RxFrame, RxReport, RxStamp, StepOutcome, Transmission};
 use v2xw_radio::{
     AccessCategory, Arrival, ChannelId, Dcc, EdcaOcbMac, FrameDescriptor, FrameKind,
     InterferenceSource, LossCause, Mac, MacSdu, Mcs, OfdmPhy, Phy, RadioEndpoint, RxHandle,
@@ -1357,17 +1355,16 @@ impl Engine {
                     let creds = phase2.provision(id);
                     if !creds.is_empty() {
                         match runtime.as_obu_mut() {
-                            Some(obu) => crate::wiring::install_provisioned(
-                                obu,
-                                &self.scenario,
-                                id,
-                                &creds,
-                            ),
+                            Some(obu) => {
+                                crate::wiring::install_provisioned(obu, &self.scenario, id, &creds)
+                            }
                             None => crate::hosted::install_credentials(
                                 runtime.stores_mut(),
                                 &self.scenario,
                                 id,
-                                creds.iter().map(|c| (c.i, c.j, c.valid_from, c.valid_until)),
+                                creds
+                                    .iter()
+                                    .map(|c| (c.i, c.j, c.valid_from, c.valid_until)),
                             ),
                         }
                     }

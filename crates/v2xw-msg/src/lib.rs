@@ -139,8 +139,8 @@ pub mod generator;
 pub mod j2735;
 pub mod sec_types;
 pub mod size_model;
-pub mod vam;
 pub mod units;
+pub mod vam;
 
 pub use codec::{
     ETSI_UPER_CODEC_ID, Encoded, EtsiUperCodec, Message, MessageCodec, MsgType, SizeModelVersion,

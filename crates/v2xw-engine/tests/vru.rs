@@ -137,7 +137,9 @@ fn run_equipped(
     scenario.actors.vehicles.demand.rate_veh_per_h = Some(3600.0);
     scenario.messages.sets = sets.iter().map(|s| (*s).to_string()).collect();
     scenario.time.duration_s = seconds;
-    scenario.validate().expect("an equipped VRU population validates");
+    scenario
+        .validate()
+        .expect("an equipped VRU population validates");
     let mut engine = v2xw_engine::Engine::build(scenario, "").expect("builds");
     let mut recorder = v2xw_engine::MemoryRecorder::new();
     let report = engine.run(&mut recorder).expect("runs");
@@ -145,10 +147,7 @@ fn run_equipped(
 }
 
 /// The `msg_type` of every record on `channel`, with its node fields.
-fn by_type(
-    recorder: &v2xw_engine::MemoryRecorder,
-    channel: &str,
-) -> Vec<serde_json::Value> {
+fn by_type(recorder: &v2xw_engine::MemoryRecorder, channel: &str) -> Vec<serde_json::Value> {
     recorder
         .records()
         .iter()
@@ -175,17 +174,31 @@ fn equipped_pedestrians_send_psms_that_other_nodes_hear() {
             assert_eq!(r["msg_type"], "psm", "{r}");
         }
     }
-    assert!(tx.iter().any(|r| r["msg_type"] == "bsm"), "no BSM either: {report:?}");
+    assert!(
+        tx.iter().any(|r| r["msg_type"] == "bsm"),
+        "no BSM either: {report:?}"
+    );
     // Signed like a vehicle's: an envelope around the payload.
-    assert!(psm.iter().all(|r| r["envelope_bytes"].as_u64().unwrap_or(0) > 0));
+    assert!(
+        psm.iter()
+            .all(|r| r["envelope_bytes"].as_u64().unwrap_or(0) > 0)
+    );
     // A real J2735 PSM: its decoded content is on the record, with the pseudonym's first
     // four octets as its temporary id, a position on the globe and the device's speed.
     for r in &psm {
         let p = r["pseudonym"].as_str().expect("a PSM names its pseudonym");
         let c = &r["content"];
         assert_eq!(c["temp_id"].as_str(), Some(&p[..8]), "{r}");
-        assert!(c["lat_deg"].as_f64().is_some_and(|l| l.abs() <= 90.0), "{r}");
-        assert!(c["speed_mps"].as_f64().is_some_and(|v| (0.0..3.0).contains(&v)), "{r}");
+        assert!(
+            c["lat_deg"].as_f64().is_some_and(|l| l.abs() <= 90.0),
+            "{r}"
+        );
+        assert!(
+            c["speed_mps"]
+                .as_f64()
+                .is_some_and(|v| (0.0..3.0).contains(&v)),
+            "{r}"
+        );
         assert!(c["msg_count"].as_u64().is_some(), "{r}");
         // 31 octets: the mandatory PSM in its MessageFrame.
         assert_eq!(r["payload_bytes"].as_u64(), Some(31), "{r}");
@@ -196,11 +209,16 @@ fn equipped_pedestrians_send_psms_that_other_nodes_hear() {
         .iter()
         .filter(|r| r["msg_type"] == "psm" && r["outcome"] == "delivered")
         .count();
-    assert!(heard > 0, "no PSM delivered: {} psm attempts", rx.iter().filter(|r| r["msg_type"] == "psm").count());
+    assert!(
+        heard > 0,
+        "no PSM delivered: {} psm attempts",
+        rx.iter().filter(|r| r["msg_type"] == "psm").count()
+    );
     // And a pedestrian's own device hears the vehicles.
     assert!(
-        rx.iter().any(|r| psm_nodes.contains(&r["rx"].as_u64().unwrap_or(u64::MAX))
-            && r["msg_type"] == "bsm"),
+        rx.iter().any(
+            |r| psm_nodes.contains(&r["rx"].as_u64().unwrap_or(u64::MAX)) && r["msg_type"] == "bsm"
+        ),
         "no pedestrian received a BSM"
     );
     // Its queues and load are published like a vehicle's.
@@ -218,14 +236,40 @@ fn equipped_pedestrians_send_psms_that_other_nodes_hear() {
 fn on_the_etsi_stack_equipped_pedestrians_send_vams() {
     let (recorder, _) = run_equipped(&["cam"], 12.0);
     let tx = by_type(&recorder, "node.tx");
-    assert!(tx.iter().any(|r| r["msg_type"] == "vam"), "no VAM on node.tx");
+    assert!(
+        tx.iter().any(|r| r["msg_type"] == "vam"),
+        "no VAM on node.tx"
+    );
     assert!(!tx.iter().any(|r| r["msg_type"] == "psm"));
     // A real ETSI VAM, decoded on the record like a PSM.
     for r in tx.iter().filter(|r| r["msg_type"] == "vam") {
         let p = r["pseudonym"].as_str().expect("a VAM names its pseudonym");
         let c = &r["content"];
         assert_eq!(c["temp_id"].as_str(), Some(&p[..8]), "{r}");
-        assert!(c["lon_deg"].as_f64().is_some_and(|l| l.abs() <= 180.0), "{r}");
+        assert!(
+            c["lon_deg"].as_f64().is_some_and(|l| l.abs() <= 180.0),
+            "{r}"
+        );
         assert!(c["speed_mps"].as_f64().is_some(), "{r}");
     }
+}
+
+/// Pedestrians, cyclists and their devices keep the determinism contract: the same scenario
+/// twice gives byte-identical records, every channel included.
+#[test]
+fn a_run_with_vru_devices_is_deterministic() {
+    let digest = |r: &v2xw_engine::MemoryRecorder| -> Vec<u8> {
+        let mut out = Vec::new();
+        for (t, rec) in r.records() {
+            out.extend_from_slice(&t.to_le_bytes());
+            out.extend_from_slice(rec.channel.as_bytes());
+            out.extend_from_slice(&rec.json);
+        }
+        out
+    };
+    let (a, ra) = run_equipped(&["bsm"], 6.0);
+    let (b, rb) = run_equipped(&["bsm"], 6.0);
+    assert!(ra.vru_devices_created > 0);
+    assert_eq!(ra.records, rb.records);
+    assert!(digest(&a) == digest(&b), "two runs of one scenario differ");
 }

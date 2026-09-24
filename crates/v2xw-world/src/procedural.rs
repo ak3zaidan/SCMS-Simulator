@@ -1298,9 +1298,8 @@ fn add_walk_network(
         };
         for n in targets {
             let to = &lanes[n];
-            let delta = crate::model::normalise_angle(
-                to.heading_at(0.0) - from.heading_at(from.length_m),
-            );
+            let delta =
+                crate::model::normalise_angle(to.heading_at(0.0) - from.heading_at(from.length_m));
             connections.push(Connection {
                 from_lane: from.id,
                 to_lane: to.id,

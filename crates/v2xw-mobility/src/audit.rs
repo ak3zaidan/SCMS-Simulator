@@ -799,7 +799,9 @@ impl TrafficAuditor {
         if self.crosswalks.is_empty() || self.prev_peds.is_empty() {
             return;
         }
-        let occupied = self.crosswalks.occupied(self.prev_peds.iter().map(|p| p.lane));
+        let occupied = self
+            .crosswalks
+            .occupied(self.prev_peds.iter().map(|p| p.lane));
         if occupied.is_empty() {
             return;
         }
@@ -810,7 +812,8 @@ impl TrafficAuditor {
             };
             // Where the front was at `t0`, on this step's lane's arc length.
             let front_before = if before.lane == a.lane
-                || a.changing.is_some_and(|(from, to)| from == before.lane && to == a.lane)
+                || a.changing
+                    .is_some_and(|(from, to)| from == before.lane && to == a.lane)
             {
                 before.s_m
             } else {
@@ -1801,12 +1804,7 @@ mod tests {
             .expect("the crosswalk")
             .lanes[0];
         let edge = conflict.enter_s();
-        let on_crossing = pedestrian(
-            7,
-            walker_lane,
-            1.0,
-            world.lane(walker_lane).point_at(1.0),
-        );
+        let on_crossing = pedestrian(7, walker_lane, 1.0, world.lane(walker_lane).point_at(1.0));
         let run = |with_walker: bool| {
             let mut audit = TrafficAuditor::new(&world, AuditParams::default());
             let walkers: Vec<AuditPedestrian> = if with_walker {
@@ -1873,7 +1871,14 @@ mod tests {
             let mut audit = TrafficAuditor::new(&world, AuditParams::default());
             let on_kerb = pedestrian(3, kerb, 0.0, world.lane(kerb).end());
             let stepped = pedestrian(3, crossing, 0.2, world.lane(crossing).point_at(0.2));
-            audit.observe_with_pedestrians(&world, t0.saturating_sub(100_000_000), t0, &[], &[], &[on_kerb]);
+            audit.observe_with_pedestrians(
+                &world,
+                t0.saturating_sub(100_000_000),
+                t0,
+                &[],
+                &[],
+                &[on_kerb],
+            );
             audit.observe_with_pedestrians(&world, t0, t0 + 100_000_000, &[], &[], &[stepped]);
             audit.report().count(Check::PedestrianDontWalkEntry)
         };

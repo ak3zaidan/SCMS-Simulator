@@ -71,14 +71,7 @@ fn run(params: EngineParams, seconds: u64) -> AuditReport {
         let update = engine.step(&mut ctx, params.step);
         let actors = engine.audit_actors(&world, update.t);
         let people = engine.audit_pedestrians(&world);
-        auditor.observe_with_pedestrians(
-            &world,
-            t,
-            update.t,
-            &actors,
-            &update.despawned,
-            &people,
-        );
+        auditor.observe_with_pedestrians(&world, t, update.t, &actors, &update.despawned, &people);
         t = update.t;
     }
     auditor.report()
@@ -127,7 +120,11 @@ fn pedestrians_and_cyclists_in_signalised_traffic_hold_every_invariant() {
         "invariants violated: {failing:?}\nexamples: {examples:#?}"
     );
     // A real run: people walked, and a real share of that walking was on crosswalks.
-    assert!(report.stats.pedestrian_steps > 100_000, "{:?}", report.stats);
+    assert!(
+        report.stats.pedestrian_steps > 100_000,
+        "{:?}",
+        report.stats
+    );
     assert!(
         report.stats.pedestrian_crossing_steps > 2_000,
         "hardly anyone crossed a street: {:?}",
@@ -213,7 +210,11 @@ fn the_world_has_a_walk_network_and_bicycle_lanes() {
             .iter()
             .any(|l| l.kind == v2xw_world::LaneKind::Crossing)
     );
-    assert!(lanes.iter().any(|l| l.kind == v2xw_world::LaneKind::Sidewalk));
+    assert!(
+        lanes
+            .iter()
+            .any(|l| l.kind == v2xw_world::LaneKind::Sidewalk)
+    );
     assert!(
         lanes
             .iter()

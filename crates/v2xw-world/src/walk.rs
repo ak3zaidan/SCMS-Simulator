@@ -374,12 +374,7 @@ fn polyline_crossings(a: &Lane, b: &Lane) -> Vec<(f64, f64, f64, f64)> {
             let sl = math::hypot(s.0, s.1).max(1e-12);
             let sin = denom / (rl * sl);
             let cos = (r.0 * s.0 + r.1 * s.1) / (rl * sl);
-            out.push((
-                a.cumulative[i] + t * rl,
-                b.cumulative[j] + u * sl,
-                sin,
-                cos,
-            ));
+            out.push((a.cumulative[i] + t * rl, b.cumulative[j] + u * sl, sin, cos));
         }
     }
     out
@@ -775,11 +770,41 @@ mod tests {
         let m = ClassMask::MOTOR_TRAFFIC;
         let p = ClassMask::PEDESTRIAN;
         let lanes = vec![
-            lane(0, LaneKind::Driving, &[(-60.0, -1.75), (-10.0, -1.75)], 3.5, m),
-            lane(1, LaneKind::Internal, &[(-10.0, -1.75), (10.0, -1.75)], 3.5, m),
-            lane(2, LaneKind::Driving, &[(10.0, -1.75), (60.0, -1.75)], 3.5, m),
-            lane(3, LaneKind::Driving, &[(1.75, -60.0), (1.75, -10.0)], 3.5, m),
-            lane(4, LaneKind::Internal, &[(1.75, -10.0), (1.75, 10.0)], 3.5, m),
+            lane(
+                0,
+                LaneKind::Driving,
+                &[(-60.0, -1.75), (-10.0, -1.75)],
+                3.5,
+                m,
+            ),
+            lane(
+                1,
+                LaneKind::Internal,
+                &[(-10.0, -1.75), (10.0, -1.75)],
+                3.5,
+                m,
+            ),
+            lane(
+                2,
+                LaneKind::Driving,
+                &[(10.0, -1.75), (60.0, -1.75)],
+                3.5,
+                m,
+            ),
+            lane(
+                3,
+                LaneKind::Driving,
+                &[(1.75, -60.0), (1.75, -10.0)],
+                3.5,
+                m,
+            ),
+            lane(
+                4,
+                LaneKind::Internal,
+                &[(1.75, -10.0), (1.75, 10.0)],
+                3.5,
+                m,
+            ),
             lane(5, LaneKind::Driving, &[(1.75, 10.0), (1.75, 60.0)], 3.5, m),
             lane(6, LaneKind::Crossing, &[(12.0, -8.0), (12.0, 8.0)], 4.0, p),
             lane(7, LaneKind::Crossing, &[(12.0, 8.0), (12.0, -8.0)], 4.0, p),

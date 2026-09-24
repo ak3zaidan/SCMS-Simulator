@@ -1456,7 +1456,8 @@ impl VruDeviceRuntime {
                 item,
             }) {
                 self.drops.record(DropCause::RxOverflow);
-                out.rx_reports.push(Self::dropped(&refused.item, DropCause::RxOverflow));
+                out.rx_reports
+                    .push(Self::dropped(&refused.item, DropCause::RxOverflow));
             }
         }
 

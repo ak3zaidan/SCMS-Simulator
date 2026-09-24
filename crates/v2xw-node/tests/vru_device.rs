@@ -313,44 +313,41 @@ fn every_frame_says_where_its_payload_came_from() {
     // One stack per device: with both, a VAM on every step leaves the duty cycle's T_off in
     // front of every PSM (`a_psm_and_a_vam_cannot_go_back_to_back`).
     for services in [VruServices::SAE, VruServices::ETSI] {
-    let mut d = device(services);
-    for k in 0..=40u64 {
-        let now = k * 100 * NS_PER_MS;
-        d.set_belief(belief(Vec3::new(5.0 * k as f64, 0.0, 0.0), 1.4));
-        let mut ctx = NodeRuntimeCtx::new(now, &rng);
-        let out = d.step(&mut ctx, Vec::new(), 0.0);
-        assert_eq!(out.payload_provenance.len(), out.transmissions.len());
-        for ((ty, p), tx) in out.payload_provenance.iter().zip(&out.transmissions) {
-            assert_eq!(*ty, tx.msg_type);
-            match (ty, p) {
-                (MsgType::Psm, PayloadProvenance::Encoded { codec }) => {
-                    assert_eq!(*codec, v2xw_msg::j2735::psm::PSM_CODEC_ID);
-                    let payload = &tx.signed.as_ref().expect("signed").payload;
-                    let m = v2xw_msg::j2735::psm::decode_message_frame(payload)
-                        .expect("a PSM that decodes");
-                    assert_eq!(m.id, tx.signer.0[..4]);
-                    assert_eq!(
-                        m.basic_type,
-                        v2xw_msg::j2735::psm::PersonalDeviceUserType::Pedestrian
-                    );
-                    assert_eq!(m.speed, v2xw_msg::j2735::bsm::speed(1.4));
-                    psms += 1;
+        let mut d = device(services);
+        for k in 0..=40u64 {
+            let now = k * 100 * NS_PER_MS;
+            d.set_belief(belief(Vec3::new(5.0 * k as f64, 0.0, 0.0), 1.4));
+            let mut ctx = NodeRuntimeCtx::new(now, &rng);
+            let out = d.step(&mut ctx, Vec::new(), 0.0);
+            assert_eq!(out.payload_provenance.len(), out.transmissions.len());
+            for ((ty, p), tx) in out.payload_provenance.iter().zip(&out.transmissions) {
+                assert_eq!(*ty, tx.msg_type);
+                match (ty, p) {
+                    (MsgType::Psm, PayloadProvenance::Encoded { codec }) => {
+                        assert_eq!(*codec, v2xw_msg::j2735::psm::PSM_CODEC_ID);
+                        let payload = &tx.signed.as_ref().expect("signed").payload;
+                        let m = v2xw_msg::j2735::psm::decode_message_frame(payload)
+                            .expect("a PSM that decodes");
+                        assert_eq!(m.id, tx.signer.0[..4]);
+                        assert_eq!(
+                            m.basic_type,
+                            v2xw_msg::j2735::psm::PersonalDeviceUserType::Pedestrian
+                        );
+                        assert_eq!(m.speed, v2xw_msg::j2735::bsm::speed(1.4));
+                        psms += 1;
+                    }
+                    (MsgType::Vam, PayloadProvenance::Encoded { codec }) => {
+                        assert_eq!(*codec, v2xw_msg::vam::VAM_CODEC_ID);
+                        let payload = &tx.signed.as_ref().expect("signed").payload;
+                        let m = v2xw_msg::vam::decode_vam(payload).expect("a VAM that decodes");
+                        assert_eq!(m.header.0.station_id.0.to_be_bytes(), tx.signer.0[..4]);
+                        assert_eq!(m.vam.vam_parameters.basic_container.station_type.0, 1);
+                        vams += 1;
+                    }
+                    other => panic!("unexpected payload provenance {other:?}"),
                 }
-                (MsgType::Vam, PayloadProvenance::Encoded { codec }) => {
-                    assert_eq!(*codec, v2xw_msg::vam::VAM_CODEC_ID);
-                    let payload = &tx.signed.as_ref().expect("signed").payload;
-                    let m = v2xw_msg::vam::decode_vam(payload).expect("a VAM that decodes");
-                    assert_eq!(
-                        m.header.0.station_id.0.to_be_bytes(),
-                        tx.signer.0[..4]
-                    );
-                    assert_eq!(m.vam.vam_parameters.basic_container.station_type.0, 1);
-                    vams += 1;
-                }
-                other => panic!("unexpected payload provenance {other:?}"),
             }
         }
-    }
     }
     assert!(psms > 0 && vams > 0, "{psms} PSMs, {vams} VAMs");
 }
