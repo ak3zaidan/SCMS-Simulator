@@ -352,6 +352,9 @@ export function ScenarioPanel(): React.JSX.Element {
                 <div key={item.id} className="row" style={{ justifyContent: "space-between" }}>
                   <span title={item.description}>
                     {item.name ?? item.id}
+                    {list.filter((o) => o.kind === "preset" && o.name === item.name).length > 1 ? (
+                      <span className="faint"> ({item.id.split("/").pop()})</span>
+                    ) : null}
                     {(item as { running?: boolean }).running ? <span className="faint"> (running)</span> : null}
                   </span>
                   <button

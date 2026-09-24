@@ -206,6 +206,8 @@ enum HostMsg {
 /// field of it is `Send`, which is the reason the split exists: the engine is not.
 #[derive(Debug)]
 struct Setup {
+    /// The imported world in the engine's exact native form, for the next run's kernel.
+    world_memo: Option<WorldMemo>,
     world_payload: WorldPayload,
     world_json: String,
     hello: HelloBody,
@@ -238,6 +240,17 @@ struct Setup {
     /// The `prov_id` a `MetricSample` resolves through: the registered metric-family
     /// model, or `0` when the run installed none.
     metric_prov: u32,
+}
+
+/// The last world this process imported, kept for the next run of the same world.
+///
+/// Kept as `v2xw_world::serde_native` bytes, whose round trip is exact (same content hash,
+/// same lane graph), under `v2xw_engine::wiring::world_cache_key`, which covers every input
+/// of the import. A run on a kept world is therefore the same run as one on a fresh import.
+#[derive(Debug)]
+struct WorldMemo {
+    key: String,
+    bytes: Vec<u8>,
 }
 
 /// One signal controller's fixed-time plan, flattened for evaluation without the world.
@@ -499,6 +512,7 @@ fn spawn_host(
     scenario: Scenario,
     options: &LiveOptions,
     lookahead: usize,
+    memo: Option<WorldMemo>,
 ) -> Result<(Box<Setup>, Host)> {
     let (setup_tx, setup_rx) =
         std::sync::mpsc::channel::<std::result::Result<Box<Setup>, String>>();
@@ -527,7 +541,47 @@ fn spawn_host(
         .stack_size(16 * 1024 * 1024)
         .spawn(move || {
             let _alive = KernelThreadGuard::enter();
-            let mut engine = match v2xw_engine::Engine::build(scenario, &build_utc) {
+            // The world: the one this process imported last time when every input of the
+            // import is unchanged (the key covers them all, source file contents included),
+            // a fresh import otherwise. Every Run is a fresh kernel, and before this every one
+            // of them imported the map again — on Manhattan, most of the wait after Run.
+            let key = v2xw_engine::wiring::world_cache_key(&scenario).ok();
+            let kept = match (memo, key.as_ref()) {
+                (Some(m), Some(k)) if &m.key == k => {
+                    v2xw_world::serde_native::from_bytes(&m.bytes).ok().map(|w| (w, m.bytes))
+                }
+                _ => None,
+            };
+            let (world, bytes) = match kept {
+                Some((world, bytes)) => (world, Some(bytes)),
+                None => match v2xw_engine::wiring::build_world(&scenario) {
+                    Ok(world) => {
+                        let bytes = v2xw_world::serde_native::to_bytes(&world).ok();
+                        (world, bytes)
+                    }
+                    Err(e) => {
+                        let _ = setup_tx.send(Err(e.to_string()));
+                        return;
+                    }
+                },
+            };
+            // `world.cache` names a directory to keep the world in across processes; a kept
+            // world still belongs there, so it is written when the entry is missing.
+            if let (Some(dir), Some(k), Some(b)) = (
+                scenario.world.cache.as_deref().map(str::trim).filter(|d| !d.is_empty()),
+                key.as_ref(),
+                bytes.as_ref(),
+            ) {
+                let entry = std::path::Path::new(dir).join(format!("{k}.v2xwworld"));
+                if !entry.exists() && std::fs::create_dir_all(dir).is_ok() {
+                    let partial = entry.with_extension(format!("{}.partial", std::process::id()));
+                    if std::fs::write(&partial, b).is_ok() && std::fs::rename(&partial, &entry).is_err() {
+                        let _ = std::fs::remove_file(&partial);
+                    }
+                }
+            }
+            let world_memo = key.zip(bytes).map(|(key, bytes)| WorldMemo { key, bytes });
+            let mut engine = match v2xw_engine::Engine::build_with_world(scenario, world, &build_utc) {
                 Ok(e) => e,
                 Err(e) => {
                     let _ = setup_tx.send(Err(e.to_string()));
@@ -541,7 +595,10 @@ fn spawn_host(
                 recording.as_deref(),
                 actor_capacity,
             ) {
-                Ok(s) => s,
+                Ok(mut s) => {
+                    s.world_memo = world_memo;
+                    s
+                }
                 Err(e) => {
                     let _ = setup_tx.send(Err(e.to_string()));
                     return;
@@ -940,6 +997,7 @@ fn assemble_setup(
     };
 
     Ok(Box::new(Setup {
+        world_memo: None,
         world_payload: payload,
         world_json,
         hello,
@@ -2168,6 +2226,8 @@ pub struct LiveEngine {
     stats: RunStats,
     /// What the scenario's exporters wrote after the run, or why they could not.
     exports: Option<std::result::Result<Vec<v2xw_engine::export::Exported>, String>>,
+    /// The last imported world, for the next run's kernel (see [`WorldMemo`]).
+    world_memo: Option<WorldMemo>,
 }
 
 /// Whole-run totals, read off the steps the kernel produced — not off what a connection
@@ -2278,7 +2338,9 @@ impl LiveEngine {
     /// # Errors
     /// As [`LiveEngine::open`].
     pub fn new(scenario: Scenario, options: LiveOptions) -> Result<Self> {
-        let (setup, host) = spawn_host(scenario.clone(), &options, options.lookahead_steps)?;
+        let (mut setup, host) =
+            spawn_host(scenario.clone(), &options, options.lookahead_steps, None)?;
+        let world_memo = setup.world_memo.take();
         let projector = Projector::new(&setup);
         let metric_names = setup
             .catalogue
@@ -2323,6 +2385,7 @@ impl LiveEngine {
             runs_started: 1,
             stats: RunStats::default(),
             exports: None,
+            world_memo,
         })
     }
 
@@ -2568,10 +2631,11 @@ impl LiveEngine {
     /// runs the last scenario that built.
     fn restart(&mut self, scenario: Scenario) -> Result<()> {
         self.host.shutdown();
-        let (setup, host) = match spawn_host(
+        let (mut setup, host) = match spawn_host(
             scenario.clone(),
             &self.options,
             self.options.lookahead_steps,
+            self.world_memo.take(),
         ) {
             Ok(pair) => pair,
             Err(e) => {
@@ -2580,6 +2644,7 @@ impl LiveEngine {
                 return Err(e);
             }
         };
+        self.world_memo = setup.world_memo.take();
         self.metric_names = setup
             .catalogue
             .iter()
