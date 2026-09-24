@@ -1,6 +1,7 @@
 # VWP v1 — V2X World Simulator wire protocol (engine ↔ UI)
 
-Status: **normative, implementable**. Version `1.0`. Date: 2026-09-18.
+Status: **normative, implementable**. Version `1.1` (2026-09-24: `view.follow {feed}` and the `node.feed`
+notification, §6.7.1; additive under §8.4). Version `1.0`: 2026-09-18.
 
 Implements `docs/adr/0008-recording-format-and-engine-ui-protocol.md`, `docs/design/02-architecture.md` §9,
 `docs/design/09-ui.md` §2/§5/§7/§8, `docs/design/03-interfaces.md` §14, `docs/design/06-node-models.md` §2.4.
@@ -1945,6 +1946,64 @@ The run stops: its kernel is stopped and joined before the reply, and `run.state
 `view.follow` is the subscription control for `Telemetry`: the server sends telemetry only for subscribed
 nodes, which is what keeps the telemetry frame small.
 
+#### 6.7.1 The followed node's message feed (v1.1)
+
+`view.follow` takes one more optional parameter, and its result one more optional member:
+
+```json
+{"params": {"feed": {"oneOf": [{"type": "boolean"},
+   {"type": "object", "additionalProperties": false,
+    "properties": {"sent": {"type": "integer", "minimum": 0, "maximum": 200, "default": 20},
+                   "received": {"type": "integer", "minimum": 0, "maximum": 500, "default": 40},
+                   "waiting": {"type": "integer", "minimum": 0, "maximum": 100, "default": 8},
+                   "bytes": {"type": "boolean", "default": true},
+                   "hz": {"type": "number", "minimum": 0.2, "maximum": 20, "default": 4}}}]}},
+ "result": {"feed": {"type": "object", "required": ["v"],
+   "properties": {"v": {"const": 1}, "available": {"type": "boolean"}, "reason": {"type": "string"},
+                  "hz": {}, "sent": {}, "received": {}, "waiting": {}, "bytes": {}}}}}
+```
+
+`feed: true` (or an object of limits) subscribes the followed node to `node.feed` (§6.14); `false` drops the
+subscription; absent leaves it as it is. The subscription belongs to the followed node: following another
+node or `clear` drops it. An engine with no feed (the fixture, a replay) answers `available: false` with a
+reason and pushes nothing.
+
+While subscribed the server sends `node.feed` once immediately after the reply (the node's kept history,
+`reset: true`) and then at most `hz` times per wall-clock second, each push carrying what the node put on
+the air and what it resolved since the previous push (`since_ns` → `t_ns`), newest first, at most `sent` and
+`received` of each, with the number left out in `omitted`. The pacing is the transport's (§1.5's kind of
+wall time) and moves no simulated value. After a backward seek the next push starts over (`reset: true`).
+
+Every decoded value is read from the frame's own octets. The engine hands the server each transmitted
+SPDU (`RunRecorder::tap_frame`, not a record: nothing recorded or digested changes); the server parses
+the IEEE 1609.2 envelope with the same parser a receiving node verifies with and the payload with the
+J2735 BSM or ETSI CAM decoder. A field carried as its data element's "unavailable" value arrives as
+`{"v": null, "na": true, "raw": <the sentinel>}`. `decoded.spans` tile `[0, spdu_bytes)`: the 1609.2
+header, the payload, `headerInfo`, the signer and the signature.
+
+A `node.feed` push:
+
+| Member | Meaning |
+|---|---|
+| `v` | the feed schema version, `1`; a reader refuses another |
+| `node`, `t_ns`, `since_ns`, `reset` | whose feed, the stream instant it covers, the previous push's instant |
+| `sent[]` | `msg`, `t_ns` (on the air), `type`, `bytes` (on_wire, payload, envelope, certificate, network, link), `radio` (power, channel, airtime), `signer`, `pseudonym` (HashedId8), `timing` (generated, sign start, signed; sign-queue, signing and channel-access ms), `decoded` |
+| `received[]` | `msg`, `t_ns` (resolved), `type`, `outcome` (`delivered`/`lost`/`in-flight`), `cause`, `verification`, `rssi_dbm`, `sinr_db`, `bytes_on_wire`, `e2e_ms`, `stages_ms` (the 10 stages of `node.rx`'s decomposition), `from` and `dist_m` (**GT**: absent on a `node`-profile connection), `decoded` (delivered only) |
+| `omitted`, `shed`, `undetected` | new entries the push bound left out; entries the server's per-node cap shed; attempts the receiver never detected (`out-of-range`, `below-sensitivity`), counted and not listed |
+| `history_ns` | how far behind the stream the server keeps a node's traffic (20 s) |
+| `queues` | the five queues of 03-interfaces §8 (`rx`, `verify`, `app`, `tx`, `crl`): `depth` at the instant, `peak` during the last step, `in_service`, `served` and `wait_p50_ms`/`wait_p95_ms` over the last second, `drops` by cause over the last ten seconds, `waiting[]` (every message that waited during the last step: `msg`, `type`, `from`, `enqueued_ns`, `left_ns` or `null`, `waited_ms`, `stage`), `reported_depth` (the node's own telemetry window), plus `step_ms` and `kernel_lead_ms` |
+
+The queues are reconstructed from the node's own `node.tx`/`node.rx` stamps, so they are the node model's
+instants, not a second model. A reading covers the whole last step because the stream is drawn on the step
+grid and a vehicle's traffic is periodic at the same period: read only at the instant, a queue that is busy
+every step can read empty forever. The CRL task queue has no per-task stamps; its `depth` is `null` and its
+`reported_depth` is the node's telemetry window. A message still queued at the instant is known only once
+the kernel has run past the moment it leaves; `kernel_lead_ms` says how far that is.
+
+`docs/protocol/vectors/node-feed-v1.json` is a captured push. `crates/v2xw-server/tests/feed.rs` fails when
+the server's push stops having exactly its shape, and `@vwp/protocol`'s `test/feed.test.ts` checks the
+TypeScript definitions against the same file.
+
 #### `view.camera`
 
 ```json
@@ -2009,7 +2068,7 @@ Overlays whose name ends in `_gt` have `visibility: "GT"`; in the `node` profile
                  "t_ns": {"$ref":"#/$defs/SimTimeNs","description":"default: now"},
                  "include": {"type":"array","uniqueItems":true,
                    "items":{"enum":["telemetry","stores","queues","neighbors","certs","crl",
-                                    "gnss","clock","apps","detectors","provenance"]},
+                                    "gnss","clock","apps","detectors","provenance","messages"]},
                    "default":["telemetry","queues","neighbors"]},
                  "limit": {"type":"integer","minimum":1,"maximum":1000,"default":50,
                            "description":"row cap for list-valued sections"}}},
@@ -2044,6 +2103,12 @@ Overlays whose name ends in `_gt` have `visibility: "GT"`; in the `node` profile
 ```
 
 This is the HUD and inspector payload of 09-ui §5, as JSON, on demand.
+
+`messages` (added with the metrics track, 2026-09-23) is the node's recent traffic oldest first, each entry
+with the members of §6.7.1's `sent[]` and `received[]` plus the original flat names (`msg_type`,
+`bytes_on_wire`, `payload_bytes`, `content`, …); `queues` answers with §6.7.1's queue reading. Both come
+from the same store as `node.feed`, and on a `node`-profile connection `messages.received[]` carries no
+`from` or `dist_m` (§5.2).
 
 #### `inspect.link`
 
@@ -2551,6 +2616,7 @@ The server sends these as JSON-RPC notifications (no `id`, no reply expected).
 | `log` | `{"level","target","message","t_ns"?}` | `tracing` events at or above the connection's level |
 | `validation` | `{"errors":[…],"warnings":[…]}` | the scenario changed and was re-validated |
 | `experiment.progress` | `{"experiment_id","cells_done","cells_total","eta_s"}` | during `experiment.run` |
+| `node.feed` (v1.1) | §6.7.1 | while `view.follow {feed}` stands for the followed node |
 
 ### 6.15 Method inventory
 
