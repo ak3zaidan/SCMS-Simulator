@@ -267,6 +267,15 @@ pub struct Case {
     pub jmax: u32,
     /// Whether the resolution succeeded.
     pub resolved: bool,
+    /// A single-subject revocation ([BRECHT §VI-D]): the MA's decision names one
+    /// pseudonym certificate, so there is no "same device?" question to put to the Linkage
+    /// Authorities; the PCA lookup identifies the request, the RA blocklists it and both
+    /// LAs must release their seeds before the CRL Generator can append an entry.
+    pub direct: bool,
+    /// Whether the case has finished, either by an appended CRL entry or by a refusal
+    /// somewhere on the path (an unknown linkage value, an unknown request, an LA that
+    /// said "different devices"). A driver serialising cases waits on this.
+    pub done: bool,
 }
 
 /// The CRL Generator's and the CRL Store's state.
@@ -274,6 +283,8 @@ pub struct Case {
 pub struct CrlState {
     /// The published entries.
     pub entries: Vec<CrlLinkageEntry>,
+    /// Whether a cadence publication is already scheduled (CRL Generator only).
+    pub publish_armed: bool,
 }
 
 /// Everything the deployment knows.
@@ -398,6 +409,22 @@ impl ScmsRun {
             p.device_profile,
         );
         self.state.devices.insert(node, DeviceState::new(node));
+    }
+
+    /// Replaces the link `device` reaches the backend over (privacy proxy, RA, DCM, ECA,
+    /// CRL Store) with `link`.
+    ///
+    /// The deployment's default device link is a fixed cellular uplink; a driver that
+    /// models the access leg itself — the cellular Uu model's latency and capacity at the
+    /// device's position, or a roadside unit's relay over its backhaul — states the link
+    /// the next exchange will see here, so the flow's round trips cost what that access
+    /// really costs and are charged to the transport it really used.
+    pub fn set_access(&mut self, device: NodeId, link: Link) {
+        let n = self.state.nodes;
+        let net = self.kernel.net_mut();
+        for peer in [n.lop, n.ra, n.dcm, n.eca, n.crl_store] {
+            net.connect(device, peer, link);
+        }
     }
 
     /// Puts `device` in range of the roadside CRL broadcast path.
@@ -599,6 +626,15 @@ impl ScmsRun {
         self.start_provisioning(device, at, i, 1, jmax, FlowId::Topup)
     }
 
+    /// Starts a top-up at `at`, a driver's instant (never earlier than the kernel's
+    /// clock): how an engine running the backend in lockstep asks for the next i-period
+    /// the moment the device's pool runs low, rather than at whatever instant the
+    /// backend last processed.
+    pub fn topup_at(&mut self, device: NodeId, at: SimTime, i: u32, jmax: u32) -> FlowRun {
+        let at = at.max(self.kernel.now());
+        self.start_provisioning(device, at, i, 1, jmax, FlowId::Topup)
+    }
+
     /// Submits a misbehaviour report about the certificate `(subject_i, subject_lv)`.
     pub fn submit_report(
         &mut self,
@@ -649,6 +685,8 @@ impl ScmsRun {
             i_rev,
             jmax,
             resolved: false,
+            direct: false,
+            done: false,
         });
         let ma = self.state.nodes.ma;
         self.inject(
@@ -661,6 +699,184 @@ impl ScmsRun {
             run,
         );
         Some((run, crl_run))
+    }
+
+    /// Revokes the device behind the report the MA holds at `index`, from period `i_rev`
+    /// forward: the revocation sequence of [BRECHT §VI-D] for one reported certificate.
+    ///
+    /// MA → PCA (`lv` → request hash), MA → RA (hash → blocklist, LCIs), MA → LA1 and LA2
+    /// (LCI → `ls(i_rev)`), MA → CRLG. **Both** Linkage Authorities must answer with a seed
+    /// before an entry exists: a CRL entry is the pair of seeds, and one LA alone can
+    /// neither issue nor refuse on the other's behalf.
+    ///
+    /// The decision to revoke is the authority's pipeline's, taken before this is called
+    /// (`v2xw_threat::LegacyWindow`); this is only the protocol that carries it out.
+    ///
+    /// Returns the resolution run and the CRL-issuance run, or `None` when no such report
+    /// is held or a case is still in progress (cases are carried out one at a time, as the
+    /// single `MaState::case` slot says; the caller queues).
+    pub fn revoke(&mut self, index: usize, i_rev: u32, jmax: u32) -> Option<(FlowRun, FlowRun)> {
+        if self.case_open() {
+            return None;
+        }
+        let r = self.state.ma.reports.get(index)?.clone();
+        let run = self.new_run();
+        let crl_run = self.new_run();
+        self.state.ma.case = Some(Case {
+            run,
+            crl_run,
+            subjects: [(r.subject_i, r.subject_lv), (r.subject_i, r.subject_lv)],
+            lookups: Vec::new(),
+            same: [None, None],
+            seeds: [None, None],
+            i_rev,
+            jmax,
+            resolved: false,
+            direct: true,
+            done: false,
+        });
+        let ma = self.state.nodes.ma;
+        self.inject(
+            ma,
+            ScmsMsg::PcaLookupRequest {
+                i: r.subject_i,
+                lv: r.subject_lv,
+            },
+            FlowId::LinkageResolution,
+            run,
+        );
+        Some((run, crl_run))
+    }
+
+    /// Whether a case is in progress.
+    #[must_use]
+    pub fn case_open(&self) -> bool {
+        self.state.ma.case.as_ref().is_some_and(|c| !c.done)
+    }
+
+    /// A misbehaviour report whose **access leg** — the device's own link to the privacy
+    /// proxy — was carried by the caller, arriving at the Location Obscurer Proxy at
+    /// `arrive_at`.
+    ///
+    /// An engine models that leg itself (cellular Uu with its latency, capacity and
+    /// coverage, or an RSU relay over the sidelink and the unit's backhaul), so the
+    /// deployment's fixed device link must not be charged a second time. The device-side
+    /// stages are stamped at the instants the caller supplies, the leg is written to the
+    /// wire log with the transport and the bytes it really used, and the report enters the
+    /// backend at the proxy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn report_at_proxy(
+        &mut self,
+        reporter: NodeId,
+        subject_i: u32,
+        subject_lv: LinkageValue,
+        detected_at: SimTime,
+        sent_at: SimTime,
+        arrive_at: SimTime,
+        transport: Transport,
+        bytes: u32,
+    ) -> FlowRun {
+        let run = self.new_run();
+        let flow = FlowId::Report;
+        for (stage, t) in [(StageId::Detect, detected_at), (StageId::ReportSent, sent_at)] {
+            self.kernel.stages.push(crate::stage::StageStamp {
+                t,
+                run,
+                flow,
+                stage,
+                node: Some(reporter),
+                size: None,
+            });
+        }
+        let lop = self.state.nodes.lop;
+        self.kernel.steps.push(crate::stage::WireStep {
+            t: sent_at,
+            from: reporter,
+            to: lop,
+            flow,
+            run,
+            step: "report",
+            bytes,
+            transport,
+        });
+        self.kernel.inject_at(
+            arrive_at,
+            Delivery {
+                at: arrive_at,
+                from: reporter,
+                to: lop,
+                msg: ScmsMsg::Report(Box::new(ReportSubmission {
+                    reporter,
+                    subject_i,
+                    subject_lv,
+                    observed_at: detected_at,
+                })),
+                flow,
+                run,
+            },
+        );
+        run
+    }
+
+    /// Enrols and provisions `device` **before the run**, leaving the backend's clock,
+    /// queues and logs untouched.
+    ///
+    /// A vehicle on the road already holds its pool: enrolment happens at the factory or
+    /// dealership and the first batch is downloaded long before the drive a scenario
+    /// simulates (05-protocols.md §3.2, bootstrap "offline in the PoC; modeled as a
+    /// scenario-time-zero event"). The flows run for real — butterfly expansion, the two
+    /// Linkage Authorities' pre-linkage values, the PCA's issuance — on a scratch kernel
+    /// over the same topology, so every entity's *state* (the RA's request record, the
+    /// LAs' chains, the PCA's `lv` table, the device's credentials) is exactly what the
+    /// in-run flows would have left; only the scratch kernel's time and logs are thrown
+    /// away. That is what lets a revocation during the run resolve this device.
+    ///
+    /// # Errors
+    /// Whatever the flows return on the scratch kernel.
+    pub fn preload(&mut self, device: NodeId, start_i: u32, periods: u32, jmax: u32) -> Result<()> {
+        if !self.state.devices.contains_key(&device) {
+            self.add_device(device);
+        }
+        let mut scratch: Kernel<ScmsMsg> = Kernel::new_at(self.kernel.net().clone(), 0);
+        let p = self.state.params;
+        for (node, spec) in self.state.nodes.backend_service_models(&p) {
+            scratch.host(node, &spec, p.backend_profile);
+        }
+        // Every device already hosted keeps a host on the scratch kernel too, so a device
+        // that is being provisioned is never the only one the handlers can address.
+        scratch.host(
+            device,
+            &crate::service::ServiceModelSpec::new(1, p.device_overhead),
+            p.device_profile,
+        );
+        let mut real = core::mem::replace(&mut self.kernel, scratch);
+        // The request shuffle happened long before the run and its length is not what a
+        // pre-run pool is for; with the cited one-day window the device's download polls
+        // would give up before the batch was ready. The window is restored below.
+        let saved = self.state.params;
+        self.state.params.shuffle_window = Duration::ZERO;
+        self.state.params.first_batch_delay = Duration::ZERO;
+        self.enrol_at(device, 0);
+        let mut outcome = Self::drain_into(&mut self.state, &mut self.kernel);
+        if outcome.is_ok() {
+            let at = self.kernel.now();
+            self.start_provisioning(device, at, start_i, periods, jmax, FlowId::Provisioning);
+            outcome = Self::drain_into(&mut self.state, &mut self.kernel);
+        }
+        core::mem::swap(&mut self.kernel, &mut real);
+        self.state.params = saved;
+        outcome
+    }
+
+    fn drain_into(state: &mut ScmsState, kernel: &mut Kernel<ScmsMsg>) -> Result<()> {
+        while let Some(d) = kernel.next_delivery() {
+            let profile = kernel.profile_of(d.to);
+            let mut out = Outbox::new(profile);
+            let (at, to) = (d.at, d.to);
+            state.handle(d, &mut out)?;
+            kernel.dispatch(at, to, out)?;
+        }
+        Ok(())
     }
 
     /// Has a device fetch, expand and enforce the current CRL.
@@ -1377,10 +1593,29 @@ impl ScmsState {
                     return Ok(());
                 };
                 let Some(found) = found else {
+                    // The PCA issued no certificate with that linkage value: nothing to
+                    // resolve, and the case ends here.
+                    case.done = true;
                     return Ok(());
                 };
                 case.lookups.push(found);
-                if case.lookups.len() == 1 {
+                if case.direct {
+                    // One certificate names one enrolment: the PCA's answer is the
+                    // request hash, which is the device ([BRECHT §VI-D]).
+                    case.resolved = true;
+                    let hash = found.request_hash;
+                    self.ma.decisions.push(hash);
+                    out.stage_at(StageId::Resolved, to, None, flow, run);
+                    out.send(
+                        n.ra,
+                        ScmsMsg::BlocklistRequest { request_hash: hash },
+                        "blocklist-request",
+                        self.sizes.blocklist_request(),
+                        Transport::BackendNet,
+                        flow,
+                        run,
+                    );
+                } else if case.lookups.len() == 1 {
                     let (i, lv) = case.subjects[1];
                     out.send(
                         n.pca,
@@ -1437,6 +1672,9 @@ impl ScmsState {
                     match (case.same[0], case.same[1]) {
                         (Some(a), Some(b)) => {
                             case.resolved = a && b;
+                            if !case.resolved {
+                                case.done = true;
+                            }
                             (case.resolved, case.lookups[0].request_hash)
                         }
                         _ => (false, [0u8; 32]),
@@ -1478,6 +1716,9 @@ impl ScmsState {
             }
             ScmsMsg::BlocklistResponse { known, lci1, lci2 } => {
                 if !known {
+                    if let Some(case) = self.ma.case.as_mut() {
+                        case.done = true;
+                    }
                     return Ok(());
                 }
                 let Some(case) = self.ma.case.as_ref() else {
@@ -1558,6 +1799,9 @@ impl ScmsState {
                     max_forward: linkage::DEFAULT_MAX_FORWARD_PERIODS,
                 };
                 self.crlg.entries.push(entry);
+                if let Some(case) = self.ma.case.as_mut() {
+                    case.done = true;
+                }
                 Self::sign(out, 1);
                 let entries = u32::try_from(self.crlg.entries.len()).unwrap_or(u32::MAX);
                 out.stage_at(
@@ -1567,8 +1811,50 @@ impl ScmsState {
                     flow,
                     run,
                 );
+                let cadence = self.params.crl_cadence;
+                if self.params.publish_on_cadence && cadence > Duration::ZERO {
+                    // The list is re-issued on the cadence, not per entry: the entry waits
+                    // for the next boundary of the calendar that starts at the epoch
+                    // [BRECHT §VI-G], and every entry appended before it rides along.
+                    if !self.crlg.publish_armed {
+                        self.crlg.publish_armed = true;
+                        let c = cadence.as_nanos().max(1);
+                        let since = at.saturating_sub(self.params.epoch);
+                        let next = (since / c + 1) * c;
+                        out.start_timer(
+                            Duration::from_nanos(next - since),
+                            ScmsMsg::CrlPublishTimer,
+                            flow,
+                            run,
+                        );
+                    }
+                    return Ok(());
+                }
                 // The store first, then the broadcast path, so that two links with the
                 // same parameters stamp `published` before `first_rsu_broadcast`.
+                out.send(
+                    n.crl_store,
+                    ScmsMsg::CrlPublish { entries },
+                    "crl-publish",
+                    self.sizes.crl(entries),
+                    Transport::BackendNet,
+                    flow,
+                    run,
+                );
+                out.send(
+                    n.crl_broadcast,
+                    ScmsMsg::CrlPublish { entries },
+                    "crl-broadcast",
+                    self.sizes.crl(entries),
+                    Transport::BackendNet,
+                    flow,
+                    run,
+                );
+            }
+            ScmsMsg::CrlPublishTimer => {
+                self.crlg.publish_armed = false;
+                Self::sign(out, 1);
+                let entries = u32::try_from(self.crlg.entries.len()).unwrap_or(u32::MAX);
                 out.send(
                     n.crl_store,
                     ScmsMsg::CrlPublish { entries },

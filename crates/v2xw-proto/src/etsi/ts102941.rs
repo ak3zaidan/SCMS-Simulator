@@ -8,7 +8,7 @@ use v2xw_core::card::{
 };
 use v2xw_core::ids::NodeId;
 use v2xw_core::model::Model;
-use v2xw_core::time::Duration;
+use v2xw_core::time::{Duration, SimTime};
 use v2xw_sec::primitive::profiles;
 
 use crate::error::Result;
@@ -122,6 +122,12 @@ pub struct EtsiParams {
     /// Whether the Misbehaviour Authority runs the optional pre-processing stage of
     /// TS 103 759 §4 before collection.
     pub report_pre_processing: bool,
+    /// Whether the authority decides on the first report it collects.
+    ///
+    /// Set by default, which is this crate's own scope boundary (the decision belongs to
+    /// the `MaPipeline` family). A driver that runs a pipeline clears it and hands the
+    /// pipeline's decision in with [`EtsiRun::decide_block`].
+    pub decide_on_report: bool,
     /// How long a trust list is valid for: the `nextUpdate` horizon.
     pub ctl_validity: Duration,
     /// Backend servers per entity.
@@ -156,6 +162,7 @@ impl Default for EtsiParams {
             ca_crl_entries: 1,
             report_payload_bytes: 1_200,
             report_pre_processing: true,
+            decide_on_report: true,
             // "update cadence <= 3 months, stations updated within 1 week" [EUCP §2.2,
             // via 05-protocols.md §2.6]. Three months is the horizon; the week is the
             // station's obligation and not the list's validity.
@@ -320,6 +327,11 @@ pub enum Ts102941Msg {
     ReportPreProcessed {
         /// The reporter.
         station: NodeId,
+        /// The subject.
+        subject: NodeId,
+    },
+    /// MA → MA: a decision the authority's pipeline took, carried out.
+    MaDecision {
         /// The subject.
         subject: NodeId,
     },
@@ -1237,6 +1249,138 @@ impl EtsiRun {
         run
     }
 
+    /// A station on the road: enrolled, holding `tickets` authorization tickets, before
+    /// the run.
+    ///
+    /// The standard authorization flow carries no per-ticket state in this skeleton (the
+    /// EA keeps its enrolment set and blocklist, the AA its count), so the pre-run pool is
+    /// that state set directly, and the run's clock and logs are untouched.
+    pub fn preload(&mut self, station: NodeId, tickets: u32) {
+        if !self.tickets.contains_key(&station) {
+            self.add_station(station);
+        }
+        self.enrolled.insert(station);
+        *self.tickets.entry(station).or_insert(0) += tickets;
+    }
+
+    /// Replaces the link `station` reaches the EA, the AA, the CPOC and the MA over — the
+    /// access the driver models (cellular Uu, or a roadside unit's relay and backhaul).
+    pub fn set_access(&mut self, station: NodeId, link: Link) {
+        let (ea, aa, cpoc, ma) = (self.nodes.ea, self.nodes.aa, self.nodes.cpoc, self.nodes.ma);
+        let net = self.kernel.net_mut();
+        for peer in [ea, aa, cpoc, ma] {
+            net.connect(station, peer, link);
+        }
+    }
+
+    /// Starts the standard authorization flow at `at` (never before the kernel's clock).
+    pub fn authorize_at(&mut self, station: NodeId, at: SimTime) -> FlowRun {
+        let run = self.new_run();
+        let at = at.max(self.kernel.now());
+        self.kernel.inject_at(
+            at,
+            Delivery {
+                at,
+                from: station,
+                to: station,
+                msg: Ts102941Msg::AuthorizationRequest { station },
+                flow: FlowId::EtsiAuthorization,
+                run,
+            },
+        );
+        run
+    }
+
+    /// A misbehaviour report whose access leg the caller carried, arriving at the
+    /// Misbehaviour Authority at `arrive_at`: the device stages are stamped at the caller's
+    /// instants and the leg is logged under the transport it used.
+    #[allow(clippy::too_many_arguments)]
+    pub fn report_at_ma(
+        &mut self,
+        reporter: NodeId,
+        subject: NodeId,
+        detected_at: SimTime,
+        sent_at: SimTime,
+        arrive_at: SimTime,
+        transport: Transport,
+        bytes: u32,
+    ) -> FlowRun {
+        let run = self.new_run();
+        let flow = FlowId::EtsiMisbehaviourReport;
+        for (stage, t) in [(StageId::Detect, detected_at), (StageId::ReportSent, sent_at)] {
+            self.kernel.stages.push(crate::stage::StageStamp {
+                t,
+                run,
+                flow,
+                stage,
+                node: Some(reporter),
+                size: None,
+            });
+        }
+        let ma = self.nodes.ma;
+        self.kernel.steps.push(crate::stage::WireStep {
+            t: sent_at,
+            from: reporter,
+            to: ma,
+            flow,
+            run,
+            step: "etsi-misbehaviour-report",
+            bytes,
+            transport,
+        });
+        self.kernel.inject_at(
+            arrive_at,
+            Delivery {
+                at: arrive_at,
+                from: reporter,
+                to: ma,
+                msg: Ts102941Msg::MisbehaviourReport {
+                    station: reporter,
+                    subject,
+                },
+                flow,
+                run,
+            },
+        );
+        run
+    }
+
+    /// Carries out the authority pipeline's decision to block `subject`: the MA signs
+    /// the decision and the EA blocklists the enrolment credential (the passive
+    /// revocation of TS 102 941 §6.1.6).
+    pub fn decide_block(&mut self, subject: NodeId, at: SimTime) -> FlowRun {
+        let run = self.new_run();
+        let ma = self.nodes.ma;
+        let at = at.max(self.kernel.now());
+        self.kernel.inject_at(
+            at,
+            Delivery {
+                at,
+                from: ma,
+                to: ma,
+                msg: Ts102941Msg::MaDecision { subject },
+                flow: FlowId::EtsiMisbehaviourReport,
+                run,
+            },
+        );
+        run
+    }
+
+    /// Runs every delivery due at or before `horizon`, then stops.
+    ///
+    /// # Errors
+    /// Whatever [`Kernel::dispatch`] returns.
+    pub fn run_until(&mut self, horizon: SimTime) -> Result<()> {
+        while let Some(d) = self.kernel.next_delivery_before(horizon) {
+            let profile = self.kernel.profile_of(d.to);
+            let mut out = Outbox::new(profile);
+            let (at, to) = (d.at, d.to);
+            self.handle(d, &mut out);
+            self.kernel.dispatch(at, to, out)?;
+        }
+        Ok(())
+    }
+
     /// How many tickets `station` holds.
     #[must_use]
     pub fn tickets_of(&self, station: NodeId) -> u32 {
@@ -1693,8 +1837,13 @@ impl EtsiRun {
                     );
                 } else {
                     out.stage_at(StageId::ReportReceived, to, None, flow, run);
-                    self.decide(out, subject, to, n.ea, flow, run);
+                    if self.params.decide_on_report {
+                        self.decide(out, subject, to, n.ea, flow, run);
+                    }
                 }
+            }
+            Ts102941Msg::MaDecision { subject } => {
+                self.decide(out, subject, to, n.ea, flow, run);
             }
             Ts102941Msg::ReportPreProcessed { station, subject } => {
                 let _ = station;
@@ -1705,7 +1854,9 @@ impl EtsiRun {
                 verify(out, 1);
                 self.pre_processed += 1;
                 out.stage_at(StageId::ReportReceived, to, None, flow, run);
-                self.decide(out, subject, to, n.ea, flow, run);
+                if self.params.decide_on_report {
+                    self.decide(out, subject, to, n.ea, flow, run);
+                }
             }
             Ts102941Msg::BlockEnrolment { subject } => {
                 verify(out, 1);

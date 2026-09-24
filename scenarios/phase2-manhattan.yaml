@@ -1,35 +1,40 @@
-# Phase 2 vertical slice: two honest vehicles, one that lies, a roadside unit with a
-# backhaul, the CAMP SCMS backend, a misbehaviour report and a revocation that reaches the
-# other vehicle through the roadside.
+# Phase 2 vertical slice: a fleet on the real Manhattan network, one vehicle that lies,
+# roadside units at the signalised intersections of two equipped avenues, the CAMP SCMS
+# backend reached over each vehicle's cellular link, and a revocation that reaches the
+# fleet by cellular download and by roadside broadcast.
 #
 # 10-roadmap.md's Phase 2 is a *path*, not a feature list, and this file is that path:
 #
 #   the liar broadcasts a frozen position
-#     -> an honest vehicle's detector suite fires on the inconsistency
-#     -> it files a misbehaviour report, on the air, as a real frame
-#     -> the roadside unit decodes it and carries it over its backhaul
-#     -> the Misbehaviour Authority holds two reports about two pseudonyms
-#     -> both Linkage Authorities resolve them to one device
-#     -> the CRL Generator issues, the roadside broadcasts
-#     -> the honest vehicles install the entry and stop trusting the liar
+#     -> honest vehicles' detector suites fire on the inconsistency
+#     -> each files a misbehaviour report and uploads it over its cellular modem
+#        (a report is backend traffic: it never goes on the sidelink broadcast unless a
+#        vehicle has no modem and relays through a roadside unit)
+#     -> the Location Obscurer Proxy strips the network identifiers, the RA shuffles
+#     -> the Misbehaviour Authority's persistence gate (threat/ma/legacy-window) sees
+#        sustained evidence from several trusted reporters and decides to revoke
+#     -> the PCA identifies the certificate's request, the RA blocklists the device, both
+#        Linkage Authorities release their seeds, the CRL Generator issues on its cadence
+#     -> the CRL Store publishes; cellular vehicles download it, and the roadside units
+#        with the `crl` role broadcast it
+#     -> every vehicle that installs it stops trusting the liar, and the liar, finding
+#        itself on the list, stops transmitting
 #
 # Run it, and inspect the decomposition, with:
 #
 #     v2xw run scenarios/phase2-manhattan.yaml --out runs/phase2
-#
-# Everything above the threat and protocol layers is `phase1-manhattan.yaml` unchanged, so
-# a difference between the two runs is a difference this file's four new blocks made.
 schema: v2xw/scenario/1
 
 meta:
   name: phase2-manhattan
   description: >-
-    Three equipped vehicles on the real Manhattan network, one of them a ConstPos
-    attacker, with a roadside unit on a mast, the CAMP SCMS backend, the legacy
-    twelve-detector suite on every honest node, and a revocation distributed over the
-    5.9 GHz broadcast path.
+    An equipped fleet on the real Manhattan network, one of them a ConstPos attacker,
+    55 roadside units at the signalised intersections of 5th and 6th Avenues, the CAMP
+    SCMS backend over cellular Uu, the legacy twelve-detector suite on every honest node,
+    the legacy persistence-gated authority, and a revocation distributed by cellular
+    download and roadside broadcast.
   authors: [v2xw]
-  tags: [phase2, manhattan, osm, dsrc, signed, scms, misbehaviour, revocation]
+  tags: [phase2, manhattan, osm, dsrc, signed, scms, misbehaviour, revocation, cellular]
   created: "2026-09-22"
 
 seed: "0xC0FFEE_5EED"
@@ -52,15 +57,11 @@ world:
   highway_preset: urban-us-nyc
   imported_at: "2026-09-18T00:00:00Z"
   buildings:
-    # Off, deliberately, and only for radio obstruction (the buildings are still imported
-    # and drawn). This scenario exercises the revocation *path* with one roadside unit at
-    # (900, 1000), and with building obstruction on, that one mast hears 2 of the 30
-    # reports the detectors file — the rest are behind Midtown towers — so no case
-    # resolves and nothing is revoked (measured: reports_received 2, crls_issued 0; with
-    # obstruction off, 72 and 1). That is the physically right answer for one mast in a
-    # street grid. To run the path with buildings on, put masts at the intersections the
-    # fleet actually drives through.
-    enabled: false
+    # On. Buildings obstruct the sidelink (Sommer), which is what a Midtown street grid
+    # does to 5.9 GHz. The misbehaviour reports no longer depend on it: they are backend
+    # traffic and travel over each vehicle's cellular link, as in a deployment (a single
+    # roadside mast used to hear 2 of 30 reports behind the towers).
+    enabled: true
     keep_holes: true
   terrain:
     dem: null
@@ -70,34 +71,86 @@ actors:
     equipped_fraction: 1.0
     demand:
       kind: mobility/demand/poisson
-      # 200 veh/h over 60 s realises three vehicles under this seed, which is the smallest
-      # fleet the path needs: one to lie, one to detect and report, and one to still be
-      # listening when the revocation arrives. The run report states the count rather than
-      # this file claiming it.
-      rate_veh_per_h: 200.0
+      rate_veh_per_h: 600.0
 
-  # One roadside unit, on a mast in the middle of the box.
+  # Roadside units at every signalised intersection of 5th and 6th Avenues in the
+  # extract, 27th to 55th Street, read off the imported network with
+  #   cargo run -p v2xw-engine --example rsu_sites -- scenarios/phase2-manhattan.yaml \
+  #       "5th Avenue" "6th Avenue"
+  # (one signalised junction on 6th Avenue with no cross street is left out).
   #
-  # `position_m` and not `site`, because an OSM extract carries road geometry and buildings
-  # and *no mast inventory*: the importer produces no infrastructure sites at all, so a
-  # scenario on an imported city says where the mast stands. The coordinates are
-  # world-local ENU metres from the bounding box's south-west corner (build decision D6),
-  # and the 6 m antenna height is added on top of the ground height given here.
+  # The density is the NYC Connected Vehicle Pilot's: its Manhattan roadside units were
+  # installed at signalised intersections along avenue corridors that included 5th and
+  # 6th Avenues (USDOT ITS JPO, NYC CV Pilot deployment documentation). The pilot's exact
+  # intersection list is not in the design set, so "every signalised intersection of the
+  # two avenues inside the box" is this file's reading of it and is stated as such.
   #
-  # 900 m east, 1,000 m north is the middle of the D7 box — 45th to 60th, 8th to Park —
-  # which puts every street in the extract inside the 1 km candidate range.
+  # Each unit relays reports for a vehicle with no modem (`report-forward`), carries
+  # certificate top-ups (`provisioning-proxy`) and broadcasts the CRL it holds (`crl`).
+  # It also verifies what it hears and runs the detector suite: the legacy authority counts
+  # a unit as trusted infrastructure, and its reports go straight onto its backhaul. Its
+  # backhaul is `net.backhaul`'s, and its hardware the default roadside profile
+  # (rsu/commsignia-its-rs4, the one whose datasheet publishes a verification rate).
   rsus:
-    - position_m: [900.0, 1000.0, 0.0]
-      # `report-forward` is what makes the unit carry a misbehaviour report over its
-      # backhaul, and `crl` is what makes it broadcast the revocation. A unit with neither
-      # role hears both and does nothing, which is the point of naming them.
-      roles: [report-forward, crl]
-      profile: rsu/cohda-mk5-rsu
+    - {position_m: [190.4, 7.5, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 27th Street / West 27th Street
+    - {position_m: [228.0, 75.3, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 28th Street / West 28th Street
+    - {position_m: [266.4, 144.5, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 29th Street / West 29th Street
+    - {position_m: [304.8, 213.4, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 30th Street / West 30th Street
+    - {position_m: [342.6, 281.1, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 31st Street / West 31st Street
+    - {position_m: [380.9, 350.0, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 32nd Street / West 32nd Street
+    - {position_m: [419.1, 419.1, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 33rd Street / West 33rd Street
+    - {position_m: [460.7, 494.6, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 34th Street / West 34th Street
+    - {position_m: [500.8, 566.8, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 35th Street / West 35th Street
+    - {position_m: [539.1, 636.1, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 36th Street / West 36th Street
+    - {position_m: [576.4, 704.2, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 37th Street / West 37th Street
+    - {position_m: [614.3, 772.9, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 38th Street / West 38th Street
+    - {position_m: [652.4, 841.9, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 39th Street / West 39th Street
+    - {position_m: [690.6, 911.1, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 40th Street / West 40th Street
+    - {position_m: [728.0, 979.0, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 41st Street
+    - {position_m: [770.3, 1052.8, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 42nd Street / West 42nd Street
+    - {position_m: [811.5, 1128.9, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 43rd Street / West 43rd Street
+    - {position_m: [849.4, 1197.4, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 44th Street / West 44th Street
+    - {position_m: [887.7, 1267.4, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 45th Street / West 45th Street
+    - {position_m: [927.1, 1336.7, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 46th Street / West 46th Street
+    - {position_m: [966.5, 1405.8, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 47th Street / West 47th Street
+    - {position_m: [1004.2, 1475.1, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 48th Street / West 48th Street
+    - {position_m: [1042.0, 1544.6, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 49th Street / West 49th Street
+    - {position_m: [1080.5, 1615.1, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 50th Street / West 50th Street
+    - {position_m: [1119.8, 1685.2, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 51st Street / West 51st Street
+    - {position_m: [1158.0, 1754.5, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 52nd Street / West 52nd Street
+    - {position_m: [1195.6, 1822.1, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 53rd Street / West 53rd Street
+    - {position_m: [1234.8, 1893.1, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 54th Street / West 54th Street
+    - {position_m: [1273.1, 1962.9, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 5th Avenue / East 55th Street / West 55th Street
+    - {position_m: [731.3, 1626.3, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / News Corp. Plaza / West 48th Street
+    - {position_m: [-5.7, 296.0, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 29th Street
+    - {position_m: [32.3, 363.9, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 30th Street
+    - {position_m: [71.2, 432.6, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 31st Street
+    - {position_m: [110.2, 500.6, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 32nd Street
+    - {position_m: [149.0, 568.8, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 33rd Street
+    - {position_m: [190.3, 644.2, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 34th Street
+    - {position_m: [229.1, 717.1, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 35th Street
+    - {position_m: [267.9, 786.5, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 36th Street
+    - {position_m: [304.1, 855.1, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 37th Street
+    - {position_m: [342.3, 923.6, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 38th Street
+    - {position_m: [381.5, 993.2, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 39th Street
+    - {position_m: [418.9, 1061.5, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 40th Street
+    - {position_m: [456.4, 1130.1, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 41st Street
+    - {position_m: [496.8, 1204.0, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 42nd Street
+    - {position_m: [538.5, 1278.8, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 43rd Street
+    - {position_m: [577.2, 1348.4, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 44th Street
+    - {position_m: [615.6, 1418.2, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 45th Street
+    - {position_m: [654.3, 1487.0, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 46th Street
+    - {position_m: [692.8, 1556.5, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 47th Street
+    - {position_m: [770.0, 1696.2, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 49th Street
+    - {position_m: [809.3, 1766.9, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 50th Street
+    - {position_m: [846.9, 1835.1, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 51st Street
+    - {position_m: [885.8, 1905.2, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 52nd Street
+    - {position_m: [923.7, 1973.8, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 53rd Street
+    - {position_m: [962.1, 2043.2, 0.0], roles: [report-forward, crl, provisioning-proxy]}   # 6th Avenue / West 54th Street
 
   backend:
-    # The CAMP SCMS of 05-protocols.md (`v2xw_proto::CAMP_SCMS_ID`): eleven entities, butterfly key expansion, two
-    # Linkage Authorities, and the linkage-value CRL. `v2xw-proto` is the deployment; this
-    # line selects it.
+    # The CAMP SCMS of 05-protocols.md: the online roles, butterfly key expansion, two
+    # Linkage Authorities and the linkage-value CRL.
     protocol: protocol/scms/camp
     entities:
       ra: {}
@@ -122,6 +175,20 @@ radio:
 
 net:
   layer: wsmp
+  # Every vehicle has a cellular modem (the connected-vehicle TCU): the cell-capacity Uu
+  # model at the 500 m urban-macro inter-site distance of TR 37.885, with the internet leg
+  # from the operator's core to the backend added (Narayanan et al. WWW'20).
+  uu:
+    id: cellular/uu/cell-capacity-mm1
+    params:
+      isd_m: 500
+      penetration: 1.0
+  # The roadside units' wired backhaul.
+  backhaul:
+    id: backhaul/fixed
+    params:
+      latency_ms: 10
+      capacity_mbps: 1000
 
 messages:
   sets: [bsm]
@@ -131,27 +198,31 @@ security:
   envelope: ieee1609.2
   signature: ecdsa-p256
   crypto_mode: modeled
-  # `verify-all`, which is what 10-roadmap.md's Phase 2 scope names. It is not a stylistic
-  # choice: a detector only sees what the node's verification policy delivered, and
-  # `prioritized` skips a sender beyond its range — so a liar 400 m away would never be
-  # checked and the run would report "no misbehaviour" for a reason that has nothing to do
-  # with misbehaviour.
+  # The credential lifecycle. Every cited default stays (a one-week i-period, 20
+  # certificates per period, a lifetime an hour longer than the period) except three
+  # calendar windows, compressed so a five-minute run reaches a revocation at all:
+  #
+  #   report_shuffle_window_s  CAMP-EE SCMS-765: "10,000 reports or one day"      -> 60 s
+  #   crl_cadence_s            daily, the USDOT 2013 working assumption          -> 60 s
+  #   crl_fetch_interval_s     uncited ("on every RA connection", OEM-set)      -> 30 s
+  #
+  # With the cited values the same path takes a day and a half, which is the real
+  # answer for a deployment and the reason revocation-latency.yaml exists.
+  protocol:
+    id: protocol/scms/camp
+    params:
+      report_shuffle_window_s: 60
+      crl_cadence_s: 60
+      crl_fetch_interval_s: 30
   verification_policy: verify-all
   signer_id_policy:
     full_cert_every_ms: 1000
     digest_otherwise: true
   pseudonym_change:
+    # The J2945/1 CERTCHG interval. The authority decides on evidence about one
+    # certificate, so the path no longer needs a rotation inside the run.
     strategy: time
-    # Ten seconds, not the J2945/1 five minutes, and this is the one number in this file
-    # that exists to make the path *reachable* rather than to model a deployment.
-    #
-    # The Misbehaviour Authority resolves a device by correlating **two** reports about
-    # **two different pseudonyms** — that is the whole reason the resolution asks two
-    # Linkage Authorities anything. A vehicle that keeps one pseudonym for the whole run
-    # is reported once, the authority holds one report, and no case is ever opened. Ten
-    # seconds puts both of the device's provisioned certificates on the air inside a
-    # sixty-second run. A deployment study sets it back to 300 and runs for longer.
-    period_s: 10.0
+    period_s: 300.0
 
 nodes:
   default_obu: obu/unex-obu-301-craton2
@@ -161,30 +232,21 @@ nodes:
 threats:
   attackers:
     # The legacy ConstPos attacker: it freezes its claimed position at the first instant it
-    # acts and keeps broadcasting it while it drives away. It is the simplest falsification
-    # in the ported catalog and the one the legacy suite's consistency checks are
-    # calibrated on, which makes it the right first attacker for a path test — a detector
-    # that cannot catch ConstPos cannot catch anything.
+    # acts and keeps broadcasting it while it drives away.
     - id: threat/attacker/legacy/ConstPos
-      # The first vehicle, counted over vehicles and not over nodes: the roadside unit is a
-      # node too, and it is created first.
       count: 1
       schedule:
-        # Five seconds of honest behaviour first, so the detectors have a motion reference
-        # to find the claim inconsistent *with*. A liar that lies from its first message is
-        # a vehicle with no history, which is a different (and easier) detection problem.
         from_s: 5.0
         to_s: 300.0
 
 detection:
   local:
-    # The ported twelve-detector suite, with the legacy thresholds. It runs on every node
-    # that is not an attacker, sees only what that node's own runtime delivered to its
-    # applications, and has no world argument — invariant I-T2 expressed as a signature.
     - id: detect/legacy-12
+  # The legacy authority's persistence gate at its legacy operating point: 3 trusted
+  # reporters, reports in 4 distinct seconds spanning 3 s inside a 15 s window.
+  ma:
+    id: threat/ma/legacy-window
 
-# `all` rather than `[pdr]`: a Phase 2 run is measured on the revocation latency
-# decomposition as well as on the air interface.
 metrics: [all]
 
 exporters: []

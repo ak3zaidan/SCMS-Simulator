@@ -1040,6 +1040,13 @@ fn catalogue() -> Registry {
             let _ = registry.register(card);
         }
     }
+    // The backend-connectivity and authority models the security path selects
+    // (`net.uu`, `net.backhaul`, `detection.ma`), so their slots offer them.
+    for card in crate::backend::catalogue_cards() {
+        if !registry.contains(&card.id) {
+            let _ = registry.register(card);
+        }
+    }
     let _ = v2xw_proto::register_all(&mut registry);
     // The security crate's registration takes a civil clock because a certificate has a
     // validity window. The schema's own default `time.t0` is used, so the catalogue is a

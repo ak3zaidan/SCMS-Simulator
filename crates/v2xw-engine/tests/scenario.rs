@@ -369,6 +369,8 @@ fn the_shipped_scenarios_still_validate() {
         "phase1-grid.yaml",
         "phase1-manhattan.yaml",
         "phase2-manhattan.yaml",
+        "pseudonym-privacy.yaml",
+        "revocation-latency.yaml",
     ] {
         let path = repo.join(name);
         if !path.exists() {

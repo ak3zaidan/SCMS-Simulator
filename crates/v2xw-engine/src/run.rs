@@ -172,12 +172,13 @@ const MAX_GRANTS_PER_TIMER: u32 = 8;
 /// estimate, so it is a belief and not a ground-truth density (invariant I-C2).
 const J2945_DENSITY_RADIUS_M: f64 = 100.0;
 
-/// Where a backhaul transfer's byte-accounting id starts.
+/// Where a backend transfer's byte-accounting id starts.
 ///
 /// Invariant I-N1 checks that no id is attributed to two buckets, and a `node.tx` record's
-/// id is its frame number. Backhaul SDUs are numbered by their own counter, so they are
-/// placed in a range no frame number reaches (2^40 frames is decades at any fleet size).
-const BACKHAUL_ID_BASE: u64 = 1 << 40;
+/// id is its frame number. Backend transfers — backhaul, cellular, backend network — are
+/// numbered by their own counter, so they are placed in a range no frame number reaches
+/// (2^41 frames is decades at any fleet size).
+const BACKEND_BYTES_ID_BASE: u64 = 1 << 41;
 
 /// One node's MAC counters since its last `mac.cbr` report.
 #[derive(Debug, Clone, Copy, Default)]
@@ -203,6 +204,31 @@ struct ReportJourney {
     t_tx_start: SimTime,
     t_tx_end: SimTime,
     t_arrival: SimTime,
+}
+
+/// Something in flight to or from the backend, by the SDU id its [`Event::NetDeliver`]
+/// carries.
+#[derive(Debug, Clone)]
+enum Transfer {
+    /// A misbehaviour report on its way to the Location Obscurer Proxy.
+    Report {
+        reporter: NodeId,
+        report: Box<v2xw_threat::MisbehaviourReport>,
+        /// The unit that relayed it, for a relayed report.
+        via: Option<NodeId>,
+        /// The air hop's stamps, for a relayed report.
+        journey: Option<ReportJourney>,
+        detected_at: SimTime,
+        sent_at: SimTime,
+        transport: v2xw_proto::Transport,
+    },
+    /// A CRL download over a vehicle's cellular downlink.
+    Crl {
+        node: NodeId,
+        version: u32,
+        entries: Vec<v2xw_sec::linkage::CrlLinkageEntry>,
+        requested_at: SimTime,
+    },
 }
 
 /// What one run produced.
@@ -516,8 +542,9 @@ struct FrameState {
 enum AppPayload {
     /// A misbehaviour report on its way to a roadside unit that forwards it.
     Report(Box<v2xw_threat::MisbehaviourReport>),
-    /// A certificate revocation list broadcast by the roadside.
-    Crl(Box<v2xw_sec::linkage::CrlLinkageEntry>),
+    /// A certificate revocation list broadcast by the roadside: the list's version (its
+    /// entry count) and the entries this frame carries.
+    Crl(Box<(u32, Vec<v2xw_sec::linkage::CrlLinkageEntry>)>),
 }
 
 impl FrameState {
@@ -595,19 +622,15 @@ pub struct Engine {
     /// The roadside units' positions. They are nodes but not actors, so they are not in
     /// the mobility snapshot and the reception phase has to find them here.
     rsus: BTreeMap<NodeId, Vec3>,
-    /// Reports in flight over a backhaul, by the SDU id their [`Event::NetDeliver`]
-    /// carries.
-    backhaul: BTreeMap<
-        v2xw_core::ids::SduId,
-        (
-            NodeId,
-            Box<v2xw_threat::MisbehaviourReport>,
-            NodeId,
-            ReportJourney,
-        ),
-    >,
-    /// The next backhaul SDU id.
+    /// Backend traffic in flight: reports to the proxy and CRL downloads, by the SDU id
+    /// their [`Event::NetDeliver`] carries.
+    transfers: BTreeMap<v2xw_core::ids::SduId, Transfer>,
+    /// The next backend SDU id.
     next_sdu: u32,
+    /// The next `net.bytes` id for a backend transfer.
+    next_backend_bytes: u64,
+    /// Whether the roadside CRL broadcast timer is running.
+    crl_timer_armed: bool,
     next_node: u32,
     next_frame: u32,
     /// The producer of the normative `Keyframe`/`Delta` stream (vwp-v1 §3.3, §3.4).
@@ -847,6 +870,7 @@ impl Engine {
         let gen_timing = crate::wiring::generation_timing(&scenario);
         crate::wiring::register_generation_timing(&mut registry, gen_timing)?;
         let providers = crate::wiring::build_metrics(&scenario, &mut registry)?;
+        crate::backend::register_used(&scenario, &mut registry)?;
         let manifest = crate::manifest::assemble(&scenario, &world, &registry, build_utc)?;
         // The snapshot stream's cadence is the scenario's mobility step and, by default,
         // a keyframe every simulated second (§3.1.1). A caller recording into a container
@@ -921,8 +945,10 @@ impl Engine {
             pending_tx: BTreeMap::new(),
             phase2: None,
             rsus: BTreeMap::new(),
-            backhaul: BTreeMap::new(),
+            transfers: BTreeMap::new(),
             next_sdu: 0,
+            next_backend_bytes: 0,
+            crl_timer_armed: false,
             next_node: 0,
             next_frame: 0,
             snapshots,
@@ -1171,6 +1197,7 @@ impl Engine {
             self.report.nodes_created += 1;
             if let Some(phase2) = self.phase2.as_mut() {
                 phase2.note_rsu(id);
+                phase2.arm_rsu_detector(id);
             }
         }
     }
@@ -1461,8 +1488,9 @@ impl Engine {
             }
             self.report.end_ns = key.time;
         }
-        if let Some(phase2) = self.phase2.as_ref() {
-            self.report.phase2 = phase2.report().clone();
+        if let Some(phase2) = self.phase2.as_mut() {
+            phase2.finish();
+            self.report.phase2 = phase2.report();
         }
         self.report.sidelink = self.sidelink_report();
         // What the *recorder* says it kept, asked once at the end and never inferred from
@@ -1765,6 +1793,7 @@ impl Engine {
         self.rebuild_snapshot(&update);
         self.declare_jamming(now, step);
         self.update_beliefs(recorder, now);
+        self.on_backend_step(recorder, now, horizon);
 
         self.report.mobility_steps += 1;
 
@@ -1864,7 +1893,8 @@ impl Engine {
                 // store, replacing the stand-in this installs. So the digest → pseudonym
                 // map is filled in `hand_down_app`, at the instant a frame carries one.
                 if let Some(phase2) = self.phase2.as_mut() {
-                    let creds = phase2.provision(id);
+                    let creds = phase2.provision(id, now, &self.rng);
+                    phase2.phase_crl_poll(id, &self.rng, now);
                     if !creds.is_empty() {
                         match runtime.as_obu_mut() {
                             Some(obu) => {
@@ -1933,6 +1963,9 @@ impl Engine {
             if let Some(rec) = self.actors.remove(actor)
                 && let Some(node) = rec.node
             {
+                if let Some(phase2) = self.phase2.as_mut() {
+                    phase2.retire(node);
+                }
                 self.nodes.remove(&node);
                 self.inboxes.remove(&node);
                 self.node_phase.remove(&node);
@@ -2398,6 +2431,16 @@ impl Engine {
         for record in &windows {
             self.emit(recorder, record);
         }
+        if self.phase2.is_some() {
+            let closed: Vec<NodeId> = results
+                .iter()
+                .filter(|(_, outcome, ..)| outcome.telemetry.is_some())
+                .map(|(id, ..)| *id)
+                .collect();
+            for id in closed {
+                self.emit_node_security(recorder, id, now);
+            }
+        }
 
         // Every received frame whose fate the node settled, joined back to its attempt and
         // recorded on `node.rx`, in (node, report) order.
@@ -2417,6 +2460,13 @@ impl Engine {
             for tx in &outcome.transmissions {
                 self.hand_down(*id, tx, now, horizon);
             }
+        }
+
+        // Pseudonym changes, credential starvation and self-revocation, from each node's
+        // own store after its step.
+        if self.phase2.is_some() {
+            let ids: Vec<NodeId> = results.iter().map(|(id, ..)| *id).collect();
+            self.note_security(recorder, &ids, now);
         }
 
         // The local detector suite, over what each node's own runtime delivered to its
@@ -2519,15 +2569,20 @@ impl Engine {
                 provenance,
                 params,
                 phase2,
+                nodes,
                 ..
             } = self;
             let mut null = crate::ctx::NullRecorder::new();
             let mut ctx = EngineCtx::new(
                 scheduler, rng, world, snapshot, provenance, params, &mut null,
             );
+            let reporter = nodes
+                .get(&node)
+                .and_then(|n| n.stores().certs.active())
+                .map(|c| v2xw_core::hash::hex_encode(&c.digest.0[..]));
             phase2
                 .as_mut()
-                .map(|p| p.detect(&mut ctx, node, &me, delivered))
+                .map(|p| p.detect(&mut ctx, node, &me, reporter, delivered))
                 .unwrap_or_default()
         };
         // The node's counters are cumulative, so take the running total rather than
@@ -2541,39 +2596,7 @@ impl Engine {
             r.spdu_signature_failures = r.spdu_signature_failures.max(sig);
         }
         for report in reports {
-            let Some(signer) = self
-                .nodes
-                .get(&node)
-                .and_then(|n| n.stores().certs.active().map(|c| c.digest.clone()))
-            else {
-                continue;
-            };
-            // The report's size on the air is the SCMS deployment's own figure for a
-            // report submission, which is one of the five wire sizes 05-protocols marks
-            // as having no published value and which `v2xw-proto` carries with its
-            // provenance rather than inventing here.
-            let bytes = crate::phase2::report_bytes();
-            // `Transmission::sized`, not a struct literal: the report's size comes from
-            // `v2xw-proto`'s own wire table and nothing builds the octets, which is
-            // exactly the case the constructor exists for — and it is one edit in
-            // `v2xw-node` rather than one here when that struct grows a field.
-            // Generation and signing are both on the node's own clock, as they are for
-            // every frame the node's generator builds.
-            let tx = Transmission::sized(
-                v2xw_msg::MsgType::Mbr,
-                bytes,
-                signer,
-                true,
-                self.signing_cost(node).after(believed),
-                believed,
-            );
-            self.hand_down_app(
-                node,
-                &tx,
-                now,
-                horizon,
-                Some(AppPayload::Report(Box::new(report))),
-            );
+            self.route_report(node, report, now, now, horizon);
         }
     }
 
@@ -2638,6 +2661,16 @@ impl Engine {
             self.report.suppressed_frames += 1;
             return;
         }
+        // `security.signature`: a scheme other than P-256 changes the octets on the air
+        // (`crate::signature`); the SPDU the node built is the P-256 one. Everything below
+        // — padding, fragmentation, the MTU check — sees the resized SPDU.
+        let (tx_bytes, tx_envelope, tx_cert) = crate::signature::resize(
+            &self.scenario.security.signature,
+            tx.bytes,
+            tx.envelope_bytes(),
+            tx.cert_bytes(),
+            tx.full_certificate,
+        );
         // Neither WSMP nor GeoNetworking can split an SDU, so everything that splits one
         // happens here, above the network layer (04-models.md §7.3, `crate::frag`). The
         // SDU the fragmenter sees is the signed message plus the scenario's padding, which
@@ -2652,7 +2685,7 @@ impl Engine {
         } else {
             0
         };
-        let sdu_bytes = tx.bytes.saturating_add(padding);
+        let sdu_bytes = tx_bytes.saturating_add(padding);
         let mtu = self.net.sdu_mtu();
         // Named by the frame index its first frame will take, so an SDU's id and its first
         // frame's are the same number, as they always were for a whole frame.
@@ -2792,6 +2825,39 @@ impl Engine {
             }
         }
         let _ = signature_valid;
+        // The passive privacy observer hears the safety frame as it goes on the air.
+        if matches!(tx.msg_type, v2xw_msg::MsgType::Bsm | v2xw_msg::MsgType::Cam)
+            && let Some(signer) = credential.as_ref().map(|c| crate::phase2::digest_bytes(&c.digest))
+            && self.phase2.is_some()
+        {
+            let confidence = belief.map_or(5.0, |b| b.semi_major_m.max(0.0));
+            let Engine {
+                scheduler,
+                rng,
+                world,
+                snapshot,
+                provenance,
+                params,
+                phase2,
+                ..
+            } = self;
+            let mut null = crate::ctx::NullRecorder::new();
+            let mut ctx = EngineCtx::new(
+                scheduler, rng, world, snapshot, provenance, params, &mut null,
+            );
+            if let Some(p) = phase2.as_mut() {
+                p.observe_frame(
+                    &mut ctx,
+                    signer,
+                    ready,
+                    t_generated,
+                    claim.0,
+                    claim.1,
+                    claim.2,
+                    confidence,
+                );
+            }
+        }
         // The transmit power is congestion control's, not the scenario's: J2945/1 controls
         // power as well as rate, and the SUPRA filter's output is what the link budget has
         // to be evaluated at. With no DCC model (the abstract tier) it is the profile's.
@@ -2817,7 +2883,7 @@ impl Engine {
         // on the payload side and a certificate-cycle fragment on the envelope side.
         let split = tx
             .payload_bytes()
-            .zip(tx.envelope_bytes())
+            .zip(tx_envelope)
             .map(|(p, e)| (p.saturating_add(padding), e.saturating_add(cert_extra)));
         let sidelink = self.sidelink.is_some();
         let frame_layers = |layers: &mut v2xw_net::FrameLayers| {
@@ -2906,8 +2972,7 @@ impl Engine {
             focus_placement: BTreeMap::new(),
             sl: sidelink::SlFrame::default(),
             layers,
-            cert_bytes: tx
-                .cert_bytes()
+            cert_bytes: tx_cert
                 .map(|c| c.saturating_add(cert_extra))
                 .or((cert_extra > 0).then_some(cert_extra)),
             t_generated,
@@ -4132,9 +4197,9 @@ impl Engine {
 
     /// A Phase 2 application message reached a node that decoded it.
     ///
-    /// The two messages the revocation path needs, and what the receiver does with each.
-    /// It is the engine doing an application layer's job; see [`crate::phase2`] for why
-    /// and for what that skips.
+    /// The two messages the engine puts on the air for the security path — a report being
+    /// relayed to a roadside unit, and a roadside CRL broadcast — and what the receiver
+    /// does with each.
     #[allow(clippy::too_many_arguments)]
     fn on_app_message(
         &mut self,
@@ -4148,181 +4213,254 @@ impl Engine {
     ) {
         match app {
             AppPayload::Report(report) => {
-                // Only a unit with the `report-forward` role carries a report onward; a
-                // vehicle that happens to overhear one does nothing with it, which is what
-                // makes the role a decision rather than a label. The question is asked of
-                // **this** unit: asking whether any declared unit carries the role made
-                // the role a property of the scenario instead of the mast.
-                let forwards = self
+                // Only a unit with the `report-forward` role and a backhaul carries a
+                // report onward; a vehicle that overhears one does nothing with it.
+                let Some(backhaul) = self
                     .phase2
                     .as_ref()
-                    .is_some_and(|p| p.rsu_has_role(rx, "report-forward"));
-                if !forwards {
+                    .filter(|p| p.rsu_has_role(rx, "report-forward"))
+                    .and_then(|p| p.rsu_spec_of(rx).map(|s| s.backhaul))
+                    .filter(|b| b.connected)
+                else {
+                    return;
+                };
+                if !self
+                    .phase2
+                    .as_mut()
+                    .is_some_and(|p| p.claim_forward(&report.report_id))
+                {
                     return;
                 }
-                // And it is this unit's backhaul that is paid for, not the first one's.
-                let latency = self
-                    .phase2
-                    .as_ref()
-                    .and_then(|p| p.rsu_spec_of(rx).map(|s| s.backhaul))
-                    .unwrap_or(Duration::ZERO);
-                let at = latency.after(now);
+                let bytes = crate::phase2::report_bytes();
+                let at = backhaul.delay(bytes).after(now);
                 if at > horizon {
                     return;
                 }
                 let sdu = v2xw_core::ids::SduId::new(self.next_sdu);
                 self.next_sdu += 1;
-                self.backhaul.insert(sdu, (tx, report.clone(), rx, journey));
-                // The report's octets cross the unit's backhaul: one transfer in the
-                // backhaul bucket (invariant I-N1), sized as the report was on the air.
-                let bytes = u64::from(crate::phase2::report_bytes());
-                let transfer = NetBytes::new(
-                    now,
-                    BACKHAUL_ID_BASE + u64::from(sdu.index()),
-                    ByteBucket::Backhaul,
-                    bytes,
-                    Some(rx),
+                self.transfers.insert(
+                    sdu,
+                    Transfer::Report {
+                        reporter: tx,
+                        report: report.clone(),
+                        via: Some(rx),
+                        journey: Some(journey),
+                        detected_at: report.detection_time.min(journey.t_generated),
+                        sent_at: journey.t_tx_start,
+                        transport: v2xw_proto::Transport::RsuBackhaul,
+                    },
                 );
-                self.emit(recorder, &transfer);
-                // The report crosses the backhaul as a `NetDeliver` to the Misbehaviour
-                // Authority's host, which is the roadside unit's own node id: the backend
-                // has its own id space (`crate::phase2`) and the engine never mixes them,
-                // so the delivery is addressed to the unit that forwards it.
+                // The backhaul's bytes are booked when the backend logs the hop
+                // (`Phase2::report_at_proxy`), in the backhaul bucket.
                 self.scheduler.schedule(
                     at,
                     EventClass::NetDeliver,
                     Event::NetDeliver { sdu, to: rx },
                 );
             }
-            AppPayload::Crl(entry) => {
-                let Some(runtime) = self.nodes.get_mut(&rx) else {
-                    return;
-                };
-                runtime
-                    .stores_mut()
-                    .crl
-                    .add_linkage_entry((**entry).clone());
-                // A node that finds one of its *own* certificates on the CRL stops
-                // transmitting [CAMP-EE §2.2.10.2]; `CertStore::sweep` does that on the
-                // node's next step, from the gate this has just written.
-                let revoked_here: Vec<v2xw_msg::sec_types::HashedId8> = {
-                    let stores = runtime.stores();
-                    let mine = self
-                        .phase2
-                        .as_ref()
-                        .map(|p| p.creds(rx).to_vec())
-                        .unwrap_or_default();
-                    stores
-                        .certs
-                        .credentials()
-                        .iter()
-                        .filter(|c| {
-                            mine.iter().any(|k| {
-                                k.i == c.i_period
-                                    && k.j == c.j_index
-                                    && stores.crl.store().revokes_linkage_at_period(k.i, k.lv)
-                            })
-                        })
-                        .map(|c| c.digest.clone())
-                        .collect()
-                };
-                for digest in revoked_here {
-                    runtime.stores_mut().crl.revoke_own(&digest);
-                }
-                if let Some(phase2) = self.phase2.as_mut() {
-                    phase2.note_crl_installed();
-                }
+            AppPayload::Crl(list) => {
+                let (version, entries) = (list.0, list.1.clone());
+                self.install_crl_at(recorder, rx, version, &entries, now, false);
             }
         }
     }
 
-    /// A report arrives at the backend over the backhaul.
-    ///
-    /// The backend then runs to quiescence on its own clock and reports the latency of the
-    /// whole revocation; the engine schedules the roadside broadcast for `now + latency`,
-    /// which is how the two clocks are kept apart (see [`crate::phase2`], joint 3).
+    /// A vehicle installs CRL entries it received, and enforces them.
+    fn install_crl_at(
+        &mut self,
+        recorder: &mut dyn RunRecorder,
+        node: NodeId,
+        version: u32,
+        entries: &[v2xw_sec::linkage::CrlLinkageEntry],
+        now: SimTime,
+        cellular: bool,
+    ) {
+        if self.rsus.contains_key(&node) {
+            return;
+        }
+        let Some(phase2) = self.phase2.as_mut() else {
+            return;
+        };
+        let (fresh, records) = phase2.install_crl(node, version, entries, now, cellular);
+        if fresh.is_empty() && records.is_empty() {
+            return;
+        }
+        let own = {
+            let Some(runtime) = self.nodes.get_mut(&node) else {
+                return;
+            };
+            for e in &fresh {
+                runtime.stores_mut().crl.add_linkage_entry(*e);
+            }
+            // A node that finds one of its *own* certificates on the CRL stops
+            // transmitting [CAMP-EE §2.2.10.2]; `CertStore::sweep` does that on the node's
+            // next step, from the gate this has just written.
+            //
+            // A compromised device does not: the rule binds a conforming implementation
+            // that malfunctioned, and an attacker running its own software ignores it. What
+            // protects the fleet from a revoked attacker is every *receiver's* CRL check,
+            // which is why an armed attacker keeps transmitting here and the refused
+            // receptions are counted.
+            let attacker = self.phase2.as_ref().is_some_and(|p| p.is_attacker(node));
+            let revoked: Vec<(u32, u32)> = if attacker {
+                Vec::new()
+            } else {
+                self.phase2
+                    .as_ref()
+                    .map(|p| p.own_revoked(node, &runtime.stores().crl))
+                    .unwrap_or_default()
+            };
+            let digests: Vec<v2xw_msg::sec_types::HashedId8> = runtime
+                .stores()
+                .certs
+                .credentials()
+                .iter()
+                .filter(|c| revoked.contains(&(c.i_period, c.j_index)))
+                .map(|c| c.digest.clone())
+                .collect();
+            for d in &digests {
+                runtime.stores_mut().crl.revoke_own(d);
+            }
+            digests
+        };
+        if !own.is_empty() {
+            if let Some(p) = self.phase2.as_mut() {
+                p.note_self_revoked(node);
+            }
+            for d in own {
+                let rec = crate::sec_records::SecCert::new(
+                    now,
+                    node,
+                    "revoked",
+                    Some(hex_digest(&d.0[..])),
+                    None,
+                );
+                self.emit(recorder, &rec);
+            }
+        }
+        for r in records {
+            self.emit(recorder, &r);
+        }
+    }
+
+    /// Something reached its end of the backend: a report at the privacy proxy, or a CRL
+    /// download at a vehicle.
     fn on_net_deliver(
         &mut self,
         recorder: &mut dyn RunRecorder,
         sdu: v2xw_core::ids::SduId,
-        to: NodeId,
-        horizon: SimTime,
+        _to: NodeId,
+        _horizon: SimTime,
     ) {
         let now = self.scheduler.now();
-        let Some((reporter, report, rsu, journey)) = self.backhaul.remove(&sdu) else {
+        let Some(transfer) = self.transfers.remove(&sdu) else {
             return;
         };
-        // The report's whole journey, vehicle to authority, as one decomposed trace on
-        // `msg.latency`: the first hop is the V2I frame, the second the backhaul. The
-        // backhaul was scheduled from the end of the frame at the unit, so a backhaul
-        // shorter than the propagation delay (a few microseconds) is clamped rather than
-        // made negative.
-        let mut trace = v2xw_metrics::latency::TraceBuilder::new(
-            "mbr",
-            Some("mbr".to_string()),
-            Some(journey.msg),
-            journey.t_generated,
-        );
-        trace
-            .endpoints(Some(reporter), Some(rsu))
-            .to("sign_queue", journey.t_sign_start)
-            .to("sign", journey.t_signed)
-            .to("mac_access", journey.t_tx_start)
-            .to("airtime", journey.t_tx_end)
-            .to("propagation", journey.t_arrival)
-            .hop(1)
-            .to("backhaul", now.max(journey.t_arrival));
-        let trace = trace.finish();
-        self.emit(recorder, &trace);
-        let Some(phase2) = self.phase2.as_mut() else {
-            return;
-        };
-        let Some(revocation) = phase2.on_report_received(*report, reporter) else {
-            return;
-        };
-        let at = revocation.latency.after(now);
-        if at > horizon {
-            // The revocation was issued and the run ends before the backend's own latency
-            // would have put it on the air. Counted, because `crls_issued` without
-            // `crl_broadcasts` otherwise looks exactly like a roadside path that is not
-            // wired up, and those want opposite responses: a longer `time.duration_s`
-            // against a defect in this file.
-            if let Some(phase2) = self.phase2.as_mut() {
-                phase2.note_crl_past_horizon();
+        match transfer {
+            Transfer::Report {
+                reporter,
+                report,
+                via,
+                journey,
+                detected_at,
+                sent_at,
+                transport,
+            } => {
+                // The report's whole journey to the proxy as one decomposed trace on
+                // `msg.latency`.
+                let trace = match journey {
+                    Some(journey) => {
+                        let mut trace = v2xw_metrics::latency::TraceBuilder::new(
+                            "mbr",
+                            Some("mbr".to_string()),
+                            Some(journey.msg),
+                            journey.t_generated,
+                        );
+                        trace
+                            .endpoints(Some(reporter), via)
+                            .to("sign_queue", journey.t_sign_start)
+                            .to("sign", journey.t_signed)
+                            .to("mac_access", journey.t_tx_start)
+                            .to("airtime", journey.t_tx_end)
+                            .to("propagation", journey.t_arrival)
+                            .hop(1)
+                            .to("backhaul", now.max(journey.t_arrival));
+                        trace.finish()
+                    }
+                    None => {
+                        let mut trace = v2xw_metrics::latency::TraceBuilder::new(
+                            "mbr",
+                            Some("mbr".to_string()),
+                            None,
+                            detected_at,
+                        );
+                        trace
+                            .endpoints(Some(reporter), None)
+                            .to("sign", sent_at.max(detected_at))
+                            .to("uu", now.max(sent_at));
+                        trace.finish()
+                    }
+                };
+                self.emit(recorder, &trace);
+                if let Some(phase2) = self.phase2.as_mut() {
+                    phase2.report_at_proxy(*report, reporter, detected_at, sent_at, now, transport);
+                }
             }
-            return;
+            Transfer::Crl {
+                node,
+                version,
+                entries,
+                requested_at,
+            } => {
+                let mut trace = v2xw_metrics::latency::TraceBuilder::new(
+                    "crl-download",
+                    Some("crl".to_string()),
+                    None,
+                    requested_at,
+                );
+                trace.endpoints(None, Some(node)).to("uu", now);
+                let trace = trace.finish();
+                self.emit(recorder, &trace);
+                self.install_crl_at(recorder, node, version, &entries, now, true);
+            }
         }
-        let _ = to;
-        // `FlowTimer` is the class credential and backend protocol timers live at
-        // (02-architecture.md §5.1). Flow 0 step 0 is this run's one revocation.
-        self.scheduler.schedule(
-            at,
-            EventClass::FlowTimer,
-            Event::FlowTimer { flow: 0, step: 0 },
-        );
     }
 
-    /// The roadside puts the CRL on the air.
+    /// The roadside units with the `crl` role put the list they hold on the air, and the
+    /// timer re-arms itself for the next repetition.
     fn on_flow_timer(&mut self, horizon: SimTime) {
         let now = self.scheduler.now();
-        let Some((entry, bytes)) = self
-            .phase2
-            .as_ref()
-            .and_then(|p| p.revocation().map(|r| (r.entry.clone(), r.bytes)))
-        else {
+        self.crl_timer_armed = false;
+        let Some(phase2) = self.phase2.as_ref() else {
             return;
         };
-        // The units that carry the `crl` role, each asked about itself. The predicate
-        // used to ignore the unit it was filtering and ask whether *any* declared unit
-        // carried the role, so a scenario with two masts had the one without the role
-        // broadcast as well — and the counterexample test that says a unit with no `crl`
-        // role puts nothing on the air held only because the shipped scenario declares
-        // exactly one unit.
-        let broadcasters: Vec<NodeId> = self
-            .phase2
-            .as_ref()
-            .map(|p| p.rsus_with_role("crl"))
-            .unwrap_or_default();
+        let (version, entries) = {
+            let (v, e) = phase2.broadcast_crl();
+            (v, e.to_vec())
+        };
+        if version == 0 {
+            return;
+        }
+        let interval = phase2.params().crl_broadcast_interval;
+        // Each unit asked about itself, and only a unit whose backhaul brought it the
+        // list broadcasts it.
+        let broadcasters: Vec<NodeId> = phase2
+            .rsus_with_role("crl")
+            .into_iter()
+            .filter(|n| phase2.rsu_spec_of(*n).is_some_and(|s| s.backhaul.connected))
+            .collect();
+        // Split the list so no frame exceeds the network layer's MTU: `fragmenter/none`
+        // refuses an SDU above it, and a CRL of a few dozen 40-byte entries reaches it.
+        let mtu = self.net.sdu_mtu().saturating_sub(64).max(1);
+        let header = phase2.crl_size(0);
+        let per_entry = phase2.crl_size(1).saturating_sub(header).max(1);
+        let per_frame = (mtu.saturating_sub(header) / per_entry).max(1) as usize;
+        let chunks: Vec<Vec<v2xw_sec::linkage::CrlLinkageEntry>> =
+            entries.chunks(per_frame).map(<[_]>::to_vec).collect();
+        let sizes: Vec<u32> = chunks
+            .iter()
+            .map(|c| phase2.crl_size(c.len() as u32))
+            .collect();
         for rsu in broadcasters {
             let Some(signer) = self
                 .nodes
@@ -4335,28 +4473,618 @@ impl Engine {
                 .nodes
                 .get(&rsu)
                 .map_or(now, |n| n.clock().believed_time(now));
-            let ready_at = self.signing_cost(rsu).after(believed);
-            // Sized from `v2xw-proto`'s CRL wire table; see `run_detectors` for why this
-            // frame carries no encoded octets.
-            let tx = Transmission::sized(
-                v2xw_msg::MsgType::Crl,
-                bytes,
-                signer,
-                true,
-                ready_at,
-                believed,
-            );
-            self.hand_down_app(
-                rsu,
-                &tx,
-                now,
-                horizon,
-                Some(AppPayload::Crl(Box::new(entry.clone()))),
-            );
-            if let Some(phase2) = self.phase2.as_mut() {
-                phase2.note_crl_broadcast();
+            for (chunk, bytes) in chunks.iter().zip(&sizes) {
+                let ready_at = self.signing_cost(rsu).after(believed);
+                let tx = Transmission::sized(
+                    v2xw_msg::MsgType::Crl,
+                    *bytes,
+                    signer.clone(),
+                    true,
+                    ready_at,
+                    believed,
+                );
+                self.hand_down_app(
+                    rsu,
+                    &tx,
+                    now,
+                    horizon,
+                    Some(AppPayload::Crl(Box::new((version, chunk.clone())))),
+                );
+                if let Some(phase2) = self.phase2.as_mut() {
+                    phase2.note_crl_broadcast();
+                }
             }
         }
+        let next = interval.after(now);
+        if next <= horizon {
+            self.crl_timer_armed = true;
+            self.scheduler.schedule(
+                next,
+                EventClass::FlowTimer,
+                Event::FlowTimer { flow: 0, step: 0 },
+            );
+        }
+    }
+
+    /// The backend's share of a mobility step.
+    ///
+    /// Retries held reports, runs the backend in lockstep to `now`, writes what it did,
+    /// installs completed top-ups, starts the roadside CRL broadcast when a list is first
+    /// published, polls the CRL Store for cellular vehicles, starts top-ups for pools
+    /// running low, and moves each vehicle's CRL gate to the current i-period.
+    #[allow(clippy::too_many_lines)]
+    fn on_backend_step(&mut self, recorder: &mut dyn RunRecorder, now: SimTime, horizon: SimTime) {
+        if self.phase2.is_none() {
+            return;
+        }
+        // Where each vehicle is: the modem's coverage and a relay's reach are physics,
+        // so they are evaluated at the true position.
+        let positions: BTreeMap<NodeId, Vec3> = self
+            .actors
+            .values()
+            .filter_map(|a| a.node.map(|n| (n, a.last.pos)))
+            .collect();
+
+        // 1. Reports held for want of connectivity.
+        let held = self
+            .phase2
+            .as_ref()
+            .map(crate::phase2::Phase2::nodes_with_outbox)
+            .unwrap_or_default();
+        for node in held {
+            let reports = self
+                .phase2
+                .as_mut()
+                .map(|p| p.take_outbox(node))
+                .unwrap_or_default();
+            for (report, detected) in reports {
+                self.route_report(node, report, detected, now, horizon);
+            }
+        }
+
+        // 2. The backend, to now.
+        let tick = match self.phase2.as_mut() {
+            Some(p) => p.advance(now),
+            None => return,
+        };
+        for r in &tick.stages {
+            self.emit(recorder, r);
+        }
+        for r in &tick.ma_reports {
+            self.emit(recorder, r);
+        }
+        for r in &tick.ma_decisions {
+            self.emit(recorder, r);
+        }
+        let claims = self
+            .phase2
+            .as_mut()
+            .map(crate::phase2::Phase2::take_link_claims)
+            .unwrap_or_default();
+        for c in &claims {
+            self.emit(recorder, c);
+        }
+        for (t, bucket, bytes, node) in &tick.bytes {
+            self.emit_backend_bytes(recorder, *t, *bucket, *bytes, *node);
+        }
+
+        // 3. Completed top-ups.
+        for (node, creds, bytes) in &tick.installs {
+            if let Some(runtime) = self.nodes.get_mut(node) {
+                for c in creds {
+                    runtime.stores_mut().certs.insert(crate::wiring::provisioned_handle(*node, c));
+                }
+            }
+            let rec = crate::sec_records::SecCert::new(now, *node, "top-up", None, Some(*bytes));
+            self.emit(recorder, &rec);
+        }
+
+        // 4. A newly published list starts the roadside broadcast.
+        if tick.published.is_some() && !self.crl_timer_armed {
+            let lag = self
+                .phase2
+                .as_ref()
+                .and_then(|p| {
+                    p.rsus_with_role("crl")
+                        .into_iter()
+                        .filter_map(|n| p.rsu_spec_of(n).map(|s| s.backhaul))
+                        .filter(|b| b.connected)
+                        .map(|b| b.latency)
+                        .min()
+                })
+                .unwrap_or(Duration::ZERO);
+            let at = lag.after(now).max(now + 1);
+            if at <= horizon {
+                self.crl_timer_armed = true;
+                self.scheduler.schedule(
+                    at,
+                    EventClass::FlowTimer,
+                    Event::FlowTimer { flow: 0, step: 0 },
+                );
+            }
+        }
+
+        // 5. Cellular CRL polls.
+        let polls = self
+            .phase2
+            .as_mut()
+            .map(|p| p.crl_polls_due(now))
+            .unwrap_or_default();
+        for (node, _have) in polls {
+            let pos = positions.get(&node).copied().unwrap_or(Vec3::ZERO);
+            let (version, entries, req, size) = {
+                let Some(p) = self.phase2.as_ref() else { break };
+                let (v, e) = p.published_crl();
+                (v, e.to_vec(), p.crl_request_size(), p.crl_size(v))
+            };
+            let (ul, dl) = {
+                let Engine {
+                    scheduler,
+                    rng,
+                    world,
+                    snapshot,
+                    provenance,
+                    params,
+                    phase2,
+                    ..
+                } = self;
+                let mut null = crate::ctx::NullRecorder::new();
+                let mut ctx = EngineCtx::new(
+                    scheduler, rng, world, snapshot, provenance, params, &mut null,
+                );
+                let access = phase2.as_mut().map(crate::phase2::Phase2::access_mut);
+                match access {
+                    None => break,
+                    Some(a) => {
+                        let ul = a.uu_send(
+                            &mut ctx,
+                            node,
+                            pos,
+                            v2xw_radio::cellular::Direction::Uplink,
+                            req,
+                        );
+                        let dl = if matches!(ul, crate::backend::AccessOutcome::Arrives(_)) {
+                            a.uu_send(
+                                &mut ctx,
+                                node,
+                                pos,
+                                v2xw_radio::cellular::Direction::Downlink,
+                                size,
+                            )
+                        } else {
+                            ul
+                        };
+                        (ul, dl)
+                    }
+                }
+            };
+            match (ul, dl) {
+                (
+                    crate::backend::AccessOutcome::Arrives(t1),
+                    crate::backend::AccessOutcome::Arrives(t2),
+                ) => {
+                    // The request reaches the store at `t1`; the store answers after a
+                    // backend service time, and the list comes back over the downlink,
+                    // whose own delay was drawn with the request (the M/M/1 state at the
+                    // instant of the exchange).
+                    let service = self
+                        .phase2
+                        .as_ref()
+                        .map_or(Duration::ZERO, |p| p.params().scms.backend_overhead);
+                    let at = service.after(t1).saturating_add(t2.saturating_sub(now));
+                    for (bucket, bytes) in [
+                        (ByteBucket::CellularUl, u64::from(req)),
+                        (ByteBucket::CellularDl, u64::from(size)),
+                    ] {
+                        self.emit_backend_bytes(recorder, now, bucket, bytes, Some(node));
+                    }
+                    if at <= horizon {
+                        let sdu = v2xw_core::ids::SduId::new(self.next_sdu);
+                        self.next_sdu += 1;
+                        self.transfers.insert(
+                            sdu,
+                            Transfer::Crl {
+                                node,
+                                version,
+                                entries,
+                                requested_at: now,
+                            },
+                        );
+                        self.scheduler.schedule(
+                            at.max(now + 1),
+                            EventClass::NetDeliver,
+                            Event::NetDeliver { sdu, to: node },
+                        );
+                    } else if let Some(p) = self.phase2.as_mut() {
+                        p.crl_poll_failed(node);
+                    }
+                }
+                _ => {
+                    if let Some(p) = self.phase2.as_mut() {
+                        p.crl_poll_failed(node);
+                    }
+                }
+            }
+        }
+
+        // 6. Top-ups for pools running low.
+        let due = self
+            .phase2
+            .as_mut()
+            .map(|p| p.topups_due(now))
+            .unwrap_or_default();
+        for (node, kind, i) in due {
+            let pos = positions.get(&node).copied().unwrap_or(Vec3::ZERO);
+            let Some(p) = self.phase2.as_mut() else { break };
+            let link = match kind {
+                crate::backend::AccessKind::Cellular => {
+                    if p.access_mut().uu_coverage(pos, now) {
+                        p.access_mut().nominal_link(kind, None)
+                    } else {
+                        None
+                    }
+                }
+                crate::backend::AccessKind::RsuRelay => {
+                    let unit = p.relay_in_range(pos, "provisioning-proxy");
+                    let backhaul = unit.and_then(|u| p.rsu_spec_of(u).map(|s| s.backhaul));
+                    p.access_mut().nominal_link(kind, backhaul)
+                }
+                crate::backend::AccessKind::Offline => None,
+            };
+            if let Some(link) = link {
+                p.start_topup(node, link, i, now);
+            }
+        }
+
+        // 7. Each vehicle's CRL gate follows its own clock across i-periods.
+        let Some(p) = self.phase2.as_ref() else {
+            return;
+        };
+        let lifecycle = *p.params();
+        for (node, runtime) in &mut self.nodes {
+            if self.rsus.contains_key(node) {
+                continue;
+            }
+            let believed = runtime.clock().believed_time(now);
+            let period = lifecycle.period_at(believed);
+            if runtime.stores().crl.current_period() != period {
+                runtime.stores_mut().crl.set_period(period);
+            }
+        }
+    }
+
+    /// Writes one backend transfer's bytes on `net.bytes` and books them to the access
+    /// counters, so the recording and the run report cannot disagree.
+    fn emit_backend_bytes(
+        &mut self,
+        recorder: &mut dyn RunRecorder,
+        t: SimTime,
+        bucket: ByteBucket,
+        bytes: u64,
+        node: Option<NodeId>,
+    ) {
+        let id = BACKEND_BYTES_ID_BASE + self.next_backend_bytes;
+        self.next_backend_bytes += 1;
+        if let Some(p) = self.phase2.as_mut() {
+            p.access_mut().note_bytes(bucket, bytes);
+        }
+        let rec = NetBytes::new(t, id, bucket, bytes, node);
+        self.emit(recorder, &rec);
+    }
+
+    /// Sends one misbehaviour report over the reporter's backend access, or holds it.
+    fn route_report(
+        &mut self,
+        node: NodeId,
+        report: v2xw_threat::MisbehaviourReport,
+        detected_at: SimTime,
+        now: SimTime,
+        horizon: SimTime,
+    ) {
+        // A roadside unit's own report goes straight onto its backhaul: it is wired
+        // infrastructure with no access leg to pay.
+        if let Some(backhaul) = self
+            .phase2
+            .as_ref()
+            .and_then(|p| p.rsu_spec_of(node).map(|s| s.backhaul))
+        {
+            if !backhaul.connected {
+                return;
+            }
+            let sent_at = self.signing_cost(node).after(now);
+            let at = backhaul.delay(crate::phase2::report_bytes()).after(sent_at);
+            if at > horizon {
+                return;
+            }
+            if let Some(p) = self.phase2.as_mut() {
+                p.note_rsu_report();
+            }
+            let sdu = v2xw_core::ids::SduId::new(self.next_sdu);
+            self.next_sdu += 1;
+            self.transfers.insert(
+                sdu,
+                Transfer::Report {
+                    reporter: node,
+                    report: Box::new(report),
+                    via: Some(node),
+                    journey: None,
+                    detected_at,
+                    sent_at,
+                    transport: v2xw_proto::Transport::RsuBackhaul,
+                },
+            );
+            self.scheduler.schedule(
+                at,
+                EventClass::NetDeliver,
+                Event::NetDeliver { sdu, to: node },
+            );
+            return;
+        }
+        let Some(kind) = self.phase2.as_ref().map(|p| p.access_kind(node)) else {
+            return;
+        };
+        let pos = self
+            .actors
+            .values()
+            .find(|a| a.node == Some(node))
+            .map_or(Vec3::ZERO, |a| a.last.pos);
+        let bytes = crate::phase2::report_bytes();
+        let sign = self.signing_cost(node);
+        match kind {
+            crate::backend::AccessKind::Cellular => {
+                let outcome = {
+                    let Engine {
+                        scheduler,
+                        rng,
+                        world,
+                        snapshot,
+                        provenance,
+                        params,
+                        phase2,
+                        ..
+                    } = self;
+                    let mut null = crate::ctx::NullRecorder::new();
+                    let mut ctx = EngineCtx::new(
+                        scheduler, rng, world, snapshot, provenance, params, &mut null,
+                    );
+                    let Some(p) = phase2.as_mut() else { return };
+                    p.access_mut().uu_send(
+                        &mut ctx,
+                        node,
+                        pos,
+                        v2xw_radio::cellular::Direction::Uplink,
+                        bytes,
+                    )
+                };
+                match outcome {
+                    crate::backend::AccessOutcome::Arrives(t) => {
+                        // The report is signed and encrypted to the MA before it leaves.
+                        let sent_at = sign.after(now);
+                        let at = sign.after(t).max(now + 1);
+                        if at > horizon {
+                            if let Some(p) = self.phase2.as_mut() {
+                                p.hold_report(node, report, detected_at);
+                            }
+                            return;
+                        }
+                        if let Some(p) = self.phase2.as_mut() {
+                            p.note_upload(node, kind);
+                        }
+                        let sdu = v2xw_core::ids::SduId::new(self.next_sdu);
+                        self.next_sdu += 1;
+                        self.transfers.insert(
+                            sdu,
+                            Transfer::Report {
+                                reporter: node,
+                                report: Box::new(report),
+                                via: None,
+                                journey: None,
+                                detected_at,
+                                sent_at,
+                                transport: v2xw_proto::Transport::CellularUu,
+                            },
+                        );
+                        self.scheduler.schedule(
+                            at,
+                            EventClass::NetDeliver,
+                            Event::NetDeliver { sdu, to: node },
+                        );
+                    }
+                    crate::backend::AccessOutcome::Lost => {
+                        if let Some(p) = self.phase2.as_mut() {
+                            p.note_report_lost();
+                        }
+                    }
+                    crate::backend::AccessOutcome::NoCoverage => {
+                        // No serving cell: a roadside unit in range relays it, or it waits.
+                        if let Some(report) = self.relay_report(node, report, pos, now, horizon)
+                            && let Some(p) = self.phase2.as_mut()
+                        {
+                            p.hold_report(node, report, detected_at);
+                        }
+                    }
+                }
+            }
+            crate::backend::AccessKind::RsuRelay => {
+                if let Some(report) = self.relay_report(node, report, pos, now, horizon) {
+                    if let Some(p) = self.phase2.as_mut() {
+                        p.hold_report(node, report, detected_at);
+                    }
+                }
+            }
+            crate::backend::AccessKind::Offline => {
+                if let Some(p) = self.phase2.as_mut() {
+                    p.hold_report(node, report, detected_at);
+                }
+            }
+        }
+    }
+
+    /// Puts a report on the air to a relaying roadside unit in range, returning it when
+    /// there is none (or the vehicle cannot sign), so the caller holds it.
+    ///
+    /// A device uses whatever IP connectivity it has (05-protocols.md §3.2, "Uu or RSU
+    /// backhaul"): a vehicle with no modem relays, and one whose modem has no serving cell
+    /// relays when a unit is in range.
+    fn relay_report(
+        &mut self,
+        node: NodeId,
+        report: v2xw_threat::MisbehaviourReport,
+        pos: Vec3,
+        now: SimTime,
+        horizon: SimTime,
+    ) -> Option<v2xw_threat::MisbehaviourReport> {
+        let in_range = self
+            .phase2
+            .as_ref()
+            .and_then(|p| p.relay_in_range(pos, "report-forward"))
+            .is_some();
+        if !in_range {
+            return Some(report);
+        }
+        let Some(signer) = self
+            .nodes
+            .get(&node)
+            .and_then(|n| n.stores().certs.active().map(|c| c.digest.clone()))
+        else {
+            return Some(report);
+        };
+        let believed = self
+            .nodes
+            .get(&node)
+            .map_or(now, |n| n.clock().believed_time(now));
+        let tx = Transmission::sized(
+            v2xw_msg::MsgType::Mbr,
+            crate::phase2::report_bytes(),
+            signer,
+            true,
+            self.signing_cost(node).after(believed),
+            believed,
+        );
+        if let Some(p) = self.phase2.as_mut() {
+            p.note_upload(node, crate::backend::AccessKind::RsuRelay);
+        }
+        self.hand_down_app(
+            node,
+            &tx,
+            now,
+            horizon,
+            Some(AppPayload::Report(Box::new(report))),
+        );
+        None
+    }
+
+    /// After the node phase: each vehicle's pseudonym changes (every identifier together,
+    /// on `sec.cert` and `sec.pseudonym`) and whether it is left unable to sign.
+    fn note_security(&mut self, recorder: &mut dyn RunRecorder, ids: &[NodeId], now: SimTime) {
+        let mut out: Vec<crate::sec_records::SecPseudonymView> = Vec::new();
+        let mut changes: Vec<NodeId> = Vec::new();
+        for id in ids {
+            if self.rsus.contains_key(id) {
+                continue;
+            }
+            let Some(runtime) = self.nodes.get(id) else {
+                continue;
+            };
+            if !runtime.state().transmits() {
+                continue;
+            }
+            let certs = &runtime.stores().certs;
+            let active = certs.active().cloned();
+            let n_changes = certs.changes();
+            let pool_valid = certs
+                .credentials()
+                .iter()
+                .filter(|c| c.is_valid_at(runtime.clock().believed_time(now)))
+                .count() as u32;
+            let digest = active.as_ref().map(|c| crate::phase2::digest_bytes(&c.digest));
+            let Some(p) = self.phase2.as_mut() else {
+                return;
+            };
+            if active.is_none() {
+                p.note_starved(*id);
+            }
+            if let Some(old) = p.note_change(*id, n_changes, digest) {
+                let hex = |d: &[u8]| v2xw_core::hash::hex_encode(d);
+                out.push(crate::sec_records::SecPseudonymView {
+                    t: now,
+                    node: *id,
+                    reason: match (active.is_none(), certs.last_reason()) {
+                        (true, _) => "exhausted".to_string(),
+                        (false, Some(r)) => serde_json::to_value(r)
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_string))
+                            .unwrap_or_else(|| "scheduled".to_string()),
+                        (false, None) => "scheduled".to_string(),
+                    },
+                    old_digest: old.map(|d| hex(&d)),
+                    new_digest: digest.map(|d| hex(&d)),
+                    old_temp_id: old.map(|d| hex(&d[..4])),
+                    new_temp_id: digest.map(|d| hex(&d[..4])),
+                    old_l2: old.map(|d| hex(&crate::phase2::l2_address(&d))),
+                    new_l2: digest.map(|d| hex(&crate::phase2::l2_address(&d))),
+                    i: active.as_ref().map_or(0, |c| c.i_period),
+                    j: active.as_ref().map_or(0, |c| c.j_index),
+                    pool_valid,
+                    changes: n_changes,
+                });
+                changes.push(*id);
+            }
+        }
+        for view in out {
+            let cert = crate::sec_records::SecCert::new(
+                view.t,
+                view.node,
+                "change",
+                view.new_digest.clone(),
+                None,
+            );
+            self.emit(recorder, &cert);
+            let rec = crate::sec_records::SecPseudonym(view);
+            self.emit(recorder, &rec);
+        }
+        let _ = changes;
+    }
+
+    /// One vehicle's security panel row, with its telemetry window.
+    fn emit_node_security(&mut self, recorder: &mut dyn RunRecorder, node: NodeId, now: SimTime) {
+        if self.rsus.contains_key(&node) {
+            return;
+        }
+        let pos = self
+            .actors
+            .values()
+            .find(|a| a.node == Some(node))
+            .map_or(Vec3::ZERO, |a| a.last.pos);
+        let (Some(p), Some(runtime)) = (self.phase2.as_ref(), self.nodes.get(&node)) else {
+            return;
+        };
+        let link_up = match p.access_kind(node) {
+            crate::backend::AccessKind::Cellular => {
+                // `uu_coverage` is a read of the cell plan and takes `&self`.
+                p.uu_coverage(pos, now)
+            }
+            crate::backend::AccessKind::RsuRelay => {
+                p.relay_in_range(pos, "report-forward").is_some()
+                    || p.relay_in_range(pos, "provisioning-proxy").is_some()
+            }
+            crate::backend::AccessKind::Offline => false,
+        };
+        let believed = runtime.clock().believed_time(now);
+        let Some(view) = p.security_view(
+            node,
+            believed,
+            &runtime.stores().certs,
+            p.crl_entries_of(node),
+            link_up,
+        ) else {
+            return;
+        };
+        let rec = crate::sec_records::NodeSecurity(crate::sec_records::NodeSecurityView {
+            t: now,
+            ..view
+        });
+        self.emit(recorder, &rec);
     }
 
     /// One link's received power and distance.

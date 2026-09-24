@@ -153,6 +153,16 @@ pub struct ScmsParams {
     pub report_shuffle_window: Duration,
     /// CRL cadence: daily, the USDOT 2013 working assumption [BRECHT §VI-G].
     pub crl_cadence: Duration,
+    /// Whether the CRL Generator holds a new entry until the next [`Self::crl_cadence`]
+    /// boundary before publishing it.
+    ///
+    /// Clear by default, which publishes on decision: this crate's own flows and tests
+    /// measure the revocation *path*, and a day of calendar wait in every one of them
+    /// would measure the calendar instead. A deployment study sets it — the engine does
+    /// whenever a scenario states a cadence — and the wait then appears as its own
+    /// `issued → published` step of the decomposition, which is where 05-protocols §2.5
+    /// puts it.
+    pub publish_on_cadence: bool,
     /// How long after the acknowledgement the device first polls for a batch.
     pub first_batch_delay: Duration,
     /// How long between polls of a repository that is not ready.
@@ -203,6 +213,7 @@ impl Default for ScmsParams {
             shuffle_window: BatchPolicy::CAMP_SHUFFLE.max_delay,
             report_shuffle_window: BatchPolicy::CAMP_SHUFFLE.max_delay,
             crl_cadence: Duration::from_secs(86_400),
+            publish_on_cadence: false,
             first_batch_delay: Duration::from_secs(60),
             download_poll_interval: Duration::from_secs(60),
             max_download_polls: 64,

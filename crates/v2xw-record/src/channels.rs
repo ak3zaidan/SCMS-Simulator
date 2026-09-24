@@ -194,6 +194,15 @@ pub const CHANNELS: &[ChannelSpec] = &[
         visibility: Visibility::NodeAndGt,
         payload_bytes: None,
     },
+    // One row per node per telemetry window: its certificate pool, current pseudonym,
+    // backend link and revocation state — what a chase view's security panel reads.
+    // A recording and inspector channel, not an `Event` payload.
+    ChannelSpec {
+        name: "node.security",
+        wire_id: None,
+        visibility: Visibility::Node,
+        payload_bytes: None,
+    },
     ChannelSpec {
         name: "node.telemetry",
         wire_id: Some(15),
@@ -228,6 +237,20 @@ pub const CHANNELS: &[ChannelSpec] = &[
         visibility: Visibility::NodeAndGt,
         payload_bytes: Some(48),
     },
+    // A passive observer's claim that two pseudonyms are one vehicle. Whether it was right
+    // is a join a metric provider makes against the vehicles' own `sec.pseudonym` rows.
+    ChannelSpec {
+        name: "privacy.link",
+        wire_id: None,
+        visibility: Visibility::Node,
+        payload_bytes: None,
+    },
+    ChannelSpec {
+        name: "privacy.track",
+        wire_id: None,
+        visibility: Visibility::Node,
+        payload_bytes: None,
+    },
     ChannelSpec {
         name: "proto.msg",
         wire_id: Some(21),
@@ -254,6 +277,14 @@ pub const CHANNELS: &[ChannelSpec] = &[
         wire_id: Some(20),
         visibility: Visibility::Node,
         payload_bytes: Some(40),
+    },
+    // One pseudonym change, with every identifier that changed together (certificate,
+    // temporary ID, link-layer address) before and after.
+    ChannelSpec {
+        name: "sec.pseudonym",
+        wire_id: None,
+        visibility: Visibility::Node,
+        payload_bytes: None,
     },
     ChannelSpec {
         name: "snapshot.delta",

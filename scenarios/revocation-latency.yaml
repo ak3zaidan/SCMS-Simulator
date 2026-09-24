@@ -3,9 +3,10 @@
 #      how much harm does the device do in the meantime?
 # ============================================================================
 #
-# The revocation path end to end: a liar, a detector, a report over the air, a roadside
-# unit's backhaul, the Misbehaviour Authority, two Linkage Authorities resolving two
-# pseudonyms to one device, the CRL Generator, the broadcast, and the receivers installing
+# The revocation path end to end: a liar, a detector, a report over the vehicle's
+# cellular uplink, the RA's shuffle, the Misbehaviour Authority's persistence gate, the
+# PCA and both Linkage Authorities identifying the device, the CRL Generator on its
+# cadence, the cellular download and the roadside broadcast, and the receivers installing
 # the entry.
 #
 #     v2xw experiment run scenarios/revocation-latency.yaml --out runs/revocation
@@ -54,19 +55,17 @@
 #   `exporters: [recording, net-trace]` would be for — and this file cannot ask for those,
 #   because the engine runs no exporter stage and the validator refuses a non-empty list.
 #   Run `v2xw run --record` on a materialised cell to get the recording.
-# * **Cellular CRL distribution.** RQ3 as written sweeps `cellular.uu_model` and RSU
-#   density. This build distributes a CRL over the 5.9 GHz broadcast path from the roadside
-#   unit only; the cellular Uu models exist in `v2xw-radio` and nothing selects them
-#   (`v2xw_engine::wiring` builds no Uu link), so "RSU versus cellular" is not a sweep this
-#   file can run. The single roadside unit's position is a *proxy* for coverage and is
-#   swept as one.
-# * **A daily-versus-continuous revocation cadence.** `revocation.cadence` is not a field
-#   of the scenario schema. The authority's batching windows come from
-#   `ScmsParams::default().quick()`, which shortens the two CAMP batching windows so a
-#   short scenario can reach a revocation at all — a *cited* deployment number replaced by
-#   a run-length accommodation, and the single largest caveat on every latency figure this
-#   file produces. The stage decomposition is what makes it visible: look at the
-#   authority's stage before quoting a total.
+# * **The deployment calendar.** The cited windows — the RA's report shuffle ("10,000
+#   reports or one day", CAMP-EE SCMS-765) and the daily CRL cadence (USDOT's working
+#   assumption, Brecht 2018 §VI-G) — make a revocation take a day and a half, which a
+#   ten-minute run cannot hold. `security.protocol.params` compresses exactly those
+#   windows below (a minute each) and leaves every other cited number alone. Each window is
+#   its own stage of the decomposition (`report_sent → shuffled`, `issued → published`),
+#   so the calendar's contribution can be substituted back analytically; quote a total
+#   only with that substitution made.
+# * **Cellular versus roadside distribution** is a sweep this file can now run
+#   (`net.uu.params.penetration`, `security.protocol.params.crl_fetch_interval_s`, the
+#   units' `crl` role); it is not in the sweep below, which keeps RQ3's two axes.
 #
 # ## Why the sweep is traffic and attacker fraction
 #
@@ -90,10 +89,11 @@ seed: "0xC0FFEE_5EED"
 
 time:
   t0: "2027-03-04T08:00:00Z"
-  # Six hundred seconds. The path has to fit inside the run: onset, a motion history, two
-  # pseudonyms on the air, two reports, the authority's (shortened) batching window, the
-  # issuance, the broadcast and the installation. Ten minutes is enough with the shortened
-  # windows and is not enough with the cited ones — which is the caveat in the header.
+  # Six hundred seconds. The path has to fit inside the run: onset, a motion history,
+  # sustained evidence from several reporters, the RA's (compressed) shuffle, the
+  # investigation, the CRL cadence, and the download or broadcast and installation. Ten
+  # minutes is enough with the compressed windows and not with the cited ones — which is
+  # the caveat in the header.
   duration_s: 600.0
   mobility_step_ms: 100
   des_resolution: 1us
@@ -171,6 +171,12 @@ radio:
 
 net:
   layer: wsmp
+  # Every vehicle reaches the backend over a cellular modem: reports go up and the CRL
+  # comes down over Uu, and the roadside unit broadcasts it as well.
+  uu:
+    id: cellular/uu/cell-capacity-mm1
+    params:
+      isd_m: 500
 
 messages:
   sets: [bsm]
@@ -190,13 +196,17 @@ security:
     digest_otherwise: true
   pseudonym_change:
     strategy: time
-    # Sixty seconds. The authority resolves a device by correlating **two** reports about
-    # **two different pseudonyms** — that is the whole reason the resolution asks two
-    # Linkage Authorities anything — so a device that keeps one pseudonym for the whole run
-    # is reported once, the authority holds one report, and no case is ever opened. Sixty
-    # seconds puts several of the device's provisioned certificates on the air inside a
-    # ten-minute run. A deployment study sets it back to 300 and runs for an hour.
-    period_s: 60.0
+    # The J2945/1 CERTCHG interval. The authority decides on sustained evidence about one
+    # certificate, so the path needs no pseudonym change inside the run.
+    period_s: 300.0
+  # The compressed calendar (see the header): the report shuffle and the CRL cadence at a
+  # minute each, and a cellular CRL poll every 30 s. Everything else is cited.
+  protocol:
+    id: protocol/scms/camp
+    params:
+      report_shuffle_window_s: 60
+      crl_cadence_s: 60
+      crl_fetch_interval_s: 30
 
 nodes:
   default_obu: obu/unex-obu-301-craton2
@@ -218,6 +228,8 @@ threats:
 detection:
   local:
     - id: detect/legacy-12
+  ma:
+    id: threat/ma/legacy-window
 
 metrics: [all]
 exporters: []

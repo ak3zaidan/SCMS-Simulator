@@ -391,7 +391,7 @@ pub static CHOICES: &[Choices] = &[
     choices("security.pseudonym_change.strategy", &STRATEGIES),
     Choices {
         path: "security.signature",
-        values: &["ecdsa-p256"],
+        values: &crate::signature::SIGNATURES,
         narrowed_by: "security.crypto_mode",
         narrowed_when: "real",
         narrowed_to: &REAL_SIGNATURES,
@@ -628,9 +628,12 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     },
     KeyStatus {
         path: "actors.rsus[].backhaul",
-        status: Status::NotImplemented,
-        note: "The backhaul latency in force is a fixed constant from the SCMS \
-               parameters; this id is read by nothing.",
+        status: Status::Wired,
+        note: "This unit's backhaul: 'backhaul/fixed' (net.backhaul's latency and \
+               capacity), 'backhaul/cellular' (the Uu model's one-way latency) or \
+               'backhaul/none' (an isolated unit: it relays nothing and broadcasts no CRL). \
+               A relayed misbehaviour report pays it, byte for byte, in the backhaul \
+               bucket.",
     },
     KeyStatus {
         path: "actors.backend.protocol",
@@ -640,15 +643,18 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     },
     KeyStatus {
         path: "actors.backend.entities",
-        status: Status::NotImplemented,
-        note: "The backend runs on fixed built-in parameters. Per-entity profiles, \
-               service models and network models are read by nothing.",
+        status: Status::Partial,
+        note: "Keyed by CAMP SCMS role (ra, pca, la1, la2, ma, crlg, lop, crl_store, \
+               crl_broadcast, eca, dcm). 'profile' sets the hardware the entity's \
+               cryptography is costed on and 'service_model' its queue ('service/mmc', \
+               the default M/M/c, or 'service/mm1'). 'net' is not read: every entity sits \
+               on net.backend_net.",
     },
     KeyStatus {
         path: "actors.backend.links",
-        status: Status::NotImplemented,
-        note: "Validated as a topology and then ignored: every backend hop uses one \
-               constant latency and no capacity limit.",
+        status: Status::Wired,
+        note: "Overrides the latency and capacity of one link between two backend roles; \
+               every flow crossing it pays the new figures.",
     },
     // --- environment -------------------------------------------------------
     KeyStatus {
@@ -802,18 +808,30 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     },
     KeyStatus {
         path: "net.backhaul",
-        status: Status::NotImplemented,
-        note: "Read by nothing.",
+        status: Status::Wired,
+        note: "The roadside units' default backhaul: 'backhaul/fixed' with latency_ms \
+               (default 10, uncited) and capacity_mbps (default 1000), 'backhaul/cellular' \
+               or 'backhaul/none'.",
     },
     KeyStatus {
         path: "net.uu",
-        status: Status::NotImplemented,
-        note: "Read by nothing: there is no cellular uplink in this build.",
+        status: Status::Wired,
+        note: "Gives vehicles a cellular modem for backend traffic (misbehaviour reports, \
+               CRL downloads, certificate top-ups); safety messages stay on the sidelink. \
+               'cellular/uu/fixed-latency' (params.preset, a measured one-way latency; \
+               default 4g-east-coast), 'cellular/uu/cell-capacity-mm1' (per-cell capacity, \
+               an M/M/1 queue per UE, isd_m, uplink_mbps, downlink_mbps) or \
+               'cellular/uu/handover-outage' (adds handover interruption and loss, \
+               loss_percentile). params.penetration is the share of vehicles with a modem \
+               (default 1); the rest relay through roadside units or are offline. Without \
+               net.uu no vehicle has a modem.",
     },
     KeyStatus {
         path: "net.backend_net",
-        status: Status::NotImplemented,
-        note: "Read by nothing.",
+        status: Status::Wired,
+        note: "The links between backend entities: 'backend-net/fixed' with latency_ms \
+               (default 10) and capacity_mbps (default 1000); both uncited defaults of the \
+               SCMS deployment's card.",
     },
     // --- messages ----------------------------------------------------------
     KeyStatus {
@@ -861,15 +879,32 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     },
     KeyStatus {
         path: "security.protocol",
-        status: Status::NotImplemented,
-        note: "The credential protocol is selected by actors.backend.protocol. This key \
-               is read by nothing.",
+        status: Status::Partial,
+        note: "'protocol/scms/camp' runs the credential lifecycle; its params set \
+               i_period_s (default one week), cert_lifetime_s (the period plus an hour), \
+               certs_per_period (20), pool_periods (2 held at the start), \
+               topup_below_periods (1), cert_shuffle_window_s and report_shuffle_window_s \
+               (one day, CAMP), crl_cadence_s (one day; 0 publishes on decision), \
+               crl_fetch_interval_s (3600, uncited) and crl_broadcast_interval_s (5, \
+               uncited). Vehicles top up over their backend link when the pool runs low \
+               and cannot sign once it is empty. 'protocol/etsi/ts102941' runs the ETSI \
+               ITS PKI: authorization tickets (certs_per_period a period, no linkage), \
+               TS 103 759 reports straight to the MA, and passive revocation only — the \
+               authority's decision blocklists the enrolment credential at the EA, the \
+               vehicle keeps its tickets until they expire and no reception is refused \
+               (TS 102 941 §6.1.4 NOTE 4). It needs security.envelope 'etsi103097'. The \
+               ETSI butterfly authorization and the ECTL/CA-CRL flows are not driven.",
     },
     KeyStatus {
         path: "security.signature",
-        status: Status::NotImplemented,
-        note: "Cross-checked against the crypto mode and then ignored: the primitive is \
-               fixed in the security crate.",
+        status: Status::Partial,
+        note: "ecdsa-p256, ecdsa-brainpoolp256r1, ecdsa-p384, hybrid-falcon512-ecdsa-p256 \
+               and hybrid-mldsa44-ecdsa-p256 change the octets of every signed message and \
+               attached certificate on the air by their published sizes (FIPS 204, \
+               Falcon-512, SEC 1). A hybrid SPDU above the network MTU is refused and \
+               counted until a fragmenter is selected. The node still signs and verifies \
+               with ECDSA P-256, so the post-quantum half's time is not charged; only \
+               ecdsa-p256 runs in real crypto mode.",
     },
     KeyStatus {
         path: "security.crypto_mode",
@@ -937,8 +972,10 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     },
     KeyStatus {
         path: "nodes.backend_tier",
-        status: Status::NotImplemented,
-        note: "Read by nothing.",
+        status: Status::Partial,
+        note: "abstract: backend entities never queue (64 servers, no fixed overhead). \
+               medium and high: each entity is an M/M/c with the deployment's servers and \
+               overhead, and the RA shuffles; high adds nothing over medium yet.",
     },
     // --- threats and detection --------------------------------------------
     KeyStatus {
@@ -948,9 +985,10 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     },
     KeyStatus {
         path: "threats.attackers[].params",
-        status: Status::Partial,
-        note: "Only 'intensity' and 'dt_s' are read; any other key in the object is \
-               silently dropped.",
+        status: Status::Wired,
+        note: "Every key is read or refused: intensity, dt_s, magnitude_scale, dos_burst, \
+               delay_s, expired_cert_lag_s, not_yet_valid_lead_s and each legacy magnitude \
+               by name (const_pos_offset_m, teleport_dx_m, heading_offset_deg, …).",
     },
     KeyStatus {
         path: "threats.jammers",
@@ -965,29 +1003,41 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     },
     KeyStatus {
         path: "threats.compromised_rsus",
-        status: Status::NotImplemented,
-        note: "Read by nothing.",
+        status: Status::Refused,
+        note: "Refused when non-empty: v2xw-threat's CompromisedRsu (drop, delay or forge \
+               what a unit forwards) is not yet driven by the engine's roadside path, so a \
+               list here would change nothing.",
     },
     KeyStatus {
         path: "detection.local",
-        status: Status::Partial,
-        note: "The detector suite is installed by id. Its parameters are not read.",
+        status: Status::Wired,
+        note: "'detect/legacy-12' on every honest vehicle and every roadside unit (a \
+               unit is trusted infrastructure to the authority). params override the suite's \
+               thresholds by name (consistency_threshold_m, heading_threshold_deg, \
+               detector_lag_s, z_threshold, min_consecutive, sybil_min_certs, art_max_m, \
+               max_accel_mps2, stale_max_s, …) and report_interval_s (default 1: a \
+               reporter files about one subject at most once a second).",
     },
     KeyStatus {
         path: "detection.ma",
-        status: Status::NotImplemented,
-        note: "The misbehaviour authority runs on built-in parameters; naming a pipeline \
-               model selects nothing.",
+        status: Status::Wired,
+        note: "'threat/ma/legacy-window', the authority's persistence gate: it revokes \
+               only when report_threshold_k trusted reporters (3) filed in \
+               revoke_min_seconds distinct seconds (4) spanning revoke_persist_s (3 s) \
+               inside revoke_window_s (15 s); defence, reputation_max (40) and \
+               report_budget (30) gate reporters. It runs with or without this key.",
     },
     KeyStatus {
         path: "detection.responder",
-        status: Status::NotImplemented,
-        note: "Read by nothing.",
+        status: Status::Refused,
+        note: "Refused when set: the authority's only response in this build is \
+               revocation through the credential protocol, which detection.ma decides.",
     },
     KeyStatus {
         path: "detection.perception_tier",
-        status: Status::NotImplemented,
-        note: "Read by nothing: there is no perception model in this build.",
+        status: Status::Refused,
+        note: "Refused when set: there is no perception model in this build, so no \
+               detector reads sensor data.",
     },
     // --- measurement -------------------------------------------------------
     KeyStatus {
@@ -1077,8 +1127,111 @@ pub fn validate(s: &Scenario) -> Vec<ScenarioError> {
     metrics_and_exporters(s, &mut e);
     timeline(s, &mut e);
     experiment(s, &mut e);
+    security_backend(s, &mut e);
     unreachable_keys(s, &mut e);
     e
+}
+
+/// The security lifecycle's and the backend's keys, checked by the very functions that
+/// build them (`crate::backend`, `crate::phase2`), so a value the loader accepts is a
+/// value the run can act on and the page hears about a bad one at Apply rather than at
+/// run start.
+fn security_backend(s: &Scenario, e: &mut Vec<ScenarioError>) {
+    let mut take = |r: crate::error::Result<()>| {
+        if let Err(crate::EngineError::Scenario(inner)) = r {
+            e.push(inner);
+        }
+    };
+    take(crate::backend::BackendAccess::from_scenario(s).and_then(|access| {
+        for (i, rsu) in s.actors.rsus.iter().enumerate() {
+            access.backhaul_of(rsu.backhaul.as_deref()).map_err(|_| {
+                crate::EngineError::Scenario(ScenarioError::conflict(
+                    &format!("actors.rsus[{i}].backhaul"),
+                    format!(
+                        "'{}' is not a backhaul model; allowed: {}",
+                        rsu.backhaul.as_deref().unwrap_or(""),
+                        crate::backend::BACKHAUL_MODELS.join(", ")
+                    ),
+                ))
+            })?;
+        }
+        Ok(())
+    }));
+    take(crate::phase2::LifecycleParams::from_scenario(s).map(|_| ()));
+    for (i, a) in s.threats.attackers.iter().enumerate() {
+        if let Some(kind) = a
+            .id
+            .strip_prefix("threat/attacker/legacy/")
+            .and_then(v2xw_threat::AttackKind::parse)
+            && let Err(crate::EngineError::Scenario(ScenarioError::Conflict { field, conflict: why })) =
+                crate::phase2::attacker_params(kind, &a.params)
+        {
+            e.push(conflict(
+                &field.replace("threats.attackers[]", &format!("threats.attackers[{i}]")),
+                why,
+            ));
+        }
+    }
+    if let Some(ma) = &s.detection.ma
+        && ma.id != crate::phase2::MA_LEGACY_WINDOW
+    {
+        e.push(conflict(
+            "detection.ma",
+            format!(
+                "'{}' is not an authority pipeline this build ships; one: {}",
+                ma.id,
+                crate::phase2::MA_LEGACY_WINDOW
+            ),
+        ));
+    }
+    let etsi = s.actors.backend.protocol.as_deref() == Some(crate::phase2::ETSI_PKI)
+        || s
+            .security
+            .protocol
+            .as_ref()
+            .is_some_and(|p| p.id == crate::phase2::ETSI_PKI);
+    if etsi && s.security.envelope != "etsi103097" {
+        e.push(conflict(
+            "security.envelope",
+            format!(
+                "is '{}', and the ETSI ITS PKI issues TS 103 097 certificates and \
+                 authorization tickets; a station on it signs 'etsi103097' envelopes",
+                s.security.envelope
+            ),
+        ));
+    }
+    if !crate::signature::SIGNATURES.contains(&s.security.signature.as_str()) {
+        e.push(conflict(
+            "security.signature",
+            format!(
+                "'{}' is not a signature scheme this build models; allowed: {}",
+                s.security.signature,
+                crate::signature::SIGNATURES.join(", ")
+            ),
+        ));
+    }
+    if !s.threats.compromised_rsus.is_empty() {
+        e.push(conflict(
+            "threats.compromised_rsus",
+            "names roadside units, and v2xw-threat's CompromisedRsu is not driven by the \
+             engine's roadside path yet, so the list would change nothing; leave it empty"
+                .to_string(),
+        ));
+    }
+    if s.detection.responder.is_some() {
+        e.push(conflict(
+            "detection.responder",
+            "is set, and this build's only response to the authority's decision is \
+             revocation through the credential protocol; remove it"
+                .to_string(),
+        ));
+    }
+    if s.detection.perception_tier.is_some() {
+        e.push(conflict(
+            "detection.perception_tier",
+            "is set, and there is no perception model in this build; remove it".to_string(),
+        ));
+    }
 }
 
 /// Keys this build validates, documents and hashes but **cannot act on**.
@@ -1593,7 +1746,9 @@ fn actors(s: &Scenario, e: &mut Vec<ScenarioError>) {
             );
         }
         for (end, name) in [("from", &l.from), ("to", &l.to)] {
-            if !entities.contains(name.as_str()) {
+            if !entities.contains(name.as_str())
+                && !crate::phase2::SCMS_ENTITIES.contains(&name.as_str())
+            {
                 e.push(conflict(
                     &format!("actors.backend.links[{i}].{end}"),
                     format!(
