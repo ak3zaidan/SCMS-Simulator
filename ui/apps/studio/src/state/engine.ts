@@ -835,7 +835,9 @@ export class StudioEngine {
       this.#log(
         "warn",
         "camera",
-        `${mode} needs a vehicle to follow and the stream has none, so the view stayed on the ${applied}. Click a vehicle first.`,
+        mode === "rsu"
+          ? `the rsu view looks from a roadside unit and this run has none, so the view stayed on the ${applied}.`
+          : `${mode} needs a vehicle to follow and the stream has none, so the view stayed on the ${applied}. Click a vehicle first.`,
       );
     }
     this.#applyModeOverlays(applied);
