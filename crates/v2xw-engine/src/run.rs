@@ -3152,11 +3152,21 @@ impl Engine {
             // A node that finds one of its *own* certificates on the CRL stops
             // transmitting [CAMP-EE §2.2.10.2]; `CertStore::sweep` does that on the node's
             // next step, from the gate this has just written.
-            let revoked: Vec<(u32, u32)> = self
-                .phase2
-                .as_ref()
-                .map(|p| p.own_revoked(node, &runtime.stores().crl))
-                .unwrap_or_default();
+            //
+            // A compromised device does not: the rule binds a conforming implementation
+            // that malfunctioned, and an attacker running its own software ignores it. What
+            // protects the fleet from a revoked attacker is every *receiver's* CRL check,
+            // which is why an armed attacker keeps transmitting here and the refused
+            // receptions are counted.
+            let attacker = self.phase2.as_ref().is_some_and(|p| p.is_attacker(node));
+            let revoked: Vec<(u32, u32)> = if attacker {
+                Vec::new()
+            } else {
+                self.phase2
+                    .as_ref()
+                    .map(|p| p.own_revoked(node, &runtime.stores().crl))
+                    .unwrap_or_default()
+            };
             let digests: Vec<v2xw_msg::sec_types::HashedId8> = runtime
                 .stores()
                 .certs

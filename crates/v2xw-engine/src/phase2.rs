@@ -353,6 +353,17 @@ struct Case {
     enforced_first: Option<SimTime>,
 }
 
+/// An ETSI decision carried out as the EA's blocklist.
+#[derive(Debug, Clone)]
+struct Block {
+    subject: NodeId,
+    subject_digest: String,
+    run: FlowRun,
+    detected: SimTime,
+    decided: SimTime,
+    blocked: Option<SimTime>,
+}
+
 /// A report on its way to the authority, keyed by its backend run.
 #[derive(Debug, Clone)]
 struct InFlightReport {
@@ -374,6 +385,8 @@ struct NodeSec {
     next_crl_fetch: SimTime,
     crl_fetch_in_flight: bool,
     topup: Option<FlowRun>,
+    /// ETSI: the ticket count at which the requested top-up is complete.
+    etsi_target: Option<u32>,
     /// The last i-period this vehicle holds certificates for.
     last_period: u32,
     changes_seen: u32,
@@ -493,6 +506,10 @@ pub struct BackendTick {
 /// The Phase 2 state of one run.
 pub struct Phase2 {
     scms: ScmsRun,
+    /// The ETSI ITS PKI, when `security.protocol` selects it; `scms` then carries nothing.
+    etsi: Option<v2xw_proto::etsi::ts102941::EtsiRun>,
+    /// ETSI decisions, carried out as blocklistings.
+    blocks: Vec<Block>,
     params: LifecycleParams,
     access: BackendAccess,
     creds: BTreeMap<NodeId, Vec<ProvisionedCred>>,
@@ -599,17 +616,14 @@ impl Phase2 {
         }
         if let Some(protocol) = &protocol
             && protocol != CAMP_SCMS
+            && protocol != ETSI_PKI
         {
-            let why = if protocol == ETSI_PKI {
-                "the ETSI ITS PKI's flows ship in v2xw-proto (enrolment, authorization, \
-                 ticket download, ECTL and CA-CRL distribution) but are not yet driven by \
-                 the engine, so a run cannot select it"
-            } else {
-                "it is not a credential protocol this build ships"
-            };
             return Err(conflict(
                 "security.protocol",
-                format!("{protocol}: {why}; this build runs {CAMP_SCMS}"),
+                format!(
+                    "{protocol} is not a credential protocol this build ships; \
+                     {CAMP_SCMS} or {ETSI_PKI}"
+                ),
             ));
         }
 
@@ -790,8 +804,23 @@ impl Phase2 {
             scms: scms_params,
             ..params
         };
+        let etsi = if protocol.as_deref() == Some(ETSI_PKI) {
+            let mut ep = v2xw_proto::etsi::ts102941::EtsiParams::default();
+            ep.decide_on_report = false;
+            ep.at_validity = params.scms.cert_lifetime;
+            Some(v2xw_proto::etsi::ts102941::EtsiRun::new(ep).map_err(|e| {
+                conflict(
+                    "security.protocol",
+                    format!("the ETSI deployment refused to start: {e}"),
+                )
+            })?)
+        } else {
+            None
+        };
         Ok(Some(Phase2 {
             scms,
+            etsi,
+            blocks: Vec::new(),
             params,
             access,
             creds: BTreeMap::new(),
@@ -948,6 +977,36 @@ impl Phase2 {
         let kind = self.access.assign(rng, node, relay);
         let device = device_of(node);
         let start = self.params.period_at(now);
+        if let Some(etsi) = self.etsi.as_mut() {
+            // Authorization tickets: `certs_per_period` a week — the C2C-CC profile's 20
+            // parallel tickets [TR 103 415 Table A.2] under the EU policy's cap of 100
+            // [EUCP §7.2.1] — with no linkage value, because nothing ever revokes one
+            // (TS 102 941 §6.1.4 NOTE 4).
+            etsi.preload(device, self.params.jmax * self.params.pool_periods);
+            let out: Vec<ProvisionedCred> = (start..start + self.params.pool_periods)
+                .flat_map(|i| {
+                    let (from, until) = self.params.scms.validity(i);
+                    (0..self.params.jmax).map(move |j| ProvisionedCred {
+                        i,
+                        j,
+                        lv: LinkageValue::new([0u8; 9]),
+                        valid_from: from,
+                        valid_until: until,
+                    })
+                })
+                .collect();
+            self.nodes.insert(
+                node,
+                NodeSec {
+                    access: Some(kind),
+                    last_period: start + self.params.pool_periods.saturating_sub(1),
+                    next_crl_fetch: SimTime::MAX,
+                    ..NodeSec::default()
+                },
+            );
+            self.creds.insert(node, out.clone());
+            return out;
+        }
         if self
             .scms
             .preload(device, start, self.params.pool_periods, self.params.jmax)
@@ -1295,6 +1354,22 @@ impl Phase2 {
         let Some((subject, i, lv)) = self.resolve_subject(&report.subject_cert_digest) else {
             return;
         };
+        if let Some(etsi) = self.etsi.as_mut() {
+            // TS 103 759: the report goes to the MA, signed with the reporter's ticket and
+            // encrypted to the authority — no RA shuffle in the ETSI system.
+            let run = etsi.report_at_ma(
+                device_of(reporter),
+                device_of(subject),
+                detected_at,
+                sent_at,
+                arrive_at,
+                transport,
+                report_bytes(),
+            );
+            self.in_flight
+                .insert(run, InFlightReport { report, subject });
+            return;
+        }
         let run = self.scms.report_at_proxy(
             device_of(reporter),
             i,
@@ -1312,6 +1387,9 @@ impl Phase2 {
     /// Runs the backend to `now` and turns what happened into records and actions.
     #[allow(clippy::too_many_lines)]
     pub fn advance(&mut self, now: SimTime) -> BackendTick {
+        if self.etsi.is_some() {
+            return self.advance_etsi(now);
+        }
         let mut tick = BackendTick::default();
         // Start any queued case the backend can take.
         self.start_cases(now);
@@ -1325,60 +1403,16 @@ impl Phase2 {
             self.stage_cursor = cursor;
             v
         };
-        // The reports the authority received since the last tick, in the order their
-        // evidence was observed: a shuffle releases a batch at one instant, and the
-        // persistence gate dates evidence by observation, not by arrival.
-        let mut arrived: Vec<(SimTime, FlowRun, InFlightReport)> = Vec::new();
-        for s in &stamps {
-            if s.stage == StageId::ReportReceived
-                && let Some(f) = self.in_flight.remove(&s.run)
-            {
-                arrived.push((s.t, s.run, f));
-            }
-        }
-        arrived.sort_by(|a, b| {
-            (a.2.report.detection_time, &a.2.report.report_id)
-                .cmp(&(b.2.report.detection_time, &b.2.report.report_id))
-        });
-        for (t_arrived, run, f) in arrived {
-            {
-                let s = v2xw_proto::stage::StageStamp {
-                    t: t_arrived,
-                    run,
-                    flow: v2xw_proto::stage::FlowId::Report,
-                    stage: StageId::ReportReceived,
-                    node: None,
-                    size: None,
-                };
-                self.report.reports_at_ma += 1;
-                let mut r = f.report;
-                r.ingest_time = s.t;
-                tick.ma_reports.push(v2xw_threat::records::MaReportRecord {
-                    t: s.t,
-                    reporter: r.reporter,
-                    subject: r.subject_cert_digest.clone(),
-                    detector: r.leading_reason().map(str::to_string),
-                });
-                if let Some(MaAction::Revoke { subject }) =
-                    self.ma.ingest_evidence(&r, r.detection_time)
-                {
-                    self.report.ma_revoke_decisions += 1;
-                    tick.ma_decisions.push(v2xw_threat::records::MaDecisionRecord {
-                        t: s.t,
-                        subject: subject.clone(),
-                        decision: "revoke".to_string(),
-                    });
-                    self.queue.push_back(Case {
-                        subject: f.subject,
-                        subject_digest: subject,
-                        report_run: s.run,
-                        runs: None,
-                        entry: None,
-                        stamps_emitted: BTreeSet::new(),
-                        enforced_first: None,
-                    });
-                }
-            }
+        for (subject, subject_digest, report_run, _t) in self.ingest_arrivals(&stamps, &mut tick) {
+            self.queue.push_back(Case {
+                subject,
+                subject_digest,
+                report_run,
+                runs: None,
+                entry: None,
+                stamps_emitted: BTreeSet::new(),
+                enforced_first: None,
+            });
         }
         self.start_cases(now);
         if !self.queue.is_empty() || self.scms.case_open() {
@@ -1506,25 +1540,203 @@ impl Phase2 {
             (new.to_vec(), cursor)
         };
         self.step_cursor = cursor;
-        for s in steps {
-            use v2xw_metrics::channels::ByteBucket;
-            let from_device = s.from.index() >= SCMS_DEVICE_BASE;
-            let node = [s.from, s.to]
-                .into_iter()
-                .find(|n| n.index() >= SCMS_DEVICE_BASE)
-                .map(|n| NodeId::new(n.index() - SCMS_DEVICE_BASE));
-            let bucket = match s.transport {
-                Transport::BackendNet => ByteBucket::Backend,
-                Transport::RsuBackhaul => ByteBucket::Backhaul,
-                Transport::CellularUu if from_device => ByteBucket::CellularUl,
-                Transport::CellularUu => ByteBucket::CellularDl,
-                // The air hop of a relayed exchange is the sidelink's; the engine puts
-                // the relayed reports on it as frames. A backend exchange the kernel
-                // relays end to end over a unit is booked on the backhaul above.
-                _ => continue,
-            };
-            tick.bytes.push((s.t, bucket, u64::from(s.bytes), node));
+        push_bytes(&mut tick, steps);
+        tick
+    }
+
+    /// The reports the authority received in `stamps`, through the persistence gate, in the
+    /// order their evidence was observed (a shuffle releases a batch at one instant, and
+    /// the gate dates evidence by observation, not by arrival). Returns each decision:
+    /// `(subject node, certificate digest, the triggering report's run, the instant)`.
+    fn ingest_arrivals(
+        &mut self,
+        stamps: &[v2xw_proto::stage::StageStamp],
+        tick: &mut BackendTick,
+    ) -> Vec<(NodeId, String, FlowRun, SimTime)> {
+        let mut arrived: Vec<(SimTime, FlowRun, InFlightReport)> = Vec::new();
+        for s in stamps {
+            if s.stage == StageId::ReportReceived
+                && let Some(f) = self.in_flight.remove(&s.run)
+            {
+                arrived.push((s.t, s.run, f));
+            }
         }
+        arrived.sort_by(|a, b| {
+            (a.2.report.detection_time, &a.2.report.report_id)
+                .cmp(&(b.2.report.detection_time, &b.2.report.report_id))
+        });
+        let mut decisions = Vec::new();
+        for (t, run, f) in arrived {
+            self.report.reports_at_ma += 1;
+            let mut r = f.report;
+            r.ingest_time = t;
+            tick.ma_reports.push(v2xw_threat::records::MaReportRecord {
+                t,
+                reporter: r.reporter,
+                subject: r.subject_cert_digest.clone(),
+                detector: r.leading_reason().map(str::to_string),
+            });
+            if let Some(MaAction::Revoke { subject }) = self.ma.ingest_evidence(&r, r.detection_time)
+            {
+                self.report.ma_revoke_decisions += 1;
+                tick.ma_decisions.push(v2xw_threat::records::MaDecisionRecord {
+                    t,
+                    subject: subject.clone(),
+                    decision: "revoke".to_string(),
+                });
+                decisions.push((f.subject, subject, run, t));
+            }
+        }
+        decisions
+    }
+
+    /// The ETSI deployment's share of a step: reports through the gate, a decision
+    /// carried out as the EA's blocklist (passive revocation, TS 102 941 §6.1.6), ticket
+    /// top-ups, and the bytes it moved. There is no per-vehicle revocation list to publish:
+    /// "revocation of authorization tickets is not possible as passive revocation is
+    /// preferred" [TS 102 941 §6.1.4 NOTE 4], so a blocked vehicle keeps signing until its
+    /// last ticket expires, and that instant is the revocation's last stage.
+    fn advance_etsi(&mut self, now: SimTime) -> BackendTick {
+        let mut tick = BackendTick::default();
+        let Some(etsi) = self.etsi.as_mut() else {
+            return tick;
+        };
+        if let Err(e) = etsi.run_until(now) {
+            self.note_backend_error(&e);
+        }
+        let stamps: Vec<v2xw_proto::stage::StageStamp> = {
+            let etsi = self.etsi.as_ref().expect("checked");
+            let (new, cursor) = etsi.kernel.stages_since(self.stage_cursor);
+            let v = new.to_vec();
+            self.stage_cursor = cursor;
+            v
+        };
+        for s in &stamps {
+            if s.stage == StageId::Blocklisted
+                && let Some(b) = self.blocks.iter_mut().find(|b| b.run == s.run && b.blocked.is_none())
+            {
+                b.blocked = Some(s.t);
+                tick.stages.push(crate::sec_records::ProtoRevocation::stage(
+                    s.t,
+                    "blocklisted",
+                    &b.subject_digest,
+                    None,
+                    None,
+                    None,
+                ));
+                let last = self
+                    .creds
+                    .get(&b.subject)
+                    .and_then(|c| c.iter().map(|c| c.valid_until).max())
+                    .unwrap_or(s.t);
+                tick.stages.push(crate::sec_records::ProtoRevocation::stage(
+                    last,
+                    "last_valid_credential_expiry",
+                    &b.subject_digest,
+                    None,
+                    None,
+                    Some(b.subject),
+                ));
+                if self.revocation.is_none() {
+                    let stages = vec![
+                        (StageId::Detect, b.detected),
+                        (StageId::Decision, b.decided),
+                        (StageId::Blocklisted, s.t),
+                        (StageId::LastValidCredentialExpiry, last),
+                    ];
+                    let total = Duration::from_nanos(last.saturating_sub(b.detected));
+                    self.report.revocation_latency_ns = total.as_nanos();
+                    self.report.revocation_stages = stages
+                        .iter()
+                        .map(|(st, t)| (st.as_str().to_string(), t.saturating_sub(b.detected)))
+                        .collect();
+                }
+            }
+        }
+        for (subject, subject_digest, run, t) in self.ingest_arrivals(&stamps, &mut tick) {
+            if self.blocks.iter().any(|b| b.subject == subject) {
+                self.report.decisions_already_covered += 1;
+                continue;
+            }
+            let detected = self
+                .etsi
+                .as_ref()
+                .and_then(|e| e.kernel.stages.at(run, StageId::Detect))
+                .unwrap_or(t);
+            let block_run = self
+                .etsi
+                .as_mut()
+                .expect("checked")
+                .decide_block(device_of(subject), t);
+            self.report.cases_opened += 1;
+            if self.attackers.contains_key(&subject) {
+                self.report.revoked_attackers += 1;
+            } else {
+                self.report.revoked_honest += 1;
+            }
+            for (stage, at) in [("detect", detected), ("decision", t)] {
+                tick.stages.push(crate::sec_records::ProtoRevocation::stage(
+                    at,
+                    stage,
+                    &subject_digest,
+                    None,
+                    None,
+                    None,
+                ));
+            }
+            self.blocks.push(Block {
+                subject,
+                subject_digest,
+                run: block_run,
+                detected,
+                decided: t,
+                blocked: None,
+            });
+        }
+        // Ticket top-ups: a request per ticket, and the batch installs when the AA has
+        // granted them all.
+        let mut finished = Vec::new();
+        for (node, n) in &self.nodes {
+            if let Some(target) = n.etsi_target
+                && self
+                    .etsi
+                    .as_ref()
+                    .is_some_and(|e| e.tickets_of(device_of(*node)) >= target)
+            {
+                finished.push(*node);
+            }
+        }
+        for node in finished {
+            let i = self.nodes.get(&node).map_or(0, |n| n.last_period + 1);
+            let fresh: Vec<ProvisionedCred> = (0..self.params.jmax)
+                .map(|j| {
+                    let (from, until) = self.params.scms.validity(i);
+                    ProvisionedCred {
+                        i,
+                        j,
+                        lv: LinkageValue::new([0u8; 9]),
+                        valid_from: from,
+                        valid_until: until,
+                    }
+                })
+                .collect();
+            if let Some(n) = self.nodes.get_mut(&node) {
+                n.etsi_target = None;
+                n.topup = None;
+                n.last_period = i;
+            }
+            self.report.topups_completed += 1;
+            self.report.certs_topped_up += fresh.len() as u64;
+            self.creds.entry(node).or_default().extend(fresh.iter().copied());
+            tick.installs.push((node, fresh, 0));
+        }
+        let (steps, cursor) = {
+            let etsi = self.etsi.as_ref().expect("checked");
+            let (new, cursor) = etsi.kernel.steps_since(self.step_cursor);
+            (new.to_vec(), cursor)
+        };
+        self.step_cursor = cursor;
+        push_bytes(&mut tick, steps);
         tick
     }
 
@@ -1806,6 +2018,23 @@ impl Phase2 {
     /// Starts one vehicle's top-up over `link`, for period `i`.
     pub fn start_topup(&mut self, node: NodeId, link: v2xw_proto::Link, i: u32, now: SimTime) {
         let device = device_of(node);
+        if let Some(etsi) = self.etsi.as_mut() {
+            // One standard authorization per ticket [TS 102 941 §6.2.3.3]; a blocklisted
+            // station's requests are refused by the EA and its pool runs dry.
+            etsi.set_access(device, link);
+            let target = etsi.tickets_of(device) + self.params.jmax;
+            let mut run = FlowRun(0);
+            for _ in 0..self.params.jmax {
+                run = etsi.authorize_at(device, now);
+            }
+            self.report.topups_started += 1;
+            if let Some(n) = self.nodes.get_mut(&node) {
+                n.topup = Some(run);
+                n.etsi_target = Some(target);
+            }
+            let _ = i;
+            return;
+        }
         self.scms.set_access(device, link);
         let run = self.scms.topup_at(device, now, i, self.params.jmax);
         self.report.topups_started += 1;
@@ -1865,7 +2094,7 @@ impl Phase2 {
         Some(crate::sec_records::NodeSecurityView {
             t,
             node,
-            protocol: CAMP_SCMS.to_string(),
+            protocol: if self.etsi.is_some() { ETSI_PKI } else { CAMP_SCMS }.to_string(),
             pseudonym: active.map(|c| hex(&c.digest.0[..])),
             temp_id: active.map(|c| hex(&c.digest.0[..4])),
             cert_i: active.map(|c| c.i_period),
@@ -2238,6 +2467,27 @@ fn backend_profile(id: &str) -> Option<&'static str> {
     ]
     .into_iter()
     .find(|p| *p == id)
+}
+
+/// The backend's wire steps, in their byte buckets. The sidelink's own bytes are not here:
+/// a relayed report's air hop is a frame on `node.tx` like any other.
+fn push_bytes(tick: &mut BackendTick, steps: Vec<v2xw_proto::stage::WireStep>) {
+    use v2xw_metrics::channels::ByteBucket;
+    for s in steps {
+        let from_device = s.from.index() >= SCMS_DEVICE_BASE;
+        let node = [s.from, s.to]
+            .into_iter()
+            .find(|n| n.index() >= SCMS_DEVICE_BASE)
+            .map(|n| NodeId::new(n.index() - SCMS_DEVICE_BASE));
+        let bucket = match s.transport {
+            Transport::BackendNet => ByteBucket::Backend,
+            Transport::RsuBackhaul => ByteBucket::Backhaul,
+            Transport::CellularUu if from_device => ByteBucket::CellularUl,
+            Transport::CellularUu => ByteBucket::CellularDl,
+            _ => continue,
+        };
+        tick.bytes.push((s.t, bucket, u64::from(s.bytes), node));
+    }
 }
 
 /// The eight bytes of a certificate digest, as this module keys its maps by.

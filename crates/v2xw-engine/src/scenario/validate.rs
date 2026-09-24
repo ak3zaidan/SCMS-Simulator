@@ -703,8 +703,13 @@ pub static KEY_STATUS: &[KeyStatus] = &[
                (one day, CAMP), crl_cadence_s (one day; 0 publishes on decision), \
                crl_fetch_interval_s (3600, uncited) and crl_broadcast_interval_s (5, \
                uncited). Vehicles top up over their backend link when the pool runs low \
-               and cannot sign once it is empty. 'protocol/etsi/ts102941' is refused: its \
-               flows ship in v2xw-proto but the engine does not drive them yet.",
+               and cannot sign once it is empty. 'protocol/etsi/ts102941' runs the ETSI \
+               ITS PKI: authorization tickets (certs_per_period a period, no linkage), \
+               TS 103 759 reports straight to the MA, and passive revocation only — the \
+               authority's decision blocklists the enrolment credential at the EA, the \
+               vehicle keeps its tickets until they expire and no reception is refused \
+               (TS 102 941 §6.1.4 NOTE 4). It needs security.envelope 'etsi103097'. The \
+               ETSI butterfly authorization and the ECTL/CA-CRL flows are not driven.",
     },
     KeyStatus {
         path: "security.signature",
@@ -974,6 +979,22 @@ fn security_backend(s: &Scenario, e: &mut Vec<ScenarioError>) {
                 "'{}' is not an authority pipeline this build ships; one: {}",
                 ma.id,
                 crate::phase2::MA_LEGACY_WINDOW
+            ),
+        ));
+    }
+    let etsi = s.actors.backend.protocol.as_deref() == Some(crate::phase2::ETSI_PKI)
+        || s
+            .security
+            .protocol
+            .as_ref()
+            .is_some_and(|p| p.id == crate::phase2::ETSI_PKI);
+    if etsi && s.security.envelope != "etsi103097" {
+        e.push(conflict(
+            "security.envelope",
+            format!(
+                "is '{}', and the ETSI ITS PKI issues TS 103 097 certificates and \
+                 authorization tickets; a station on it signs 'etsi103097' envelopes",
+                s.security.envelope
             ),
         ));
     }

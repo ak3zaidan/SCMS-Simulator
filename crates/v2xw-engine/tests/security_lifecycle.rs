@@ -309,3 +309,86 @@ fn a_report_goes_over_the_cellular_uplink_not_the_sidelink() {
     );
     assert!(p.access.uu_ul_bytes > 0);
 }
+
+/// The two protocols revoke differently, and the run shows it. Under the CAMP SCMS the
+/// authority's decision becomes a linkage-seed CRL entry that receivers enforce; under the
+/// ETSI ITS PKI there is no per-vehicle list (TS 102 941 §6.1.4 NOTE 4): the EA blocklists
+/// the enrolment credential, the vehicle keeps signing with the tickets it holds, no
+/// reception is refused, and its pool runs dry because the AA stops issuing.
+#[test]
+fn the_etsi_pki_revokes_passively_and_the_scms_actively() {
+    let base = |protocol: &str| {
+        let mut s = grid(90.0, 900.0);
+        s.security.verification_policy = "verify-all".to_string();
+        s.detection.local = vec![ModelChoice::new(v2xw_engine::phase2::LEGACY_12)];
+        s.threats.attackers = vec![v2xw_engine::scenario::schema::Attacker {
+            id: "threat/attacker/legacy/ConstPos".to_string(),
+            count: Some(1),
+            schedule: Some(v2xw_engine::scenario::schema::DilationWindow {
+                from_s: 5.0,
+                to_s: 90.0,
+            }),
+            ..Default::default()
+        }];
+        cellular(&mut s);
+        s.actors.backend.protocol = Some(protocol.to_string());
+        s.security.protocol = Some(ModelChoice {
+            id: protocol.to_string(),
+            params: json!({
+                "i_period_s": 30, "cert_lifetime_s": 31, "certs_per_period": 3,
+                "cert_shuffle_window_s": 1, "first_batch_delay_s": 1,
+                "download_poll_interval_s": 1, "report_shuffle_window_s": 2,
+                "crl_cadence_s": 0, "crl_fetch_interval_s": 2
+            }),
+        });
+        if protocol == v2xw_engine::phase2::ETSI_PKI {
+            s.security.envelope = "etsi103097".to_string();
+        }
+        s
+    };
+    let (scms, _) = run(base(v2xw_engine::phase2::CAMP_SCMS));
+    let (etsi, rec) = run(base(v2xw_engine::phase2::ETSI_PKI));
+    let (a, b) = (&scms.phase2, &etsi.phase2);
+    println!(
+        "SCMS: {} decisions, {} issued, {} installed, {} refused receptions; \
+         ETSI: {} decisions, {} issued, {} refused receptions, {} top-ups started, {} \
+         completed, {} starved vehicles",
+        a.ma_revoke_decisions,
+        a.crls_issued,
+        a.crls_installed,
+        a.revoked_receptions,
+        b.ma_revoke_decisions,
+        b.crls_issued,
+        b.revoked_receptions,
+        b.topups_started,
+        b.topups_completed,
+        b.vehicles_starved
+    );
+    assert_eq!(
+        a.backend_errors + b.backend_errors,
+        0,
+        "{} {}",
+        a.first_backend_error,
+        b.first_backend_error
+    );
+    // On this small grid the attacker has usually driven out of the map by the time the
+    // list is installed, so refused receptions are asserted by the Manhattan path test;
+    // what distinguishes the protocols here is that the SCMS issues a list the fleet
+    // installs and the ETSI PKI issues none.
+    assert!(
+        a.revoked_attackers >= 1 && a.crls_installed > 0,
+        "the SCMS path must issue a list the fleet installs"
+    );
+    assert_eq!(b.crls_installed, 0, "the ETSI PKI installed a revocation list");
+    assert!(b.revoked_attackers >= 1, "the ETSI authority must decide on the attacker");
+    assert_eq!(b.crls_issued, 0, "the ETSI PKI has no per-vehicle revocation list");
+    assert_eq!(b.revoked_receptions, 0, "a passive revocation refused a reception");
+    let stages: BTreeSet<String> = records(&rec, "proto.revocation")
+        .iter()
+        .filter_map(|r| r["stage"].as_str().map(str::to_string))
+        .collect();
+    for s in ["detect", "decision", "blocklisted", "last_valid_credential_expiry"] {
+        assert!(stages.contains(s), "ETSI stage {s} missing: {stages:?}");
+    }
+    assert!(b.topups_completed > 0, "honest ETSI vehicles must top their tickets up");
+}
