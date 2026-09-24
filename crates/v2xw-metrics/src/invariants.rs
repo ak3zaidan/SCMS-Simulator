@@ -1126,6 +1126,451 @@ pub fn check_d9_quantisation(samples: &[MetricSample]) -> InvariantOutcome {
 }
 
 // ---------------------------------------------------------------------------------------
+// The measurement layer's own consistency: M-RX1, M-LAT1, M-BYTE1, M-BYTE2, M-SHARE,
+// M-RANGE
+// ---------------------------------------------------------------------------------------
+
+/// M-RX1's statement.
+pub const M_RX1: &str = "every reception attempt on phy.rx is followed to exactly one \
+                         node.rx fate — delivered, lost with exactly one known cause, or in \
+                         flight at the end of the run — so delivered + lost + in flight = \
+                         attempts, and a PHY loss is the same loss on both channels";
+
+/// M-RX1: `node.rx` accounts for every `phy.rx` attempt exactly once.
+///
+/// Attempts are keyed by `(message id, receiver)`. The check is skipped for a run with no
+/// `node.rx` records, which is a run from before the channel existed rather than a run
+/// that lost them — but a run with `node.rx` and no `phy.rx`, or one where the two counts
+/// differ, is a violation.
+#[must_use]
+pub fn check_m_rx1(ledger: &EventLedger) -> InvariantOutcome {
+    use crate::channels::{RxFate, rx_cause};
+    if ledger.node_rx.is_empty() {
+        return InvariantOutcome::skipped("M-RX1", M_RX1, "no node.rx records");
+    }
+    let mut violations = Vec::new();
+    // (msg, rx) → the PHY's cause, if it lost the frame.
+    let mut phy: BTreeMap<(u64, u32), Option<String>> = BTreeMap::new();
+    let mut phy_unkeyed = 0_u64;
+    for r in &ledger.rx {
+        match r.msg {
+            Some(m) => {
+                let cause = (r.outcome == RxOutcome::Lost).then(|| {
+                    r.all_causes()
+                        .first()
+                        .map_or_else(String::new, |c| (*c).to_string())
+                });
+                if phy.insert((m, r.rx.index()), cause).is_some() {
+                    violations.push(violation(
+                        "M-RX1",
+                        Some(format!("msg {m} at node {}", r.rx.index())),
+                        "phy.rx records the same attempt twice".to_string(),
+                        &[],
+                    ));
+                }
+            }
+            None => phy_unkeyed += 1,
+        }
+    }
+    let (mut delivered, mut lost, mut in_flight) = (0_i64, 0_i64, 0_i64);
+    let mut seen: BTreeMap<(u64, u32), u32> = BTreeMap::new();
+    for v in &ledger.node_rx {
+        let subject = || {
+            Some(format!(
+                "msg {} at node {}",
+                v.msg.map_or_else(|| "?".to_string(), |m| m.to_string()),
+                v.rx.index()
+            ))
+        };
+        match v.outcome {
+            RxFate::Delivered => {
+                delivered += 1;
+                if v.cause.is_some() {
+                    violations.push(violation(
+                        "M-RX1",
+                        subject(),
+                        "a delivered attempt carries a loss cause".to_string(),
+                        &[],
+                    ));
+                }
+            }
+            RxFate::Lost => {
+                lost += 1;
+                match v.cause.as_deref() {
+                    None => violations.push(violation(
+                        "M-RX1",
+                        subject(),
+                        "a lost attempt carries no cause".to_string(),
+                        &[],
+                    )),
+                    Some(c) if !rx_cause::is_known(c) => violations.push(violation(
+                        "M-RX1",
+                        subject(),
+                        format!("the loss cause '{c}' is not in the node.rx vocabulary"),
+                        &[],
+                    )),
+                    Some(_) => {}
+                }
+            }
+            RxFate::InFlight => in_flight += 1,
+        }
+        let Some(m) = v.msg else {
+            violations.push(violation(
+                "M-RX1",
+                subject(),
+                "a node.rx record names no message, so it cannot be matched to its attempt"
+                    .to_string(),
+                &[],
+            ));
+            continue;
+        };
+        *seen.entry((m, v.rx.index())).or_insert(0) += 1;
+        match phy.get(&(m, v.rx.index())) {
+            None => violations.push(violation(
+                "M-RX1",
+                subject(),
+                "a node.rx fate with no phy.rx attempt behind it".to_string(),
+                &[],
+            )),
+            Some(Some(phy_cause)) => {
+                // The PHY lost it, so node.rx must say lost, for the same reason.
+                if v.outcome != RxFate::Lost || v.cause.as_deref() != Some(phy_cause.as_str()) {
+                    violations.push(violation(
+                        "M-RX1",
+                        subject(),
+                        format!(
+                            "the PHY lost this frame to '{phy_cause}', and node.rx says {:?} \
+                             ({:?})",
+                            v.outcome, v.cause
+                        ),
+                        &[],
+                    ));
+                }
+            }
+            Some(None) => {
+                if v.cause.as_deref().is_some_and(rx_cause::is_phy) {
+                    violations.push(violation(
+                        "M-RX1",
+                        subject(),
+                        "the PHY decoded this frame, and node.rx blames the PHY for losing it"
+                            .to_string(),
+                        &[],
+                    ));
+                }
+            }
+        }
+    }
+    for (key, n) in &seen {
+        if *n > 1 {
+            violations.push(violation(
+                "M-RX1",
+                Some(format!("msg {} at node {}", key.0, key.1)),
+                format!("{n} node.rx fates for one attempt"),
+                &[("fates", Number::int(i64::from(*n)))],
+            ));
+        }
+    }
+    let missing = phy.keys().filter(|k| !seen.contains_key(k)).count();
+    let attempts = phy.len() as i64 + phy_unkeyed as i64;
+    if delivered + lost + in_flight != attempts || missing > 0 {
+        violations.push(violation(
+            "M-RX1",
+            None,
+            "delivered + lost + in flight on node.rx is not the attempts on phy.rx".to_string(),
+            &[
+                ("attempts", Number::int(attempts)),
+                ("delivered", Number::int(delivered)),
+                ("in_flight", Number::int(in_flight)),
+                ("lost", Number::int(lost)),
+                ("unmatched_attempts", Number::int(missing as i64)),
+            ],
+        ));
+    }
+    InvariantOutcome {
+        checked: ledger.node_rx.len() as u64,
+        violations,
+        ..InvariantOutcome::passed("M-RX1", M_RX1, 0)
+    }
+}
+
+/// M-LAT1's statement.
+pub const M_LAT1: &str = "every delivered message's stamps run forward in time and its \
+                          latency stages tile the interval from generation to delivery, so \
+                          they sum to the end-to-end latency exactly";
+
+/// M-LAT1: every delivered `node.rx` and every `msg.latency` decomposes exactly.
+#[must_use]
+pub fn check_m_lat1(ledger: &EventLedger) -> InvariantOutcome {
+    use crate::channels::RxFate;
+    let delivered: Vec<&crate::channels::NodeRxView> = ledger
+        .node_rx
+        .iter()
+        .filter(|v| v.outcome == RxFate::Delivered)
+        .collect();
+    if delivered.is_empty() && ledger.latency.is_empty() {
+        return InvariantOutcome::skipped(
+            "M-LAT1",
+            M_LAT1,
+            "no delivered node.rx and no msg.latency records",
+        );
+    }
+    let mut violations = Vec::new();
+    let mut check =
+        |subject: String, trace: Option<crate::latency::LatencyTrace>, e2e: Option<u64>| {
+            let Some(trace) = trace else {
+                violations.push(violation(
+                    "M-LAT1",
+                    Some(subject),
+                    "the delivery's stamps are incomplete or do not close on its delivery \
+                 instant, so its latency cannot be decomposed"
+                        .to_string(),
+                    &[],
+                ));
+                return;
+            };
+            if let Err(defect) = trace.validate() {
+                let numbers: Vec<(&str, Number)> = defect
+                    .instants()
+                    .into_iter()
+                    .map(|(k, t)| (k, Number::int(t as i64)))
+                    .collect();
+                violations.push(violation(
+                    "M-LAT1",
+                    Some(subject),
+                    defect.to_string(),
+                    &numbers,
+                ));
+                return;
+            }
+            let stages: u64 = trace.stage_ns().values().sum();
+            let total = trace.total_ns().unwrap_or(0);
+            if stages != total || e2e.is_some_and(|e| e != total) {
+                violations.push(violation(
+                    "M-LAT1",
+                    Some(subject),
+                    "the stages do not sum to the end-to-end latency".to_string(),
+                    &[
+                        ("stages_ns", Number::int(stages as i64)),
+                        ("total_ns", Number::int(total as i64)),
+                    ],
+                ));
+            }
+        };
+    for v in &delivered {
+        check(
+            format!(
+                "msg {} at node {}",
+                v.msg.map_or_else(|| "?".to_string(), |m| m.to_string()),
+                v.rx.index()
+            ),
+            v.latency_trace(),
+            v.e2e_ns(),
+        );
+    }
+    for t in &ledger.latency {
+        check(format!("{} msg {:?}", t.flow, t.msg), Some(t.clone()), None);
+    }
+    InvariantOutcome {
+        checked: (delivered.len() + ledger.latency.len()) as u64,
+        violations,
+        ..InvariantOutcome::passed("M-LAT1", M_LAT1, 0)
+    }
+}
+
+/// M-BYTE1's statement.
+pub const M_BYTE1: &str = "every frame's octets on the air are exactly its payload, \
+                           envelope, fragmentation, network and link octets — each octet \
+                           in one layer";
+
+/// M-BYTE1: `node.tx`'s per-layer split adds up to `bytes_on_wire`.
+#[must_use]
+pub fn check_m_byte1(ledger: &EventLedger) -> InvariantOutcome {
+    let split: Vec<&crate::channels::NodeTxView> = ledger
+        .tx
+        .iter()
+        .filter(|t| t.layers_consistent().is_some())
+        .collect();
+    if split.is_empty() {
+        return InvariantOutcome::skipped("M-BYTE1", M_BYTE1, "no node.tx with a layer split");
+    }
+    let violations: Vec<InvariantViolation> = split
+        .iter()
+        .filter(|t| t.layers_consistent() == Some(false))
+        .map(|t| {
+            violation(
+                "M-BYTE1",
+                Some(format!("msg {:?} from node {}", t.msg, t.node.index())),
+                "the layers do not add up to the octets on the air".to_string(),
+                &[
+                    ("bytes_on_wire", Number::int(t.bytes_on_wire as i64)),
+                    ("link", Number::int(t.link_bytes.unwrap_or(0) as i64)),
+                    ("net", Number::int(t.net_header_bytes.unwrap_or(0) as i64)),
+                    ("spdu", Number::int(t.spdu_bytes.unwrap_or(0) as i64)),
+                ],
+            )
+        })
+        .collect();
+    InvariantOutcome {
+        checked: split.len() as u64,
+        violations,
+        ..InvariantOutcome::passed("M-BYTE1", M_BYTE1, 0)
+    }
+}
+
+/// M-BYTE2's statement.
+pub const M_BYTE2: &str = "in every window the five per-bucket byte rates sum to bytes_total";
+
+/// M-BYTE2: `bytes_air + bytes_uu_ul + bytes_uu_dl + bytes_backhaul + bytes_backend =
+/// bytes_total` at every flush, to within the quantisation of five values.
+#[must_use]
+pub fn check_m_byte2(samples: &[MetricSample]) -> InvariantOutcome {
+    let mut totals: BTreeMap<u64, f64> = BTreeMap::new();
+    let mut parts: BTreeMap<u64, (f64, u32)> = BTreeMap::new();
+    for s in samples {
+        let Some(v) = s.value.point() else { continue };
+        if s.metric == "bytes_total" {
+            totals.insert(s.t, v);
+        } else if ByteBucket::ALL.iter().any(|b| b.metric_name() == s.metric) {
+            let e = parts.entry(s.t).or_insert((0.0, 0));
+            e.0 += v;
+            e.1 += 1;
+        }
+    }
+    if totals.is_empty() {
+        return InvariantOutcome::skipped("M-BYTE2", M_BYTE2, "no bytes_total samples");
+    }
+    let mut violations = Vec::new();
+    for (t, total) in &totals {
+        let (sum, n) = parts.get(t).copied().unwrap_or((0.0, 0));
+        let tolerance = Quantum::BYTES.get() * f64::from(n.max(1));
+        if (sum - total).abs() > tolerance {
+            violations.push(violation(
+                "M-BYTE2",
+                Some(format!("t = {t} ns")),
+                "the buckets do not sum to the total".to_string(),
+                &[
+                    ("buckets", Number::real(sum, Quantum::BYTES)),
+                    ("total", Number::real(*total, Quantum::BYTES)),
+                ],
+            ));
+        }
+    }
+    InvariantOutcome {
+        checked: totals.len() as u64,
+        violations,
+        ..InvariantOutcome::passed("M-BYTE2", M_BYTE2, 0)
+    }
+}
+
+/// M-SHARE's statement.
+pub const M_SHARE: &str = "in every window the latency-stage shares of one flow and message \
+                           type sum to one";
+
+/// M-SHARE: `latency_stage_share` sums to one per (window, flow, message type).
+#[must_use]
+pub fn check_m_share(samples: &[MetricSample]) -> InvariantOutcome {
+    use crate::def::Dim;
+    let mut sums: BTreeMap<String, (f64, u32)> = BTreeMap::new();
+    for s in samples.iter().filter(|s| s.metric == "latency_stage_share") {
+        let Some(v) = s.value.point() else { continue };
+        let key = format!(
+            "t={} flow={:?} msg_type={:?}",
+            s.t,
+            s.dims.get(&Dim::Flow),
+            s.dims.get(&Dim::MsgType)
+        );
+        let e = sums.entry(key).or_insert((0.0, 0));
+        e.0 += v;
+        e.1 += 1;
+    }
+    if sums.is_empty() {
+        return InvariantOutcome::skipped("M-SHARE", M_SHARE, "no latency_stage_share samples");
+    }
+    let violations: Vec<InvariantViolation> = sums
+        .iter()
+        .filter(|(_, (sum, n))| (sum - 1.0).abs() > Quantum::RATIO.get() * f64::from(*n))
+        .map(|(key, (sum, _))| {
+            violation(
+                "M-SHARE",
+                Some(key.clone()),
+                "the stage shares do not sum to one".to_string(),
+                &[("sum", Number::real(*sum, Quantum::RATIO))],
+            )
+        })
+        .collect();
+    InvariantOutcome {
+        checked: sums.len() as u64,
+        violations,
+        ..InvariantOutcome::passed("M-SHARE", M_SHARE, 0)
+    }
+}
+
+/// M-RANGE's statement.
+pub const M_RANGE: &str = "no metric sample reports a value its definition declares \
+                           physically impossible: a negative delay, a ratio of a part to its \
+                           whole above one, a negative count";
+
+/// M-RANGE: every float of every sample lies in its metric's declared physical range.
+///
+/// Checks the point estimate and, for a distribution, its extremes and percentiles. A
+/// confidence interval's bounds are not checked: they are about the estimate, not the
+/// quantity. Needs the catalogue, because the range is on the definition; pass
+/// `ProviderSet::catalog()`.
+#[must_use]
+pub fn check_metric_ranges(
+    samples: &[MetricSample],
+    catalog: &[crate::def::MetricDef],
+) -> InvariantOutcome {
+    use crate::def::SampleValue;
+    use crate::stats::DistributionSummary;
+    if samples.is_empty() {
+        return InvariantOutcome::skipped("M-RANGE", M_RANGE, "no metric samples");
+    }
+    let defs: BTreeMap<&str, &crate::def::MetricDef> =
+        catalog.iter().map(|d| (d.name.as_str(), d)).collect();
+    let mut violations = Vec::new();
+    let mut checked = 0_u64;
+    for s in samples {
+        let Some(def) = defs.get(s.metric.as_str()) else {
+            continue;
+        };
+        let values: Vec<f64> = match &s.value {
+            SampleValue::Distribution(DistributionSummary::Summary {
+                min,
+                max,
+                mean,
+                p50,
+                p95,
+                p99,
+                ..
+            }) => vec![*min, *max, *mean, *p50, *p95, *p99],
+            other => other.point().into_iter().collect(),
+        };
+        for v in values {
+            checked += 1;
+            if !def.admits(v) {
+                violations.push(violation(
+                    "M-RANGE",
+                    Some(s.key()),
+                    format!(
+                        "{v} {} is outside [{}, {}]",
+                        def.unit,
+                        def.min_value.map_or("-inf".to_string(), |x| x.to_string()),
+                        def.max_value.map_or("inf".to_string(), |x| x.to_string())
+                    ),
+                    &[("value", Number::real(v, s.quantum))],
+                ));
+            }
+        }
+    }
+    InvariantOutcome {
+        checked,
+        violations,
+        ..InvariantOutcome::passed("M-RANGE", M_RANGE, 0)
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // The whole set
 // ---------------------------------------------------------------------------------------
 
@@ -1144,6 +1589,11 @@ pub fn check_all(ledger: &EventLedger, samples: &[MetricSample]) -> InvariantRep
         check_i_r3(ledger),
         check_i_t2(ledger),
         check_i_t3(ledger),
+        check_m_byte1(ledger),
+        check_m_byte2(samples),
+        check_m_lat1(ledger),
+        check_m_rx1(ledger),
+        check_m_share(samples),
         check_d9_quantisation(samples),
     ])
 }
@@ -1907,7 +2357,10 @@ mod tests {
                 .iter()
                 .map(|o| o.invariant.as_str())
                 .collect::<Vec<_>>(),
-            vec!["I-M1", "I-N1", "I-P4", "I-R3", "I-T2", "I-T3", "D9"]
+            vec![
+                "I-M1", "I-N1", "I-P4", "I-R3", "I-T2", "I-T3", "M-BYTE1", "M-BYTE2", "M-LAT1",
+                "M-RX1", "M-SHARE", "D9"
+            ]
         );
         assert!(report.held(), "{:?}", report.failed());
         report.assert_all().unwrap();
@@ -1964,5 +2417,212 @@ mod tests {
         assert!(report.held());
         assert_eq!(report.skipped().len(), report.outcomes.len());
         report.assert_all().unwrap();
+    }
+
+    // --- M-RX1, M-LAT1, M-BYTE1, M-BYTE2, M-SHARE, M-RANGE ----------------------------
+
+    fn phy(msg: u64, rx: u32, cause: Option<&str>) -> OwnedRecord {
+        rec(
+            "phy.rx",
+            Visibility::NodeAndGt,
+            match cause {
+                None => json!({"t_start":0,"t_end":1,"tx":1,"rx":rx,"msg":msg,"outcome":"ok"}),
+                Some(c) => json!({"t_start":0,"t_end":1,"tx":1,"rx":rx,"msg":msg,
+                                  "outcome":"lost","cause":c}),
+            },
+        )
+    }
+
+    fn fate(msg: u64, rx: u32, outcome: &str, cause: Option<&str>) -> OwnedRecord {
+        rec(
+            "node.rx",
+            Visibility::NodeAndGt,
+            json!({"t":1,"rx":rx,"tx":1,"msg":msg,"outcome":outcome,"cause":cause}),
+        )
+    }
+
+    #[test]
+    fn m_rx1_holds_when_every_attempt_has_one_fate() {
+        let l = ledger(&[
+            phy(1, 2, None),
+            phy(1, 3, Some("collision")),
+            phy(2, 2, None),
+            phy(2, 3, None),
+            fate(1, 2, "delivered", None),
+            fate(1, 3, "lost", Some("collision")),
+            fate(2, 2, "lost", Some("verify-overflow")),
+            fate(2, 3, "in-flight", None),
+        ]);
+        let o = check_m_rx1(&l);
+        assert!(o.held(), "{:?}", o.violations);
+        assert_eq!(o.checked, 4);
+    }
+
+    #[test]
+    fn m_rx1_catches_a_missing_fate_a_double_fate_and_a_changed_cause() {
+        // An attempt with no fate: delivered + lost + in flight falls short of attempts.
+        let l = ledger(&[
+            phy(1, 2, None),
+            phy(1, 3, None),
+            fate(1, 2, "delivered", None),
+        ]);
+        assert!(!check_m_rx1(&l).held());
+        // An attempt resolved twice.
+        let l = ledger(&[
+            phy(1, 2, None),
+            fate(1, 2, "delivered", None),
+            fate(1, 2, "lost", Some("revoked")),
+        ]);
+        assert!(!check_m_rx1(&l).held());
+        // A PHY loss reported above the PHY as something else.
+        let l = ledger(&[
+            phy(1, 2, Some("fading")),
+            fate(1, 2, "lost", Some("revoked")),
+        ]);
+        assert!(!check_m_rx1(&l).held());
+        // A decoded frame blamed on the PHY.
+        let l = ledger(&[phy(1, 2, None), fate(1, 2, "lost", Some("collision"))]);
+        assert!(!check_m_rx1(&l).held());
+        // A loss with no cause, and one with an invented cause.
+        let l = ledger(&[phy(1, 2, None), fate(1, 2, "lost", None)]);
+        assert!(!check_m_rx1(&l).held());
+        let l = ledger(&[phy(1, 2, None), fate(1, 2, "lost", Some("gremlins"))]);
+        assert!(!check_m_rx1(&l).held());
+    }
+
+    fn delivered_rx(stamps: [u64; 8], delivered: u64) -> OwnedRecord {
+        let [g, s0, s1, a, b, arr, rxd, vd] = stamps;
+        rec(
+            "node.rx",
+            Visibility::NodeAndGt,
+            json!({"t":delivered,"rx":2,"tx":1,"msg":1,"outcome":"delivered",
+                   "t_generated":g,"t_sign_start":s0,"t_signed":s1,"t_tx_start":a,
+                   "t_tx_end":b,"t_arrival":arr,"t_rx_done":rxd,"t_verify_start":rxd,
+                   "t_verify_done":vd,"t_delivered":delivered}),
+        )
+    }
+
+    #[test]
+    fn m_lat1_holds_on_forward_stamps_and_fails_on_backward_ones() {
+        let good = delivered_rx([0, 10, 20, 30, 40, 41, 50, 60], 60);
+        assert!(check_m_lat1(&ledger(&[good])).held());
+        // Signed before the signer started.
+        let bad = delivered_rx([0, 10, 5, 30, 40, 41, 50, 60], 60);
+        assert!(!check_m_lat1(&ledger(&[bad])).held());
+        // Delivered at an instant the stages do not reach.
+        let bad = delivered_rx([0, 10, 20, 30, 40, 41, 50, 60], 70);
+        assert!(!check_m_lat1(&ledger(&[bad])).held());
+    }
+
+    #[test]
+    fn m_byte1_catches_layers_that_do_not_add_up() {
+        let tx = |on_wire: u64| {
+            rec(
+                "node.tx",
+                Visibility::Node,
+                json!({"t":1,"node":1,"msg":1,"bytes_on_wire":on_wire,"payload_bytes":40,
+                       "envelope_bytes":93,"spdu_bytes":133,"net_header_bytes":5,
+                       "link_bytes":38}),
+            )
+        };
+        assert!(check_m_byte1(&ledger(&[tx(176)])).held());
+        assert!(!check_m_byte1(&ledger(&[tx(177)])).held());
+    }
+
+    fn scalar(def: &MetricDef, t: u64, dims: Dims, v: f64) -> MetricSample {
+        MetricSample::new(
+            def,
+            t,
+            dims,
+            SampleValue::Scalar(Estimate::Value { point: v, n: 1 }),
+        )
+    }
+
+    fn rate_def(name: &str) -> MetricDef {
+        MetricDef::new(
+            name,
+            "B/s",
+            Agg::Rate,
+            Visibility::Node,
+            Quantum::BYTES,
+            "d",
+        )
+        .not_accounting_for("x")
+    }
+
+    #[test]
+    fn m_byte2_checks_the_buckets_against_the_total() {
+        let mut samples: Vec<MetricSample> = ByteBucket::ALL
+            .iter()
+            .map(|b| scalar(&rate_def(b.metric_name()), 5, Dims::new(), 100.0))
+            .collect();
+        samples.push(scalar(&rate_def("bytes_total"), 5, Dims::new(), 500.0));
+        assert!(check_m_byte2(&samples).held());
+        samples.pop();
+        samples.push(scalar(&rate_def("bytes_total"), 5, Dims::new(), 501.0));
+        assert!(!check_m_byte2(&samples).held());
+    }
+
+    #[test]
+    fn m_share_requires_the_stage_shares_to_sum_to_one() {
+        let def = MetricDef::new(
+            "latency_stage_share",
+            "ratio",
+            Agg::ratio("a", "b"),
+            Visibility::Node,
+            Quantum::RATIO,
+            "d",
+        )
+        .not_accounting_for("x");
+        let share = |stage: &str, v: f64| {
+            let mut d = Dims::new();
+            d.insert(crate::def::Dim::Stage, crate::def::DimValue::label(stage));
+            scalar(&def, 1, d, v)
+        };
+        assert!(check_m_share(&[share("a", 0.25), share("b", 0.75)]).held());
+        assert!(!check_m_share(&[share("a", 0.25), share("b", 0.7)]).held());
+    }
+
+    #[test]
+    fn m_range_fails_an_impossible_value() {
+        let ratio = MetricDef::new(
+            "delivery_ratio",
+            "ratio",
+            Agg::ratio("a", "b"),
+            Visibility::Node,
+            Quantum::RATIO,
+            "d",
+        )
+        .with_range(0.0, 1.0)
+        .not_accounting_for("x");
+        let latency = MetricDef::new(
+            "e2e_latency",
+            "ms",
+            Agg::Distribution,
+            Visibility::Node,
+            Quantum::TIME_MS,
+            "d",
+        )
+        .with_range(0.0, f64::INFINITY)
+        .not_accounting_for("x");
+        let catalog = vec![ratio.clone(), latency.clone()];
+        let fine = vec![
+            scalar(&ratio, 1, Dims::new(), 0.97),
+            scalar(&latency, 1, Dims::new(), 3.5),
+        ];
+        assert!(check_metric_ranges(&fine, &catalog).held());
+        // A delivery ratio above one.
+        let over = vec![scalar(&ratio, 1, Dims::new(), 1.02)];
+        assert!(!check_metric_ranges(&over, &catalog).held());
+        // A negative latency, hidden in a distribution's minimum.
+        let mut d = crate::stats::Distribution::new();
+        d.observe_all([-2.0, 4.0, 5.0]);
+        let neg = vec![MetricSample::new(
+            &latency,
+            1,
+            Dims::new(),
+            SampleValue::Distribution(d.summary(1)),
+        )];
+        assert!(!check_metric_ranges(&neg, &catalog).held());
     }
 }

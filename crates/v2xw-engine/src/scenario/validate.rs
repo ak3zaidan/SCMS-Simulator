@@ -403,12 +403,20 @@ pub static KEY_STATUS: &[KeyStatus] = &[
                model's implementation loss), phy (the 802.11p sensitivity table) and \
                obstacle (the Sommer building row). Unknown families and ids are refused." },
     // --- network -----------------------------------------------------------
-    KeyStatus { path: "net.layer", status: Status::Refused,
-        note: "No network layer is composed: a frame goes from the signer to the MAC with \
-               no header between them. Only 'wsmp' loads, and even that is a declaration." },
-    KeyStatus { path: "net.fragmenter", status: Status::NotImplemented,
-        note: "No fragmenter is wired in; a frame over the MSDU cap is dropped rather \
-               than split." },
+    KeyStatus { path: "net.layer", status: Status::Wired,
+        note: "The network and transport header every frame carries: 'wsmp' (IEEE 1609.3, \
+               5 octets for a BSM) or 'gn-btp' (ETSI GeoNetworking with BTP, 44 octets for a \
+               CAM). LLC/SNAP, the 802.11 MAC header and the FCS are added below either, \
+               and the air time and the overhead metrics are computed over the whole \
+               frame." },
+    KeyStatus { path: "net.fragmenter", status: Status::Refused,
+        note: "Only 'fragmenter/none' loads, and it is enforced: a signed message larger \
+               than the network layer's MTU (1,400 octets for WSMP, 1,398 for \
+               GeoNetworking) is refused before the MAC and counted in the run report. The \
+               splitting fragmenters are refused because no message this build signs \
+               comes near the MTU (a CAM with a certificate is about 400 octets), so they \
+               would have nothing to split; they matter once post-quantum signatures can \
+               be selected, which security.signature does not yet offer." },
     KeyStatus { path: "net.backhaul", status: Status::NotImplemented,
         note: "Read by nothing." },
     KeyStatus { path: "net.uu", status: Status::NotImplemented,
@@ -419,14 +427,21 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus { path: "messages.sets", status: Status::Refused,
         note: "Which message sets the nodes generate. Only the BSM and the CAM have a \
                generator, so anything else is refused rather than silently unsent." },
-    KeyStatus { path: "messages.generator", status: Status::Partial,
-        note: "Sets where each node's generator sits in time: params.phase_window_ms (each \
-               node's phase is uniform over it; default 100) and params.max_jitter_ms (a \
-               per-message delay before the radio; default 10). 0 and 0 put every vehicle \
-               on one grid. The generation rules themselves are fixed." },
+    KeyStatus { path: "messages.generator", status: Status::Wired,
+        note: "Tunes the generators. Under any id, params.phase_window_ms (each node's \
+               phase is uniform over it; default 100) and params.max_jitter_ms (a \
+               per-message delay before the radio; default 10) place every node's \
+               generator in time; 0 and 0 put every vehicle on one grid. \
+               'generator/bsm-j2945-1' also takes the J2945/1 nominal, minimum and maximum \
+               time between BSMs, and 'generator/cam-en302637-2' the EN 302 637-2 CAM \
+               triggering intervals and thresholds; the other generator keeps the \
+               standard's defaults. Nodes run at the mobility step, so an interval shorter \
+               than it is refused." },
     KeyStatus { path: "messages.codec_tier", status: Status::Refused,
-        note: "The node encodes real UPER unconditionally, so the size-model tier is \
-               refused rather than ignored." },
+        note: "Only 'uper' loads, and it is what runs: every BSM and CAM is encoded for \
+               real. The size-model tier (build decision D2) covers SPaT, MAP, PSM, SRM, \
+               SSM, CPM and VAM — messages no node in this build generates — so selecting \
+               it would change no frame and is refused rather than ignored." },
     // --- security ----------------------------------------------------------
     KeyStatus { path: "security.envelope", status: Status::Wired,
         note: "Which secured-message envelope the nodes use." },
@@ -625,15 +640,22 @@ fn unreachable_keys(s: &Scenario, e: &mut Vec<ScenarioError>) {
         }
     }
 
-    // The network layer. `v2xw-net` implements both, and the engine composes neither:
-    // `Engine::hand_down_app` puts a signed SPDU straight into the MAC's queue with no
-    // WSMP or GeoNetworking header between them.
-    if s.net.layer != "wsmp" {
+    // The fragmenter. `fragmenter/none` is enforced at `Engine::hand_down_app`; the
+    // splitting strategies exist in `v2xw-net` and no message this build signs is large
+    // enough for them to act on (see the key's status note).
+    if let Some(f) = s.net.fragmenter.as_ref()
+        && f.id != v2xw_net::FRAGMENTER_NONE_ID
+    {
         e.push(conflict(
-            "net.layer",
+            "net.fragmenter",
             format!(
-                "is '{}', and this build composes no network layer at all: a frame goes                  from the node's signer to the MAC with no header between them, so                  'gn-btp' would not be the thing that ran. Only 'wsmp' is accepted, and                  even that is a declaration rather than a layer — see `Engine::hand_down_app`",
-                s.net.layer
+                "is '{}', and only '{}' runs in this build: the largest message a node \
+                 signs is a CAM with a certificate, about 400 octets against a 1,398-octet \
+                 MTU, so a splitting fragmenter would never split anything. It becomes \
+                 meaningful with post-quantum signatures, which security.signature does \
+                 not yet offer",
+                f.id,
+                v2xw_net::FRAGMENTER_NONE_ID
             ),
         ));
     }
@@ -1124,61 +1146,15 @@ fn net(s: &Scenario, e: &mut Vec<ScenarioError>) {
 }
 
 fn messages(s: &Scenario, e: &mut Vec<ScenarioError>) {
-    // `messages.generator` tunes the generation timing and nothing else: the generation
-    // rules themselves are the node runtime's (`v2xw_msg::generator`).
-    if let Some(g) = &s.messages.generator {
-        let known = [
-            v2xw_msg::GENERATION_TIMING_ID,
-            v2xw_msg::BSM_GENERATOR_ID,
-            v2xw_msg::CAM_GENERATOR_ID,
-        ];
-        if !known.contains(&g.id.as_str()) {
-            e.push(conflict(
-                "messages.generator.id",
-                format!(
-                    "'{}' is not a generator this build ships; choose one of: {}",
-                    g.id,
-                    known.join(", ")
-                ),
-            ));
-        }
-        if let Some(obj) = g.params.as_object() {
-            for (k, v) in obj {
-                let limit = match k.as_str() {
-                    "phase_window_ms" => 1_000.0,
-                    "max_jitter_ms" => 100.0,
-                    other => {
-                        e.push(conflict(
-                            &format!("messages.generator.params.{other}"),
-                            "is not a generation-timing parameter; the two are \
-                             phase_window_ms and max_jitter_ms"
-                                .to_string(),
-                        ));
-                        continue;
-                    }
-                };
-                match v.as_f64() {
-                    Some(x) if x.is_finite() && (0.0..=limit).contains(&x) => {}
-                    _ => e.push(conflict(
-                        &format!("messages.generator.params.{k}"),
-                        format!("is {v}, and it must be a number of milliseconds in [0, {limit}]"),
-                    )),
-                }
-            }
-        } else if !g.params.is_null() {
-            e.push(conflict(
-                "messages.generator.params",
-                "must be an object of phase_window_ms and max_jitter_ms".to_string(),
-            ));
-        }
-    }
-
     one_of(
         "messages.codec_tier",
         &s.messages.codec_tier,
         &CODEC_TIERS,
         e,
     );
+    if let Some(g) = s.messages.generator.as_ref() {
+        generator(s, g, e);
+    }
     if s.messages.sets.is_empty() {
         e.push(conflict(
             "messages.sets",
@@ -1214,6 +1190,124 @@ fn messages(s: &Scenario, e: &mut Vec<ScenarioError>) {
             }
         }
     }
+}
+
+/// The generation-timing parameters (`v2xw_msg::GenerationTiming`), read by
+/// `wiring::generation_timing` whichever generator the key names, with their upper bounds
+/// in milliseconds.
+const TIMING_PARAMS: [(&str, f64); 2] = [("phase_window_ms", 1_000.0), ("max_jitter_ms", 100.0)];
+
+/// `messages.generator`: a known generator, its own parameter names, and values a node
+/// stepped at the mobility step can honour.
+///
+/// Two tracks gave this key parameters, and both are honoured. The generation-timing pair
+/// (`phase_window_ms`, `max_jitter_ms`; `wiring::generation_timing`) places every node's
+/// generator in time and is accepted under any of the three ids. The BSM and CAM ids also
+/// take their own generator's rule parameters (`wiring::generator_params`).
+/// `generator/timing-phase-jitter` takes the timing pair only.
+fn generator(s: &Scenario, g: &crate::scenario::ModelChoice, e: &mut Vec<ScenarioError>) {
+    use v2xw_msg::generator::{BSM_GENERATOR_ID, CAM_GENERATOR_ID};
+    let names: &[&str] = match g.id.as_str() {
+        v2xw_msg::GENERATION_TIMING_ID => &[],
+        BSM_GENERATOR_ID => &["nominal_itt_ms", "min_itt_ms", "max_itt_ms"],
+        CAM_GENERATOR_ID => &[
+            "t_gen_cam_min_ms",
+            "t_gen_cam_max_ms",
+            "t_check_cam_gen_ms",
+            "n_gen_cam",
+            "heading_threshold_deg",
+            "position_threshold_m",
+            "speed_threshold_mps",
+            "low_frequency_interval_ms",
+        ],
+        other => {
+            e.push(conflict(
+                "messages.generator.id",
+                format!(
+                    "is '{other}', and the generators a node runs are '{BSM_GENERATOR_ID}' and \
+                     '{CAM_GENERATOR_ID}'; '{}' sets the generation timing alone",
+                    v2xw_msg::GENERATION_TIMING_ID
+                ),
+            ));
+            return;
+        }
+    };
+    let params = match &g.params {
+        serde_json::Value::Null => return,
+        serde_json::Value::Object(m) => m,
+        _ => {
+            e.push(conflict(
+                "messages.generator.params",
+                "must be an object of the generator's parameters".to_string(),
+            ));
+            return;
+        }
+    };
+    let step_ms = s.time.mobility_step_ms as f64;
+    let mut read = |name: &str| -> Option<f64> {
+        let v = params.get(name)?;
+        match v.as_f64() {
+            Some(x) if x.is_finite() && x > 0.0 => Some(x),
+            _ => {
+                e.push(conflict(
+                    &format!("messages.generator.params.{name}"),
+                    format!("is {v}, and must be a positive number"),
+                ));
+                None
+            }
+        }
+    };
+    let values: Vec<(String, Option<f64>)> =
+        names.iter().map(|n| (n.to_string(), read(n))).collect();
+    for (key, v) in params {
+        if let Some((_, limit)) = TIMING_PARAMS.iter().find(|(n, _)| n == key) {
+            match v.as_f64() {
+                Some(x) if x.is_finite() && (0.0..=*limit).contains(&x) => {}
+                _ => e.push(conflict(
+                    &format!("messages.generator.params.{key}"),
+                    format!("is {v}, and it must be a number of milliseconds in [0, {limit}]"),
+                )),
+            }
+        } else if !names.contains(&key.as_str()) {
+            let all: Vec<&str> = names
+                .iter()
+                .copied()
+                .chain(TIMING_PARAMS.iter().map(|(n, _)| *n))
+                .collect();
+            e.push(conflict(
+                &format!("messages.generator.params.{key}"),
+                format!("is not a parameter of '{}'; it has {}", g.id, all.join(", ")),
+            ));
+        }
+    }
+    let get = |n: &str| values.iter().find(|(k, _)| k == n).and_then(|(_, v)| *v);
+    // A node is stepped once per mobility step, so it cannot send more often than that.
+    for n in ["nominal_itt_ms", "min_itt_ms", "t_gen_cam_min_ms", "t_check_cam_gen_ms"] {
+        if let Some(v) = get(n)
+            && v < step_ms
+        {
+            e.push(conflict(
+                &format!("messages.generator.params.{n}"),
+                format!(
+                    "is {v} ms, shorter than the {step_ms} ms mobility step the nodes are \
+                     stepped at, so no node could send that often"
+                ),
+            ));
+        }
+    }
+    let ordered = |lo: &str, hi: &str, e: &mut Vec<ScenarioError>| {
+        if let (Some(a), Some(b)) = (get(lo), get(hi))
+            && a > b
+        {
+            e.push(conflict(
+                &format!("messages.generator.params.{lo}"),
+                format!("is {a}, above {hi} = {b}"),
+            ));
+        }
+    };
+    ordered("min_itt_ms", "nominal_itt_ms", e);
+    ordered("nominal_itt_ms", "max_itt_ms", e);
+    ordered("t_gen_cam_min_ms", "t_gen_cam_max_ms", e);
 }
 
 fn security(s: &Scenario, e: &mut Vec<ScenarioError>) {

@@ -365,7 +365,9 @@ impl Engine {
         };
         let pool = sl.mac.pool().clone();
         let slot = pool.slot_of(state.start);
-        let len = pool.subchannels_for(state.bytes).unwrap_or(1);
+        // The transport block carries the network PDU: the SPDU and its WSMP or
+        // GeoNetworking header (`FrameState::layers`, with no 802.11 framing on a sidelink).
+        let len = pool.subchannels_for(state.layers.psdu_bytes()).unwrap_or(1);
         let resource = state
             .sl_resource
             .unwrap_or_else(|| SlResource::new(slot, 0, len));
@@ -470,7 +472,7 @@ impl Engine {
                 rx,
                 power_dbm,
                 resource,
-                bytes: state.bytes,
+                bytes: state.layers.psdu_bytes(),
                 rx_transmitting: transmitting.is_some_and(|t| t.contains(&rx)),
                 interferers: state.sl_interferers.get(&rx).cloned().unwrap_or_default(),
             };

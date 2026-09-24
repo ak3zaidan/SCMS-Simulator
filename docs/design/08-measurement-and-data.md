@@ -74,6 +74,57 @@ Dimensions: `t` (time bin), `node`, `class` (car/truck/bus/moto/vru/rsu), `dist_
 ### 2.6 Privacy (07-threats §6)
 `linkability_rate` (fraction of pseudonym changes an observer links correctly), `anonymity_set_size`, `degree_of_anonymity` (TR 103 415 §5.1.2), `tracking_duration` (mean tracked duration, Wiedersheim et al. 2010 method).
 
+### 2.7 Built 2026-09-23: per-attempt evidence, decomposed delay, awareness, load, overhead
+
+What `v2xw-metrics` computes from a real run, and where each number comes from. The
+definitions, units, citations and "not accounted for" lists are on each `MetricDef`; this
+table is the map.
+
+**Channels.** `node.rx` (NODE+GT): one record per `phy.rx` attempt, followed to exactly one
+fate — `delivered` (with `verified`/`unverified`), `lost` with one cause from a closed
+vocabulary (the PHY's causes, then `reassembly-failed`, `rx-overflow`, `verify-policy-drop`,
+`verify-overflow`, `signature-invalid`, `revoked`, `receiver-off`), or `in-flight` at the end
+of the run — carrying received power, SINR, distance, bytes, air time and every stamp of the
+message's journey on the true timeline. `msg.latency` (NODE or NODE+GT): a
+`LatencyTrace` — contiguous stages from origin to delivery — for any flow that is not a V2V
+broadcast (the misbehaviour report's vehicle → RSU → backhaul flow is the first user;
+credential top-up, CRL distribution and multi-hop relays plug in with `TraceBuilder`).
+`net.bytes`: one record per transfer on a bucket other than the air. `node.tx` gains the
+signing and MAC stamps and the frame's per-layer octets; `mac.cbr` gains queue depth, drops
+and offered load; `gt.kinematics` names the mounted node.
+
+**The frame.** A PSDU is payload + security envelope + network/transport header (WSMP 5 B for
+a BSM; GN SHB + BTP-B 44 B for a CAM) + LLC/SNAP 8 B + 802.11 QoS Data MAC header 26 B + FCS
+4 B (`v2xw_net::frame`, 04-models §4.6, §7). Air time is computed over the whole PSDU. The
+uncertain sizes (LLC framing under WSMP; the QoS Data clause) are stated on the module.
+
+**End-to-end delay** (`e2e_latency`, p50/p95/p99 per flow and message type) is decomposed
+into `sign_queue`, `sign`, `mac_aifs`, `mac_backoff`, `mac_defer`, `airtime`, `propagation`,
+`reception`, `verify_queue`, `verify`. The stages tile generation-to-delivery, so they sum to
+the total exactly in integer nanoseconds (`latency_stage`, `latency_stage_share`). The
+verification queue runs in continuous time: a frame waits from the instant it arrived, and a
+backlog outlives the engine's tick.
+
+| Family | Metrics | Sources |
+|---|---|---|
+| Awareness | `aoi` (time-average age of information), `aoi_peak`, `nar` at 100 and 300 m, `delivery_ratio` (application-level PDR) in 50 m bins to 1 km, `pir` | Kaul et al. SECON 2011 and INFOCOM 2012; Costa et al. IEEE T-IT 2016; Boban and d'Orey IEEE TVT 2016 (from memory; equation number unverified); Martelli et al. INFOCOM 2012 |
+| Load | `cbr`, `channel_occupancy` (per-node CR), `channel_load` (offered air time around a node against the channel's one second per second), `offered_load`, `carried_load`, `loss_rate` per cause, `collision_rate`, `half_duplex_rate`, `mac_queue_depth`, `mac_drops`, `mac_access_delay`, `airtime_per_node` | TS 36.214 §5.1.31, TS 103 574; Torrent-Moreno et al. IEEE TVT 2009; EN 302 571 §4.2.10.1; IEEE 802.11-2020 §10.23.2 |
+| Overhead | `security_overhead`, `net_header_overhead`, `link_overhead`, `cert_bytes_share`, `air_bytes_per_payload_byte`, `bytes_per_vehicle_hour` per bucket, `bytes_total` | 04-models §4.6, §7, §9.3; IEEE 1609.2 §6.3.4 |
+
+**Consistency, tested on synthetic streams and on a real run** (`crates/v2xw-engine/tests/
+measurement.rs`): M-RX1 delivered + lost + in flight = attempts, and a PHY loss is the same
+loss on both channels; M-LAT1 stages sum to the total; M-BYTE1 a frame's layers sum to its
+octets; M-BYTE2 the buckets sum to `bytes_total`; M-SHARE the stage shares sum to one;
+M-RANGE no sample leaves its metric's physical range (a delivery ratio above one, a negative
+delay). Each was shown to fail on an injected violation.
+
+**Live view.** A metric streams as its headline, a distribution's p50/p95/p99
+(`e2e_latency.p95`), and one series per value of a declared breakdown
+(`latency_stage[airtime]`, `loss_rate[collision]`); the Studio's measurement picker lists
+every series with its unit, definition and citation. Breakdowns a metric does not declare
+(per node, per distance bin of `pdr`, per message type of a stage) are in the recording and
+`metrics.json`.
+
 ## 3. Plotting
 
 - Live: uPlot sparklines and small multiples fed by `metric.sample` (09-ui §5).

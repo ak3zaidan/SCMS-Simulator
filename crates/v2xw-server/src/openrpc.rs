@@ -375,7 +375,7 @@ fn all_methods() -> Vec<Value> {
                                    "items": {"enum": ["telemetry", "stores", "queues",
                                                       "neighbors", "certs", "crl", "gnss",
                                                       "clock", "apps", "detectors",
-                                                      "provenance"]}},
+                                                      "provenance", "messages"]}},
                        "limit": {"type": "integer", "minimum": 1, "maximum": 1000,
                                  "default": 50}}),
             ),

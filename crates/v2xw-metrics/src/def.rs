@@ -67,6 +67,9 @@ pub enum Dim {
     Channel,
     /// Cryptographic primitive, for `verify_rate`.
     Primitive,
+    /// A message flow: `v2v`, or a backend exchange's own name (`credential-topup`,
+    /// `mbr`, `crl-download`), for the latency decomposition.
+    Flow,
     /// Message type.
     MsgType,
     /// Byte-accounting bucket (air / cellular UL / cellular DL / backhaul / backend).
@@ -237,6 +240,32 @@ pub struct MetricDef {
     /// True if the metric is a machine-dependent runtime diagnostic. Such a metric is
     /// excluded from every digested artefact, structurally: see [`crate::DigestSet`].
     pub diagnostic: bool,
+    /// The smallest value the metric can physically take, where it has one: zero for a
+    /// latency, a count or a ratio. `None` means unbounded below.
+    ///
+    /// Not a plausibility band. It is the boundary past which a value is *impossible* — a
+    /// negative delay, a delivery ratio above one — and
+    /// [`crate::invariants::check_metric_ranges`] fails a run whose samples cross it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_value: Option<f64>,
+    /// The largest value the metric can physically take (one for a proportion). `None`
+    /// means unbounded above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_value: Option<f64>,
+    /// One dimension whose values a live view shows as series of their own, and the values
+    /// it will see: `latency_stage` by `stage`, `loss_rate` by `cause`.
+    ///
+    /// A live stream has to name every series before its first frame (the VWP symbol table
+    /// is append-only), so a dimension can only become a series if its values are known in
+    /// advance. `None` means the metric is shown by its headline alone; its full breakdown
+    /// is still in the recording and in `metrics.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakdown: Option<(Dim, Vec<String>)>,
+    /// True when the metric has no value without its breakdown dimension — a stage's
+    /// share of the delay, an awareness ratio at a radius — so a live view offers only the
+    /// per-value series and no headline that would never receive a sample.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub breakdown_only: bool,
 }
 
 impl MetricDef {
@@ -266,7 +295,46 @@ impl MetricDef {
             min_samples: crate::stats::DEFAULT_MIN_SAMPLES,
             not_accounted: Vec::new(),
             diagnostic: false,
+            min_value: None,
+            max_value: None,
+            breakdown: None,
+            breakdown_only: false,
         }
+    }
+
+    /// Marks the metric as having no headline: every sample carries its breakdown value.
+    #[must_use]
+    pub const fn breakdown_only(mut self) -> Self {
+        self.breakdown_only = true;
+        self
+    }
+
+    /// Declares the dimension a live view breaks this metric down by, and its values.
+    #[must_use]
+    pub fn with_breakdown<S: Into<String>>(
+        mut self,
+        dim: Dim,
+        values: impl IntoIterator<Item = S>,
+    ) -> Self {
+        self.breakdown = Some((dim, values.into_iter().map(Into::into).collect()));
+        self
+    }
+
+    /// Declares the physically possible range. A non-finite bound means unbounded on that
+    /// side.
+    #[must_use]
+    pub fn with_range(mut self, lo: f64, hi: f64) -> Self {
+        self.min_value = lo.is_finite().then_some(lo);
+        self.max_value = hi.is_finite().then_some(hi);
+        self
+    }
+
+    /// True if `v` is a value this metric can physically take.
+    #[must_use]
+    pub fn admits(&self, v: f64) -> bool {
+        v.is_finite()
+            && self.min_value.is_none_or(|lo| v >= lo)
+            && self.max_value.is_none_or(|hi| v <= hi)
     }
 
     /// Sets the dimensions.
@@ -348,6 +416,26 @@ impl MetricDef {
                 ));
             }
             _ => {}
+        }
+        if let (Some(lo), Some(hi)) = (self.min_value, self.max_value)
+            && lo > hi
+        {
+            return Err(bad(format!("the range [{lo}, {hi}] is empty")));
+        }
+        if let Some((dim, values)) = &self.breakdown {
+            if !self.dims.contains(dim) {
+                return Err(bad(format!(
+                    "the breakdown dimension {dim} is not one of the metric's dimensions"
+                )));
+            }
+            if values.is_empty() {
+                return Err(bad("a breakdown with no values shows nothing".to_string()));
+            }
+        }
+        if self.breakdown_only && self.breakdown.is_none() {
+            return Err(bad(
+                "a metric with no headline must declare the breakdown it is shown by".to_string(),
+            ));
         }
         let mut seen = std::collections::BTreeSet::new();
         for d in &self.dims {

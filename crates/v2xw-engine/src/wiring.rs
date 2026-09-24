@@ -256,6 +256,22 @@ fn build_world_geometry(scenario: &Scenario) -> Result<World> {
 /// [`EngineError::Registry`] if a card fails validation or two models share an id.
 pub fn register_all(registry: &mut Registry) -> Result<()> {
     v2xw_node::register_all(registry)?;
+    // The message generators, the two network layers and the fragmenters: the models the
+    // `messages.generator`, `net.layer` and `net.fragmenter` keys choose between. Without
+    // them the page's choice lists for those keys were empty and the manifest pinned none
+    // of the models that framed and paced every frame of the run.
+    let extra: Vec<v2xw_core::card::ModelCard> = vec![
+        v2xw_core::model::Model::card(&v2xw_msg::generator::BsmGenerator::default()).clone(),
+        v2xw_core::model::Model::card(&v2xw_msg::generator::CamGenerator::default()).clone(),
+        v2xw_core::model::Model::card(&v2xw_net::WsmpNetLayer::default()).clone(),
+        v2xw_core::model::Model::card(&v2xw_net::GnBtpNetLayer::default()).clone(),
+        v2xw_core::model::Model::card(&v2xw_net::NoneFragmenter::default()).clone(),
+    ];
+    for card in extra {
+        if !registry.contains(&card.id) {
+            registry.register(card)?;
+        }
+    }
     for (_, card) in v2xw_mobility::model_cards() {
         // A card already registered by another crate is not an error here: two crates may
         // legitimately publish the same model. `register` refuses a *different* card under
@@ -991,13 +1007,29 @@ pub fn build_metrics(
         return Ok(set);
     }
     let all = scenario.metrics.iter().any(|m| m == "all");
-    let comms = v2xw_metrics::comms::CommsProvider::new(0);
-    let wanted = all
-        || v2xw_metrics::provider::MetricProvider::defs(&comms)
-            .iter()
-            .any(|d| scenario.metrics.contains(&d.name.to_string()));
-    if wanted {
-        set.register(registry, Box::new(comms))?;
+    // Every provider a run can feed, in the crate's fixed order. The runtime diagnostics
+    // (wall-clock per simulated second, memory high-water mark) are not among them: the
+    // engine reads no clock (02-architecture.md §6.1), so it has nothing to hand them, and
+    // installing them would put a column of refusals in every run.
+    let candidates: Vec<Box<dyn v2xw_metrics::MetricProvider + Send>> = vec![
+        Box::new(v2xw_metrics::comms::CommsProvider::new(0)),
+        Box::new(v2xw_metrics::latency::LatencyProvider::new()),
+        Box::new(v2xw_metrics::awareness::AwarenessProvider::new(0)),
+        Box::new(v2xw_metrics::load::LoadProvider::new(0)),
+        Box::new(v2xw_metrics::overhead::OverheadProvider::new(0)),
+        Box::new(v2xw_metrics::security::SecurityProvider::new(0)),
+        Box::new(v2xw_metrics::detection::DetectionProvider::new()),
+        Box::new(v2xw_metrics::safety::SafetyProvider::new(0)),
+    ];
+    for provider in candidates {
+        let wanted = all
+            || provider
+                .defs()
+                .iter()
+                .any(|d| scenario.metrics.contains(&d.name.to_string()));
+        if wanted {
+            set.register(registry, provider)?;
+        }
     }
     Ok(set)
 }
@@ -1162,6 +1194,7 @@ pub fn build_node(
         "on-demand" => Box::new(OnDemand::new(0.5)),
         _ => Box::new(Prioritized::new(300.0)),
     };
+    let (bsm_params, cam_params) = generator_params(scenario);
     let config = NodeConfig {
         tx_power_dbm: TX_POWER_DBM,
         services: service_set(scenario),
@@ -1170,6 +1203,8 @@ pub fn build_node(
         origin: env.origin,
         dims,
         station_type: station_type(class),
+        bsm_params,
+        cam_params,
         ..NodeConfig::default()
     };
     let mut runtime = ObuRuntime::new(node, profile, policy, config, at);
@@ -1187,6 +1222,74 @@ fn apply_compute_tier(runtime: &mut ObuRuntime, scenario: &Scenario) {
     if scenario.nodes.compute_tier == v2xw_core::card::Tier::Abstract {
         runtime.set_compute_unlimited();
     }
+}
+
+/// The generation parameters `messages.generator` sets, over the standards' defaults.
+///
+/// The key names one generator and overrides its card's parameters; the other generator
+/// keeps its defaults. Every name and bound was checked by `validate`, so a value that
+/// does not read here is one the loader already refused, and the default stands.
+pub fn generator_params(
+    scenario: &Scenario,
+) -> (
+    v2xw_msg::generator::BsmGenParams,
+    v2xw_msg::generator::CamGenParams,
+) {
+    use v2xw_msg::generator::{BSM_GENERATOR_ID, BsmGenParams, CAM_GENERATOR_ID, CamGenParams};
+    let mut bsm = BsmGenParams::j2945_1();
+    let mut cam = CamGenParams::en302637_2();
+    let Some(choice) = scenario.messages.generator.as_ref() else {
+        return (bsm, cam);
+    };
+    let ms = |name: &str| -> Option<Duration> {
+        choice
+            .params
+            .get(name)
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| Duration::from_nanos((v * 1e6).round().max(0.0) as u64))
+    };
+    let num = |name: &str| choice.params.get(name).and_then(serde_json::Value::as_f64);
+    match choice.id.as_str() {
+        BSM_GENERATOR_ID => {
+            if let Some(d) = ms("nominal_itt_ms") {
+                bsm.nominal_itt = d;
+            }
+            if let Some(d) = ms("min_itt_ms") {
+                bsm.min_itt = d;
+            }
+            if let Some(d) = ms("max_itt_ms") {
+                bsm.max_itt = d;
+            }
+        }
+        CAM_GENERATOR_ID => {
+            if let Some(d) = ms("t_gen_cam_min_ms") {
+                cam.t_gen_cam_min = d;
+            }
+            if let Some(d) = ms("t_gen_cam_max_ms") {
+                cam.t_gen_cam_max = d;
+            }
+            if let Some(d) = ms("t_check_cam_gen_ms") {
+                cam.t_check_cam_gen = d;
+            }
+            if let Some(n) = num("n_gen_cam") {
+                cam.n_gen_cam = n.round().clamp(1.0, 255.0) as u8;
+            }
+            if let Some(deg) = num("heading_threshold_deg") {
+                cam.heading_threshold_rad = deg * (core::f64::consts::PI / 180.0);
+            }
+            if let Some(m) = num("position_threshold_m") {
+                cam.position_threshold_m = m;
+            }
+            if let Some(v) = num("speed_threshold_mps") {
+                cam.speed_threshold_mps = v;
+            }
+            if let Some(d) = ms("low_frequency_interval_ms") {
+                cam.low_frequency_interval = d;
+            }
+        }
+        _ => {}
+    }
+    (bsm, cam)
 }
 
 /// Puts `security.envelope` and `security.signer_id_policy` into a fresh node's security

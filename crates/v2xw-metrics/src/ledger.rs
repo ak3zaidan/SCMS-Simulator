@@ -26,9 +26,10 @@ use v2xw_core::ctx::{OwnedRecord, Visibility};
 
 use crate::channels::{
     ChannelView, DetObservationView, GtAttackActionView, GtKinematicsView, MaDecisionView,
-    MaReportView, MacCbrView, NetBytesView, NetFragView, NodeTelemetryView, NodeTxView,
+    MaReportView, MacCbrView, NetBytesView, NetFragView, NodeRxView, NodeTelemetryView, NodeTxView,
     NodeVerifyView, PhyRxView, ProtoMsgView, ProtoRevocationView, SecCertView, decode,
 };
+use crate::latency::LatencyTrace;
 
 /// A run's decoded records, in arrival order per channel.
 ///
@@ -44,6 +45,10 @@ pub struct EventLedger {
     pub tx: Vec<NodeTxView>,
     /// `phy.rx`, in arrival order.
     pub rx: Vec<PhyRxView>,
+    /// `node.rx`, in arrival order.
+    pub node_rx: Vec<NodeRxView>,
+    /// `msg.latency`, in arrival order.
+    pub latency: Vec<LatencyTrace>,
     /// `mac.cbr`, in arrival order.
     pub cbr: Vec<MacCbrView>,
     /// `net.frag`, in arrival order.
@@ -141,6 +146,8 @@ impl EventLedger {
         match rec.channel {
             NodeTxView::CHANNEL => take!(NodeTxView, tx),
             PhyRxView::CHANNEL => take!(PhyRxView, rx),
+            NodeRxView::CHANNEL => take!(NodeRxView, node_rx),
+            crate::latency::MSG_LATENCY => take!(LatencyTrace, latency),
             MacCbrView::CHANNEL => take!(MacCbrView, cbr),
             NetFragView::CHANNEL => take!(NetFragView, frag),
             NetBytesView::CHANNEL => take!(NetBytesView, bytes),

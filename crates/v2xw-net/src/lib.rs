@@ -32,6 +32,7 @@
 //! | `fragmenter/generic-sdu` | [`frag::generic`] | 04-models.md §7.3 |
 //! | `P_sdu = 1 - prod(1 - p_i)` and the hook that measures it | [`amplification`] | 04-models.md §7.4 |
 //! | Byte accounting, invariant I-N1 | [`accounting`] | 03-interfaces.md §5 |
+//! | One frame's PSDU by layer: payload, envelope, network, LLC/SNAP, MAC, FCS | [`frame`] | 04-models.md §4.6, §7, §9.3 |
 //! | Errors and drop causes | [`error`] | — |
 //!
 //! # The three numbers worth knowing
@@ -96,6 +97,7 @@ pub mod accounting;
 pub mod amplification;
 pub mod error;
 pub mod frag;
+pub mod frame;
 pub mod gn;
 pub mod netlayer;
 pub mod wsmp;
@@ -115,6 +117,7 @@ pub use frag::none::{FRAGMENTER_NONE_ID, NoneFragmenter};
 pub use frag::{
     FragRecord, FragmentDesc, FragmentKind, Fragmenter, ReassemblyBuffer, ReassemblyOutcome,
 };
+pub use frame::{FCS_BYTES, FrameLayers, FrameMsg, MAC_HEADER_QOS_DATA_BYTES, NetStack};
 pub use gn::{GN_BTP_NET_LAYER_ID, GnBtpNetLayer, GnParams, ITS_GN_MAX_SDU_SIZE};
 pub use netlayer::{
     BtpKind, BtpPort, DecapOutcome, GnTransport, NetLayer, NetMeta, NetPdu, Psid, Transport,

@@ -25,7 +25,8 @@ use v2xw_core::kinematics::Kinematics;
 use v2xw_core::math::{q3, quantize_to};
 use v2xw_core::time::SimTime;
 use v2xw_metrics::channels::{
-    GtKinematicsView, MacCbrView, NodeTelemetryView, NodeTxView, PhyRxView, RxOutcome, SignerId,
+    ByteBucket, GtKinematicsView, MacCbrView, NetBytesView, NodeRxView, NodeTelemetryView,
+    NodeTxView, PhyRxView, RxFate, RxOutcome, SignerId,
 };
 
 /// The dB grid every received-power and ratio field is written on (build decision D9).
@@ -71,6 +72,21 @@ channel_record!(
     Visibility::NodeAndGt
 );
 channel_record!(
+    /// `node.rx` — one reception attempt followed from the PHY to its fate, with every
+    /// stamp of the message's journey. Node-and-ground-truth, like `phy.rx`.
+    NodeRx,
+    NodeRxView,
+    "node.rx",
+    Visibility::NodeAndGt
+);
+channel_record!(
+    /// `net.bytes` — one transfer on an accounting bucket other than the air.
+    NetBytes,
+    NetBytesView,
+    "net.bytes",
+    Visibility::Node
+);
+channel_record!(
     /// `mac.cbr` — the channel busy ratio a node measured.
     MacCbr,
     MacCbrView,
@@ -104,7 +120,15 @@ impl GtKinematics {
             lane: q.lane.map(|l| l.lane.0),
             lane_pos_m: q.lane.map(|l| q3(l.s_m)),
             class: Some(class.to_string()),
+            node: None,
         })
+    }
+
+    /// The same record naming the node mounted on the actor.
+    #[must_use]
+    pub fn with_node(mut self, node: Option<NodeId>) -> Self {
+        self.0.node = node;
+        self
     }
 }
 
@@ -145,7 +169,47 @@ impl NodeTx {
             dcc_state: None,
             signer: Some(signer),
             t_generated: Some(t_generated),
+            t_sign_start: None,
+            t_signed: None,
+            mac_aifs_ns: None,
+            mac_backoff_ns: None,
+            net_header_bytes: None,
+            link_bytes: None,
+            frag_header_bytes: None,
+            spdu_bytes: None,
+            cert_bytes: None,
         })
+    }
+
+    /// Fills in the sender's side of the latency decomposition: when signing started, when
+    /// the frame reached the MAC, and how much of the channel-access delay was AIFS and how
+    /// much the backoff countdown the MAC reported.
+    #[must_use]
+    pub fn with_journey(
+        mut self,
+        t_sign_start: SimTime,
+        t_signed: SimTime,
+        mac_aifs_ns: u64,
+        mac_backoff_ns: u64,
+    ) -> Self {
+        self.0.t_sign_start = Some(t_sign_start);
+        self.0.t_signed = Some(t_signed);
+        self.0.mac_aifs_ns = Some(mac_aifs_ns);
+        self.0.mac_backoff_ns = Some(mac_backoff_ns);
+        self
+    }
+
+    /// Fills in the frame's layers (`v2xw_net::frame`): the SPDU, the network and transport
+    /// header, the link layer and any fragmentation header, which with the payload and
+    /// envelope partition `bytes_on_wire`; and the attached certificate's octets.
+    #[must_use]
+    pub fn with_layers(mut self, l: &v2xw_net::FrameLayers, cert_bytes: Option<u32>) -> Self {
+        self.0.spdu_bytes = Some(u64::from(l.spdu_bytes()));
+        self.0.net_header_bytes = Some(u64::from(l.network));
+        self.0.link_bytes = Some(u64::from(l.link_bytes()));
+        self.0.frag_header_bytes = Some(u64::from(l.fragmentation));
+        self.0.cert_bytes = cert_bytes.map(u64::from);
+        self
     }
 
     /// Fills in the payload/envelope split, when the node's own generator encoded one.
@@ -165,6 +229,163 @@ impl NodeTx {
         self.0.payload_bytes = payload_bytes.map(u64::from);
         self.0.envelope_bytes = envelope_bytes.map(u64::from);
         self
+    }
+}
+
+impl NodeRx {
+    /// A reception attempt at `rx`, not yet resolved: the PHY's measurements and the
+    /// sender's side of the journey, quantised (D9). The engine fills in the fate.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn attempt(
+        tx: NodeId,
+        rx: NodeId,
+        msg: u64,
+        msg_type: &str,
+        rssi_dbm: f64,
+        sinr_db: f64,
+        dist_m: f64,
+        bytes_on_wire: u64,
+        airtime_us: u64,
+        payload_bytes: Option<u64>,
+    ) -> Self {
+        NodeRx(NodeRxView {
+            t: 0,
+            rx,
+            tx: Some(tx),
+            msg: Some(msg),
+            msg_type: Some(msg_type.to_string()),
+            outcome: RxFate::InFlight,
+            cause: None,
+            verification: None,
+            rssi_dbm: Some(quantize_to(rssi_dbm, Q_DB)),
+            sinr_db: Some(quantize_to(sinr_db, Q_DB)),
+            dist_m: Some(q3(dist_m)),
+            bytes_on_wire: Some(bytes_on_wire),
+            airtime_us: Some(airtime_us),
+            payload_bytes,
+            t_generated: None,
+            t_sign_start: None,
+            t_signed: None,
+            mac_aifs_ns: None,
+            mac_backoff_ns: None,
+            t_tx_start: None,
+            t_tx_end: None,
+            t_arrival: None,
+            t_rx_done: None,
+            t_verify_start: None,
+            t_verify_done: None,
+            t_delivered: None,
+        })
+    }
+
+    /// The sender's side of the message's journey and the instant it reached this
+    /// receiver, all on the simulation's timeline.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn journey(
+        mut self,
+        t_generated: SimTime,
+        t_sign_start: SimTime,
+        t_signed: SimTime,
+        mac_aifs_ns: u64,
+        mac_backoff_ns: u64,
+        t_tx_start: SimTime,
+        t_tx_end: SimTime,
+        t_arrival: SimTime,
+    ) -> Self {
+        self.0.t_generated = Some(t_generated);
+        self.0.t_sign_start = Some(t_sign_start);
+        self.0.t_signed = Some(t_signed);
+        self.0.mac_aifs_ns = Some(mac_aifs_ns);
+        self.0.mac_backoff_ns = Some(mac_backoff_ns);
+        self.0.t_tx_start = Some(t_tx_start);
+        self.0.t_tx_end = Some(t_tx_end);
+        self.0.t_arrival = Some(t_arrival);
+        self
+    }
+
+    /// Resolves the attempt as lost to `cause` at `t`.
+    #[must_use]
+    pub fn lost(mut self, t: SimTime, cause: &str) -> Self {
+        self.0.t = t;
+        self.0.outcome = RxFate::Lost;
+        self.0.cause = Some(cause.to_string());
+        self
+    }
+
+    /// Resolves the attempt as delivered to the applications at `delivered`.
+    #[must_use]
+    pub fn delivered(mut self, t: SimTime, verification: &str, delivered: SimTime) -> Self {
+        self.0.t = t;
+        self.0.outcome = RxFate::Delivered;
+        self.0.cause = None;
+        self.0.verification = Some(verification.to_string());
+        self.0.t_delivered = Some(delivered);
+        self
+    }
+
+    /// Marks the attempt as still between the PHY and the application when the run ended.
+    #[must_use]
+    pub fn in_flight(mut self, t: SimTime) -> Self {
+        self.0.t = t;
+        self.0.outcome = RxFate::InFlight;
+        self
+    }
+}
+
+impl NetBytes {
+    /// One transfer of `bytes_on_wire` octets on `bucket`, identified by `id` (invariant
+    /// I-N1 needs the identity to detect a double attribution).
+    #[must_use]
+    pub fn new(
+        t: SimTime,
+        id: u64,
+        bucket: ByteBucket,
+        bytes_on_wire: u64,
+        node: Option<NodeId>,
+    ) -> Self {
+        NetBytes(NetBytesView {
+            t,
+            id: Some(id),
+            bucket,
+            bytes_on_wire,
+            node,
+        })
+    }
+}
+
+impl MacCbr {
+    /// One node's MAC report for a window: the measured busy ratio (quantised to D9's ratio
+    /// grid), the EDCA queue depth, and what was offered to and refused by the MAC.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn report(
+        t: SimTime,
+        node: NodeId,
+        channel: u16,
+        cbr: f64,
+        queue_depth: u64,
+        mac_drops: u64,
+        offered_frames: u64,
+        offered_bytes: u64,
+        offered_airtime_us: u64,
+        span_ns: u64,
+    ) -> Self {
+        MacCbr(MacCbrView {
+            t,
+            node,
+            channel: Some(channel),
+            cbr: quantize_to(cbr, 1e-4),
+            busy_us: None,
+            window_us: None,
+            queue_depth: Some(queue_depth),
+            mac_drops: Some(mac_drops),
+            offered_frames: Some(offered_frames),
+            offered_bytes: Some(offered_bytes),
+            offered_airtime_us: Some(offered_airtime_us),
+            span_ns: Some(span_ns),
+        })
     }
 }
 
@@ -290,6 +511,43 @@ mod tests {
         assert_eq!(view.sinr_db, Some(11.99));
         assert_eq!(view.dist_m, Some(123.457));
         assert_eq!(view.outcome, RxOutcome::Ok);
+
+        let rx = NodeRx::attempt(
+            NodeId::new(1),
+            NodeId::new(2),
+            42,
+            "bsm",
+            -82.123_456,
+            11.987_65,
+            123.456_789,
+            300,
+            424,
+            Some(40),
+        )
+        .lost(9, "collision");
+        let owned = rx.to_owned_record().expect("serialises");
+        assert_eq!(owned.channel, "node.rx");
+        assert_eq!(owned.visibility, Visibility::NodeAndGt);
+        let view: NodeRxView = decode(&owned).expect("decodes");
+        assert_eq!(view.outcome, RxFate::Lost);
+        assert_eq!(view.cause.as_deref(), Some("collision"));
+        assert_eq!(view.rssi_dbm, Some(-82.12));
+        assert_eq!(view.dist_m, Some(123.457));
+        assert_eq!(view.airtime_us, Some(424));
+
+        let bytes = NetBytes::new(5, 77, ByteBucket::Backhaul, 256, Some(NodeId::new(4)));
+        let owned = bytes.to_owned_record().expect("serialises");
+        let view: NetBytesView = decode(&owned).expect("decodes");
+        assert_eq!(view.bucket, ByteBucket::Backhaul);
+        assert_eq!(view.id, Some(77));
+
+        let cbr = MacCbr::report(5, NodeId::new(4), 172, 0.123_456_7, 3, 1, 10, 3000, 4240, 1);
+        let owned = cbr.to_owned_record().expect("serialises");
+        let view: MacCbrView = decode(&owned).expect("decodes");
+        assert_eq!(view.cbr, 0.1235);
+        assert_eq!(view.queue_depth, Some(3));
+        assert_eq!(view.offered_bytes, Some(3000));
+        v2xw_record::grid::scan_record("mac.cbr", &owned.json).expect("on its declared grid");
     }
 
     /// Every float in a `gt.kinematics` record sits on its declared grid, which is the

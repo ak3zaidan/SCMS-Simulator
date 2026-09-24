@@ -72,8 +72,8 @@ use v2xw_record::wire::telemetry::NodeTelemetry;
 use crate::clock::ClockModel;
 use crate::ctx::{NodeCtx, NodeCtxExt};
 use crate::policy::{
-    PolicyView, RxSummary, SkipReason, VerificationPolicy, VerifyAll, VerifyDecision,
-    VerifyDecisionRecord, VerifyReason,
+    PolicyView, RxSummary, VerificationPolicy, VerifyAll, VerifyDecision,
+    VerifyDecisionRecord,
 };
 use crate::profile::{HardwareProfile, RunsOn};
 use crate::queue::{Admission, DropCause, DropLedger, NodeQueue, QueueKind, Queued};
@@ -1346,6 +1346,21 @@ impl RsuRuntime {
             };
             self.window.verification(sched.wait);
             let verdict = self.classify(ctx, &frame);
+            ctx.emit(VerifyDecisionRecord::verified(
+                self.node,
+                q.enqueued_at,
+                sched.start,
+                sched.finish,
+                policy_id(self.policy.code()),
+                frame.msg_type.as_str(),
+                self.config.verify_op,
+                match verdict {
+                    VerificationState::Verified | VerificationState::Revoked => "valid",
+                    VerificationState::Invalid => "invalid",
+                    _ => "skipped",
+                },
+                0,
+            ));
             // The report-forwarding role, on the one message type that reaches it over the
             // air: a verified misbehaviour report goes into store-and-forward, and an
             // unverified one does not. A relay that forwarded what it had not checked
@@ -1553,6 +1568,7 @@ impl RsuRuntime {
                 full_certificate,
                 ready_at: sched.finish,
                 generation_time: believed,
+                sign_start: sched.start,
                 signed: Some(frame),
             });
         }
@@ -1657,36 +1673,17 @@ impl RsuRuntime {
         msg_type: MsgType,
         d: &VerifyDecision,
     ) {
-        let (outcome, reason, priority) = match d {
-            VerifyDecision::Verify { priority, reason } => (
-                "verify",
-                match reason {
-                    VerifyReason::PolicyVerifiesAll => "policy-verifies-all",
-                    VerifyReason::ApplicationRelevant => "application-relevant",
-                    VerifyReason::Proximate => "proximate",
-                    VerifyReason::UnknownSigner => "unknown-signer",
-                },
-                *priority,
-            ),
-            VerifyDecision::DeliverUnverified { reason } => (
-                "unverified",
-                match reason {
-                    SkipReason::NotRelevant => "not-relevant",
-                    SkipReason::KnownVerifiedSigner => "known-verified-signer",
-                },
-                0,
-            ),
-            VerifyDecision::Drop { cause } => ("drop", cause.as_str(), 0),
-        };
-        ctx.emit(VerifyDecisionRecord {
-            node: self.node,
-            t_ns: believed,
-            policy: policy_id(self.policy.code()),
-            msg_type: msg_type.as_str(),
-            outcome,
-            reason,
-            priority,
-        });
+        // A skip or a drop settles the message's fate here; a decision to verify is
+        // recorded when the check runs (`run_verifications`), with its instants.
+        if let Some(rec) = VerifyDecisionRecord::decided(
+            self.node,
+            believed,
+            policy_id(self.policy.code()),
+            msg_type.as_str(),
+            d,
+        ) {
+            ctx.emit(rec);
+        }
     }
 
     fn close_window(&mut self, now: SimTime) -> NodeTelemetry {

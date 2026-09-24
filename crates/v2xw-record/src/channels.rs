@@ -145,6 +145,24 @@ pub const CHANNELS: &[ChannelSpec] = &[
         visibility: Visibility::Derived,
         payload_bytes: None,
     },
+    // One message's latency decomposed into stages, for a flow other than V2V (a
+    // backend exchange, a relay). Its endpoints may be true node ids, so it is tagged as
+    // `phy.rx` is.
+    ChannelSpec {
+        name: "msg.latency",
+        wire_id: None,
+        visibility: Visibility::NodeAndGt,
+        payload_bytes: None,
+    },
+    // The byte-accounting projection of the `net.*` family (invariant I-N1): one record
+    // per transfer on a bucket other than the air, which `node.tx` already carries.
+    // Never an `Event` payload.
+    ChannelSpec {
+        name: "net.bytes",
+        wire_id: None,
+        visibility: Visibility::Node,
+        payload_bytes: None,
+    },
     ChannelSpec {
         name: "net.frag",
         wire_id: Some(13),
@@ -156,6 +174,15 @@ pub const CHANNELS: &[ChannelSpec] = &[
         wire_id: Some(16),
         visibility: Visibility::Node,
         payload_bytes: Some(32),
+    },
+    // One reception attempt followed to its fate, with the stamps of its journey. The
+    // sender and the distance are ground truth, as on `phy.rx`. Not an `Event` payload:
+    // at one record per attempt it is a recording and metric channel, not a UI one.
+    ChannelSpec {
+        name: "node.rx",
+        wire_id: None,
+        visibility: Visibility::NodeAndGt,
+        payload_bytes: None,
     },
     ChannelSpec {
         name: "node.telemetry",

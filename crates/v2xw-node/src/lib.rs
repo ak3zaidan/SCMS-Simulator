@@ -114,7 +114,10 @@ pub use rsu::{
     Backhaul, BackhaulKind, ForwardItem, ForwardKind, ForwardQueue, RsuConfig, RsuRole, RsuRoles,
     RsuRuntime, RsuStepOutcome,
 };
-pub use runtime::{NodeConfig, ObuRuntime, RxFrame, StepOutcome, Transmission, VerifiedMessage};
+pub use runtime::{
+    NodeConfig, ObuRuntime, RxDisposition, RxFrame, RxReport, RxStamp, StepOutcome, Transmission,
+    VerifiedMessage,
+};
 pub use safety::{
     Eebl, EeblParams, Fcw, FcwParams, Ima, ImaParams, SafetyApp, SafetyAppSet, Severity,
     Surrogates, Warning, WarningKind, WarningRecord,

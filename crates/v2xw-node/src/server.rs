@@ -298,6 +298,16 @@ impl ServerBank {
         self.free_at.len()
     }
 
+    /// The instant the first server frees up — when a task offered now would start, if it
+    /// arrived no later than this.
+    ///
+    /// What a FIFO waiting line in front of the bank needs to simulate itself in continuous
+    /// time: the head of the line starts at `max(its arrival, earliest_free())`, and it is
+    /// in the queue (not in service) until then.
+    pub fn earliest_free(&self) -> SimTime {
+        self.free_at.iter().copied().min().unwrap_or(0)
+    }
+
     /// Offers one task of length `duration`, arriving at `arrival`.
     ///
     /// The task goes to the server that frees up first; ties go to the lowest-indexed

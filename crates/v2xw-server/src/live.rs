@@ -81,7 +81,7 @@ use v2xw_core::ids::{ActorId, LaneId, NodeId, SignalId};
 use v2xw_core::time::{Duration, SimTime};
 use v2xw_engine::{Scenario, run::RunReport};
 use v2xw_metrics::channels::{
-    DetObservationView, GtKinematicsView, MacCbrView, NodeTelemetryView, NodeTxView,
+    DetObservationView, GtKinematicsView, MacCbrView, NodeRxView, NodeTelemetryView, NodeTxView,
     NodeVerifyView, PhyRxView, ProtoRevocationView, RxOutcome, SecCertView, SignerId,
     VerifyOutcome, decode,
 };
@@ -221,6 +221,9 @@ struct Setup {
     /// The same entries as `provenance`, resolved to strings for `explain` (§6.9).
     prov_chain: Vec<Value>,
     catalogue: Vec<MetricInfo>,
+    /// Series names that are another series under a second spelling: a breakdown with a
+    /// single declared value is the metric's headline (`bytes_air[air]` is `bytes_air`).
+    metric_aliases: Vec<(String, String)>,
     /// Class names by `class_idx`, so the projector can map `gt.kinematics.class`.
     class_names: Vec<String>,
     /// Signal plans as `(signal id, phase boundaries)`, evaluated by the projector.
@@ -917,24 +920,39 @@ fn assemble_setup(
         .map_err(|e| ServerError::Internal(e.to_string()))?;
     let providers = v2xw_engine::wiring::build_metrics(scenario, &mut registry)
         .map_err(|e| ServerError::Internal(e.to_string()))?;
-    let catalogue: Vec<MetricInfo> = providers
-        .catalog()
-        .into_iter()
-        .map(|def| {
-            let visibility = crate::visibility_name(def.visibility).to_string();
-            MetricInfo {
-                str_id: strings.intern(&def.name),
-                agg_code: agg_code(&def.agg.tag()),
-                name: def.name,
-                unit: def.unit,
-                agg: def.agg.tag(),
-                visibility,
-                definition_md: def.definition_md,
-                dims: def.dims.iter().map(ToString::to_string).collect(),
-                not_accounted: def.not_accounted,
+    // One catalogue row per *series* the stream can carry, each interned now: §2.5's table
+    // is append-only and a `MetricSample` has nowhere to put an extension, so every name a
+    // sample can be sent under has to be in the table before the first frame. A metric is
+    // its headline series; a distribution adds its three percentiles; a metric that
+    // declares a breakdown adds one series per declared value (see `metric_series`).
+    let mut catalogue: Vec<MetricInfo> = Vec::new();
+    let mut metric_aliases: Vec<(String, String)> = Vec::new();
+    for def in providers.catalog() {
+        let visibility = crate::visibility_name(def.visibility).to_string();
+        let source = def.source.as_ref().map(|s| s.reference.clone()).unwrap_or_default();
+        for series in metric_series(&def) {
+            match series {
+                Series::Alias { from, to } => metric_aliases.push((from, to)),
+                Series::Row { name, agg, note } => catalogue.push(MetricInfo {
+                    str_id: strings.intern(&name),
+                    agg_code: agg_code(&agg),
+                    name,
+                    unit: def.unit.clone(),
+                    agg,
+                    visibility: visibility.clone(),
+                    definition_md: if note.is_empty() {
+                        def.definition_md.clone()
+                    } else {
+                        format!("{note} {}", def.definition_md)
+                    },
+                    dims: def.dims.iter().map(ToString::to_string).collect(),
+                    not_accounted: def.not_accounted.clone(),
+                    source: source.clone(),
+                    base: def.name.clone(),
+                }),
             }
-        })
-        .collect();
+        }
+    }
 
     // §3.8: one provenance entry per registered model, so every `prov_id` the stream
     // references resolves to a real card rather than to a fixture's invention.
@@ -1044,6 +1062,7 @@ fn assemble_setup(
         provenance,
         prov_chain,
         catalogue,
+        metric_aliases,
         class_names,
         signals,
         equipped_fraction: scenario.actors.vehicles.equipped_fraction,
@@ -1096,6 +1115,76 @@ fn hex_bytes(hex: &str) -> Vec<u8> {
             (hi << 4) | lo
         })
         .collect()
+}
+
+/// One series a metric contributes to the stream's catalogue.
+enum Series {
+    /// A row of its own: a name to intern, its aggregation tag, and a note on what the
+    /// series is, prefixed to the metric's definition.
+    Row {
+        name: String,
+        agg: String,
+        note: String,
+    },
+    /// A second spelling of another series.
+    Alias { from: String, to: String },
+}
+
+/// The series one metric is streamed as.
+///
+/// The headline (no dimension); for a distribution, its p50, p95 and p99; and for a metric
+/// that declares a breakdown (`MetricDef::breakdown`), one `name[value]` series per
+/// declared value — or, when it declares exactly one value, an alias of the headline. A
+/// metric declared `breakdown_only` has no headline (every sample carries its value), so
+/// it offers only the per-value series rather than a row that would never receive data.
+fn metric_series(def: &v2xw_metrics::MetricDef) -> Vec<Series> {
+    let mut out = Vec::new();
+    let distribution = matches!(def.agg, v2xw_metrics::Agg::Distribution);
+    if !def.breakdown_only {
+        out.push(Series::Row {
+            name: def.name.clone(),
+            agg: if distribution {
+                "mean".to_string()
+            } else {
+                def.agg.tag()
+            },
+            note: if distribution {
+                "Mean over the window.".to_string()
+            } else {
+                String::new()
+            },
+        });
+    }
+    if distribution && !def.breakdown_only {
+        for q in ["p50", "p95", "p99"] {
+            out.push(Series::Row {
+                name: format!("{}.{q}", def.name),
+                agg: q.to_string(),
+                note: format!("The {q} (type-7 quantile) over the window."),
+            });
+        }
+    }
+    if let Some((dim, values)) = def.breakdown.as_ref() {
+        if values.len() == 1 {
+            out.push(Series::Alias {
+                from: format!("{}[{}]", def.name, values[0]),
+                to: def.name.clone(),
+            });
+        } else {
+            for v in values {
+                out.push(Series::Row {
+                    name: format!("{}[{v}]", def.name),
+                    agg: if matches!(def.agg, v2xw_metrics::Agg::Distribution) {
+                        "mean".to_string()
+                    } else {
+                        def.agg.tag()
+                    },
+                    note: format!("For {dim} = {v}."),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// `MetricAgg` of §3.7 for an aggregation's tag.
@@ -1242,6 +1331,10 @@ struct Projector {
     unmapped_nodes: BTreeSet<u32>,
     /// Metric names the stream carried that the symbol table does not hold.
     unnamed_metrics: BTreeSet<String>,
+    /// Per node, the most recent frames it put on the air and the most recent receptions
+    /// it resolved, as the evidence `inspect.node`'s `messages` section shows for a
+    /// followed vehicle. Bounded at [`MESSAGE_LOG`] each.
+    messages: BTreeMap<NodeId, (std::collections::VecDeque<Value>, std::collections::VecDeque<Value>)>,
     /// Channels seen in the stream that this projector has no §3.6 payload for.
     unprojected_channels: BTreeSet<String>,
     /// Channels whose records the channel's own reader-side view could not decode.
@@ -1275,7 +1368,7 @@ impl Projector {
             .enumerate()
             .map(|(i, s)| (s.clone(), u32::try_from(i).unwrap_or(0)))
             .collect();
-        let metric_ids = setup
+        let mut metric_ids: BTreeMap<String, (u32, u16, u8)> = setup
             .catalogue
             .iter()
             .map(|m| {
@@ -1285,6 +1378,11 @@ impl Projector {
                 )
             })
             .collect();
+        for (from, to) in &setup.metric_aliases {
+            if let Some(ids) = metric_ids.get(to).copied() {
+                metric_ids.insert(from.clone(), ids);
+            }
+        }
         let step_ns = setup.cadence.mobility_step.as_nanos().max(1);
         Projector {
             step_ns,
@@ -1309,6 +1407,7 @@ impl Projector {
             over_capacity: BTreeSet::new(),
             unmapped_nodes: BTreeSet::new(),
             unnamed_metrics: BTreeSet::new(),
+            messages: BTreeMap::new(),
             unprojected_channels: BTreeSet::new(),
             undecodable_channels: BTreeMap::new(),
             links: BTreeMap::new(),
@@ -1412,6 +1511,7 @@ impl Projector {
                         if let Some(power) = view.power_dbm {
                             counters.tx_power_cdbm = Some((power * 100.0).round() as i16);
                         }
+                        self.log_message(view.node, true, sent_json(&view));
                         events.push(EventEntry {
                             sim_time_ns: t,
                             channel_id: 10,
@@ -1536,6 +1636,24 @@ impl Projector {
                         self.counters.entry(node).or_default().reported = Some(view);
                     }
                 },
+                // One reception attempt's fate, a backend flow's latency trace and a
+                // transfer's byte accounting are recording and metric channels: the stream
+                // carries what they measure as metric samples, not as §3.6 payloads.
+                "node.rx" => {
+                    // The evidence is what the radio decoded: a delivery, or a loss above the
+                    // PHY. The PHY's own losses — most of them a distant frame below
+                    // sensitivity — are on `phy.rx` and in the link view.
+                    if let Ok(view) = decode::<NodeRxView>(record)
+                        && (view.outcome == v2xw_metrics::channels::RxFate::Delivered
+                            || !view
+                                .cause
+                                .as_deref()
+                                .is_some_and(v2xw_metrics::channels::rx_cause::is_phy))
+                    {
+                        self.log_message(view.rx, false, received_json(&view));
+                    }
+                }
+                "msg.latency" | "net.bytes" => {}
                 "metric.sample" => match serde_json::from_slice::<MetricSample>(&record.json) {
                     Ok(sample) => self.push_metric(&sample, &mut metrics),
                     Err(_) => self.undecodable(record.channel),
@@ -1599,6 +1717,16 @@ impl Projector {
             recorded: Vec::new(),
             generation: 0,
         }
+    }
+
+    /// Appends one message to a node's evidence log, dropping the oldest past the bound.
+    fn log_message(&mut self, node: NodeId, sent: bool, entry: Value) {
+        let (tx, rx) = self.messages.entry(node).or_default();
+        let log = if sent { tx } else { rx };
+        if log.len() >= MESSAGE_LOG {
+            log.pop_front();
+        }
+        log.push_back(entry);
     }
 
     /// Counts one record its channel's own reader-side view refused.
@@ -1779,36 +1907,126 @@ impl Projector {
     }
 
     /// Appends the §3.7 rows one metric sample produces.
+    ///
+    /// A sample is sent under the series its dimensions name (see `metric_series`): no
+    /// dimension is the headline, plus the three percentiles of a distribution; one
+    /// declared breakdown dimension is `name[value]`. A per-node sample is not a series —
+    /// one plot line per node would be thousands of lines — and the metric's headline
+    /// carries the across-node figure. A sample under no interned series is counted in
+    /// `unnamed_metrics` rather than sent under a name the client cannot resolve, and
+    /// before this every dimensioned sample was sent under its bare name, so a metric's
+    /// plot interleaved its distance bins, its causes and its nodes into one zig-zag line.
     fn push_metric(&mut self, sample: &MetricSample, out: &mut Vec<MetricRow>) {
-        let Some((str_metric, agg, visibility)) = self.metric_ids.get(&sample.metric).copied()
-        else {
-            self.unnamed_metrics.insert(sample.metric.clone());
+        if sample.dims.iter().any(|(d, _)| d.to_string() == "node") {
             return;
-        };
-        let Some(value) = sample.value.point() else {
-            // An insufficient sample is a refusal, not a zero, and §3.7 has no encoding
-            // for one. Dropping it is right: the client sees a gap, which is what
+        }
+        let dims: Vec<String> = sample
+            .dims
+            .iter()
+            .filter(|(d, _)| d.to_string() != "t")
+            .map(|(_, v)| v.to_string())
+            .collect();
+        let mut rows: Vec<(String, Option<f64>)> = Vec::new();
+        match dims.as_slice() {
+            [] => {
+                rows.push((sample.metric.clone(), sample.value.point()));
+                if let v2xw_metrics::SampleValue::Distribution(d) = &sample.value {
+                    for (suffix, q) in [
+                        ("p50", v2xw_metrics::Percentile::P50),
+                        ("p95", v2xw_metrics::Percentile::P95),
+                        ("p99", v2xw_metrics::Percentile::P99),
+                    ] {
+                        rows.push((format!("{}.{suffix}", sample.metric), d.quantile(q)));
+                    }
+                }
+            }
+            [value] => rows.push((format!("{}[{value}]", sample.metric), sample.value.point())),
+            _ => return,
+        }
+        for (series, value) in rows {
+            let Some((str_metric, agg, visibility)) = self.metric_ids.get(&series).copied()
+            else {
+                // A breakdown the metric does not declare is left to the recording and
+                // `metrics.json` on purpose. Only a metric the table does not know at all is
+                // the defect `unnamed_metrics` exists to surface.
+                if !self.metric_ids.contains_key(&sample.metric) {
+                    self.unnamed_metrics.insert(sample.metric.clone());
+                }
+                continue;
+            };
+            // An insufficient sample is a refusal, not a zero, and §3.7 has no encoding for
+            // one. Dropping it is right: the client sees a gap, which is what
             // "insufficient" means.
-            return;
-        };
-        let node_id = match &sample.dims.iter().find(|(d, _)| d.to_string() == "node") {
-            Some((_, v)) => v.to_string().parse::<u32>().unwrap_or(U32_NONE),
-            None => U32_NONE,
-        };
-        out.push(MetricRow {
-            value,
-            str_metric,
-            // The dimension dictionary is a §3.8 `Provenance` structure and this build's
-            // one metric carries no dimensions; `0` is §3.7's "no dimensions".
-            dim_key: 0,
-            node_id,
-            count: u32::try_from(sample.value.n()).unwrap_or(u32::MAX),
-            agg,
-            visibility,
-            prov_id: self.metric_prov,
-        });
+            let Some(value) = value else { continue };
+            out.push(MetricRow {
+                value,
+                str_metric,
+                // The dimension is in the series name, so the row carries none; `0` is
+                // §3.7's "no dimensions".
+                dim_key: 0,
+                node_id: U32_NONE,
+                count: u32::try_from(sample.value.n()).unwrap_or(u32::MAX),
+                agg,
+                visibility,
+                prov_id: self.metric_prov,
+            });
+        }
         out.sort_by_key(|r| (r.str_metric, r.node_id));
+        out.dedup_by_key(|r| (r.str_metric, r.node_id));
     }
+}
+
+/// How many sent and how many received messages a node's evidence log keeps.
+const MESSAGE_LOG: usize = 64;
+
+/// One transmitted frame as a followed vehicle's evidence: what it was and every octet
+/// of it by layer, and when it was generated, signed and put on the air.
+fn sent_json(v: &NodeTxView) -> Value {
+    json!({
+        "t_ns": v.t,
+        "msg": v.msg,
+        "msg_type": v.msg_type,
+        "bytes_on_wire": v.bytes_on_wire,
+        "payload_bytes": v.payload_bytes,
+        "envelope_bytes": v.envelope_bytes,
+        "cert_bytes": v.cert_bytes,
+        "net_header_bytes": v.net_header_bytes,
+        "link_bytes": v.link_bytes,
+        "airtime_us": v.airtime_us,
+        "power_dbm": v.power_dbm,
+        "signer": v.signer,
+        "t_generated_ns": v.t_generated,
+        "t_signed_ns": v.t_signed,
+    })
+}
+
+/// One reception as a followed vehicle's evidence: from whom, what it measured, what
+/// became of it, and — when it reached an application — its delay stage by stage, in ms.
+fn received_json(v: &NodeRxView) -> Value {
+    let stages: serde_json::Map<String, Value> = v
+        .latency_trace()
+        .map(|t| {
+            t.stage_ns()
+                .into_iter()
+                .map(|(k, ns)| (k, json!((ns as f64) / 1e6)))
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "t_ns": v.t,
+        "msg": v.msg,
+        "from": v.tx,
+        "msg_type": v.msg_type,
+        "outcome": v.outcome,
+        "cause": v.cause,
+        "verification": v.verification,
+        "rssi_dbm": v.rssi_dbm,
+        "sinr_db": v.sinr_db,
+        "dist_m": v.dist_m,
+        "bytes_on_wire": v.bytes_on_wire,
+        "e2e_ms": v.e2e_ns().map(|ns| (ns as f64) / 1e6),
+        "stages_ms": stages,
+    })
 }
 
 /// `MovementPhaseState` (SAE J2735) for a world signal state.
@@ -3489,6 +3707,24 @@ impl Introspect for LiveEngine {
                 }
             }
             return Some(Value::Array(rows));
+        }
+        // `messages`: what this node most recently sent and received, message by message —
+        // each frame's layers and stamps, each reception's fate, cause and decomposed
+        // delay. Answered from the projector's log, so it needs no telemetry window.
+        if section == "messages" {
+            let (sent, received) = self.projector.messages.get(&NodeId::new(node))?;
+            let now = self.sim_time();
+            let pick = |log: &std::collections::VecDeque<Value>| -> Vec<Value> {
+                let mut v: Vec<Value> = log
+                    .iter()
+                    .filter(|e| e["t_ns"].as_u64().is_none_or(|t| t <= now))
+                    .cloned()
+                    .collect();
+                let skip = v.len().saturating_sub(limit);
+                v.drain(..skip);
+                v
+            };
+            return Some(json!({ "sent": pick(sent), "received": pick(received) }));
         }
         let telemetry = self.last_telemetry.get(&node)?;
         match section {

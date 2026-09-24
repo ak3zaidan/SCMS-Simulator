@@ -674,6 +674,38 @@ button.stat:focus-visible { outline: 2px solid var(--accent); outline-offset: 1p
 .menu-pop .kv { grid-template-columns: minmax(64px, max-content) 1fr; }
 .menu-pop.wide { min-width: 340px; max-width: 460px; }
 
+/* ------------------------------------------------------------------ measurement picker */
+
+/* The strip is the picker's anchor: it opens upwards over the viewport, above the plots. */
+.plots { position: relative; }
+.metric-picker { left: 10px; width: min(560px, calc(100vw - 32px)); max-width: none; max-height: 55vh; }
+.metric-picker-head {
+  display: flex;
+  gap: 6px;
+  position: sticky;
+  top: -6px;
+  background: var(--bg-panel);
+  padding: 2px 0 6px;
+  z-index: 1;
+}
+.metric-picker-head input { flex: 1; min-width: 0; }
+.metric-family { margin-bottom: 6px; }
+.metric-family-name {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 4px 0 2px;
+}
+.metric-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto auto;
+  gap: 8px;
+  font-size: 11px;
+}
+.metric-row .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.metric-live { color: var(--accent); font-size: 10px; }
+
 .note.warn-note { border-left-color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
 
 /* ---------------------------------------------- the transport bar (state/transport.ts) */

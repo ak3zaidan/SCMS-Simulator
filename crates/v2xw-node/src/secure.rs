@@ -347,6 +347,10 @@ pub struct SignedFrame {
     pub payload: Vec<u8>,
     /// The IEEE 1609.2 `SignedData` SPDU: what actually goes on the air.
     pub spdu: Vec<u8>,
+    /// The octets of the signer's certificate inside the envelope when a full certificate
+    /// was attached (its COER encoding), zero when the signer was named by an eight-octet
+    /// digest. What the certificate-versus-digest share of the envelope is computed from.
+    pub cert_bytes: u32,
 }
 
 impl SignedFrame {
@@ -598,9 +602,15 @@ impl NodeSecurity {
         let pdu = self
             .crypto
             .sign_envelope(&self.envelope, ctx, &signer, payload, &hdr, sid)?;
+        let cert_bytes = if pdu.signer_id == v2xw_sec::SignerIdChoice::Certificate {
+            u32::try_from(signer.cert_coer().len()).unwrap_or(u32::MAX)
+        } else {
+            0
+        };
         let frame = SignedFrame {
             payload: payload.to_vec(),
             spdu: pdu.bytes().to_vec(),
+            cert_bytes,
         };
         Ok((frame, pdu))
     }

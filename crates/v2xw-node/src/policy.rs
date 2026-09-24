@@ -113,23 +113,146 @@ pub enum SkipReason {
     KnownVerifiedSigner,
 }
 
-/// The record a policy decision lands on (`node.verify`, 06-node-models.md §2.1).
+/// One verification task and its fate — the `node.verify` record (03-interfaces.md §14,
+/// 06-node-models.md §2.1).
+///
+/// # Its shape is the reader's
+///
+/// The record decodes as `v2xw_metrics::channels::NodeVerifyView`: `t_enqueue`, the
+/// optional `t_start` and `t_done`, and an `outcome` of `valid`, `invalid`, `dropped` or
+/// `skipped`. It used to be a *decision* log — `t_ns` and an outcome of `verify`,
+/// `unverified` or `drop` — which no reader of the channel could decode: every metric on
+/// `node.verify` read nothing, and the live server counted every record as undecodable.
+///
+/// A task is recorded once, when its fate is known: a policy's skip or drop at the
+/// decision, a verification when it runs ([`VerifyDecisionRecord::verified`]). Every
+/// instant is on the node's own clock, which is what the node can know; durations
+/// between them are unaffected by its offset.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct VerifyDecisionRecord {
     /// Which node decided.
     pub node: NodeId,
-    /// The node's own clock at the decision.
-    pub t_ns: SimTime,
+    /// When the message was offered to the policy, on the node's own clock.
+    pub t_enqueue: SimTime,
+    /// When the signature check started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t_start: Option<SimTime>,
+    /// When it finished.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t_done: Option<SimTime>,
     /// Which policy.
     pub policy: &'static str,
     /// What kind of message.
     pub msg_type: &'static str,
-    /// `verify`, `unverified` or `drop`.
+    /// `valid`, `invalid`, `dropped` or `skipped`.
     pub outcome: &'static str,
     /// The reason, in the policy's own vocabulary.
     pub reason: &'static str,
-    /// The queue priority, for a message that will be verified.
+    /// The queue priority, for a message that was verified.
     pub priority: u32,
+    /// The primitive, for a message that was verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primitive: Option<&'static str>,
+    /// The modelled cost, µs, for a message that was verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_us: Option<u64>,
+    /// How many tasks were waiting ahead of this one when it was queued.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_depth: Option<u64>,
+}
+
+impl VerifyDecisionRecord {
+    /// The record of a decision that settles the message's fate at once — a skip or a
+    /// drop — or `None` for a decision to verify, whose record is written when the check
+    /// runs.
+    #[must_use]
+    pub fn decided(
+        node: NodeId,
+        at: SimTime,
+        policy: &'static str,
+        msg_type: &'static str,
+        decision: &VerifyDecision,
+    ) -> Option<Self> {
+        let (outcome, reason) = match decision {
+            VerifyDecision::Verify { .. } => return None,
+            VerifyDecision::DeliverUnverified { reason } => (
+                "skipped",
+                match reason {
+                    SkipReason::NotRelevant => "not-relevant",
+                    SkipReason::KnownVerifiedSigner => "known-verified-signer",
+                },
+            ),
+            VerifyDecision::Drop { cause } => ("dropped", cause.as_str()),
+        };
+        Some(Self {
+            node,
+            t_enqueue: at,
+            t_start: None,
+            t_done: None,
+            policy,
+            msg_type,
+            outcome,
+            reason,
+            priority: 0,
+            primitive: None,
+            cost_us: None,
+            queue_depth: None,
+        })
+    }
+
+    /// The record of a task the queue refused or evicted.
+    #[must_use]
+    pub fn overflowed(
+        node: NodeId,
+        at: SimTime,
+        policy: &'static str,
+        msg_type: &'static str,
+    ) -> Self {
+        Self {
+            node,
+            t_enqueue: at,
+            t_start: None,
+            t_done: None,
+            policy,
+            msg_type,
+            outcome: "dropped",
+            reason: DropCause::VerifyOverflow.as_str(),
+            priority: 0,
+            primitive: None,
+            cost_us: None,
+            queue_depth: None,
+        }
+    }
+
+    /// The record of a signature check that ran.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn verified(
+        node: NodeId,
+        enqueued: SimTime,
+        start: SimTime,
+        done: SimTime,
+        policy: &'static str,
+        msg_type: &'static str,
+        primitive: &'static str,
+        outcome: &'static str,
+        queue_depth: u64,
+    ) -> Self {
+        Self {
+            node,
+            t_enqueue: enqueued,
+            t_start: Some(start),
+            t_done: Some(done),
+            policy,
+            msg_type,
+            outcome,
+            reason: "verified",
+            priority: 0,
+            primitive: Some(primitive),
+            cost_us: Some(done.saturating_sub(start) / 1_000),
+            queue_depth: Some(queue_depth),
+        }
+    }
 }
 
 impl v2xw_core::ctx::Record for VerifyDecisionRecord {
