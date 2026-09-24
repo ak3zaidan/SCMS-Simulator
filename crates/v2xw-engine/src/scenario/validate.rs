@@ -724,7 +724,9 @@ pub static KEY_STATUS: &[KeyStatus] = &[
         note: "Physical-layer fidelity. Medium decides each frame from its SINR over time \
                with the 802.11p error model; high adds preamble capture, which only \
                changes frames that overlap another at the receiver, so a sparse run gives \
-               the same result at either.",
+               the same result at either. Abstract takes effect together with an abstract \
+               MAC (reception from a table); with a medium or high MAC the frame is \
+               decided by the medium PHY, so abstract and medium give the same run.",
     },
     KeyStatus {
         path: "radio.tiers.mac",
@@ -875,7 +877,12 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus {
         path: "security.envelope",
         status: Status::Wired,
-        note: "Which secured-message envelope the nodes use.",
+        note: "Which secured-message envelope the nodes use. 'etsi103097' is the ETSI \
+               TS 103 097 profile of the same IEEE 1609.2 structure: it enforces that \
+               profile's rules when a node signs (a DENM must carry its generation \
+               location, for one), and the ETSI credential protocol requires it. A BSM \
+               signed under either profile has the same octets, so on a BSM run the two \
+               give the same result.",
     },
     KeyStatus {
         path: "security.protocol",
