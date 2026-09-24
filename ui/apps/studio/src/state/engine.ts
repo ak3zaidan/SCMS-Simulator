@@ -35,6 +35,7 @@ import {
   type WorldChunkMessage,
   type ParamsOf,
   type ResultOf,
+  type InspectNodeParams,
 } from "@vwp/protocol";
 import { CAMERA_MODES, Viewer, type CameraMode, type OverlayEntry } from "@vwp/viewer";
 import type { OverlayName } from "@vwp/protocol";
@@ -126,6 +127,9 @@ const SPARK_KEYS = SPARKLINE_SERIES.map((s) => s.key);
 
 /** How often the DOM-side projection of the hot state is refreshed (09-ui §4). */
 const STORE_HZ = 5;
+
+/** How often the followed node's inspector (and its message log) is refreshed, ms. */
+const INSPECT_POLL_MS = 1000;
 
 /**
  * The methods that act on a connection's own view and are refused over `POST /rpc` (§6.2, −32009).
@@ -279,6 +283,7 @@ export class StudioEngine {
       this.viewer?.select(null);
       this.viewer?.cameras.follow(null);
       this.#followedNode = null;
+      this.#stopInspectPoll();
       useStudio.getState().setSelection(null, null);
     }
     const client = this.client;
@@ -578,6 +583,7 @@ export class StudioEngine {
     this.client?.close(1000, "studio closed");
     this.client = null;
     this.#followedNode = null;
+    this.#stopInspectPoll();
     this.telemetry.clear();
     this.spark.reset();
     this.metrics.reset();
@@ -795,6 +801,7 @@ export class StudioEngine {
       this.viewer?.select(null);
       this.viewer?.cameras.follow(null);
       this.#followedNode = null;
+      this.#stopInspectPoll();
       store.setSelection(null, null);
       if (this.client) await this.request("view.follow", { clear: true }).catch(() => undefined);
       await this.setFollowChannels(false);
@@ -819,6 +826,7 @@ export class StudioEngine {
     }
     await this.setFollowChannels(true);
     void this.inspectFollowed();
+    this.#startInspectPoll();
   }
 
   /**
@@ -860,22 +868,50 @@ export class StudioEngine {
     await this.request("view.follow", { node: nodeId, telemetry: true }).catch(() => undefined);
     await this.setFollowChannels(true);
     void this.inspectFollowed();
+    this.#startInspectPoll();
   }
 
-  /** §6.8 — pull the inspector payload for the followed node. */
-  async inspectFollowed(): Promise<void> {
+  /**
+   * §6.8 — pull the inspector payload for the followed node, including its `messages` section:
+   * what it most recently broadcast (with each message's content and pseudonym) and what it heard.
+   *
+   * `quiet` is the once-a-second refresh while something is followed. It goes straight to the
+   * socket so it does not fill the Calls-made list, keeps the last answer when one poll fails, and
+   * drops an answer for a node that is no longer the followed one.
+   */
+  async inspectFollowed(quiet = false): Promise<void> {
     const node = this.#followedNode;
     if (node === null || !this.client) return;
+    const params = {
+      node,
+      include: ["telemetry", "stores", "queues", "neighbors", "certs", "crl", "provenance", "messages"] as InspectNodeParams["include"],
+      limit: 50,
+    };
     try {
-      const res = await this.request("inspect.node", {
-        node,
-        include: ["telemetry", "stores", "queues", "neighbors", "certs", "crl", "provenance"],
-        limit: 50,
-      });
+      const res =
+        quiet && this.streaming
+          ? await this.client.request("inspect.node", params)
+          : await this.request("inspect.node", params);
+      if (this.#followedNode !== node) return;
       useStudio.getState().setInspect(res);
     } catch {
-      useStudio.getState().setInspect(null);
+      if (!quiet) useStudio.getState().setInspect(null);
     }
+  }
+
+  #inspectTimer: ReturnType<typeof setInterval> | null = null;
+
+  /** Refresh the followed node's inspector once a second, so its message log stays live. */
+  #startInspectPoll(): void {
+    this.#stopInspectPoll();
+    this.#inspectTimer = setInterval(() => {
+      if (this.#followedNode !== null && this.streaming) void this.inspectFollowed(true);
+    }, INSPECT_POLL_MS);
+  }
+
+  #stopInspectPoll(): void {
+    if (this.#inspectTimer !== null) clearInterval(this.#inspectTimer);
+    this.#inspectTimer = null;
   }
 
   // ---------------------------------------------------------------------------------------------

@@ -822,3 +822,10 @@ button.stat:focus-visible { outline: 2px solid var(--accent); outline-offset: 1p
 .runrow.current { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .runrow .name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .runrow .meta { font-size: 10px; color: var(--text-dim); font-family: var(--mono); }
+
+/* The followed vehicle's message log (components/MessageLog.tsx). */
+.msg-table td { vertical-align: top; }
+.msg-table tr.msg-lost td { color: var(--text-dim); }
+.msg-table tr.msg-rotated td { border-top: 1px solid var(--accent, #7aa2f7); }
+.msg-table .msg-badge { color: var(--accent, #7aa2f7); font-size: 10px; white-space: nowrap; }
+.msg-table tr.msg-detail td { text-align: left; background: var(--panel-2, transparent); }

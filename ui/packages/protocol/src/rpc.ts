@@ -325,14 +325,78 @@ export interface InspectNodeParams {
   include?: ("telemetry" | "stores" | "queues" | "neighbors" | "certs" | "crl" | "gnss" | "clock" | "apps" | "detectors" | "provenance" | "messages")[];
   limit?: number;
 }
-/** §6.8 — one neighbour-table row. */
+/**
+ * §6.8 — one neighbour-table row. The spec's row names a certificate `digest` and a `verify_state`;
+ * the live engine answers from its link history instead, with the sending `node`, whether its last
+ * frame was `heard` or `lost`, and the last RSSI. Both shapes are typed, so a client shows either.
+ */
 export interface InspectNeighbor {
-  digest: string;
-  verify_state: "unverified" | "verified" | "failed" | "revoked";
+  digest?: string;
+  verify_state?: "unverified" | "verified" | "failed" | "revoked";
+  node?: NodeId;
+  state?: "heard" | "lost";
+  rssi_dbm?: number | null;
   last_seen_ns: SimTimeNs;
   distance_m?: number;
   relevance?: number;
   messages?: number;
+}
+/** What one broadcast message said: its wire fields decoded, and the kinematic claim receivers are handed. */
+export interface InspectMessageContent {
+  msg_count?: number;
+  temp_id?: string;
+  sec_mark_ms?: number;
+  lat_deg?: number;
+  lon_deg?: number;
+  elev_m?: number;
+  speed_mps?: number;
+  heading_deg?: number;
+  part_ii?: number;
+  claimed_x_m?: number;
+  claimed_y_m?: number;
+  claimed_speed_mps?: number;
+  claimed_heading_rad?: number;
+}
+/** One frame the node put on the air (`inspect.node` `messages.sent`). */
+export interface InspectSentMessage {
+  t_ns: SimTimeNs;
+  msg?: number | null;
+  msg_type?: string | null;
+  bytes_on_wire: number;
+  payload_bytes?: number | null;
+  envelope_bytes?: number | null;
+  cert_bytes?: number | null;
+  net_header_bytes?: number | null;
+  link_bytes?: number | null;
+  airtime_us?: number | null;
+  power_dbm?: number | null;
+  signer?: "certificate" | "digest" | "self-signed" | null;
+  t_generated_ns?: SimTimeNs | null;
+  t_signed_ns?: SimTimeNs | null;
+  channel?: number | null;
+  pseudonym?: string | null;
+  content?: InspectMessageContent | null;
+}
+/** One reception at the node, followed to its fate (`inspect.node` `messages.received`). */
+export interface InspectReceivedMessage {
+  t_ns: SimTimeNs;
+  msg?: number | null;
+  from?: NodeId | null;
+  msg_type?: string | null;
+  outcome?: "delivered" | "lost" | "in-flight";
+  cause?: string | null;
+  verification?: string | null;
+  rssi_dbm?: number | null;
+  sinr_db?: number | null;
+  dist_m?: number | null;
+  bytes_on_wire?: number | null;
+  e2e_ms?: number | null;
+  stages_ms?: Record<string, number>;
+}
+/** `inspect.node`'s `messages` section: the followed node's recent traffic, oldest first. */
+export interface InspectMessages {
+  sent: InspectSentMessage[];
+  received: InspectReceivedMessage[];
 }
 /** §6.8 `inspect.node` result. `additionalProperties: true`, so unknown keys are kept (R9). */
 export interface InspectNodeResult {
@@ -346,6 +410,7 @@ export interface InspectNodeResult {
   queues?: Record<string, { depth?: number; p50?: number; p95?: number; policy?: string; drops?: Record<string, unknown> }>;
   stores?: Record<string, unknown>;
   neighbors?: InspectNeighbor[];
+  messages?: InspectMessages;
   certs?: Record<string, unknown>[];
   crl?: Record<string, unknown>;
   gnss?: Record<string, unknown>;

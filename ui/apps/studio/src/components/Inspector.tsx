@@ -14,6 +14,7 @@
 
 import { Fragment } from "react";
 
+import { MessageLog } from "./MessageLog.js";
 import { ObuHud } from "./ObuHud.js";
 import { WhyTab } from "./WhyTab.js";
 import { engine } from "../state/engine.js";
@@ -93,7 +94,7 @@ function StateTab(): React.JSX.Element {
       </div>
 
       {queues.length > 0 ? (
-        <div className="section">
+        <div className="section" data-testid="inspector-queues">
           <h3>Queues</h3>
           <table className="table">
             <thead>
@@ -124,24 +125,34 @@ function StateTab(): React.JSX.Element {
         </div>
       ) : null}
 
+      <MessageLog />
+
       {neighbors.length > 0 ? (
         <div className="section">
           <h3>Neighbour table ({neighbors.length})</h3>
           <table className="table" data-testid="neighbour-table">
             <thead>
               <tr>
-                <th>digest</th>
+                <th>neighbour</th>
                 <th>state</th>
-                <th>msgs</th>
+                <th>msgs / RSSI</th>
                 <th>last seen</th>
               </tr>
             </thead>
             <tbody>
-              {neighbors.slice(0, 20).map((n) => (
-                <tr key={n.digest}>
-                  <td>{n.digest}</td>
-                  <td>{n.verify_state}</td>
-                  <td>{n.messages ?? "—"}</td>
+              {neighbors.slice(0, 20).map((n, i) => (
+                // The live engine answers from its link history (node, heard/lost, RSSI); the
+                // spec's row names a certificate digest and a verification state. Show either.
+                <tr key={n.digest ?? `node-${n.node ?? i}`}>
+                  <td>{n.digest ?? (n.node !== undefined ? `node ${n.node}` : NA)}</td>
+                  <td>{n.verify_state ?? n.state ?? NA}</td>
+                  <td>
+                    {n.messages !== undefined
+                      ? n.messages
+                      : typeof n.rssi_dbm === "number"
+                        ? `${n.rssi_dbm.toFixed(1)} dBm`
+                        : "—"}
+                  </td>
                   <td>{simClock(n.last_seen_ns)}</td>
                 </tr>
               ))}
