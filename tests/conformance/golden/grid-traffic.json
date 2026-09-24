@@ -1,0 +1,39 @@
+{
+  "case": "grid-traffic",
+  "scenario_hash": "f24f26f48df8b0093c9143eef3001840ae8cd22e71f420f77e49c1ff3762687e",
+  "world_hash": "5f87bbe41a0f1bd2b76ee9a5c886103e5b15274f45c52382f683482ad5c5e0ef",
+  "master_seed": 26719282226331630,
+  "end_ns": 10000000000,
+  "records": 14972,
+  "record_digest": "41d5e5c399b5786f8cad1e67335ffb94bfb05d701a1d1cc67534ca94f12a33e6",
+  "per_channel": {
+    "gt.kinematics": [
+      619,
+      109557
+    ],
+    "mac.cbr": [
+      57,
+      11465
+    ],
+    "metric.sample": [
+      1298,
+      337420
+    ],
+    "node.rx": [
+      4140,
+      2105235
+    ],
+    "node.tx": [
+      616,
+      458259
+    ],
+    "node.verify": [
+      4102,
+      1013804
+    ],
+    "phy.rx": [
+      4140,
+      801340
+    ]
+  }
+}
