@@ -136,16 +136,19 @@ export function transport(input: TransportInput): Transport {
       busy || !streaming
         ? off(stopped ?? "Connect to change the speed.")
         : { enabled: true, why: "How fast simulated time runs against the clock on the wall" },
+    // Anywhere in the run, simulated yet or not: a target past what the live kernel has
+    // produced is simulated first, with progress shown under the bar (vwp-v1 §6.6 `run.seek`).
+    // Before that the bar could not leave 0 s until the run had been played.
     seek:
-      busy || !streaming || produced <= 0
+      busy || !streaming || spanNs <= 0
         ? off(
             !streaming
               ? // Worth spelling out: over HTTP every other control still works, and this one
                 // genuinely cannot, so "the stream is closed" is the whole reason.
                 "Seeking needs an open stream — the engine sends the frames for the new position on it."
-              : "Nothing has been simulated yet.",
+              : "The run has no length to move through.",
           )
-        : { enabled: true, why: "Move to a point the run has already simulated" },
+        : { enabled: true, why: "Move to any point of the run; one not simulated yet is simulated first" },
     restart:
       busy || connection === "connecting" || connection === "handshaking"
         ? off("Waiting for the engine.")
