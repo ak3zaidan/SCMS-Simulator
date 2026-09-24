@@ -382,3 +382,60 @@ fn the_shipped_scenarios_still_validate() {
     }
     assert!(validate(&Scenario::minimal()).is_empty());
 }
+
+/// An on-board unit whose profile publishes no signing cost cannot send: `ObuRuntime`
+/// never signs for free, so every frame would be dropped before the air. Found in QA from
+/// the page: `obu/cohda-mk5`, which the settings list offers, ran 20 s of Manhattan with
+/// 22 vehicles and put no frame on the air. The loader now refuses it by name — for the
+/// default and for a per-class choice — and accepts the same profile when no vehicle
+/// sends anything, so the rule is about signing and not about the profile.
+#[test]
+fn an_obu_that_cannot_sign_is_refused_when_vehicles_send() {
+    let fields = |s: &Scenario| -> Vec<String> {
+        validate(s)
+            .iter()
+            .filter_map(ScenarioError::field)
+            .map(str::to_string)
+            .collect()
+    };
+    let reference = Scenario::minimal();
+    assert!(
+        !fields(&reference).iter().any(|f| f.starts_with("nodes.")),
+        "the reference OBU signs: {:?}",
+        validate(&reference)
+    );
+
+    let mut mk5 = Scenario::minimal();
+    mk5.nodes.default_obu = "obu/cohda-mk5".into();
+    let errors = validate(&mk5);
+    let named = errors
+        .iter()
+        .find(|e| e.field() == Some("nodes.default_obu"))
+        .unwrap_or_else(|| panic!("obu/cohda-mk5 was accepted: {errors:#?}"));
+    let text = named.to_string();
+    assert!(text.contains("ecdsa-p256-sign"), "{text}");
+    assert!(
+        text.contains("obu/unex-obu-301-craton2"),
+        "names one that signs: {text}"
+    );
+
+    let mut per_class = Scenario::minimal();
+    per_class
+        .nodes
+        .per_class
+        .insert("passenger".into(), "obu/cohda-mk5".into());
+    assert!(
+        fields(&per_class).contains(&"nodes.per_class.passenger".to_string()),
+        "{:#?}",
+        validate(&per_class)
+    );
+
+    // Discriminating: with nothing for a vehicle to send, the same profile is fine.
+    let mut silent = mk5.clone();
+    silent.messages.sets.clear();
+    assert!(
+        !fields(&silent).contains(&"nodes.default_obu".to_string()),
+        "{:#?}",
+        validate(&silent)
+    );
+}

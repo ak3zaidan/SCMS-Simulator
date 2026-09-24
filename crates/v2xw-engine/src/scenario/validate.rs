@@ -2193,6 +2193,42 @@ fn nodes(s: &Scenario, e: &mut Vec<ScenarioError>) {
             ),
         ));
     }
+    // A vehicle signs every message it sends on its own hardware, and a profile that
+    // publishes no cost for the signing primitive signs nothing (`ObuRuntime` never signs
+    // for free): every frame is dropped before the air and the run is silent. Found in QA:
+    // `nodes.default_obu: obu/cohda-mk5`, offered by the page's list, ran 20 s of
+    // Manhattan with 22 vehicles and put no frame on the air. Refused here by name, as a
+    // roadside unit without one already is (`run.rs`, SPaT/MAP broadcasters).
+    let vehicles_send = s
+        .messages
+        .sets
+        .iter()
+        .any(|m| matches!(m.as_str(), "bsm" | "cam" | "denm" | "srm" | "cpm"));
+    if vehicles_send {
+        let op = v2xw_node::NodeConfig::default().sign_op;
+        let signs = |id: &str| v2xw_node::profiles::get(id).is_none_or(|p| p.op_cost(op).is_some());
+        let signing: Vec<&str> = obus.iter().copied().filter(|id| signs(id)).collect();
+        let unsigned = |field: &str, id: &str, e: &mut Vec<ScenarioError>| {
+            e.push(conflict(
+                field,
+                format!(
+                    "'{id}' publishes no {op} cost (its sources give no signing rate or \
+                     latency for it), and a vehicle signs every message it sends on its own \
+                     hardware, so no vehicle on it could send anything; on-board units that \
+                     publish one: {}",
+                    signing.join(", ")
+                ),
+            ));
+        };
+        if obus.contains(&s.nodes.default_obu.as_str()) && !signs(&s.nodes.default_obu) {
+            unsigned("nodes.default_obu", &s.nodes.default_obu, e);
+        }
+        for (name, profile) in &s.nodes.per_class {
+            if obus.contains(&profile.as_str()) && !signs(profile) {
+                unsigned(&format!("nodes.per_class.{name}"), profile, e);
+            }
+        }
+    }
     for (name, profile) in &s.nodes.per_class {
         if !obus.contains(&profile.as_str()) {
             e.push(conflict(
