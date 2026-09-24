@@ -2343,7 +2343,12 @@ impl GeometricUrbanV2v {
             ),
             None => (tr37885_nlos_db(d3d, f_hz / 1e9), GeometricState::NlosStreet),
         };
-        let around = around.max(los_db);
+        // No path round a corner beats line of sight over the path's own length: the
+        // energy travels at least `d_t + d_r`. The bound only binds where Mangel's fit is
+        // extrapolated — a corner in an open plaza, where `x_t` and `w_r` far exceed the
+        // Munich streets it was fitted on.
+        let unfolded = los.corner.map_or(d3d, |c| (c.d_t_m + c.d_r_m).max(d3d));
+        let around = around.max(los_db).max(self.los_db(unfolded, f_hz));
         let through = los_db + self.sommer.loss_db(los.walls_crossed, los.obstructed_len_m);
         if through < around {
             (through, GeometricState::NlosThrough)
@@ -2453,8 +2458,8 @@ fn geometric_card() -> ModelCard {
         ),
         Equation::new(
             "composition",
-            "PL = max(PL_LOS, min(PL_around, PL_through)) + shadowing; obstacle_db = PL − \
-             PL_LOS",
+            "PL = max(PL_LOS(d), min(max(PL_around, PL_LOS(d_t + d_r)), PL_through)) + \
+             shadowing; obstacle_db = PL − PL_LOS(d)",
         ),
     ];
     card.parameters = vec![
@@ -2504,8 +2509,11 @@ fn geometric_card() -> ModelCard {
          Abbas 2015 gives the same symbol in the paper that reprints the equation; the \
          Mangel paper itself was not retrievable to confirm it."
             .to_string(),
-        "x_t and w_r are measured by casting rays to the nearest building wall, 60 m at \
-         most each way; an open side counts as 60 m."
+        "x_t and w_r are measured by casting three parallel rays 1 m apart to the nearest \
+         building wall, 25 m at most each way; an open side counts as 25 m. The cap is a \
+         design choice that keeps the fit inside street-scale geometry: 25 m a side admits \
+         a 50 m street, wider than Park Avenue's 43 m, and stops a plaza or the edge of an \
+         imported extract being read as an infinitely wide street."
             .to_string(),
         "The receiver hears the stronger of the around-the-corner and through-the-buildings \
          paths; their powers are not summed."
@@ -2513,13 +2521,18 @@ fn geometric_card() -> ModelCard {
         "One shadowing process per link, whose σ follows the state the link is in.".to_string(),
     ];
     card.limitations = vec![
-        "Mangel's model was fitted for d_t and d_r up to roughly 150 m at Munich \
-         intersections; longer legs are extrapolated."
+        "The ranges of d_t, d_r, x_t and w_r in Mangel's Munich measurements were not \
+         retrievable; long legs and unusual street widths may be extrapolation."
             .to_string(),
         "It is a V2V model (both antennas about 1.5 m); a roadside unit on a mast uses it \
          unchanged."
             .to_string(),
         "Two-corner paths have no cited validated law; they get TR 37.885's NLOS law.".to_string(),
+        "x_t and w_r are measured, not assumed: in Midtown about a quarter of lane points \
+         have one side with no wall within 60 m (plazas, parks, lots, the extract's edge). \
+         Such a side counts as 25 m, and the loss is held at no less than line of sight \
+         over the unfolded path d_t + d_r."
+            .to_string(),
         "Heights in the breakpoint are the phase-centre z, clamped to 0.5-30 m: on a world \
          with terrain that is above the datum, not above the local ground."
             .to_string(),
@@ -3480,5 +3493,24 @@ mod tests {
         let sd = math::sqrt(xs.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n);
         assert!(mean.abs() < 0.2, "{mean}");
         assert!((sd - 4.1).abs() < 0.2, "{sd}");
+    }
+
+    /// Round an open plaza's corner Mangel's fit is extrapolated far beyond its streets,
+    /// and would put the loss below line of sight over the path the energy actually
+    /// travels; the loss is held at that.
+    #[test]
+    fn no_corner_beats_line_of_sight_over_the_unfolded_path() {
+        let f = 5.9e9;
+        let model = GeometricUrbanV2v::new(Tier::High, EnvClass::Urban);
+        let tx = ep(0, 0.0, 0.0);
+        let rx = ep(1, 20.0, 300.0);
+        let mut plaza = LosResult::blocked_by_buildings(2, 30.0);
+        plaza.corner = Some(corner(20.0, 300.0, 60.0, 120.0));
+        let raw = mangel_nlos_db(&corner(20.0, 300.0, 60.0, 120.0), f, 1.5, 1.5, false);
+        let unfolded = tr37885_urban_los_db(320.0, 5.9);
+        assert!(raw < unfolded, "the fit alone: {raw} against {unfolded}");
+        let (pl, state) = model.mean_loss_db(&tx, &rx, f, &plaza);
+        assert_eq!(state, GeometricState::NlosCorner);
+        assert!((pl - unfolded).abs() < 1e-9, "{pl} vs {unfolded}");
     }
 }

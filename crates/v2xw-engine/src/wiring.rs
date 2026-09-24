@@ -1098,6 +1098,43 @@ impl ObstacleStack {
         }
     }
 
+    /// [`ObstacleStack::classify_with`] with each end's street direction, so the corner of
+    /// a blocked path is found where the two streets cross
+    /// ([`v2xw_radio::CornerTracer::trace_directed`]). No vehicles: the engine looks for
+    /// those itself, only on building-clear paths.
+    pub fn classify_directed(
+        &mut self,
+        world: &World,
+        a: v2xw_core::geom::Vec3,
+        b: v2xw_core::geom::Vec3,
+        geometry: bool,
+        dirs: (Option<(f64, f64)>, Option<(f64, f64)>),
+    ) -> v2xw_radio::LosResult {
+        let mut parts = Vec::with_capacity(2);
+        if let Some(buildings) = self.buildings.as_mut() {
+            let mut los = buildings.los_cached(world, a, b);
+            if geometry
+                && los.class.has_building()
+                && let Some(tracer) = self.corners.as_ref()
+            {
+                los.corner = tracer.trace_directed(world, a, b, dirs.0, dirs.1);
+            }
+            parts.push(los);
+        }
+        if let Some(terrain) = self.terrain.as_ref() {
+            parts.push(
+                <v2xw_radio::TerrainDiffraction as v2xw_radio::ObstacleModel<
+                    crate::ctx::EngineCtx<'_>,
+                >>::los(terrain, world, a, b, None),
+            );
+        }
+        match parts.len() {
+            0 => v2xw_radio::LosResult::clear(),
+            1 => parts.pop().expect("one part"),
+            _ => v2xw_radio::merge_los(&parts),
+        }
+    }
+
     /// The line-of-sight answer for one path, buildings and terrain only.
     pub fn classify(
         &mut self,

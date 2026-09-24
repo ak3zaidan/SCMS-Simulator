@@ -16,8 +16,8 @@
 //!
 //! **The geometry.** `--geometry PAIRS` samples that many pairs of points on driving
 //! lanes, 1.5 m antennas, and classifies each link the way the high tier does: line of
-//! sight, round one street corner (the junction both ends see), or blocked with no single
-//! corner. For each class and 100 m bin it prints the share of links and the probability
+//! sight, round one street corner (where the two ends' streets cross, from each lane's
+//! heading), or blocked with no single corner. For each class and 100 m bin it prints the share of links and the probability
 //! the received power clears the 802.11p sensitivity (EN 302 663 static, 6 Mbit/s,
 //! −88 dBm) at J2945/1's 20 dBm radiated power and a 3 dBi receive antenna, under each law's
 //! own log-normal shadowing and no fast fading or interference — the medium tier's
@@ -141,7 +141,7 @@ fn geometry(scenario: &Scenario, pairs: usize) -> Result<(), Box<dyn std::error:
         state ^= state << 17;
         (state >> 11) as f64 / (1u64 << 53) as f64
     };
-    let mut point = |u: f64, v: f64| {
+    let point = |u: f64, v: f64| {
         // Length-weighted lane, uniform along it.
         let mut target = u * total;
         let mut lane = lanes[lanes.len() - 1];
@@ -152,11 +152,12 @@ fn geometry(scenario: &Scenario, pairs: usize) -> Result<(), Box<dyn std::error:
             }
             target -= l.length_m;
         }
-        let p = lane.offset_point(v * lane.length_m, 0.0);
-        Vec3::new(p.x, p.y, p.z + 1.5)
+        let s_m = v * lane.length_m;
+        let p = lane.offset_point(s_m, 0.0);
+        let (sn, cs) = v2xw_core::math::sin_cos(lane.heading_at(s_m));
+        (Vec3::new(p.x, p.y, p.z + 1.5), (cs, sn))
     };
-    let buildings = v2xw_radio::BuildingShadowing::new(v2xw_core::card::Tier::Medium);
-    let mut buildings = buildings;
+    let mut buildings = v2xw_radio::BuildingShadowing::new(v2xw_core::card::Tier::Medium);
     let tracer = v2xw_radio::CornerTracer::build(&world);
     let env = v2xw_engine::wiring::world_env(&world);
     let high = v2xw_radio::GeometricUrbanV2v::new(v2xw_core::card::Tier::High, env);
@@ -174,8 +175,8 @@ fn geometry(scenario: &Scenario, pairs: usize) -> Result<(), Box<dyn std::error:
     let mut tries = 0usize;
     while done < pairs && tries < pairs * 50 {
         tries += 1;
-        let a = point(uniform(), uniform());
-        let b = point(uniform(), uniform());
+        let (a, a_dir) = point(uniform(), uniform());
+        let (b, b_dir) = point(uniform(), uniform());
         let d = a.distance(b);
         if !(1.0..1_000.0).contains(&d) {
             continue;
@@ -185,7 +186,8 @@ fn geometry(scenario: &Scenario, pairs: usize) -> Result<(), Box<dyn std::error:
         let class = if !los.class.has_building() {
             0
         } else {
-            los.corner = tracer.trace(&world, a, b);
+            // The street each end is on, as the engine traces it: the vehicle's heading.
+            los.corner = tracer.trace_directed(&world, a, b, Some(a_dir), Some(b_dir));
             if los.corner.is_some() { 1 } else { 2 }
         };
         let tx = v2xw_radio::RadioEndpoint::isotropic(

@@ -176,22 +176,38 @@ impl BuildingIndex {
 #[must_use]
 pub fn segment_blocked(world: &World, index: &BuildingIndex, a: Vec3, b: Vec3) -> bool {
     let floor = a.z.min(b.z);
-    for id in index.candidates_along(a, b) {
-        let Some(building) = world.building(id) else {
-            continue;
-        };
-        if building.base_z_m + building.height_m <= floor {
-            continue;
-        }
-        let ring = &building.footprint;
-        if point_in_ring(ring, a) || point_in_ring(ring, b) {
-            return true;
-        }
-        if ring
-            .windows(2)
-            .any(|w| segment_intersection_t(a, b, w[0], w[1]).is_some())
-        {
-            return true;
+    // Walked piece by piece from `a`, testing each piece's buildings as it is reached, so
+    // a path blocked near its start — most blocked paths in a city — costs one tree query
+    // rather than one per piece of its whole length. The answer is a boolean, so the
+    // order the buildings are tested in cannot reach it.
+    let len = a.distance_2d(b);
+    let pieces = (len / BuildingIndex::WALK_STEP_M).ceil().max(1.0) as usize;
+    let mut seen: Vec<u32> = Vec::new();
+    for i in 0..pieces {
+        let p = a.lerp(b, i as f64 / pieces as f64);
+        let q = a.lerp(b, (i + 1) as f64 / pieces as f64);
+        let query = AABB::from_corners([p.x.min(q.x), p.y.min(q.y)], [p.x.max(q.x), p.y.max(q.y)]);
+        for e in index.tree.locate_in_envelope_intersecting(&query) {
+            if seen.contains(&e.id) {
+                continue;
+            }
+            seen.push(e.id);
+            let Some(building) = world.building(BuildingId::new(e.id)) else {
+                continue;
+            };
+            if building.base_z_m + building.height_m <= floor {
+                continue;
+            }
+            let ring = &building.footprint;
+            if point_in_ring(ring, a) || point_in_ring(ring, b) {
+                return true;
+            }
+            if ring
+                .windows(2)
+                .any(|w| segment_intersection_t(a, b, w[0], w[1]).is_some())
+            {
+                return true;
+            }
         }
     }
     false
@@ -275,7 +291,8 @@ impl RTreeObject for JunctionPoint {
 /// * `d_t`, `d_r`: the two ends' horizontal distances to the junction centre.
 /// * `x_t`: from the transmitter, perpendicular to its street (the direction to the
 ///   corner), towards the side the receiver's street leaves on, the distance to the first
-///   building wall ([`first_wall_m`]), capped at [`CornerTracer::MAX_WALL_M`].
+///   building wall (three parallel rays 1 m apart, so a hairline gap between two
+///   footprints is not an open street), capped at [`CornerTracer::MAX_WALL_M`].
 /// * `w_r`: from the receiver, perpendicular to its street on both sides, the distance
 ///   between the two first walls, each side capped at [`CornerTracer::MAX_WALL_M`].
 ///
@@ -292,8 +309,13 @@ impl CornerTracer {
     pub const DETOUR_RATIO: f64 = 1.6;
     /// How many candidate junctions are tried, nearest detour first.
     pub const MAX_CANDIDATES: usize = 12;
-    /// How far a wall is looked for, metres; an open side further than this counts as this.
-    pub const MAX_WALL_M: f64 = 60.0;
+    /// How far a wall is looked for, metres; an open side counts as this. 25 m a side admits
+    /// a 50 m street, wider than any avenue in Midtown (Park Avenue is 43 m), and stops a
+    /// plaza or the edge of an imported extract being read as an infinitely wide street,
+    /// where the Mangel fit would be extrapolated far beyond the streets it came from.
+    pub const MAX_WALL_M: f64 = 25.0;
+    /// Half the spacing of the three rays a wall is looked for with, metres.
+    pub const GAP_M: f64 = 1.0;
 
     /// Builds the tracer for a world: an index of its junction centres and of its
     /// building footprints. Pure: the same world gives the same tracer.
@@ -325,6 +347,78 @@ impl CornerTracer {
     pub const fn buildings(&self) -> &BuildingIndex {
         &self.buildings
     }
+
+    /// The corner a link turns round when each end's street direction is known — a
+    /// vehicle's heading — or `None`.
+    ///
+    /// Two streets meet where the line through the transmitter along its street crosses
+    /// the line through the receiver along theirs, so the corner is the junction nearest
+    /// that crossing (within [`CornerTracer::SNAP_M`]), tried nearest first up to three,
+    /// with the same clear-leg test as [`CornerTracer::trace`]. Streets closer to
+    /// parallel than 20° have no single corner between them. Without both directions
+    /// (a roadside unit, a pedestrian) the undirected search is used.
+    ///
+    /// This finds the corner of an L-shaped path directly, where the undirected search
+    /// has to try the junctions nearer the straight line first — every one of them
+    /// blocked — and can give up before it reaches the two that are corners.
+    #[must_use]
+    pub fn trace_directed(
+        &self,
+        world: &World,
+        tx: Vec3,
+        rx: Vec3,
+        tx_dir: Option<(f64, f64)>,
+        rx_dir: Option<(f64, f64)>,
+    ) -> Option<CornerGeometry> {
+        let (Some(u), Some(v)) = (tx_dir, rx_dir) else {
+            return self.trace(world, tx, rx);
+        };
+        let (Some(u), Some(v)) = (unit(u.0, u.1), unit(v.0, v.1)) else {
+            return self.trace(world, tx, rx);
+        };
+        let cross = u.0 * v.1 - u.1 * v.0;
+        // sin 20°: streets closer to parallel than that meet nowhere useful.
+        if cross.abs() < 0.342 {
+            return None;
+        }
+        // T + a·u = R + b·v.
+        let (wx, wy) = (rx.x - tx.x, rx.y - tx.y);
+        let a = (wx * v.1 - wy * v.0) / cross;
+        let meet = [tx.x + a * u.0, tx.y + a * u.1];
+        let d = tx.distance_2d(rx);
+        let reach = Self::DETOUR_RATIO * d;
+        let window = AABB::from_corners(
+            [meet[0] - Self::SNAP_M, meet[1] - Self::SNAP_M],
+            [meet[0] + Self::SNAP_M, meet[1] + Self::SNAP_M],
+        );
+        let at = Vec3::new(meet[0], meet[1], 0.0);
+        let mut candidates: Vec<(f64, u32, [f64; 2])> = self
+            .junctions
+            .locate_in_envelope(&window)
+            .filter_map(|j| {
+                let p = Vec3::new(j.at[0], j.at[1], 0.0);
+                let off = p.distance_2d(at);
+                let detour = tx.distance_2d(p) + p.distance_2d(rx);
+                (off <= Self::SNAP_M && detour <= reach).then_some((off, j.id, j.at))
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let corner_z = 0.5 * (tx.z + rx.z);
+        for &(_, _, at) in candidates.iter().take(3) {
+            let j = Vec3::new(at[0], at[1], corner_z);
+            if segment_blocked(world, &self.buildings, tx, j)
+                || segment_blocked(world, &self.buildings, j, rx)
+            {
+                continue;
+            }
+            return Some(self.measure(world, tx, rx, j));
+        }
+        None
+    }
+
+    /// How far from the two streets' crossing a junction centre may be and still be their
+    /// corner, metres: half a wide avenue.
+    pub const SNAP_M: f64 = 20.0;
 
     /// The corner a link from `tx` to `rx` (antenna phase centres) turns round, or `None`.
     #[must_use]
@@ -363,6 +457,28 @@ impl CornerTracer {
         None
     }
 
+    /// How far the nearest wall is from `origin` along `dir`, metres, capped at
+    /// [`CornerTracer::MAX_WALL_M`].
+    ///
+    /// Three parallel rays, the middle one and one [`CornerTracer::GAP_M`] to each side,
+    /// and the nearest hit of the three: OpenStreetMap footprints do not tile a block
+    /// exactly, and a single ray slips through the hairline gap between two adjacent
+    /// buildings and reports an open street where there is a wall. A gap narrower than
+    /// two metres is not a street at 5.9 GHz (the first Fresnel zone of a 50 m path is
+    /// over a metre in radius).
+    #[must_use]
+    pub fn wall_m(&self, world: &World, origin: Vec3, dir: (f64, f64)) -> f64 {
+        let side = (-dir.1 * Self::GAP_M, dir.0 * Self::GAP_M);
+        [
+            origin,
+            Vec3::new(origin.x + side.0, origin.y + side.1, origin.z),
+            Vec3::new(origin.x - side.0, origin.y - side.1, origin.z),
+        ]
+        .into_iter()
+        .filter_map(|o| first_wall_m(world, &self.buildings, o, dir, Self::MAX_WALL_M))
+        .fold(Self::MAX_WALL_M, f64::min)
+    }
+
     /// The four quantities of the corner at `j`.
     fn measure(&self, world: &World, tx: Vec3, rx: Vec3, j: Vec3) -> CornerGeometry {
         let d_t = tx.distance_2d(j).max(1.0);
@@ -377,20 +493,10 @@ impl CornerTracer {
             -1.0
         };
         let n_t = (-u.1 * side, u.0 * side);
-        let x_t = first_wall_m(world, &self.buildings, tx, n_t, Self::MAX_WALL_M)
-            .unwrap_or(Self::MAX_WALL_M)
-            .max(1.0);
+        let x_t = self.wall_m(world, tx, n_t).max(1.0);
         let n_r = (-v.1, v.0);
-        let left = first_wall_m(world, &self.buildings, rx, n_r, Self::MAX_WALL_M)
-            .unwrap_or(Self::MAX_WALL_M);
-        let right = first_wall_m(
-            world,
-            &self.buildings,
-            rx,
-            (-n_r.0, -n_r.1),
-            Self::MAX_WALL_M,
-        )
-        .unwrap_or(Self::MAX_WALL_M);
+        let left = self.wall_m(world, rx, n_r);
+        let right = self.wall_m(world, rx, (-n_r.0, -n_r.1));
         CornerGeometry {
             corner: j,
             d_t_m: d_t,
@@ -2468,5 +2574,41 @@ mod tests {
                 .trace(&world, at(200.0, 257.0), at(300.0, 7.0))
                 .is_none()
         );
+    }
+
+    /// With each end's street direction known, the corner is where the two streets cross:
+    /// found directly, the same corner the undirected search finds, and none between two
+    /// parallel streets or when a direction points nowhere useful.
+    #[test]
+    fn the_directed_tracer_finds_the_crossing_of_the_two_streets() {
+        let world = city();
+        let tracer = CornerTracer::build(&world);
+        let tx = at(390.0, 257.0);
+        let rx = at(440.0, 307.0);
+        let east = Some((1.0, 0.0));
+        let north = Some((0.0, 1.0));
+        let c = tracer
+            .trace_directed(&world, tx, rx, east, north)
+            .expect("a corner");
+        assert_eq!(Some(c), tracer.trace(&world, tx, rx));
+        // Direction signs do not matter: a street is a line.
+        let back = tracer.trace_directed(&world, tx, rx, Some((-1.0, 0.0)), Some((0.0, -1.0)));
+        assert_eq!(back, Some(c));
+        // An L far from the straight line, whose corner the undirected search would reach
+        // only after the blocked junctions nearer the diagonal: two blocks east, half a block north.
+        let far_tx = at(20.0, 257.0);
+        let far_rx = at(873.0, 400.0);
+        let far = tracer
+            .trace_directed(&world, far_tx, far_rx, east, north)
+            .expect("the corner at (873, 257)");
+        assert!((far.corner.x - 873.0).abs() < 1e-9 && (far.corner.y - 257.0).abs() < 1e-9);
+        // Parallel streets: no single corner, whatever the geometry.
+        assert!(
+            tracer
+                .trace_directed(&world, tx, at(390.0, 507.0), east, east)
+                .is_none()
+        );
+        // One direction unknown: the undirected search.
+        assert_eq!(tracer.trace_directed(&world, tx, rx, east, None), Some(c));
     }
 }

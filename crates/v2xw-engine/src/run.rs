@@ -413,6 +413,9 @@ struct FrameState {
     /// frame that far under its noise — but they are interference at every receiver they
     /// share with a frame that is, and energy in a sidelink receiver's sensing window.
     faint: BTreeMap<NodeId, f64>,
+    /// The transmitter's heading when the frame started, radians — its street's
+    /// direction, which the high tier's corner tracer reads. `None` for a roadside unit.
+    tx_heading: Option<f64>,
     /// The i-period the signer's certificate belongs to, as the envelope states it.
     claimed_cert_period: u32,
     /// The linkage value the signer's certificate carries, when the credential the node
@@ -2241,6 +2244,7 @@ impl Engine {
                 tx_handle: None,
                 arrivals: BTreeMap::new(),
                 faint: BTreeMap::new(),
+                tx_heading: None,
                 claimed_cert_period,
                 claimed_linkage,
                 app,
@@ -2725,6 +2729,13 @@ impl Engine {
         let floor_dbm = self.range.floor_dbm();
         let mut candidates: Vec<(NodeId, Vec3)> = Vec::new();
         let mut beyond: Vec<(NodeId, Vec3)> = Vec::new();
+        // Each receiver's heading — its street's direction — for the corner tracer.
+        let mut headings: BTreeMap<NodeId, f64> = BTreeMap::new();
+        state.tx_heading = self
+            .actors
+            .values()
+            .find(|a| a.node == Some(state.tx))
+            .map(|a| a.last.heading_rad);
         for actor in self.snapshot.actors_within(state.tx_pos, reach_m) {
             let Some(rec) = self.actors.get(&actor) else {
                 continue;
@@ -2734,6 +2745,7 @@ impl Engine {
                 continue;
             }
             let pos = rec.last.extrapolate(now).pos;
+            headings.insert(node, rec.last.heading_rad);
             if state.tx_pos.distance_2d(pos) <= full_m {
                 candidates.push((node, pos));
             } else {
@@ -2763,7 +2775,8 @@ impl Engine {
         // attempt: no receiver detects a frame that far under its own noise. It stays as
         // energy, which is what it is.
         for &(rx, rx_pos) in &candidates {
-            let (rssi, dist, high) = self.link_budget(&state, rx, rx_pos);
+            let (rssi, dist, high) =
+                self.link_budget(&state, rx, rx_pos, headings.get(&rx).copied());
             if rssi < floor_dbm {
                 state.faint.insert(rx, rssi);
                 self.report.faint_arrivals += 1;
@@ -3415,7 +3428,13 @@ impl Engine {
     /// `v2xw_radio::FocusPlan::evaluate` (02-architecture.md §7.3): inside, the focus
     /// stack; inbound, the surrounding propagation with no fading draw; otherwise the
     /// surrounding stack.
-    fn link_budget(&mut self, state: &FrameState, rx: NodeId, rx_pos: Vec3) -> (f64, f64, bool) {
+    fn link_budget(
+        &mut self,
+        state: &FrameState,
+        rx: NodeId,
+        rx_pos: Vec3,
+        rx_heading: Option<f64>,
+    ) -> (f64, f64, bool) {
         let now = self.scheduler.now();
         let link = LinkKey::new(state.tx, rx);
         let distance_m = state.tx_pos.distance(rx_pos);
@@ -3449,12 +3468,18 @@ impl Engine {
         // and the vehicles on a clear one; terrain knife edges (ITU-R P.526). Each only
         // when the scenario turned it on and the world has it. A clear link costs nothing
         // but the index query.
-        let mut los = self.obstacles.classify_with(
+        let dir = |h: Option<f64>| {
+            h.map(|h| {
+                let (s, c) = v2xw_core::math::sin_cos(h);
+                (c, s)
+            })
+        };
+        let mut los = self.obstacles.classify_directed(
             &self.world,
             tx_end.pos,
             rx_end.pos,
             law.traces_geometry(),
-            None,
+            (dir(state.tx_heading), dir(rx_heading)),
         );
         // TR 37.885's NLOSv is a same-street state: the vehicles on the path are looked
         // for only when no building is, and only near the line.
