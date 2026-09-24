@@ -1006,3 +1006,268 @@ test("the views are still correct at t = 0 and after the run has finished", asyn
   await page.waitForTimeout(6000);
   await check("after the end of the run");
 });
+
+// ===============================================================================================
+// 7. Traffic lights agree with the stream
+// ===============================================================================================
+
+/**
+ * Install a recorder of every signal row the stream delivers, with the sim time it is for, so the
+ * lamps can be checked against the state the engine said held at the instant the scene is drawn.
+ */
+async function recordSignals(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const w = window as unknown as {
+      __vwpStudio: { engine: { client: { onKeyframe(f: (k: unknown) => void): () => void; onDelta(f: (d: unknown) => void): () => void } | null } };
+      __signalLog?: { t: number; keyframe: boolean; ids: number[]; phases: number[] }[];
+    };
+    const log: { t: number; keyframe: boolean; ids: number[]; phases: number[] }[] = [];
+    w.__signalLog = log;
+    const client = w.__vwpStudio.engine.client;
+    if (!client) throw new Error("no client");
+    const take = (keyframe: boolean) => (m: unknown): void => {
+      const msg = m as { simTimeNs: bigint; signals: { count: number; signalId: Uint32Array; phase: Uint8Array } };
+      if (!keyframe && msg.signals.count === 0) return;
+      log.push({
+        t: Number(msg.simTimeNs) / 1e9,
+        keyframe,
+        ids: Array.from(msg.signals.signalId.subarray(0, msg.signals.count)),
+        phases: Array.from(msg.signals.phase.subarray(0, msg.signals.count)),
+      });
+    };
+    client.onKeyframe(take(true));
+    client.onDelta(take(false));
+  });
+}
+
+/**
+ * Every head against the state the stream says held at the drawn instant: the latest keyframe at or
+ * before it, with every later delta up to it on top. Returns the heads checked and the mismatches.
+ */
+function signalAgreement(page: Page): Promise<{ heads: number; mismatches: number; examples: string[]; renderSim: number; rows: number }> {
+  return page.evaluate(() => {
+    const w = window as unknown as {
+      __vwpStudio: { engine: { viewer: { interpolator: { renderSimSeconds: number }; worldRenderer: { signals: { count: number; headState(i: number): { signalId: number; phase: number } | null } } } } };
+      __signalLog: { t: number; keyframe: boolean; ids: number[]; phases: number[] }[];
+    };
+    const v = w.__vwpStudio.engine.viewer;
+    const at = v.interpolator.renderSimSeconds;
+    const log = w.__signalLog;
+    let start = -1;
+    for (let i = 0; i < log.length; i++) if (log[i].keyframe && log[i].t <= at + 1e-6) start = i;
+    // Nothing to compare against until a keyframe at or before the drawn instant has been seen:
+    // the recorder starts mid-stream, and deltas alone are not the whole state.
+    if (start < 0) return { heads: 0, mismatches: 0, examples: [], renderSim: at, rows: 0 };
+    const state = new Map<number, number>();
+    if (start >= 0) {
+      for (let i = start; i < log.length; i++) {
+        const e = log[i];
+        if (e.t > at + 1e-6) break;
+        if (i > start && e.keyframe) state.clear();
+        e.ids.forEach((id, k) => state.set(id, e.phases[k]));
+      }
+    }
+    const s = v.worldRenderer.signals;
+    let mismatches = 0;
+    const examples: string[] = [];
+    for (let i = 0; i < s.count; i++) {
+      const h = s.headState(i);
+      if (!h) continue;
+      const want = state.has(h.signalId) ? (state.get(h.signalId) as number) : 0xff;
+      if (h.phase !== want) {
+        mismatches++;
+        if (examples.length < 5) examples.push(`head ${i} (signal ${h.signalId}) shows ${h.phase}, stream says ${want}`);
+      }
+    }
+    return { heads: s.count, mismatches, examples, renderSim: at, rows: log.length };
+  });
+}
+
+test("every signal head shows the stream's state for the drawn instant — running, after a seek, and after a reconnect", async ({ page }) => {
+  await streaming(page);
+  await recordSignals(page);
+  // Long enough to see a phase change (the mock's plan changes every few seconds) and a keyframe.
+  const findings: string[] = [];
+  let checked = 0;
+  for (let i = 0; i < 24; i++) {
+    await page.waitForTimeout(400);
+    const a = await signalAgreement(page);
+    if (a.rows === 0) continue;
+    checked++;
+    if (a.mismatches > 0) findings.push(`running, t=${a.renderSim.toFixed(2)}: ${a.mismatches}/${a.heads} heads wrong — ${a.examples.join("; ")}`);
+  }
+  expect(checked, "no signal rows arrived at all").toBeGreaterThan(10);
+
+  // A seek backwards, paused there: the keyframe is the whole state, and nothing from later survives.
+  await rpc(page, "run.seek", { t_ns: 2_000_000_000, pause_after: true });
+  await page.waitForTimeout(2500);
+  let a = await signalAgreement(page);
+  if (a.mismatches > 0) findings.push(`after a seek back: ${a.mismatches}/${a.heads} heads wrong — ${a.examples.join("; ")}`);
+
+  // A reconnect: a fresh connection sends a keyframe; the lamps must come back to the stream's state.
+  await page.evaluate(async () => {
+    const e = (window as unknown as { __vwpStudio: { engine: { reopenStream(): Promise<void> } } }).__vwpStudio.engine;
+    await e.reopenStream();
+  });
+  await expect(page.getByTestId("connection-state")).toHaveAttribute("data-state", "streaming", { timeout: 60_000 });
+  await recordSignals(page);
+  await rpc(page, "run.resume").catch(() => undefined);
+  await page.waitForTimeout(3000);
+  a = await signalAgreement(page);
+  if (a.rows > 0 && a.mismatches > 0) findings.push(`after a reconnect: ${a.mismatches}/${a.heads} heads wrong — ${a.examples.join("; ")}`);
+  expect(findings, findings.join("\n")).toEqual([]);
+});
+
+// ===============================================================================================
+// 8. Vehicles and buildings
+// ===============================================================================================
+
+/**
+ * No vehicle may be drawn inside a building the viewer draws unless the engine put it there.
+ *
+ * The old far building LOD was the footprint's bounding box, so from 700 m out a fifth of the
+ * traffic sat inside drawn walls; interpolation cutting a corner could do the same up close. This
+ * samples every live vehicle for a few seconds against the footprints, in the plan view (every
+ * building far) and in chase, and separates the viewer's share from the engine's: a rendered
+ * position inside a footprint where none of the stream's last three poses of that vehicle is.
+ */
+test("no vehicle is drawn inside a building unless the stream put it there", async ({ page }) => {
+  await streaming(page);
+  const sample = async (): Promise<{ samples: number; viewer: number; engine: number; examples: string[] }> =>
+    page.evaluate(async () => {
+      const e = (window as unknown as { __vwpStudio: { engine: Record<string, unknown> } }).__vwpStudio.engine as {
+        viewer: {
+          interpolator: { count: number; outOccupied: Uint8Array; outActorId: Uint32Array; outPosition: Float32Array };
+          worldRenderer: { buildingIndexAt(x: number, y: number): number; buildingTopOf(i: number): number; ghostBuilding: number };
+        };
+        client: { poses: { count: number; occupied: Uint8Array; actorId: Uint32Array; positions: Float32Array }; onDelta(f: () => void): () => void };
+      };
+      const v = e.viewer;
+      const w = v.worldRenderer;
+      const inside = (x: number, y: number, z: number): boolean => {
+        const b = w.buildingIndexAt(x, y);
+        return b >= 0 && b !== w.ghostBuilding && z < w.buildingTopOf(b);
+      };
+      const history: Map<number, [number, number, number]>[] = [];
+      const snap = (): void => {
+        const p = e.client.poses;
+        const m = new Map<number, [number, number, number]>();
+        for (let i = 0; i < p.count; i++) if (p.occupied[i] === 1) m.set(p.actorId[i], [p.positions[i * 3], p.positions[i * 3 + 1], p.positions[i * 3 + 2]]);
+        history.push(m);
+        if (history.length > 3) history.shift();
+      };
+      snap();
+      const off = e.client.onDelta(snap);
+      let samples = 0;
+      let viewer = 0;
+      let engine = 0;
+      const examples: string[] = [];
+      const t0 = performance.now();
+      while (performance.now() - t0 < 4000) {
+        await new Promise((r) => requestAnimationFrame(r));
+        const it = v.interpolator;
+        for (let i = 0; i < it.count; i++) {
+          if (it.outOccupied[i] !== 1) continue;
+          samples++;
+          const x = it.outPosition[i * 3];
+          const y = it.outPosition[i * 3 + 1];
+          const z = it.outPosition[i * 3 + 2];
+          if (!inside(x, y, z)) continue;
+          const id = it.outActorId[i];
+          const streamInside = history.some((h) => {
+            const q = h.get(id);
+            return q !== undefined && inside(q[0], q[1], q[2]);
+          });
+          if (streamInside) engine++;
+          else {
+            viewer++;
+            if (examples.length < 5) examples.push(`vehicle ${id} drawn at ${x.toFixed(1)},${y.toFixed(1)}`);
+          }
+        }
+      }
+      off();
+      return { samples, viewer, engine, examples };
+    });
+
+  const map = await sample();
+  await followEquippedActor(page);
+  await page.waitForTimeout(3000);
+  const chase = await sample();
+  // eslint-disable-next-line no-console
+  console.log(`vehicles inside buildings — plan view: ${map.viewer} viewer-caused, ${map.engine} engine-placed of ${map.samples}; chase: ${chase.viewer} and ${chase.engine} of ${chase.samples}`);
+  expect(map.samples + chase.samples).toBeGreaterThan(100);
+  expect(map.viewer + chase.viewer, [...map.examples, ...chase.examples].join("; ")).toBe(0);
+});
+
+// ===============================================================================================
+// 9. Depth: no z-fighting between the road's layers
+// ===============================================================================================
+
+/**
+ * Move the plan-view camera by a centimetre — a hundredth of a pixel at this altitude — and redraw.
+ * With the road's layers resolved by the depth buffer nothing changes; z-fighting layers swap
+ * which one is in front and the road's surface speckles. Vehicles, overlays and signal lamps are
+ * hidden: they are not what this measures.
+ */
+test("the plan view's road layers do not z-fight as the camera moves", async ({ page }) => {
+  await streaming(page);
+  await rpc(page, "run.pause").catch(() => undefined);
+  const flicker = await page.evaluate(() => {
+    const e = (window as unknown as { __vwpStudio: { engine: Record<string, unknown> } }).__vwpStudio.engine as {
+      viewer: {
+        stop(): void;
+        start(): void;
+        step(dt: number): unknown;
+        camera: { near: number };
+        cameras: { setMode(m: string, i?: boolean): unknown; altitudeM: number; target: { x: number; y: number; z: number }; snap(): void };
+        actors: { group: { visible: boolean } };
+        overlays: { group: { visible: boolean } };
+        worldRenderer: { signalsGroup: { visible: boolean }; sitesGroup: { visible: boolean }; buildingsGroup: { visible: boolean } };
+      };
+    };
+    const v = e.viewer;
+    v.stop();
+    const hide = [v.actors.group, v.overlays.group, v.worldRenderer.signalsGroup, v.worldRenderer.sitesGroup, v.worldRenderer.buildingsGroup];
+    const was = hide.map((g) => g.visible);
+    hide.forEach((g) => (g.visible = false));
+    v.cameras.setMode("map", true);
+    v.cameras.altitudeM = 1400;
+    v.cameras.snap();
+    const canvas = document.querySelector('[data-testid="viewer-canvas"]') as HTMLCanvasElement;
+    const gl = (canvas.getContext("webgl2") ?? canvas.getContext("webgl")) as WebGLRenderingContext;
+    const grab = (): Uint8Array => {
+      const buf = new Uint8Array(canvas.width * canvas.height * 4);
+      gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      return buf;
+    };
+    for (let i = 0; i < 10; i++) v.step(1 / 60);
+    // The base frame is drawn exactly like the moved ones — snapped, no time passing — or the
+    // plan view's automatic recentring (every 0.2 s of frame time) is measured instead of depth.
+    const tx = v.cameras.target.x;
+    v.cameras.snap();
+    v.step(0);
+    const base = grab();
+    let worst = 0;
+    let total = 0;
+    for (let k = 1; k <= 6; k++) {
+      v.cameras.target.x = tx + k * 0.01;
+      v.cameras.snap();
+      v.step(0);
+      const f = grab();
+      let changed = 0;
+      for (let i = 0; i < f.length; i += 4) {
+        if (Math.abs(f[i] - base[i]) > 24 || Math.abs(f[i + 1] - base[i + 1]) > 24 || Math.abs(f[i + 2] - base[i + 2]) > 24) changed++;
+      }
+      const frac = changed / (f.length / 4);
+      worst = Math.max(worst, frac);
+      total += frac;
+    }
+    v.cameras.target.x = tx;
+    hide.forEach((g, i) => (g.visible = was[i]));
+    v.start();
+    return { worst, mean: total / 6, near: v.camera.near };
+  });
+  // eslint-disable-next-line no-console
+  console.log(`plan-view flicker under a 1-6 cm camera move: worst ${(flicker.worst * 100).toFixed(3)} % of pixels, mean ${(flicker.mean * 100).toFixed(3)} %, near plane ${flicker.near.toFixed(1)} m`);
+  expect(flicker.worst).toBeLessThan(0.002);
+});

@@ -1583,7 +1583,7 @@ export class OverlayManager {
     this.markers.setChannel("detection", this.isEnabled("detections"));
     const w = this.#world;
     if (w) {
-      w.markings.visible = this.isEnabled("lane_markings");
+      w.markingsEnabled = this.isEnabled("lane_markings");
       w.buildingsGroup.visible = this.isEnabled("buildings");
       w.signalsGroup.visible = this.isEnabled("signal_state");
     }

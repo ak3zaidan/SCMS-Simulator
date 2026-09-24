@@ -989,6 +989,7 @@ export class Viewer {
 
     // 3. Static scene follow-ups.
     this.#syncClipPlanes();
+    this.worldRenderer.fadeMarkings(this.camera.position.distanceTo(this.cameras.look), this.camera.fov, this.#height);
     this.#syncDepthCueing();
     this.worldRenderer.followCamera(this.camera);
     this.worldRenderer.setShadowFocus(this.cameras.look.x, this.cameras.look.y, this.cameras.look.z);

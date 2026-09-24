@@ -69,6 +69,8 @@ const Z_ROAD = 0.1;
 const Z_JUNCTION = 0.16;
 const Z_CROSSING = 0.2;
 const Z_MARKING = 0.24;
+/** Width of a painted lane line, metres: `addOffsetLine`'s half-width 0.09 twice. */
+const MARKING_WIDTH_M = 0.18;
 
 /** Tuning for {@link WorldRenderer}. */
 export interface WorldRendererOptions {
@@ -249,6 +251,8 @@ export class WorldRenderer {
   #ghost = -1;
   /** A second ghosted building: the one the camera itself is in; see {@link setGhostBuildings}. */
   #ghost2 = -1;
+  /** The `lane_markings` overlay's choice; {@link fadeMarkings} only ever hides on top of it. */
+  #markingsWanted = true;
   #buildingBackend: BuildingBackend = "none";
   #buildError: string | null = null;
 
@@ -306,10 +310,16 @@ export class WorldRenderer {
     this.lights.name = "world/lights";
 
     this.#surfaceMaterial = new MeshLambertMaterial({ vertexColors: true, name: "world-surface" });
+    // Markings test depth against the road but never write it, and draw after it: where two
+    // markings overlap — the edge lines of the two directions meet on the centre line, a white and a
+    // yellow strip at exactly the same height — the later one wins, every frame, instead of the two
+    // trading places as the camera moves (measured: 1.8 % of a 1,680 x 1,050 plan view changing
+    // under a 1 cm camera move, all of it markings).
     this.#markingMaterial = new MeshBasicMaterial({
       vertexColors: true, name: "lane-markings", polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
-      toneMapped: false,
+      toneMapped: false, depthWrite: false,
     });
+    this.markings.renderOrder = 1;
     this.#buildingMaterial = new MeshLambertMaterial({ vertexColors: true, name: "buildings" });
     this.#siteMaterial = new MeshLambertMaterial({ vertexColors: true, name: "sites" });
 
@@ -1170,6 +1180,39 @@ export class WorldRenderer {
     }
     this.#buildingsVisible = visible;
     return visible;
+  }
+
+  /**
+   * Fade the lane markings out as they shrink below a pixel.
+   *
+   * A marking is 0.18 m wide. From the plan view's 1.4 km that is a sixth of a pixel, and a line
+   * that thin is rasterised as a scatter of pixels that changes with every sub-pixel camera move:
+   * measured at 1,680 x 1,050, a one-pixel pan changed 8.5 % of the frame, all of it markings (the
+   * road surfaces alone: 0.04 %). Full strength from about one pixel wide, gone below a third.
+   * `distanceM` is the camera's distance to what it looks at, `fovDeg` and `viewportPx` its
+   * vertical field and height.
+   */
+  fadeMarkings(distanceM: number, fovDeg: number, viewportPx: number): void {
+    const mPerPx = (2 * Math.max(1, distanceM) * Math.tan((fovDeg * Math.PI) / 360)) / Math.max(1, viewportPx);
+    const coverage = MARKING_WIDTH_M / mPerPx;
+    const t = Math.min(1, Math.max(0, (coverage - 0.35) / (0.9 - 0.35)));
+    const opacity = t * t * (3 - 2 * t);
+    const m = this.#markingMaterial;
+    this.markings.visible = this.#markingsWanted && opacity > 0.02;
+    if (Math.abs(m.opacity - opacity) > 0.01) {
+      m.opacity = opacity;
+      m.transparent = opacity < 0.999;
+    }
+  }
+
+  /** Whether lane markings are wanted at all (the `lane_markings` overlay). */
+  get markingsEnabled(): boolean {
+    return this.#markingsWanted;
+  }
+
+  set markingsEnabled(v: boolean) {
+    this.#markingsWanted = v;
+    this.markings.visible = v;
   }
 
   /** Keep the sky centred on the camera so its radius never has to cover the whole world. */
