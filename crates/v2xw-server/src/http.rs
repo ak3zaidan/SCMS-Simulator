@@ -733,11 +733,18 @@ async fn handle_text(
         }
     };
     let id = request.id.clone();
+    let received_at = Instant::now();
+    if request.method == "run.seek"
+        && let Some(target) = seek_target(&state.run, &request.params)
+        && !compute_ahead(socket, state, target).await
+    {
+        return TextOutcome::Gone;
+    }
     let mut ctx = rpc::Context {
         run: &state.run,
         session: Some(session),
         pending: Some(steps),
-        received_at: Some(Instant::now()),
+        received_at: Some(received_at),
     };
     let outcome = rpc::dispatch(&mut ctx, &request);
     match outcome {
@@ -812,6 +819,88 @@ async fn handle_text(
             }
         }
     }
+}
+
+/// Where a `run.seek` asks to go, when that is past what the run has produced but inside
+/// the run: the case [`compute_ahead`] exists for. `None` for anything the seek itself will
+/// answer — a target already seekable, one outside the run, a malformed request.
+fn seek_target(run: &Run, params: &serde_json::Map<String, Value>) -> Option<u64> {
+    let horizon = run.horizon_ns();
+    let target = match (params.get("t_ns"), params.get("fraction")) {
+        (Some(t), _) => t.as_u64()?,
+        (None, Some(f)) => {
+            let f = f.as_f64()?;
+            if !(0.0..=1.0).contains(&f) {
+                return None;
+            }
+            (horizon as f64 * f) as u64
+        }
+        _ => return None,
+    };
+    let (_, max_ns) = run.seek_range();
+    (target > max_ns && target <= horizon).then_some(target)
+}
+
+/// Runs the kernel forward until `target` is seekable, telling the client how far it is.
+///
+/// A live kernel keeps only a bounded lead on the stream (`LiveOptions::lookahead_steps`,
+/// 12.8 s at the defaults once the channel is counted), so a seek past it used to be refused
+/// with "the engine has only simulated up to …": the scrub bar could not reach most of a run
+/// the user had not watched. The kernel is let run ahead in 100 ms slices, with the run lock
+/// released between them so `run.status` and the producer keep going, and every slice sends
+/// §6.14's `job.progress` so the page can show a progress bar rather than a frozen control.
+/// The seek then lands exactly as one inside the range does. Returns `false` if the socket
+/// went away meanwhile.
+async fn compute_ahead(socket: &mut WebSocket, state: &AppState, target: u64) -> bool {
+    const SLICE: WallDuration = WallDuration::from_millis(100);
+    let job_id = format!("run.seek:{target}");
+    let (_, start) = state.run.seek_range();
+    let mut last = start;
+    let mut stalled = 0u32;
+    loop {
+        let run = Arc::clone(&state.run);
+        let reached = tokio::task::spawn_blocking(move || run.extend_to(target, SLICE))
+            .await
+            .unwrap_or(last);
+        let progress = if target > start {
+            ((reached.saturating_sub(start)) as f64 / (target - start) as f64).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let done = reached >= target;
+        let notice = rpc::notification(
+            "job.progress",
+            json!({"job_id": job_id, "progress": progress,
+                   "message": format!("simulating ahead to {:.1} s: at {:.1} s",
+                                      target as f64 / 1e9, reached as f64 / 1e9),
+                   "t_ns": reached, "target_ns": target}),
+        );
+        if socket
+            .send(Message::Text(notice.to_string().into()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        if done {
+            break;
+        }
+        // A kernel that has ended, or failed, will not get further; the seek then answers
+        // with the range it has, which is -32003 and says so.
+        stalled = if reached == last { stalled + 1 } else { 0 };
+        if stalled >= 50 {
+            break;
+        }
+        last = reached;
+    }
+    let done = rpc::notification(
+        "job.done",
+        json!({"job_id": job_id, "state": "done", "outputs": []}),
+    );
+    socket
+        .send(Message::Text(done.to_string().into()))
+        .await
+        .is_ok()
 }
 
 /// Sends an `Error` frame, a `Bye` and closes (§3.10, §3.11).

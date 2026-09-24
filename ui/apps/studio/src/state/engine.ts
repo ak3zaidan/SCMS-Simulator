@@ -390,6 +390,16 @@ export class StudioEngine {
       // now rather than at the next 2 s poll, so the page says "finished" the moment it is.
       if (p.state === "finished" || p.state === "paused") void this.refreshStatus();
     });
+    // A seek past what the live kernel has produced runs the kernel forward first, reporting
+    // §6.14 `job.progress` as it goes (crates/v2xw-server/src/http.rs, `compute_ahead`).
+    client.onRpcNotification("job.progress", (p) => {
+      if (typeof p.job_id === "string" && p.job_id.startsWith("run.seek:")) {
+        useStudio.getState().setSeekProgress({ progress: p.progress, message: p.message ?? "" });
+      }
+    });
+    client.onRpcNotification("job.done", (p) => {
+      if (typeof p.job_id === "string" && p.job_id.startsWith("run.seek:")) useStudio.getState().setSeekProgress(null);
+    });
     client.onRpcNotification("log", (p) => this.#log(p.level === "error" ? "error" : p.level === "warn" ? "warn" : "info", p.target ?? "engine", p.message));
     client.onRpcNotification("view.changed", (p) => {
       if (typeof p.mode === "string" && (CAMERA_MODES as readonly string[]).includes(p.mode)) {
@@ -617,12 +627,16 @@ export class StudioEngine {
    * connection's own view and are refused over HTTP with −32009. Rather than send a call that
    * cannot succeed, this says what is missing.
    */
-  async request<M extends VwpMethodName>(method: M, params: ParamsOf<M>): Promise<ResultOf<M>> {
+  async request<M extends VwpMethodName>(
+    method: M,
+    params: ParamsOf<M>,
+    options?: { readonly timeoutMs?: number },
+  ): Promise<ResultOf<M>> {
     const client = this.client;
     if (this.streaming && client) {
       useStudio.getState().noteRpcCall(method);
       try {
-        return await client.request(method, params);
+        return await client.request(method, params, options);
       } catch (err) {
         this.#log("error", "rpc", `${method}: ${errText(err)}`);
         throw err;
@@ -641,7 +655,7 @@ export class StudioEngine {
         const reopened = this.client;
         if (this.streaming && reopened) {
           useStudio.getState().noteRpcCall(method);
-          return await reopened.request(method, params);
+          return await reopened.request(method, params, options);
         }
       }
       const err = new Error(

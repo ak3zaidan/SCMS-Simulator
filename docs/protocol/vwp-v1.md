@@ -1877,8 +1877,13 @@ all frames produced by the step before replying.
 
 Ordering guarantee: the server MUST send the `Keyframe` (with `FLAG_SEEK_RESULT | FLAG_RESYNC`) and all
 deltas up to `t_ns` **before** the JSON-RPC reply. A client can therefore treat the reply as "the scene is
-now at `t_ns`". Live runs support `run.seek` only backwards into recorded time and only when
-`HELLO_SEEKABLE` is set; seeking a live run pauses it.
+now at `t_ns`". Live runs support `run.seek` only when `HELLO_SEEKABLE` is set; seeking a live run
+pauses it. **`DECISION` (2026-09-23): a live run seeks forward too.** A live kernel computes only a
+bounded distance ahead of the stream; a target past what it has produced, but inside the run, is reached
+by letting the kernel run there first. While it does, the server sends `job.progress`
+`{"job_id":"run.seek:<t_ns>","progress","message","t_ns","target_ns"}` on the calling connection (§6.14),
+then `job.done`, then the frames and the reply as above. A client should allow such a call longer than
+its usual timeout. `-32003` then means only that the run ended before `t_ns`.
 
 #### `run.speed`
 

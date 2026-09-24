@@ -2539,6 +2539,9 @@ pub struct LiveEngine {
     cursor: u64,
     /// One past the highest step index produced.
     produced: u64,
+    /// A step a seek is waiting for, beyond the bounded lead: while it is set, [`Self::pump`]
+    /// takes steps past `lookahead_steps` until it is produced. Cleared by the seek.
+    seek_goal: Option<u64>,
     state: RunState,
     speed: f64,
     client_sync: bool,
@@ -2719,6 +2722,7 @@ impl LiveEngine {
             base_index: 0,
             cursor: 0,
             produced: 0,
+            seek_goal: None,
             client_sync: false,
             report: None,
             failure: None,
@@ -2862,13 +2866,21 @@ impl LiveEngine {
             // proportional to the run, made the followed vehicle's message log (filled at
             // absorb time, read at the stream's instant) show only the run's last seconds,
             // and made run.status report counters from the end of the run.
-            if self.timeline.len() >= self.options.retain_steps && self.base_index >= self.cursor {
+            // A seek waiting beyond the lead lifts both bounds until its step is here: the
+            // retention window then slides forward past the stream position (see `absorb`),
+            // because the seek is about to move the stream there anyway.
+            let seeking = self.seek_goal.is_some_and(|goal| self.produced <= goal);
+            if !seeking
+                && self.timeline.len() >= self.options.retain_steps
+                && self.base_index >= self.cursor
+            {
                 break;
             }
-            if self.produced
-                >= self
-                    .cursor
-                    .saturating_add(self.options.lookahead_steps.max(1) as u64)
+            if !seeking
+                && self.produced
+                    >= self
+                        .cursor
+                        .saturating_add(self.options.lookahead_steps.max(1) as u64)
             {
                 break;
             }
@@ -2922,12 +2934,16 @@ impl LiveEngine {
                 }
                 self.timeline.push_back(out);
                 self.produced = index + 1;
+                let seeking = self.seek_goal.is_some();
                 while self.timeline.len() > self.options.retain_steps
-                    && self.base_index < self.cursor
+                    && (self.base_index < self.cursor || seeking)
                 {
                     self.timeline.pop_front();
                     self.base_index += 1;
                 }
+                // Only while seeking can the window have slid past the stream position; the
+                // position then waits at the oldest step still held, where the seek finds it.
+                self.cursor = self.cursor.max(self.base_index);
                 true
             }
             HostMsg::Done(report) => {
@@ -3025,6 +3041,7 @@ impl LiveEngine {
         self.base_index = 0;
         self.cursor = 0;
         self.produced = 0;
+        self.seek_goal = None;
         self.report = None;
         self.failure = None;
         self.history.clear();
@@ -3496,6 +3513,8 @@ impl Engine for LiveEngine {
     }
 
     fn seek(&mut self, t: SimTime) -> Result<Vec<StepOutput>> {
+        // Whatever the seek decides, the lead goes back to its bound afterwards.
+        self.seek_goal = None;
         self.pump();
         let (min_ns, max_ns) = self.seek_range();
         if t < min_ns || t > max_ns {
@@ -3526,6 +3545,38 @@ impl Engine for LiveEngine {
             self.state = RunState::Paused;
         }
         Ok(outputs)
+    }
+
+    fn extend_to(&mut self, t: SimTime, budget: std::time::Duration) -> u64 {
+        let step_ns = self.step_ns();
+        let goal = (t.min(self.descriptor.duration)) / step_ns;
+        if self.has(goal) || self.report.is_some() || self.failure.is_some() {
+            self.pump();
+            return self.seek_range().1;
+        }
+        self.seek_goal = Some(goal);
+        // A transport wait, like `pump_blocking`'s: the kernel's output is the same whenever
+        // it is collected, so how long this waits changes nothing but when the seek lands.
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            self.pump();
+            if self.produced > goal || self.report.is_some() || self.failure.is_some() {
+                break;
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match self.host.steps.recv_timeout(left) {
+                Ok(message) => {
+                    if !self.absorb(message) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        self.seek_range().1
     }
 
     fn seek_range(&self) -> (u64, u64) {

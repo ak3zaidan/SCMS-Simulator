@@ -400,6 +400,11 @@ interface StudioState {
   reconnectAttempts: number;
   validation: ValidationView | null;
   timeline: readonly TimelineMark[];
+  /**
+   * A seek that is running the live kernel forward to its target, as the engine reports it
+   * (§6.14 `job.progress`); `null` when none is.
+   */
+  seekProgress: { readonly progress: number; readonly message: string } | null;
   logs: readonly LogLine[];
   provenanceCount: number;
   metricProvenance: Readonly<Record<string, number>>;
@@ -464,6 +469,7 @@ interface StudioState {
   setScenarioList: (items: readonly ScenarioListItem[]) => void;
   setValidation: (v: ValidationView | null) => void;
   addTimelineMarks: (marks: readonly TimelineMark[]) => void;
+  setSeekProgress: (p: { readonly progress: number; readonly message: string } | null) => void;
   addLog: (line: LogLine) => void;
   setProvenanceCount: (n: number) => void;
   /**
@@ -618,6 +624,7 @@ export const useStudio = create<StudioState>((set) => ({
   reconnectAttempts: 0,
   validation: null,
   timeline: [],
+  seekProgress: null,
   logs: [],
   provenanceCount: 0,
   metricProvenance: {},
@@ -683,6 +690,7 @@ export const useStudio = create<StudioState>((set) => ({
   setReconnectAttempts: (n) => set((state) => (state.reconnectAttempts === n ? state : { reconnectAttempts: n })),
   setScenarioList: (items) => set({ scenarioList: items }),
   setValidation: (v) => set({ validation: v }),
+  setSeekProgress: (p) => set({ seekProgress: p }),
   addTimelineMarks: (marks) =>
     set((state) => (marks.length === 0 ? state : { timeline: [...state.timeline, ...marks].slice(-MAX_MARKS) })),
   addLog: (line) => set((state) => ({ logs: [line, ...state.logs].slice(0, MAX_LOGS) })),

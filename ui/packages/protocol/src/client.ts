@@ -215,7 +215,7 @@ export interface VwpClientApi {
   readonly slots: SlotTable;
   connect(): Promise<HelloMessage>;
   close(code?: number, reason?: string): void;
-  request<M extends VwpMethodName>(method: M, params: ParamsOf<M>): Promise<ResultOf<M>>;
+  request<M extends VwpMethodName>(method: M, params: ParamsOf<M>, options?: { readonly timeoutMs?: number }): Promise<ResultOf<M>>;
   on<K extends keyof VwpClientEvents>(event: K, listener: (payload: VwpClientEvents[K]) => void): () => void;
   onHello(listener: (payload: HelloMessage) => void): () => void;
   onKeyframe(listener: (payload: KeyframeMessage) => void): () => void;
@@ -408,9 +408,13 @@ export class VwpClient implements VwpClientApi {
   /** Connection-state transitions. */
   onState(listener: Listener<"state">): () => void { return this.on("state", listener); }
 
-  /** Typed JSON-RPC call (§6). */
-  request<M extends VwpMethodName>(method: M, params: ParamsOf<M>): Promise<ResultOf<M>> {
-    return this.rpc.request(method, params);
+  /** Typed JSON-RPC call (§6). `options.timeoutMs` overrides the timeout for this call. */
+  request<M extends VwpMethodName>(
+    method: M,
+    params: ParamsOf<M>,
+    options?: { readonly timeoutMs?: number },
+  ): Promise<ResultOf<M>> {
+    return this.rpc.request(method, params, options);
   }
 
   /** Subscribe to one §6.14 notification with its typed params. */

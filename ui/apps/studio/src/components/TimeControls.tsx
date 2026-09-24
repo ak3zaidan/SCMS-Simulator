@@ -96,6 +96,12 @@ const CHANNEL_LABEL: Record<string, string> = {
   "app.warning": "safety warning",
 };
 
+/**
+ * How long a seek may take. A seek past what the live kernel has produced runs the kernel to the
+ * target first (with progress shown), which on a large map in a debug build can take minutes.
+ */
+const SEEK_TIMEOUT_MS = 10 * 60_000;
+
 /** The seekable range an engine reported when it refused a seek (`-32003`). */
 interface SeekRefusal {
   readonly minNs: number;
@@ -124,6 +130,7 @@ export function TimeControls(): React.JSX.Element {
   const compareSync = useStudio((s) => s.compareSync);
   const setWhy = useStudio((s) => s.setWhy);
   const status = useStatus();
+  const seekProgress = useStudio((s) => s.seekProgress);
   const [stepUnit, setStepUnit] = useState<"step" | "keyframe" | "second">("step");
   const [busy, setBusy] = useState(false);
   /** The value under the thumb while a scrub gesture is in flight; `null` when it is not. */
@@ -228,7 +235,10 @@ export function TimeControls(): React.JSX.Element {
         return;
       }
       try {
-        await engine.request("run.seek", { t_ns: target, pause_after: true });
+        // A target past what the live kernel has produced is reached by running the kernel
+        // there; the engine reports `job.progress` meanwhile (shown below the bar), so the call
+        // is allowed as long as a long jump on a large map takes rather than the usual 30 s.
+        await engine.request("run.seek", { t_ns: target, pause_after: true }, { timeoutMs: SEEK_TIMEOUT_MS });
       } catch (err) {
         // §6.6's `-32003` carries the range that would have worked. Remembering it is how the bar
         // learns a bound `run.status` never publishes — and how the two engines in this repository,
@@ -237,8 +247,8 @@ export function TimeControls(): React.JSX.Element {
         if (range === null) throw err;
         setRefused(range);
         throw new Error(
-          `The engine has only simulated up to ${simClock(range.maxNs)} so far, so it cannot move to ` +
-            `${simClock(target)} yet. Let the run reach that point first.`,
+          `The engine could only simulate up to ${simClock(range.maxNs)}, so it cannot move to ` +
+            `${simClock(target)}: the run ended or stopped before it got there.`,
         );
       }
     },
@@ -427,7 +437,7 @@ export function TimeControls(): React.JSX.Element {
           <div
             className="produced"
             style={{ width: `${pct(seekableNs)}%` }}
-            title={`Simulated up to ${simClock(seekableNs)}. Beyond that there is nothing to show yet.`}
+            title={`Simulated up to ${simClock(seekableNs)}. Moving beyond it runs the simulation there first.`}
           />
         ) : null}
         <div className="fill" style={{ width: `${pct(nowNs)}%` }} />
@@ -579,6 +589,14 @@ export function TimeControls(): React.JSX.Element {
         </div>
       ) : null}
 
+      {seekProgress !== null ? (
+        <div className="timebar-notice" role="status" data-testid="seek-progress">
+          <progress value={seekProgress.progress} max={1} aria-label="Simulating ahead to the seek target" />{" "}
+          {seekProgress.message !== ""
+            ? seekProgress.message.replace(/^simulating/, "Simulating")
+            : `Simulating ahead: ${Math.round(seekProgress.progress * 100)} %`}
+        </div>
+      ) : null}
       {notice ? (
         <div className="timebar-notice" role="status" data-testid="time-notice">
           {notice}

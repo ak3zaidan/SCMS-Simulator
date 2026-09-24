@@ -1041,17 +1041,28 @@ export class JsonRpcClient {
     return this.#pending.size;
   }
 
-  /** Call a method and await its typed result. */
-  request<M extends VwpMethodName>(method: M, params: ParamsOf<M>): Promise<ResultOf<M>> {
+  /**
+   * Call a method and await its typed result.
+   *
+   * `options.timeoutMs` overrides the client's timeout for this one call — for a call the server
+   * reports progress on while it works (a `run.seek` past what a live kernel has produced sends
+   * `job.progress` until it lands), where the default would give up on a call that is going well.
+   */
+  request<M extends VwpMethodName>(
+    method: M,
+    params: ParamsOf<M>,
+    options: { readonly timeoutMs?: number } = {},
+  ): Promise<ResultOf<M>> {
     const id = this.#nextId++;
     const payload: JsonRpcRequest = { jsonrpc: "2.0", method, params, id };
+    const timeoutMs = options.timeoutMs ?? this.#timeoutMs;
     return new Promise<ResultOf<M>>((resolve, reject) => {
       const timer =
-        this.#timeoutMs > 0
+        timeoutMs > 0
           ? setTimeout(() => {
               this.#pending.delete(id);
-              reject(new Error(`${method} timed out after ${this.#timeoutMs} ms`));
-            }, this.#timeoutMs)
+              reject(new Error(`${method} timed out after ${timeoutMs} ms`));
+            }, timeoutMs)
           : null;
       this.#pending.set(id, {
         method,

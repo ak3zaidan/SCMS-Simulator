@@ -322,6 +322,17 @@ impl Run {
         Ok((stepped, self.sim_time()))
     }
 
+    /// Lets the run compute ahead towards `t` for up to `budget`; see
+    /// [`Engine::extend_to`]. Returns the new end of the seekable range.
+    pub fn extend_to(&self, t: SimTime, budget: std::time::Duration) -> u64 {
+        self.engine.lock().extend_to(t, budget)
+    }
+
+    /// The end of the run, which no seek can pass.
+    pub fn horizon_ns(&self) -> u64 {
+        self.engine.lock().horizon_ns()
+    }
+
     /// Positions the run at `t` (§7.3).
     ///
     /// # Errors
