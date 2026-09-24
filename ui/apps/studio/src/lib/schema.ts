@@ -206,3 +206,161 @@ export function groupsOf(fields: readonly FormField[]): string[] {
   for (const f of fields) if (!seen.includes(f.group)) seen.push(f.group);
   return seen;
 }
+
+// ---------------------------------------------------------------------------------------------
+// The engine's published settings surface
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Whether the engine acts on a field, as `crates/v2xw-engine`'s `KEY_STATUS` table says.
+ *
+ * The page never decides this itself: it is read off the `x-status` the engine publishes for every
+ * leaf, so a key someone wires changes what the form says the moment the engine is rebuilt.
+ */
+export type FieldStatus = "wired" | "partial" | "not-implemented" | "refused" | "descriptive" | "unknown";
+
+/** A form field with the engine's own statement of whether it changes the run. */
+export interface PublishedFormField extends FormField {
+  readonly status: FieldStatus;
+  /** The engine's sentence about what it does with the field. */
+  readonly statusNote: string;
+  /** True for a list or a map, edited as JSON because its elements have no fixed pointer. */
+  readonly collection: boolean;
+}
+
+/** One row of the published field index, or one node of the published schema. */
+export interface PublishedRow {
+  readonly [key: string]: unknown;
+}
+
+function statusOf(value: unknown): FieldStatus {
+  return value === "wired" || value === "partial" || value === "not-implemented" || value === "refused" || value === "descriptive"
+    ? value
+    : "unknown";
+}
+
+/** Every schema node that carries an `x-pointer`, by pointer — the first one wins. */
+function schemaIndex(schema: unknown): Map<string, PublishedRow> {
+  const out = new Map<string, PublishedRow>();
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const child of node) walk(child);
+      return;
+    }
+    if (node === null || typeof node !== "object") return;
+    const row = node as PublishedRow;
+    const pointer = row["x-pointer"];
+    if (typeof pointer === "string" && !out.has(pointer)) out.set(pointer, row);
+    for (const child of Object.values(row)) walk(child);
+  };
+  walk(schema);
+  return out;
+}
+
+function kindOfRow(row: PublishedRow): FormField["kind"] {
+  if (Array.isArray(row.enum) && row.enum.length > 0) return "enum";
+  switch (row.kind) {
+    case "integer": return "integer";
+    case "number": return "number";
+    case "boolean": return "boolean";
+    case "enum": return "enum";
+    case "string": return "string";
+    default: return "json";
+  }
+}
+
+/**
+ * The settings form, built from the engine's published field index (`scenario.get {with_schema}`
+ * `fields`) and its schema.
+ *
+ * Three kinds of row come out of it:
+ *
+ *  * **a leaf** at a fixed pointer, with the widget its type calls for;
+ *  * **a collection** — a list or a map, whose element leaves the engine publishes under `/-/` or
+ *    `/*` because an element has no fixed pointer — edited as one JSON value at the collection's
+ *    own pointer, carrying the collection's status;
+ *  * **a choice of variant** for a tagged union such as `world.source`, whose tag is not a leaf of
+ *    any variant but is what picks between them.
+ *
+ * Every row carries the engine's `x-status`, which is the point: a field the engine does not act on
+ * is marked in the form, not silently accepted.
+ */
+export function fieldsFromPublished(
+  fields: readonly PublishedRow[],
+  schema: unknown,
+  doc: unknown,
+): PublishedFormField[] {
+  const index = schemaIndex(schema);
+  const out: PublishedFormField[] = [];
+  const seen = new Set<string>();
+  const push = (field: PublishedFormField): void => {
+    if (seen.has(field.pointer)) return;
+    seen.add(field.pointer);
+    out.push(field);
+  };
+  const fromRow = (
+    row: PublishedRow,
+    pointer: string,
+    collection: boolean,
+    kind: FormField["kind"],
+  ): PublishedFormField => ({
+    pointer,
+    label: typeof row.title === "string" ? row.title : humanise(pointer.split("/").pop() ?? pointer),
+    group: typeof row["x-group"] === "string" ? row["x-group"] : "Other",
+    kind,
+    ...(typeof row.unit === "string" && row.unit !== "" ? { unit: row.unit } : {}),
+    ...(typeof row.description === "string" ? { help: row.description } : {}),
+    ...(kind === "enum" && Array.isArray(row.enum) ? { options: row.enum.map(String) } : {}),
+    ...(typeof row.minimum === "number" ? { min: row.minimum } : {}),
+    ...(typeof row.exclusiveMinimum === "number" ? { min: row.exclusiveMinimum } : {}),
+    ...(typeof row.maximum === "number" ? { max: row.maximum } : {}),
+    status: statusOf(row["x-status"]),
+    statusNote: typeof row["x-status-note"] === "string" ? row["x-status-note"] : "",
+    collection,
+  });
+
+  for (const row of fields) {
+    const pointer = row["x-pointer"];
+    if (typeof pointer !== "string" || pointer === "") continue;
+    const cut = pointer.search(/\/[-*](\/|$)/);
+    if (cut >= 0) {
+      const root = pointer.slice(0, cut);
+      const rootRow = index.get(root) ?? row;
+      push(fromRow({ ...rootRow, "x-group": rootRow["x-group"] ?? row["x-group"] }, root, true, "json"));
+      continue;
+    }
+    // A tagged union's tag sits beside its variants' leaves; offer it where its first leaf is.
+    for (const [unionPointer, node] of index) {
+      if (typeof node["x-tag"] !== "string" || !Array.isArray(node["x-variants"])) continue;
+      if (!pointer.startsWith(`${unionPointer}/`)) continue;
+      const name = typeof node.title === "string" ? node.title : humanise(unionPointer.split("/").pop() ?? "");
+      push({
+        ...fromRow(node, `${unionPointer}/${node["x-tag"]}`, false, "enum"),
+        label: `${name}: kind`,
+        options: (node["x-variants"] as unknown[]).map(String),
+      });
+    }
+    push(fromRow(row, pointer, false, kindOfRow(row)));
+  }
+
+  // A top-level section the index has no leaf for (a plain list of names, say) is still a setting.
+  if (doc !== null && typeof doc === "object") {
+    for (const key of Object.keys(doc as Record<string, unknown>)) {
+      const pointer = `/${key}`;
+      if (out.some((f) => f.pointer === pointer || f.pointer.startsWith(`${pointer}/`))) continue;
+      push(fromRow(index.get(pointer) ?? {}, pointer, true, "json"));
+    }
+  }
+  return out;
+}
+
+/** The pointers at which `a` and `b` differ, down to the leaves, sorted. */
+export function changedPointers(a: unknown, b: unknown, at = ""): string[] {
+  const isObject = (v: unknown): v is Record<string, unknown> =>
+    v !== null && typeof v === "object" && !Array.isArray(v);
+  if (isObject(a) && isObject(b)) {
+    const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])].sort();
+    return keys.flatMap((k) => changedPointers(a[k], b[k], `${at}/${k.replace(/~/g, "~0").replace(/\//g, "~1")}`));
+  }
+  return JSON.stringify(a) === JSON.stringify(b) ? [] : [at === "" ? "/" : at];
+}

@@ -60,6 +60,7 @@ pub mod adapters;
 pub mod ctx;
 pub mod error;
 pub mod event;
+pub mod export;
 pub mod manifest;
 pub mod phase2;
 pub mod records;

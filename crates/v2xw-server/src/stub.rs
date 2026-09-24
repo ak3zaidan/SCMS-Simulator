@@ -312,6 +312,7 @@ impl StubEngine {
             // paragraph).
             end_of_run: t.saturating_add(self.step_ns()) >= self.descriptor.duration,
             recorded: Vec::new(),
+            generation: 0,
         }
     }
 
@@ -974,6 +975,10 @@ impl Engine for StubEngine {
                 if self.state == RunState::Running {
                     return Err(ServerError::RunAlreadyRunning);
                 }
+                // `run.start` rewinds (§6.6: it "begins producing the stream" of a run).
+                // It used to only set the state, so on a finished fixture run it reported
+                // `running` and produced nothing: the page's Run-again did nothing at all.
+                self.step_index = 0;
                 self.speed = speed;
                 self.state = if paused {
                     RunState::Paused

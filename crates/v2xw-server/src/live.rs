@@ -71,7 +71,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 
 use serde_json::{Value, json};
@@ -102,8 +102,11 @@ use v2xw_record::wire::{StrTable, U32_NONE};
 use v2xw_world::WorldPayload;
 use v2xw_world::model::SignalState;
 
-use crate::engine::{Control, ControlOutcome, Engine, Query, RunDescriptor, RunState, StepOutput};
-use crate::error::{Result, ServerError};
+use crate::engine::{
+    Control, ControlOutcome, Engine, Query, RunDescriptor, RunState, ScenarioSource, StageRequest,
+    Staged, StepOutput,
+};
+use crate::error::{ParamError, Result, ServerError};
 use crate::introspect::{Introspect, MetricInfo};
 
 /// How a live run is started.
@@ -193,6 +196,8 @@ enum HostMsg {
     Done(Box<RunReport>),
     /// The run aborted.
     Failed(String),
+    /// What the scenario's exporters wrote, or why they could not.
+    Exported(std::result::Result<Vec<v2xw_engine::export::Exported>, String>),
 }
 
 /// Everything about the run the kernel knows before its first step.
@@ -201,6 +206,8 @@ enum HostMsg {
 /// field of it is `Send`, which is the reason the split exists: the engine is not.
 #[derive(Debug)]
 struct Setup {
+    /// The imported world in the engine's exact native form, for the next run's kernel.
+    world_memo: Option<WorldMemo>,
     world_payload: WorldPayload,
     world_json: String,
     hello: HelloBody,
@@ -235,6 +242,17 @@ struct Setup {
     metric_prov: u32,
 }
 
+/// The last world this process imported, kept for the next run of the same world.
+///
+/// Kept as `v2xw_world::serde_native` bytes, whose round trip is exact (same content hash,
+/// same lane graph), under `v2xw_engine::wiring::world_cache_key`, which covers every input
+/// of the import. A run on a kept world is therefore the same run as one on a fresh import.
+#[derive(Debug)]
+struct WorldMemo {
+    key: String,
+    bytes: Vec<u8>,
+}
+
 /// One signal controller's fixed-time plan, flattened for evaluation without the world.
 #[derive(Debug, Clone)]
 struct SignalPlan {
@@ -265,6 +283,40 @@ impl SignalPlan {
     }
 }
 
+/// How many kernel threads exist in this process right now.
+///
+/// Counted by the thread itself — incremented as its body starts, decremented by a guard
+/// as it returns, however it returns — so the number is the threads that are actually
+/// alive, not the handles somebody remembered to drop. `run.status` publishes it, and the
+/// lifecycle tests hold it to one: before the kernel had a cancellation point, every
+/// restart left the previous kernel computing to its horizon beside the new one.
+static KERNEL_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many kernel threads have ever been started in this process.
+static KERNEL_THREADS_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+/// The number of kernel threads alive in this process.
+pub fn kernel_threads() -> usize {
+    KERNEL_THREADS.load(Ordering::SeqCst)
+}
+
+/// Decrements [`KERNEL_THREADS`] when the kernel thread's body ends, by any path.
+struct KernelThreadGuard;
+
+impl KernelThreadGuard {
+    fn enter() -> Self {
+        KERNEL_THREADS.fetch_add(1, Ordering::SeqCst);
+        KERNEL_THREADS_STARTED.fetch_add(1, Ordering::SeqCst);
+        KernelThreadGuard
+    }
+}
+
+impl Drop for KernelThreadGuard {
+    fn drop(&mut self) {
+        KERNEL_THREADS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// A handle on the thread the kernel runs on.
 #[derive(Debug)]
 struct Host {
@@ -274,23 +326,39 @@ struct Host {
 }
 
 impl Host {
-    /// Tells the kernel to stop producing.
+    /// Tells the kernel to stop, without waiting for it.
     ///
-    /// It does not stop the kernel: `v2xw_engine::Engine::run` has no cancellation point,
-    /// so the thread runs to the scenario horizon with its output discarded and then ends.
-    /// That is stated rather than worked around — the alternative is unwinding through the
-    /// kernel from a recorder callback, which is not a thing to do to a simulation.
+    /// The kernel checks the flag between every two events (`RunRecorder::cancelled`), and
+    /// a recorder blocked on a full channel checks it every 2 ms, so the thread ends within
+    /// one event's work of this call.
     fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Stops the kernel and waits for its thread to end.
+    ///
+    /// The wait is bounded by one event's work plus one world import: a kernel still
+    /// building its world when it is told to stop finishes the build, then sees the flag
+    /// before its first event. Draining the channel while waiting is what keeps a recorder
+    /// blocked on a full channel from waiting on us while we wait on it.
+    fn shutdown(&mut self) {
+        self.stop();
+        if let Some(join) = self.join.take() {
+            while !join.is_finished() {
+                while self.steps.try_recv().is_ok() {}
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let _ = join.join();
+        }
     }
 }
 
 impl Drop for Host {
     fn drop(&mut self) {
-        self.stop();
-        // Not joined: see `Host::stop`. The thread holds nothing the process needs and
-        // exits on its own; joining here would block a shutdown for the length of a run.
-        let _ = self.join.take();
+        // Joined, now that the kernel can be stopped: a dropped run must not leave a
+        // simulation computing on its own thread (the defect `KERNEL_THREADS` exists to
+        // catch).
+        self.shutdown();
     }
 }
 
@@ -427,6 +495,10 @@ impl v2xw_engine::RunRecorder for StepRecorder {
     fn refused(&self) -> u64 {
         self.refused
     }
+
+    fn cancelled(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
 }
 
 /// Builds the kernel on a dedicated thread and streams its steps back.
@@ -440,6 +512,7 @@ fn spawn_host(
     scenario: Scenario,
     options: &LiveOptions,
     lookahead: usize,
+    memo: Option<WorldMemo>,
 ) -> Result<(Box<Setup>, Host)> {
     let (setup_tx, setup_rx) =
         std::sync::mpsc::channel::<std::result::Result<Box<Setup>, String>>();
@@ -450,13 +523,65 @@ fn spawn_host(
     let actor_capacity = options.actor_capacity.max(1);
     let label = options.label.clone();
     let token = options.session_token.clone();
-    let recording = options.recording.clone();
+    // Naming an exporter makes the run record: every exporter reads the recording, so the
+    // recording is written to `runs/<meta.name>/` (the command line's convention) when the
+    // server was not given a path of its own.
+    let exporters = scenario.exporters.clone();
+    let recording = options.recording.clone().or_else(|| {
+        (!exporters.is_empty()).then(|| {
+            std::path::PathBuf::from("runs")
+                .join(&scenario.meta.name)
+                .join("recording.mcap")
+        })
+    });
     let host_stop = Arc::clone(&stop);
+    let export_stop = Arc::clone(&stop);
     let join = std::thread::Builder::new()
         .name("v2xw-engine".to_string())
         .stack_size(16 * 1024 * 1024)
         .spawn(move || {
-            let mut engine = match v2xw_engine::Engine::build(scenario, &build_utc) {
+            let _alive = KernelThreadGuard::enter();
+            // The world: the one this process imported last time when every input of the
+            // import is unchanged (the key covers them all, source file contents included),
+            // a fresh import otherwise. Every Run is a fresh kernel, and before this every one
+            // of them imported the map again — on Manhattan, most of the wait after Run.
+            let key = v2xw_engine::wiring::world_cache_key(&scenario).ok();
+            let kept = match (memo, key.as_ref()) {
+                (Some(m), Some(k)) if &m.key == k => {
+                    v2xw_world::serde_native::from_bytes(&m.bytes).ok().map(|w| (w, m.bytes))
+                }
+                _ => None,
+            };
+            let (world, bytes) = match kept {
+                Some((world, bytes)) => (world, Some(bytes)),
+                None => match v2xw_engine::wiring::build_world(&scenario) {
+                    Ok(world) => {
+                        let bytes = v2xw_world::serde_native::to_bytes(&world).ok();
+                        (world, bytes)
+                    }
+                    Err(e) => {
+                        let _ = setup_tx.send(Err(e.to_string()));
+                        return;
+                    }
+                },
+            };
+            // `world.cache` names a directory to keep the world in across processes; a kept
+            // world still belongs there, so it is written when the entry is missing.
+            if let (Some(dir), Some(k), Some(b)) = (
+                scenario.world.cache.as_deref().map(str::trim).filter(|d| !d.is_empty()),
+                key.as_ref(),
+                bytes.as_ref(),
+            ) {
+                let entry = std::path::Path::new(dir).join(format!("{k}.v2xwworld"));
+                if !entry.exists() && std::fs::create_dir_all(dir).is_ok() {
+                    let partial = entry.with_extension(format!("{}.partial", std::process::id()));
+                    if std::fs::write(&partial, b).is_ok() && std::fs::rename(&partial, &entry).is_err() {
+                        let _ = std::fs::remove_file(&partial);
+                    }
+                }
+            }
+            let world_memo = key.zip(bytes).map(|(key, bytes)| WorldMemo { key, bytes });
+            let mut engine = match v2xw_engine::Engine::build_with_world(scenario, world, &build_utc) {
                 Ok(e) => e,
                 Err(e) => {
                     let _ = setup_tx.send(Err(e.to_string()));
@@ -470,7 +595,10 @@ fn spawn_host(
                 recording.as_deref(),
                 actor_capacity,
             ) {
-                Ok(s) => s,
+                Ok(mut s) => {
+                    s.world_memo = world_memo;
+                    s
+                }
                 Err(e) => {
                     let _ = setup_tx.send(Err(e.to_string()));
                     return;
@@ -497,6 +625,18 @@ fn spawn_host(
             };
             let outcome = engine.run(&mut recorder);
             recorder.finish();
+            // The exporters, on this thread so the transport stays responsive, and only for a
+            // run that reached its end: a stopped run's recording is a fragment.
+            if outcome.is_ok()
+                && !exporters.is_empty()
+                && !export_stop.load(Ordering::SeqCst)
+                && let Some(path) = recording.as_deref()
+            {
+                let out_dir = path.parent().unwrap_or(std::path::Path::new("."));
+                let result = v2xw_engine::export::run_exporters(&exporters, path, out_dir)
+                    .map_err(|e| e.to_string());
+                let _ = step_tx.send(HostMsg::Exported(result));
+            }
             let _ = match outcome {
                 Ok(report) => step_tx.send(HostMsg::Done(Box::new(report))),
                 Err(e) => step_tx.send(HostMsg::Failed(e.to_string())),
@@ -524,6 +664,28 @@ fn spawn_host(
             join: Some(join),
         },
     ))
+}
+
+/// The run-scoped facts a `Hello` is built from, for the run `setup` describes.
+fn descriptor_of(setup: &Setup) -> RunDescriptor {
+    RunDescriptor {
+        run_id: crate::stub::uuid_string(&setup.run_id_bytes),
+        run_id_bytes: setup.run_id_bytes,
+        hello: setup.hello.clone(),
+        cadence: setup.cadence,
+        origin_m: setup.origin_m,
+        duration: setup.duration,
+        live: true,
+        // §3.1.2 sets `HELLO_SEEKABLE` on a live run "once ≥ 1 keyframe is recorded".
+        // The first keyframe is step 0, which is produced before any client can have
+        // connected, so the flag is set from the start rather than flipped later —
+        // which it could not be anyway, because `Run` snapshots this descriptor per run.
+        seekable: true,
+        scenario: setup.scenario_doc.clone(),
+        scenario_hash_hex: setup.scenario_hash_hex.clone(),
+        recording_path: setup.recording_path.clone(),
+        provenance: Some(setup.provenance.clone()),
+    }
 }
 
 /// Opens the MCAP recording a live run writes, declaring the cadence and attaching the
@@ -835,6 +997,7 @@ fn assemble_setup(
     };
 
     Ok(Box::new(Setup {
+        world_memo: None,
         world_payload: payload,
         world_json,
         hello,
@@ -1390,6 +1553,7 @@ impl Projector {
             provenance: None,
             end_of_run: raw.index >= self.last_index,
             recorded: Vec::new(),
+            generation: 0,
         }
     }
 
@@ -2043,6 +2207,115 @@ pub struct LiveEngine {
     appended_strings: Vec<String>,
     /// Membership test for `appended_strings`, so the append is O(log n) and not O(n).
     appended_index: BTreeSet<String>,
+    /// The scenario the next `run.start` runs, when `scenario.set` or `scenario.load` put
+    /// one in place (§6.6 "or the already-set one").
+    staged: Option<Scenario>,
+    /// Where the scenario this engine was opened on came from, for resolving presets.
+    source: Option<std::path::PathBuf>,
+    /// A running SHA-256 over every step the kernel produced, in order: the run's output
+    /// digest. Two runs with the same scenario and seed agree on it and two runs with
+    /// different seeds do not, which is the reproducibility claim made checkable.
+    digest: sha2::Sha256,
+    /// How many steps the digest covers.
+    digest_steps: u64,
+    /// Set once the digest covers the whole run.
+    digest_final: Option<String>,
+    /// How many runs this engine has started, counting the first.
+    runs_started: u64,
+    /// Whole-run totals, accumulated as the kernel produces steps.
+    stats: RunStats,
+    /// What the scenario's exporters wrote after the run, or why they could not.
+    exports: Option<std::result::Result<Vec<v2xw_engine::export::Exported>, String>>,
+    /// The last imported world, for the next run's kernel (see [`WorldMemo`]).
+    world_memo: Option<WorldMemo>,
+}
+
+/// Whole-run totals, read off the steps the kernel produced — not off what a connection
+/// subscribed to — so they describe the run and not one viewer of it.
+///
+/// They are what makes a changed setting checkable from outside: a changed arrival rate
+/// moves `actors_seen`, a changed propagation model moves `mean_rssi_dbm`, a changed message
+/// set moves `tx_by_type`. Published under `run.status.engine.stats`.
+#[derive(Debug, Default, Clone)]
+struct RunStats {
+    /// Distinct actors that appeared in any step.
+    actors: BTreeSet<u32>,
+    /// Frames put on the air, by message family.
+    tx_by_type: BTreeMap<&'static str, u64>,
+    /// Sum of the transmit power of the frames that reported one, dBm.
+    tx_power_sum_dbm: f64,
+    /// How many frames reported a transmit power.
+    tx_power_n: u64,
+    /// Reception attempts evaluated, and how many decoded.
+    rx_attempts: u64,
+    rx_ok: u64,
+    /// Sum of the received power of the attempts that reported one, dBm.
+    rssi_sum_dbm: f64,
+    rssi_n: u64,
+}
+
+impl RunStats {
+    fn absorb(&mut self, out: &StepOutput) {
+        for pose in &out.snapshot.actors {
+            self.actors.insert(pose.actor.index());
+        }
+        let tx = v2xw_record::channels::by_name("node.tx").and_then(|c| c.wire_id);
+        let rx = v2xw_record::channels::by_name("phy.rx").and_then(|c| c.wire_id);
+        for event in &out.events {
+            let p = &event.payload;
+            if Some(event.channel_id) == tx && p.len() >= 20 {
+                let code = u16::from_le_bytes([p[16], p[17]]);
+                *self.tx_by_type.entry(msg_type_name(code)).or_insert(0) += 1;
+                let centi = i16::from_le_bytes([p[18], p[19]]);
+                if centi != i16::MIN {
+                    self.tx_power_sum_dbm += f64::from(centi) / 100.0;
+                    self.tx_power_n += 1;
+                }
+            } else if Some(event.channel_id) == rx && p.len() >= 41 {
+                self.rx_attempts += 1;
+                if p[40] == 0 {
+                    self.rx_ok += 1;
+                }
+                let rssi = f32::from_le_bytes([p[28], p[29], p[30], p[31]]);
+                if rssi.is_finite() {
+                    self.rssi_sum_dbm += f64::from(rssi);
+                    self.rssi_n += 1;
+                }
+            }
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let mean = |sum: f64, n: u64| (n > 0).then(|| sum / n as f64);
+        json!({
+            "actors_seen": self.actors.len(),
+            "tx_frames": self.tx_by_type.values().sum::<u64>(),
+            "tx_by_type": self.tx_by_type,
+            "mean_tx_power_dbm": mean(self.tx_power_sum_dbm, self.tx_power_n),
+            "rx_attempts": self.rx_attempts,
+            "rx_ok": self.rx_ok,
+            "mean_rssi_dbm": mean(self.rssi_sum_dbm, self.rssi_n),
+        })
+    }
+}
+
+/// The message family a `node.tx` type code names (the inverse of `msg_type_code`).
+fn msg_type_name(code: u16) -> &'static str {
+    match code {
+        1 => "bsm",
+        2 => "cam",
+        3 => "denm",
+        4 => "spat",
+        5 => "map",
+        6 => "psm",
+        7 => "vam",
+        8 => "cpm",
+        9 => "srm",
+        10 => "ssm",
+        11 => "wsa",
+        12 => "crl",
+        _ => "other",
+    }
 }
 
 impl LiveEngine {
@@ -2055,7 +2328,9 @@ impl LiveEngine {
     pub fn open(path: impl AsRef<std::path::Path>, options: LiveOptions) -> Result<Self> {
         let scenario = Scenario::load(path.as_ref())
             .map_err(|e| ServerError::Internal(format!("{}: {e}", path.as_ref().display())))?;
-        Self::new(scenario, options)
+        let mut engine = Self::new(scenario, options)?;
+        engine.source = Some(path.as_ref().to_path_buf());
+        Ok(engine)
     }
 
     /// Builds the kernel from a scenario already in hand.
@@ -2063,31 +2338,16 @@ impl LiveEngine {
     /// # Errors
     /// As [`LiveEngine::open`].
     pub fn new(scenario: Scenario, options: LiveOptions) -> Result<Self> {
-        let (setup, host) = spawn_host(scenario.clone(), &options, options.lookahead_steps)?;
+        let (mut setup, host) =
+            spawn_host(scenario.clone(), &options, options.lookahead_steps, None)?;
+        let world_memo = setup.world_memo.take();
         let projector = Projector::new(&setup);
         let metric_names = setup
             .catalogue
             .iter()
             .map(|m| (m.str_id, m.name.clone()))
             .collect();
-        let descriptor = RunDescriptor {
-            run_id: crate::stub::uuid_string(&setup.run_id_bytes),
-            run_id_bytes: setup.run_id_bytes,
-            hello: setup.hello.clone(),
-            cadence: setup.cadence,
-            origin_m: setup.origin_m,
-            duration: setup.duration,
-            live: true,
-            // §3.1.2 sets `HELLO_SEEKABLE` on a live run "once ≥ 1 keyframe is recorded".
-            // The first keyframe is step 0, which is produced before any client can have
-            // connected, so the flag is set from the start rather than flipped later —
-            // which it could not be anyway, because `Run` snapshots this descriptor.
-            seekable: true,
-            scenario: setup.scenario_doc.clone(),
-            scenario_hash_hex: setup.scenario_hash_hex.clone(),
-            recording_path: setup.recording_path.clone(),
-            provenance: Some(setup.provenance.clone()),
-        };
+        let descriptor = descriptor_of(&setup);
         let world = Arc::new(setup.world_payload.clone());
         let world_json = setup.world_json.clone();
         Ok(LiveEngine {
@@ -2117,6 +2377,15 @@ impl LiveEngine {
             last_telemetry: BTreeMap::new(),
             appended_strings: Vec::new(),
             appended_index: BTreeSet::new(),
+            staged: None,
+            source: None,
+            digest: <sha2::Sha256 as sha2::Digest>::new(),
+            digest_steps: 0,
+            digest_final: None,
+            runs_started: 1,
+            stats: RunStats::default(),
+            exports: None,
+            world_memo,
         })
     }
 
@@ -2274,6 +2543,8 @@ impl LiveEngine {
             HostMsg::Step(raw) => {
                 let index = raw.index;
                 let out = self.projector.project(&raw);
+                self.digest_step(&out);
+                self.stats.absorb(&out);
                 for row in &out.metrics {
                     if let Some(name) = self.metric_names.get(&row.str_metric) {
                         self.history
@@ -2298,6 +2569,10 @@ impl LiveEngine {
             HostMsg::Done(report) => {
                 self.report = Some(*report);
                 false
+            }
+            HostMsg::Exported(result) => {
+                self.exports = Some(result);
+                true
             }
             HostMsg::Failed(message) => {
                 self.failure = Some(message);
@@ -2347,16 +2622,41 @@ impl LiveEngine {
         }
     }
 
-    /// Restarts the run from `t = 0` on a fresh kernel thread.
-    fn restart(&mut self) -> Result<()> {
-        let (setup, host) = spawn_host(
-            self.scenario.clone(),
+    /// Starts `scenario` from `t = 0` on a fresh kernel thread, after the previous one has
+    /// stopped and been joined — so there is never more than one kernel in the process.
+    ///
+    /// On a build failure (a world that does not import, say) the previous run's streamed
+    /// history is kept, so the page still shows what it showed, the state becomes `error`
+    /// with the engine's own message, and the scenario is not changed: pressing Run again
+    /// runs the last scenario that built.
+    fn restart(&mut self, scenario: Scenario) -> Result<()> {
+        self.host.shutdown();
+        let (mut setup, host) = match spawn_host(
+            scenario.clone(),
             &self.options,
             self.options.lookahead_steps,
-        )?;
+            self.world_memo.take(),
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.failure = Some(e.to_string());
+                self.state = RunState::Error;
+                return Err(e);
+            }
+        };
+        self.world_memo = setup.world_memo.take();
+        self.metric_names = setup
+            .catalogue
+            .iter()
+            .map(|m| (m.str_id, m.name.clone()))
+            .collect();
+        self.descriptor = descriptor_of(&setup);
+        self.world = Arc::new(setup.world_payload.clone());
+        self.world_json = setup.world_json.clone();
         self.projector = Projector::new(&setup);
         self.setup = setup;
         self.host = host;
+        self.scenario = scenario;
         self.timeline.clear();
         self.base_index = 0;
         self.cursor = 0;
@@ -2365,10 +2665,272 @@ impl LiveEngine {
         self.failure = None;
         self.history.clear();
         self.last_telemetry.clear();
-        // The string table is *not* cleared: a restart reuses this run's id and its
-        // descriptor, so an id a client already resolved must keep meaning what it meant.
+        // Every connection gets a fresh `Hello` for the new run (`Run` moves to a new
+        // generation on every start), so the strings the previous run appended are
+        // nobody's any more. Keeping them grew every `Hello` with every run.
+        self.appended_strings.clear();
+        self.appended_index.clear();
+        self.digest = <sha2::Sha256 as sha2::Digest>::new();
+        self.digest_steps = 0;
+        self.digest_final = None;
+        self.stats = RunStats::default();
+        self.exports = None;
+        self.runs_started += 1;
         Ok(())
     }
+
+    /// The scenario `run.start` will run when it names none: the staged one, else the
+    /// current one.
+    fn next_scenario(&self) -> Scenario {
+        self.staged.clone().unwrap_or_else(|| self.scenario.clone())
+    }
+
+    /// Resolves a preset id or a path to a loaded, validated scenario.
+    fn load_preset(&self, id: &str) -> Result<Scenario> {
+        let path = self
+            .preset_paths()
+            .into_iter()
+            .find(|p| preset_id(p) == id)
+            .unwrap_or_else(|| std::path::PathBuf::from(id));
+        Scenario::load(&path).map_err(|e| {
+            ServerError::param(
+                "/scenario",
+                &format!("{}: {e}", path.display()),
+                "pick one of the scenarios scenario.list offers",
+            )
+        })
+    }
+
+    /// The scenario files beside the one this engine was opened on, sorted.
+    fn preset_paths(&self) -> Vec<std::path::PathBuf> {
+        let Some(dir) = self.source.as_ref().and_then(|p| p.parent()) else {
+            return Vec::new();
+        };
+        let dir = if dir.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            dir
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<std::path::PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|x| x == "yaml" || x == "yml" || x == "json")
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// Parses, migrates and validates an inline document the way the loader does a file.
+    ///
+    /// `meta.base` is resolved against the directory of the scenario this engine was
+    /// opened on, which is where a document the page edited came from.
+    fn scenario_from_document(&self, doc: &Value) -> std::result::Result<Scenario, Vec<ParamError>> {
+        let text = serde_json::to_string(doc).map_err(|e| {
+            vec![ParamError::new("/", e.to_string(), "pass a JSON object")]
+        })?;
+        let base = self.source.as_ref().and_then(|p| p.parent());
+        match Scenario::parse(&text, base) {
+            Ok(s) => Ok(s),
+            Err(first) => {
+                // `parse` stops at the first problem. Collect all of them when the
+                // document at least deserialises, so a form can mark every bad field.
+                let mut migrated = doc.clone();
+                let _ = v2xw_engine::scenario::Chain::shipped().migrate(&mut migrated);
+                match Scenario::from_document(migrated) {
+                    Ok(s) => {
+                        let all: Vec<ParamError> = v2xw_engine::scenario::validate(&s)
+                            .iter()
+                            .map(scenario_error)
+                            .collect();
+                        if all.is_empty() {
+                            Err(vec![engine_error(&first)])
+                        } else {
+                            Err(all)
+                        }
+                    }
+                    Err(_) => Err(vec![engine_error(&first)]),
+                }
+            }
+        }
+    }
+
+    /// Records one produced step in the run's output digest.
+    fn digest_step(&mut self, out: &StepOutput) {
+        use sha2::Digest;
+        let d = &mut self.digest;
+        d.update(out.sim_time.to_le_bytes());
+        d.update((out.snapshot.actors.len() as u64).to_le_bytes());
+        for pose in &out.snapshot.actors {
+            d.update(pose.actor.index().to_le_bytes());
+            for v in pose.pos_m {
+                d.update(v.to_bits().to_le_bytes());
+            }
+            d.update(pose.heading_rad.to_bits().to_le_bytes());
+            d.update(pose.speed_mps.to_bits().to_le_bytes());
+        }
+        d.update((out.events.len() as u64).to_le_bytes());
+        for event in &out.events {
+            d.update(event.channel_id.to_le_bytes());
+            d.update(event.sim_time_ns.to_le_bytes());
+            d.update(&event.payload);
+        }
+        self.digest_steps += 1;
+        if out.end_of_run {
+            self.digest_final = Some(hex_of(&self.digest.clone().finalize()));
+        }
+    }
+}
+
+/// The id `scenario.list` gives a scenario file: its path as the engine was given it.
+fn preset_id(path: &std::path::Path) -> String {
+    path.display().to_string()
+}
+
+/// A loader error as a `{path, message, hint}` row (§6.4).
+fn scenario_error(e: &v2xw_engine::ScenarioError) -> ParamError {
+    let path = e
+        .field()
+        .map(|f| format!("/{}", f.replace('.', "/")))
+        .unwrap_or_else(|| "/".to_string());
+    ParamError::new(path, e.to_string(), "see the field's help text for its allowed values")
+}
+
+/// An engine error from the loader as a `{path, message, hint}` row.
+fn engine_error(e: &v2xw_engine::EngineError) -> ParamError {
+    match e {
+        v2xw_engine::EngineError::Scenario(inner) => scenario_error(inner),
+        other => ParamError::new("/", other.to_string(), "check the scenario document"),
+    }
+}
+
+/// Lower-case hex of a digest.
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Every JSON Pointer at which `a` and `b` differ, down to the leaves, sorted.
+fn changed_pointers(a: &Value, b: &Value) -> Vec<String> {
+    fn walk(a: Option<&Value>, b: Option<&Value>, at: &str, out: &mut Vec<String>) {
+        match (a, b) {
+            (Some(Value::Object(x)), Some(Value::Object(y))) => {
+                let keys: BTreeSet<&String> = x.keys().chain(y.keys()).collect();
+                for k in keys {
+                    let child = format!("{at}/{}", k.replace('~', "~0").replace('/', "~1"));
+                    walk(x.get(k), y.get(k), &child, out);
+                }
+            }
+            (x, y) if x == y => {}
+            // `274` and `274.0` are one value. A document that went through a browser comes
+            // back with every whole float written as an integer (JavaScript has one number
+            // type), and inside an opaque `Value` block — a world generator's parameters —
+            // nothing re-types it, so a plain `==` reported untouched fields as edits.
+            (Some(Value::Number(x)), Some(Value::Number(y))) if x.as_f64() == y.as_f64() => {}
+            _ => out.push(if at.is_empty() { "/".to_string() } else { at.to_string() }),
+        }
+    }
+    let mut out = Vec::new();
+    walk(Some(a), Some(b), "", &mut out);
+    out
+}
+
+/// Applies an RFC 6902 patch's `add`, `replace`, `remove` and `test` operations.
+fn apply_patch(doc: &mut Value, ops: &[Value]) -> std::result::Result<(), ParamError> {
+    for (i, op) in ops.iter().enumerate() {
+        let kind = op.get("op").and_then(Value::as_str).unwrap_or("");
+        let path = op.get("path").and_then(Value::as_str).ok_or_else(|| {
+            ParamError::new(format!("/patch/{i}/path"), "required", "a JSON Pointer")
+        })?;
+        let (parent, key) = match path.rfind('/') {
+            Some(at) => (&path[..at], path[at + 1..].replace("~1", "/").replace("~0", "~")),
+            None => {
+                return Err(ParamError::new(
+                    format!("/patch/{i}/path"),
+                    "must start with /",
+                    "e.g. /time/duration_s",
+                ));
+            }
+        };
+        let value = op.get("value").cloned();
+        match kind {
+            "test" => {
+                if doc.pointer(path) != value.as_ref() {
+                    return Err(ParamError::new(
+                        format!("/patch/{i}"),
+                        format!("test failed at {path}"),
+                        "the document changed under this patch",
+                    ));
+                }
+            }
+            "add" | "replace" | "remove" => {
+                let target = doc.pointer_mut(parent).ok_or_else(|| {
+                    ParamError::new(
+                        format!("/patch/{i}/path"),
+                        format!("`{parent}` does not exist"),
+                        "add the enclosing object first",
+                    )
+                })?;
+                match (target, kind) {
+                    (Value::Object(map), "remove") => {
+                        map.remove(&key);
+                    }
+                    (Value::Object(map), _) => {
+                        map.insert(key, value.unwrap_or(Value::Null));
+                    }
+                    (Value::Array(items), _) => {
+                        let index = if key == "-" {
+                            items.len()
+                        } else {
+                            key.parse::<usize>().map_err(|_| {
+                                ParamError::new(
+                                    format!("/patch/{i}/path"),
+                                    "not an array index",
+                                    "use a number or -",
+                                )
+                            })?
+                        };
+                        match kind {
+                            "remove" if index < items.len() => {
+                                items.remove(index);
+                            }
+                            "replace" if index < items.len() => {
+                                items[index] = value.unwrap_or(Value::Null);
+                            }
+                            "add" if index <= items.len() => {
+                                items.insert(index, value.unwrap_or(Value::Null));
+                            }
+                            _ => {
+                                return Err(ParamError::new(
+                                    format!("/patch/{i}/path"),
+                                    "index out of range",
+                                    "check the array's length",
+                                ));
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(ParamError::new(
+                            format!("/patch/{i}/path"),
+                            format!("`{parent}` is not an object or an array"),
+                            "patch a field inside an object",
+                        ));
+                    }
+                }
+            }
+            other => {
+                return Err(ParamError::new(
+                    format!("/patch/{i}/op"),
+                    format!("`{other}` is not supported here"),
+                    "use add, replace, remove or test",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Engine for LiveEngine {
@@ -2385,7 +2947,11 @@ impl Engine for LiveEngine {
     }
 
     fn sim_time(&self) -> SimTime {
-        self.cursor.saturating_mul(self.step_ns())
+        // The instant of the last step the stream sent — the one on the client's screen,
+        // and the one `emitted()`, the node table and the counts all describe. It was
+        // `cursor · Δt`, one step ahead of all three, so a finished 5 s run reported
+        // `t_ns = 5.1 s` against `t_end_ns = 5 s` and the page's clock read past the end.
+        self.cursor.saturating_sub(1).saturating_mul(self.step_ns())
     }
 
     fn speed(&self) -> (f64, bool) {
@@ -2430,21 +2996,28 @@ impl Engine for LiveEngine {
                 paused,
                 speed,
                 seed,
+                scenario,
             } => {
+                // §6.6 refuses a start while the run is moving (-32001); the page pauses
+                // first. From any other state the previous kernel is stopped and joined
+                // before the next one is built, so there is never a second kernel.
                 if self.state == RunState::Running {
                     return Err(ServerError::RunAlreadyRunning);
                 }
-                if let Some(seed) = seed
-                    && seed != self.scenario.seed
-                {
-                    return Err(ServerError::NotSupportedHere(format!(
-                        "this run is pinned to seed {}: a different seed is a different run, \
-                         and the run id, the `Hello` and the world are fixed when the server \
-                         binds. Start the server on the scenario with `--seed {seed}`.",
-                        self.scenario.seed
-                    )));
+                let mut next = match scenario {
+                    Some(ScenarioSource::Document(doc)) => {
+                        self.scenario_from_document(&doc).map_err(ServerError::ScenarioInvalid)?
+                    }
+                    Some(ScenarioSource::Preset(id)) => self.load_preset(&id)?,
+                    None => self.next_scenario(),
+                };
+                if let Some(seed) = seed {
+                    next.seed = seed;
                 }
-                self.restart()?;
+                self.restart(next)?;
+                // Staged edits are consumed by the run that runs them; the form then shows
+                // the running scenario, which is now the edited one.
+                self.staged = None;
                 self.speed = speed;
                 self.state = if paused {
                     RunState::Paused
@@ -2476,7 +3049,9 @@ impl Engine for LiveEngine {
                 self.client_sync = client_sync;
             }
             Control::Stop { finalize_exports } => {
-                self.host.stop();
+                // Stopped and joined: the kernel thread is gone when this returns, not
+                // computing to the horizon with nobody listening.
+                self.host.shutdown();
                 self.state = RunState::Finished;
                 if let Some(path) = &self.descriptor.recording_path {
                     extra.insert("recording_path".to_string(), json!(path));
@@ -2583,6 +3158,144 @@ impl Engine for LiveEngine {
 
     fn query(&mut self, query: &Query) -> Result<Value> {
         crate::introspect::answer(self, query)
+    }
+
+    fn world_json(&self) -> Option<String> {
+        Some(self.world_json.clone())
+    }
+
+    fn current(&self) -> Option<StepOutput> {
+        self.emitted().cloned()
+    }
+
+    fn stage(&mut self, request: StageRequest) -> Result<Staged> {
+        let running = self.descriptor.scenario.clone();
+        let (scenario, errors, document) = match request {
+            StageRequest::Preset(id) => {
+                let s = self.load_preset(&id)?;
+                (Some(s), Vec::new(), None)
+            }
+            StageRequest::Document(doc) => match self.scenario_from_document(&doc) {
+                Ok(s) => (Some(s), Vec::new(), None),
+                Err(errors) => (None, errors, Some(doc)),
+            },
+            StageRequest::Patch(ops) => {
+                let mut doc = match &self.staged {
+                    Some(s) => serde_json::to_value(s)
+                        .map_err(|e| ServerError::Internal(e.to_string()))?,
+                    None => running.clone(),
+                };
+                apply_patch(&mut doc, &ops).map_err(|e| ServerError::InvalidParams(vec![e]))?;
+                match self.scenario_from_document(&doc) {
+                    Ok(s) => (Some(s), Vec::new(), None),
+                    Err(errors) => (None, errors, Some(doc)),
+                }
+            }
+        };
+        match scenario {
+            Some(scenario) => {
+                let document = serde_json::to_value(&scenario)
+                    .map_err(|e| ServerError::Internal(e.to_string()))?;
+                let hash = scenario
+                    .content_hash()
+                    .map_err(|e| ServerError::Internal(e.to_string()))?;
+                let changed = changed_pointers(&running, &document);
+                // Staging the scenario that is already running is un-staging: nothing
+                // differs, and the form should say "no pending edits".
+                self.staged = if changed.is_empty() { None } else { Some(scenario) };
+                Ok(Staged {
+                    document,
+                    hash,
+                    changed,
+                    errors: Vec::new(),
+                })
+            }
+            None => {
+                // An invalid document is reported and not staged: the next run keeps
+                // whatever was staged before, so a typo never replaces a good scenario.
+                let document = document.unwrap_or(Value::Null);
+                let changed = changed_pointers(&running, &document);
+                Ok(Staged {
+                    hash: String::new(),
+                    document,
+                    changed,
+                    errors,
+                })
+            }
+        }
+    }
+
+    fn staged(&self) -> Option<Staged> {
+        let scenario = self.staged.as_ref()?;
+        let document = serde_json::to_value(scenario).ok()?;
+        let hash = scenario.content_hash().ok()?;
+        let changed = changed_pointers(&self.descriptor.scenario, &document);
+        Some(Staged {
+            document,
+            hash,
+            changed,
+            errors: Vec::new(),
+        })
+    }
+
+    fn validate_document(&self, doc: &Value) -> Option<(Vec<ParamError>, Vec<ParamError>)> {
+        Some(match self.scenario_from_document(doc) {
+            Ok(_) => (Vec::new(), Vec::new()),
+            Err(errors) => (errors, Vec::new()),
+        })
+    }
+
+    fn presets(&self) -> Vec<Value> {
+        let running = self.descriptor.scenario_hash_hex.clone();
+        self.preset_paths()
+            .iter()
+            .map(|path| {
+                let id = preset_id(path);
+                match Scenario::load(path) {
+                    Ok(s) => json!({
+                        "id": id,
+                        "kind": "preset",
+                        "name": s.meta.name,
+                        "description": s.meta.description,
+                        "tags": s.meta.tags,
+                        "hash": s.content_hash().unwrap_or_default(),
+                        "running": s.content_hash().is_ok_and(|h| h == running),
+                    }),
+                    // Listed, not hidden: a scenario in the folder that does not load is
+                    // something the user should hear about, with the loader's reason.
+                    Err(e) => json!({
+                        "id": id,
+                        "kind": "preset",
+                        "name": path.file_stem().map(|s| s.to_string_lossy().to_string()),
+                        "description": format!("does not load: {e}"),
+                        "tags": ["invalid"],
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    fn diagnostics(&self) -> Value {
+        json!({
+            "kernel_threads": kernel_threads(),
+            "kernel_threads_started": KERNEL_THREADS_STARTED.load(Ordering::SeqCst),
+            "runs_started": self.runs_started,
+            "produced_ns": self.produced.saturating_mul(self.step_ns()),
+            "output_digest": self.digest_final,
+            "digest_steps": self.digest_steps,
+            "failure": self.failure,
+            "stats": self.stats.to_json(),
+            "finished": self.report.is_some(),
+            // Frames not generated because they fell in a `time.time_dilation` window.
+            "suppressed_frames": self.report.as_ref().map(|r| r.suppressed_frames),
+            "exports": match &self.exports {
+                None => Value::Null,
+                Some(Ok(done)) => json!(done),
+                Some(Err(why)) => json!({"error": why}),
+            },
+            "retained_steps": self.timeline.len(),
+            "retain_limit_steps": self.options.retain_steps,
+        })
     }
 }
 

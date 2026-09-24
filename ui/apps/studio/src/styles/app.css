@@ -505,6 +505,22 @@ button.hud-field:focus-visible {
 .field label { display: block; font-size: 11px; color: var(--text-dim); margin-bottom: 2px; }
 .field .unit { color: var(--text-faint); font-family: var(--mono); }
 .field .help { font-size: 10px; color: var(--text-faint); margin-top: 2px; line-height: 1.35; }
+/* A setting the engine does not act on: still editable, visibly not part of the run. */
+.field.inactive > label, .field.inactive input, .field.inactive select, .field.inactive textarea { opacity: 0.6; }
+.field.edited > label { color: var(--accent); }
+.field .status-note { color: var(--warn); }
+.field-status {
+  display: inline-block; font-size: 9px; line-height: 1.4; padding: 0 5px; margin-left: 4px;
+  border: 1px solid var(--border); border-radius: 8px; color: var(--text-dim); text-transform: none;
+  vertical-align: 1px; white-space: nowrap;
+}
+.field-status.warn { border-color: var(--warn); color: var(--warn); }
+.field-status.info { border-color: var(--accent); color: var(--accent); }
+.field-status.off { border-style: dashed; color: var(--text-faint); }
+.settings-group > summary { cursor: pointer; list-style: revert; }
+.settings-group > summary h3 { margin: 0; }
+.err-text { color: var(--err); }
+textarea.bad { border-color: var(--err); }
 
 .table { width: 100%; border-collapse: collapse; font-size: 11px; font-family: var(--mono); }
 .table th, .table td { text-align: right; padding: 2px 5px; border-bottom: 1px solid var(--border); }

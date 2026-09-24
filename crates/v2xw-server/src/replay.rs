@@ -177,6 +177,8 @@ impl Engine for ReplayEngine {
         let t_ns = self.sim_time();
         match command {
             Control::Start { paused, speed, .. } => {
+                // A replay started again plays from its first step.
+                self.cursor = 0;
                 self.speed = speed;
                 self.state = if paused {
                     RunState::Paused

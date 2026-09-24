@@ -17,7 +17,7 @@ use serde_json::{Map, Value, json};
 use v2xw_core::ids::NodeId;
 use v2xw_record::wire::Frame;
 
-use crate::engine::{Control, Query, RunState};
+use crate::engine::{Control, Query, RunState, ScenarioSource, StageRequest};
 use crate::error::{ParamError, Result, ServerError};
 use crate::run::Run;
 use crate::session::{CameraState, OVERLAYS, Session, overlay_is_gt};
@@ -84,7 +84,11 @@ pub struct Outcome {
     pub result: Value,
     /// Notifications to send after the reply.
     pub notifications: Vec<Value>,
-    /// True when the call asked the run to stop, so the caller sends `Bye{reason=1}`.
+    /// True when the connection must end after the reply, with `Bye{reason=1}`.
+    ///
+    /// No method sets it any more: `run.stop` used to, and the page that pressed Stop was
+    /// left with no socket to press Run on. It is kept for a method that genuinely ends a
+    /// connection.
     pub bye: bool,
 }
 
@@ -314,11 +318,24 @@ pub fn dispatch(ctx: &mut Context<'_>, request: &Request) -> Result<Outcome> {
 fn run_start(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
     let speed = bounded(p, "speed", 0.0, 100.0, 1.0)?;
     let paused = flag(p, "paused", false);
-    let seed = uint(p, "seed");
+    let seed = seed_param(p)?;
+    let scenario = match p.get("scenario") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) => Some(ScenarioSource::Preset(id.clone())),
+        Some(doc @ Value::Object(_)) => Some(ScenarioSource::Document(doc.clone())),
+        Some(_) => {
+            return Err(ServerError::param(
+                "/scenario",
+                "must be a preset id, a path or a scenario document",
+                "omit it to run the scenario scenario.set staged, or the current one",
+            ));
+        }
+    };
     let outcome = ctx.run.control(Control::Start {
         paused,
         speed,
         seed,
+        scenario,
     })?;
     let d = ctx.run.descriptor();
     let mut result = json!({
@@ -327,23 +344,55 @@ fn run_start(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
         "world_hash": ctx.run.world().content_hash_hex(),
         "scenario_hash": d.scenario_hash_hex,
         "t_end_ns": d.duration,
+        "generation": ctx.run.generation(),
     });
     if let Some(path) = &d.recording_path {
         result["recording_path"] = json!(path);
     }
-    Ok(Outcome {
-        result,
-        notifications: vec![notification(
-            "run.state",
-            json!({"state": outcome.state.as_str(), "t_ns": outcome.t_ns,
-                   "run_id": d.run_id, "reason": "run.start"}),
-        )],
-        ..Default::default()
-    })
+    for (key, value) in outcome.extra {
+        result[key] = value;
+    }
+    // Every connection hears it, not only the caller: a second tab watching the run has to
+    // learn that a new one began as surely as the tab that pressed Run.
+    ctx.run.notify_state(outcome.state, outcome.t_ns, "run.start");
+    Ok(Outcome::of(result))
+}
+
+/// `seed`: a non-negative integer, or a decimal or `0x`-hexadecimal string — the two
+/// spellings a scenario file uses for its master seed.
+fn seed_param(p: &Map<String, Value>) -> Result<Option<u64>> {
+    match p.get("seed") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n.as_u64().map(Some).ok_or_else(|| {
+            ServerError::param("/seed", "must be a non-negative integer", "pass e.g. 42")
+        }),
+        Some(Value::String(text)) => parse_seed(text).map(Some).ok_or_else(|| {
+            ServerError::param(
+                "/seed",
+                &format!("`{text}` is not a seed"),
+                "decimal, or hexadecimal with a 0x prefix; underscores are allowed",
+            )
+        }),
+        Some(_) => Err(ServerError::param(
+            "/seed",
+            "must be an integer or a string",
+            "pass e.g. 42 or \"0xC0FFEE\"",
+        )),
+    }
+}
+
+/// Parses a seed written the way a scenario writes one.
+pub fn parse_seed(text: &str) -> Option<u64> {
+    let clean: String = text.trim().chars().filter(|c| *c != '_').collect();
+    match clean.strip_prefix("0x").or_else(|| clean.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => clean.parse().ok(),
+    }
 }
 
 fn run_pause(ctx: &mut Context<'_>) -> Result<Outcome> {
     let outcome = ctx.run.control(Control::Pause)?;
+    ctx.run.notify_state(outcome.state, outcome.t_ns, "run.pause");
     // §6.6: "The server MUST have sent every frame up to and including `t_ns` before
     // replying." Draining the connection's own backlog here is what makes that true
     // (conformance R5).
@@ -357,6 +406,7 @@ fn run_pause(ctx: &mut Context<'_>) -> Result<Outcome> {
 
 fn run_resume(ctx: &mut Context<'_>) -> Result<Outcome> {
     let outcome = ctx.run.control(Control::Resume)?;
+    ctx.run.notify_state(outcome.state, outcome.t_ns, "run.resume");
     Ok(Outcome::of(
         json!({"state": outcome.state.as_str(), "t_ns": outcome.t_ns}),
     ))
@@ -434,12 +484,33 @@ fn run_seek(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
     if t_ns < min_ns || t_ns > max_ns {
         return Err(ServerError::SeekOutOfRange { min_ns, max_ns });
     }
+    // Refused *before* the run is touched. The check used to come after `Run::seek`, so a
+    // seek over HTTP moved the run's cursor and paused it, and then reported that it could
+    // not be done — a refusal with a side effect.
+    if ctx.session.is_none() {
+        return Err(ServerError::NotSupportedHere(
+            "run.seek streams its result over the connection; call it on the socket".to_string(),
+        ));
+    }
+    let before = ctx.run.state();
     let outputs = ctx.run.seek(t_ns)?;
+    let after = ctx.run.state();
+    if before != after {
+        ctx.run.notify_state(after, t_ns, "run.seek");
+    }
+    let generation = ctx.run.generation();
     let session = ctx.session.as_deref_mut().ok_or_else(|| {
         ServerError::NotSupportedHere(
             "run.seek streams its result over the connection; call it on the socket".to_string(),
         )
     })?;
+    if session.generation() != generation {
+        // The run this connection's `Hello` described has been replaced; its frames would
+        // be encoded against the wrong tables. The fresh `Hello` is on its way.
+        return Err(ServerError::NotSupportedHere(
+            "a new run started; seek again once its Hello has arrived".to_string(),
+        ));
+    }
     let (frames, keyframe_seq, deltas) = session.encode_seek(&outputs)?;
     Ok(Outcome {
         pre_frames: frames,
@@ -492,11 +563,11 @@ fn run_stop(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
     for (key, value) in outcome.extra {
         result[key] = value;
     }
-    Ok(Outcome {
-        result,
-        bye: true,
-        ..Default::default()
-    })
+    ctx.run.notify_state(outcome.state, outcome.t_ns, "run.stop");
+    // The connection stays open. §6.6 used to end it with `Bye{reason = 1}`, which left a
+    // page that pressed Stop with no socket to press Run on; the run is over, the
+    // connection is not, and `run.start` on it sends the next run's `Hello`.
+    Ok(Outcome::of(result))
 }
 
 fn run_status(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
@@ -530,6 +601,10 @@ fn run_status(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> 
         "seq": seq,
         "dropped": {"delta": 0, "event": 0, "telemetry": 0, "metric": 0},
         "warnings": [],
+        "generation": ctx.run.generation(),
+        "scenario_hash": d.scenario_hash_hex,
+        "staged_hash": ctx.run.staged().map(|s| s.hash),
+        "engine": ctx.run.diagnostics(),
     })))
 }
 
@@ -829,8 +904,15 @@ fn is_gt_metric(run: &crate::Run, name: &str) -> bool {
 }
 
 fn scenario_get(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
-    let d = ctx.run.descriptor().clone();
-    let mut scenario = d.scenario.clone();
+    let d = ctx.run.descriptor();
+    // The scenario the next `run.start` will run: the staged one when `scenario.set` or
+    // `scenario.load` has put one in place, the running one otherwise (§6.6: `run.start`
+    // "loads … the already-set one").
+    let staged = ctx.run.staged();
+    let (mut scenario, hash) = match &staged {
+        Some(s) => (s.document.clone(), s.hash.clone()),
+        None => (d.scenario.clone(), d.scenario_hash_hex.clone()),
+    };
     if let Some(pointer) = text(p, "path") {
         scenario = scenario.pointer(pointer).cloned().ok_or_else(|| {
             ServerError::param(
@@ -840,7 +922,15 @@ fn scenario_get(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome
             )
         })?;
     }
-    let mut result = json!({"scenario": scenario, "hash": d.scenario_hash_hex});
+    let mut result = json!({
+        "scenario": scenario,
+        "hash": hash,
+        "running_hash": d.scenario_hash_hex,
+        "staged": staged.as_ref().map(|s| json!({
+            "hash": s.hash, "changed": s.changed, "valid": s.errors.is_empty(),
+            "errors": s.errors,
+        })),
+    });
     if flag(p, "with_schema", false) {
         // The published surface, not a hand-written stub. §13 of 03-interfaces requires
         // the schema to carry help text and units for every field, and
@@ -908,42 +998,68 @@ fn scenario_set(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome
             "pass a whole document or an RFC 6902 patch",
         )]));
     }
-    let d = ctx.run.descriptor().clone();
-    let errors = validate_scenario(p.get("scenario").unwrap_or(&d.scenario));
-    let valid = errors.is_empty();
+    let request = match (p.get("scenario"), p.get("patch")) {
+        (Some(doc @ Value::Object(_)), _) => StageRequest::Document(doc.clone()),
+        (Some(_), _) => {
+            return Err(ServerError::param(
+                "/scenario",
+                "must be a scenario document (an object)",
+                "pass the whole document, or an RFC 6902 patch as `patch`",
+            ));
+        }
+        (None, Some(Value::Array(ops))) => StageRequest::Patch(ops.clone()),
+        (None, _) => {
+            return Err(ServerError::param(
+                "/patch",
+                "must be an array of RFC 6902 operations",
+                "[{\"op\": \"replace\", \"path\": \"/time/duration_s\", \"value\": 30}]",
+            ));
+        }
+    };
+    let staged = ctx.run.stage(request)?;
+    let valid = staged.errors.is_empty();
     if !valid && flag(p, "validate", true) {
-        return Err(ServerError::ScenarioInvalid(errors));
+        return Err(ServerError::ScenarioInvalid(staged.errors));
     }
     Ok(Outcome {
         result: json!({
-            "hash": d.scenario_hash_hex,
+            "hash": staged.hash,
             "valid": valid,
-            "errors": errors,
+            "errors": staged.errors,
+            // Nothing is changed in a run that is already moving: every edit is taken at
+            // the next `run.start`, which is the only instant at which a changed world,
+            // seed or fleet can be consistent with everything already streamed.
             "applied_live": [],
-            // Everything in the fixture's scenario is structural, so nothing can be
-            // applied to a run in flight. A real engine lists the `param.change` fields.
-            "requires_restart": ["/traffic/actors", "/world"],
+            "requires_restart": staged.changed,
         }),
         notifications: vec![notification(
             "validation",
-            json!({"errors": errors, "warnings": []}),
+            json!({"errors": staged.errors, "warnings": []}),
         )],
         ..Default::default()
     })
 }
 
 fn scenario_validate(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
-    let d = ctx.run.descriptor().clone();
+    let d = ctx.run.descriptor();
     let doc = p.get("scenario").unwrap_or(&d.scenario);
-    let errors = validate_scenario(doc);
     let strict = flag(p, "strict", false);
-    let warnings: Vec<ParamError> = vec![ParamError {
-        path: "/".to_string(),
-        message: "this run is produced by the server's synthetic fixture, not by an engine"
-            .to_string(),
-        hint: None,
-        severity: Some("warning".to_string()),
-    }];
+    let (errors, warnings) = match ctx.run.validate_document(doc) {
+        // The loader's own rules — the same code `run.start` will run the document
+        // through, so "valid" here means it will start.
+        Some(verdict) => verdict,
+        None => (
+            validate_scenario(doc),
+            vec![ParamError {
+                path: "/".to_string(),
+                message: "this run is produced by the server's synthetic fixture, not by an \
+                          engine, so only the document's shape was checked"
+                    .to_string(),
+                hint: None,
+                severity: Some("warning".to_string()),
+            }],
+        ),
+    };
     let (errors, warnings) = if strict {
         let mut e = errors;
         e.extend(warnings);
@@ -1030,8 +1146,11 @@ fn scenario_load(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcom
             "pass a file path or a preset id",
         ));
     };
-    let d = ctx.run.descriptor().clone();
+    let d = ctx.run.descriptor();
     if path == "stub/grid" || path == d.scenario_hash_hex {
+        // Loading the running scenario withdraws whatever `scenario.set` staged: the next run
+        // is the one on screen again. An engine with no scenario to stage has nothing to undo.
+        let _ = ctx.run.stage(StageRequest::Document(d.scenario.clone()));
         return Ok(Outcome::of(json!({
             "hash": d.scenario_hash_hex,
             "valid": true,
@@ -1039,10 +1158,22 @@ fn scenario_load(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcom
             "errors": [],
         })));
     }
-    Err(ServerError::Io {
-        path: path.to_string(),
-        errno: "ENOENT".to_string(),
-    })
+    // A live engine stages the preset for the next run, exactly as `scenario.set` stages
+    // a document; the form then shows it, and Run runs it.
+    match ctx.run.stage(StageRequest::Preset(path.to_string())) {
+        Ok(staged) => Ok(Outcome::of(json!({
+            "hash": staged.hash,
+            "valid": staged.errors.is_empty(),
+            "scenario": staged.document,
+            "errors": staged.errors,
+            "requires_restart": staged.changed,
+        }))),
+        Err(ServerError::NotSupportedHere(_)) => Err(ServerError::Io {
+            path: path.to_string(),
+            errno: "ENOENT".to_string(),
+        }),
+        Err(e) => Err(e),
+    }
 }
 
 fn scenario_list(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
@@ -1056,14 +1187,19 @@ fn scenario_list(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcom
     }
     let prefix = text(p, "prefix").unwrap_or("");
     let limit = bounded(p, "limit", 1.0, 1_000.0, 100.0)? as usize;
-    let d = ctx.run.descriptor().clone();
+    let d = ctx.run.descriptor();
     let mut items = Vec::new();
     if kind == "all" || kind == "presets" {
-        items.push(json!({
-            "id": "stub/grid", "kind": "preset", "name": "Synthetic grid",
-            "description": "the server's own fixture run", "tags": ["fixture"],
-            "hash": d.scenario_hash_hex
-        }));
+        let presets = ctx.run.presets();
+        if presets.is_empty() {
+            items.push(json!({
+                "id": "stub/grid", "kind": "preset", "name": "Synthetic grid",
+                "description": "the server's own fixture run", "tags": ["fixture"],
+                "hash": d.scenario_hash_hex
+            }));
+        } else {
+            items.extend(presets);
+        }
     }
     if kind == "all" || kind == "runs" {
         items.push(json!({

@@ -70,6 +70,8 @@ export interface StatusInput {
   readonly spanText?: string;
   /** Where the clock is, already formatted. */
   readonly clockText?: string;
+  /** Reconnect attempts since the engine was last reached. */
+  readonly reconnectAttempts?: number;
 }
 
 const RUN: StatusAction = {
@@ -193,11 +195,18 @@ export function describeStatus(input: StatusInput): StatusView {
       };
 
     case "reconnecting":
+      // It used to promise that "the stream resumes where it left off". That is true of a
+      // network blip and false of the case users actually hit — the simulator was stopped or
+      // restarted — where the page comes back to whatever the engine is serving now.
       return {
         tone: "warn",
         chip: "Reconnecting",
-        headline: "The connection dropped. Reconnecting…",
-        detail: "The stream resumes where it left off, so nothing already received is lost.",
+        headline:
+          (input.reconnectAttempts ?? 0) > 1
+            ? `Lost contact with the engine. Still trying (attempt ${input.reconnectAttempts})…`
+            : "Lost contact with the engine. Reconnecting…",
+        detail:
+          "If the simulator was stopped, start it again: this page reconnects by itself and shows whatever run it is serving. Nothing already on screen is lost in the meantime.",
         action: null,
         banner: true,
       };

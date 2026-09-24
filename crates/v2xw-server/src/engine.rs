@@ -158,6 +158,16 @@ pub struct StepOutput {
     /// recorder stored and the session passes it to the socket. When this is non-empty the
     /// session ignores `snapshot`, `telemetry`, `events` and `metrics`.
     pub recorded: Vec<v2xw_record::wire::Frame>,
+    /// Which run of this process produced the step: [`crate::Run`] stamps it with the
+    /// generation current when the step was taken.
+    ///
+    /// A connection compares it with the generation its own `Hello` described and never
+    /// encodes a step of another run against that `Hello`'s tables. Before this existed a
+    /// rewind handed the new run's step 0 to a snapshot encoder still holding the old run's
+    /// last step; the encoder refused a step that did not advance, and the transport ended
+    /// the connection — the page's socket died on every "Run again" and came back only by
+    /// reconnecting. Engines leave it `0`; only the run sets it.
+    pub generation: u64,
 }
 
 impl StepOutput {
@@ -256,6 +266,39 @@ pub struct NodeFacts {
     pub class_idx: u8,
 }
 
+/// Where the scenario a `run.start` runs comes from (§6.6's `scenario` parameter).
+#[derive(Debug, Clone)]
+pub enum ScenarioSource {
+    /// An inline scenario document.
+    Document(Value),
+    /// A preset id from `scenario.list`, or a path the engine can read.
+    Preset(String),
+}
+
+/// What `scenario.set` / `scenario.load` asks an engine to hold for its next run.
+#[derive(Debug, Clone)]
+pub enum StageRequest {
+    /// A whole scenario document.
+    Document(Value),
+    /// An RFC 6902 patch against the scenario the next run would otherwise use.
+    Patch(Vec<Value>),
+    /// A preset id or a path, as `scenario.load` names one.
+    Preset(String),
+}
+
+/// A scenario an engine is holding for its next run: the answer to `scenario.set`.
+#[derive(Debug, Clone)]
+pub struct Staged {
+    /// The resolved document, as `scenario.get` would return it once it runs.
+    pub document: Value,
+    /// Its digest, which is the next run's `Hello.scenario_hash`.
+    pub hash: String,
+    /// Every JSON Pointer whose value differs from the running scenario's, sorted.
+    pub changed: Vec<String>,
+    /// Loader errors; empty means the next `run.start` will run it.
+    pub errors: Vec<crate::error::ParamError>,
+}
+
 /// A run-control command: the engine-facing half of §6.6.
 #[derive(Debug, Clone)]
 pub enum Control {
@@ -267,6 +310,8 @@ pub enum Control {
         speed: f64,
         /// Seed override.
         seed: Option<u64>,
+        /// The scenario to run instead of the staged or current one.
+        scenario: Option<ScenarioSource>,
     },
     /// `run.pause`.
     Pause,
@@ -504,4 +549,67 @@ pub trait Engine: Send + std::fmt::Debug {
     /// `-32006` for an unknown id, `-32007` for an unknown metric, `-32008` for a failed
     /// export, `-32009` where the query does not apply to this kind of run.
     fn query(&mut self, query: &Query) -> Result<Value>;
+
+    /// The `vwp-world/1` JSON form of [`Engine::world`], when this engine can produce it.
+    ///
+    /// Asked after every `run.start`, because a started run may be on a different world:
+    /// `None` keeps the form the run was wrapped with, which is right for an engine whose
+    /// world never changes.
+    fn world_json(&self) -> Option<String> {
+        None
+    }
+
+    /// The state at the stream position, for a connection that attaches to a run that is
+    /// not advancing.
+    ///
+    /// §1.3 rule 4 has a server send nothing after `Hello` until the run moves, which is
+    /// right for a run that has not started and wrong for one that is paused half-way or
+    /// finished: the page that attaches to it — a reload, a second tab, a reconnect after
+    /// the engine restarted — would show an empty city until somebody pressed play.
+    /// `None` (the default) keeps §1.3's behaviour.
+    fn current(&self) -> Option<StepOutput> {
+        None
+    }
+
+    /// Holds a scenario for the next `run.start` (`scenario.set`, `scenario.load`).
+    ///
+    /// # Errors
+    /// `-32009` for an engine that runs no scenario (the default), `-32602` for a
+    /// document that is not a scenario at all.
+    fn stage(&mut self, request: StageRequest) -> Result<Staged> {
+        let _ = request;
+        Err(crate::error::ServerError::NotSupportedHere(
+            "this engine runs no scenario document, so there is nothing to set; start a \
+             server with `--scenario` to edit one"
+                .to_string(),
+        ))
+    }
+
+    /// The scenario held for the next run, if one differs from the running one.
+    fn staged(&self) -> Option<Staged> {
+        None
+    }
+
+    /// Checks a scenario document with the loader's own rules: `(errors, warnings)`.
+    ///
+    /// `None` (the default) means the engine has no loader, and the RPC layer falls back
+    /// to its structural checks.
+    fn validate_document(
+        &self,
+        doc: &Value,
+    ) -> Option<(Vec<crate::error::ParamError>, Vec<crate::error::ParamError>)> {
+        let _ = doc;
+        None
+    }
+
+    /// The scenarios `scenario.list` offers and `scenario.load` / `run.start` accept, as
+    /// `#/$defs/ScenarioListItem` objects.
+    fn presets(&self) -> Vec<Value> {
+        Vec::new()
+    }
+
+    /// Engine facts for `run.status` beyond the schema's required members.
+    fn diagnostics(&self) -> Value {
+        Value::Object(serde_json::Map::new())
+    }
 }

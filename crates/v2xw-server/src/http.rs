@@ -127,7 +127,7 @@ async fn healthz(State(state): State<AppState>, headers: HeaderMap) -> Response 
         axum::Json(json!({
             "ok": true,
             "engine": concat!("v2xw-server ", env!("CARGO_PKG_VERSION")),
-            "runs": [state.run.descriptor().run_id],
+            "runs": [state.run.descriptor().run_id.clone()],
         })),
     )
         .into_response()
@@ -307,36 +307,38 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
         }
     }
 
-    let descriptor = state.run.descriptor().clone();
-    let mut session = Session::new(params, &descriptor);
+    // Subscribed before the generation is read, so a run started between the two is seen
+    // as a change rather than missed.
+    let mut generations = state.run.watch_generation();
+    let mut notices = state.run.subscribe_notices();
     let mut steps = state.run.subscribe();
+    let generation = *generations.borrow_and_update();
+    let descriptor = state.run.descriptor();
+    let mut session = Session::new(params, &descriptor);
+    session.bind(generation, &state.session_token);
 
     // §1.3: the server sends exactly one Hello immediately, before anything else. A live
     // run's node table is the set it has *now*, not the set it had when the server bound
-    // (§3.1.3), so it is read here per connection.
-    let live = state.run.live_node_table();
-    let hello = match session.hello_frame_with_nodes(
-        &descriptor,
-        state.run.state(),
-        state.run.sim_time(),
-        &state.session_token,
-        live.as_ref()
-            .map(|(nodes, strings)| (&nodes[..], &strings[..])),
-    ) {
-        Ok(frame) => frame,
+    // (§3.1.3), so it is read here per connection. A run that is not moving also gets the
+    // state at its position, so a page that attaches to a paused or finished run — a
+    // reload, a second tab, a reconnect after the engine restarted — shows the city as it
+    // stands instead of nothing.
+    let greeting = match session.greet(&state.run, &descriptor) {
+        Ok(frames) => frames,
         Err(e) => {
             let _ = send_error_and_bye(&mut socket, &e, 3, 1011).await;
             return;
         }
     };
+    let (hello, rest) = greeting.split_at(1);
     if socket
-        .send(Message::Binary(hello.into_bytes().into()))
+        .send(Message::Binary(hello[0].clone().into_bytes().into()))
         .await
         .is_err()
     {
         return;
     }
-    for frame in session.resume_backlog() {
+    for frame in session.resume_backlog().into_iter().chain(rest.iter().cloned()) {
         if socket
             .send(Message::Binary(frame.into_bytes().into()))
             .await
@@ -346,15 +348,10 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
         }
     }
 
-    // §1.4's last paragraph tells a client to stop retrying after `Bye{reason = 0}`. A
-    // client that attaches *after* the run finished would otherwise get a `Hello` and then
-    // silence, and reconnect with backoff for as long as the process lives — the one case
-    // where the rule is most needed is the one where nothing sent it.
-    if state.run.state() == RunState::Finished {
-        let _ = send_bye(&mut socket, &state, 0, "run complete").await;
-        let _ = close(&mut socket, 1000, "run complete").await;
-        return;
-    }
+    // A finished run is not a reason to hang up. This server can seek back through it
+    // and start another run on the same connection (§6.6: `run.start` sends "a fresh
+    // `Hello` on this connection"), so the connection stays open until the client or the
+    // process ends it. See `docs/protocol/vwp-v1.md` §1.4 on `Bye{reason = 0}`.
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -388,12 +385,55 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
                     }
                 }
             }
+            changed = generations.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let current = *generations.borrow_and_update();
+                if current != session.generation()
+                    && !regreet(&mut socket, &state, &mut session).await
+                {
+                    return;
+                }
+            }
+            notice = notices.recv() => {
+                match notice {
+                    Ok(notice) => {
+                        if socket
+                            .send(Message::Text(notice.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    // A notification is advisory state, and `run.status` is the
+                    // authoritative answer; a connection that missed some carries on.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
             step = steps.recv() => {
                 match step {
                     Ok(output) => {
+                        if output.generation < session.generation() {
+                            // A step the previous run produced before it was replaced.
+                            continue;
+                        }
+                        if output.generation > session.generation()
+                            && !regreet(&mut socket, &state, &mut session).await
+                        {
+                            return;
+                        }
                         let effects = match session.encode_step(&output) {
                             Ok(e) => e,
-                            Err(_) => return,
+                            Err(e) => {
+                                // Said, not swallowed: a connection that ends here with no
+                                // frame looked, from the page, like the engine vanishing.
+                                tracing::error!(error = %e, "a step could not be encoded");
+                                let _ = send_error_and_bye(&mut socket, &e, 3, 1011).await;
+                                return;
+                            }
                         };
                         if effects.fatal {
                             let _ = close(&mut socket, 1011, "send queue overflow").await;
@@ -425,11 +465,6 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
                             {
                                 return;
                             }
-                        }
-                        if output.end_of_run {
-                            let _ = send_bye(&mut socket, &state, 0, "run complete").await;
-                            let _ = close(&mut socket, 1000, "run complete").await;
-                            return;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -475,6 +510,28 @@ async fn connection(mut socket: WebSocket, state: AppState, query: String) {
             }
         }
     }
+}
+
+/// Moves a connection onto the run's new generation: a fresh `Hello`, then the state at
+/// the new run's position when it is not moving. Returns `false` when the socket is gone.
+async fn regreet(socket: &mut WebSocket, state: &AppState, session: &mut Session) -> bool {
+    let frames = match session.regreet(&state.run) {
+        Ok(frames) => frames,
+        Err(e) => {
+            let _ = send_error_and_bye(socket, &e, 3, 1011).await;
+            return false;
+        }
+    };
+    for frame in frames {
+        if socket
+            .send(Message::Binary(frame.into_bytes().into()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Handles one text frame. Returns `false` when the connection must end.
@@ -538,6 +595,24 @@ async fn handle_text(
                 let _ = send_bye(socket, state, 1, "run.stop").await;
                 let _ = close(socket, 1000, "client requested stop").await;
                 return false;
+            }
+            // Steps that arrived while this call ran are the calling connection's to
+            // encode against the generation it is on now, which the call may have moved.
+            if session.generation() != state.run.generation() {
+                match session.regreet(&state.run) {
+                    Ok(frames) => {
+                        for frame in frames {
+                            if socket
+                                .send(Message::Binary(frame.into_bytes().into()))
+                                .await
+                                .is_err()
+                            {
+                                return false;
+                            }
+                        }
+                    }
+                    Err(_) => return false,
+                }
             }
             true
         }

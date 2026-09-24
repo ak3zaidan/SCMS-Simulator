@@ -192,7 +192,7 @@ A new connection for a run that already has a connection with the same session t
 one: the server sends `Bye{reason = 4 (superseded)}` on the old socket and closes it with 1012.
 
 The client SHOULD reconnect with exponential backoff 250 ms → 8 s with ±20 % jitter, and MUST stop
-retrying after `Bye{reason = 0 (run-complete)}` or close code 4406/4404.
+retrying after `Bye{reason = 0 (run-complete)}` or close code 4406/4404. **`DECISION` (2026-09-23): a server whose runs can be started again (a live engine, the fixture) does not send `Bye{reason = 0}` at the end of a run** — it marks the last frame `FLAG_END_OF_RUN`, publishes `run.state {state: "finished"}`, and keeps the connection, so the client can seek back through the finished run and `run.start` a new one on the same socket. `Bye{reason = 0}` remains the signal for a server that will serve nothing further.
 
 ### 1.5 Backpressure — the server never queues unboundedly
 
@@ -1873,7 +1873,7 @@ now at `t_ns`". Live runs support `run.seek` only backwards into recorded time a
  "errors": [-32002, -32008]}
 ```
 
-The server then sends `Bye{reason = 1}`.
+The run stops: its kernel is stopped and joined before the reply, and `run.state {state: "finished"}` goes to every connection. **`DECISION` (2026-09-23): the connection stays open** — the page that pressed Stop needs a socket to press Run on, and `run.start` on it sends the next run's `Hello` (below). Earlier drafts had the server send `Bye{reason = 1}` and close here.
 
 #### `run.status`
 

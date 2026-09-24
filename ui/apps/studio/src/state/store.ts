@@ -101,6 +101,47 @@ export interface RunInfo {
   readonly runId: string;
   readonly profile: "full" | "node";
   readonly live: boolean;
+  /** How many runs the engine process has started; every `run.start` moves it. */
+  readonly generation: number;
+  /** The scenario held for the next run by an Apply, or `null` when there is none. */
+  readonly stagedHash: string | null;
+  /** The finished run's output digest: equal for two runs of one scenario and seed. */
+  readonly outputDigest: string | null;
+  /** Kernel threads alive in the engine process; one while a run is in flight, never more. */
+  readonly kernelThreads: number | null;
+}
+
+/** One row of the engine's published settings surface (`scenario.get {with_schema}` `fields`). */
+export interface PublishedField {
+  readonly "x-pointer"?: string;
+  readonly "x-path"?: string;
+  readonly "x-group"?: string;
+  readonly "x-status"?: string;
+  readonly "x-status-note"?: string;
+  readonly title?: string;
+  readonly description?: string;
+  readonly unit?: string;
+  readonly kind?: string;
+  readonly enum?: readonly unknown[];
+  readonly minimum?: number;
+  readonly maximum?: number;
+  readonly default?: unknown;
+  readonly [key: string]: unknown;
+}
+
+/** What `scenario.set` is holding for the next run. */
+export interface StagedScenario {
+  readonly hash: string;
+  readonly changed: readonly string[];
+  readonly valid: boolean;
+}
+
+/** The parts of `scenario.get` beyond the document. */
+export interface ScenarioExtras {
+  readonly runningHash: string;
+  readonly staged: StagedScenario | null;
+  readonly fields: readonly PublishedField[];
+  readonly statuses: readonly { id: string; label: string; note: string }[];
 }
 
 /** The pseudonym the followed node is currently using (§3.6.7 `sec.cert`, §3.6.4 `node.tx`). */
@@ -307,7 +348,10 @@ export interface CompareSync {
 
 const EMPTY_RUN: RunInfo = {
   state: "idle", tNs: 0, tEndNs: 0, speed: 1, actors: 0, nodes: 0, runId: "", profile: "full", live: true,
+  generation: 0, stagedHash: null, outputDigest: null, kernelThreads: null,
 };
+
+const EMPTY_EXTRAS: ScenarioExtras = { runningHash: "", staged: null, fields: [], statuses: [] };
 
 /** Before the first probe: the page's own origin, unresolved. */
 const UNRESOLVED_TARGET: EngineTargetView = {
@@ -342,7 +386,10 @@ interface StudioState {
   scenario: unknown;
   scenarioHash: string;
   scenarioSchema: Record<string, unknown> | null;
+  scenarioExtras: ScenarioExtras;
   scenarioList: readonly ScenarioListItem[];
+  /** Reconnect attempts since the engine was last reached; 0 while connected. */
+  reconnectAttempts: number;
   validation: ValidationView | null;
   timeline: readonly TimelineMark[];
   logs: readonly LogLine[];
@@ -394,7 +441,13 @@ interface StudioState {
   setFrameCounts: (f: FrameCounts) => void;
   setRpcMethods: (m: readonly { name: string; summary: string }[], title: string) => void;
   noteRpcCall: (method: string) => void;
-  setScenario: (doc: unknown, hash: string, schema: Record<string, unknown> | null) => void;
+  setScenario: (
+    doc: unknown,
+    hash: string,
+    schema: Record<string, unknown> | null,
+    extras?: Partial<ScenarioExtras>,
+  ) => void;
+  setReconnectAttempts: (n: number) => void;
   setScenarioList: (items: readonly ScenarioListItem[]) => void;
   setValidation: (v: ValidationView | null) => void;
   addTimelineMarks: (marks: readonly TimelineMark[]) => void;
@@ -546,7 +599,9 @@ export const useStudio = create<StudioState>((set) => ({
   scenario: null,
   scenarioHash: "",
   scenarioSchema: null,
+  scenarioExtras: EMPTY_EXTRAS,
   scenarioList: [],
+  reconnectAttempts: 0,
   validation: null,
   timeline: [],
   logs: [],
@@ -596,7 +651,21 @@ export const useStudio = create<StudioState>((set) => ({
   setRpcMethods: (m, title) => set({ rpcMethods: m, rpcTitle: title }),
   noteRpcCall: (method) =>
     set((state) => ({ rpcCalls: [{ method, at: Date.now() }, ...state.rpcCalls].slice(0, 40) })),
-  setScenario: (doc, hash, schema) => set({ scenario: doc, scenarioHash: hash, scenarioSchema: schema }),
+  setScenario: (doc, hash, schema, extras) =>
+    set((state) => ({
+      scenario: doc,
+      scenarioHash: hash,
+      scenarioSchema: schema,
+      // A caller that has only a document (a preset opened from a file) keeps the surface the
+      // engine published; the field index is a property of the build, not of the document.
+      scenarioExtras: {
+        runningHash: extras?.runningHash ?? state.scenarioExtras.runningHash,
+        staged: extras?.staged !== undefined ? extras.staged : state.scenarioExtras.staged,
+        fields: extras?.fields && extras.fields.length > 0 ? extras.fields : state.scenarioExtras.fields,
+        statuses: extras?.statuses && extras.statuses.length > 0 ? extras.statuses : state.scenarioExtras.statuses,
+      },
+    })),
+  setReconnectAttempts: (n) => set((state) => (state.reconnectAttempts === n ? state : { reconnectAttempts: n })),
   setScenarioList: (items) => set({ scenarioList: items }),
   setValidation: (v) => set({ validation: v }),
   addTimelineMarks: (marks) =>

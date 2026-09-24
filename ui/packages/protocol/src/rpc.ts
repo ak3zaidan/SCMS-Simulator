@@ -151,6 +151,8 @@ export interface RunStartResult {
   scenario_hash: Sha256Hex;
   recording_path?: string;
   t_end_ns?: SimTimeNs;
+  /** How many runs this engine process has started; every `run.start` moves it. */
+  generation?: number;
 }
 /** §6.6 `run.pause` / `run.resume` params (empty object). */
 export type RunPauseParams = Record<string, never>;
@@ -231,6 +233,22 @@ export interface RunStatusResult {
   dropped?: { delta?: number; event?: number; telemetry?: number; metric?: number };
   manifest?: Record<string, unknown>;
   warnings?: ValidationError[];
+  /** How many runs this engine process has started; every `run.start` moves it. */
+  generation?: number;
+  /** The running scenario's digest. */
+  scenario_hash?: Sha256Hex;
+  /** The digest of the scenario held for the next run, when `scenario.set` staged one. */
+  staged_hash?: Sha256Hex | null;
+  /** Engine facts beyond the schema: kernel threads, the run's output digest, retention. */
+  engine?: {
+    kernel_threads?: number;
+    kernel_threads_started?: number;
+    runs_started?: number;
+    output_digest?: string | null;
+    digest_steps?: number;
+    failure?: string | null;
+    [key: string]: unknown;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +436,15 @@ export interface ScenarioGetResult {
   scenario: unknown;
   hash: Sha256Hex;
   schema?: Record<string, unknown>;
+  /** The running scenario's digest, when `scenario` is a staged one that differs from it. */
+  running_hash?: Sha256Hex;
+  /** What `scenario.set` is holding for the next run, or `null`. */
+  staged?: { hash: Sha256Hex; changed: string[]; valid: boolean; errors?: ValidationError[] } | null;
+  /** The published settings surface: one row per editable leaf, with its implementation status. */
+  fields?: Record<string, unknown>[];
+  /** The implementation-status vocabulary the `fields` rows use. */
+  statuses?: { id: string; label: string; note: string }[];
+  groups?: { name: string; description: string; sections: string[] }[];
 }
 /** RFC 6902 patch operation, as `scenario.set` accepts it. */
 export interface JsonPatchOp {

@@ -160,7 +160,8 @@ fn run_control_refuses_what_section_6_6_says_it_should() {
             .control(Control::Start {
                 paused: false,
                 speed: 1.0,
-                seed: None
+                seed: None,
+                scenario: None,
             })
             .expect_err("already running")
             .code(),

@@ -232,6 +232,11 @@ pub enum Status {
     /// Validated and refused: the loader rejects any value this build cannot act on, so
     /// the field exists but only its implemented values load.
     Refused,
+    /// Describes the scenario rather than configuring the run: shown in the page and kept
+    /// with the scenario in the run's record, and by design it changes nothing computed.
+    /// Distinct from [`Status::NotImplemented`], which is a setting the engine *should*
+    /// act on and does not.
+    Descriptive,
 }
 
 /// One key's implementation status.
@@ -257,9 +262,10 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     // --- the run -----------------------------------------------------------
     KeyStatus { path: "schema", status: Status::Wired,
         note: "The schema version. The loader migrates by it." },
-    KeyStatus { path: "meta", status: Status::NotImplemented,
-        note: "Documentation. It is hashed into the scenario digest and changes nothing \
-               about the run." },
+    KeyStatus { path: "meta", status: Status::Descriptive,
+        note: "Describes the scenario: shown with it in the page's scenario list and kept \
+               with the scenario in every recording and in the scenario digest. By design \
+               it changes nothing the run computes." },
     KeyStatus { path: "meta.name", status: Status::Wired,
         note: "Names the output directory, the recording's run label and the manifest." },
     KeyStatus { path: "meta.base", status: Status::Wired,
@@ -275,12 +281,15 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus { path: "time.mobility_step_ms", status: Status::Wired,
         note: "The mobility period, and the step the stream and run.seek are quantised \
                to." },
-    KeyStatus { path: "time.des_resolution", status: Status::NotImplemented,
-        note: "The kernel is always nanoseconds. This states a guarantee to models and \
-               no model reads it." },
-    KeyStatus { path: "time.time_dilation", status: Status::NotImplemented,
-        note: "Recorded in the manifest and nowhere else: no radio event is skipped \
-               inside a window and no metric is marked not-observed for one." },
+    KeyStatus { path: "time.des_resolution", status: Status::Refused,
+        note: "The resolution the run promises its models. The kernel keeps nanoseconds \
+               whatever this says; the loader refuses a resolution the run cannot keep — \
+               '1ms' with a PHY or MAC that times frames in microseconds, or a \
+               time-dilation window off the promised grid." },
+    KeyStatus { path: "time.time_dilation", status: Status::Partial,
+        note: "Inside a window no radio frame is generated: the frames are counted as \
+               suppressed in the run report and in run.status. The mobility tier is not \
+               lowered inside a window, and no metric is marked not-observed for one." },
     // --- the world ---------------------------------------------------------
     KeyStatus { path: "world.source", status: Status::Wired,
         note: "Where the world comes from. Procedural grids and OpenStreetMap XML are \
@@ -299,8 +308,10 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus { path: "world.terrain", status: Status::NotImplemented,
         note: "No terrain raster is read. The world is flat and the digital elevation \
                model named here is ignored." },
-    KeyStatus { path: "world.cache", status: Status::NotImplemented,
-        note: "No import is cached. Every run re-imports the world." },
+    KeyStatus { path: "world.cache", status: Status::Wired,
+        note: "A directory: the imported world is kept there, keyed by the world section \
+               and the source file's contents, and read back exactly on the next run \
+               instead of importing again." },
     KeyStatus { path: "world.highway_preset", status: Status::Wired,
         note: "Which jurisdiction's fallback speed limits the OpenStreetMap importer \
                uses. An OSM import is refused without it." },
@@ -451,9 +462,11 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     // --- measurement -------------------------------------------------------
     KeyStatus { path: "metrics", status: Status::Wired,
         note: "Which metric providers to install; 'all' selects every registered one." },
-    KeyStatus { path: "exporters", status: Status::Refused,
-        note: "The engine runs no exporter stage. Exporting is the command line's job, so \
-               a non-empty list is refused rather than ignored." },
+    KeyStatus { path: "exporters", status: Status::Wired,
+        note: "Written after the run, over its recording: 'recording' keeps the MCAP, \
+               'jsonl', 'parquet' and 'arrow' write one table per recorded channel. \
+               opts.profile 'node' drops every ground-truth channel and column. Naming \
+               any exporter makes the run record." },
     KeyStatus { path: "events", status: Status::Partial,
         note: "Timeline items are scheduled and fire. Only 'outage' and 'weather.front' \
                do anything; a demand multiplier, an attack wave, a parameter change and a \
@@ -561,16 +574,28 @@ fn unreachable_keys(s: &Scenario, e: &mut Vec<ScenarioError>) {
         ));
     }
 
-    // Exporters run after a run, from the command-line tool's own options; the engine has
-    // no exporter stage and `Scenario::exporters` reaches nothing.
-    if !s.exporters.is_empty() {
-        e.push(conflict(
-            "exporters",
-            format!(
-                "lists {} exporter(s), and the engine runs none: exporting is the                  command-line tool's stage (`v2xw run --record`, `v2xw export`) and this                  list is not read by `Engine::run`. Drive the exporter from the tool                  instead of from the scenario",
-                s.exporters.len()
-            ),
-        ));
+    // Exporters run after the run, over its recording (`crate::export`). An id this build
+    // does not implement is refused rather than skipped, so a list never promises a file
+    // that will not be written.
+    for (i, x) in s.exporters.iter().enumerate() {
+        if !crate::export::EXPORTERS.contains(&x.id.as_str()) && !x.id.trim().is_empty() {
+            e.push(conflict(
+                &format!("exporters[{i}].id"),
+                format!(
+                    "'{}' is not an exporter this build has; one of {}",
+                    x.id,
+                    crate::export::EXPORTERS.join(", ")
+                ),
+            ));
+        }
+        if let Err(ScenarioError::Conflict { field, conflict: why }) =
+            crate::export::profile_of(x, i).map_err(|err| match err {
+                crate::EngineError::Scenario(inner) => inner,
+                other => ScenarioError::conflict("exporters", other.to_string()),
+            })
+        {
+            e.push(conflict(&field, why));
+        }
     }
 
     // The network layer. `v2xw-net` implements both, and the engine composes neither:
@@ -697,6 +722,46 @@ fn time(s: &Scenario, e: &mut Vec<ScenarioError>) {
         &RESOLUTIONS,
         e,
     );
+    // `des_resolution` is a guarantee the run makes, not a knob on the clock: the kernel keeps
+    // nanoseconds whatever it says. A resolution is therefore accepted only when everything
+    // the run times is representable at it. The binding case is the radio: at the medium and
+    // high PHY/MAC tiers a frame is timed in microseconds — an 802.11p OFDM symbol is 8 µs and
+    // SIFS 32 µs in a 10 MHz channel (IEEE 802.11-2020 §17.4, Table 17-21) — and a millisecond
+    // grid cannot hold either.
+    if s.time.des_resolution == "1ms"
+        && (s.radio.tiers.phy != Tier::Abstract
+            || s.radio.tiers.mac != Tier::Abstract)
+    {
+        e.push(conflict(
+            "time.des_resolution",
+            "is '1ms', and the PHY/MAC tiers time frames in microseconds (an 802.11p OFDM \
+             symbol is 8 µs, SIFS 32 µs; IEEE 802.11-2020 §17.4): a run at this tier cannot \
+             promise millisecond resolution. Use '1us', or the abstract PHY and MAC"
+                .to_string(),
+        ));
+    }
+    let grid_s = match s.time.des_resolution.as_str() {
+        "1us" => Some(1e-6),
+        "1ms" => Some(1e-3),
+        _ => None,
+    };
+    if let Some(grid) = grid_s {
+        for (i, w) in s.time.time_dilation.iter().enumerate() {
+            for (name, at) in [("from_s", w.from_s), ("to_s", w.to_s)] {
+                let ticks = at / grid;
+                if (ticks - ticks.round()).abs() > 1e-6 {
+                    e.push(conflict(
+                        &format!("time.time_dilation[{i}].{name}"),
+                        format!(
+                            "is {at} s, which is not on the {} grid time.des_resolution \
+                             promises",
+                            s.time.des_resolution
+                        ),
+                    ));
+                }
+            }
+        }
+    }
 
     let horizon = s.time.duration_s;
     let mut windows: Vec<(f64, f64)> = Vec::new();

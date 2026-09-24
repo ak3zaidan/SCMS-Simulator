@@ -484,8 +484,22 @@ impl Engine {
     /// card does not validate, and [`EngineError::Scenario`] if the scenario is invalid.
     pub fn build(scenario: Scenario, build_utc: &str) -> Result<Engine> {
         scenario.validate()?;
-
         let world = crate::wiring::build_world(&scenario)?;
+        Self::build_with_world(scenario, world, build_utc)
+    }
+
+    /// As [`Engine::build`], on a world the caller already has.
+    ///
+    /// For a driver that runs one scenario many times — the server, where every Run is a
+    /// fresh kernel — and keeps the world it imported last time. The caller vouches that
+    /// `world` is what [`crate::wiring::build_world`] returns for this scenario; the server
+    /// keys its copy by [`crate::wiring::world_cache_key`], which covers every input of the
+    /// import, so a run on a kept world is the same run as one on a fresh import.
+    ///
+    /// # Errors
+    /// As [`Engine::build`], less the world import.
+    pub fn build_with_world(scenario: Scenario, world: World, build_utc: &str) -> Result<Engine> {
+        scenario.validate()?;
         let mut registry = Registry::new();
         crate::wiring::register_all(&mut registry)?;
 
@@ -870,6 +884,12 @@ impl Engine {
 
         while let Some((key, event)) = self.scheduler.pop() {
             if key.time > horizon {
+                break;
+            }
+            // The one cancellation point (see `RunRecorder::cancelled`): between two
+            // events, never inside a phase. Asked before the event is counted, so a
+            // cancelled run's report does not claim an event it did not run.
+            if recorder.cancelled() {
                 break;
             }
             self.report.count(event.class());

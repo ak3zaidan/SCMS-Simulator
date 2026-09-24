@@ -204,10 +204,11 @@ await check("§6.1 / R10 — a JSON-RPC batch array is rejected with −32600", 
   eq(body.error.code, -32600, "code");
 });
 
-await check("§6.3 / R1 — /rpc/schema is an OpenRPC 1.3.2 document naming all 32 methods", async () => {
+await check("§6.3 / R1 — /rpc/schema is an OpenRPC 1.3.2 document naming all 33 methods", async () => {
   const doc = await (await fetch(`${base}/rpc/schema`)).json();
   eq(doc.openrpc, "1.3.2", "openrpc version");
-  eq(doc.methods.length, 32, "method count");
+  eq(doc.methods.length, 33, "method count: the 32 of §6.15 plus scenario.schema (the generated settings surface)");
+  assert(doc.methods.map((m) => m.name).includes("scenario.schema"), "scenario.schema present");
   assert(doc.methods.map((m) => m.name).includes("rpc.discover"), "rpc.discover present");
   for (const m of doc.methods) {
     assert(m.result?.schema, `${m.name} has a result schema`);
@@ -638,7 +639,7 @@ await check("R9 — an unknown method is −32601", async () => {
   c.close();
 });
 
-await check("every one of the 32 methods answers (a result or a documented error code)", async () => {
+await check("every one of the 33 methods answers (a result or a documented error code)", async () => {
   const doc = await (await fetch(`${base}/rpc/schema`)).json();
   const c = client();
   const hello = await c.connect();
@@ -650,7 +651,7 @@ await check("every one of the 32 methods answers (a result or a documented error
     "view.follow": { node }, "view.camera": { mode: "map" }, "overlay.set": { list: true },
     "inspect.node": { node }, "inspect.link": { tx: node, rx: hello.nodes.nodeId[1] },
     "inspect.entity": { entity: "ma" }, "explain": { subject: { kind: "metric", id: "pdr" } },
-    "scenario.get": {}, "scenario.set": { scenario: { schema: "v2xw/scenario/1", seed: 0, time: { duration_s: 60 } } },
+    "scenario.get": {}, "scenario.schema": { sections: ["statuses"] }, "scenario.set": { scenario: { schema: "v2xw/scenario/1", seed: 0, time: { duration_s: 60 } } },
     "scenario.validate": {}, "scenario.save": { path: "/tmp/x.yaml" },
     "scenario.load": { path: "stub/grid" }, "scenario.list": {},
     "world.import_osm": { bbox: [0, 0, 0.01, 0.01] }, "world.generate": { kind: "grid" },
@@ -674,7 +675,7 @@ await check("every one of the 32 methods answers (a result or a documented error
       answered.push(m);
     }
   }
-  eq(answered.length, 32, `answered ${answered.length} of 32`);
+  eq(answered.length, 33, `answered ${answered.length} of 33`);
   // The sweep called `run.seek`, which §6.6 says pauses a live run, and `run.pause`.
   // §1.3 rule 4 then says the server sends nothing until `run.resume`, so later checks
   // that expect a moving stream have to put it back.
@@ -825,30 +826,64 @@ await check("§1.2 — a client-sent binary frame draws an Error frame and close
 // --- end of run ------------------------------------------------------------------
 if (shortBase) {
   console.log("\n§2.3, §3.11 end of run");
-  await check("FLAG_END_OF_RUN then Bye{reason=0} then close 1000", async () => {
+  await check("FLAG_END_OF_RUN, then the connection stays open: seek back, and run.start greets again", async () => {
     // The short server starts paused so its three seconds are not over before the suite
     // reaches this point. §1.3 rule 4 is why that works: a paused run sends nothing.
+    //
+    // This check used to require `Bye{reason = 0}` and a close at the end of the run. The
+    // server no longer hangs up there, deliberately: a finished run can be seeked through
+    // and started again on the same connection (§6.6: `run.start` sends "a fresh `Hello`
+    // on this connection"), and closing the socket was what left the page issuing
+    // `run.seek` over HTTP — where it can only be refused — after every run.
     await rpcHttp("run.speed", { speed: 0 }, shortBase);
     await rpcHttp("run.resume", {}, shortBase);
     const ws = new WebSocket(`${shortBase.replace(/^http/, "ws")}/vwp/v1?compress=none&v=1`, ["vwp.v1"]);
     ws.binaryType = "arraybuffer";
-    const result = await new Promise((res, rej) => {
-      let sawEndOfRun = false;
-      let byeReason = null;
-      const timer = setTimeout(() => rej(new Error(`no close; end_of_run=${sawEndOfRun} bye=${byeReason}`)), 40000);
-      ws.addEventListener("message", (e) => {
-        if (typeof e.data === "string") return;
-        const v = new DataView(e.data);
-        const type = v.getUint16(6, true);
-        const flags = v.getUint16(12, true);
-        if (flags & 0x0008) sawEndOfRun = true;
-        if (type === 0x00ff) byeReason = v.getUint8(24 + 16);
-      });
-      ws.addEventListener("close", (e) => { clearTimeout(timer); res({ code: e.code, sawEndOfRun, byeReason }); });
+    const frames = [];
+    const replies = new Map();
+    let closed = null;
+    ws.addEventListener("message", (e) => {
+      if (typeof e.data === "string") {
+        const msg = JSON.parse(e.data);
+        if (msg.id !== undefined) replies.set(msg.id, msg);
+        return;
+      }
+      const v = new DataView(e.data);
+      frames.push({ type: v.getUint16(6, true), flags: v.getUint16(12, true) });
     });
-    assert(result.sawEndOfRun, "a canonical frame carried FLAG_END_OF_RUN");
-    eq(result.byeReason, 0, "Bye reason is 0 (run-complete)");
-    eq(result.code, 1000, "close code");
+    ws.addEventListener("close", (e) => { closed = e.code; });
+    const until = async (what, pred, ms = 40000) => {
+      const t0 = Date.now();
+      while (!pred()) {
+        if (Date.now() - t0 > ms) throw new Error(`timed out waiting for ${what}`);
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    };
+    let id = 100;
+    const rpc = async (method, params) => {
+      const mine = ++id;
+      ws.send(JSON.stringify({ jsonrpc: "2.0", id: mine, method, params }));
+      await until(`${method} reply`, () => replies.has(mine), 15000);
+      return replies.get(mine);
+    };
+    await until("FLAG_END_OF_RUN", () => frames.some((f) => f.flags & 0x0008));
+    await new Promise((r) => setTimeout(r, 1500));
+    eq(closed, null, "the connection is still open after the end of the run");
+    assert(!frames.some((f) => f.type === 0x00ff), "no Bye at the end of a run the server can start again");
+    const status = await rpc("run.status", {});
+    eq(status.result?.state, "finished", "run.status on the same socket says finished");
+    const before = frames.length;
+    const seek = await rpc("run.seek", { t_ns: 1_000_000_000 });
+    assert(seek.result, `run.seek on the socket answers: ${JSON.stringify(seek.error ?? {})}`);
+    assert(
+      frames.slice(before).some((f) => f.type === 0x0002 && f.flags & 0x0020),
+      "the seek streamed a SEEK_RESULT keyframe before its reply",
+    );
+    const mark = frames.length;
+    const start = await rpc("run.start", { paused: true });
+    assert(start.result, `run.start on the socket answers: ${JSON.stringify(start.error ?? {})}`);
+    await until("the new run's Hello", () => frames.slice(mark).some((f) => f.type === 0x0001), 10000);
+    ws.close();
   });
 } else {
   skipped.push("end of run (no short-run server url given)");

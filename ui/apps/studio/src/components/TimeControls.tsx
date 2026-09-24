@@ -372,6 +372,17 @@ export function TimeControls(): React.JSX.Element {
         >
           ▶▶
         </button>
+        <button
+          type="button"
+          className="icon"
+          title={caps.stop.why}
+          disabled={!caps.stop.enabled}
+          onClick={() => void call(() => engine.request("run.stop", {}))}
+          data-testid="stop"
+          aria-label="Stop the run"
+        >
+          ■
+        </button>
       </div>
 
       <select

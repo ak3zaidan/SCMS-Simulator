@@ -13,6 +13,7 @@
 
 import {
   ChannelId,
+  HelloFlags,
   VwpClient,
   bytesToHex,
   computeWorldContentHash,
@@ -138,6 +139,12 @@ const STORE_HZ = 5;
 const CONNECTION_SCOPED: readonly VwpMethodName[] = ["view.follow", "view.camera", "overlay.set"];
 
 /**
+ * Methods the engine answers over HTTP only with a refusal, because their result is frames on the
+ * connection. Never sent over HTTP: the page reopens the socket or says, in words, why it cannot.
+ */
+const SOCKET_ONLY: readonly VwpMethodName[] = ["run.seek"];
+
+/**
  * How many metric names the store projection keeps.
  *
  * `MetricSample.str_metric` (§3.7) is a wire-supplied string id, so the name set is engine- and
@@ -240,6 +247,76 @@ export class StudioEngine {
    */
   #connectInFlight: { url: string; promise: Promise<HelloMessage> } | null = null;
 
+  /** Reconnect attempts since the last `Hello`, for the status line. */
+  #reconnectAttempts = 0;
+
+  /**
+   * Re-establish everything the engine keeps per connection, after a `Hello` that was not the
+   * connection's first.
+   *
+   * A resumed `Hello` (§1.4 rule 1) needs nothing: the engine kept the session. Anything else is a
+   * fresh session — a new run started on this socket, or the engine came back after going away —
+   * and the event subscription, the follow and the overlay catalogue it had are gone. Node ids are
+   * not stable across runs, so the selection is dropped rather than re-sent: following node 12 of
+   * the last run would follow an unrelated vehicle, or nothing, in this one.
+   */
+  async #afterFreshHello(hello: HelloMessage): Promise<void> {
+    const reconnected = this.#reconnectAttempts > 0;
+    this.#reconnectAttempts = 0;
+    useStudio.getState().setReconnectAttempts(0);
+    if ((hello.helloFlags & HelloFlags.RESUMED) !== 0) {
+      this.#log("info", "vwp", "reconnected; the engine resumed the stream where it left off");
+      return;
+    }
+    this.#log(
+      "info",
+      "vwp",
+      reconnected
+        ? "reconnected to the engine; showing the run it is serving now"
+        : "a new run started on this connection",
+    );
+    if (useStudio.getState().selectedActor !== null || this.#followedNode !== null) {
+      this.viewer?.select(null);
+      this.viewer?.cameras.follow(null);
+      this.#followedNode = null;
+      useStudio.getState().setSelection(null, null);
+    }
+    const client = this.client;
+    if (!client) return;
+    try {
+      await client.request("events.set", { subscribe: [...DEFAULT_CHANNELS], max_events_per_step: 2000 });
+    } catch (err) {
+      this.#log("warn", "events", `events.set failed: ${errText(err)}`);
+    }
+    void this.refreshStatus();
+    void this.refreshScenario();
+    void this.refreshOverlayCatalogue();
+  }
+
+  /**
+   * Resolve with the next `Hello` on the current connection, or reject after `timeoutMs`.
+   *
+   * Created *before* the call that causes the `Hello`, so it cannot be missed. The rejection is
+   * pre-handled: a caller that decides not to wait does not leave an unhandled rejection behind.
+   */
+  #nextHello(timeoutMs: number): Promise<HelloMessage> {
+    const client = this.client;
+    if (!client) return Promise.reject(new Error("no connection"));
+    const promise = new Promise<HelloMessage>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        off();
+        reject(new Error(`the engine did not announce the new run within ${Math.round(timeoutMs / 1000)} s`));
+      }, timeoutMs);
+      const off = client.onHello((hello) => {
+        clearTimeout(timer);
+        off();
+        resolve(hello);
+      });
+    });
+    promise.catch(() => undefined);
+    return promise;
+  }
+
   /**
    * Open the VWP connection, coalescing concurrent callers.
    *
@@ -265,8 +342,23 @@ export class StudioEngine {
     const client = new VwpClient({ url: baseUrl, compress: "none", autoReconnect: true });
     this.client = client;
 
-    client.onState((state) => useStudio.getState().setConnection(state));
-    client.onHello((hello) => this.handleHello(hello));
+    client.onState((state) => {
+      useStudio.getState().setConnection(state);
+      if (state === "reconnecting") {
+        this.#reconnectAttempts++;
+        useStudio.getState().setReconnectAttempts(this.#reconnectAttempts);
+      }
+    });
+    // Every `Hello` after the first is either a new run on this socket (§6.6: `run.start`
+    // sends "a fresh `Hello` on this connection") or a reconnect after the engine went away.
+    // Either way the engine's side of the connection is new — its subscriptions, its follow —
+    // so the page has to ask for them again, or the second run streams no events at all.
+    let greeted = false;
+    client.onHello((hello) => {
+      this.handleHello(hello);
+      if (greeted) void this.#afterFreshHello(hello);
+      greeted = true;
+    });
     client.onKeyframe(() => {
       this.#frameCounts.keyframe++;
       this.#lastSimTimeNs = Number(client.poses.simTimeNs);
@@ -285,7 +377,10 @@ export class StudioEngine {
     client.on("protocolerror", (err) => this.#log("error", "protocol", `${err.code}: ${err.message}`));
     client.onRpcNotification("run.state", (p) => {
       useStudio.getState().setRun({ state: p.state, tNs: p.t_ns });
-      this.#log("info", "run", `state → ${p.state}`);
+      this.#log("info", "run", `state → ${p.state}${typeof (p as { reason?: unknown }).reason === "string" ? ` (${(p as { reason: string }).reason})` : ""}`);
+      // A finished or stopped run publishes its output digest and its final counts; fetch them
+      // now rather than at the next 2 s poll, so the page says "finished" the moment it is.
+      if (p.state === "finished" || p.state === "paused") void this.refreshStatus();
     });
     client.onRpcNotification("log", (p) => this.#log(p.level === "error" ? "error" : p.level === "warn" ? "warn" : "info", p.target ?? "engine", p.message));
     client.onRpcNotification("view.changed", (p) => {
@@ -524,8 +619,27 @@ export class StudioEngine {
         throw err;
       }
     }
-    if (CONNECTION_SCOPED.includes(method)) {
-      const err = new Error(`${method} needs an open stream — press Connect first`);
+    if (CONNECTION_SCOPED.includes(method) || SOCKET_ONLY.includes(method)) {
+      // A seek streams its frames on the socket, so over HTTP the engine can only refuse it —
+      // which is how the page came to show "not supported here: run.seek streams its result
+      // over the connection" after a run finished. Try to get the socket back first.
+      if (this.client && !this.streaming) {
+        try {
+          await this.reopenStream();
+        } catch {
+          /* reported below */
+        }
+        const reopened = this.client;
+        if (this.streaming && reopened) {
+          useStudio.getState().noteRpcCall(method);
+          return await reopened.request(method, params);
+        }
+      }
+      const err = new Error(
+        method === "run.seek"
+          ? "Moving through the run needs the live connection to the engine, and it is not open right now. It reconnects by itself; try again in a moment."
+          : `${method} needs an open stream — press Connect first`,
+      );
       this.#log("warn", "rpc", err.message);
       throw err;
     }
@@ -827,13 +941,45 @@ export class StudioEngine {
    *
    * Returns the state the engine reports at the end, so a caller can say what happened.
    */
-  async startRun(): Promise<string> {
-    if (useStudio.getState().run.state === "running") await this.request("run.pause", {});
+  async startRun(options: { readonly scenario?: string | Record<string, unknown> } = {}): Promise<string> {
+    if (this.#starting) return this.#starting;
+    const attempt = this.#startRunOnce(options).finally(() => {
+      this.#starting = null;
+    });
+    this.#starting = attempt;
+    return attempt;
+  }
+
+  /** The `startRun` in flight, so a double press starts one run and not two. */
+  #starting: Promise<string> | null = null;
+
+  async #startRunOnce(options: { readonly scenario?: string | Record<string, unknown> }): Promise<string> {
+    await this.refreshStatus();
+    if (useStudio.getState().run.state === "running") {
+      // It may finish between the status and the pause; a refused pause is then not an error.
+      await this.request("run.pause", {}).catch(() => undefined);
+    }
     const speed = useStudio.getState().run.speed;
-    await this.request("run.start", { paused: true, ...(Number.isFinite(speed) ? { speed } : {}) });
-    if (!this.streaming) await this.reopenStream();
+    // The engine answers `run.start` and then sends the new run's `Hello` on the same socket.
+    // Waiting for that `Hello` — rather than for the socket to look open — is what makes the
+    // resume below land on the new run: before it, "Run again" raced the engine's own teardown.
+    const fresh = this.streaming ? this.#nextHello(120_000) : null;
+    // Over HTTP, because building a run can take longer than the socket's 30 s call timeout on a
+    // large map, and a timeout there would report a failure for a run that is in fact starting.
+    const started = await this.requestHttp("run.start", {
+      paused: true,
+      ...(Number.isFinite(speed) ? { speed } : {}),
+      ...(options.scenario !== undefined ? { scenario: options.scenario } : {}),
+    });
+    if (fresh !== null && this.streaming) {
+      await fresh;
+    } else {
+      await this.reopenStream();
+    }
     const res = await this.request("run.resume", {});
     await this.refreshStatus();
+    void this.refreshScenario();
+    this.#log("info", "run", `started run ${started.run_id.slice(0, 8)} (${res.state})`);
     return res.state;
   }
 
@@ -860,6 +1006,10 @@ export class StudioEngine {
         runId: s.run_id,
         profile: s.profile,
         live: s.live,
+        generation: typeof s.generation === "number" ? s.generation : 0,
+        stagedHash: typeof s.staged_hash === "string" ? s.staged_hash : null,
+        outputDigest: typeof s.engine?.output_digest === "string" ? s.engine.output_digest : null,
+        kernelThreads: typeof s.engine?.kernel_threads === "number" ? s.engine.kernel_threads : null,
       });
     } catch {
       /* a poll failure is not worth a log line */
@@ -886,7 +1036,12 @@ export class StudioEngine {
   async refreshScenario(): Promise<void> {
     try {
       const res = await this.request("scenario.get", { with_schema: true, resolved: true });
-      useStudio.getState().setScenario(res.scenario, res.hash, res.schema ?? null);
+      useStudio.getState().setScenario(res.scenario, res.hash, res.schema ?? null, {
+        runningHash: typeof res.running_hash === "string" ? res.running_hash : res.hash,
+        staged: res.staged ?? null,
+        fields: Array.isArray(res.fields) ? res.fields : [],
+        statuses: Array.isArray(res.statuses) ? res.statuses : [],
+      });
     } catch (err) {
       this.#log("warn", "scenario", `scenario.get failed: ${errText(err)}`);
     }
