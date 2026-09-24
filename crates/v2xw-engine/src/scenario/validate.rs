@@ -681,8 +681,10 @@ pub static KEY_STATUS: &[KeyStatus] = &[
                at TR 37.885's NLOS law. High is priced from the geometry: TR 37.885 line \
                of sight, TR 37.885 blockage from the vehicles actually on the path, the \
                Mangel 2011 model round a traced street corner, TR 37.885 NLOS where no \
-               single corner connects, plus Nakagami fading. Rain applies at medium and \
-               high.",
+               single corner connects. Both take Nakagami fading unless radio.models \
+               says otherwise. High is the default: on a street grid it is the law best \
+               supported by the intersection measurements it was fitted to, at about 1.8 \
+               times medium's cost. Rain applies at medium and high.",
     },
     KeyStatus {
         path: "radio.tiers.phy",

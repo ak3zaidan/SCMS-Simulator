@@ -103,11 +103,14 @@ weather:
 radio:
   rat: dsrc-80211p
   tiers:
-    # The medium tier throughout: log-distance with shadowing and Nakagami fading, a
-    # link-budget PHY with a modelled PER curve, and a CSMA/CA MAC with DCC. The high tier
-    # is frame-level and needs a matching MAC; the abstract tier is free-space with no
-    # fading and would make every reception succeed.
-    propagation: medium
+    # Propagation at the high tier: every link priced from Midtown's own geometry — TR
+    # 37.885 line of sight, the blockage of the vehicles actually on the path, the Mangel
+    # 2011 intersection model round the street corner a blocked link turns, TR 37.885 NLOS
+    # where no single corner connects. It is the default best supported by measurement for
+    # a street grid (04-models.md §3.3); the medium tier's distance-only NLOS law does not
+    # see corners. PHY and MAC stay medium: a link-budget PHY with a modelled PER curve and
+    # a CSMA/CA MAC with DCC (the high PHY is frame-level and needs a matching MAC).
+    propagation: high
     phy: medium
     mac: medium
 

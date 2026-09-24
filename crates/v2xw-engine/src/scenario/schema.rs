@@ -721,7 +721,7 @@ pub enum Rat {
 #[serde(deny_unknown_fields)]
 pub struct RadioTiers {
     /// Path loss.
-    #[serde(default = "RadioTiers::medium")]
+    #[serde(default = "RadioTiers::high")]
     pub propagation: Tier,
     /// The physical layer.
     #[serde(default = "RadioTiers::medium")]
@@ -738,12 +738,17 @@ impl RadioTiers {
     fn medium() -> Tier {
         Tier::Medium
     }
+    /// Propagation's default: the geometric city-street law, the one best supported by
+    /// measurement on a street grid (04-models.md §3.3).
+    fn high() -> Tier {
+        Tier::High
+    }
 }
 
 impl Default for RadioTiers {
     fn default() -> Self {
         RadioTiers {
-            propagation: Tier::Medium,
+            propagation: Tier::High,
             phy: Tier::Medium,
             mac: Tier::Medium,
             focus: None,
