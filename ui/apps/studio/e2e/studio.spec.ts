@@ -263,8 +263,13 @@ test("light theme renders and the actor-state legend keeps shape redundancy", as
   await page.getByTestId("theme-toggle").click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   await expect(page.getByTestId("state-legend")).toBeVisible();
-  const shapes = await page.locator('[data-testid="state-legend"] svg').count();
-  expect(shapes).toBe(5);
+  // Five state glyphs, each its own shape; the road-user key the vru track added (a vehicle dot
+  // and a smaller pedestrian/cyclist dot) is a size key, not a state, and is counted apart.
+  const legend = page.getByTestId("state-legend");
+  const roadUsers = await legend.locator('[data-testid="legend-vehicle"] svg, [data-testid="legend-vru"] svg').count();
+  expect(roadUsers).toBe(2);
+  const shapes = await legend.locator("svg").count();
+  expect(shapes - roadUsers).toBe(5);
   await page.waitForTimeout(1200);
   await page.screenshot({ path: `${SHOTS}/05-light-theme.png` });
 });
