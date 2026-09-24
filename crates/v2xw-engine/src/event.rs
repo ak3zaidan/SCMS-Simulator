@@ -140,6 +140,10 @@ pub enum Event {
 pub enum NodeTask {
     /// The node runtime's periodic step: clock, inbox, verification, generation.
     Step,
+    /// A signature check the node started has finished: the node is woken to hand the
+    /// message to its applications at that instant (`ObuRuntime::wake_timed`), and does
+    /// nothing else.
+    Deliver,
     /// A pseudonym change is due.
     PseudonymChange,
     /// A certificate top-up request is due.

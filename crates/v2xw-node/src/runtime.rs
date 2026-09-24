@@ -193,6 +193,16 @@ struct Waiting {
     depth: u64,
 }
 
+/// A frame whose signature check has started and not yet finished: it reaches the
+/// applications at `finish`, not before.
+#[derive(Debug, Clone)]
+struct Verifying {
+    /// The message as the applications will receive it, with the node's conclusion.
+    message: VerifiedMessage,
+    /// The report the engine joins to the reception attempt.
+    report: RxReport,
+}
+
 /// One message this node wants transmitted.
 ///
 /// # The bytes, not a count
@@ -393,6 +403,13 @@ pub struct ObuRuntime {
     /// Beside every frame in the verification queue (`queues[1]`), in the same order: the
     /// token and the instants its report needs.
     verify_meta: VecDeque<Waiting>,
+    /// Checks in progress, keyed by (finish instant, start order): what the applications
+    /// receive once each finishes. A check that has started has been charged to its server
+    /// and its verdict is fixed, but the message is not the applications' until the server
+    /// is done with it.
+    verifying: BTreeMap<(SimTime, u64), Verifying>,
+    /// The start-order tie-break for [`ObuRuntime::verifying`].
+    verify_seq: u64,
     /// When each frame still waiting to be parsed will start its parse, on the node's
     /// clock — the receive queue's occupancy, when parsing has a cost.
     parse_starts: VecDeque<SimTime>,
@@ -477,6 +494,8 @@ impl ObuRuntime {
                 NodeQueue::new(QueueKind::Crl, config.queue_capacity[4]),
             ],
             verify_meta: VecDeque::new(),
+            verifying: BTreeMap::new(),
+            verify_seq: 0,
             parse_starts: VecDeque::new(),
             drops: DropLedger::new(),
             clock: ClockModel::new(0.0),
@@ -644,11 +663,11 @@ impl ObuRuntime {
     ///
     /// What is still waiting stays in the queue across steps, so a node that cannot keep up
     /// carries a real backlog, its queue-overflow drops happen at the instant the queue was
-    /// full, and a verification's wait is the wait it would have had. A check that has
-    /// *started* by the end of the step is delivered to the applications at this step; its
-    /// report carries the instant it truly finishes, which may be up to one service time
-    /// after the step. The applications run at the tick, so that is the one approximation,
-    /// and it is bounded by a single verification's cost.
+    /// full, and a verification's wait is the wait it would have had. A message reaches the
+    /// applications when its check *finishes*: a check still running at the end of the step
+    /// is held, [`ObuRuntime::next_completion`] says when it finishes, and the engine wakes
+    /// the node then ([`ObuRuntime::wake_timed`]). Until 2026-09-24 it was delivered when
+    /// it started, up to one verification service time early.
     pub fn step_timed(
         &mut self,
         ctx: &mut dyn NodeCtx,
@@ -661,21 +680,7 @@ impl ObuRuntime {
 
         let mut out = StepOutcome::default();
         if self.state == NodeState::Off {
-            // A switched-off radio hears nothing; the frames it was handed are reported as
-            // such rather than vanishing.
-            for (_, stamp) in inbox {
-                let at = stamp
-                    .arrived_at
-                    .map_or(believed, |t| self.clock.believed_time(t));
-                out.rx_reports.push(RxReport {
-                    token: stamp.token,
-                    disposition: RxDisposition::NodeOff,
-                    arrived: at,
-                    parsed: at,
-                    verify_start: None,
-                    verify_done: None,
-                });
-            }
+            self.switched_off(believed, inbox, &mut out);
             return out;
         }
 
@@ -693,6 +698,80 @@ impl ObuRuntime {
             out.telemetry = Some(self.close_window(ctx, now));
         }
         out
+    }
+
+    /// Wakes the node between its periodic steps, to hand over what has finished.
+    ///
+    /// A signature check that started during a step usually finishes after it, and its
+    /// message is not the applications' until it does. The engine calls this at
+    /// [`ObuRuntime::next_completion`]: the frames that have arrived by now are received
+    /// in continuous time exactly as [`ObuRuntime::step_timed`] receives them, every check
+    /// that has finished is delivered, and nothing else happens — no generation, no
+    /// pseudonym rotation, no telemetry window, which are the periodic step's.
+    pub fn wake_timed(
+        &mut self,
+        ctx: &mut dyn NodeCtx,
+        inbox: Vec<(RxFrame, RxStamp)>,
+    ) -> StepOutcome {
+        let now = ctx.now();
+        self.clock.advance(now, self.belief.fix.has_position());
+        let believed = self.clock.believed_time(now);
+        let mut out = StepOutcome::default();
+        if self.state == NodeState::Off {
+            self.switched_off(believed, inbox, &mut out);
+            return out;
+        }
+        self.receive(ctx, believed, inbox, &mut out);
+        out
+    }
+
+    /// When the next signature check in progress finishes, on this node's own clock — the
+    /// instant the engine must wake it for ([`ObuRuntime::wake_timed`]). `None` when no
+    /// check is running.
+    #[must_use]
+    pub fn next_completion(&self) -> Option<SimTime> {
+        self.verifying.keys().next().map(|(finish, _)| *finish)
+    }
+
+    /// [`ObuRuntime::next_completion`] on the simulation's timeline, seen from `now`: the
+    /// node's clock stands a fixed offset from the truth between two of its steps, so the
+    /// interval to the finish is the same on both. Never before `now`.
+    #[must_use]
+    pub fn next_completion_after(&self, now: SimTime) -> Option<SimTime> {
+        let finish = self.next_completion()?;
+        let believed = self.clock.believed_time(now);
+        Some(now.saturating_add(finish.saturating_sub(believed)))
+    }
+
+    /// Everything a switched-off node was handed, and every check it had in progress, is
+    /// reported as reaching a node that was off, rather than vanishing.
+    fn switched_off(
+        &mut self,
+        believed: SimTime,
+        inbox: Vec<(RxFrame, RxStamp)>,
+        out: &mut StepOutcome,
+    ) {
+        for (_, v) in core::mem::take(&mut self.verifying) {
+            out.rx_reports.push(RxReport {
+                disposition: RxDisposition::NodeOff,
+                ..v.report
+            });
+        }
+        {
+            for (_, stamp) in inbox {
+                let at = stamp
+                    .arrived_at
+                    .map_or(believed, |t| self.clock.believed_time(t));
+                out.rx_reports.push(RxReport {
+                    token: stamp.token,
+                    disposition: RxDisposition::NodeOff,
+                    arrived: at,
+                    parsed: at,
+                    verify_start: None,
+                    verify_done: None,
+                });
+            }
+        }
     }
 
     fn receive(
@@ -753,8 +832,11 @@ impl ObuRuntime {
                 }
             };
 
-            // 2. Everything the verifier would have started by the time the policy looks.
-            self.advance_verifications(ctx, parsed, out);
+            // 2. Everything the verifier would have started by the time the policy looks, and
+            //    every check that has finished by then handed to the applications — so the
+            //    neighbour table the policy reads is the one it would really read.
+            self.advance_verifications(ctx, parsed);
+            self.complete_verifications(parsed, out);
 
             // 3. The policy, over the queue as it is at this instant.
             self.learn_or_request(&frame);
@@ -856,7 +938,26 @@ impl ObuRuntime {
             }
         }
 
-        self.advance_verifications(ctx, believed, out);
+        self.advance_verifications(ctx, believed);
+        self.complete_verifications(believed, out);
+    }
+
+    /// Hands every check that has finished by `until` to the applications, in the order
+    /// they finished, with its report.
+    ///
+    /// This is the one place a verified message is delivered. It used to happen when the
+    /// check *started*, up to one verification service time before the signature was
+    /// actually known to be good; now it happens when it finishes, and a check still
+    /// running at the end of a step waits for [`ObuRuntime::wake_timed`] or the next step.
+    fn complete_verifications(&mut self, until: SimTime, out: &mut StepOutcome) {
+        while let Some(entry) = self.verifying.first_entry() {
+            if entry.key().0 > until {
+                break;
+            }
+            let done = entry.remove();
+            self.deliver(done.message, out);
+            out.rx_reports.push(done.report);
+        }
     }
 
     /// Reports one frame the verification queue refused or evicted.
@@ -907,14 +1008,9 @@ impl ObuRuntime {
     ///
     /// The head of the line starts at `max(when it was queued, when a server frees up)`;
     /// if that is after `until` it is still waiting and so is everything behind it. A check
-    /// that starts is charged to its server, classified, delivered, and reported with the
-    /// instants it really started and finished.
-    fn advance_verifications(
-        &mut self,
-        ctx: &mut dyn NodeCtx,
-        until: SimTime,
-        out: &mut StepOutcome,
-    ) {
+    /// that starts is charged to its server and classified, and waits in `verifying` until
+    /// the instant it finishes ([`ObuRuntime::complete_verifications`] hands it over).
+    fn advance_verifications(&mut self, ctx: &mut dyn NodeCtx, until: SimTime) {
         let probe = OpDescriptor::verify(self.config.verify_op, 0);
         if self.service.service_time(ctx, &probe).is_none() {
             // The profile costs no verification. Nothing is verified and nothing is
@@ -975,16 +1071,25 @@ impl ObuRuntime {
                 },
                 meta.depth,
             ));
-            let m = self.to_message(&frame, meta.arrived, verdict);
-            self.deliver(m, out);
-            out.rx_reports.push(RxReport {
-                token: meta.token,
-                disposition: RxDisposition::Delivered(verdict),
-                arrived: meta.arrived,
-                parsed: meta.parsed,
-                verify_start: Some(sched.start),
-                verify_done: Some(sched.finish),
-            });
+            // The verdict is fixed now, but the applications have it only when the server
+            // is done: the message waits in `verifying` until `sched.finish`.
+            let message = self.to_message(&frame, meta.arrived, verdict);
+            let seq = self.verify_seq;
+            self.verify_seq += 1;
+            self.verifying.insert(
+                (sched.finish, seq),
+                Verifying {
+                    message,
+                    report: RxReport {
+                        token: meta.token,
+                        disposition: RxDisposition::Delivered(verdict),
+                        arrived: meta.arrived,
+                        parsed: meta.parsed,
+                        verify_start: Some(sched.start),
+                        verify_done: Some(sched.finish),
+                    },
+                },
+            );
         }
     }
 

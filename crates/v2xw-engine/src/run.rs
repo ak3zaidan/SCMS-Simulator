@@ -569,6 +569,9 @@ pub struct Engine {
     jamming: jamming::Jamming,
     /// The 20 m bins of the reception census (`phy.prr`), the very bins the metric reads.
     prr_bins: v2xw_metrics::bins::Bins,
+    /// When each node is next woken to hand over a finished signature check
+    /// ([`crate::event::NodeTask::Deliver`]): at most one pending wake per node.
+    node_wake: BTreeMap<NodeId, SimTime>,
     report: RunReport,
 }
 
@@ -760,6 +763,7 @@ impl Engine {
             focus,
             jamming: jammers,
             prr_bins: v2xw_metrics::comms::prr_bins(),
+            node_wake: BTreeMap::new(),
             report: RunReport::default(),
         };
         let phase2 = crate::phase2::Phase2::build(&engine.scenario, &engine.world)?;
@@ -1103,6 +1107,10 @@ impl Engine {
                     node,
                     task: crate::event::NodeTask::Step,
                 } => self.on_node_phase(recorder, horizon, Some(node)),
+                Event::NodeTask {
+                    node,
+                    task: crate::event::NodeTask::Deliver,
+                } => self.on_node_wake(recorder, horizon, node),
                 Event::MacTimer { node, channel } => {
                     self.on_mac_timer(node, ChannelId(channel), horizon);
                 }
@@ -1397,6 +1405,7 @@ impl Engine {
                 self.node_phase.remove(&node);
                 self.node_class.remove(&node);
                 self.mac_window.remove(&node);
+                self.node_wake.remove(&node);
                 // Frames the retired node had been handed and not yet processed never
                 // reach an application: each attempt is settled here rather than left
                 // without a fate.
@@ -1661,6 +1670,75 @@ impl Engine {
         horizon: SimTime,
         only: Option<NodeId>,
     ) {
+        self.run_nodes(recorder, horizon, only, false);
+    }
+
+    /// One node is woken because a signature check it started has finished: it receives
+    /// what has arrived and hands every finished check to its applications, and nothing
+    /// else — no generation, which is the periodic step's (`ObuRuntime::wake_timed`).
+    fn on_node_wake(&mut self, recorder: &mut dyn RunRecorder, horizon: SimTime, node: NodeId) {
+        let now = self.scheduler.now();
+        if self.node_wake.get(&node) == Some(&now) {
+            self.node_wake.remove(&node);
+        }
+        if !self.nodes.contains_key(&node) {
+            return;
+        }
+        self.run_nodes(recorder, horizon, Some(node), true);
+    }
+
+    /// Schedules a node's wake for the instant its next signature check finishes, unless
+    /// one is already scheduled at or before it.
+    ///
+    /// One pending wake per node, at the earliest instant anything finishes: a wake hands
+    /// over everything finished by then and schedules the next, so the heap holds one
+    /// entry per node with a check running, not one per check.
+    fn schedule_wake(&mut self, node: NodeId, now: SimTime, horizon: SimTime) {
+        let Some(at) = self
+            .nodes
+            .get(&node)
+            .and_then(|n| n.next_completion_after(now))
+        else {
+            return;
+        };
+        // Strictly after `now`: a wake at this instant would dispatch again before the
+        // loop advances, and anything finished by `now` has been handed over already.
+        self.request_wake(node, at.max(now + 1), horizon);
+    }
+
+    /// Wakes `node` at `at` unless a wake is already pending at or before it.
+    ///
+    /// Called for a signature check's finish ([`Engine::schedule_wake`]) and for a decoded
+    /// frame's arrival, so a receiver takes each frame into its verifier the instant it
+    /// arrives and hands it to its applications the instant the check finishes — rather
+    /// than at its next periodic step, up to a mobility step later.
+    fn request_wake(&mut self, node: NodeId, at: SimTime, horizon: SimTime) {
+        if at > horizon {
+            return;
+        }
+        if self.node_wake.get(&node).is_some_and(|&t| t <= at) {
+            return;
+        }
+        self.node_wake.insert(node, at);
+        self.scheduler.schedule(
+            at,
+            EventClass::NodeTask,
+            Event::NodeTask {
+                node,
+                task: crate::event::NodeTask::Deliver,
+            },
+        );
+    }
+
+    /// The node phase's map and merge, over one node or all of them, as a periodic step or
+    /// as a wake.
+    fn run_nodes(
+        &mut self,
+        recorder: &mut dyn RunRecorder,
+        horizon: SimTime,
+        only: Option<NodeId>,
+        wake: bool,
+    ) {
         let now = self.scheduler.now();
         let step_s = self.scenario.time.mobility_step().as_secs_f64();
         // A node stepping at its own phase generates between two GNSS epochs. Its belief
@@ -1671,7 +1749,9 @@ impl Engine {
         // read, correctly, as an inconsistent sender. An OBU does the same: the BSM's
         // position is meant to be the position at `secMark`, and 04-models.md §8.1 records
         // J2945/1's latency-compensation requirement as secondary-sourced.
-        if let Some(node) = only {
+        if let Some(node) = only
+            && !wake
+        {
             self.dead_reckon_belief(node, now);
         }
         let mut inboxes = core::mem::take(&mut self.inboxes);
@@ -1712,7 +1792,11 @@ impl Engine {
                     .state()
                     .transmits()
                     .then(|| v2xw_core::NodeView::position(runtime).ground_speed_mps() * step_s);
-                let outcome = runtime.step_timed(&mut local, inbox, travelled.unwrap_or(0.0));
+                let outcome = if wake {
+                    runtime.wake_timed(&mut local, inbox)
+                } else {
+                    runtime.step_timed(&mut local, inbox, travelled.unwrap_or(0.0))
+                };
                 (*id, outcome, local.take_emitted(), travelled.unwrap_or(0.0))
             })
             .collect();
@@ -1795,6 +1879,22 @@ impl Engine {
         }
 
         self.inboxes = inboxes;
+
+        // A check still running hands its message over when it finishes, not at the next
+        // periodic step: each node that has one is woken then — and so is a node with a
+        // frame still on its way, at the instant the frame arrives.
+        for (id, ..) in &results {
+            self.schedule_wake(*id, now, horizon);
+            let next_arrival = self.inboxes.get(id).and_then(|q| {
+                q.iter()
+                    .filter_map(|(_, st)| st.arrived_at)
+                    .filter(|t| *t > now)
+                    .min()
+            });
+            if let Some(at) = next_arrival {
+                self.request_wake(*id, at, horizon);
+            }
+        }
     }
 
     /// Advances one node's position belief to `now` along its own believed velocity.
@@ -2993,6 +3093,10 @@ impl Engine {
                             arrived_at: Some(arrival),
                         },
                     ));
+                }
+                // The receiver takes the frame into its verifier the instant it arrives.
+                if handed {
+                    self.request_wake(outcome.rx, arrival, self.scenario.time.horizon_ns());
                 }
                 if state.app.is_some() {
                     delivered_app.push((outcome.rx, arrival));

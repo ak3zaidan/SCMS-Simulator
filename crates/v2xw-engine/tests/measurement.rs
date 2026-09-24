@@ -116,6 +116,43 @@ fn a_real_run_satisfies_every_measurement_invariant() {
     assert!(delivered > 0, "no message reached an application");
 }
 
+/// A message reaches a receiver's applications when its signature check finishes — not
+/// when the check starts, and not at the receiver's next periodic step. Every delivered
+/// attempt is resolved (`t`, the instant the node handed it over) at its own
+/// `t_delivered`, the instant its check finished, to within a microsecond of clock
+/// arithmetic; before 2026-09-24 it was handed over when the check started, up to one
+/// verification service time before `t_delivered`.
+#[test]
+fn a_message_is_handed_to_the_applications_when_its_verification_finishes() {
+    let (_, recorder, _) = run();
+    let mut ledger = EventLedger::new();
+    for (_, r) in recorder.records() {
+        ledger.ingest(r);
+    }
+    let mut checked = 0;
+    let mut early = 0;
+    let mut late = 0;
+    for v in &ledger.node_rx {
+        if v.outcome != RxFate::Delivered {
+            continue;
+        }
+        let d = v.t_delivered.expect("a delivery carries its instant");
+        checked += 1;
+        if v.t + 1_000 < d {
+            early += 1;
+        }
+        if v.t > d + 1_000 {
+            late += 1;
+        }
+    }
+    assert!(checked > 100, "only {checked} deliveries to check");
+    assert_eq!(early, 0, "{early} of {checked} handed over before their check finished");
+    assert_eq!(
+        late, 0,
+        "{late} of {checked} handed over after their check had finished (waiting for a step)"
+    );
+}
+
 #[test]
 fn the_decomposed_latency_is_the_right_size_for_802_11p() {
     let (_, recorder, _) = run();
