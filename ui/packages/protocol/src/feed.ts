@@ -109,6 +109,30 @@ export interface FeedDecoded {
   error?: string;
 }
 
+/**
+ * How the access layer sent a frame: `node.tx`'s radio view. The MCS is named in the
+ * technology's own table; the sidelink fields are absent on 802.11p.
+ */
+export interface FeedAccess {
+  /** `dsrc-80211p`, `lte-v2x-mode4` or `nr-v2x-mode2`. */
+  rat: string;
+  /** The MCS by name (`6mbps-qpsk-1/2`, `lte-mcs7-j3161`, `nr-mcs9`). */
+  mcs: string;
+  qm?: number;
+  code_rate?: number;
+  slot?: number;
+  subch?: number;
+  subch_len?: number;
+  subchannels?: number;
+  /** 1 for the initial transmission, 2 and 3 for blind retransmissions. */
+  attempt?: number;
+  attempts?: number;
+  priority?: number;
+  cbr?: number;
+  cr?: number;
+  cr_limit?: number;
+}
+
 /** One frame the node put on the air. */
 export interface FeedSent {
   msg: number;
@@ -122,7 +146,13 @@ export interface FeedSent {
     network: number | null;
     link: number | null;
   };
-  radio: { power_dbm: number | null; channel: number | null; airtime_us: number | null };
+  radio: {
+    power_dbm: number | null;
+    channel: number | null;
+    airtime_us: number | null;
+    /** The access layer's view; absent from an engine older than VWP 1.1's feed. */
+    access?: FeedAccess | null;
+  };
   signer: "certificate" | "digest" | "self" | null;
   pseudonym: string | null;
   timing: {

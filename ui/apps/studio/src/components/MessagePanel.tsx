@@ -17,7 +17,7 @@
 
 import { Fragment, useMemo } from "react";
 
-import type { FeedDecoded, FeedQueue, FeedReceived, FeedSent } from "@vwp/protocol";
+import type { FeedAccess, FeedDecoded, FeedQueue, FeedReceived, FeedSent } from "@vwp/protocol";
 
 import { useStudio } from "../state/store.js";
 import { NA, shortDigest, simClock } from "../lib/format.js";
@@ -28,6 +28,19 @@ const DRAWN = 60;
 
 const fmt = (v: number | null | undefined, digits: number, unit = ""): string =>
   typeof v === "number" && Number.isFinite(v) ? `${v.toFixed(digits)}${unit}` : NA;
+
+/** The access layer's view of one transmission, on one line: the MCS by name and, on a
+ * sidelink, the resource, the HARQ transmission and the congestion state it was granted under. */
+function accessLine(a: FeedAccess): string {
+  const parts = [`${a.rat} ${a.mcs}`];
+  if (a.slot !== undefined) {
+    parts.push(`slot ${a.slot}, sub-channels ${a.subch ?? NA}+${a.subch_len ?? NA}${a.subchannels !== undefined ? ` of ${a.subchannels}` : ""}`);
+  }
+  if (a.attempt !== undefined) parts.push(`transmission ${a.attempt} of ${a.attempts ?? NA}`);
+  if (a.cbr !== undefined) parts.push(`CBR ${a.cbr.toFixed(2)}`);
+  if (a.cr !== undefined) parts.push(`CR ${a.cr.toFixed(3)}${a.cr_limit !== undefined ? ` (limit ${a.cr_limit.toFixed(3)})` : ""}`);
+  return parts.join(" · ");
+}
 
 function num(e: FeedSent | FeedReceived, k: string, digits: number): string {
   const f = fieldOf(e, k);
@@ -270,6 +283,7 @@ function Detail(): React.JSX.Element | null {
             v={`payload ${sent.bytes.payload ?? NA} + envelope ${sent.bytes.envelope ?? NA}${sent.bytes.certificate ? ` (cert ${sent.bytes.certificate})` : ""} + network ${sent.bytes.network ?? NA} + link ${sent.bytes.link ?? NA} = ${sent.bytes.on_wire} B`}
           />
           <KV k="radio" v={`${fmt(sent.radio.power_dbm, 1, " dBm")} · channel ${sent.radio.channel ?? NA} · ${sent.radio.airtime_us ?? NA} µs on air`} />
+          {sent.radio.access ? <KV k="access" v={accessLine(sent.radio.access)} /> : null}
           <KV
             k="timing"
             v={`sign queue ${fmt(sent.timing.sign_queue_ms, 3, " ms")} · signing ${fmt(sent.timing.sign_ms, 3, " ms")} · channel access ${fmt(sent.timing.channel_access_ms, 3, " ms")}`}

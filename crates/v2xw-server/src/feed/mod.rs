@@ -132,6 +132,10 @@ pub struct TxFrame {
     pub pseudonym: Option<[u8; 8]>,
     /// The SPDU octets, when the node encoded one.
     pub spdu: Option<Arc<[u8]>>,
+    /// How the access layer sent it (`node.tx`'s radio view): the technology's own MCS
+    /// and, on a sidelink, the resource, the HARQ transmission and the CBR/CR it was
+    /// granted under.
+    pub access: Option<Box<v2xw_metrics::channels::TxRadioView>>,
 }
 
 /// One reception attempt at a node, compact.
@@ -358,6 +362,7 @@ impl FeedStore {
             t_signed: v.t_signed,
             pseudonym,
             spdu,
+            access: v.radio.clone().map(Box::new),
         };
         let log = self.logs.entry(frame.node).or_default();
         if log.sent.len() >= MAX_PER_NODE {
@@ -458,7 +463,12 @@ impl FeedStore {
                 "network": f.layers[3],
                 "link": f.layers[4],
             },
-            "radio": {"power_dbm": f.power_dbm, "channel": f.channel, "airtime_us": f.airtime_us},
+            "radio": {
+                "power_dbm": f.power_dbm,
+                "channel": f.channel,
+                "airtime_us": f.airtime_us,
+                "access": f.access,
+            },
             "signer": f.signer,
             "pseudonym": f.pseudonym.map(|p| decode::hex(&p)),
             "timing": {
