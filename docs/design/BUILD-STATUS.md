@@ -61,9 +61,9 @@ the page) and the page re-checked.
   - 54 moved the run's digest in the expected direction. Examples: OBU 10 dBm, mean RSSI
     −107.5 → −114.5 dBm; buildings off, 1,902 → 27,504 receptions; `time_dilation`, 424
     suppressed frames.
-  - 25 were refused, each with the engine's reason. Four refusals are phrased
-    "internal error": a missing map or DEM file, an RSU `site` on an imported city, and a
-    wrong `net.backend_net` id.
+  - 25 were refused, each with the engine's reason. Five causes come back phrased
+    "internal error": a missing map file, a missing DEM file, an RSU `site` on an
+    imported city, a wrong `net.backend_net` id, and an unknown `detection.ma.params` key.
   - 31 left the digest unchanged, each for a stated reason: descriptive fields; the
     default value; nothing in a 40 s run reached the backend; or the three notes above.
   - `keep_holes` and `metres_per_level` changed nothing in a 20 s run and were not
@@ -197,8 +197,9 @@ the page) and the page re-checked.
    - One page load in about 10 fell back to the built-in settings list under heavy CPU.
      It was not reproduced in 3 further loads.
 7. **Wording:**
-   - Four run-time refusals are prefixed "internal error" although the cause is the
-     user's input.
+   - Five run-time refusals are prefixed "internal error" although the cause is the
+     user's input: a missing map or DEM file, an RSU `site` on an imported city, a wrong
+     `net.backend_net` id, an unknown `detection.ma.params` key.
    - `TimelineKind::Closure`'s doc says `lane` or `edge`; the loader wants
      `target: "edge:N" | "street:NAME"`.
 
