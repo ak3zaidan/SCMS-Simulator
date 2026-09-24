@@ -561,7 +561,7 @@ pub enum CrlVerdict {
 /// unauthenticated certificate from buying unbounded work.
 ///
 /// See the module documentation for why the bound lives here.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CrlGate {
     store: v2xw_sec::CrlStore,
     current_period: u32,
@@ -574,6 +574,22 @@ pub struct CrlGate {
     own_revoked: Vec<[u8; 8]>,
     entries: usize,
     expansion_pm: u16,
+}
+
+/// A gate at i-period 0 with the plausibility window every gate has.
+///
+/// Written out rather than derived: a derived `Default` gave `skew: 0`, and every node's
+/// gate is built through `Stores::default()`. With no skew a receiver refused any
+/// certificate from a period other than its own, so across an i-period boundary — the
+/// overlap CAMP's lifetimes exist for, where some stations have moved to the new period
+/// and some have not — honest traffic was rejected as invalid, the signature detector
+/// reported it, and the authority revoked honest vehicles. Found in QA with the credential
+/// lifecycle compressed to 60 s periods on Manhattan: 3,645 of 33,361 verifications
+/// invalid, two honest devices revoked in a run with no attacker.
+impl Default for CrlGate {
+    fn default() -> Self {
+        CrlGate::new(0)
+    }
 }
 
 impl CrlGate {
@@ -1209,6 +1225,31 @@ mod tests {
             LinkageSeed::new([seed; 16]),
             LinkageSeed::new([seed ^ 0xFF; 16]),
         )
+    }
+
+    /// The gate every node gets (`Stores::default()`) accepts a certificate one period
+    /// either side of its own, as `CrlGate::new` does, and refuses two away.
+    #[test]
+    fn the_default_gate_keeps_the_period_overlap() {
+        let lv = device(1).linkage_value_for(5, 0);
+        let mut g = Stores::default().crl;
+        g.set_period(5);
+        for claimed in [4, 5, 6] {
+            assert_eq!(
+                g.check(claimed, lv, true),
+                CrlVerdict::NotRevoked,
+                "period {claimed}"
+            );
+        }
+        for claimed in [3, 7] {
+            assert!(
+                matches!(
+                    g.check(claimed, lv, true),
+                    CrlVerdict::RefusedImplausiblePeriod { .. }
+                ),
+                "period {claimed}"
+            );
+        }
     }
 
     fn gate_with_entries(current: u32, n: u32) -> CrlGate {

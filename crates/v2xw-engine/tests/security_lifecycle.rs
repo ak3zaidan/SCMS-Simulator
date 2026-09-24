@@ -560,3 +560,67 @@ fn a_roadside_unit_verifies_and_checks_what_it_hears() {
     );
     assert!(with_default.phase2.messages_checked > with_mk5.phase2.messages_checked);
 }
+
+/// Honest traffic across an i-period boundary verifies, and every vehicle signs in a
+/// period a receiver accepts — including one that entered after the first boundary.
+///
+/// Found in QA on Manhattan with the lifecycle compressed to 60 s periods: from the first
+/// boundary on, receivers rejected honest BSMs as invalid (3,645 of 33,361
+/// verifications), the signature detector reported them, and the authority revoked two
+/// honest vehicles in a run with no attacker. Every node's revocation gate came from
+/// `Stores::default()`, whose derived `CrlGate::default()` had no period skew, so a
+/// certificate one period away — the overlap CAMP's lifetimes exist for — was refused.
+/// Before the fix this run had 115 invalid verifications around the 40 s and 60 s
+/// boundaries.
+#[test]
+fn a_late_vehicle_signs_in_the_current_period_and_honest_traffic_verifies() {
+    let mut s = grid(70.0, 400.0);
+    let mut params = compressed();
+    params["pool_periods"] = json!(1);
+    params["certs_per_period"] = json!(5);
+    params["cert_lifetime_s"] = json!(23);
+    lifecycle(&mut s, params);
+    cellular(&mut s);
+    s.security.pseudonym_change.period_s = Some(10.0);
+    let (report, rec) = run(s);
+    let period_ns = 20_000_000_000_u64;
+    let mut stale = Vec::new();
+    let mut checked = 0;
+    for r in records(&rec, "node.security") {
+        let (Some(t), Some(i)) = (r["t"].as_u64(), r["cert_i"].as_u64()) else {
+            continue;
+        };
+        checked += 1;
+        let current = t / period_ns;
+        let until = r["cert_valid_until"].as_u64().unwrap_or(u64::MAX);
+        if i + 1 < current || until == u64::MAX {
+            stale.push(format!(
+                "node {} at {:.1} s signs in period {i} (now {current}), valid until {until}",
+                r["node"],
+                t as f64 / 1e9
+            ));
+        }
+    }
+    assert!(checked > 0, "no node.security rows");
+    let invalid = records(&rec, "node.verify")
+        .iter()
+        .filter(|r| r["outcome"] == "invalid")
+        .count();
+    println!(
+        "{checked} security rows, {} stale; {invalid} invalid verifications; {} honest \
+         revocations",
+        stale.len(),
+        report.phase2.revoked_honest
+    );
+    assert!(
+        stale.is_empty(),
+        "{} stale rows, e.g. {:?}",
+        stale.len(),
+        &stale[..stale.len().min(3)]
+    );
+    assert_eq!(invalid, 0, "honest traffic was rejected as invalid");
+    assert_eq!(
+        report.phase2.revoked_honest, 0,
+        "an honest vehicle was revoked"
+    );
+}
