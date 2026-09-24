@@ -139,12 +139,29 @@ describe("§1.3 — the handshake", () => {
 });
 
 describe("§1.4 — resume and §10.2 H10 gap detection", () => {
-  it("puts one-past-the-last-applied seq in ?resume= on the next connection", () => {
-    const { client } = makeClient();
+  it("puts the session token and one-past-the-last-applied seq on the next connection", async () => {
+    const { client, sockets } = makeClient();
+    const connecting = client.connect();
+    sockets[0].open();
+    sockets[0].deliverBinary(hexToArrayBuffer(SPEC_HELLO_HEX));
+    await connecting;
+    expect(client.sessionToken).toBe("s_7f3a9c21"); // §3.1.1 str_session_token
     client.ring.seed(10n);
     client.ring.push(10n, MsgType.Keyframe, new ArrayBuffer(8));
     client.ring.push(11n, MsgType.Delta, new ArrayBuffer(8));
-    expect(new URL(client.endpointUrl()).searchParams.get("resume")).toBe("12");
+    const url = new URL(client.endpointUrl());
+    expect(url.searchParams.get("session")).toBe("s_7f3a9c21");
+    expect(url.searchParams.get("resume")).toBe("12");
+    client.close();
+  });
+
+  it("sends no ?resume= without a session to resume, because a seq alone names nothing", () => {
+    const { client } = makeClient();
+    client.ring.seed(10n);
+    client.ring.push(10n, MsgType.Keyframe, new ArrayBuffer(8));
+    const url = new URL(client.endpointUrl());
+    expect(url.searchParams.get("resume")).toBeNull();
+    expect(url.searchParams.get("session")).toBeNull();
   });
 
   it("detects a seq gap from the stream itself, without the stream.drop notification", async () => {

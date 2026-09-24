@@ -101,6 +101,10 @@ interface Conn {
 }
 
 /** A mock engine: one world, one run, many connections. */
+
+/** The session token every mock `Hello` issues (§3.1.1); a resume must send it back (§1.4). */
+export const MOCK_SESSION_TOKEN = "mock-session";
+
 export class MockEngineServer {
   readonly world: GeneratedWorld;
   readonly run: MockRun;
@@ -172,7 +176,9 @@ export class MockEngineServer {
     const engineVersion = this.#strings.add("vwp-mock-server 0.1.0");
     const scenarioName = this.#strings.add(String((this.#scenario.meta as { name: string }).name));
     const runLabel = this.#strings.add(options.runLabel ?? "mock");
-    const sessionToken = this.#strings.add("");
+    // §1.4 — a resume names its session. The mock keeps one run-wide ring, so every connection
+    // shares one token; the engine mints one per session (crates/v2xw-server/src/resume.rs).
+    const sessionToken = this.#strings.add(MOCK_SESSION_TOKEN);
     const worldUrl = this.#strings.add(`/world/${this.world.contentHashHex}.vwb`);
     const classNames = ACTOR_CLASSES.map((c) => this.#strings.add(c.name));
     const profileObu = this.#strings.add("obu/cohda-mk5");
@@ -363,7 +369,8 @@ export class MockEngineServer {
 
   #onConnection(ws: WebSocket, url: URL): void {
     const profile: Profile = url.searchParams.get("profile") === "node" ? "node" : "full";
-    const resumeParam = url.searchParams.get("resume");
+    // §1.4 — `?resume=` is only meaningful with the session that issued it.
+    const resumeParam = url.searchParams.get("session") === MOCK_SESSION_TOKEN ? url.searchParams.get("resume") : null;
     const id = this.#nextConnId++;
     const conn: Conn = {
       ws, id, profile,

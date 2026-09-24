@@ -88,6 +88,11 @@ impl ResumeRing {
             .collect()
     }
 
+    /// The oldest retained `seq`, if anything is retained.
+    pub fn first_seq(&self) -> Option<u64> {
+        self.entries.front().map(|e| e.seq)
+    }
+
     /// How many frames are retained.
     pub fn len(&self) -> usize {
         self.entries.len()

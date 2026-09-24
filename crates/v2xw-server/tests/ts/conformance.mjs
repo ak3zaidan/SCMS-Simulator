@@ -424,7 +424,13 @@ await check("C7 — the symbol table is stable across connections and append-onl
   const b = client();
   const helloB = await b.connect();
   eq(helloB.strings.length, sizeA, "second Hello carries the same table size");
-  assert(JSON.stringify(helloB.strings) === JSON.stringify(helloA.strings), "same table");
+  // §1.4 (2026-09-23): each session's Hello names its own session token, which is a string in
+  // the table. So the two tables are the same table apart from that one entry, which sits at
+  // the same id in both and differs in both.
+  eq(helloB.strSessionToken, helloA.strSessionToken, "the token has the same id in both tables");
+  assert(helloA.sessionToken !== "" && helloA.sessionToken !== helloB.sessionToken, "each session has its own token");
+  const masked = (h) => h.strings.map((s, i) => (i === h.strSessionToken ? "<token>" : s));
+  assert(JSON.stringify(masked(helloB)) === JSON.stringify(masked(helloA)), "same table apart from the token");
   a.close(); b.close();
 });
 
@@ -732,39 +738,47 @@ await check("H6 — a resume the ring cannot serve falls back to Hello + RESYNC,
 
 await check("H5 — a resume inside the ring sets HELLO_RESUMED and replays from that seq", async () => {
   const wsUrl = base.replace(/^http/, "ws");
-  // Read a little of the stream to learn a seq that is certainly in the ring.
+  // Read a little of the stream, keeping the session token the Hello issued (§3.1.1).
   const first = new WebSocket(`${wsUrl}/vwp/v1?compress=none&v=1`, ["vwp.v1"]);
   first.binaryType = "arraybuffer";
-  const lastSeq = await new Promise((res, rej) => {
-    let n = 0, seq = 0;
+  const { token, lastSeq } = await new Promise((res, rej) => {
+    let n = 0, seq = 0, token = null;
     const timer = setTimeout(() => rej(new Error("no canonical frames")), 15000);
     first.addEventListener("message", (e) => {
       if (typeof e.data === "string") return;
       const v = new DataView(e.data);
-      if (v.getUint16(6, true) === 0x0001) return;
+      if (v.getUint16(6, true) === 0x0001) {
+        token = P.decodeHello(P.viewFrame(e.data)).sessionToken;
+        return;
+      }
       seq = Number(v.getBigUint64(16, true));
-      if (++n >= 6) { clearTimeout(timer); first.close(); res(seq); }
+      // 4000 is not "done" (1000), so the server keeps the session for a resume (§1.4).
+      if (++n >= 6) { clearTimeout(timer); first.close(4000, "dropped"); res({ token, lastSeq: seq }); }
     });
   });
-  const second = new WebSocket(`${wsUrl}/vwp/v1?resume=${lastSeq}&compress=none&v=1`, ["vwp.v1"]);
+  assert(typeof token === "string" && token.length > 0, `Hello issued a session token (${token})`);
+  await new Promise((r) => setTimeout(r, 300));
+  const next = lastSeq + 1;
+  const second = new WebSocket(`${wsUrl}/vwp/v1?session=${token}&resume=${next}&compress=none&v=1`, ["vwp.v1"]);
   second.binaryType = "arraybuffer";
-  const hello = await new Promise((res, rej) => {
-    const timer = setTimeout(() => rej(new Error("no Hello")), 15000);
+  const seen = await new Promise((res, rej) => {
+    const timer = setTimeout(() => rej(new Error("no Hello and replay")), 15000);
+    const out = { hello: null, seqs: [] };
     second.addEventListener("message", (e) => {
       if (typeof e.data === "string") return;
       const v = new DataView(e.data);
-      if (v.getUint16(6, true) !== 0x0001) return;
-      clearTimeout(timer);
-      res({ flags: new DataView(e.data).getUint32(24 + 4, true),
-            resumeSeq: Number(new DataView(e.data).getBigUint64(24 + 136, true)) });
+      if (v.getUint16(6, true) === 0x0001) {
+        out.hello = { flags: v.getUint32(24 + 4, true), resumeSeq: Number(v.getBigUint64(24 + 136, true)) };
+        return;
+      }
+      out.seqs.push(Number(v.getBigUint64(16, true)));
+      if (out.seqs.length >= 20) { clearTimeout(timer); res(out); }
     });
   });
   second.close();
-  // A brand-new connection has an empty ring, so §1.4 rule 2 applies and HELLO_RESUMED is
-  // clear. This documents the consequence of the per-connection ring rather than asserting
-  // a resume that cannot happen: see the note in `session.rs`.
-  eq(hello.flags & 0x0020, 0, "HELLO_RESUMED");
-  eq(hello.resumeSeq, 0, "resume_seq is the next seq the server will emit");
+  eq(seen.hello.flags & 0x0020, 0x0020, "HELLO_RESUMED");
+  eq(seen.hello.resumeSeq, next, "resume_seq is the client's seq");
+  for (let i = 0; i < seen.seqs.length; i++) eq(seen.seqs[i], next + i, `seq ${i} after the resume, with no gap and no duplicate`);
 });
 
 await check("§1.4 rule 3 — an unknown run closes with 4404 after Error + Bye", async () => {

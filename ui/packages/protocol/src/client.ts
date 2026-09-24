@@ -259,6 +259,7 @@ export class VwpClient implements VwpClientApi {
   #decodeOptions: DecodeOptions;
   #trackPoses: boolean;
   #helloTimer: ReturnType<typeof setTimeout> | null = null;
+  #sessionToken: string | null = null;
 
   constructor(options: VwpClientOptions) {
     this.#options = options;
@@ -296,13 +297,26 @@ export class VwpClient implements VwpClientApi {
     return this.#hello !== null && (this.#hello.helloFlags & HelloFlags.NODE_ONLY) !== 0;
   }
 
-  /** The URL this client will open, including the `?resume=` of §1.4 when resuming. */
+  /**
+   * The session this client is resuming on reconnect: the last `Hello`'s `str_session_token`
+   * (§1.4, §3.1.1). `null` before the first `Hello`, or when the server issued an empty one.
+   */
+  get sessionToken(): string | null {
+    return this.#sessionToken;
+  }
+
+  /** The URL this client will open, including the `?session=&resume=` of §1.4 when resuming. */
   endpointUrl(): string {
     const base = this.#options.url.replace(/^http/, "ws").replace(/\/+$/, "");
     const params = new URLSearchParams();
     if (this.#options.run) params.set("run", this.#options.run);
+    // §1.4: a resume names the session it resumes. A `seq` alone names nothing, so it is only
+    // sent with the token the last `Hello` issued.
     const resume = this.ring.nextSeq;
-    if (resume !== null) params.set("resume", resume.toString());
+    if (resume !== null && this.#sessionToken !== null) {
+      params.set("session", this.#sessionToken);
+      params.set("resume", resume.toString());
+    }
     if (this.#options.profile) params.set("profile", this.#options.profile);
     params.set("compress", this.#options.compress ?? (this.#options.decompress ? "zstd" : "none"));
     params.set("v", "1");
@@ -589,6 +603,7 @@ export class VwpClient implements VwpClientApi {
           this.#mergeResumedStrings(msg.strings);
         }
         this.ring.seed(msg.resumeSeq);
+        this.#sessionToken = msg.sessionToken === "" ? null : msg.sessionToken;
         if (this.#trackPoses && msg.actorCapacity > 0) {
           const capacity = Math.min(msg.actorCapacity, 1 << 20);
           this.poses.ensureCapacity(capacity);

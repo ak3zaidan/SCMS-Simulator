@@ -53,7 +53,11 @@ fn fixture(speed: f64) -> Arc<Run> {
 
 /// The pacing parameters a rewind must leave alone, checked on one run.
 fn rewinds_keep_pacing(run: &Run, started_at: f64) {
-    assert_eq!(status(run)["speed"], json!(started_at), "the speed it was started with");
+    assert_eq!(
+        status(run)["speed"],
+        json!(started_at),
+        "the speed it was started with"
+    );
 
     // A rewind that says nothing about speed keeps it — the reported defect.
     call(run, "run.start", json!({"paused": true}));
@@ -75,7 +79,11 @@ fn rewinds_keep_pacing(run: &Run, started_at: f64) {
     call(run, "run.start", json!({"paused": true}));
     let s = status(run);
     assert_eq!(s["speed"], json!(2.0));
-    assert_eq!(s["sync"], json!("client"), "the pacing mode survives a rewind");
+    assert_eq!(
+        s["sync"],
+        json!("client"),
+        "the pacing mode survives a rewind"
+    );
 }
 
 #[test]
@@ -125,7 +133,11 @@ fn a_live_rewind_keeps_the_speed_the_pacing_mode_and_the_seed() {
 
     // A seed chosen by one `run.start` is the run's seed from then on: the next rewind
     // re-runs that run, not the scenario file's seed.
-    call(run.as_ref(), "run.start", json!({"paused": true, "seed": 77}));
+    call(
+        run.as_ref(),
+        "run.start",
+        json!({"paused": true, "seed": 77}),
+    );
     let hash = status(&run)["scenario_hash"].clone();
     call(run.as_ref(), "run.start", json!({"paused": true}));
     assert_eq!(

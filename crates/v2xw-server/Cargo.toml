@@ -44,6 +44,10 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# A real WebSocket client for the resume tests, which cut the TCP connection under it.
+# Both are already in the lockfile, through axum's `ws` feature.
+tokio-tungstenite = "0.29"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 [[bin]]
 name = "v2xw-server"

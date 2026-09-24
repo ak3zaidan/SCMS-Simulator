@@ -2788,12 +2788,14 @@ name = "v2xw-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "parking_lot",
  "serde",
  "serde_json",
  "sha2",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "v2xw-core",
  "v2xw-engine",
