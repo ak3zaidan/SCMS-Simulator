@@ -375,3 +375,45 @@ fn the_manhattan_scenario_builds_a_real_osm_world() {
         "the world came out on a different projection than the one D6 fixes"
     );
 }
+
+/// `--duration-s` is validated as part of the scenario it produces: an override that makes
+/// the file valid runs, and one that makes it invalid is refused by the rule it breaks.
+///
+/// Found in QA: the file was validated before the override was applied, so
+/// `--duration-s 180` on a 40 s scenario whose attacker schedule ran to 180 s was refused
+/// ("not a non-empty interval inside the run [0, 40] s"), and a shortening override was
+/// never checked at all.
+#[test]
+fn a_duration_override_is_validated_with_the_scenario_it_makes() {
+    let dir = out_dir("override-validation");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let text = std::fs::read_to_string(grid_scenario()).expect("grid scenario");
+    // The grid scenario runs 60 s; an event at 80 s is past its horizon.
+    let late = dir.join("late-event.yaml");
+    std::fs::write(
+        &late,
+        format!("{text}\nevents:\n  - {{t: 80.0, type: weather.front, value: rain}}\n"),
+    )
+    .expect("write");
+    assert!(
+        v2xw_engine::Scenario::load(&late).is_err(),
+        "the file on its own must be invalid for this test to mean anything"
+    );
+    let mut longer = options(late.clone(), dir.join("longer"));
+    longer.duration_s = Some(90.0);
+    longer.record = false;
+    longer.verify = false;
+    run(&longer).expect("a 90 s run makes the 80 s event valid");
+
+    let early = dir.join("early-event.yaml");
+    std::fs::write(
+        &early,
+        format!("{text}\nevents:\n  - {{t: 10.0, type: weather.front, value: rain}}\n"),
+    )
+    .expect("write");
+    v2xw_engine::Scenario::load(&early).expect("the file on its own is valid");
+    let mut shorter = options(early, dir.join("shorter"));
+    shorter.duration_s = Some(5.0);
+    let err = run(&shorter).expect_err("a 5 s run leaves the 10 s event past the horizon");
+    assert!(err.to_string().contains("events[0].t"), "{err}");
+}

@@ -75,6 +75,20 @@ impl Scenario {
         Ok(scenario)
     }
 
+    /// Loads a scenario from a file as [`Scenario::load`] does — migrated, with its base
+    /// merged — but does not validate it.
+    ///
+    /// For a caller that changes fields before running (the command line's `--duration-s`
+    /// and `--rate-veh-per-h`): it validates what it will actually run, with
+    /// [`Scenario::validate`], after the change. Validating first refuses a valid override
+    /// and lets an invalid one through.
+    ///
+    /// # Errors
+    /// As [`Scenario::load`], less the validation conflict.
+    pub fn load_unvalidated(path: impl AsRef<Path>) -> Result<Scenario> {
+        Scenario::from_document(load_document(path.as_ref(), 0)?)
+    }
+
     /// Parses a scenario from a string, with `base_dir` for resolving `meta.base`.
     ///
     /// YAML and JSON are both accepted: JSON is a subset of YAML 1.2 and `serde_yml`

@@ -161,8 +161,15 @@ pub fn run(opts: &RunOptions) -> Result<RunOutcome> {
     let total = Stopwatch::start();
 
     let load = Stopwatch::start();
-    let mut scenario = Scenario::load(&opts.scenario)?;
+    // Validated after the overrides, because the scenario checked has to be the one that
+    // runs: validating the file first refused `--duration-s 180` on a 40 s file whose
+    // attacker schedule runs to 180 s, and let `--duration-s 5` through on a file whose
+    // timeline has an event at 10 s — an event that would then never fire.
+    let mut scenario = Scenario::load_unvalidated(&opts.scenario)?;
     apply_overrides(&mut scenario, opts);
+    scenario
+        .validate()
+        .map_err(v2xw_engine::EngineError::Scenario)?;
     let load_s = load.elapsed_s();
 
     let name = scenario.meta.name.clone();
