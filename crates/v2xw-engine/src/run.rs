@@ -3655,6 +3655,9 @@ impl Engine {
             if at > horizon {
                 return;
             }
+            if let Some(p) = self.phase2.as_mut() {
+                p.note_rsu_report();
+            }
             let sdu = v2xw_core::ids::SduId::new(self.next_sdu);
             self.next_sdu += 1;
             self.transfers.insert(

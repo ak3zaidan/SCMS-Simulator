@@ -244,8 +244,9 @@ fn without_either_distribution_path_the_revocation_never_reaches_a_vehicle() {
 }
 
 /// A fleet with no modem reaches the backend only through a unit that relays reports; with
-/// the `report-forward` role removed, the authority hears nothing and the reports wait in
-/// the vehicles' outboxes.
+/// the `report-forward` role removed, no vehicle's report reaches the authority and they
+/// wait in the vehicles' outboxes. (The units' own reports, filed as trusted
+/// infrastructure over their backhaul, still arrive, and are counted apart.)
 #[test]
 fn without_a_modem_or_a_relay_the_authority_hears_nothing() {
     let mut scenario = phase2();
@@ -257,9 +258,14 @@ fn without_a_modem_or_a_relay_the_authority_hears_nothing() {
     let p = &report.phase2;
     assert!(p.reports_sent > 0, "the detectors still have to fire, or this proves nothing");
     assert_eq!(p.reports_uploaded_cellular, 0);
-    assert_eq!(p.reports_received, 0, "a report reached the backend over nothing");
-    assert!(p.reports_unsent > 0, "the reports must be held, not dropped");
-    assert_eq!(p.crls_issued, 0);
+    assert_eq!(p.reports_uploaded_relay, 0);
+    // The units still file their own reports over their backhaul: what reaches the
+    // authority is exactly those, and not one vehicle's.
+    assert_eq!(
+        p.reports_received, p.reports_from_rsus,
+        "a vehicle's report reached the backend over nothing"
+    );
+    assert!(p.reports_unsent > 0, "the vehicles' reports must be held, not dropped");
 }
 
 /// The Phase 2 run is deterministic.

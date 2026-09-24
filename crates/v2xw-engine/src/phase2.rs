@@ -425,6 +425,8 @@ pub struct Phase2Report {
     pub reports_uploaded_cellular: u64,
     /// Of those, put on the air to a relaying roadside unit.
     pub reports_uploaded_relay: u64,
+    /// Reports roadside units filed themselves, straight onto their backhaul.
+    pub reports_from_rsus: u64,
     /// Reports still in an outbox at the end of the run, for want of connectivity.
     pub reports_unsent: u64,
     /// Reports the access link lost.
@@ -1352,6 +1354,11 @@ impl Phase2 {
         if let Some(n) = self.nodes.get_mut(&node) {
             n.reports_uploaded += 1;
         }
+    }
+
+    /// Counts a report a roadside unit put on its backhaul.
+    pub fn note_rsu_report(&mut self) {
+        self.report.reports_from_rsus += 1;
     }
 
     /// Counts a report the access link lost.
