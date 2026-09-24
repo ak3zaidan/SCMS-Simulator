@@ -1025,7 +1025,7 @@ pub fn build_metrics(
     // (wall-clock per simulated second, memory high-water mark) are not among them: the
     // engine reads no clock (02-architecture.md §6.1), so it has nothing to hand them, and
     // installing them would put a column of refusals in every run.
-    let candidates: Vec<Box<dyn v2xw_metrics::MetricProvider + Send>> = vec![
+    let mut candidates: Vec<Box<dyn v2xw_metrics::MetricProvider + Send>> = vec![
         Box::new(v2xw_metrics::comms::CommsProvider::new(0)),
         Box::new(v2xw_metrics::latency::LatencyProvider::new()),
         Box::new(v2xw_metrics::awareness::AwarenessProvider::new(0)),
@@ -1034,8 +1034,17 @@ pub fn build_metrics(
         Box::new(v2xw_metrics::security::SecurityProvider::new(0)),
         Box::new(v2xw_metrics::detection::DetectionProvider::new()),
         Box::new(v2xw_metrics::safety::SafetyProvider::new(0)),
-        Box::new(crate::privacy_metrics::PrivacyProvider::new()),
     ];
+    // The pseudonym, pool, linkability and backend-link metrics read records only the
+    // security path writes, so a run without it would publish a column of empty samples.
+    let security_path = scenario.actors.backend.protocol.is_some()
+        || scenario.security.protocol.is_some()
+        || !scenario.actors.rsus.is_empty()
+        || !scenario.threats.attackers.is_empty()
+        || !scenario.detection.local.is_empty();
+    if security_path {
+        candidates.push(Box::new(crate::privacy_metrics::PrivacyProvider::new()));
+    }
     for provider in candidates {
         let wanted = all
             || provider
