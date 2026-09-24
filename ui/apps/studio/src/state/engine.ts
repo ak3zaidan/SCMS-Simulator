@@ -26,6 +26,7 @@ import {
   type ErrorMessage,
   type EventMessage,
   type HelloMessage,
+  type KeyframeMessage,
   type MetricSampleMessage,
   type NodeTelemetry,
   type ProvenanceMessage,
@@ -35,6 +36,8 @@ import {
   type WorldChunkMessage,
   type ParamsOf,
   type ResultOf,
+  parseNodeFeed,
+  type FeedOptions,
 } from "@vwp/protocol";
 import { CAMERA_MODES, Viewer, type CameraMode, type OverlayEntry } from "@vwp/viewer";
 import type { OverlayName } from "@vwp/protocol";
@@ -128,8 +131,25 @@ const SPARK_KEYS = SPARKLINE_SERIES.map((s) => s.key);
 /** How often the DOM-side projection of the hot state is refreshed (09-ui §4). */
 const STORE_HZ = 5;
 
-/** How often the followed node's inspector (and its message log) is refreshed, ms. */
-const INSPECT_POLL_MS = 1000;
+/**
+ * How often the followed node's neighbour table is refreshed, ms.
+ *
+ * Its messages and queues no longer ride this poll: the engine pushes them as `node.feed` while the
+ * node is followed (vwp-v1 §6.7), a few times a second, with nothing lost between pushes.
+ */
+const INSPECT_POLL_MS = 2000;
+
+/**
+ * What the message panel asks the engine to push (`view.follow {feed}`).
+ *
+ * Four pushes a second keeps a 10 Hz BSM stream readable row by row; 25 sent and 50 received per push
+ * are more than a vehicle sends or hears in a quarter second on a dense street, so `omitted` stays at
+ * zero outside a jam, and when it does not the panel says how many were left out.
+ */
+const FEED_OPTIONS: FeedOptions = { sent: 25, received: 50, waiting: 8, bytes: true, hz: 4 };
+
+/** Node ids the stream marks "no node" with (§3.4.5). */
+const NO_NODE = 0xffffffff;
 
 /**
  * The methods that act on a connection's own view and are refused over `POST /rpc` (§6.2, −32009).
@@ -193,6 +213,13 @@ export class StudioEngine {
   #storeTimer: ReturnType<typeof setInterval> | null = null;
   #statusTimer: ReturnType<typeof setInterval> | null = null;
   #followedNode: number | null = null;
+  /**
+   * slot → actor, kept from keyframes and spawns so a despawn row (which names only its slot, and
+   * whose slot the client has already released) can be traced to its radio (§3.4.6).
+   */
+  #slotActor = new Map<number, number>();
+  /** A `node.feed` push this client could not read was reported once, not per push. */
+  #feedRefusalLogged = false;
   #worldChunks: Uint8Array[] = [];
   #worldChunkBytes = 0;
   /** §3.1.1 — the §4.2 payload digest this run promised, lower-case hex; what §10.5 W3 checks. */
@@ -274,6 +301,19 @@ export class StudioEngine {
       this.#log("info", "vwp", `reconnected; the engine resumed the stream at seq ${hello.resumeSeq}, with nothing missed`);
       useStudio.getState().setConnection("streaming");
       void this.refreshStatus();
+      // The resumed session kept the follow and its feed subscription (the session outlives the
+      // socket), so this is belt and braces: asking again is idempotent, and it restores the
+      // followed node's telemetry and message feed if the engine kept the stream but not them.
+      const node = this.#followedNode;
+      if (node !== null && this.client) {
+        try {
+          const res = await this.client.request("view.follow", { node, telemetry: true, feed: FEED_OPTIONS });
+          this.#noteFeedAnswer(res.feed);
+          await this.setFollowChannels(true);
+        } catch (err) {
+          this.#log("warn", "follow", `could not resubscribe node ${node} after the reconnect: ${errText(err)}`);
+        }
+      }
       return;
     }
     this.#log(
@@ -368,9 +408,10 @@ export class StudioEngine {
       if (greeted) void this.#afterFreshHello(hello);
       greeted = true;
     });
-    client.onKeyframe(() => {
+    client.onKeyframe((kf) => {
       this.#frameCounts.keyframe++;
       this.#lastSimTimeNs = Number(client.poses.simTimeNs);
+      this.handleKeyframe(kf);
       this.#dirty = true;
     });
     client.onDelta((delta) => this.#onDelta(delta));
@@ -402,6 +443,7 @@ export class StudioEngine {
       if (typeof p.job_id === "string" && p.job_id.startsWith("run.seek:")) useStudio.getState().setSeekProgress(null);
     });
     client.onRpcNotification("log", (p) => this.#log(p.level === "error" ? "error" : p.level === "warn" ? "warn" : "info", p.target ?? "engine", p.message));
+    client.onRpcNotification("node.feed", (p) => this.handleFeed(p));
     client.onRpcNotification("view.changed", (p) => {
       if (typeof p.mode === "string" && (CAMERA_MODES as readonly string[]).includes(p.mode)) {
         useStudio.getState().setCameraMode(p.mode as CameraMode);
@@ -604,6 +646,7 @@ export class StudioEngine {
     this.provenance.clear();
     this.dims.clear();
     this.nodes.clear();
+    this.#slotActor.clear();
     this.nodeByActor.clear();
     this.#metricProv.clear();
     this.#metricDims.clear();
@@ -834,11 +877,18 @@ export class StudioEngine {
     store.setSelection(actorId, nodeId);
     if (!this.client) return;
     try {
-      const res = await this.request("view.follow", { actor: actorId, ...(nodeId !== null ? { node: nodeId } : {}), camera: mode, telemetry: true });
+      const res = await this.request("view.follow", {
+        actor: actorId,
+        ...(nodeId !== null ? { node: nodeId } : {}),
+        camera: mode,
+        telemetry: true,
+        feed: FEED_OPTIONS,
+      });
       if (typeof res.following === "number") {
         this.#followedNode = res.following;
         useStudio.getState().setSelection(actorId, res.following);
       }
+      this.#noteFeedAnswer(res.feed);
     } catch {
       /* logged by request() */
     }
@@ -883,10 +933,28 @@ export class StudioEngine {
     useStudio.getState().setCameraMode("rsu");
     useStudio.getState().setSelection(null, nodeId);
     if (!this.client) return;
-    await this.request("view.follow", { node: nodeId, telemetry: true }).catch(() => undefined);
+    const res = await this.request("view.follow", { node: nodeId, telemetry: true, feed: FEED_OPTIONS }).catch(() => undefined);
+    this.#noteFeedAnswer(res?.feed);
     await this.setFollowChannels(true);
     void this.inspectFollowed();
     this.#startInspectPoll();
+  }
+
+  /** Shows the engine's reason when it has no message feed (a fixture or a recording). */
+  #noteFeedAnswer(feed: { available?: boolean; reason?: string } | undefined): void {
+    const store = useStudio.getState();
+    if (feed === undefined) {
+      store.setFeedUnavailable("this engine did not answer the message-feed request; it predates VWP v1.1");
+    } else if (feed.available === false) {
+      store.setFeedUnavailable(feed.reason ?? "this engine has no message feed");
+    }
+    // Following a vehicle in the chase or dashboard view opens its messages, unless the user is
+    // reading the provenance or the log.
+    const tab = store.inspectorTab;
+    const mode = store.cameraMode;
+    if ((mode === "chase" || mode === "dashboard") && (tab === "state" || tab === "messages")) {
+      store.setInspectorTab("messages");
+    }
   }
 
   /**
@@ -905,13 +973,13 @@ export class StudioEngine {
     try {
       if (quiet) {
         if (!this.streaming) return;
-        const res = await this.client.request("inspect.node", { node, include: ["messages"], limit: 50 });
-        if (this.#followedNode === node) useStudio.getState().setInspectMessages(res.messages ?? null);
+        const res = await this.client.request("inspect.node", { node, include: ["neighbors"], limit: 50 });
+        if (this.#followedNode === node) useStudio.getState().setNeighbors(res.neighbors ?? null);
         return;
       }
       const res = await this.request("inspect.node", {
         node,
-        include: ["telemetry", "stores", "queues", "neighbors", "certs", "crl", "provenance", "messages"],
+        include: ["telemetry", "stores", "neighbors", "certs", "crl", "provenance"],
         limit: 50,
       });
       if (this.#followedNode !== node) return;
@@ -1150,6 +1218,7 @@ export class StudioEngine {
     const previousLabels = new Map<number, string>();
     if (resumed) for (const [id, info] of this.nodes) previousLabels.set(id, info.label);
     this.nodes.clear();
+    this.#slotActor.clear();
     this.nodeByActor.clear();
     if (!resumed) {
       // `setHello` empties the timeline, so anything still queued belongs to the previous run.
@@ -1346,7 +1415,101 @@ export class StudioEngine {
   #onDelta(delta: DeltaMessage): void {
     this.#frameCounts.delta++;
     this.#lastSimTimeNs = Number(delta.simTimeNs);
+    this.handleDelta(delta);
     this.#dirty = true;
+  }
+
+  /**
+   * §3.3 — a keyframe says which actors exist. The radios of actors that are not among them have
+   * left the run; their rows leave the node table, except the followed one's, which the inspector
+   * still names.
+   *
+   * Public, like {@link handleEvent}, so `test/radios.test.ts` can deliver frames without a socket.
+   */
+  handleKeyframe(kf: Pick<KeyframeMessage, "actors">): void {
+    this.#dirty = true;
+    this.#slotActor.clear();
+    const present = new Set<number>();
+    const ids = kf.actors.actorId;
+    for (let slot = 0; slot < kf.actors.count; slot++) {
+      if (ids[slot] === NO_NODE) continue;
+      this.#slotActor.set(slot, ids[slot]);
+      present.add(ids[slot]);
+    }
+    for (const [nodeId, info] of this.nodes) {
+      if (info.actorId !== null && !present.has(info.actorId) && nodeId !== this.#followedNode) this.#dropNode(nodeId);
+    }
+  }
+
+  /**
+   * §3.4.5–§3.4.6 — a delta's spawns and despawns keep the node table current.
+   *
+   * `Hello`'s node table is the set known when the connection opened (§3.1.3), and in a run whose
+   * vehicles arrive later that set is empty or short: every radio that spawned after t = 0 was
+   * missing from it, so the inspector printed "actor id n/a" for it and counted radios from a polled
+   * figure instead. A spawn row names its node, so the table grows here; a despawn row names its
+   * slot, which {@link handleKeyframe} and the spawns traced to an actor.
+   */
+  handleDelta(delta: Pick<DeltaMessage, "spawns" | "despawns">): void {
+    this.#dirty = true;
+    const sp = delta.spawns;
+    for (let i = 0; i < sp.count; i++) {
+      const actorId = sp.actorId[i];
+      this.#slotActor.set(sp.slot[i], actorId);
+      const nodeId = sp.nodeId[i];
+      if (nodeId === NO_NODE) continue;
+      const known = this.nodes.get(nodeId);
+      this.nodes.set(nodeId, {
+        nodeId,
+        actorId,
+        label: known?.label || `node ${nodeId}`,
+        profileId: known?.profileId ?? "",
+        kind: known?.kind ?? 0,
+        flags: known?.flags ?? 0,
+        classIdx: sp.classIdx[i] === 0xff ? null : sp.classIdx[i],
+        x: known?.x ?? 0,
+        y: known?.y ?? 0,
+        z: known?.z ?? 0,
+      });
+      this.nodeByActor.set(actorId, nodeId);
+    }
+    const dp = delta.despawns;
+    for (let i = 0; i < dp.count; i++) {
+      const actorId = this.#slotActor.get(dp.slot[i]);
+      this.#slotActor.delete(dp.slot[i]);
+      if (actorId === undefined) continue;
+      const nodeId = this.nodeByActor.get(actorId);
+      if (nodeId !== undefined && nodeId !== this.#followedNode) this.#dropNode(nodeId);
+    }
+  }
+
+  #dropNode(nodeId: number): void {
+    const info = this.nodes.get(nodeId);
+    this.nodes.delete(nodeId);
+    if (info?.actorId !== null && info?.actorId !== undefined && this.nodeByActor.get(info.actorId) === nodeId) {
+      this.nodeByActor.delete(info.actorId);
+    }
+    this.telemetry.delete(nodeId);
+  }
+
+  /**
+   * §6.14 `node.feed` — the followed node's messages and queues.
+   *
+   * Checked before it is kept ({@link parseNodeFeed}); a push for a node that is no longer followed
+   * is dropped, which is what stops a push in flight when the user clicked another car from painting
+   * the old car's messages under the new car's name.
+   */
+  handleFeed(raw: unknown): void {
+    const parsed = parseNodeFeed(raw);
+    if (!parsed.ok) {
+      if (!this.#feedRefusalLogged) {
+        this.#feedRefusalLogged = true;
+        this.#log("warn", "feed", `a message-feed push was refused: ${parsed.reason}`);
+      }
+      return;
+    }
+    if (parsed.feed.node !== this.#followedNode) return;
+    useStudio.getState().applyFeed(parsed.feed);
   }
 
   #onTelemetry(msg: TelemetryMessage): void {
@@ -1647,6 +1810,22 @@ export class StudioEngine {
     const rec = followed === null ? null : this.telemetry.get(followed) ?? null;
     store.setTelemetry(rec, followed, this.#lastSimTimeNs);
     store.setFrameCounts({ ...this.#frameCounts });
+    store.setRadios(this.nodes.size);
+    // The followed vehicle's pose, for the HUD line that sits beside what its BSMs say.
+    const actor = store.selectedActor;
+    const slot = actor === null ? undefined : this.client?.slots.slotOf(actor);
+    if (actor !== null && slot !== undefined && this.client) {
+      const p = this.client.poses.positionOf(slot);
+      store.setFollowedPose({
+        tNs: this.#lastSimTimeNs,
+        x: p.x,
+        y: p.y,
+        speed: this.client.poses.speedOf(slot),
+        headingRad: this.client.poses.headingOf(slot),
+      });
+    } else if (store.followedPose !== null) {
+      store.setFollowedPose(null);
+    }
     if (this.#pendingMarks.length > 0) {
       store.addTimelineMarks(this.#pendingMarks);
       this.#pendingMarks = [];

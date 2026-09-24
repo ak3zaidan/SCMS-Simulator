@@ -4192,6 +4192,11 @@ impl Engine {
         .with_layers(&state.layers, state.cert_bytes)
         .with_content(Some(hex_digest(&state.signer.0[..])), state.content.clone())
         .with_radio(mcs_index, Some(radio));
+        // The frame's own octets, for a viewer that decodes them (`RunRecorder::tap_frame`).
+        // Not a record: nothing recorded, counted or digested changes.
+        if let Some(spdu) = state.spdu.as_deref() {
+            recorder.tap_frame(self.scheduler.now(), state.tx, frame_index, spdu);
+        }
         self.emit(recorder, &tx_record);
     }
 
@@ -5789,6 +5794,10 @@ impl RunRecorder for Tee<'_> {
     /// the in-crate wrapper, and it is the one an out-of-crate wrapper is modelled on.
     fn write_wire_frame(&mut self, frame: &v2xw_record::wire::Frame) {
         self.inner.write_wire_frame(frame);
+    }
+
+    fn tap_frame(&mut self, at: SimTime, node: NodeId, msg: u64, spdu: &[u8]) {
+        self.inner.tap_frame(at, node, msg, spdu);
     }
 
     fn refused(&self) -> u64 {

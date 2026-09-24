@@ -2801,7 +2801,9 @@ dependencies = [
  "v2xw-engine",
  "v2xw-metrics",
  "v2xw-mobility",
+ "v2xw-msg",
  "v2xw-record",
+ "v2xw-sec",
  "v2xw-world",
 ]
 

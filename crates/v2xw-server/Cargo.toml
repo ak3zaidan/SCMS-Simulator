@@ -26,6 +26,11 @@ v2xw-engine = { path = "../v2xw-engine", version = "0.1.0" }
 # The single VWP frame encoder and decoder (vwp-v1 §2, §3) and the replay reader (§7).
 # There is deliberately no second encoder in this crate: two encoders drift.
 v2xw-record = { workspace = true }
+# The chase view's message inspector decodes each frame's octets with the real decoders:
+# the IEEE 1609.2 envelope parser a receiving node verifies with, and the J2735 and ETSI
+# message codecs (`src/feed/decode.rs`).
+v2xw-sec = { workspace = true }
+v2xw-msg = { workspace = true }
 # HTTP and the WebSocket upgrade. `ws` is not an axum default feature.
 axum = { workspace = true, features = ["ws"] }
 tokio = { workspace = true }

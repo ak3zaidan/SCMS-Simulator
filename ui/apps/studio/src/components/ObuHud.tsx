@@ -19,6 +19,8 @@ import { useStudio } from "../state/store.js";
 import { NA, durationNs, int, shortDigest, simClock } from "../lib/format.js";
 import { MISSING_FROM_WIRE, SPARKLINE_SERIES, hudGroups, totalDrops, type HudField } from "../lib/telemetry.js";
 import { getPointer } from "../lib/schema.js";
+import { bearingDeg } from "../lib/feed.js";
+import { toGeodetic } from "../lib/geo.js";
 
 function fieldIndex(fields: HudField[]): Map<string, HudField> {
   const m = new Map<string, HudField>();
@@ -79,6 +81,7 @@ export function ObuHud({ docked = false }: { docked?: boolean }): React.JSX.Elem
   const selectedActor = useStudio((s) => s.selectedActor);
   const seriesTick = useStudio((s) => s.seriesTick);
   const hello = useStudio((s) => s.hello);
+  const pose = useStudio((s) => s.followedPose);
 
   const groups = useMemo(() => (telemetry ? hudGroups(telemetry) : []), [telemetry]);
   const byKey = useMemo(() => fieldIndex(groups.flatMap((g) => [...g.fields])), [groups]);
@@ -142,6 +145,7 @@ export function ObuHud({ docked = false }: { docked?: boolean }): React.JSX.Elem
       </div>
 
       <div className="hud-body">
+        {pose && hello ? <PoseRow pose={pose} origin={hello.origin} /> : null}
         <div className="hud-row">
           <Value field={byKey.get("msgs_in_per_s")} label="rx" node={telemetryNode} />
           <Value field={byKey.get("msgs_out_per_s")} label="tx" node={telemetryNode} />
@@ -229,6 +233,47 @@ export function ObuHud({ docked = false }: { docked?: boolean }): React.JSX.Elem
           />
         ))}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Where the followed vehicle is, as the stream draws it: latitude and longitude by the engine's own
+ * projection (`lib/geo.ts`), speed, and heading in the BSM's convention (degrees clockwise from north)
+ * — so it can be read against the position its broadcasts claim in the message panel, which is its
+ * GNSS belief and differs by the receiver's error.
+ */
+function PoseRow({
+  pose,
+  origin,
+}: {
+  pose: { x: number; y: number; speed: number; headingRad: number };
+  origin: { lat: number; lon: number };
+}): React.JSX.Element {
+  const g = toGeodetic(origin, pose.x, pose.y);
+  return (
+    <div className="hud-row" data-testid="hud-pose" title="the vehicle's pose in the stream (its true position, drawn at the body centre)">
+      <span className="hud-pose-field">
+        <span className="k">position</span>
+        <span className="v" data-testid="hud-pose-lat" data-value={g.lat}>
+          {g.lat.toFixed(6)}°
+        </span>
+        <span className="v" data-testid="hud-pose-lon" data-value={g.lon}>
+          {g.lon.toFixed(6)}°
+        </span>
+      </span>
+      <span className="hud-pose-field">
+        <span className="k">speed</span>
+        <span className="v" data-testid="hud-pose-speed" data-value={pose.speed}>
+          {pose.speed.toFixed(1)} m/s
+        </span>
+      </span>
+      <span className="hud-pose-field">
+        <span className="k">heading</span>
+        <span className="v" data-testid="hud-pose-heading" data-value={bearingDeg(pose.headingRad)}>
+          {bearingDeg(pose.headingRad).toFixed(0)}°
+        </span>
+      </span>
     </div>
   );
 }

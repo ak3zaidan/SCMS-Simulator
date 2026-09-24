@@ -627,4 +627,23 @@ pub trait Engine: Send + std::fmt::Debug {
     fn diagnostics(&self) -> Value {
         Value::Object(serde_json::Map::new())
     }
+
+    /// The followed node's message feed at the stream position: the frames it sent and
+    /// the receptions it resolved since `after` (everything kept when `None`, or when
+    /// `after` is later than the stream, which a backward seek makes it), and its queues —
+    /// the `node.feed` notification's parameters (vwp-v1 §6.7, §6.14; `crate::feed`).
+    ///
+    /// `gt` keeps the ground-truth members (the true sender, the distance); a `node`-profile
+    /// connection passes `false`. `None` (the default) means this engine has no feed: the
+    /// fixture synthesises no frames and a replay carries no octets.
+    fn node_feed(
+        &self,
+        node: u32,
+        after: Option<SimTime>,
+        limits: &crate::feed::FeedLimits,
+        gt: bool,
+    ) -> Option<Value> {
+        let _ = (node, after, limits, gt);
+        None
+    }
 }

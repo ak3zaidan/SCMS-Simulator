@@ -1,0 +1,667 @@
+{
+  "history_ns": 20000000000,
+  "node": 0,
+  "omitted": {
+    "received": 0,
+    "sent": 39
+  },
+  "queues": {
+    "drop_window_ms": 10000,
+    "kernel_lead_ms": 100.0,
+    "list": [
+      {
+        "depth": 0,
+        "drops": {},
+        "id": "rx",
+        "in_service": 0,
+        "label": "Receive",
+        "peak": 0,
+        "reported_depth": {
+          "p50": 0,
+          "p95": 0
+        },
+        "served": 10,
+        "wait_p50_ms": 0.0,
+        "wait_p95_ms": 0.0,
+        "waiting": [],
+        "waiting_omitted": 0,
+        "what": "from arrival to the end of the parse"
+      },
+      {
+        "depth": 0,
+        "drops": {},
+        "id": "verify",
+        "in_service": 0,
+        "label": "Verification",
+        "peak": 0,
+        "reported_depth": {
+          "p50": 1,
+          "p95": 1
+        },
+        "served": 10,
+        "wait_p50_ms": 0.0,
+        "wait_p95_ms": 0.0,
+        "waiting": [],
+        "waiting_omitted": 0,
+        "what": "from the parse to the start of the signature check; in service = being checked"
+      },
+      {
+        "depth": 0,
+        "drops": {},
+        "id": "app",
+        "in_service": 0,
+        "label": "Application",
+        "peak": 0,
+        "reported_depth": {
+          "p50": 0,
+          "p95": 0
+        },
+        "served": 10,
+        "wait_p50_ms": 0.0,
+        "wait_p95_ms": 0.0,
+        "waiting": [],
+        "waiting_omitted": 0,
+        "what": "from the verdict to delivery to the applications"
+      },
+      {
+        "depth": 0,
+        "drops": {},
+        "drops_note": "a frame the transmit queue refuses is on no channel, so transmit drops are not observable here",
+        "id": "tx",
+        "in_service": 0,
+        "label": "Transmit",
+        "peak": 1,
+        "reported_depth": {
+          "p50": 1,
+          "p95": 1
+        },
+        "served": 10,
+        "wait_p50_ms": 14.946,
+        "wait_p95_ms": 18.305,
+        "waiting": [
+          {
+            "enqueued_ns": 3903462077,
+            "from": null,
+            "left_ns": 3921767077,
+            "msg": 177,
+            "stage": "on the air",
+            "type": "bsm",
+            "waited_ms": 18.305
+          }
+        ],
+        "waiting_omitted": 0,
+        "what": "from generation to the air: the signing queue, the signer and channel access"
+      },
+      {
+        "depth": null,
+        "drops": {},
+        "id": "crl",
+        "in_service": 0,
+        "label": "CRL tasks",
+        "peak": null,
+        "reported_depth": {
+          "p50": 0,
+          "p95": 0
+        },
+        "served": 0,
+        "wait_p50_ms": null,
+        "wait_p95_ms": null,
+        "waiting": [],
+        "waiting_omitted": 0,
+        "what": "no per-task stamps are published for CRL work; the depth is the node's own telemetry window"
+      }
+    ],
+    "source": "reconstructed from the node's own node.tx and node.rx stamps; reported_depth is the node's own telemetry window",
+    "step_ms": 100.0,
+    "t_ns": 4000000000,
+    "window_ms": 1000
+  },
+  "received": [
+    {
+      "bytes_on_wire": 176,
+      "cause": null,
+      "decoded": {
+        "hex": "03810040038028001425034029569243c3dad301edb5a58d30880341412000702c9c20fdfa1fa1007fff80005a0fa04001200002990d37d693cb8000a55a494e8d935980806e627d16059bdfa36d2758b490787df27795aaea3199866fde11231ff2ba2b86e7d5631114c2fdbebf5a2481d982bdf28fd4fab0c94111ac64cb0f0775e712d7",
+        "message": {
+          "fields": [
+            {
+              "k": "msg_cnt",
+              "label": "msgCnt",
+              "raw": 13,
+              "v": 13
+            },
+            {
+              "k": "temp_id",
+              "label": "id (temporary)",
+              "raw": "00a55a49",
+              "v": "00a55a49"
+            },
+            {
+              "k": "sec_mark",
+              "label": "secMark",
+              "raw": 3855,
+              "unit": "ms",
+              "v": 3855.0
+            },
+            {
+              "k": "lat",
+              "label": "latitude",
+              "raw": 72411,
+              "unit": "°",
+              "v": 0.0072411
+            },
+            {
+              "k": "lon",
+              "label": "longitude",
+              "raw": 84066,
+              "unit": "°",
+              "v": 0.0084066
+            },
+            {
+              "k": "elev",
+              "label": "elevation",
+              "raw": 6,
+              "unit": "m",
+              "v": 0.6
+            },
+            {
+              "k": "acc_semi_major",
+              "label": "accuracy · semi-major",
+              "raw": 130,
+              "unit": "m",
+              "v": 6.5
+            },
+            {
+              "k": "acc_semi_minor",
+              "label": "accuracy · semi-minor",
+              "raw": 130,
+              "unit": "m",
+              "v": 6.5
+            },
+            {
+              "k": "acc_orientation",
+              "label": "accuracy · orientation",
+              "raw": 16384,
+              "unit": "°",
+              "v": 90.0
+            },
+            {
+              "k": "transmission",
+              "label": "transmission",
+              "na": true,
+              "raw": 7,
+              "v": null
+            },
+            {
+              "k": "speed",
+              "label": "speed",
+              "raw": 89,
+              "unit": "m/s",
+              "v": 1.78
+            },
+            {
+              "k": "heading",
+              "label": "heading",
+              "raw": 7200,
+              "unit": "° from north",
+              "v": 90.0
+            },
+            {
+              "k": "angle",
+              "label": "steering wheel angle",
+              "na": true,
+              "raw": 127,
+              "unit": "°",
+              "v": null
+            },
+            {
+              "k": "accel_long",
+              "label": "acceleration · longitudinal",
+              "na": true,
+              "raw": 2001,
+              "unit": "m/s²",
+              "v": null
+            },
+            {
+              "k": "accel_lat",
+              "label": "acceleration · lateral",
+              "na": true,
+              "raw": 2001,
+              "unit": "m/s²",
+              "v": null
+            },
+            {
+              "k": "accel_vert",
+              "label": "acceleration · vertical",
+              "na": true,
+              "raw": -127,
+              "unit": "G",
+              "v": null
+            },
+            {
+              "k": "yaw_rate",
+              "label": "yaw rate",
+              "raw": 0,
+              "unit": "°/s",
+              "v": 0.0
+            },
+            {
+              "k": "brakes_wheels",
+              "label": "brakes · wheel brakes applied",
+              "na": true,
+              "raw": 16,
+              "v": null
+            },
+            {
+              "k": "brakes_traction",
+              "label": "brakes · traction control",
+              "na": true,
+              "raw": 0,
+              "v": null
+            },
+            {
+              "k": "brakes_abs",
+              "label": "brakes · ABS",
+              "na": true,
+              "raw": 0,
+              "v": null
+            },
+            {
+              "k": "brakes_scs",
+              "label": "brakes · stability control",
+              "na": true,
+              "raw": 0,
+              "v": null
+            },
+            {
+              "k": "brakes_boost",
+              "label": "brakes · brake boost",
+              "na": true,
+              "raw": 0,
+              "v": null
+            },
+            {
+              "k": "brakes_aux",
+              "label": "brakes · auxiliary brakes",
+              "na": true,
+              "raw": 0,
+              "v": null
+            },
+            {
+              "k": "width",
+              "label": "size · width",
+              "raw": 180,
+              "unit": "m",
+              "v": 1.8
+            },
+            {
+              "k": "length",
+              "label": "size · length",
+              "raw": 500,
+              "unit": "m",
+              "v": 5.0
+            },
+            {
+              "k": "part_ii",
+              "label": "Part II containers",
+              "raw": [],
+              "v": 0
+            }
+          ],
+          "format": "SAE J2735 MessageFrame · BasicSafetyMessage (DSRCmsgID 20)"
+        },
+        "security": {
+          "generation_time_us": 731232003855307,
+          "hash": "sha256",
+          "payload_bytes": 40,
+          "psid": 32,
+          "signature": {
+            "alg": "ECDSA NIST P-256",
+            "r": "6e627d16059bdfa36d2758b490787df27795aaea3199866fde11231ff2ba2b86",
+            "s": "e7d5631114c2fdbebf5a2481d982bdf28fd4fab0c94111ac64cb0f0775e712d7"
+          },
+          "signer": {
+            "hashed_id8": "00a55a494e8d9359",
+            "kind": "digest"
+          },
+          "standard": "IEEE 1609.2-2016 SignedData"
+        },
+        "spans": [
+          {
+            "end": 7,
+            "layer": "envelope",
+            "name": "1609.2 header",
+            "start": 0
+          },
+          {
+            "end": 47,
+            "layer": "payload",
+            "name": "payload",
+            "start": 7
+          },
+          {
+            "end": 59,
+            "layer": "envelope",
+            "name": "headerInfo",
+            "start": 47
+          },
+          {
+            "end": 67,
+            "layer": "envelope",
+            "name": "signer",
+            "start": 59
+          },
+          {
+            "end": 133,
+            "layer": "envelope",
+            "name": "signature",
+            "start": 67
+          }
+        ],
+        "spdu_bytes": 133
+      },
+      "dist_m": 687.6190185546875,
+      "e2e_ms": 19.646293,
+      "from": 4,
+      "msg": 172,
+      "outcome": "delivered",
+      "rssi_dbm": -77.0,
+      "sinr_db": 21.0,
+      "stages_ms": {
+        "airtime": 0.28,
+        "mac_aifs": 0.0,
+        "mac_backoff": 0.0,
+        "mac_defer": 0.0,
+        "propagation": 0.002293,
+        "reception": 0.0,
+        "sign": 18.964,
+        "sign_queue": 0.0,
+        "verify": 0.4,
+        "verify_queue": 0.0
+      },
+      "t_ns": 3903462077,
+      "type": "bsm",
+      "verification": "verified"
+    }
+  ],
+  "reset": true,
+  "sent": [
+    {
+      "bytes": {
+        "certificate": 0,
+        "envelope": 93,
+        "link": 38,
+        "network": 5,
+        "on_wire": 176,
+        "payload": 40
+      },
+      "decoded": {
+        "hex": "038100400380280014250a0116febb83cfdad302f6b5a514e288b5414120007089d460fdfa1fa1007fff80005a0fa04001200002990d37d74fe680045bfaee5072174680800e2bd188fb982d91ca94932030a6dfa102567db4605ca115d03de05dd96b05c0eab20340b2220653258ffdb4436f23d7653331d51d120f2f40af029c69595087",
+        "message": {
+          "fields": [
+            {
+              "k": "msg_cnt",
+              "label": "msgCnt",
+              "raw": 40,
+              "v": 40
+            },
+            {
+              "k": "temp_id",
+              "label": "id (temporary)",
+              "raw": "045bfaee",
+              "v": "045bfaee"
+            },
+            {
+              "k": "sec_mark",
+              "label": "secMark",
+              "raw": 3903,
+              "unit": "ms",
+              "v": 3903.0
+            },
+            {
+              "k": "lat",
+              "label": "latitude",
+              "raw": 72941,
+              "unit": "°",
+              "v": 0.0072941
+            },
+            {
+              "k": "lon",
+              "label": "longitude",
+              "raw": 22470,
+              "unit": "°",
+              "v": 0.002247
+            },
+            {
+              "k": "elev",
+              "label": "elevation",
+              "raw": 362,
+              "unit": "m",
+              "v": 36.2
+            },
+            {
+              "k": "acc_semi_major",
+              "label": "accuracy · semi-major",
+              "raw": 130,
+              "unit": "m",
+              "v": 6.5
+            },
+            {
+              "k": "acc_semi_minor",
+              "label": "accuracy · semi-minor",
+              "raw": 130,
+              "unit": "m",
+              "v": 6.5
+            },
+            {
+              "k": "acc_orientation",
+              "label": "accuracy · orientation",
+              "raw": 16384,
+              "unit": "°",
+              "v": 90.0
+            },
+            {
+              "k": "transmission",
+              "label": "transmission",
+              "na": true,
+              "raw": 7,
+              "v": null
+            },
+            {
+              "k": "speed",
+              "label": "speed",
+              "raw": 275,
+              "unit": "m/s",
+              "v": 5.5
+            },
+            {
+              "k": "heading",
+              "label": "heading",
+              "raw": 21600,
+              "unit": "° from north",
+              "v": 270.0
+            },
+            {
+              "k": "angle",
+              "label": "steering wheel angle",
+              "na": true,
+              "raw": 127,
+              "unit": "°",
+              "v": null
+            },
+            {
+              "k": "accel_long",
+              "label": "acceleration · longitudinal",
+              "na": true,
+              "raw": 2001,
+              "unit": "m/s²",
+              "v": null
+            },
+            {
+              "k": "accel_lat",
+              "label": "acceleration · lateral",
+              "na": true,
+              "raw": 2001,
+              "unit": "m/s²",
+              "v": null
+            },
+            {
+              "k": "accel_vert",
+              "label": "acceleration · vertical",
+              "na": true,
+              "raw": -127,
+              "unit": "G",
+              "v": null
+            },
+            {
+              "k": "yaw_rate",
+              "label": "yaw rate",
+              "raw": 0,
+              "unit": "°/s",
+              "v": 0.0
+            },
+            {
+              "k": "brakes_wheels",
+              "label": "brakes · wheel brakes applied",
+              "na": true,
+              "raw": 16,
+              "v": null
+            },
+            {
+              "k": "brakes_traction",
+              "label": "brakes · traction control",
+              "na": true,
+              "raw": 0,
+              "v": null
+            },
+            {
+              "k": "brakes_abs",
+              "label": "brakes · ABS",
+              "na": true,
+              "raw": 0,
+              "v": null
+            },
+            {
+              "k": "brakes_scs",
+              "label": "brakes · stability control",
+              "na": true,
+              "raw": 0,
+              "v": null
+            },
+            {
+              "k": "brakes_boost",
+              "label": "brakes · brake boost",
+              "na": true,
+              "raw": 0,
+              "v": null
+            },
+            {
+              "k": "brakes_aux",
+              "label": "brakes · auxiliary brakes",
+              "na": true,
+              "raw": 0,
+              "v": null
+            },
+            {
+              "k": "width",
+              "label": "size · width",
+              "raw": 180,
+              "unit": "m",
+              "v": 1.8
+            },
+            {
+              "k": "length",
+              "label": "size · length",
+              "raw": 500,
+              "unit": "m",
+              "v": 5.0
+            },
+            {
+              "k": "part_ii",
+              "label": "Part II containers",
+              "raw": [],
+              "v": 0
+            }
+          ],
+          "format": "SAE J2735 MessageFrame · BasicSafetyMessage (DSRCmsgID 20)"
+        },
+        "security": {
+          "generation_time_us": 731232003903462,
+          "hash": "sha256",
+          "payload_bytes": 40,
+          "psid": 32,
+          "signature": {
+            "alg": "ECDSA NIST P-256",
+            "r": "0e2bd188fb982d91ca94932030a6dfa102567db4605ca115d03de05dd96b05c0",
+            "s": "eab20340b2220653258ffdb4436f23d7653331d51d120f2f40af029c69595087"
+          },
+          "signer": {
+            "hashed_id8": "045bfaee50721746",
+            "kind": "digest"
+          },
+          "standard": "IEEE 1609.2-2016 SignedData"
+        },
+        "spans": [
+          {
+            "end": 7,
+            "layer": "envelope",
+            "name": "1609.2 header",
+            "start": 0
+          },
+          {
+            "end": 47,
+            "layer": "payload",
+            "name": "payload",
+            "start": 7
+          },
+          {
+            "end": 59,
+            "layer": "envelope",
+            "name": "headerInfo",
+            "start": 47
+          },
+          {
+            "end": 67,
+            "layer": "envelope",
+            "name": "signer",
+            "start": 59
+          },
+          {
+            "end": 133,
+            "layer": "envelope",
+            "name": "signature",
+            "start": 67
+          }
+        ],
+        "spdu_bytes": 133
+      },
+      "msg": 177,
+      "pseudonym": "045bfaee50721746",
+      "radio": {
+        "airtime_us": 280,
+        "channel": 172,
+        "power_dbm": 20.0
+      },
+      "signer": "digest",
+      "t_ns": 3921767077,
+      "timing": {
+        "channel_access_ms": 0.0,
+        "generated_ns": 3903462077,
+        "on_air_ns": 3921767077,
+        "sign_ms": 18.305,
+        "sign_queue_ms": 0.0,
+        "sign_start_ns": 3903462077,
+        "signed_ns": 3921767077
+      },
+      "type": "bsm"
+    }
+  ],
+  "shed": {
+    "received": 0,
+    "sent": 0
+  },
+  "since_ns": null,
+  "t_ns": 4000000000,
+  "undetected": 0,
+  "v": 1
+}

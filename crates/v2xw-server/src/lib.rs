@@ -51,6 +51,7 @@
 
 pub mod engine;
 pub mod error;
+pub mod feed;
 pub mod http;
 pub mod introspect;
 pub mod live;
@@ -71,7 +72,7 @@ pub use error::{ParamError, Result, ServerError};
 pub use live::{LiveEngine, LiveOptions};
 pub use replay::ReplayEngine;
 pub use run::Run;
-pub use session::{ConnectParams, Session};
+pub use session::{ConnectParams, FeedSub, Session};
 pub use stub::{StubEngine, StubOptions};
 
 /// The numeric `Visibility` code of §3.1.5 for a channel's tag.

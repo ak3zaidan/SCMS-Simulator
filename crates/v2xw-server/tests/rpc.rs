@@ -58,9 +58,11 @@ fn the_inventory_is_the_thirty_two_methods_of_section_6_15() {
     }
 }
 
+/// Eight in v1.0; v1.1 added `node.feed`, the followed node's messages and queues (§6.14,
+/// additive under §8.4).
 #[test]
-fn the_notification_list_is_the_eight_of_section_6_14() {
-    assert_eq!(NOTIFICATIONS.len(), 8);
+fn the_notification_list_is_the_nine_of_section_6_14() {
+    assert_eq!(NOTIFICATIONS.len(), 9);
     for name in [
         "run.state",
         "stream.drop",
@@ -70,6 +72,7 @@ fn the_notification_list_is_the_eight_of_section_6_14() {
         "log",
         "validation",
         "experiment.progress",
+        "node.feed",
     ] {
         assert!(NOTIFICATIONS.contains(&name), "§6.14 names `{name}`");
     }

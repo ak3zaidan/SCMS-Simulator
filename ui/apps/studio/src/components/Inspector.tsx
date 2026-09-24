@@ -14,13 +14,13 @@
 
 import { Fragment } from "react";
 
-import { MessageLog } from "./MessageLog.js";
+import { MessagePanel } from "./MessagePanel.js";
 import { ObuHud } from "./ObuHud.js";
 import { WhyTab } from "./WhyTab.js";
 import { engine } from "../state/engine.js";
 import { useStudio } from "../state/store.js";
-import { NA, int, radioCount, simClock } from "../lib/format.js";
-import { hudGroups, queueRows } from "../lib/telemetry.js";
+import { NA, radioCount, simClock } from "../lib/format.js";
+import { hudGroups } from "../lib/telemetry.js";
 
 function StateTab(): React.JSX.Element {
   const telemetry = useStudio((s) => s.telemetry);
@@ -29,8 +29,11 @@ function StateTab(): React.JSX.Element {
   const hello = useStudio((s) => s.hello);
   const setWhy = useStudio((s) => s.setWhy);
   const actors = useStudio((s) => s.run.actors);
-  const nodes = useStudio((s) => s.run.nodes);
+  const radios = useStudio((s) => s.radios);
   const runState = useStudio((s) => s.run.state);
+  const selectedActor = useStudio((s) => s.selectedActor);
+  const polledNeighbors = useStudio((s) => s.neighbors);
+  const setTab = useStudio((s) => s.setInspectorTab);
   const devDetails = useStudio((s) => s.devDetails);
   const info = telemetryNode !== null ? engine.nodes.get(telemetryNode) : undefined;
 
@@ -53,7 +56,10 @@ function StateTab(): React.JSX.Element {
               <dt>scenario</dt>
               <dd>{hello.scenarioName}</dd>
               <dt>radios</dt>
-              <dd data-testid="inspector-radios">{radioCount(nodes, hello.nodeCount, runState)}</dd>
+              {/* The radios in the stream on screen: the node table Hello seeded and every spawn and
+                  despawn since has kept current. It used to print run.status's polled count, which
+                  leaves out the roadside units and lags the stream by up to two seconds. */}
+              <dd data-testid="inspector-radios">{radioCount(radios, hello.nodeCount, runState)}</dd>
               <dt>vehicle types</dt>
               <dd>{hello.classNames.join(", ") || "—"}</dd>
               <dt>map centre</dt>
@@ -72,8 +78,11 @@ function StateTab(): React.JSX.Element {
   }
 
   const groups = telemetry ? hudGroups(telemetry) : [];
-  const queues = telemetry ? queueRows(telemetry) : [];
-  const neighbors = inspect?.neighbors ?? [];
+  const neighbors = polledNeighbors ?? inspect?.neighbors ?? [];
+  // The actor this radio rides on. The node table knows it for every radio the stream has
+  // announced, including one that spawned after t = 0 (a Delta spawn row names its node); the
+  // engine's own answer and the car that was clicked are the fallbacks, in that order.
+  const actorId = inspect?.actor ?? info?.actorId ?? (inspect?.kind === "rsu" ? null : selectedActor);
 
   return (
     <div className="panel-body" data-testid="inspector-state">
@@ -83,7 +92,7 @@ function StateTab(): React.JSX.Element {
           <dt>node id</dt>
           <dd>{telemetryNode}</dd>
           <dt>actor id</dt>
-          <dd>{info?.actorId ?? NA}</dd>
+          <dd data-testid="inspector-actor-id">{actorId ?? NA}</dd>
           <dt>kind</dt>
           <dd>{inspect?.kind ?? (info?.kind === 2 ? "rsu" : "obu")}</dd>
           <dt>profile</dt>
@@ -93,39 +102,13 @@ function StateTab(): React.JSX.Element {
         </dl>
       </div>
 
-      {queues.length > 0 ? (
-        <div className="section" data-testid="inspector-queues">
-          <h3>Queues</h3>
-          <table className="table">
-            <thead>
-              <tr>
-                <th>queue</th>
-                <th>p50</th>
-                <th>p95</th>
-                <th>drops</th>
-              </tr>
-            </thead>
-            <tbody>
-              {queues.map((q) => (
-                <tr key={q.id}>
-                  <td>
-                    {q.label} <span className="faint">{q.unit}</span>
-                  </td>
-                  <td>{q.p50 === null ? NA : int(q.p50)}</td>
-                  <td>{q.p95 === null ? NA : int(q.p95)}</td>
-                  <td>
-                    {q.drops.length === 0
-                      ? "—"
-                      : q.drops.map((d) => `${d.label} ${d.value === null ? NA : int(d.value)}`).join(", ")}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      ) : null}
-
-      <MessageLog />
+      <p className="help">
+        What this radio sends and hears, message by message, and what is waiting in its queues are under{" "}
+        <button type="button" className="linklike" data-testid="open-messages" onClick={() => setTab("messages")}>
+          Messages
+        </button>
+        .
+      </p>
 
       {neighbors.length > 0 ? (
         <div className="section">
@@ -267,6 +250,15 @@ export function Inspector(): React.JSX.Element {
         </button>
         <button
           type="button"
+          className={tab === "messages" ? "active" : ""}
+          onClick={() => setTab("messages")}
+          data-testid="tab-messages"
+          title="What the followed radio sends and hears, message by message, and its queues"
+        >
+          messages
+        </button>
+        <button
+          type="button"
           className={tab === "why" ? "active" : ""}
           onClick={() => setTab("why")}
           data-testid="tab-why"
@@ -284,6 +276,7 @@ export function Inspector(): React.JSX.Element {
         </button>
       </div>
       {tab === "state" ? <StateTab /> : null}
+      {tab === "messages" ? <MessagePanel /> : null}
       {tab === "why" ? <WhyTab /> : null}
       {tab === "log" ? <LogTab /> : null}
       {hudDocked ? (
