@@ -474,8 +474,7 @@ fn view_follow_with_a_feed_pushes_it_and_a_new_follow_drops_it() {
         "view.follow",
         json!({"node": nodes[1], "feed": {"hz": 99}}),
     )
-    .err()
-    .expect("refused");
+    .expect_err("refused");
     assert_eq!(err["code"], json!(-32602), "{err}");
     // `clear` drops it too.
     call(

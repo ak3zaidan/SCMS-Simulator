@@ -187,7 +187,7 @@ struct RawStep {
     records: Vec<OwnedRecord>,
     /// The octets of every frame put on the air in this step, by message id
     /// (`RunRecorder::tap_frame`). Not records: nothing recorded or digested sees them.
-    taps: Vec<(u64, Arc<[u8]>)>,
+    taps: Vec<Tap>,
 }
 
 /// What the host thread reports.
@@ -440,6 +440,9 @@ impl Drop for Host {
     }
 }
 
+/// One tapped frame: its message id and the SPDU octets (`RunRecorder::tap_frame`).
+type Tap = (u64, Arc<[u8]>);
+
 /// The kernel's sink: groups records into mobility steps and hands each step over.
 ///
 /// This is the whole of the step-boundary machinery. `v2xw_engine::Engine::run` dispatches
@@ -453,7 +456,7 @@ impl Drop for Host {
 struct StepRecorder {
     step_ns: u64,
     /// The step being accumulated, its records and its tapped frames.
-    current: Option<(u64, Vec<OwnedRecord>, Vec<(u64, Arc<[u8]>)>)>,
+    current: Option<(u64, Vec<OwnedRecord>, Vec<Tap>)>,
     /// The last step index that was handed over, so the empty ones between can be filled.
     emitted_through: Option<u64>,
     /// The final step index of the run, from the scenario horizon.
@@ -469,7 +472,7 @@ struct StepRecorder {
 
 impl StepRecorder {
     /// Hands `index` over as a complete step, with every empty step before it.
-    fn hand_over(&mut self, index: u64, records: Vec<OwnedRecord>, taps: Vec<(u64, Arc<[u8]>)>) {
+    fn hand_over(&mut self, index: u64, records: Vec<OwnedRecord>, taps: Vec<Tap>) {
         let first = self.emitted_through.map_or(0, |e| e + 1);
         for empty in first..index {
             if !self.send(RawStep {
@@ -545,7 +548,7 @@ impl StepRecorder {
 impl StepRecorder {
     /// The accumulator of step `index`, handing the previous step over when the instant
     /// has crossed into a new one.
-    fn step_at(&mut self, index: u64) -> (&mut Vec<OwnedRecord>, &mut Vec<(u64, Arc<[u8]>)>) {
+    fn step_at(&mut self, index: u64) -> (&mut Vec<OwnedRecord>, &mut Vec<Tap>) {
         if self
             .current
             .as_ref()

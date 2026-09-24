@@ -675,7 +675,7 @@ impl FeedStore {
         for (id, label, what) in QUEUES {
             let Some(q) = qs.get_mut(id) else { continue };
             // Still waiting first, longest first; then those that left during the step.
-            q.waiting.sort_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
+            q.waiting.sort_by_key(|w| (w.1, w.0));
             let seen = q.waiting.len();
             let shown: Vec<Value> = q
                 .waiting
