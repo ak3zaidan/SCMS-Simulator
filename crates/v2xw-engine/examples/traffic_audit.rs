@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! cargo run -p v2xw-engine --example traffic_audit -- <scenario.yaml> \
-//!     [--rate VEH_PER_H] [--duration S] [--json OUT]
+//!     [--rate VEH_PER_H] [--duration S] [--json OUT] [--pedestrians N] [--cyclists N]
 //! ```
 //!
 //! The world, the mobility engine and the demand model are built by the same
@@ -35,6 +35,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|a| !a.starts_with("--"))
         .ok_or("usage: traffic_audit <scenario.yaml> [--rate R] [--duration S] [--json OUT]")?;
     let mut scenario = Scenario::load(path)?;
+    // `--pedestrians N` and `--cyclists N` override `actors.vru`, so a scenario without one can
+    // be audited with vulnerable road users on it.
+    if let Some(n) = value("--pedestrians") {
+        scenario.actors.vru.pedestrians = n.parse()?;
+    }
+    if let Some(n) = value("--cyclists") {
+        scenario.actors.vru.cyclists = n.parse()?;
+    }
     if let Some(rate) = value("--rate") {
         scenario.actors.vehicles.demand.rate_veh_per_h = Some(rate.parse()?);
         if scenario.actors.vehicles.demand.kind == "mobility/demand/none" {
@@ -187,7 +195,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        auditor.observe(&world, t, t1, &actors, &update.despawned);
+        let people = mobility.audit_pedestrians(&world);
+        auditor.observe_with_pedestrians(&world, t, t1, &actors, &update.despawned, &people);
         t = t1;
     }
     let report = auditor.report();

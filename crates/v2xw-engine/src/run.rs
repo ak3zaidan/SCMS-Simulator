@@ -100,7 +100,7 @@ use v2xw_mobility::{
 use v2xw_msg::generator::DccState;
 use v2xw_node::stores::VerificationState;
 use v2xw_node::{
-    NodeConfig, ObuRuntime, RxDisposition, RxFrame, RxReport, RxStamp, StepOutcome, Transmission,
+    NodeConfig, RxDisposition, RxFrame, RxReport, RxStamp, StepOutcome, Transmission,
 };
 use v2xw_radio::{
     AccessCategory, Arrival, ChannelId, Dcc, EdcaOcbMac, FrameDescriptor, FrameKind,
@@ -289,6 +289,12 @@ pub struct RunReport {
     /// What the sidelink access layer did, when `radio.rat` selected LTE-V2X or NR-V2X.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sidelink: Option<sidelink::SidelinkReport>,
+    /// How many of [`RunReport::nodes_created`] were pedestrians' and cyclists' devices
+    /// (`actors.vru.device_fraction`).
+    pub vru_devices_created: u64,
+    /// How many PSMs and VAMs a VRU device wanted to send and did not: the EN 302 571 duty
+    /// cycle, the energy budget, or no credential (`v2xw_node::vru`).
+    pub vru_suppressed: u64,
 }
 
 impl RunReport {
@@ -489,7 +495,10 @@ pub struct Engine {
     dcc: Option<SaeJ2945Dcc>,
     weather: WeatherState,
     actors: BTreeMap<ActorId, ActorRecord>,
-    nodes: BTreeMap<NodeId, ObuRuntime>,
+    /// Every hosted device: vehicles' OBUs and roadside units, and — when
+    /// `actors.vru.device_fraction` equips them — pedestrians' and cyclists' handsets
+    /// ([`crate::hosted::HostedNode`]).
+    nodes: BTreeMap<NodeId, crate::hosted::HostedNode>,
     /// Frames each node has received and not yet processed, with the instant each
     /// finished arriving and the token its `node.rx` record is joined by.
     inboxes: BTreeMap<NodeId, Vec<(RxFrame, RxStamp)>>,
@@ -961,7 +970,7 @@ impl Engine {
             // what makes the unit's position usable by a detector's own plausibility test.
             belief.fix = v2xw_core::belief::FixQuality::Rtk;
             runtime.set_belief(belief.quantized());
-            self.nodes.insert(id, runtime);
+            self.nodes.insert(id, runtime.into());
             self.inboxes.insert(id, Vec::new());
             self.note_node_created(id);
             self.rsus.insert(id, spec.position);
@@ -1309,14 +1318,31 @@ impl Engine {
                 let id = NodeId::new(self.next_node);
                 self.next_node += 1;
                 let env = crate::wiring::NodeEnv::new(&self.world, self.wall);
-                let mut runtime = crate::wiring::build_node(
-                    &self.scenario,
-                    env,
-                    id,
-                    now,
-                    spawn.class,
-                    spawn.kinematics.dims,
-                );
+                // A pedestrian or a cyclist carries a VRU device (PSM / VAM), a vehicle an
+                // OBU; both are hosted the same way from here on.
+                let mut runtime: crate::hosted::HostedNode =
+                    if crate::wiring::is_vru_class(spawn.class) {
+                        self.report.vru_devices_created += 1;
+                        crate::hosted::build_vru_device(
+                            &self.scenario,
+                            env,
+                            id,
+                            now,
+                            spawn.class,
+                            spawn.kinematics.dims,
+                        )
+                        .into()
+                    } else {
+                        crate::wiring::build_node(
+                            &self.scenario,
+                            env,
+                            id,
+                            now,
+                            spawn.class,
+                            spawn.kinematics.dims,
+                        )
+                        .into()
+                    };
                 // Phase 2: the backend enrols and provisions the device, and the
                 // credentials it installs carry the linkage values a CRL revokes. The
                 // digest stays the `pseudo_signer` stand-in — see `crate::phase2`, joint 1
@@ -1330,12 +1356,20 @@ impl Engine {
                 if let Some(phase2) = self.phase2.as_mut() {
                     let creds = phase2.provision(id);
                     if !creds.is_empty() {
-                        crate::wiring::install_provisioned(
-                            &mut runtime,
-                            &self.scenario,
-                            id,
-                            &creds,
-                        );
+                        match runtime.as_obu_mut() {
+                            Some(obu) => crate::wiring::install_provisioned(
+                                obu,
+                                &self.scenario,
+                                id,
+                                &creds,
+                            ),
+                            None => crate::hosted::install_credentials(
+                                runtime.stores_mut(),
+                                &self.scenario,
+                                id,
+                                creds.iter().map(|c| (c.i, c.j, c.valid_from, c.valid_until)),
+                            ),
+                        }
                     }
                 }
                 self.nodes.insert(id, runtime);
@@ -1672,7 +1706,7 @@ impl Engine {
 
         let reverse = self.reverse_node_walk;
         let selected = move |id: &NodeId| only.is_none_or(|o| o == *id);
-        let walk: Box<dyn Iterator<Item = (&NodeId, &mut ObuRuntime)>> = if reverse {
+        let walk: Box<dyn Iterator<Item = (&NodeId, &mut crate::hosted::HostedNode)>> = if reverse {
             Box::new(
                 self.nodes
                     .iter_mut()
@@ -1682,6 +1716,7 @@ impl Engine {
         } else {
             Box::new(self.nodes.iter_mut().filter(move |(id, _)| selected(id)))
         };
+        let mut suppressed_by_vru = 0u64;
         let mut results: Vec<(NodeId, StepOutcome, Vec<v2xw_core::ctx::OwnedRecord>, f64)> = walk
             .map(|(id, runtime)| {
                 // What has finished arriving by now is handed over; a frame whose last
@@ -1705,10 +1740,20 @@ impl Engine {
                     .state()
                     .transmits()
                     .then(|| v2xw_core::NodeView::position(runtime).ground_speed_mps() * step_s);
-                let outcome = runtime.step_timed(&mut local, inbox, travelled.unwrap_or(0.0));
-                (*id, outcome, local.take_emitted(), travelled.unwrap_or(0.0))
+                let (outcome, suppressed) =
+                    runtime.step_timed(&mut local, inbox, travelled.unwrap_or(0.0));
+                suppressed_by_vru += suppressed;
+                // A VRU device's suppression records ride `node.tx` in the device's own
+                // shape, which is not the `NodeTx` a recording's `node.tx` holds; they are
+                // counted in the run report instead (`crate::hosted`).
+                let mut emitted = local.take_emitted();
+                if runtime.is_vru() {
+                    emitted.retain(|r| r.channel != "node.tx");
+                }
+                (*id, outcome, emitted, travelled.unwrap_or(0.0))
             })
             .collect();
+        self.report.vru_suppressed += suppressed_by_vru;
 
         // The merge (02-architecture.md §6.4). `par_iter_mut` over a `BTreeMap` yields in
         // key order but `collect` into a `Vec` does not promise to preserve it for an
@@ -3658,6 +3703,28 @@ fn message_content(
         c.heading_deg = (k.heading != bsm::HEADING_UNAVAILABLE)
             .then(|| quantize_to(f64::from(k.heading) * 0.0125, Q_DEG));
         c.part_ii = Some(u8::try_from(m.part_ii.len()).unwrap_or(u8::MAX));
+    }
+    // A pedestrian's or a cyclist's PSM, decoded from the octets its device encoded: the
+    // same fields a BSM's Part I shows, from the same J2735 data elements.
+    if msg_type == v2xw_msg::MsgType::Psm
+        && let Some(bytes) = payload
+        && let Ok(m) = v2xw_msg::j2735::psm::decode_message_frame(bytes)
+    {
+        c.msg_count = Some(m.msg_cnt);
+        c.temp_id = Some(hex_digest(&m.id));
+        c.sec_mark_ms = (m.sec_mark != bsm::D_SECOND_UNAVAILABLE).then_some(m.sec_mark);
+        c.lat_deg = (m.lat != bsm::LATITUDE_UNAVAILABLE)
+            .then(|| quantize_to(f64::from(m.lat) * 1e-7, Q_DEG));
+        c.lon_deg = (m.lon != bsm::LONGITUDE_UNAVAILABLE)
+            .then(|| quantize_to(f64::from(m.lon) * 1e-7, Q_DEG));
+        c.elev_m = m
+            .elev
+            .filter(|e| *e != bsm::ELEVATION_UNKNOWN)
+            .map(|e| quantize_to(f64::from(e) * 0.1, Q_M));
+        c.speed_mps = (m.speed != bsm::SPEED_UNAVAILABLE)
+            .then(|| quantize_to(f64::from(m.speed) * 0.02, Q_M));
+        c.heading_deg = (m.heading != bsm::HEADING_UNAVAILABLE)
+            .then(|| quantize_to(f64::from(m.heading) * 0.0125, Q_DEG));
     }
     c
 }

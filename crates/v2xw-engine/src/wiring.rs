@@ -66,8 +66,10 @@ pub fn build_world(scenario: &Scenario) -> Result<World> {
 /// cache written by an older importer from one written by this one. Bump this whenever an
 /// importer's output changes for the same inputs, or a kept cache entry replays the old
 /// world. Revision 2: the traffic track's OSM connector, stop-line setback, tunnel/bridge
-/// height and lane-pairing fixes changed the Manhattan world's content hash.
-pub const IMPORTER_REVISION: u32 = 2;
+/// height and lane-pairing fixes changed the Manhattan world's content hash. Revision 3:
+/// `footway=crossing` ways became crosswalk lanes and signalised junctions gained MUTCD
+/// pedestrian intervals (`v2xw_world::walk`).
+pub const IMPORTER_REVISION: u32 = 3;
 
 /// The key a world is cached under: a digest of everything that decides what the import
 /// produces — the scenario's `world` section (less `cache` itself), the bytes of the source

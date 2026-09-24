@@ -490,12 +490,28 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus {
         path: "actors.vru",
         status: Status::Partial,
-        note: "Pedestrians walk the sidewalk and crossing lanes (social-force model) and \
-               cyclists ride the lanes that admit bicycles (car-following on the SUMO \
-               bicycle vType); each one who finishes is replaced, so the count holds. \
-               Both need such lanes: an OpenStreetMap import has them, the procedural \
-               grid does not. device_fraction must be 0: no VRU device (PSM/VAM) is \
-               hosted by the kernel yet.",
+        note: "Pedestrians walk sidewalks and cross streets on crosswalk lanes \
+               (social-force model): they step off the kerb only on WALK or at an \
+               unsignalised crosswalk, and only when an approaching vehicle can still \
+               yield; vehicles yield to anyone on a crosswalk, turning traffic included, \
+               and never stop inside one. Signalised crosswalks get MUTCD walk, \
+               flashing don't-walk (3.5 ft/s clearance) and don't-walk intervals. \
+               Cyclists ride the lanes that admit bicycles (car-following on the SUMO \
+               bicycle vType). An OpenStreetMap import has the lanes (footway=crossing \
+               ways become crosswalks); the procedural grid has them when sidewalk_m > 0 \
+               and crossings is on, and cyclists ride its carriageway with \
+               bicycles_on_roads. Partial because: crossing nodes with no crossing way \
+               get no crosswalk, mid-block jaywalking is not modelled, and the grid has \
+               no separate cycle lanes.",
+    },
+    KeyStatus {
+        path: "actors.vru.device_fraction",
+        status: Status::Wired,
+        note: "The share of pedestrians and cyclists carrying a V2X handset. Each one \
+               equipped is hosted in the node phase as a VRU device: it sends SAE J2735 \
+               PSMs (the SAE stack) or ETSI TS 103 300-3 VAMs (the ETSI stack) under the \
+               EN 302 571 duty cycle, signed and pseudonymous like a vehicle's, and its \
+               messages appear in node.tx, node.rx and every metric.",
     },
     KeyStatus {
         path: "actors.rsus",
@@ -900,24 +916,9 @@ pub fn validate(s: &Scenario) -> Vec<ScenarioError> {
 /// hardware profile, and `time.t0` reaches its wall clock through
 /// [`crate::wiring::NodeEnv`].
 fn unreachable_keys(s: &Scenario, e: &mut Vec<ScenarioError>) {
-    // Pedestrians and cyclists move (v2xw_mobility::engine::VruPopulation). What does not
-    // exist yet is their *device*: v2xw-node's VruDeviceRuntime (PSM / VAM, the EN 302 571
-    // duty cycle, the battery) is not hosted by the kernel, whose nodes are vehicle OBUs.
-    // An equipped pedestrian would broadcast vehicle BSMs, so a device fraction above zero
-    // is refused rather than faked.
-    let vru = &s.actors.vru;
-    if vru.device_fraction > 0.0 {
-        e.push(conflict(
-            "actors.vru.device_fraction",
-            format!(
-                "is {}, and this build's kernel hosts no VRU device: pedestrians and \
-                 cyclists walk and ride, but v2xw-node's VruDeviceRuntime (PSM/VAM) is not \
-                 wired into the node phase, and giving them a vehicle OBU would put \
-                 vehicle BSMs on the air from a pedestrian. Set it to 0",
-                vru.device_fraction
-            ),
-        ));
-    }
+    // `actors.vru.device_fraction` used to be refused here: the node phase held vehicle
+    // OBUs only. It now hosts VRU devices (`crate::hosted`), so any fraction in [0, 1] is
+    // run as written.
 
     // Exporters run after the run, over its recording (`crate::export`). An id this build
     // does not implement is refused rather than skipped, so a list never promises a file

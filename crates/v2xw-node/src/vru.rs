@@ -90,7 +90,7 @@ use crate::policy::{
 };
 use crate::profile::{HardwareProfile, RunsOn};
 use crate::queue::{Admission, DropCause, DropLedger, NodeQueue, QueueKind, Queued};
-use crate::runtime::{RxFrame, Transmission, VerifiedMessage};
+use crate::runtime::{RxDisposition, RxFrame, RxReport, RxStamp, Transmission, VerifiedMessage};
 use crate::secure::{CryptoMode, NodeSecurity, PSID_SAFETY, SpduVerdict};
 use crate::server::{OpDescriptor, ProfileServiceModel, ServerBank, ServiceModel};
 use crate::stores::{
@@ -197,9 +197,8 @@ pub enum PayloadProvenance {
         /// exists and this runtime is not yet wired to it.
         superseded_by: Option<&'static str>,
     },
-    /// A real encoder produced the bytes. Nothing in this module returns this yet; it is
-    /// the variant the PSM and the VAM move to when their encoders land, and it exists so
-    /// that the move is a one-line change rather than a change of shape.
+    /// A real encoder produced the bytes: the PSM, from `v2xw_msg::j2735::psm`. The VAM
+    /// moves here when its encoder lands.
     Encoded {
         /// The codec's registry id.
         codec: &'static str,
@@ -987,6 +986,8 @@ pub struct VruConfig {
     pub psm_path_points: Option<u32>,
     /// How many path-history points a VAM carries. `None` as [`VruConfig::psm_path_points`].
     pub vam_path_points: Option<u32>,
+    /// Who carries the device, for the PSM's `basicType`: a pedestrian or a cyclist.
+    pub psm_user_type: v2xw_msg::j2735::psm::PersonalDeviceUserType,
 }
 
 impl Default for VruConfig {
@@ -1016,6 +1017,7 @@ impl Default for VruConfig {
             content_profile: ContentProfile::Typical,
             psm_path_points: None,
             vam_path_points: None,
+            psm_user_type: v2xw_msg::j2735::psm::PersonalDeviceUserType::Pedestrian,
         }
     }
 }
@@ -1054,6 +1056,18 @@ pub struct VruStepOutcome {
     pub payload_provenance: Vec<(MsgType, PayloadProvenance)>,
     /// The telemetry record, when this step closed a window.
     pub telemetry: Option<NodeTelemetry>,
+    /// Every received frame whose fate was settled in this step, with the instants of its
+    /// journey through the device — the same report an OBU gives, so the engine records
+    /// a pedestrian's receptions on `node.rx` exactly as a vehicle's.
+    pub rx_reports: Vec<RxReport>,
+}
+
+/// A frame in the device's receive path, with what its reception report needs.
+#[derive(Debug, Clone)]
+struct RxItem {
+    frame: RxFrame,
+    token: u64,
+    arrived: SimTime,
 }
 
 /// A vulnerable-road-user device: a phone or a beacon, with the limits a hand-held radio
@@ -1071,7 +1085,7 @@ pub struct VruDeviceRuntime {
     cpu: ServerBank,
     hsm: ServerBank,
     accel: ServerBank,
-    queues: [NodeQueue<Queued<RxFrame>>; 5],
+    queues: [NodeQueue<Queued<RxItem>>; 5],
     drops: DropLedger,
     clock: ClockModel,
     belief: PositionEstimate,
@@ -1346,23 +1360,72 @@ impl VruDeviceRuntime {
         inbox: Vec<RxFrame>,
         distance_travelled_m: f64,
     ) -> VruStepOutcome {
+        let stamped = inbox.into_iter().map(|f| (f, RxStamp::default())).collect();
+        self.step_timed(ctx, stamped, distance_travelled_m)
+    }
+
+    /// [`VruDeviceRuntime::step`] with each frame's reception token and arrival instant,
+    /// so every frame's fate comes back in [`VruStepOutcome::rx_reports`] — which is how
+    /// the engine hosts the device beside the vehicles' OBUs.
+    pub fn step_timed(
+        &mut self,
+        ctx: &mut dyn NodeCtx,
+        inbox: Vec<(RxFrame, RxStamp)>,
+        distance_travelled_m: f64,
+    ) -> VruStepOutcome {
         let now = ctx.now();
         self.clock.advance(now, self.belief.fix.has_position());
         let believed = self.clock.believed_time(now);
 
         let mut out = VruStepOutcome::default();
+        let arrival = |clock: &ClockModel, stamp: &RxStamp| {
+            stamp
+                .arrived_at
+                .map_or(believed, |t| clock.believed_time(t))
+                .min(believed)
+        };
         if self.state == NodeState::Off {
+            for (_, stamp) in &inbox {
+                let at = arrival(&self.clock, stamp);
+                out.rx_reports.push(RxReport {
+                    token: stamp.token,
+                    disposition: RxDisposition::NodeOff,
+                    arrived: at,
+                    parsed: at,
+                    verify_start: None,
+                    verify_done: None,
+                });
+            }
             return out;
         }
 
         if self.config.kind.receives() {
-            self.receive(ctx, believed, inbox, &mut out);
+            let items = inbox
+                .into_iter()
+                .map(|(frame, stamp)| RxItem {
+                    arrived: arrival(&self.clock, &stamp),
+                    token: stamp.token,
+                    frame,
+                })
+                .collect();
+            self.receive(ctx, believed, items, &mut out);
         } else if !inbox.is_empty() {
             // A beacon has no receiver. The frames are not silently discarded: they are
             // counted as arrivals and dropped with a cause, so a run where a beacon was
             // expected to hear something shows why it did not.
             self.drops
                 .record_n(DropCause::VerifyPolicySkip, inbox.len() as u32);
+            for (_, stamp) in &inbox {
+                let at = arrival(&self.clock, stamp);
+                out.rx_reports.push(RxReport {
+                    token: stamp.token,
+                    disposition: RxDisposition::Dropped(DropCause::VerifyPolicySkip),
+                    arrived: at,
+                    parsed: at,
+                    verify_start: None,
+                    verify_done: None,
+                });
+            }
         }
         self.stores.neighbors.age(believed);
         self.stores.certs.travelled(distance_travelled_m);
@@ -1383,21 +1446,25 @@ impl VruDeviceRuntime {
         &mut self,
         ctx: &mut dyn NodeCtx,
         believed: SimTime,
-        inbox: Vec<RxFrame>,
+        inbox: Vec<RxItem>,
         out: &mut VruStepOutcome,
     ) {
-        for frame in inbox {
+        let mut inbox = inbox;
+        inbox.sort_by_key(|i| i.arrived);
+        for item in inbox {
             self.window.message_in();
-            if let Admission::Refused(_) = self.queues[0].push(Queued {
-                item: frame,
-                enqueued_at: believed,
+            if let Admission::Refused(refused) = self.queues[0].push(Queued {
+                enqueued_at: item.arrived,
+                item,
             }) {
                 self.drops.record(DropCause::RxOverflow);
+                out.rx_reports.push(Self::dropped(&refused.item, DropCause::RxOverflow));
             }
         }
 
         for q in self.queues[0].drain() {
-            let frame = q.item;
+            let item = q.item;
+            let frame = item.frame.clone();
             self.learn_or_request(&frame);
             let relevance = frame
                 .signer
@@ -1422,27 +1489,41 @@ impl VruDeviceRuntime {
             };
             self.log_decision(ctx, believed, frame.msg_type, &decision);
             match decision {
-                VerifyDecision::Drop { cause } => self.drops.record(cause),
+                VerifyDecision::Drop { cause } => {
+                    self.drops.record(cause);
+                    out.rx_reports.push(Self::dropped(&item, cause));
+                }
                 VerifyDecision::DeliverUnverified { reason } => {
                     let _ = reason;
                     self.drops.record(DropCause::VerifyPolicySkip);
                     let m = self.to_message(&frame, believed, VerificationState::Unverified);
                     self.deliver(m, out);
+                    out.rx_reports.push(RxReport {
+                        token: item.token,
+                        disposition: RxDisposition::Delivered(VerificationState::Unverified),
+                        arrived: item.arrived,
+                        parsed: item.arrived,
+                        verify_start: None,
+                        verify_done: None,
+                    });
                 }
                 VerifyDecision::Verify { .. } => {
-                    let admitted = if self.policy.oldest_drop() {
-                        self.queues[1].push_evicting(Queued {
-                            item: frame,
-                            enqueued_at: believed,
-                        })
-                    } else {
-                        self.queues[1].push(Queued {
-                            item: frame,
-                            enqueued_at: believed,
-                        })
+                    let queued = Queued {
+                        enqueued_at: item.arrived,
+                        item,
                     };
-                    if !matches!(admitted, Admission::Queued) {
-                        self.drops.record(DropCause::VerifyOverflow);
+                    let admitted = if self.policy.oldest_drop() {
+                        self.queues[1].push_evicting(queued)
+                    } else {
+                        self.queues[1].push(queued)
+                    };
+                    match admitted {
+                        Admission::Queued => {}
+                        Admission::Refused(q) | Admission::Evicted(q) => {
+                            self.drops.record(DropCause::VerifyOverflow);
+                            out.rx_reports
+                                .push(Self::dropped(&q.item, DropCause::VerifyOverflow));
+                        }
                     }
                 }
             }
@@ -1477,7 +1558,8 @@ impl VruDeviceRuntime {
         }
         let where_ = self.service.runs_on(&probe);
         for q in self.queues[1].drain() {
-            let frame = q.item;
+            let item = q.item;
+            let frame = item.frame.clone();
             let op = OpDescriptor::verify(self.config.verify_op, frame.bytes);
             let Some(cost) = self.service.service_time(ctx, &op) else {
                 continue;
@@ -1506,6 +1588,26 @@ impl VruDeviceRuntime {
             ));
             let m = self.to_message(&frame, believed, verdict);
             self.deliver(m, out);
+            out.rx_reports.push(RxReport {
+                token: item.token,
+                disposition: RxDisposition::Delivered(verdict),
+                arrived: item.arrived,
+                parsed: item.arrived,
+                verify_start: Some(sched.start),
+                verify_done: Some(sched.finish),
+            });
+        }
+    }
+
+    /// The report for a frame dropped before it reached the applications.
+    fn dropped(item: &RxItem, cause: DropCause) -> RxReport {
+        RxReport {
+            token: item.token,
+            disposition: RxDisposition::Dropped(cause),
+            arrived: item.arrived,
+            parsed: item.arrived,
+            verify_start: None,
+            verify_done: None,
         }
     }
 
@@ -1637,7 +1739,8 @@ impl VruDeviceRuntime {
         };
 
         for r in requests {
-            let Some((payload, provenance)) = self.encode_payload(r.msg_type, &cred) else {
+            let Some((payload, provenance)) = self.encode_payload(r.msg_type, &cred, believed)
+            else {
                 self.suppress(ctx, believed, r.msg_type, 0, "no-payload", out);
                 continue;
             };
@@ -1769,23 +1872,49 @@ impl VruDeviceRuntime {
     /// bytes and [`PayloadProvenance`] says which kind of not-real it is; the fill is
     /// [`v2xw_msg::codec::PLACEHOLDER_FILL`], so a consumer that decoded one fails loudly
     /// rather than reading a plausible all-zero message.
+    /// The payload for one message, with the provenance of its length.
+    ///
+    /// The PSM is **really encoded**: SAE J2735 UPER from the device's own belief, by
+    /// [`v2xw_msg::j2735::psm`], inside its `MessageFrame`, with the first four octets of
+    /// the active pseudonym's digest as its temporary id — so the id on the air changes
+    /// exactly when the pseudonym does, as a vehicle's does. The VAM still comes from the
+    /// validated ETSI size model: its encoder needs the TS 103 300-3 module in the ETSI
+    /// build unit, which is not there yet. [`PayloadProvenance`] says which is which on
+    /// every frame; a placeholder is [`v2xw_msg::codec::PLACEHOLDER_FILL`] so a consumer
+    /// that decodes one fails loudly.
     fn encode_payload(
         &self,
         msg_type: MsgType,
         cred: &CredentialHandle,
+        believed: SimTime,
     ) -> Option<(Vec<u8>, PayloadProvenance)> {
-        // The station identifier a real payload would carry is the first four bytes of the
-        // credential's own digest, as the OBU's is, so that the identifier on the air
-        // changes exactly when the pseudonym changes. It is computed here, and discarded,
-        // because neither of this device's payloads is encoded: keeping the derivation
-        // visible is what makes the gap obvious when an encoder lands.
-        let _station_id = {
+        let station_id = {
             let mut id = [0u8; 4];
             id.copy_from_slice(&cred.digest.0[..4]);
-            u32::from_be_bytes(id)
+            id
         };
+        if msg_type == MsgType::Psm {
+            use v2xw_msg::j2735::psm;
+            // `msgCnt` is the value the PSM timer assigned when it said this PSM was due.
+            let msg_cnt = self.schedule.psm().msg_count();
+            let input = psm::PsmInput {
+                basic_type: self.config.psm_user_type,
+                msg_cnt,
+                id: station_id,
+                position: self.belief,
+                origin: self.config.origin,
+                sec_mark: v2xw_msg::j2735::bsm::sec_mark(self.config.wall, believed),
+            };
+            let message = psm::build_psm(&input).ok()?;
+            let encoded = psm::encode_message_frame(&message).ok()?;
+            return Some((
+                encoded.bytes,
+                PayloadProvenance::Encoded {
+                    codec: psm::PSM_CODEC_ID,
+                },
+            ));
+        }
         let elements = match msg_type {
-            MsgType::Psm => self.config.psm_path_points,
             MsgType::Vam => self.config.vam_path_points,
             _ => return None,
         };

@@ -114,13 +114,98 @@ fn pedestrians_and_cyclists_walk_and_ride_on_an_osm_world() {
     );
 }
 
-#[test]
-fn an_equipped_pedestrian_is_refused_until_the_kernel_hosts_a_vru_device() {
-    let mut scenario = fixture_scenario(10, 0);
-    scenario.actors.vru.device_fraction = 0.5;
-    let err = scenario.validate().expect_err("no VRU device yet");
-    assert!(
-        err.to_string().contains("actors.vru.device_fraction"),
-        "{err}"
+/// Runs the fixture with `pedestrians` equipped pedestrians (and a little vehicle
+/// traffic) for `seconds`, on the message sets given; returns the records and the report.
+fn run_equipped(
+    sets: &[&str],
+    seconds: f64,
+) -> (v2xw_engine::MemoryRecorder, v2xw_engine::RunReport) {
+    // A small signalised grid with sidewalks, crosswalks and cyclists on the carriageway.
+    let mut scenario = Scenario::minimal();
+    scenario.world.source = WorldSourceSpec::procedural(
+        "world/source/procedural-grid",
+        serde_json::json!({
+            "cols": 4, "rows": 4, "block_x_m": 120.0, "block_y_m": 90.0,
+            "lanes_per_direction": 1, "sidewalk_m": 2.0, "crossings": true,
+            "signalised": true, "corner_radius_m": 4.5, "bicycles_on_roads": true
+        }),
     );
+    scenario.actors.vru.pedestrians = 12;
+    scenario.actors.vru.device_fraction = 1.0;
+    scenario.actors.vehicles.equipped_fraction = 1.0;
+    scenario.actors.vehicles.demand.kind = "mobility/demand/poisson".to_string();
+    scenario.actors.vehicles.demand.rate_veh_per_h = Some(3600.0);
+    scenario.messages.sets = sets.iter().map(|s| (*s).to_string()).collect();
+    scenario.time.duration_s = seconds;
+    scenario.validate().expect("an equipped VRU population validates");
+    let mut engine = v2xw_engine::Engine::build(scenario, "").expect("builds");
+    let mut recorder = v2xw_engine::MemoryRecorder::new();
+    let report = engine.run(&mut recorder).expect("runs");
+    (recorder, report)
+}
+
+/// The `msg_type` of every record on `channel`, with its node fields.
+fn by_type(
+    recorder: &v2xw_engine::MemoryRecorder,
+    channel: &str,
+) -> Vec<serde_json::Value> {
+    recorder
+        .records()
+        .iter()
+        .filter(|(_, r)| r.channel == channel)
+        .map(|(_, r)| serde_json::from_slice(&r.json).expect("json"))
+        .collect()
+}
+
+/// `actors.vru.device_fraction` equips pedestrians with a VRU device, hosted in the node
+/// phase: on the SAE stack each sends signed SAE J2735 PSMs, which appear on `node.tx`
+/// beside the vehicles' BSMs, and other nodes' receptions of them appear on `node.rx`.
+#[test]
+fn equipped_pedestrians_send_psms_that_other_nodes_hear() {
+    let (recorder, report) = run_equipped(&["bsm"], 30.0);
+    assert!(report.vru_devices_created >= 12, "{report:?}");
+    let tx = by_type(&recorder, "node.tx");
+    let psm: Vec<&serde_json::Value> = tx.iter().filter(|r| r["msg_type"] == "psm").collect();
+    assert!(!psm.is_empty(), "no PSM on node.tx");
+    // A pedestrian sends PSMs and nothing else; a vehicle sends BSMs.
+    let psm_nodes: std::collections::BTreeSet<u64> =
+        psm.iter().filter_map(|r| r["node"].as_u64()).collect();
+    for r in &tx {
+        if psm_nodes.contains(&r["node"].as_u64().unwrap_or(u64::MAX)) {
+            assert_eq!(r["msg_type"], "psm", "{r}");
+        }
+    }
+    assert!(tx.iter().any(|r| r["msg_type"] == "bsm"), "no BSM either: {report:?}");
+    // Signed like a vehicle's: an envelope around the payload.
+    assert!(psm.iter().all(|r| r["envelope_bytes"].as_u64().unwrap_or(0) > 0));
+    // Heard: a reception attempt of a PSM decoded somewhere.
+    let rx = by_type(&recorder, "node.rx");
+    let heard = rx
+        .iter()
+        .filter(|r| r["msg_type"] == "psm" && r["outcome"] == "delivered")
+        .count();
+    assert!(heard > 0, "no PSM delivered: {} psm attempts", rx.iter().filter(|r| r["msg_type"] == "psm").count());
+    // And a pedestrian's own device hears the vehicles.
+    assert!(
+        rx.iter().any(|r| psm_nodes.contains(&r["rx"].as_u64().unwrap_or(u64::MAX))
+            && r["msg_type"] == "bsm"),
+        "no pedestrian received a BSM"
+    );
+    // Its queues and load are published like a vehicle's.
+    let telemetry = by_type(&recorder, "node.telemetry");
+    assert!(
+        telemetry
+            .iter()
+            .any(|r| psm_nodes.contains(&r["node"].as_u64().unwrap_or(u64::MAX))),
+        "no telemetry window from a pedestrian's device"
+    );
+}
+
+/// On the ETSI stack the same pedestrians send VAMs.
+#[test]
+fn on_the_etsi_stack_equipped_pedestrians_send_vams() {
+    let (recorder, _) = run_equipped(&["cam"], 12.0);
+    let tx = by_type(&recorder, "node.tx");
+    assert!(tx.iter().any(|r| r["msg_type"] == "vam"), "no VAM on node.tx");
+    assert!(!tx.iter().any(|r| r["msg_type"] == "psm"));
 }

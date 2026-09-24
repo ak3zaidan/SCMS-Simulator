@@ -1,0 +1,154 @@
+# Pedestrians and cyclists on a procedural Midtown-shaped grid.
+#
+# `phase1-grid.yaml` with its block count cut to 7 x 12 junctions (so a debug build runs it
+# at speed), traffic at 1,500 veh/h, and people:
+#
+#  * the grid's sidewalks become a walk network: a sidewalk each way along every block
+#    face, a crosswalk each way across every arm, and MUTCD 2009 4E.06 pedestrian intervals
+#    (walk, flashing don't walk at 3.5 ft/s, don't walk) in every signal plan;
+#  * 150 pedestrians walk it and cross at the crosswalks on WALK; drivers yield to them;
+#  * 15 cyclists ride the carriageway (`bicycles_on_roads`) with the SUMO bicycle vType;
+#  * 30 % of the people carry a handset sending signed SAE J2735 PSMs.
+schema: v2xw/scenario/1
+meta:
+  name: vru-grid
+  description: >-
+    One equipped vehicle on a Midtown-shaped procedural grid, medium mobility and medium
+    radio fidelity, IEEE 1609.2-signed BSMs at 10 Hz from one hardware profile, recorded
+    with a keyframe every simulated second, measuring packet delivery ratio.
+  authors: [v2xw]
+  tags: [phase1, procedural, dsrc, signed]
+  created: "2026-09-22"
+
+# The master seed. Every RNG stream in the run is derived from this one number through
+# (RngDomain, EntityRef); change it and nothing else to get an independent replication.
+seed: "0xC0FFEE_5EED"
+
+time:
+  # Simulated wall time at t = 0. Nothing reads a real clock; this is what puts the run on
+  # a calendar, and it is what a certificate's validity is compared against.
+  t0: "2027-03-04T08:00:00Z"
+  duration_s: 300.0
+  # 100 ms is the mobility step the car-following models are calibrated at, and it is also
+  # the BSM generation period, so one step is one message.
+  mobility_step_ms: 100
+  des_resolution: 1us
+
+world:
+  source:
+    kind: procedural
+    generator: world/source/procedural-grid
+    params:
+      # Midtown geometry: avenues 274 m apart, streets 80 m apart.
+      cols: 7
+      rows: 12
+      block_x_m: 274.0
+      block_y_m: 80.0
+      lanes_per_direction: 2
+      lane_width_m: 3.5
+      sidewalk_m: 2.0
+      # 25 mph, the NYC citywide limit — the same number `urban-us-nyc` puts on a Midtown
+      # side street, so the car-following model sees the speeds it would see on the import.
+      speed_limit_mps: 11.176
+      signalised: true
+      cycle_s: 60.0
+      amber_s: 3.0
+      crossings: true
+      # One building per block, so the obstacle model has something to shadow with.
+      block_buildings: true
+      building_height_m: 30.0
+      rsu_at_junctions: false
+      # Lanes end 4.5 m past the crossing street's kerb line (the AASHTO passenger-car
+      # 90-degree turn edge radius, 15 ft), so a right turn from the kerb lane has a
+      # radius a car can drive; with 0 it is a 1.75 m pivot.
+      corner_radius_m: 4.5
+      # Cyclists share the carriageway: UVC 11-1202 gives a rider a driver's rights.
+      bicycles_on_roads: true
+  # A procedural world has no source file, so this date only dates the run's provenance
+  # record. It is still an argument and not a clock read.
+  imported_at: "2026-09-18T00:00:00Z"
+  buildings:
+    enabled: true
+    keep_holes: true
+  terrain:
+    dem: null
+
+actors:
+  vru:
+    pedestrians: 150
+    cyclists: 15
+    device_fraction: 0.3
+  vehicles:
+    # Every vehicle that spawns is equipped, so "one vehicle" and "one node" are the same
+    # number and the run is not silently measuring an unequipped car.
+    equipped_fraction: 1.0
+    demand:
+      kind: mobility/demand/poisson
+      # The demand model this build ships takes a RATE, not a count: `PoissonParams` has a
+      # `max_total_vehicles` cap but `wiring::build_demand` does not read it, so a scenario
+      # cannot ask for exactly one vehicle. 30 veh/h over 60 s is an expectation of half an
+      # arrival and, under this seed, realises exactly one — which the run report states
+      # rather than this file claiming it. Raise it to sweep the load: measured on this
+      # world, 1500 veh/h gives 9 vehicles, 15000 gives 113 and 60000 gives 460, because
+      # the thinned-Poisson acceptance and the lane capacity reject roughly half the
+      # candidates.
+      rate_veh_per_h: 1500.0
+
+weather:
+  # Clear, which is WeatherState::CLEAR exactly: intensity 0, unlimited visibility, dry
+  # surface. `intensity` and `visibility_m` are separate fields because a road can still be
+  # wet after the rain stops.
+  initial: clear
+  intensity: 0.0
+
+radio:
+  rat: dsrc-80211p
+  tiers:
+    # The medium tier throughout: log-distance with shadowing and Nakagami fading, a
+    # link-budget PHY with a modelled PER curve, and a CSMA/CA MAC with DCC. The high tier
+    # is frame-level and needs a matching MAC; the abstract tier is free-space with no
+    # fading and would make every reception succeed.
+    propagation: medium
+    phy: medium
+    mac: medium
+
+net:
+  layer: wsmp
+
+messages:
+  sets: [bsm]
+  # Real UPER/COER bytes from the encoders, not the validated size model: a signed frame's
+  # length is what the air time and the byte accounting are computed from.
+  codec_tier: uper
+
+security:
+  envelope: ieee1609.2
+  signature: ecdsa-p256
+  # `modeled` costs the signature in HSM service time from the hardware profile's measured
+  # throughput and produces a real signature over real bytes. `real` additionally needs the
+  # credential protocol, which this build does not ship.
+  crypto_mode: modeled
+  # Verify by relevance rather than everything: at one node there is nothing to verify, and
+  # the policy is stated so that adding a second vehicle does not silently change it.
+  verification_policy: prioritized
+  signer_id_policy:
+    # A full certificate once a second, a digest otherwise — the J2945/1 rule, and the
+    # reason a recorded frame's length alternates between two values.
+    full_cert_every_ms: 1000
+    digest_otherwise: true
+  pseudonym_change:
+    strategy: time
+    period_s: 300.0
+
+nodes:
+  # The one hardware profile this build ships: the Unex OBU-301 with a Craton2, whose CPU
+  # and HSM service rates come from its published FIPS security policy.
+  default_obu: obu/unex-obu-301-craton2
+  compute_tier: medium
+  backend_tier: medium
+
+# One metric. `pdr` is the packet delivery ratio over reception attempts; the provider that
+# defines it is installed because it does, and the manifest pins its model card.
+metrics: [pdr]
+
+exporters: []

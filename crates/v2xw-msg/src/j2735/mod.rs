@@ -11,6 +11,7 @@
 //! | [`bsm`] | the Basic Safety Message: `BSMcoreData` field for field, the `VehicleSafetyExtensions` Part II container, the `MessageFrame` wrapper, and the builder from a node's belief |
 //! | [`spat`] | `SPAT`: intersection states, movement states, movement events and their timing |
 //! | [`map`] | `MapData`: intersection geometry, lanes, node lists and connections |
+//! | [`psm`] | the Personal Safety Message: the mandatory fields and `Position3D`, the `MessageFrame` wrapper, and the builder from a VRU device's belief — real UPER, not yet oracle-validated |
 //! | [`infra`] | the [`crate::MessageCodec`] seam for SPaT and MAP, and the card that states how well evidenced they are |
 //!
 //! # Trusting the bytes — and the two codecs are not equally trustworthy
@@ -53,6 +54,7 @@
 pub mod bsm;
 pub mod infra;
 pub mod map;
+pub mod psm;
 pub mod spat;
 pub mod uper;
 
