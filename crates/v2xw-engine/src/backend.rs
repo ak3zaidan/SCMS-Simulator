@@ -474,6 +474,50 @@ pub fn catalogue_cards() -> Vec<v2xw_core::card::ModelCard> {
     ]
 }
 
+/// Registers the cards of the backend models this run uses — the vehicles' Uu model, the
+/// authority pipeline and the credential protocol — so the manifest pins them like every
+/// other model of the run.
+///
+/// # Errors
+/// [`EngineError::Registry`] if a card does not validate.
+pub fn register_used(
+    scenario: &Scenario,
+    registry: &mut v2xw_core::registry::Registry,
+) -> Result<()> {
+    use v2xw_core::model::Model;
+    let security = scenario.actors.backend.protocol.is_some()
+        || scenario.security.protocol.is_some()
+        || !scenario.actors.rsus.is_empty()
+        || !scenario.threats.attackers.is_empty()
+        || !scenario.detection.local.is_empty();
+    if !security {
+        return Ok(());
+    }
+    let mut cards = vec![v2xw_threat::LegacyWindow::legacy_defaults().card().clone()];
+    if let Some(uu) = &scenario.net.uu {
+        cards.extend(catalogue_cards().into_iter().filter(|c| c.id == uu.id));
+    }
+    for card in cards {
+        if !registry.contains(&card.id) {
+            registry.register(card)?;
+        }
+    }
+    let mut protocols = v2xw_core::registry::Registry::new();
+    let _ = v2xw_proto::register_all(&mut protocols);
+    let wanted = scenario
+        .actors
+        .backend
+        .protocol
+        .clone()
+        .or_else(|| scenario.security.protocol.as_ref().map(|c| c.id.clone()));
+    for (_, m) in protocols.iter_by_id() {
+        if wanted.as_deref() == Some(m.card.id.as_str()) && !registry.contains(&m.card.id) {
+            registry.register(m.card.clone())?;
+        }
+    }
+    Ok(())
+}
+
 /// A backhaul from its id and parameters.
 fn backhaul_from(id: &str, params: &serde_json::Value, uu_one_way: Duration) -> Result<Backhaul> {
     match id {

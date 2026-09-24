@@ -697,6 +697,7 @@ impl Engine {
         let gen_timing = crate::wiring::generation_timing(&scenario);
         crate::wiring::register_generation_timing(&mut registry, gen_timing)?;
         let providers = crate::wiring::build_metrics(&scenario, &mut registry)?;
+        crate::backend::register_used(&scenario, &mut registry)?;
         let manifest = crate::manifest::assemble(&scenario, &world, &registry, build_utc)?;
         // The snapshot stream's cadence is the scenario's mobility step and, by default,
         // a keyframe every simulated second (§3.1.1). A caller recording into a container

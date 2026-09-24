@@ -116,6 +116,32 @@ pub const RTK_OUTAGE_P95_S: f64 = 60.0;
 /// The GPS SPS committed 95 % velocity accuracy, m/s [GPS SPS PS 2020 Table 3.8-3].
 pub const SPS_VELOCITY_P95_MPS: f64 = 0.2;
 
+/// The interval the outlier and burst probabilities are stated per, seconds.
+///
+/// Both are the frozen engine's values (run.py L300-304: "per-message multipath outlier
+/// probability", "per-step prob a benign vehicle enters a bad-GNSS burst"), and that engine
+/// estimated a position once per 1 s step (`PipelineConfig.dt` = 1.0) for 1 Hz beacons.
+/// This model estimates at every mobility step — ten times a second — and drew each
+/// probability per estimate, which made bursts and outliers ten times as frequent as the
+/// values say and as the legacy detectors and the authority's persistence gate were
+/// calibrated against (the burst is "shorter than the revocation persistence gate",
+/// run.py L304). Each is now a hazard over the elapsed interval:
+/// `p(dt) = 1 - (1 - p)^(dt / EVENT_STEP_S)`, which is `p` at one estimate a second and
+/// the same per-second rate at any other.
+pub const EVENT_STEP_S: f64 = 1.0;
+
+/// The probability of an event of per-[`EVENT_STEP_S`] probability `p` in `dt_s` seconds.
+#[must_use]
+pub fn event_probability(p: f64, dt_s: f64) -> f64 {
+    if p <= 0.0 || dt_s <= 0.0 {
+        return 0.0;
+    }
+    if p >= 1.0 {
+        return 1.0;
+    }
+    1.0 - math::pow(1.0 - p, dt_s / EVENT_STEP_S)
+}
+
 /// One fitted scale and the residual of its fit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuantileFit {
@@ -182,11 +208,13 @@ pub struct GaussMarkovParams {
     pub sigma_white_v_m: f64,
     /// The bias correlation time, seconds.
     pub tau_s: f64,
-    /// Outlier probability per estimate.
+    /// Outlier probability per [`EVENT_STEP_S`] of elapsed time (the legacy engine's
+    /// per-message draw at its one-second step).
     pub outlier_rate: f64,
     /// Outlier magnitude, metres.
     pub outlier_magnitude_m: f64,
-    /// Probability per estimate of entering a degraded burst.
+    /// Probability per [`EVENT_STEP_S`] of entering a degraded burst (the legacy engine's
+    /// per-step draw).
     pub burst_rate: f64,
     /// The σ multiplier during a burst.
     pub burst_factor: f64,
@@ -487,7 +515,9 @@ impl GnssModel for GaussMarkovGnss {
         {
             let coin = ctx.rng(RngDomain::Gnss, EntityRef::Node(node)).f64();
             let state = self.state.entry(node).or_default();
-            if now >= state.burst_until && coin < self.params.burst_rate {
+            if now >= state.burst_until
+                && coin < event_probability(self.params.burst_rate, dt_s)
+            {
                 state.burst_until =
                     now.saturating_add(v2xw_core::time::secs_to_ns(self.params.burst_duration_s));
             }
@@ -516,7 +546,7 @@ impl GnssModel for GaussMarkovGnss {
             gt.pos.y + bias.y + ny,
             gt.pos.z + bias.z + nz,
         );
-        if outlier_coin < self.params.outlier_rate {
+        if outlier_coin < event_probability(self.params.outlier_rate, dt_s) {
             let (s, c) = math::sin_cos(angle);
             pos = Vec3::new(
                 pos.x + self.params.outlier_magnitude_m * c,
@@ -896,6 +926,21 @@ mod tests {
 
     fn world() -> World {
         ring(&RingParams::default()).expect("a ring")
+    }
+
+    /// The event probabilities are per second of elapsed time, not per estimate: ten
+    /// estimates a tenth of a second apart carry the probability of one a second apart.
+    #[test]
+    fn an_event_probability_is_per_second_not_per_estimate() {
+        let p = 0.006;
+        assert!((event_probability(p, 1.0) - p).abs() < 1e-15);
+        let tenth = event_probability(p, 0.1);
+        let over_a_second = 1.0 - math::pow(1.0 - tenth, 10.0);
+        assert!((over_a_second - p).abs() < 1e-12);
+        // Drawn per estimate at 10 Hz, as before, the per-second rate was ten times this.
+        let per_estimate = 1.0 - math::pow(1.0 - p, 10.0);
+        assert!(per_estimate > 9.0 * p);
+        assert_eq!(event_probability(p, 0.0), 0.0);
     }
 
     #[test]
