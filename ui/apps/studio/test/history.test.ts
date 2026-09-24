@@ -16,7 +16,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { MetricHistory } from "../src/lib/history.js";
+import { MetricHistory, SeriesRing } from "../src/lib/history.js";
 
 function fillAndTime(capacity: number, pushes: number): number {
   const h = new MetricHistory(capacity);
@@ -169,5 +169,36 @@ describe("MetricHistory bounds its series count and caches its name list", () =>
     // The oldest names are evicted, the newest are kept.
     expect(h.latest("metric.49999")).toBe(49_999);
     expect(h.latest("metric.0")).toBeNull();
+  });
+});
+
+describe("a new run or a seek back does not keep the old timeline", () => {
+  // The wave A integrator's report: after "Run again" on a 20 s run, e2e_latency.p95 was drawn on
+  // a 50–125 s axis — the previous run's samples were still in the series under the new ones.
+  it("MetricHistory drops every sample later than one that arrives out of order", () => {
+    const h = new MetricHistory(900);
+    for (let t = 1; t <= 125; t++) h.push("e2e_latency.p95", t, 0.01 * t);
+    // A new run starts at t = 1 again.
+    h.push("e2e_latency.p95", 1, 0.5);
+    h.push("e2e_latency.p95", 2, 0.6);
+    const [xs, ys] = h.get("e2e_latency.p95");
+    expect(xs).toEqual([1, 2]);
+    expect(ys).toEqual([0.5, 0.6]);
+  });
+
+  it("MetricHistory keeps what is before a seek target", () => {
+    const h = new MetricHistory(900);
+    for (let t = 1; t <= 20; t++) h.push("pdr", t, t);
+    h.push("pdr", 8.5, 99);
+    expect(h.get("pdr")[0]).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 8.5]);
+  });
+
+  it("SeriesRing does the same for the sparklines", () => {
+    const r = new SeriesRing(["a"], 300);
+    for (let t = 0; t < 50; t++) r.push(t, [t]);
+    r.push(3, [7]);
+    const [xs, ys] = r.toUplotOne(0);
+    expect(xs).toEqual([0, 1, 2, 3]);
+    expect(ys).toEqual([0, 1, 2, 7]);
   });
 });

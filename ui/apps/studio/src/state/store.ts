@@ -431,7 +431,11 @@ interface StudioState {
   compareMetrics: readonly string[];
 
   setConnection: (s: VwpConnectionState) => void;
-  setHello: (h: HelloSummary) => void;
+  /**
+   * Adopt a `Hello`. A new run (or a non-resumed reconnect) empties the timeline; a resumed one
+   * (§1.4 case 1) continues the stream the timeline already describes, so it keeps it.
+   */
+  setHello: (h: HelloSummary, options?: { readonly resumed?: boolean }) => void;
   setWorldSummary: (w: WorldSummary) => void;
   setRun: (r: Partial<RunInfo>) => void;
   setSelection: (actorId: number | null, nodeId: number | null) => void;
@@ -633,7 +637,7 @@ export const useStudio = create<StudioState>((set) => ({
   compareMetrics: [],
 
   setConnection: (s) => set({ connection: s }),
-  setHello: (h) => set({ hello: h, timeline: [] }),
+  setHello: (h, options) => set(options?.resumed === true ? { hello: h } : { hello: h, timeline: [] }),
   setWorldSummary: (w) => set({ world: w }),
   setRun: (r) => set((state) => (sameRun(state.run, r) ? state : { run: { ...state.run, ...r } })),
   setSelection: (actorId, nodeId) => set({ selectedActor: actorId, selectedNode: nodeId, pseudonym: null, inspect: null, inspectMessages: null }),

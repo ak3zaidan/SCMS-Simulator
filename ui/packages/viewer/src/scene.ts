@@ -486,6 +486,14 @@ export class Viewer {
     // should start from rather than the hardcoded 10 Hz default (Q2).
     const stepSeconds = Number(hello.mobilityStepNs) / 1e9;
     if (stepSeconds > 0) this.interpolator.setNominalIntervalSeconds(stepSeconds);
+    // §1.4 case 1: a resumed `Hello` continues the stream the scene is already drawing — the
+    // replay that follows it is the frames that were missed, applied in order — so the
+    // interpolation history, the lamps and the followed car all stay. `0x20` is HELLO_RESUMED
+    // (§3.1.2), spelled as a number because this module imports the protocol's types only.
+    if ((hello.helloFlags & 0x20) !== 0) {
+      this.#signalHello = hello;
+      return;
+    }
     this.interpolator.reset();
     // A different Hello is a different run (or a non-resumed reconnect, §1.4 case 2): nothing the
     // lamps showed belongs to it. The *same* Hello re-applied — the Studio re-attaching the viewer
