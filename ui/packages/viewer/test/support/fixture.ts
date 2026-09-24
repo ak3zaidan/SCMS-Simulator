@@ -50,6 +50,8 @@ export interface GridWorldOptions {
    * Default false.
    */
   readonly controllerSignals?: boolean;
+  /** Make each junction's fourth head a pedestrian head (§4.5 `kind` 1). Default false. */
+  readonly pedestrianHeads?: boolean;
 }
 
 /** A decoded synthetic world plus the axis positions its streets sit on. */
@@ -73,6 +75,7 @@ export function makeGridWorld(options: GridWorldOptions = {}): GridWorld {
     lanesPerDirection: options.lanesPerDirection ?? 2,
     buildingsPerBlock: options.buildingsPerBlock ?? 1,
     controllerSignals: options.controllerSignals ?? false,
+    pedestrianHeads: options.pedestrianHeads ?? false,
   };
   const n = o.blocks;
   const pitch = o.blockM;
@@ -151,7 +154,7 @@ export function makeGridWorld(options: GridWorldOptions = {}): GridWorld {
         signals.push({
           signalId: o.controllerSignals ? junctionId : signalId++, junctionId, laneId: 0,
           xM: x + Math.cos(a) * 9, yM: y + Math.sin(a) * 9, zM: 5.2,
-          kind: 0, group: s,
+          kind: o.pedestrianHeads && s === 3 ? 1 : 0, group: s,
         });
         crossings.push({
           crossingId: crossingId++, junctionId,

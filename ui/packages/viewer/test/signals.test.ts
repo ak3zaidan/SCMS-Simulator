@@ -41,6 +41,48 @@ function headsOf(w: WorldRenderer, signalId: number): number[] {
   return out;
 }
 
+describe("pedestrian signal heads", () => {
+  // Each junction's fourth head is a pedestrian head: MUTCD 2009 §4E.04's two sections, walk
+  // lit on movement-allowed, the hand flashing through clearance and steady on stop, no bar.
+  const pedGrid = makeGridWorld({ blocks: 4, blockM: 120, pedestrianHeads: true });
+  const lit = (rgb: [number, number, number] | null): boolean => (rgb ? Math.max(...rgb) > 0.5 : false);
+
+  it("shows walk, a flashing hand in clearance and a steady hand on don't-walk", () => {
+    const w = new WorldRenderer({ theme: DARK_THEME });
+    w.setWorld(pedGrid.world);
+    let ped = -1;
+    let car = -1;
+    for (let i = 0; i < w.signals.count; i++) {
+      if (w.signals.isPedestrianHead(i) && ped < 0) ped = i;
+      if (!w.signals.isPedestrianHead(i) && car < 0) car = i;
+    }
+    expect(ped).toBeGreaterThanOrEqual(0);
+    const id = w.signals.headState(ped)?.signalId ?? -1;
+
+    w.applySignalKeyframe(block([[id, 6]]));
+    expect(lit(w.signals.lampColor(ped, 2)), "walk lit on movement-allowed").toBe(true);
+    expect(lit(w.signals.lampColor(ped, 0)), "hand dark on walk").toBe(false);
+
+    w.applySignalKeyframe(block([[id, 3]]));
+    expect(lit(w.signals.lampColor(ped, 0)), "hand steady on stop").toBe(true);
+    expect(lit(w.signals.lampColor(ped, 2))).toBe(false);
+    w.signals.update(0.1);
+    w.signals.update(0.6);
+    expect(lit(w.signals.lampColor(ped, 0)), "a steady hand does not flash").toBe(true);
+
+    w.applySignalKeyframe(block([[id, 8]]));
+    w.signals.update(0.1);
+    const on = lit(w.signals.lampColor(ped, 0));
+    w.signals.update(0.6);
+    const off = lit(w.signals.lampColor(ped, 0));
+    expect(on !== off, "the hand flashes through clearance").toBe(true);
+    expect(lit(w.signals.lampColor(ped, 2))).toBe(false);
+    // A vehicle head is untouched by all this: it still lights its three sections.
+    expect(w.signals.isPedestrianHead(car)).toBe(false);
+    w.dispose();
+  });
+});
+
 describe("signal heads", () => {
   it("lights every head of a controller, not just the last one", () => {
     const w = new WorldRenderer({ theme: DARK_THEME });
