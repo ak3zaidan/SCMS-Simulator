@@ -108,11 +108,19 @@ interface LumaStats {
  * file did exactly that and measured nothing but scene motion for its trouble. Group visibility is
  * the lever that survives a frame.
  *
- * The overlay layer is switched off for the duration of the probe. Transmit pulses, links and the
- * heatmap animate on the *render* clock, not the simulation clock, so they keep moving on a paused
- * run: they put 20% of a patch in motion between two otherwise identical draws, which swamps the
- * few hundred pixels a vehicle covers at map altitude. They are a separate layer with its own
- * question, and this probe's question is whether the vehicles and the buildings are drawn.
+ * The overlay layer is switched off for the duration of the probe — all of it but the vehicle
+ * marks. Transmit pulses, links and the heatmap animate on the *render* clock, not the simulation
+ * clock, so they keep moving on a paused run: they put 20% of a patch in motion between two
+ * otherwise identical draws, which swamps the few hundred pixels a vehicle covers at map altitude.
+ * They are a separate layer with its own question, and this probe's question is whether the
+ * vehicles and the buildings are drawn.
+ *
+ * The vehicle marks are not an overlay in that sense: at map altitude the mark **is** how a vehicle
+ * is drawn (`ActorLocatorOverlay`, a constant-angular-size dot, because the 5 m body projects to
+ * three pixels however correctly it is rendered). They stay on, and hiding "the actors" hides both
+ * the bodies and their marks. Switching the whole layer off measured the body alone, which the
+ * design never meant to be visible from 1,700 m — the test and the design disagreed, and the test
+ * reported 16-20 px against a floor it could only meet with a bigger car.
  */
 async function differential(
   page: Page,
@@ -131,7 +139,10 @@ async function differential(
         cameras: { followActorId: number | null };
         interpolator: { outActorId: Uint32Array; outOccupied: Uint8Array; outPosition: Float32Array; count: number };
         actors: { group: { visible: boolean } };
-        overlays: { group: { visible: boolean } };
+        overlays: {
+          group: { visible: boolean; children: { visible: boolean }[] };
+          locators: { group: { visible: boolean } };
+        };
         worldRenderer: { buildingsGroup: { visible: boolean } };
         step(dt: number): unknown;
       };
@@ -139,7 +150,9 @@ async function differential(
       const gl = (canvas.getContext("webgl2") ?? canvas.getContext("webgl")) as WebGLRenderingContext;
       const dw = canvas.width;
       const dh = canvas.height;
-      const node = target === "actors" ? viewer.actors.group : viewer.worldRenderer.buildingsGroup;
+      const nodes = target === "actors"
+        ? [viewer.actors.group, viewer.overlays.locators.group]
+        : [viewer.worldRenderer.buildingsGroup];
       const blank = { ndcX: 0, ndcY: 0, ndcZ: 0, inFrame: false, topmost: "none", coveredFraction: 0, coveredBy: "" };
       const zero = { signal: 0, noise: 0, samples: 0 };
       const noLuma = { mean: 0, stdDev: 0, min: 0, max: 0 };
@@ -258,19 +271,20 @@ async function differential(
 
       // visible → hidden → visible again, with the animated overlays off throughout. The last pair
       // is the noise floor of this very read.
-      const overlaysWere = viewer.overlays.group.visible;
-      viewer.overlays.group.visible = false;
+      const marks = viewer.overlays.locators.group;
+      const animated = viewer.overlays.group.children.filter((c) => c !== marks && c.visible);
+      for (const c of animated) c.visible = false;
       viewer.step(1 / 60);
       viewer.step(1 / 60);
       const shown = grab();
-      const was = node.visible;
-      node.visible = false;
+      const was = nodes.map((n) => n.visible);
+      for (const n of nodes) n.visible = false;
       viewer.step(1 / 60);
       const hidden = grab();
-      node.visible = was;
+      nodes.forEach((n, i) => { n.visible = was[i]; });
       viewer.step(1 / 60);
       const again = grab();
-      viewer.overlays.group.visible = overlaysWere;
+      for (const c of animated) c.visible = true;
       viewer.step(1 / 60);
 
       let sum = 0;
