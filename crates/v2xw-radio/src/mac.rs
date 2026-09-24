@@ -221,6 +221,9 @@ pub struct Backoff {
     pub drawn: u32,
     /// The instant the countdown may resume. `None` while it is frozen on a busy medium.
     pub resume_at: Option<SimTime>,
+    /// The initial AIFS this frame waits, ns (see [`TxGrant::aifs_ns`]).
+    #[serde(default)]
+    pub aifs_ns: u64,
 }
 
 /// The per-node, per-channel state of the EDCA MAC.
@@ -434,22 +437,28 @@ impl<C: Ctx + ?Sized> Mac<C> for EdcaOcbMac {
                     remaining: 0,
                     drawn: 0,
                     resume_at: Some(now),
+                    aifs_ns: 0,
                 }
             } else {
+                let resume_at = if state.busy {
+                    None
+                } else {
+                    Some(
+                        state
+                            .idle_since
+                            .unwrap_or(0)
+                            .max(now.saturating_sub(ac.aifs().as_nanos()))
+                            + ac.aifs().as_nanos(),
+                    )
+                };
                 Backoff {
                     remaining: slots,
                     drawn: slots,
-                    resume_at: if state.busy {
-                        None
-                    } else {
-                        Some(
-                            state
-                                .idle_since
-                                .unwrap_or(0)
-                                .max(now.saturating_sub(ac.aifs().as_nanos()))
-                                + ac.aifs().as_nanos(),
-                        )
-                    },
+                    // Idle for less than an AIFS: the rest of it. Busy: a whole one after
+                    // the medium clears; any further AIFS repeated after later busy
+                    // periods is deferral, not this.
+                    aifs_ns: resume_at.map_or(ac.aifs().as_nanos(), |r| r.saturating_sub(now)),
+                    resume_at,
                 }
             });
         }
@@ -568,6 +577,7 @@ impl<C: Ctx + ?Sized> Mac<C> for EdcaOcbMac {
         }
         let sdu = state.queues[index].pop_front()?;
         let drawn = state.backoff[index].map_or(0, |b| b.drawn);
+        let aifs_ns = state.backoff[index].map_or(0, |b| b.aifs_ns);
         state.backoff[index] = None;
         state.granted[index] += 1;
         let air = air_time(sdu.frame.bytes, sdu.frame.mcs);
@@ -589,6 +599,7 @@ impl<C: Ctx + ?Sized> Mac<C> for EdcaOcbMac {
             // report that the frame is overdue.
             at: due,
             backoff_slots: drawn,
+            aifs_ns,
             // One attempt, always: OCB has no ACK, so there is never a second one for a
             // group-addressed frame.
             attempt: 1,
@@ -611,6 +622,7 @@ impl<C: Ctx + ?Sized> Mac<C> for EdcaOcbMac {
                 // same instant, so a MAC driven by CCA and one driven by `poll` alone
                 // agree (EN 302 663 Annex C.4.2: the procedure runs once per frame).
                 resume_at: Some(air.after(due) + ac.aifs().as_nanos()),
+                aifs_ns: ac.aifs().as_nanos(),
             });
         }
         Some(grant)
@@ -1058,6 +1070,8 @@ impl<C: Ctx + ?Sized> Mac<C> for SlottedMac {
             // mechanism at all.
             at: due,
             backoff_slots: slot,
+            // The slotted abstraction has no per-AC AIFS (04-models.md §4.9).
+            aifs_ns: 0,
             attempt: 1,
         })
     }
@@ -1785,5 +1799,64 @@ mod tests {
             .expect("queued");
         assert!(mac.poll(&mut ctx, node, CH).is_some());
         assert_eq!(mac.id(), EdcaOcbMac::ID);
+    }
+
+    /// On an idle channel the access delay is exactly the AIFS and backoff the grant
+    /// reports: none at all for a frame that finds the medium idle for a full AIFS, and the
+    /// rest of the AIFS plus the drawn slots for one that finds it idle for less.
+    #[test]
+    fn access_on_an_idle_channel_is_the_aifs_and_backoff_the_grant_reports() {
+        let node = NodeId::new(0);
+        let aifs = AccessCategory::Vo.aifs().as_nanos();
+        // Idle since time zero: immediate access, and the grant says so.
+        let mut ctx = TestCtx::new(1);
+        let mut mac = EdcaOcbMac::new();
+        ctx.set_now(1_000_000);
+        Mac::enqueue(
+            &mut mac,
+            &mut ctx,
+            node,
+            sdu(300, 1_000_000),
+            AccessCategory::Vo,
+        )
+        .expect("queued");
+        let g = Mac::poll(&mut mac, &mut ctx, node, CH).expect("granted");
+        assert_eq!((g.at, g.aifs_ns, g.backoff_slots), (1_000_000, 0, 0));
+
+        // Idle for 10 µs when the frame arrives: 48 µs of AIFS left, then the backoff.
+        for seed in 1..=20u64 {
+            let mut ctx = TestCtx::new(seed);
+            let mut mac = EdcaOcbMac::new();
+            ctx.set_now(1_000_000);
+            Mac::on_cca(
+                &mut mac,
+                &mut ctx,
+                node,
+                CH,
+                CcaState::Busy { energy_dbm: -70.0 },
+            );
+            ctx.set_now(1_200_000);
+            Mac::on_cca(&mut mac, &mut ctx, node, CH, CcaState::Idle);
+            let ready = 1_210_000;
+            ctx.set_now(ready);
+            Mac::enqueue(
+                &mut mac,
+                &mut ctx,
+                node,
+                sdu(300, ready),
+                AccessCategory::Vo,
+            )
+            .expect("queued");
+            let due = Mac::<TestCtx>::next_poll_at(&mac, node, CH).expect("armed");
+            ctx.set_now(due);
+            let g = Mac::poll(&mut mac, &mut ctx, node, CH).expect("granted");
+            let slots = u64::from(g.backoff_slots) * timing::SLOT_TIME.as_nanos();
+            assert_eq!(g.aifs_ns, aifs - 10_000);
+            assert_eq!(
+                g.at - ready,
+                g.aifs_ns + slots,
+                "access delay is the AIFS and the backoff, with no deferral"
+            );
+        }
     }
 }

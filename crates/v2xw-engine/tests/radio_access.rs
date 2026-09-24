@@ -225,8 +225,26 @@ fn each_radio_technology_runs_its_own_access_layer() {
     assert_eq!(nr_sl.rat, "nr-v2x-mode2");
     assert!(lte_sl.selections.values().sum::<u64>() > 0 && lte_sl.grants > 0);
     // A BSM that attaches its certificate once a second outgrows a one-sub-channel
-    // reservation, which TS 36.321 §5.14.1.1 answers with a reselection.
-    assert!(lte_sl.selections.get("size-change").copied().unwrap_or(0) > 0);
+    // reservation, which TS 36.321 §5.14.1.1 answers with a reselection. The default LTE
+    // pool is SAE J3161/1's, whose two-sub-channel minimum holds both the digest-signed
+    // and the certificate-bearing BSM, so the trigger is shown on the Molina-Masegosa
+    // pool, where a certificate-bearing BSM needs two 12-PRB sub-channels and a
+    // digest-signed one one.
+    assert_eq!(lte_sl.profile, "sae-j3161");
+    let mut mm = with_rat(open_air(manhattan_fleet(30, 3.0)), "lte-v2x-pc5");
+    mm.radio.models.insert(
+        "sidelink".to_string(),
+        v2xw_engine::scenario::schema::ModelChoice {
+            id: "access/sidelink/engine-coupling".to_string(),
+            params: serde_json::json!({ "profile": "molina-masegosa-2017" }),
+        },
+    );
+    let (mm, _) = run_recorded(mm);
+    let mm_sl = mm
+        .sidelink
+        .as_ref()
+        .expect("an LTE run reports its sidelink");
+    assert!(mm_sl.selections.get("size-change").copied().unwrap_or(0) > 0);
     // Rel-16 only: LTE has no pre-emption and no re-evaluation.
     assert!(!lte_sl.selections.contains_key("preemption"));
     assert!(!lte_sl.selections.contains_key("reevaluation"));

@@ -26,12 +26,21 @@
 //! sidelink the jammer's power is a co-slot interferer across the whole pool, and a lost
 //! transport block that the same draw would have delivered without it is `jammed`.
 //!
-//! # What is not here
+//! # Where a jammer is
 //!
-//! * A jammer does not move: `position_m` is a fixed world point. A jammer riding a vehicle
-//!   is an attacker model (`threats.attackers`) and is not wired.
-//! * The sidelink SPS sensing does not see the jammer's energy, so a UE does not steer its
-//!   reservation away from a jammed sub-channel.
+//! Exactly one of three: `position_m`, a fixed world point; `follow_node`, the node id of
+//! a vehicle (or roadside unit) it rides — its antenna at the vehicle's, and silent while
+//! that node does not exist; or `path_m`, a polyline of world points it drives along at
+//! `speed_mps`, stopping at the end or, with `loop_path: true`, going round again. The
+//! position is re-evaluated at every mobility step and at every frame a reactive jammer
+//! hears, from the simulated clock alone, so a moving jammer is as deterministic as a
+//! fixed one.
+//!
+//! On a sidelink the jammer's energy is also measured: it enters every UE's S-RSSI in each
+//! sub-channel it covers ([`v2xw_radio::SpsEngine::note_jammer`]), so it raises the CBR —
+//! and through it the congestion control's CR limit — and the S-RSSI ranking steers
+//! reservations away from the slots a pulsed jammer covers. It carries no SCI, so it
+//! excludes no resource in step 3.
 
 use v2xw_core::geom::Vec3;
 use v2xw_core::ids::NodeId;
@@ -51,13 +60,68 @@ use crate::scenario::Scenario;
 /// keeps them clear of every vehicle and roadside unit, which count up from zero.
 pub const JAMMER_ID_BASE: u32 = 0xF000_0000;
 
+/// How a jammer moves.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum JammerMotion {
+    /// Standing at `JammerSpec::position`.
+    Fixed,
+    /// Riding a node: its antenna is the node's.
+    Follow {
+        /// The node.
+        node: u32,
+    },
+    /// Driving a polyline at a constant speed.
+    Path {
+        /// The waypoints, world metres (antenna height in z).
+        points: Vec<Vec3>,
+        /// Speed along the path, m/s.
+        speed_mps: f64,
+        /// Whether it goes round again at the end.
+        looped: bool,
+    },
+}
+
+impl JammerMotion {
+    /// Where a path jammer is `t_s` seconds after it set off.
+    fn along_path(points: &[Vec3], speed_mps: f64, looped: bool, t_s: f64) -> Vec3 {
+        let lengths: Vec<f64> = points.windows(2).map(|w| w[0].distance(w[1])).collect();
+        let total = v2xw_core::math::sum_ordered(lengths.iter().copied());
+        if total <= 0.0 || points.len() < 2 {
+            return points.first().copied().unwrap_or(Vec3::ZERO);
+        }
+        let mut d = (speed_mps * t_s).max(0.0);
+        if looped {
+            d %= total;
+        } else if d >= total {
+            return *points.last().expect("two points or more");
+        }
+        for (i, len) in lengths.iter().enumerate() {
+            if d <= *len {
+                let f = if *len > 0.0 { d / len } else { 0.0 };
+                let (a, b) = (points[i], points[i + 1]);
+                return Vec3::new(
+                    a.x + (b.x - a.x) * f,
+                    a.y + (b.y - a.y) * f,
+                    a.z + (b.z - a.z) * f,
+                );
+            }
+            d -= len;
+        }
+        *points.last().expect("two points or more")
+    }
+}
+
 /// One jammer as the scenario declared it, parsed.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct JammerSpec {
     /// Which profile.
     pub kind: JammerKind,
-    /// Where its antenna stands, world metres.
+    /// Where its antenna stands, world metres, for a fixed jammer; the first waypoint for
+    /// a path jammer; the origin for one riding a node.
     pub position: Vec3,
+    /// How it moves.
+    pub motion: JammerMotion,
     /// Its transmit power, dBm; the profile's cited default when absent.
     pub power_dbm: Option<f64>,
     /// When it is active, simulated seconds `[from, to)`.
@@ -75,7 +139,16 @@ pub struct JammerSpec {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JammerParams {
-    position_m: Vec<f64>,
+    #[serde(default)]
+    position_m: Option<Vec<f64>>,
+    #[serde(default)]
+    follow_node: Option<u32>,
+    #[serde(default)]
+    path_m: Option<Vec<Vec<f64>>>,
+    #[serde(default)]
+    speed_mps: Option<f64>,
+    #[serde(default)]
+    loop_path: Option<bool>,
     #[serde(default)]
     power_dbm: Option<f64>,
     #[serde(default)]
@@ -122,31 +195,80 @@ pub fn jammer_specs(scenario: &Scenario) -> Result<Vec<JammerSpec>, Vec<(String,
                 errors.push((
                     format!("{path}.params"),
                     format!(
-                        "do not fit a jammer: {e}. A jammer needs position_m: [x, y] or \
-                         [x, y, z] in world metres, and takes power_dbm, from_s, to_s, and \
-                         for a pulsed one period_ms and duty, for a reactive one trigger_dbm"
+                        "do not fit a jammer: {e}. A jammer needs one of position_m: [x, y] \
+                         or [x, y, z] in world metres, follow_node: <node id>, or path_m: \
+                         [[x, y], ...] with speed_mps (and loop_path); it takes power_dbm, \
+                         from_s, to_s, and for a pulsed one period_ms and duty, for a \
+                         reactive one trigger_dbm"
                     ),
                 ));
                 continue;
             }
         };
-        let position = match p.position_m.as_slice() {
-            [x, y] => Vec3::new(*x, *y, 1.5),
-            [x, y, z] => Vec3::new(*x, *y, *z),
-            _ => {
-                errors.push((
-                    format!("{path}.params.position_m"),
-                    "must be [x, y] or [x, y, z] in world metres".to_string(),
-                ));
-                continue;
-            }
+        let point = |v: &[f64]| -> Option<Vec3> {
+            let p = match v {
+                [x, y] => Vec3::new(*x, *y, 1.5),
+                [x, y, z] => Vec3::new(*x, *y, *z),
+                _ => return None,
+            };
+            (p.x.is_finite() && p.y.is_finite() && p.z.is_finite()).then_some(p)
         };
-        if !(position.x.is_finite() && position.y.is_finite() && position.z.is_finite()) {
+        let given = [
+            p.position_m.is_some(),
+            p.follow_node.is_some(),
+            p.path_m.is_some(),
+        ]
+        .iter()
+        .filter(|b| **b)
+        .count();
+        if given != 1 {
             errors.push((
-                format!("{path}.params.position_m"),
-                "is not a finite position".to_string(),
+                format!("{path}.params"),
+                "must place the jammer exactly one way: position_m, follow_node or path_m"
+                    .to_string(),
             ));
             continue;
+        }
+        let (position, motion) = if let Some(v) = p.position_m.as_deref() {
+            let Some(pos) = point(v) else {
+                errors.push((
+                    format!("{path}.params.position_m"),
+                    "must be [x, y] or [x, y, z] in finite world metres".to_string(),
+                ));
+                continue;
+            };
+            (pos, JammerMotion::Fixed)
+        } else if let Some(node) = p.follow_node {
+            (Vec3::ZERO, JammerMotion::Follow { node })
+        } else {
+            let raw = p.path_m.as_deref().unwrap_or(&[]);
+            let points: Option<Vec<Vec3>> = raw.iter().map(|v| point(v)).collect();
+            let speed = p.speed_mps.unwrap_or(0.0);
+            match points {
+                Some(points) if points.len() >= 2 && speed.is_finite() && speed > 0.0 => (
+                    points[0],
+                    JammerMotion::Path {
+                        points,
+                        speed_mps: speed,
+                        looped: p.loop_path.unwrap_or(false),
+                    },
+                ),
+                _ => {
+                    errors.push((
+                        format!("{path}.params.path_m"),
+                        "needs at least two [x, y] or [x, y, z] waypoints in finite world \
+                         metres and a positive speed_mps"
+                            .to_string(),
+                    ));
+                    continue;
+                }
+            }
+        };
+        if p.speed_mps.is_some() && p.path_m.is_none() {
+            errors.push((
+                format!("{path}.params.speed_mps"),
+                "only applies to a path_m jammer".to_string(),
+            ));
         }
         if let Some(w) = p.power_dbm
             && !(w.is_finite() && (-30.0..=40.0).contains(&w))
@@ -176,6 +298,7 @@ pub fn jammer_specs(scenario: &Scenario) -> Result<Vec<JammerSpec>, Vec<(String,
         out.push(JammerSpec {
             kind,
             position,
+            motion,
             power_dbm: p.power_dbm,
             from_s,
             to_s: p.to_s,
@@ -239,6 +362,7 @@ pub(crate) struct Jammer {
     pub(crate) id: NodeId,
     pub(crate) kind: JammerKind,
     pub(crate) position: Vec3,
+    pub(crate) motion: JammerMotion,
     active_from: SimTime,
     active_to: SimTime,
     profile: Profile,
@@ -300,6 +424,7 @@ impl Jamming {
                     id: NodeId::new(JAMMER_ID_BASE + i as u32),
                     kind: s.kind,
                     position: s.position,
+                    motion: s.motion,
                     active_from: (s.from_s * 1e9).round() as u64,
                     active_to: s.to_s.map_or(horizon, |t| (t * 1e9).round() as u64),
                     profile,
@@ -320,6 +445,33 @@ impl Jamming {
 }
 
 impl Engine {
+    /// Where jammer `k` is at `now`, or `None` while the node it rides does not exist.
+    pub(crate) fn jammer_position(&self, k: usize, now: SimTime) -> Option<Vec3> {
+        let j = &self.jamming.jammers[k];
+        match &j.motion {
+            JammerMotion::Fixed => Some(j.position),
+            JammerMotion::Follow { node } => {
+                let pos = self.node_pos(NodeId::new(*node), now)?;
+                // On a vehicle, the antenna stands at a car's antenna height above the road
+                // (TR 36.885 via 04-models.md §3.7); a roadside unit's position is already
+                // its antenna's.
+                if self.rsus.contains_key(&NodeId::new(*node)) {
+                    Some(pos)
+                } else {
+                    Some(Vec3::new(pos.x, pos.y, pos.z + 1.5))
+                }
+            }
+            JammerMotion::Path {
+                points,
+                speed_mps,
+                looped,
+            } => {
+                let t_s = now.saturating_sub(j.active_from) as f64 * 1e-9;
+                Some(JammerMotion::along_path(points, *speed_mps, *looped, t_s))
+            }
+        }
+    }
+
     /// The deterministic large-scale power a jammer at `from` delivers to a node at `to`,
     /// dBm: path loss, shadowing and obstacles, no fast-fading draw.
     fn jam_power_dbm(
@@ -408,13 +560,16 @@ impl Engine {
         self.phy.jamming_mut().prune(cutoff);
         let count = self.jamming.jammers.len();
         for k in 0..count {
-            let (id, kind, pos, from_a, to_a) = {
+            let (id, kind, from_a, to_a) = {
                 let j = &self.jamming.jammers[k];
-                (j.id, j.kind, j.position, j.active_from, j.active_to)
+                (j.id, j.kind, j.active_from, j.active_to)
             };
             if kind == JammerKind::Reactive || to_a <= now || from_a >= to {
                 continue;
             }
+            let Some(pos) = self.jammer_position(k, now) else {
+                continue;
+            };
             let (from, until) = (now.max(from_a), to.min(to_a));
             let windows = {
                 let Engine {
@@ -465,13 +620,16 @@ impl Engine {
         let channel = self.access_channel();
         let count = self.jamming.jammers.len();
         for k in 0..count {
-            let (id, kind, pos, from_a, to_a) = {
+            let (id, kind, from_a, to_a) = {
                 let j = &self.jamming.jammers[k];
-                (j.id, j.kind, j.position, j.active_from, j.active_to)
+                (j.id, j.kind, j.active_from, j.active_to)
             };
             if kind != JammerKind::Reactive || start >= to_a || start < from_a {
                 continue;
             }
+            let Some(pos) = self.jammer_position(k, start) else {
+                continue;
+            };
             // What the jammer's own receiver hears of the frame.
             let heard = self.jam_power_dbm(tx, tx_pos, tx_power_dbm, id, pos);
             let sensed = [SensedInterval::new(start, end, heard)];
@@ -521,6 +679,10 @@ impl Engine {
         self.phy
             .jamming_mut()
             .insert_windows(rx, jammer, power_dbm, channel, kind, windows);
+        // A sidelink UE measures the jammer's energy as S-RSSI in every sub-channel it
+        // covers: it enters the CBR and the S-RSSI ranking (it carries no SCI, so it
+        // excludes nothing).
+        self.sidelink_note_jam(rx, power_dbm, windows);
         if power_dbm >= v2xw_radio::phy::CBR_BUSY_THRESHOLD_DBM
             && let Some(mac) = self.mac.as_mut()
         {

@@ -1277,6 +1277,13 @@ pub struct TxGrant {
     /// How many backoff slots were counted down before this frame went out. Zero for a
     /// frame that found the medium idle for a full AIFS.
     pub backoff_slots: u32,
+    /// How much of the access delay was the initial AIFS, ns: zero for a frame that found
+    /// the medium already idle for a full AIFS (it goes out at once, IEEE 802.11-2020
+    /// §10.23.2.2 — the backoff procedure is invoked only for a frame that finds the
+    /// medium busy), the rest of the AIFS for one that found it idle for less, and a whole
+    /// AIFS for one that found it busy. Zero on a sidelink, which has no AIFS.
+    #[serde(default)]
+    pub aifs_ns: u64,
     /// How many times this frame has been attempted. Always 1 for a group-addressed
     /// frame: OCB has no ACK, so nothing is ever retransmitted (04-models.md §4.3).
     pub attempt: u32,

@@ -333,6 +333,7 @@ mod tests {
             cert_bytes: None,
             pseudonym: None,
             content: None,
+            radio: None,
         }
     }
 

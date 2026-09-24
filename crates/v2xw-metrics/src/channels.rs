@@ -332,6 +332,59 @@ pub struct NodeTxView {
     /// What the message said, decoded from the payload octets that went on the air.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<MsgContentView>,
+    /// How the access layer sent it: the technology's own MCS and resource, and for a
+    /// sidelink the congestion state and which HARQ transmission this was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio: Option<TxRadioView>,
+}
+
+/// How one transmission went out, in the access layer's own terms (NODE).
+///
+/// `node.tx`'s `mcs` byte is the index in the technology's own table; this says which
+/// table, and carries what a sidelink transmission has that an 802.11p frame does not.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TxRadioView {
+    /// `dsrc-80211p`, `lte-v2x-mode4` or `nr-v2x-mode2`.
+    pub rat: String,
+    /// The MCS by name: an 802.11p rate (`6mbps-qpsk-1/2`), an LTE MCS
+    /// (`lte-mcs7-j3161`) or an NR MCS of TS 38.214 Table 5.1.3.1-1 (`nr-mcs9`).
+    pub mcs: String,
+    /// Modulation order: 1 BPSK, 2 QPSK, 4 16-QAM, 6 64-QAM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qm: Option<u8>,
+    /// Code rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_rate: Option<f64>,
+    /// Sidelink: the subframe or slot index the transport block went out in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u64>,
+    /// Sidelink: the first sub-channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subch: Option<u32>,
+    /// Sidelink: how many sub-channels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subch_len: Option<u32>,
+    /// Sidelink: the pool's sub-channel count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subchannels: Option<u32>,
+    /// Sidelink: 1 for the initial transmission, 2 and 3 for blind retransmissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// Sidelink: how many transmissions the transport block gets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<u32>,
+    /// Sidelink: the packet's priority (PPPP), 1-8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>,
+    /// Sidelink: the CBR congestion control read, `[0, 1]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cbr: Option<f64>,
+    /// Sidelink: the channel-occupancy ratio with this transmission, `[0, 1]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cr: Option<f64>,
+    /// Sidelink: the CR limit in force; absent when there was none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cr_limit: Option<f64>,
 }
 
 /// What one transmitted message said.
@@ -454,6 +507,16 @@ pub struct PhyRxView {
     /// The application payload delivered, for goodput.
     #[serde(default)]
     pub payload_bytes: Option<u64>,
+    /// Where the link sat against a focus region (`inside`, `outside`, `inbound`,
+    /// `outbound`), when the run has one. `outbound` links are received by the cheaper
+    /// rule and carry the region's stated bias (02-architecture.md §7.3), so an aggregate
+    /// can keep them apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
+    /// Sidelink: how many copies of the transport block the receiver combined, when it
+    /// was sent with blind retransmissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copies: Option<u32>,
 }
 
 /// serde default for a `bool` field that defaults to true.

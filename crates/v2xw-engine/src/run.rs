@@ -459,6 +459,11 @@ struct FrameState {
     /// Receivers inside a `high` focus region, whose reception the high-tier PHY rule
     /// decides (preamble capture) whatever the surrounding tier is.
     focus_high: std::collections::BTreeSet<NodeId>,
+    /// Each receiver's place against the focus region, when the run has one: the tag
+    /// `phy.rx` carries so boundary-biased links can be told apart.
+    focus_placement: BTreeMap<NodeId, &'static str>,
+    /// The transport block's sidelink state across its blind retransmissions.
+    sl: sidelink::SlFrame,
     /// Every octet of the PSDU by layer (`v2xw_net::frame`). `bytes` is the SPDU a
     /// receiver verifies; `layers.psdu_bytes()` is what went on the air, and what the air
     /// time is computed from.
@@ -1240,6 +1245,13 @@ impl Engine {
                 } => self.on_node_phase(recorder, horizon, Some(node)),
                 Event::MacTimer { node, channel } => {
                     self.on_mac_timer(node, ChannelId(channel), horizon);
+                    if self
+                        .sidelink
+                        .as_ref()
+                        .is_some_and(|sl| !sl.finalize.is_empty())
+                    {
+                        self.sidelink_finalize(recorder);
+                    }
                 }
                 Event::PhyStart { frame, .. } => self.on_phy_start(frame, horizon),
                 Event::PhyEnd { frame } => self.on_phy_end(recorder, frame),
@@ -2523,6 +2535,8 @@ impl Engine {
                 sl_resource: None,
                 sl_interferers: BTreeMap::new(),
                 focus_high: std::collections::BTreeSet::new(),
+                focus_placement: BTreeMap::new(),
+                sl: sidelink::SlFrame::default(),
                 layers,
                 cert_bytes: tx.cert_bytes(),
                 t_generated,
@@ -2780,7 +2794,12 @@ impl Engine {
                 // The split of the access delay the latency decomposition reports: one
                 // AIFS of the frame's category and the slots the MAC counted down; the
                 // rest is deferral to a busy medium.
-                state.mac_aifs_ns = SAFETY_AC.aifs().as_nanos();
+                //
+                // The AIFS is the MAC's own account of what this frame waited: none when
+                // it found the medium idle for a full AIFS and went out at once. It used to
+                // be a whole AIFS on every frame, so a frame sent the instant it was ready
+                // reported 58 µs of AIFS inside a zero access delay.
+                state.mac_aifs_ns = grant.aifs_ns;
                 state.mac_backoff_ns = u64::from(grant.backoff_slots)
                     * v2xw_radio::types::timing::SLOT_TIME.as_nanos();
             } else {
@@ -2923,7 +2942,14 @@ impl Engine {
         };
         let Some(pos) = self.node_pos(state.tx, now) else {
             // The transmitter despawned between the grant and the air. Nothing to do: the
-            // frame is gone with it.
+            // frame is gone with it — except the receivers still waiting to combine a
+            // sidelink retransmission, whose losses are recorded.
+            if !state.sl.held.is_empty()
+                && let Some(sl) = self.sidelink.as_mut()
+            {
+                sl.finalize.push(frame);
+                self.frames.insert(frame, state);
+            }
             return;
         };
         state.tx_pos = pos;
@@ -3050,7 +3076,7 @@ impl Engine {
         // attempt: no receiver detects a frame that far under its own noise. It stays as
         // energy, which is what it is.
         for &(rx, rx_pos) in &candidates {
-            let (rssi, dist, high) =
+            let (rssi, dist, high, placement) =
                 self.link_budget(&state, rx, rx_pos, headings.get(&rx).copied());
             if rssi < floor_dbm {
                 state.faint.insert(rx, rssi);
@@ -3060,6 +3086,9 @@ impl Engine {
             state.arrivals.insert(rx, (rssi, dist));
             if high {
                 state.focus_high.insert(rx);
+            }
+            if let Some(p) = placement {
+                state.focus_placement.insert(rx, p);
             }
         }
         // Beyond the cap: line-of-sight energy only, from the deterministic law. A path
@@ -3208,17 +3237,17 @@ impl Engine {
         let frame_index = u64::from(frame.index());
 
         let tx_id = state.tx_id();
-        let mut outcomes: Vec<LinkOutcome> = if self.sidelink.is_some() {
-            self.sidelink_outcomes(&state)
-        } else {
-            self.dsrc_outcomes(&state)
-        };
+        if self.sidelink.is_some() {
+            self.sidelink_phy_end(recorder, frame, state, now);
+            return;
+        }
+        let mut outcomes: Vec<LinkOutcome> = self.dsrc_outcomes(&state);
 
         // The merge. `par_iter` over a `BTreeMap` is not an indexed parallel iterator, so
         // the order the results arrive in is `rayon`'s business; the guarantee the run
         // depends on is stated here rather than inherited from a library's iterator kind.
         outcomes.sort_by_key(|o| o.rx);
-        self.finish_phy_end(recorder, frame, state, now, frame_index, tx_id, outcomes);
+        self.finish_phy_end(recorder, frame, &state, now, frame_index, tx_id, outcomes);
     }
 
     /// The 802.11p reception decisions for one frame, per receiver, in parallel.
@@ -3239,6 +3268,7 @@ impl Engine {
                     distance_m,
                     received: false,
                     cause: Some(LossCause::OutOfRange),
+                    copies: None,
                 };
                 let Some(arrival) = phy.arrival(RxHandle { tx: tx_id, rx }) else {
                     // Nothing was registered for this receiver, which the PHY reports as
@@ -3277,12 +3307,28 @@ impl Engine {
         &mut self,
         recorder: &mut dyn RunRecorder,
         frame: FrameSeq,
-        state: FrameState,
+        state: &FrameState,
         now: SimTime,
         frame_index: u64,
         tx_id: u64,
         outcomes: Vec<LinkOutcome>,
     ) {
+        let _ = frame_index;
+        self.finish_rx_only(recorder, frame, state, now, tx_id, outcomes);
+        self.emit_tx_record(recorder, frame, state);
+    }
+
+    /// Records and delivers one frame's decided receptions, and retires its arrivals.
+    fn finish_rx_only(
+        &mut self,
+        recorder: &mut dyn RunRecorder,
+        frame: FrameSeq,
+        state: &FrameState,
+        now: SimTime,
+        tx_id: u64,
+        outcomes: Vec<LinkOutcome>,
+    ) {
+        let frame_index = u64::from(frame.index());
         let mut received_any = false;
         // Which receivers decoded a frame carrying an application payload, and when it
         // reached them, so the payload is acted on once per receiver after every outcome
@@ -3310,6 +3356,10 @@ impl Engine {
                 },
                 outcome.cause.map(cause_name),
                 outcome.distance_m,
+            )
+            .with_link_tags(
+                state.focus_placement.get(&outcome.rx).copied(),
+                outcome.copies,
             );
             self.emit(recorder, &record);
             // The same attempt, on `node.rx`, with the sender's side of the journey. A PHY
@@ -3432,7 +3482,40 @@ impl Engine {
         {
             self.phy.end_tx(handle);
         }
+    }
 
+    /// The `node.tx` record of one transmission, with the access layer's own view of it.
+    fn emit_tx_record(
+        &mut self,
+        recorder: &mut dyn RunRecorder,
+        frame: FrameSeq,
+        state: &FrameState,
+    ) {
+        let frame_index = u64::from(frame.index());
+        let psdu = state.layers.psdu_bytes();
+        let (mcs_index, radio) = match self.sidelink.as_ref() {
+            Some(sl) => {
+                let (i, v) = sl.radio_view(state.sl.grant.as_ref());
+                (i, v)
+            }
+            None => (
+                Mcs::ALL
+                    .iter()
+                    .position(|m| *m == state.descriptor.mcs)
+                    .and_then(|i| u8::try_from(i).ok()),
+                v2xw_metrics::channels::TxRadioView {
+                    rat: "dsrc-80211p".to_string(),
+                    mcs: dsrc_mcs_label(state.descriptor.mcs),
+                    qm: Some(match state.descriptor.mcs.modulation() {
+                        v2xw_radio::types::Modulation::Bpsk => 1,
+                        v2xw_radio::types::Modulation::Qpsk => 2,
+                        v2xw_radio::types::Modulation::Qam16 => 4,
+                        v2xw_radio::types::Modulation::Qam64 => 6,
+                    }),
+                    ..Default::default()
+                },
+            ),
+        };
         let tx_record = NodeTx::new(
             state.start,
             state.tx,
@@ -3457,7 +3540,8 @@ impl Engine {
             state.mac_backoff_ns,
         )
         .with_layers(&state.layers, state.cert_bytes)
-        .with_content(Some(hex_digest(&state.signer.0[..])), state.content.clone());
+        .with_content(Some(hex_digest(&state.signer.0[..])), state.content.clone())
+        .with_radio(mcs_index, Some(radio));
         self.emit(recorder, &tx_record);
     }
 
@@ -3709,7 +3793,7 @@ impl Engine {
         rx: NodeId,
         rx_pos: Vec3,
         rx_heading: Option<f64>,
-    ) -> (f64, f64, bool) {
+    ) -> (f64, f64, bool, Option<&'static str>) {
         let now = self.scheduler.now();
         let link = LinkKey::new(state.tx, rx);
         let distance_m = state.tx_pos.distance(rx_pos);
@@ -3775,6 +3859,7 @@ impl Engine {
                 }
             }
         }
+        let placement = evaluation.map(|e| e.placement.label());
 
         let (loss, fade, obstacle_db) = {
             let Engine {
@@ -3835,7 +3920,7 @@ impl Engine {
             -rain_db,
             fade,
         ]);
-        (rssi_dbm, distance_m, high)
+        (rssi_dbm, distance_m, high, placement)
     }
 
     /// The vehicles that may stand between two antennas: every actor whose body centre is
@@ -4000,6 +4085,7 @@ impl Engine {
     /// At the end of the run, every attempt still between the PHY and an application is
     /// recorded as in flight, so each `phy.rx` attempt has exactly one `node.rx` fate.
     fn resolve_in_flight(&mut self, recorder: &mut dyn RunRecorder, at: SimTime) {
+        self.sidelink_resolve_all(recorder);
         for (_, attempt) in core::mem::take(&mut self.rx_pending) {
             self.emit(recorder, &attempt.in_flight(at));
         }
@@ -4140,7 +4226,7 @@ const fn drop_cause_name(cause: v2xw_node::DropCause) -> &'static str {
 
 /// One receiver's evaluated outcome for one frame.
 #[derive(Debug, Clone, Copy)]
-struct LinkOutcome {
+pub(crate) struct LinkOutcome {
     rx: NodeId,
     rssi_dbm: f64,
     sinr_db: f64,
@@ -4149,6 +4235,24 @@ struct LinkOutcome {
     /// Exactly one loss cause when the frame did not decode, and `None` when it did
     /// (invariant I-R3).
     cause: Option<LossCause>,
+    /// Sidelink with blind retransmissions: the copies this receiver combined.
+    copies: Option<u32>,
+}
+
+/// The 802.11p rate's name as `node.tx` reports it: data rate, modulation, code rate.
+fn dsrc_mcs_label(mcs: Mcs) -> String {
+    let m = match mcs.modulation() {
+        v2xw_radio::types::Modulation::Bpsk => "bpsk",
+        v2xw_radio::types::Modulation::Qpsk => "qpsk",
+        v2xw_radio::types::Modulation::Qam16 => "16qam",
+        v2xw_radio::types::Modulation::Qam64 => "64qam",
+    };
+    let r = match mcs.code_rate() {
+        v2xw_radio::types::CodeRate::R1_2 => "1/2",
+        v2xw_radio::types::CodeRate::R2_3 => "2/3",
+        v2xw_radio::types::CodeRate::R3_4 => "3/4",
+    };
+    format!("{}mbps-{m}-{r}", mcs.rate_mbps())
 }
 
 /// The radio actor class a vehicle class transmits as: what sets its antenna height and

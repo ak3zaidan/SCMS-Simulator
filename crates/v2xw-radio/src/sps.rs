@@ -59,7 +59,7 @@ use v2xw_core::time::{Duration, SimTime};
 
 use crate::numeric;
 use crate::sidelink::{
-    Numerology, PoolConfig, ProbResourceKeep, Rri, SidelinkOccupancy, SlRat, SlResource,
+    Numerology, PoolConfig, Pppp, ProbResourceKeep, Rri, SidelinkOccupancy, SlRat, SlResource,
     TxPercentage,
 };
 use crate::traits::Mac;
@@ -98,14 +98,22 @@ pub struct SpsParams {
     /// `probResourceKeep`.
     pub prob_keep: ProbResourceKeep,
     /// Total transmissions per transport block: 1 for no retransmission (the
-    /// 04-models.md §5.1 default), 2 for the one blind retransmission the LTE simulator
-    /// convention allows, up to `sl-MaxTransNum-r16` for NR.
+    /// 04-models.md §5.1 default), 2 for LTE's one blind retransmission
+    /// (`allowedRetxNumberPSSCH-r14 {n0, n1}`), and for NR up to
+    /// `sl-MaxNumPerReserve-r16` (3) resources announced in one SCI.
     pub max_transmissions: u32,
-    /// The gap between a transmission and its blind retransmission, in slots.
+    /// How far apart the resources of one transport block may be, slots.
     ///
-    /// The SCI's time-gap field carries it; the LTE convention is within ±15 ms
-    /// [04-models.md §5.1 step 7].
-    pub retransmission_gap_slots: u64,
+    /// LTE: the SCI format 1 "time gap between initial transmission and retransmission"
+    /// is four bits, 0 to 15 subframes [TS 36.212 §5.4.3.1.2; TS 36.213 §14.1.1.4C], so
+    /// 15. NR: every resource one SCI reserves lies within a window of 32 slots
+    /// [TS 38.214 §8.1.5; TS 38.212 §8.3.1.1 time resource assignment], so 31.
+    pub retx_window_slots: u64,
+    /// The CBR-dependent CR limits enforced before each transmission, or `None` for no
+    /// congestion control (the study profiles of 04-models.md §5.5 run without it).
+    pub cc: Option<crate::sidelink::CrLimitTable>,
+    /// The S-RSSI above which a sub-channel counts as busy in the CBR, dBm.
+    pub cbr_threshold_dbm: f64,
     /// Whether sensing runs at all. `false` is the random-selection baseline of
     /// [Ali 2021 §II.1]: every in-pool resource in the window is a candidate.
     pub sensing: bool,
@@ -140,12 +148,31 @@ impl SpsParams {
             rri: Rri(period_ms),
             prob_keep: ProbResourceKeep::ZERO,
             max_transmissions: 1,
-            retransmission_gap_slots: 15,
+            retx_window_slots: 15,
+            cc: None,
+            cbr_threshold_dbm: crate::sidelink::CBR_SRSSI_THRESHOLD_DBM,
             sensing: true,
             srssi_ranking: true,
             reevaluation: false,
             preemption: false,
             max_per_reserve: 1,
+        }
+    }
+
+    /// The SAE J3161/1 LTE-V2X deployment profile's SPS: 10 Hz BSMs with a 100 ms
+    /// reservation, `probResourceKeep` 0.8, and the J3161/1 CR limits enforced
+    /// ([`crate::sidelink::CrLimitTable::SAE_J3161`]).
+    ///
+    /// The keep probability and the CR limits are J3161/1's, second-hand (Abrar et al.
+    /// 2026, arXiv 2608.05087). The sensing window, `T1`, `T2` and the RSRP threshold are
+    /// not quoted there, so they stay the Molina-Masegosa study values and the card says
+    /// so. J3161/1 §7.3.3's "SPS + one-shot" interleaving is not modelled.
+    #[must_use]
+    pub fn sae_j3161() -> Self {
+        Self {
+            prob_keep: ProbResourceKeep::P080,
+            cc: Some(crate::sidelink::CrLimitTable::SAE_J3161),
+            ..Self::molina_masegosa(10)
         }
     }
 
@@ -192,7 +219,9 @@ impl SpsParams {
             rri: Rri::MS100,
             prob_keep: ProbResourceKeep::ZERO,
             max_transmissions: 1,
-            retransmission_gap_slots: u64::from(mu.t_proc1_slots()),
+            retx_window_slots: 31,
+            cc: None,
+            cbr_threshold_dbm: crate::sidelink::CBR_SRSSI_THRESHOLD_DBM,
             sensing: true,
             srssi_ranking: true,
             reevaluation: true,
@@ -268,6 +297,11 @@ pub struct SensingHistory {
     cells: Vec<SensedCell>,
     /// The slot each transmit-flag cell holds, so staleness is detectable.
     tx_slot: Vec<u64>,
+    /// Energy with no SCI behind it — a jammer's — as `[from_slot, to_slot)` intervals
+    /// with the linear power it puts into *each* sub-channel, mW. Kept as intervals rather
+    /// than written into every cell, because a constant jammer covers every slot of the
+    /// window and would otherwise cost `window × sub-channels` writes per mobility step.
+    jam: Vec<(u64, u64, f64)>,
 }
 
 impl SensingHistory {
@@ -280,7 +314,32 @@ impl SensingHistory {
             subchannels,
             cells: vec![SensedCell::EMPTY; n],
             tx_slot: vec![u64::MAX; window_slots as usize],
+            jam: Vec::new(),
         }
+    }
+
+    /// Records energy that carries no SCI over `[from_slot, to_slot)`, `mw_per_subch` in
+    /// every sub-channel: a wideband jammer as this UE's receiver measures it.
+    pub fn note_jam(&mut self, from_slot: u64, to_slot: u64, mw_per_subch: f64) {
+        if to_slot <= from_slot || !(mw_per_subch > 0.0) {
+            return;
+        }
+        // Everything that has left the window is forgotten, so the list stays bounded by
+        // the jam windows of one sensing window.
+        let keep_from = to_slot.saturating_sub(2 * self.window_slots);
+        self.jam.retain(|&(_, to, _)| to > keep_from);
+        self.jam.push((from_slot, to_slot, mw_per_subch));
+    }
+
+    /// The jammer energy in one sub-channel of one slot, mW.
+    #[must_use]
+    pub fn jam_mw(&self, slot: u64) -> f64 {
+        v2xw_core::math::sum_ordered(
+            self.jam
+                .iter()
+                .filter(|&&(from, to, _)| from <= slot && slot < to)
+                .map(|&(_, _, mw)| mw),
+        )
     }
 
     fn index(&self, slot: u64, subch: u32) -> usize {
@@ -356,10 +415,21 @@ impl SensingHistory {
         (c.slot == slot).then_some(c)
     }
 
-    /// The linear S-RSSI on one resource, mW, or zero when nothing was measured.
+    /// The linear S-RSSI on one resource, mW, or zero when nothing was measured: every
+    /// transmission's energy in the sub-channel plus any jammer's.
+    ///
+    /// A slot the UE transmitted in reads zero: a half-duplex radio measured nothing there.
     #[must_use]
     pub fn srssi_mw(&self, slot: u64, subch: u32) -> f64 {
-        self.cell(slot, subch).map_or(0.0, |c| c.srssi_mw)
+        if subch >= self.subchannels || self.transmitted_in(slot) {
+            return 0.0;
+        }
+        let own = self.cell(slot, subch).map_or(0.0, |c| c.srssi_mw);
+        if self.jam.is_empty() {
+            own
+        } else {
+            own + self.jam_mw(slot)
+        }
     }
 }
 
@@ -376,6 +446,9 @@ pub struct Reservation {
     pub rri_slots: u64,
     /// `C_resel`: how many further transmissions the reservation is held for.
     pub c_resel: u32,
+    /// The blind retransmissions reserved with it: `(slots after the initial
+    /// transmission, first sub-channel)`, at most two. They repeat with the same period.
+    pub retx: [Option<(u64, u32)>; 2],
 }
 
 impl Reservation {
@@ -384,6 +457,56 @@ impl Reservation {
     pub const fn resource(&self) -> SlResource {
         SlResource::new(self.next_slot, self.subch, self.len)
     }
+
+    /// Every resource this reservation uses in its next period, initial first.
+    #[must_use]
+    pub fn period_resources(&self) -> Vec<SlResource> {
+        let mut out = vec![self.resource()];
+        for (off, subch) in self.retx.iter().flatten() {
+            out.push(SlResource::new(self.next_slot + off, *subch, self.len));
+        }
+        out
+    }
+
+    /// How many blind retransmissions each transport block gets.
+    #[must_use]
+    pub fn retx_count(&self) -> u32 {
+        self.retx.iter().flatten().count() as u32
+    }
+}
+
+/// What the UE was last granted: which resource, which transmission of the transport
+/// block, and the congestion state it was granted under — what `node.tx` reports.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SlGrantInfo {
+    /// The resource the transmission goes out on.
+    pub resource: SlResource,
+    /// 1 for the initial transmission, 2 and 3 for blind retransmissions.
+    pub attempt: u32,
+    /// How many transmissions the transport block gets in all.
+    pub total: u32,
+    /// The packet's priority.
+    pub pppp: Pppp,
+    /// The CBR the congestion control used, `[0, 1]`.
+    pub cbr: f64,
+    /// The CR including this transmission, `[0, 1]`.
+    pub cr: f64,
+    /// The CR limit in force, `None` for no limit.
+    pub cr_limit: Option<f64>,
+    /// Every resource the SCI of this transmission announces for the transport block in
+    /// this period (the initial and its retransmissions), which is what a receiver that
+    /// decodes it learns.
+    pub announced: Vec<SlResource>,
+}
+
+/// A blind retransmission owed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PendingRetx {
+    resource: SlResource,
+    sdu: MacSdu,
+    pppp: Pppp,
+    attempt: u32,
+    total: u32,
 }
 
 /// Why a selection happened, which is what a report needs to separate the mechanisms.
@@ -433,12 +556,22 @@ struct UeState {
     history: SensingHistory,
     occupancy: SidelinkOccupancy,
     reservation: Option<Reservation>,
-    /// Queued SDUs, oldest first. One access category: sidelink has no EDCA.
-    queue: Vec<MacSdu>,
-    /// Blind retransmissions still owed for the frame most recently granted.
-    retransmissions_left: u32,
-    /// The slot the owed retransmission fires in.
-    retransmission_slot: u64,
+    /// Queued SDUs with their priority, oldest first. One queue: sidelink has no EDCA.
+    queue: Vec<(MacSdu, Pppp)>,
+    /// Blind retransmissions owed, in slot order.
+    pending_retx: Vec<PendingRetx>,
+    /// The last grant, for the record.
+    last_grant: Option<SlGrantInfo>,
+    /// Retransmissions that will not happen (congestion control dropped them, or their
+    /// slot passed unpolled), not yet handed back to the caller.
+    abandoned: Vec<MacSdu>,
+    /// Transport blocks congestion control dropped, not yet handed back.
+    cc_dropped: Vec<MacSdu>,
+    /// Counters: transport blocks and retransmissions congestion control dropped, and
+    /// retransmissions granted.
+    cc_dropped_tb: u64,
+    cc_dropped_retx: u64,
+    retx_granted: u64,
     /// The last selection, for inspection.
     last_selection: Option<SelectionOutcome>,
     /// Frames dropped because the latency deadline passed before a grant, or because
@@ -519,8 +652,13 @@ impl SpsEngine {
             occupancy: SidelinkOccupancy::new(pool),
             reservation: None,
             queue: Vec::new(),
-            retransmissions_left: 0,
-            retransmission_slot: 0,
+            pending_retx: Vec::new(),
+            last_grant: None,
+            abandoned: Vec::new(),
+            cc_dropped: Vec::new(),
+            cc_dropped_tb: 0,
+            cc_dropped_retx: 0,
+            retx_granted: 0,
             last_selection: None,
             dropped: 0,
             granted: 0,
@@ -569,16 +707,77 @@ impl SpsEngine {
             .note_sensed(res, rsrp_dbm, rri_slots);
     }
 
-    /// Feeds received energy on one resource into a UE's S-RSSI measurement, and into its
-    /// CBR meter when the energy exceeds the configured threshold.
+    /// Feeds received energy on one sub-channel of one slot into a UE's S-RSSI
+    /// measurement, which is what both the S-RSSI ranking and the CBR read.
+    ///
+    /// `power_dbm` is the energy *in that sub-channel*: a transmission received at `P`
+    /// over `len` sub-channels puts `P/len` into each.
     pub fn note_energy(&mut self, node: NodeId, slot: u64, subch: u32, power_dbm: f64) {
-        let threshold = self.params.rsrp_threshold_dbm;
         let st = self.state(node);
         st.history
             .note_energy(slot, subch, numeric::dbm_to_mw(power_dbm));
-        if power_dbm >= threshold {
-            st.occupancy.note_busy(slot, subch);
-        }
+    }
+
+    /// Feeds a jammer's energy into a UE's S-RSSI over `[from_slot, to_slot)`.
+    /// `power_dbm` is the jammer's received power over the whole channel; the share in
+    /// each sub-channel is [`PoolConfig::subchannel_share`] of it.
+    ///
+    /// A jammer carries no SCI, so it excludes nothing in step 3; what it changes is the
+    /// S-RSSI ranking of step 5 and the CBR, and through the CBR the CR limit.
+    pub fn note_jammer(&mut self, node: NodeId, from_slot: u64, to_slot: u64, power_dbm: f64) {
+        let share = self.pool.subchannel_share();
+        let st = self.state(node);
+        st.history
+            .note_jam(from_slot, to_slot, numeric::dbm_to_mw(power_dbm) * share);
+    }
+
+    /// Over every UE: transport blocks and retransmissions congestion control dropped.
+    #[must_use]
+    pub fn cc_drops_total(&self) -> (u64, u64) {
+        self.ues.values().fold((0, 0), |(a, b), s| {
+            (a + s.cc_dropped_tb, b + s.cc_dropped_retx)
+        })
+    }
+
+    /// Transmissions a UE's congestion control dropped, and retransmissions it dropped.
+    #[must_use]
+    pub fn cc_drops(&self, node: NodeId) -> (u64, u64) {
+        self.ues
+            .get(&node.index())
+            .map_or((0, 0), |s| (s.cc_dropped_tb, s.cc_dropped_retx))
+    }
+
+    /// Blind retransmissions a UE has been granted.
+    #[must_use]
+    pub fn retransmissions(&self, node: NodeId) -> u64 {
+        self.ues.get(&node.index()).map_or(0, |s| s.retx_granted)
+    }
+
+    /// The UE's last grant: resource, attempt, and the congestion state it was taken in.
+    #[must_use]
+    pub fn last_grant(&self, node: NodeId) -> Option<&SlGrantInfo> {
+        self.ues
+            .get(&node.index())
+            .and_then(|s| s.last_grant.as_ref())
+    }
+
+    /// The transport blocks whose remaining blind retransmissions will not happen, since
+    /// the last call: the caller holds receivers waiting to combine them and has to
+    /// resolve those receptions.
+    pub fn take_abandoned(&mut self, node: NodeId) -> Vec<MacSdu> {
+        self.ues
+            .get_mut(&node.index())
+            .map(|s| core::mem::take(&mut s.abandoned))
+            .unwrap_or_default()
+    }
+
+    /// The transport blocks congestion control dropped before their first transmission,
+    /// since the last call.
+    pub fn take_cc_dropped(&mut self, node: NodeId) -> Vec<MacSdu> {
+        self.ues
+            .get_mut(&node.index())
+            .map(|s| core::mem::take(&mut s.cc_dropped))
+            .unwrap_or_default()
     }
 
     /// Records that a UE transmitted in a slot: it sensed nothing there (half duplex) and
@@ -609,13 +808,103 @@ impl SpsEngine {
         self.ues.get(&node.index()).map(|s| &s.history)
     }
 
-    /// A UE's sidelink CBR at a slot: the fraction of sub-channels above the S-RSSI
-    /// threshold over the last `100 · 2^µ` slots (04-models.md §5.1 channel accounting).
+    /// A UE's sidelink CBR at slot `n`: the fraction of the sub-channels of slots
+    /// `[n − 100·2^µ, n − 1]` whose S-RSSI exceeded [`SpsParams::cbr_threshold_dbm`]
+    /// [TS 36.214 §5.1.30; TS 38.215 §5.1.25; ETSI TS 103 574 §5.2].
+    ///
+    /// The S-RSSI is the sum of everything that landed in the sub-channel — every
+    /// transmission's share and any jammer's — so two weak overlapping transmissions can
+    /// make a sub-channel busy that neither would alone. Slots the UE transmitted in
+    /// measured nothing and count as not busy; the window is clamped to what the sensing
+    /// ring holds.
     #[must_use]
     pub fn sidelink_cbr(&self, node: NodeId, slot: u64) -> f64 {
-        self.ues
-            .get(&node.index())
-            .map_or(0.0, |s| s.occupancy.cbr(slot))
+        let Some(st) = self.ues.get(&node.index()) else {
+            return 0.0;
+        };
+        let window = (100 * u64::from(self.pool.mu.slots_per_ms()))
+            .min(st.history.window_slots())
+            .min(slot);
+        let s = self.pool.subchannels();
+        if window == 0 || s == 0 {
+            return 0.0;
+        }
+        let threshold = numeric::dbm_to_mw(self.params.cbr_threshold_dbm);
+        let mut busy = 0u64;
+        for t in slot - window..slot {
+            for sc in 0..s {
+                if st.history.srssi_mw(t, sc) > threshold {
+                    busy += 1;
+                }
+            }
+        }
+        busy as f64 / (window * u64::from(s)) as f64
+    }
+
+    /// A UE's channel-occupancy ratio at slot `n` for priority `k`, per TS 36.213
+    /// §14.1.1.4C and ETSI TS 103 574 §5.1: sub-channels used by packets of priority `k`
+    /// or lower in `[n − a, n − 1]`, plus those its reservations hold in `[n, n + b]`,
+    /// plus `extra` (the transmission being decided), over every sub-channel of the
+    /// `a + b + 1 = 1000·2^µ`-slot window.
+    ///
+    /// The future part counts the live reservation's remaining periods (excluding the one
+    /// at `n`, which is what `extra` is for), each with `future_retx` blind
+    /// retransmissions, and every owed retransmission.
+    #[must_use]
+    pub fn cr_with(
+        &self,
+        node: NodeId,
+        now_slot: u64,
+        k: Pppp,
+        extra: u64,
+        future_retx: u32,
+    ) -> f64 {
+        let Some(st) = self.ues.get(&node.index()) else {
+            return 0.0;
+        };
+        let (a, b) = st.occupancy.cr_split();
+        let past = st
+            .occupancy
+            .used_at_or_below(now_slot.saturating_sub(a), now_slot, k);
+        let horizon = now_slot + b;
+        let mut future = 0u64;
+        if let Some(r) = st.reservation
+            && r.rri_slots > 0
+        {
+            let per_period = u64::from(r.len) * (1 + u64::from(future_retx));
+            let mut slot = r.next_slot;
+            let mut left = r.c_resel;
+            while slot <= horizon && left > 0 {
+                if slot > now_slot {
+                    future += per_period;
+                }
+                slot += r.rri_slots;
+                left -= 1;
+            }
+        }
+        for p in &st.pending_retx {
+            if p.resource.slot >= now_slot && p.resource.slot <= horizon && p.pppp.0 >= k.0 {
+                future += u64::from(p.resource.len);
+            }
+        }
+        let cap = st.occupancy.cr_capacity().max(1);
+        (past + future + extra) as f64 / cap as f64
+    }
+
+    /// The CBR the congestion control reads for a transmission in slot `n`: the one
+    /// measured in `n − 4` ("for a (re)transmission in subframe n+4, the CBR measured in
+    /// subframe n is used", ETSI TS 103 574 §5.2).
+    #[must_use]
+    pub fn cc_cbr(&self, node: NodeId, now_slot: u64) -> f64 {
+        self.sidelink_cbr(node, now_slot.saturating_sub(4))
+    }
+
+    /// The CR limit in force for a packet of priority `k` at slot `n`, if any.
+    #[must_use]
+    pub fn cr_limit(&self, node: NodeId, now_slot: u64, k: Pppp) -> Option<f64> {
+        let table = self.params.cc.as_ref()?;
+        let l = table.limit(self.cc_cbr(node, now_slot), k);
+        l.is_finite().then_some(l)
     }
 
     /// A UE's channel-occupancy ratio at a slot.
@@ -636,6 +925,19 @@ impl SpsEngine {
     #[must_use]
     pub fn granted(&self, node: NodeId) -> u64 {
         self.ues.get(&node.index()).map_or(0, |s| s.granted)
+    }
+
+    /// How many blind retransmissions a transport block gets: `max_transmissions − 1`,
+    /// capped at LTE's one (`allowedRetxNumberPSSCH-r14 {n0, n1}`) and at NR's
+    /// `sl-MaxNumPerReserve − 1` resources after the first in one SCI.
+    #[must_use]
+    pub fn retx_budget(&self) -> u32 {
+        let want = self.params.max_transmissions.saturating_sub(1);
+        let cap = match self.params.rat {
+            SlRat::LteMode4 => 1,
+            SlRat::NrMode2 => self.params.max_per_reserve.saturating_sub(1).min(2),
+        };
+        want.min(cap)
     }
 
     /// The candidate single-subframe resources of step 2: every `(slot, start)` in the
@@ -860,7 +1162,7 @@ impl SpsEngine {
                 .clamp(1, scored.len());
             scored.into_iter().take(keep_n).map(|(r, _, _)| r).collect()
         } else {
-            surviving
+            surviving.clone()
         };
         if ranked.is_empty() {
             return None;
@@ -880,6 +1182,52 @@ impl SpsEngine {
             (pick, c)
         };
         let chosen = ranked[pick];
+
+        // Step 7: the blind retransmissions' resources, chosen the same way as the
+        // initial one — uniformly from the reported set (`S_B`, falling back to the
+        // exclusion survivors `S_A`) — inside the window one SCI can announce: ±15
+        // subframes for LTE (the 4-bit SF_gap of SCI format 1, TS 36.213 §14.1.1.4C) and
+        // 32 slots for NR (TS 38.214 §8.1.5). The earliest of the picks becomes the
+        // initial transmission, since an SCI only points forward.
+        let n_retx = self.retx_budget();
+        let mut picks: Vec<SlResource> = vec![chosen];
+        if n_retx > 0 {
+            let w = self.params.retx_window_slots;
+            let mut rng = ctx.rng(RngDomain::SpsSelection, EntityRef::Node(node));
+            for _ in 0..n_retx {
+                let fits = |r: &SlResource| {
+                    let lo = picks
+                        .iter()
+                        .map(|p| p.slot)
+                        .min()
+                        .unwrap_or(r.slot)
+                        .min(r.slot);
+                    let hi = picks
+                        .iter()
+                        .map(|p| p.slot)
+                        .max()
+                        .unwrap_or(r.slot)
+                        .max(r.slot);
+                    !picks.iter().any(|p| p.slot == r.slot) && hi - lo <= w
+                };
+                let mut pool_b: Vec<SlResource> = ranked.iter().copied().filter(fits).collect();
+                if pool_b.is_empty() {
+                    pool_b = surviving.iter().copied().filter(fits).collect();
+                }
+                if pool_b.is_empty() {
+                    break;
+                }
+                let i = rng.below(pool_b.len() as u64) as usize;
+                picks.push(pool_b[i]);
+            }
+        }
+        picks.sort_by_key(|r| (r.slot, r.subch));
+        let chosen = picks[0];
+        let mut retx = [None, None];
+        for (i, r) in picks.iter().skip(1).take(2).enumerate() {
+            retx[i] = Some((r.slot - chosen.slot, r.subch));
+        }
+
         let outcome = SelectionOutcome {
             resource: chosen,
             reason,
@@ -897,6 +1245,7 @@ impl SpsEngine {
             len: chosen.len,
             rri_slots,
             c_resel,
+            retx,
         });
         st.last_selection = Some(outcome);
         self.selections += 1;
@@ -1038,13 +1387,19 @@ impl SpsEngine {
     #[must_use]
     pub fn next_grant_at(&self, node: NodeId) -> Option<SimTime> {
         let st = self.ues.get(&node.index())?;
-        if st.queue.is_empty() && st.retransmissions_left == 0 {
-            return None;
+        let retx = st.pending_retx.iter().map(|p| p.resource.slot).min();
+        let initial = if st.queue.is_empty() {
+            None
+        } else {
+            st.reservation.map(|r| r.next_slot)
+        };
+        match (retx, initial) {
+            (None, None) => None,
+            (a, b) => Some(
+                self.pool
+                    .slot_start(a.into_iter().chain(b).min().unwrap_or(0)),
+            ),
         }
-        if st.retransmissions_left > 0 {
-            return Some(self.pool.slot_start(st.retransmission_slot));
-        }
-        st.reservation.map(|r| self.pool.slot_start(r.next_slot))
     }
 }
 
@@ -1092,7 +1447,7 @@ impl<C: Ctx + ?Sized> Mac<C> for SpsEngine {
         _ctx: &mut C,
         node: NodeId,
         sdu: MacSdu,
-        _ac: AccessCategory,
+        ac: AccessCategory,
     ) -> core::result::Result<(), DropCause> {
         // A sidelink transport block spans as many sub-channels as it needs; the cap is
         // the whole pool, not an MSDU length (04-models.md §5.1 reference mapping).
@@ -1111,7 +1466,7 @@ impl<C: Ctx + ?Sized> Mac<C> for SpsEngine {
                 depth,
             });
         }
-        st.queue.push(sdu);
+        st.queue.push((sdu, Pppp::of_access_category(ac)));
         Ok(())
     }
 
@@ -1146,56 +1501,108 @@ impl<C: Ctx + ?Sized> Mac<C> for SpsEngine {
     fn poll(&mut self, ctx: &mut C, node: NodeId, _ch: ChannelId) -> Option<TxGrant> {
         let now = ctx.now();
         let now_slot = self.pool.slot_of(now);
+        self.state(node);
 
-        let max_tx = self.params.max_transmissions;
-        let gap = self.params.retransmission_gap_slots;
-
-        // A blind retransmission is owed and its slot has come.
+        // 1. Blind retransmissions. One whose slot passed unpolled cannot be sent any more
+        //    and is handed back as abandoned; one due now is sent if congestion control
+        //    allows it, and dropped — with every later retransmission of the same
+        //    transport block — if it does not (ETSI TS 103 574 §5.3: "transmissions can
+        //    be dropped if the CR limit can still not be met").
         {
-            let st = self.state(node);
-            if st.retransmissions_left > 0 && st.retransmission_slot <= now_slot {
-                if let Some(sdu) = st.queue.first().copied() {
-                    st.retransmissions_left -= 1;
-                    st.granted += 1;
-                    let attempt = max_tx - st.retransmissions_left;
-                    if st.retransmissions_left == 0 {
-                        st.queue.remove(0);
-                    } else {
-                        st.retransmission_slot = now_slot + gap;
+            let st = self.ues.get_mut(&node.index()).expect("created above");
+            let mut gone: Vec<MacSdu> = Vec::new();
+            st.pending_retx.retain(|p| {
+                if p.resource.slot < now_slot {
+                    if !gone.iter().any(|g| g.frame.sdu_ref == p.sdu.frame.sdu_ref) {
+                        gone.push(p.sdu);
                     }
-                    return Some(TxGrant {
-                        sdu,
-                        ac: AccessCategory::Vo,
-                        at: now,
-                        backoff_slots: 0,
-                        attempt,
-                    });
+                    false
+                } else {
+                    true
                 }
-                st.retransmissions_left = 0;
+            });
+            st.abandoned.extend(gone);
+        }
+        let due = self.ues.get(&node.index()).and_then(|st| {
+            st.pending_retx
+                .iter()
+                .position(|p| p.resource.slot == now_slot)
+        });
+        if let Some(i) = due {
+            let p = self
+                .ues
+                .get_mut(&node.index())
+                .expect("exists")
+                .pending_retx
+                .remove(i);
+            let len = u64::from(p.resource.len);
+            let limit = self.cr_limit(node, now_slot, p.pppp);
+            let future_retx = self.reservation(node).map_or(0, |r| r.retx_count());
+            let cr = self.cr_with(node, now_slot, p.pppp, len, future_retx);
+            let cbr = self.cc_cbr(node, now_slot);
+            let st = self.ues.get_mut(&node.index()).expect("exists");
+            if limit.is_some_and(|l| cr > l) {
+                st.cc_dropped_retx += 1;
+                let key = p.sdu.frame.sdu_ref;
+                let before = st.pending_retx.len();
+                st.pending_retx.retain(|q| q.sdu.frame.sdu_ref != key);
+                st.cc_dropped_retx += (before - st.pending_retx.len()) as u64;
+                st.abandoned.push(p.sdu);
+            } else {
+                for sc in p.resource.range() {
+                    st.occupancy.note_used_by(now_slot, sc, p.pppp);
+                }
+                st.retx_granted += 1;
+                st.granted += 1;
+                let announced = st
+                    .pending_retx
+                    .iter()
+                    .filter(|q| q.sdu.frame.sdu_ref == p.sdu.frame.sdu_ref)
+                    .map(|q| q.resource)
+                    .chain(core::iter::once(p.resource))
+                    .collect::<Vec<_>>();
+                st.last_grant = Some(SlGrantInfo {
+                    resource: p.resource,
+                    attempt: p.attempt,
+                    total: p.total,
+                    pppp: p.pppp,
+                    cbr,
+                    cr,
+                    cr_limit: limit,
+                    announced,
+                });
+                return Some(TxGrant {
+                    sdu: p.sdu,
+                    ac: AccessCategory::Vo,
+                    at: now,
+                    backoff_slots: 0,
+                    aifs_ns: 0,
+                    attempt: p.attempt,
+                });
             }
         }
 
-        // Transport blocks whose latency budget has passed are dropped, oldest first, and
-        // handed back through `take_expired`: transmitting a BSM older than its own
-        // successor is worse than not transmitting it.
+        // 2. Transport blocks whose latency budget has passed are dropped, oldest first,
+        //    and handed back through `take_expired`: transmitting a BSM older than its own
+        //    successor is worse than not transmitting it.
         let budget = self.latency_budget_slots();
         {
             let pool_slot = |t: SimTime| self.pool.slot_of(t);
             let expired_heads = self.ues.get(&node.index()).map_or(0, |s| {
                 s.queue
                     .iter()
-                    .take_while(|q| pool_slot(q.enqueued_at) + budget < now_slot)
+                    .take_while(|(q, _)| pool_slot(q.enqueued_at) + budget < now_slot)
                     .count()
             });
             if expired_heads > 0 {
                 let st = self.state(node);
-                let gone: Vec<MacSdu> = st.queue.drain(..expired_heads).collect();
+                let gone: Vec<MacSdu> = st.queue.drain(..expired_heads).map(|(s, _)| s).collect();
                 st.dropped += gone.len() as u64;
                 st.expired.extend(gone);
             }
         }
 
-        let sdu = self
+        let (sdu, pppp) = self
             .ues
             .get(&node.index())
             .and_then(|s| s.queue.first().copied())?;
@@ -1216,9 +1623,9 @@ impl<C: Ctx + ?Sized> Mac<C> for SpsEngine {
             }
         }
 
-        // Rel-16 re-evaluation and pre-emption run before the reservation is honoured, and
-        // the two Rel-14 MAC triggers of TS 36.321 §5.14.1.1 before either: a grant too
-        // small for the transport block, or one beyond its latency budget.
+        // 3. Rel-16 re-evaluation and pre-emption run before the reservation is honoured,
+        //    and the two Rel-14 MAC triggers of TS 36.321 §5.14.1.1 before either: a grant
+        //    too small for the transport block, or one beyond its latency budget.
         let arrival_slot = self.pool.slot_of(sdu.enqueued_at);
         let reason = match self.reservation(node) {
             None => Some(SelectionReason::NoReservation),
@@ -1239,19 +1646,76 @@ impl<C: Ctx + ?Sized> Mac<C> for SpsEngine {
         if res.next_slot != now_slot {
             return None;
         }
+
+        // 4. Congestion control, before the transmission (ETSI TS 103 574 §5.1: "prior to
+        //    each transmission, the ITS-S shall ensure that its CR complies with CR
+        //    limit"). What the UE may give up, in order: the blind retransmissions, and
+        //    then the transport block itself. The reservation stays: the resource is
+        //    skipped this period, not released.
+        let res_len = u64::from(res.len);
+        let limit = self.cr_limit(node, now_slot, pppp);
+        let cbr = self.cc_cbr(node, now_slot);
+        let mut retx_keep = res.retx_count();
+        // The plan being judged is the UE's own: the retransmissions it gives up now it
+        // would give up in the coming periods too, so the future part is counted with
+        // the same number.
+        let cr_for = |e: &Self, keep: u32| {
+            e.cr_with(node, now_slot, pppp, res_len * (1 + u64::from(keep)), keep)
+        };
+        let mut cr = cr_for(self, retx_keep);
+        if let Some(l) = limit {
+            while cr > l && retx_keep > 0 {
+                retx_keep -= 1;
+                self.state(node).cc_dropped_retx += 1;
+                cr = cr_for(self, retx_keep);
+            }
+            if cr > l {
+                let st = self.state(node);
+                st.queue.remove(0);
+                st.cc_dropped_tb += 1;
+                st.dropped += 1;
+                st.cc_dropped.push(sdu);
+                self.on_transmitted(ctx, node);
+                return None;
+            }
+        }
+
+        // 5. The grant.
+        let total = 1 + retx_keep;
+        let period = res.period_resources();
+        let announced: Vec<SlResource> = period.iter().take(total as usize).copied().collect();
         let st = self.state(node);
         st.granted += 1;
-        if max_tx > 1 {
-            st.retransmissions_left = max_tx - 1;
-            st.retransmission_slot = now_slot + gap;
-        } else {
-            st.queue.remove(0);
+        st.queue.remove(0);
+        for sc in res.resource().range() {
+            st.occupancy.note_used_by(now_slot, sc, pppp);
         }
+        for (i, r) in period.iter().skip(1).take(retx_keep as usize).enumerate() {
+            st.pending_retx.push(PendingRetx {
+                resource: *r,
+                sdu,
+                pppp,
+                attempt: 2 + i as u32,
+                total,
+            });
+        }
+        st.pending_retx.sort_by_key(|p| p.resource.slot);
+        st.last_grant = Some(SlGrantInfo {
+            resource: res.resource(),
+            attempt: 1,
+            total,
+            pppp,
+            cbr,
+            cr,
+            cr_limit: limit,
+            announced,
+        });
         let grant = TxGrant {
             sdu,
             ac: AccessCategory::Vo,
             at: now,
             backoff_slots: 0,
+            aifs_ns: 0,
             attempt: 1,
         };
         self.on_transmitted(ctx, node);
@@ -1985,5 +2449,196 @@ mod tests {
                 .rng_domains
                 .contains(&"sps-selection".to_string())
         );
+    }
+
+    fn j3161(params: SpsParams) -> SpsEngine {
+        SpsEngine::new(
+            Tier::High,
+            PoolConfig::sae_j3161(crate::sidelink::LTE_MCS7_J3161),
+            params,
+        )
+    }
+
+    /// Polls a UE every slot in `from..to` and returns `(slot, grant info)` per grant.
+    fn grants(
+        e: &mut SpsEngine,
+        ctx: &mut TestCtx,
+        node: NodeId,
+        from: u64,
+        to: u64,
+    ) -> Vec<(u64, SlGrantInfo)> {
+        let mut out = Vec::new();
+        for slot in from..to {
+            ctx.set_now(e.pool().slot_start(slot));
+            if let Some(g) = Mac::poll(e, ctx, node, ChannelId::CCH) {
+                let info = e.last_grant(node).expect("a grant is recorded").clone();
+                assert_eq!(g.attempt, info.attempt);
+                out.push((slot, info));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_blind_retransmission_is_reserved_inside_the_sci_window_and_sent() {
+        let node = NodeId::new(1);
+        for seed in 1..=8u64 {
+            let mut e = j3161(SpsParams::sae_j3161().with_max_transmissions(2));
+            let mut ctx = TestCtx::new(seed);
+            Mac::enqueue(&mut e, &mut ctx, node, sdu(200, 0), AccessCategory::Vi).expect("fits");
+            let g = grants(&mut e, &mut ctx, node, 0, 200);
+            assert_eq!(
+                g.len(),
+                2,
+                "seed {seed}: one block, two transmissions: {g:?}"
+            );
+            let (s1, first) = &g[0];
+            let (s2, second) = &g[1];
+            assert_eq!((first.attempt, second.attempt), (1, 2));
+            assert_eq!((first.total, second.total), (2, 2));
+            assert!(
+                s2 > s1 && s2 - s1 <= 15,
+                "gap {} outside SCI format 1's 0-15",
+                s2 - s1
+            );
+            assert_eq!(first.resource.slot, *s1);
+            assert_eq!(second.resource.slot, *s2);
+            assert_eq!(first.resource.len, second.resource.len);
+            // The initial SCI announces both resources; the retransmission's only its own.
+            assert_eq!(first.announced.len(), 2);
+            assert!(first.announced.contains(&second.resource));
+            assert_eq!(e.retransmissions(node), 1);
+        }
+        // The counterexample: without retransmissions, one grant.
+        let mut e = j3161(SpsParams::sae_j3161());
+        let mut ctx = TestCtx::new(1);
+        Mac::enqueue(&mut e, &mut ctx, node, sdu(200, 0), AccessCategory::Vi).expect("fits");
+        assert_eq!(grants(&mut e, &mut ctx, node, 0, 200).len(), 1);
+    }
+
+    /// A one-range table with a tiny limit, so a test can put the CR on either side of it
+    /// with a handful of sub-channels.
+    const TINY: crate::sidelink::CrLimitTable = crate::sidelink::CrLimitTable {
+        id: "test-tiny",
+        source: "test",
+        cbr_bounds: &[1.0],
+        closure: crate::sidelink::RangeClosure::UpperInclusive,
+        classes: &[(1, 8, &[0.0005])],
+    };
+
+    #[test]
+    fn congestion_control_gives_up_the_retransmission_then_the_block() {
+        // One-shot traffic (no reservation period), so the CR is the past use plus this
+        // block: the limit 0.0005 of a 1,000 × 10 sub-channel window is five
+        // sub-channel-slots, and a two-sub-channel block with its retransmission is four.
+        let run = |past: u64, cc: Option<crate::sidelink::CrLimitTable>| {
+            let params = SpsParams {
+                rri: Rri::NONE,
+                cc,
+                ..SpsParams::sae_j3161()
+            }
+            .with_max_transmissions(2);
+            let mut e = j3161(params);
+            let node = NodeId::new(1);
+            for i in 0..past {
+                e.state(node)
+                    .occupancy
+                    .note_used_by(400 + i, 0, crate::sidelink::Pppp::BSM);
+            }
+            let mut ctx = TestCtx::new(4);
+            let t = e.pool().slot_start(500);
+            Mac::enqueue(&mut e, &mut ctx, node, sdu(200, t), AccessCategory::Vi).expect("fits");
+            let g = grants(&mut e, &mut ctx, node, 500, 700);
+            let dropped = e.take_cc_dropped(node).len();
+            (g.len(), e.cc_drops(node), dropped)
+        };
+        // Past 0: 4 ≤ 5, both transmissions go.
+        assert_eq!(run(0, Some(TINY)), (2, (0, 0), 0));
+        // Past 2: 6 > 5 with the retransmission, 4 without — the retransmission is dropped.
+        assert_eq!(run(2, Some(TINY)), (1, (0, 1), 0));
+        // Past 4: 6 > 5 even alone — the block is dropped and handed back.
+        assert_eq!(run(4, Some(TINY)), (0, (1, 1), 1));
+        // The counterexample: no congestion control, both go whatever the past.
+        assert_eq!(run(4, None), (2, (0, 0), 0));
+    }
+
+    #[test]
+    fn the_cr_limit_follows_the_measured_cbr() {
+        let params = SpsParams {
+            cc: Some(crate::sidelink::CrLimitTable::ETSI_TS_103_574),
+            ..SpsParams::sae_j3161()
+        };
+        let mut e = j3161(params);
+        let node = NodeId::new(1);
+        let k = crate::sidelink::Pppp::BSM;
+        assert_eq!(
+            e.cr_limit(node, 1000, k),
+            None,
+            "a quiet channel has no limit"
+        );
+        // Every sub-channel of the last 100 subframes above −94 dBm: CBR 1.
+        for slot in 896..1000u64 {
+            for sc in 0..10 {
+                e.note_energy(node, slot, sc, -80.0);
+            }
+        }
+        assert!((e.sidelink_cbr(node, 1000) - 1.0).abs() < 1e-12);
+        assert_eq!(e.cr_limit(node, 1004, k), Some(0.003));
+        // Below −94 dBm the same energy is not busy.
+        let mut quiet = j3161(SpsParams::sae_j3161());
+        for slot in 900..1000u64 {
+            for sc in 0..10 {
+                quiet.note_energy(node, slot, sc, -95.0);
+            }
+        }
+        assert_eq!(quiet.sidelink_cbr(node, 1000), 0.0);
+    }
+
+    #[test]
+    fn a_jammer_raises_the_cbr_and_steers_the_srssi_ranking_away() {
+        let node = NodeId::new(1);
+        let mut e = j3161(SpsParams::sae_j3161());
+        assert_eq!(e.sidelink_cbr(node, 1000), 0.0);
+        // −60 dBm over the 100-PRB channel is −70 dBm in each ten-PRB sub-channel.
+        e.note_jammer(node, 0, 1000, -60.0);
+        assert!((e.sidelink_cbr(node, 1000) - 1.0).abs() < 1e-12);
+        let mut weak = j3161(SpsParams::sae_j3161());
+        weak.note_jammer(node, 0, 1000, -90.0);
+        assert_eq!(
+            weak.sidelink_cbr(node, 1000),
+            0.0,
+            "−100 dBm per sub-channel is idle"
+        );
+
+        // A pulsed jammer on the first half of every 100 ms: the ranking keeps the quiet
+        // half, whatever the pick.
+        for seed in 1..=10u64 {
+            let mut p = j3161(SpsParams::sae_j3161());
+            for k in 0..10u64 {
+                p.note_jammer(node, k * 100, k * 100 + 50, -60.0);
+            }
+            let mut ctx = TestCtx::new(seed);
+            let out = p
+                .select(&mut ctx, node, 1000, 2, SelectionReason::NoReservation)
+                .expect("selects");
+            assert!(
+                out.resource.slot % 100 >= 50,
+                "seed {seed}: picked slot {} inside the jammed half",
+                out.resource.slot
+            );
+        }
+        // The counterexample: no jammer, and the pick lands in the first half sometimes.
+        let mut first_half = 0;
+        for seed in 1..=10u64 {
+            let mut p = j3161(SpsParams::sae_j3161());
+            let mut ctx = TestCtx::new(seed);
+            let out = p
+                .select(&mut ctx, node, 1000, 2, SelectionReason::NoReservation)
+                .expect("selects");
+            if out.resource.slot % 100 < 50 {
+                first_half += 1;
+            }
+        }
+        assert!(first_half > 0);
     }
 }

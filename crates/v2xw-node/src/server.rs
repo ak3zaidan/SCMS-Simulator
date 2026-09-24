@@ -288,6 +288,20 @@ impl ServerBank {
         }
     }
 
+    /// The same bank with `servers` servers, each free when the earliest of the old ones
+    /// was. Zero is raised to one, as in [`ServerBank::new`].
+    #[must_use]
+    pub fn resized(mut self, servers: u32) -> Self {
+        let at = self
+            .free_at
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(self.window_start);
+        self.free_at = vec![at; servers.max(1) as usize];
+        self
+    }
+
     /// The bank's name, for records.
     pub fn name(&self) -> &'static str {
         self.name
