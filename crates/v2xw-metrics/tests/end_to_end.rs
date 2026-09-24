@@ -95,6 +95,20 @@ fn recording() -> Vec<OwnedRecord> {
                 "payload_bytes": if delivered { json!(300) } else { serde_json::Value::Null }
             }),
         ));
+        // The frame's reception census: one receiver truly within [0, 20) m, the one the
+        // radio evaluated, and whether it decoded (3GPP TR 36.885 §A.2.1.4).
+        out.push(OwnedRecord {
+            channel: "phy.prr",
+            visibility: Visibility::Gt,
+            json: serde_json::to_vec(&json!({
+                "t": t_end,
+                "tx": 1,
+                "msg": msg,
+                "msg_type": "bsm",
+                "bins": [[0, 1, u32::from(delivered)]]
+            }))
+            .unwrap(),
+        });
         let mut fate = json!({
             "t": t_end + 700_000,
             "rx": 2 + (i % 3) as u32,
@@ -350,8 +364,13 @@ fn every_provider_registers_through_the_core_registry_with_a_valid_card() {
 fn a_whole_run_produces_the_hand_computed_headline_numbers() {
     let samples = run(&recording());
 
+    // The headline: 32 of the 40 receivers in range decoded, 0.8, and all within 20 m.
+    assert_eq!(find(&samples, "pdr").value.point(), Some(0.8));
+    assert_eq!(find(&samples, "pdr").value.n(), 40);
+    assert_eq!(find(&samples, "pdr|dist_bin=0-20").value.point(), Some(0.8));
+    assert_eq!(find(&samples, "pdr|radius=100m").value.point(), Some(0.8));
     // 32 of 40 candidate receptions in the 0–25 m bin: 0.8, with a Wilson interval.
-    let pdr = find(&samples, "pdr|dist_bin=0-25");
+    let pdr = find(&samples, "pdr_all_pairs|dist_bin=0-25");
     assert_eq!(pdr.value.point(), Some(0.8));
     assert_eq!(pdr.value.n(), 40);
     match &pdr.value {
@@ -764,6 +783,20 @@ fn each_invariant_check_catches_a_violation_injected_into_the_run() {
             }),
         ),
         (
+            "M-PRR",
+            Box::new(|r: &mut Vec<OwnedRecord>| {
+                // A census that counts a decode the radio never made.
+                r.push(OwnedRecord {
+                    channel: "phy.prr",
+                    visibility: Visibility::Gt,
+                    json: serde_json::to_vec(
+                        &json!({"t": 1, "tx": 1, "msg": 6_000, "bins": [[0, 3, 2]]}),
+                    )
+                    .unwrap(),
+                });
+            }),
+        ),
+        (
             "M-LAT1",
             Box::new(|r: &mut Vec<OwnedRecord>| {
                 // A delivery whose signature "finished" before its message was generated.
@@ -947,7 +980,8 @@ fn the_summary_is_a_manifest_sized_view_of_the_run() {
     assert_eq!(summary.schema, v2xw_metrics::summary::SUMMARY_SCHEMA);
     assert_eq!(summary.digest.len(), 64);
     assert_eq!(summary.diagnostics.len(), 3);
-    assert_eq!(summary.point("pdr|dist_bin=0-25"), Some(0.8));
+    assert_eq!(summary.point("pdr_all_pairs|dist_bin=0-25"), Some(0.8));
+    assert_eq!(summary.point("pdr"), Some(0.8));
     assert!(
         summary.insufficient > 0,
         "a run this small has thin metrics, and the summary should say how many"

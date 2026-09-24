@@ -202,6 +202,16 @@ pub const CHANNELS: &[ChannelSpec] = &[
         visibility: Visibility::Node,
         payload_bytes: Some(48),
     },
+    // The per-frame reception census behind the packet reception ratio (3GPP TR 36.885
+    // §A.2.1.4): how many equipped receivers were truly within each 20 m range of a frame
+    // and how many of them decoded it. Ground truth whole — no node knows who failed to
+    // hear it — so the NODE-only profile strips it. Never an `Event` payload.
+    ChannelSpec {
+        name: "phy.prr",
+        wire_id: None,
+        visibility: Visibility::Gt,
+        payload_bytes: None,
+    },
     ChannelSpec {
         name: "phy.rx",
         wire_id: Some(11),
@@ -280,12 +290,19 @@ mod tests {
         assert_eq!(before, ids.len(), "two channels share a wire id");
     }
 
-    /// §5.2 names the exhaustive set of whole channels the `node` profile withholds.
+    /// §5.2 names the exhaustive set of whole *wire* channels the `node` profile withholds:
+    /// the ones a `Hello` channel table can carry. A record-only channel (no wire id) is
+    /// never on the wire, so §5.2 does not list it; the recording's `NODE-only` profile
+    /// still strips it whole, and the second assertion pins that set too, so a new
+    /// ground-truth channel cannot arrive unnoticed in either.
     #[test]
     fn the_ground_truth_channel_set_is_the_one_the_specification_lists() {
-        let names: Vec<&str> = ground_truth_channels().map(|c| c.name).collect();
+        let on_the_wire: Vec<&str> = ground_truth_channels()
+            .filter(|c| c.wire_id.is_some())
+            .map(|c| c.name)
+            .collect();
         assert_eq!(
-            names,
+            on_the_wire,
             vec![
                 "gt.attack.action",
                 "gt.despawn",
@@ -293,6 +310,11 @@ mod tests {
                 "gt.spawn"
             ]
         );
+        let record_only: Vec<&str> = ground_truth_channels()
+            .filter(|c| c.wire_id.is_none())
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(record_only, vec!["phy.prr"]);
     }
 
     /// The channel-name pattern of §6.5's `ChannelName` schema.

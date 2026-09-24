@@ -440,6 +440,10 @@ struct FrameState {
     mac_backoff_ns: u64,
     /// What the message said, for the `node.tx` record ([`message_content`]).
     content: Option<v2xw_metrics::channels::MsgContentView>,
+    /// The reception census taken when the frame went on the air: how many equipped
+    /// receivers were truly within each 20 m range of the transmitter, by bin index
+    /// (`phy.prr`, 3GPP TR 36.885 §A.2.1.4). Independent of the candidate set.
+    census: BTreeMap<u32, u32>,
 }
 
 /// What a Phase 2 application message carries, beyond its length.
@@ -563,6 +567,8 @@ pub struct Engine {
     focus: Option<crate::wiring::FocusStack>,
     /// The jammers `threats.jammers` declared.
     jamming: jamming::Jamming,
+    /// The 20 m bins of the reception census (`phy.prr`), the very bins the metric reads.
+    prr_bins: v2xw_metrics::bins::Bins,
     report: RunReport,
 }
 
@@ -753,6 +759,7 @@ impl Engine {
             sidelink,
             focus,
             jamming: jammers,
+            prr_bins: v2xw_metrics::comms::prr_bins(),
             report: RunReport::default(),
         };
         let phase2 = crate::phase2::Phase2::build(&engine.scenario, &engine.world)?;
@@ -2173,6 +2180,7 @@ impl Engine {
                     &tx.signer,
                     claim,
                 )),
+                census: BTreeMap::new(),
             },
         );
         if self.mac.is_some() || self.sidelink.is_some() {
@@ -2620,6 +2628,7 @@ impl Engine {
             }
         }
         candidates.sort_by_key(|(n, _)| *n);
+        state.census = self.reception_census(state.tx, state.tx_pos, now);
 
         // Stage 2: the link budgets, sequentially, because the models carry state — a
         // shadowing process is correlated along a trajectory, which is why it has state
@@ -2715,6 +2724,42 @@ impl Engine {
         self.scheduler
             .schedule(state.end, EventClass::PhyEnd, Event::PhyEnd { frame });
         self.frames.insert(frame, state);
+    }
+
+    /// How many equipped receivers are truly within each 20 m range of a transmitter at
+    /// `now`, out to [`v2xw_metrics::channels::PRR_MAX_M`] — the `Y` of 3GPP TR 36.885
+    /// §A.2.1.4's packet reception ratio.
+    ///
+    /// A census, not the candidate set: it counts every equipped node in range from ground
+    /// truth whether or not the radio evaluates a link to it, so the delivery ratio built on
+    /// it does not move when the candidate range does. The distance is the one
+    /// [`Engine::link_budget`] reports for the same pair at the same instant (the ground
+    /// points' 3-D separation), so a decoded receiver lands in the bin it was counted in.
+    fn reception_census(&self, tx: NodeId, tx_pos: Vec3, now: SimTime) -> BTreeMap<u32, u32> {
+        let max = v2xw_metrics::channels::PRR_MAX_M;
+        let mut census: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut count = |d: f64| {
+            if d < max
+                && let Some(bin) = self.prr_bins.index_of(d)
+            {
+                *census.entry(bin as u32).or_insert(0) += 1;
+            }
+        };
+        for actor in self.snapshot.actors_within(tx_pos, max) {
+            let Some(rec) = self.actors.get(&actor) else {
+                continue;
+            };
+            match rec.node {
+                Some(node) if node != tx => count(tx_pos.distance(rec.last.extrapolate(now).pos)),
+                _ => {}
+            }
+        }
+        for (&rsu, &rsu_pos) in &self.rsus {
+            if rsu != tx {
+                count(tx_pos.distance(rsu_pos));
+            }
+        }
+        census
     }
 
     /// The reception phase (ADR 0004 decision 5, invariant I-R2).
@@ -2820,6 +2865,46 @@ impl Engine {
         let mut delivered_app: Vec<(NodeId, SimTime)> = Vec::new();
         let psdu = state.layers.psdu_bytes();
         let air_us = state.air.as_nanos() / 1_000;
+        // The census's `X`: receivers in range that decoded the frame, by the bin the census
+        // counted them in.
+        let mut decoded_by_bin: BTreeMap<u32, u32> = BTreeMap::new();
+        for outcome in &outcomes {
+            if outcome.received
+                && outcome.distance_m < v2xw_metrics::channels::PRR_MAX_M
+                && let Some(bin) = self.prr_bins.index_of(outcome.distance_m)
+            {
+                *decoded_by_bin.entry(bin as u32).or_insert(0) += 1;
+            }
+        }
+        if !state.census.is_empty() || !decoded_by_bin.is_empty() {
+            // Over the union of both maps and not clamped: a decode the census did not count
+            // would be a producer defect, and the metric refuses such a record rather than
+            // have it hidden here.
+            let keys: std::collections::BTreeSet<u32> = state
+                .census
+                .keys()
+                .chain(decoded_by_bin.keys())
+                .copied()
+                .collect();
+            let bins: Vec<[u32; 3]> = keys
+                .into_iter()
+                .map(|bin| {
+                    [
+                        bin,
+                        state.census.get(&bin).copied().unwrap_or(0),
+                        decoded_by_bin.get(&bin).copied().unwrap_or(0),
+                    ]
+                })
+                .collect();
+            let census = crate::records::PhyPrr(v2xw_metrics::channels::PhyPrrView {
+                t: now,
+                tx: state.tx,
+                msg: frame_index,
+                msg_type: Some(msg_type_name(state.msg_type).to_string()),
+                bins,
+            });
+            self.emit(recorder, &census);
+        }
         for outcome in outcomes {
             self.report.reception_attempts += 1;
             if let Some(cause) = outcome.cause {

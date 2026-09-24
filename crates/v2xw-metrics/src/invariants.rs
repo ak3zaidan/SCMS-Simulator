@@ -1293,6 +1293,71 @@ pub fn check_m_rx1(ledger: &EventLedger) -> InvariantOutcome {
     }
 }
 
+/// M-PRR's statement.
+pub const M_PRR: &str = "every frame's reception census accounts for its decodes: in every \
+                         20 m range no more receivers decoded than were in range, and the \
+                         decodes the census counts are exactly the phy.rx decodes of that \
+                         frame within the census's reach";
+
+/// M-PRR: the census behind `pdr` agrees with `phy.rx`.
+///
+/// The census is taken independently of the candidate set, so this is the check that the
+/// two views of one frame — who was in range, and who the radio says decoded it — describe
+/// the same event. A decode the census never counted, or a census that invents one, would
+/// move the headline delivery ratio without any radio event behind it.
+#[must_use]
+pub fn check_m_prr(ledger: &EventLedger) -> InvariantOutcome {
+    if ledger.prr.is_empty() {
+        return InvariantOutcome::skipped("M-PRR", M_PRR, "no phy.prr records");
+    }
+    let mut violations = Vec::new();
+    // msg → phy.rx decodes within the census's reach.
+    let mut decoded: BTreeMap<u64, u64> = BTreeMap::new();
+    for r in &ledger.rx {
+        if r.outcome == RxOutcome::Ok
+            && let (Some(m), Some(d)) = (r.msg, r.dist_m)
+            && d < crate::channels::PRR_MAX_M
+        {
+            *decoded.entry(m).or_insert(0) += 1;
+        }
+    }
+    for c in &ledger.prr {
+        let subject = || Some(format!("msg {}", c.msg));
+        let mut counted = 0_u64;
+        for &[bin, n, ok] in &c.bins {
+            if ok > n {
+                violations.push(violation(
+                    "M-PRR",
+                    subject(),
+                    format!("bin {bin}: {ok} decodes among {n} receivers in range"),
+                    &[
+                        ("in_range", Number::int(i64::from(n))),
+                        ("decoded", Number::int(i64::from(ok))),
+                    ],
+                ));
+            }
+            counted += u64::from(ok);
+        }
+        let on_phy = decoded.get(&c.msg).copied().unwrap_or(0);
+        if counted != on_phy {
+            violations.push(violation(
+                "M-PRR",
+                subject(),
+                "the census's decodes are not phy.rx's decodes of the same frame".to_string(),
+                &[
+                    ("census_decoded", Number::int(counted as i64)),
+                    ("phy_rx_decoded", Number::int(on_phy as i64)),
+                ],
+            ));
+        }
+    }
+    InvariantOutcome {
+        checked: ledger.prr.len() as u64,
+        violations,
+        ..InvariantOutcome::passed("M-PRR", M_PRR, 0)
+    }
+}
+
 /// M-LAT1's statement.
 pub const M_LAT1: &str = "every delivered message's stamps run forward in time and its \
                           latency stages tile the interval from generation to delivery, so \
@@ -1592,6 +1657,7 @@ pub fn check_all(ledger: &EventLedger, samples: &[MetricSample]) -> InvariantRep
         check_m_byte1(ledger),
         check_m_byte2(samples),
         check_m_lat1(ledger),
+        check_m_prr(ledger),
         check_m_rx1(ledger),
         check_m_share(samples),
         check_d9_quantisation(samples),
@@ -2359,7 +2425,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "I-M1", "I-N1", "I-P4", "I-R3", "I-T2", "I-T3", "M-BYTE1", "M-BYTE2", "M-LAT1",
-                "M-RX1", "M-SHARE", "D9"
+                "M-PRR", "M-RX1", "M-SHARE", "D9"
             ]
         );
         assert!(report.held(), "{:?}", report.failed());
@@ -2439,6 +2505,59 @@ mod tests {
             Visibility::NodeAndGt,
             json!({"t":1,"rx":rx,"tx":1,"msg":msg,"outcome":outcome,"cause":cause}),
         )
+    }
+
+    fn phy_at(msg: u64, rx: u32, ok: bool, dist: f64) -> OwnedRecord {
+        rec(
+            "phy.rx",
+            Visibility::NodeAndGt,
+            if ok {
+                json!({"t_start":0,"t_end":1,"tx":1,"rx":rx,"msg":msg,"outcome":"ok",
+                       "dist_m":dist})
+            } else {
+                json!({"t_start":0,"t_end":1,"tx":1,"rx":rx,"msg":msg,"outcome":"lost",
+                       "cause":"fading","dist_m":dist})
+            },
+        )
+    }
+
+    fn census(msg: u64, bins: serde_json::Value) -> OwnedRecord {
+        rec(
+            "phy.prr",
+            Visibility::Gt,
+            json!({"t":1,"tx":1,"msg":msg,"bins":bins}),
+        )
+    }
+
+    #[test]
+    fn m_prr_holds_when_the_census_counts_exactly_the_decodes() {
+        let l = ledger(&[
+            phy_at(1, 2, true, 15.0),
+            phy_at(1, 3, false, 15.0),
+            phy_at(1, 4, true, 250.0),
+            // Beyond the census's reach: neither side counts it.
+            phy_at(1, 5, true, 1_200.0),
+            // Three in range at [0, 20): two evaluated, one never evaluated (not a
+            // candidate); one of them decoded. One at [240, 260), decoded.
+            census(1, json!([[0, 3, 1], [12, 1, 1]])),
+        ]);
+        let o = check_m_prr(&l);
+        assert!(o.held(), "{:?}", o.violations);
+        assert_eq!(o.checked, 1);
+    }
+
+    #[test]
+    fn m_prr_catches_an_invented_decode_and_one_more_decode_than_receivers() {
+        let l = ledger(&[phy_at(1, 2, true, 15.0), census(1, json!([[0, 2, 2]]))]);
+        let o = check_m_prr(&l);
+        assert!(!o.held(), "the census counts a decode phy.rx never made");
+        let l = ledger(&[
+            phy_at(1, 2, true, 15.0),
+            phy_at(1, 3, true, 16.0),
+            census(1, json!([[0, 1, 2]])),
+        ]);
+        let o = check_m_prr(&l);
+        assert!(!o.held(), "two decodes among one receiver in range");
     }
 
     #[test]

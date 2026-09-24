@@ -72,6 +72,14 @@ channel_record!(
     Visibility::NodeAndGt
 );
 channel_record!(
+    /// `phy.prr` — one frame's reception census: receivers truly within each 20 m range
+    /// and how many of them decoded it (3GPP TR 36.885 §A.2.1.4). Ground truth whole.
+    PhyPrr,
+    v2xw_metrics::channels::PhyPrrView,
+    "phy.prr",
+    Visibility::Gt
+);
+channel_record!(
     /// `node.rx` — one reception attempt followed from the PHY to its fate, with every
     /// stamp of the message's journey. Node-and-ground-truth, like `phy.rx`.
     NodeRx,

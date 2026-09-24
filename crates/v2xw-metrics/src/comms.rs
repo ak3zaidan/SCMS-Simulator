@@ -3,8 +3,9 @@
 //!
 //! | Metric | Formula | Unit | What it does **not** account for |
 //! |---|---|---|---|
-//! | `pdr` | received frames / candidate receptions | ratio | receivers outside the candidate range; a frame nobody was in range of contributes nothing, so a PDR of 1.0 over an empty road is a PDR over no trials and is reported as insufficient |
-//! | `per` | frames lost / candidate receptions | ratio | the same denominator, and it is `1 − pdr` by construction, not an independently measured quantity |
+//! | `pdr` | the 3GPP packet reception ratio (TR 36.885 §A.2.1.4): receivers truly within range that decoded / receivers truly within range, from a per-frame census (`phy.prr`); headline within 300 m, also within 100 m and per 20 m bin | ratio | receivers beyond the range; reception above the PHY (verification, queues), which `delivery_ratio` covers; and coverage — a frame nobody was in range of contributes nothing |
+//! | `per` | `1 − pdr` over the same census | ratio | the same census, so it is not an independently measured quantity |
+//! | `pdr_all_pairs` | received frames / evaluated (candidate) receptions, per 25 m bin | ratio | receivers outside the engine's candidate range — and it is *set* by that range, so it is not the literature's delivery ratio: pairs a kilometre apart behind buildings count as trials |
 //! | `pdr_by_cause` | losses with this cause / all losses | ratio | a frame lost for two reasons at once: I-R3 requires exactly one cause, and [`crate::invariants`] checks it rather than this metric papering over it |
 //! | `cbr` | busy time / window length, as the MAC measured it | ratio | what the MAC could not hear: a hidden terminal's transmission is not busy time at this receiver |
 //! | `pir` | gap between successive receptions from one transmitter at one receiver | s | the first reception from a transmitter, which has no predecessor; and a gap that spans a pseudonym change, which looks like a new transmitter to the receiver but is recorded here against the true id |
@@ -42,11 +43,11 @@ use v2xw_core::time::{Duration, SimTime};
 use crate::bins::Bins;
 use crate::cards;
 use crate::channels::{
-    ByteBucket, ChannelView, MacCbrView, NetBytesView, NodeRxView, NodeTxView, PhyRxView,
-    ProtoMsgView, RxFate, RxOutcome, decode,
+    ByteBucket, ChannelView, MacCbrView, NetBytesView, NodeRxView, NodeTxView, PhyPrrView,
+    PhyRxView, ProtoMsgView, RxFate, RxOutcome,
 };
 use crate::def::{Agg, DEFAULT_LEVEL, Dim, DimValue, Dims, MetricDef, MetricSample, SampleValue};
-use crate::provider::MetricProvider;
+use crate::provider::{Decoded, MetricProvider};
 use crate::quant::Quantum;
 use crate::stats::{ConfidenceLevel, Distribution, Estimate, Proportion, ratio_of_sums};
 
@@ -59,6 +60,38 @@ use crate::stats::{ConfidenceLevel, Distribution, Estimate, Proportion, ratio_of
 /// visible reason.
 pub const UNBINNED: &str = "unbinned";
 
+/// The ranges the packet reception ratio is reported within, metres.
+///
+/// 3GPP TR 36.885 §A.2.1.4 defines the ratio per distance range and leaves the range to
+/// the evaluation, so the range a headline figure is quoted within is a choice, and this is
+/// it: 100 m and 300 m, the two ends of the neighbourhood radius 08-measurement-and-data.md
+/// §2.1 already uses for `nar`. The headline is the wider one ([`PDR_HEADLINE_RANGE_M`]).
+pub const PDR_RANGES_M: [u32; 2] = [100, 300];
+
+/// The range the headline `pdr` is quoted within, metres.
+pub const PDR_HEADLINE_RANGE_M: u32 = 300;
+
+/// The packet-reception-ratio distance bins: 20 m wide ([`crate::channels::PRR_BIN_M`],
+/// 3GPP TR 36.885 §A.2.1.4) out to [`crate::channels::PRR_MAX_M`], plus the open-ended one.
+///
+/// The engine bins its census with this very value, so a receiver cannot fall into one bin
+/// at the producer and another here.
+///
+/// # Panics
+/// Never: fifty 20 m bins are a valid bin set.
+#[must_use]
+pub fn prr_bins() -> Bins {
+    let count = (crate::channels::PRR_MAX_M / crate::channels::PRR_BIN_M) as usize;
+    Bins::uniform(
+        "dist_bin",
+        "m",
+        crate::channels::PRR_BIN_M,
+        count,
+        Quantum::LENGTH_M,
+    )
+    .expect("20 m bins to 1 km are valid")
+}
+
 /// The communication metric provider.
 ///
 /// Windowed: every metric here is per flush window, and [`MetricProvider::flush`] drains
@@ -68,13 +101,20 @@ pub struct CommsProvider {
     level: ConfidenceLevel,
     min_samples: u64,
     bins: Bins,
+    prr_bins: Bins,
 
     window_start: SimTime,
 
-    /// Delivery outcomes per distance bin, and for receptions with no recorded distance.
+    /// The census behind `pdr` (3GPP PRR): receivers in range and receivers that decoded,
+    /// per 20 m bin.
+    prr_by_bin: BTreeMap<usize, Proportion>,
+    /// The same, pooled within each of [`PDR_RANGES_M`].
+    prr_within: [Proportion; 2],
+    /// Delivery outcomes per distance bin over the evaluated pairs (`pdr_all_pairs`), and
+    /// for receptions with no recorded distance.
     pdr_by_bin: BTreeMap<usize, Proportion>,
     pdr_unbinned: Proportion,
-    /// Delivery outcomes over every candidate reception, regardless of distance.
+    /// Delivery outcomes over every evaluated (candidate) pair, regardless of distance.
     pdr_all: Proportion,
     /// Loss counts per cause.
     losses_by_cause: BTreeMap<String, u64>,
@@ -120,7 +160,10 @@ impl CommsProvider {
             level: DEFAULT_LEVEL,
             min_samples: crate::stats::DEFAULT_MIN_SAMPLES,
             bins,
+            prr_bins: prr_bins(),
             window_start: t0,
+            prr_by_bin: BTreeMap::new(),
+            prr_within: [Proportion::new(); 2],
             pdr_by_bin: BTreeMap::new(),
             pdr_unbinned: Proportion::new(),
             pdr_all: Proportion::new(),
@@ -166,11 +209,17 @@ impl CommsProvider {
         card.equations = vec![
             v2xw_core::card::Equation::new(
                 "pdr",
-                "pdr = received frames / candidate receptions, per 25 m distance bin",
+                "PRR(a, b) = X / Y summed over frames, Y = equipped receivers truly within \
+                 [a, b) m of the transmitter at the frame's start, X = those of them that \
+                 decoded it (3GPP TR 36.885 §A.2.1.4); per 20 m bin, and pooled within \
+                 100 m and within 300 m (the headline)",
             ),
+            v2xw_core::card::Equation::new("per", "per = 1 − pdr, over the same census"),
             v2xw_core::card::Equation::new(
-                "per",
-                "per = frames lost / candidate receptions = 1 − pdr",
+                "pdr_all_pairs",
+                "pdr_all_pairs = received frames / evaluated (candidate) receptions, per 25 m \
+                 distance bin; its denominator is whatever the engine's candidate range \
+                 admits",
             ),
             v2xw_core::card::Equation::new(
                 "cbr",
@@ -201,7 +250,30 @@ impl CommsProvider {
             json!(1000.0),
             cards::design("08-measurement-and-data.md §2 (dist_bin, 25 m), to 1 km"),
         ));
+        card.parameters.push(cards::param(
+            "prr_bin_width_m",
+            "m",
+            json!(crate::channels::PRR_BIN_M),
+            json!(1.0),
+            json!(1000.0),
+            cards::standard("3GPP TR 36.885 §A.2.1.4 (PRR evaluated in 20 m bins)"),
+        ));
+        card.parameters.push(cards::param(
+            "pdr_headline_range_m",
+            "m",
+            json!(PDR_HEADLINE_RANGE_M),
+            json!(20.0),
+            json!(crate::channels::PRR_MAX_M),
+            cards::design(
+                "this build's choice: the upper end of the 100–300 m neighbourhood radius of \
+                 08-measurement-and-data.md §2.1 (nar)",
+            ),
+        ));
         card.sources = vec![
+            cards::standard(
+                "3GPP TR 36.885 §A.2.1.4 (packet reception ratio: X/Y over the receivers in a \
+                 distance range, 20 m bins), the definition pdr follows",
+            ),
             cards::design("08-measurement-and-data.md §2.1 (radio and network metric catalog)"),
             cards::standard(
                 "3GPP TS 38.215 §5.1.27 (CBR for NR-V2X) and TS 36.214 (CBR for LTE-V2X), \
@@ -213,8 +285,17 @@ impl CommsProvider {
             ),
         ];
         card.limitations = vec![
-            "pdr is measured over candidate receptions, so it says nothing about coverage: a \
-             transmitter with no neighbours contributes no trials."
+            "pdr is the 3GPP packet reception ratio over a census of the receivers truly in \
+             range, so it says nothing about coverage: a transmitter with no receiver within \
+             range contributes no trials."
+                .to_string(),
+            "The 300 m headline range and the 100 m range beside it are this build's choice \
+             (the neighbourhood radii 08-measurement-and-data.md §2.1 uses for nar), not a \
+             normative figure: TR 36.885 defines the ratio per distance range and leaves the \
+             range to the evaluation. The 20 m curve is the definition itself."
+                .to_string(),
+            "pdr_all_pairs divides by every pair the engine evaluated, so it moves with the \
+             engine's candidate range and is not comparable to a published delivery ratio."
                 .to_string(),
             "goodput is receiver-side: one broadcast delivered to ten receivers counts ten \
              times."
@@ -227,6 +308,8 @@ impl CommsProvider {
                 .to_string(),
         ];
         card.validation.tests = vec![
+            "comms::tests::pdr_is_the_3gpp_reception_ratio_over_the_census".to_string(),
+            "comms::tests::pdr_does_not_depend_on_which_pairs_the_radio_evaluated".to_string(),
             "comms::tests::pdr_by_distance_reproduces_a_hand_computed_fixture".to_string(),
             "comms::tests::cbr_is_recomputed_from_busy_over_window".to_string(),
             "comms::tests::airtime_and_bytes_are_order_independent".to_string(),
@@ -237,42 +320,86 @@ impl CommsProvider {
     /// The definitions, in a fixed order.
     fn definitions(&self) -> Vec<MetricDef> {
         let src = cards::design("08-measurement-and-data.md §2.1");
+        let prr_src = cards::standard(
+            "3GPP TR 36.885 §A.2.1.4: the packet reception ratio of one transmitted packet \
+             is X/Y, Y the receivers located in the distance range (a, b) from the \
+             transmitter and X those among them that received it; evaluated in 20 m bins",
+        );
         vec![
             MetricDef::new(
                 "pdr",
                 "ratio",
-                Agg::ratio("received frames", "candidate receptions"),
+                Agg::ratio(
+                    "receivers within range that decoded the frame",
+                    "receivers within range",
+                ),
+                // Who was within range is a census only ground truth has: a node does not
+                // know who failed to hear it.
+                Visibility::Gt,
+                Quantum::RATIO,
+                "Packet reception ratio (3GPP TR 36.885 §A.2.1.4): of the equipped receivers \
+                 truly within range of each frame, the fraction that decoded it. The \
+                 headline is within 300 m; `pdr[100m]` and `pdr[300m]` are the two ranges \
+                 and `dist_bin` the 20 m curve. Every receiver in range counts, whether or \
+                 not the radio evaluated a link to it, so the figure does not depend on the \
+                 engine's candidate range.",
+            )
+            .with_dims([Dim::T, Dim::Radius, Dim::DistBin])
+            .with_breakdown(Dim::Radius, PDR_RANGES_M.iter().map(|r| format!("{r}m")))
+            .with_source(prr_src.clone())
+            .with_min_samples(self.min_samples)
+            .with_range(0.0, 1.0)
+            .not_accounting_for("receivers beyond the stated range")
+            .not_accounting_for(
+                "reception above the PHY: a decoded frame the receiver then dropped or could \
+                 not verify counts as received here (delivery_ratio is the application-level \
+                 figure)",
+            )
+            .not_accounting_for(
+                "coverage: a transmitter with no receiver within range contributes no trials",
+            ),
+            MetricDef::new(
+                "per",
+                "ratio",
+                Agg::ratio(
+                    "receivers within range that did not decode the frame",
+                    "receivers within range",
+                ),
+                Visibility::Gt,
+                Quantum::RATIO,
+                "The complement of the headline pdr, over the same census within 300 m. \
+                 Reported separately because a loss-oriented reader should not have to \
+                 subtract.",
+            )
+            .with_dims([Dim::T])
+            .with_source(prr_src)
+            .with_min_samples(self.min_samples)
+            .with_range(0.0, 1.0)
+            .not_accounting_for("the same census as pdr")
+            .not_accounting_for("bit errors within a received frame (a frame is received or not)"),
+            MetricDef::new(
+                "pdr_all_pairs",
+                "ratio",
+                Agg::ratio("received frames", "evaluated receptions"),
                 // The distance bin comes from a ground-truth field of `phy.rx`, so the
                 // binned metric inherits the GT taint (08 §1: visibility tags propagate).
                 Visibility::NodeAndGt,
                 Quantum::RATIO,
-                "Received frames divided by frames that were candidate receptions (the \
-                 receiver was within the tier's candidate range), per 25 m distance bin.",
+                "Received frames divided by every reception the engine evaluated: every pair \
+                 within its candidate range, however far and whatever stands between them, \
+                 per 25 m distance bin. Not the literature's delivery ratio — its \
+                 denominator is set by the engine's candidate range, so pairs behind a \
+                 building a kilometre apart count as trials. Kept to show what the radio \
+                 was asked to do; `pdr` is the figure to quote.",
             )
             .with_dims([Dim::T, Dim::DistBin])
             .with_source(src.clone())
             .with_min_samples(self.min_samples)
             .with_range(0.0, 1.0)
-            .not_accounting_for("receivers outside the tier's candidate range")
+            .not_accounting_for("receivers outside the engine's candidate range")
             .not_accounting_for(
                 "coverage: a transmitter with no candidate receivers contributes no trials",
             ),
-            MetricDef::new(
-                "per",
-                "ratio",
-                Agg::ratio("frames lost", "candidate receptions"),
-                // Reads only the outcome field, which is node-visible.
-                Visibility::Node,
-                Quantum::RATIO,
-                "Frames lost divided by candidate receptions. Exactly `1 − pdr`; reported \
-                 separately because a loss-oriented reader should not have to subtract.",
-            )
-            .with_dims([Dim::T])
-            .with_source(src.clone())
-            .with_min_samples(self.min_samples)
-            .with_range(0.0, 1.0)
-            .not_accounting_for("the same denominator as pdr")
-            .not_accounting_for("bit errors within a received frame (a frame is received or not)"),
             MetricDef::new(
                 "pdr_by_cause",
                 "ratio",
@@ -455,6 +582,30 @@ impl CommsProvider {
         }
     }
 
+    /// Records one frame's reception census (3GPP PRR).
+    fn on_prr(&mut self, v: &PhyPrrView) {
+        for &[bin, in_range, decoded] in &v.bins {
+            // A producer that claims more decodes than receivers is a defect the metric
+            // must not paper over by clamping: the record is refused.
+            if decoded > in_range {
+                self.rejected += 1;
+                continue;
+            }
+            let (ok, n) = (u64::from(decoded), u64::from(in_range));
+            self.prr_by_bin
+                .entry(bin as usize)
+                .or_default()
+                .observe_many(ok, n);
+            // The bin counts toward a range only when the whole bin lies inside it.
+            let upper_m = (f64::from(bin) + 1.0) * crate::channels::PRR_BIN_M;
+            for (k, r) in PDR_RANGES_M.iter().enumerate() {
+                if upper_m <= f64::from(*r) {
+                    self.prr_within[k].observe_many(ok, n);
+                }
+            }
+        }
+    }
+
     /// Records one end-to-end outcome: a delivery to an application is goodput.
     fn on_node_rx(&mut self, v: &NodeRxView) {
         if v.outcome != RxFate::Delivered {
@@ -511,6 +662,7 @@ impl MetricProvider for CommsProvider {
         vec![
             NodeTxView::channel_name(),
             PhyRxView::channel_name(),
+            PhyPrrView::channel_name(),
             MacCbrView::channel_name(),
             NodeRxView::channel_name(),
             NetBytesView::channel_name(),
@@ -519,31 +671,39 @@ impl MetricProvider for CommsProvider {
     }
 
     fn on_event(&mut self, ev: &EventRecord) {
-        match ev.channel {
-            NodeTxView::CHANNEL => match decode::<NodeTxView>(ev) {
-                Ok(v) => self.on_tx(&v),
-                Err(_) => self.rejected += 1,
-            },
-            PhyRxView::CHANNEL => match decode::<PhyRxView>(ev) {
-                Ok(v) => self.on_rx(&v),
-                Err(_) => self.rejected += 1,
-            },
-            MacCbrView::CHANNEL => match decode::<MacCbrView>(ev) {
-                Ok(v) => self.on_cbr(&v),
-                Err(_) => self.rejected += 1,
-            },
-            NodeRxView::CHANNEL => match decode::<NodeRxView>(ev) {
-                Ok(v) => self.on_node_rx(&v),
-                Err(_) => self.rejected += 1,
-            },
-            NetBytesView::CHANNEL => match decode::<NetBytesView>(ev) {
-                Ok(v) => self.on_bytes(&v),
-                Err(_) => self.rejected += 1,
-            },
-            ProtoMsgView::CHANNEL => match decode::<ProtoMsgView>(ev) {
-                Ok(v) => self.on_proto_msg(&v),
-                Err(_) => self.rejected += 1,
-            },
+        self.on_decoded(&Decoded::new(ev));
+    }
+
+    fn on_decoded(&mut self, ev: &Decoded<'_>) {
+        match ev.channel() {
+            NodeTxView::CHANNEL => ev.with(|v: Option<&NodeTxView>| match v {
+                Some(v) => self.on_tx(v),
+                None => self.rejected += 1,
+            }),
+            PhyRxView::CHANNEL => ev.with(|v: Option<&PhyRxView>| match v {
+                Some(v) => self.on_rx(v),
+                None => self.rejected += 1,
+            }),
+            PhyPrrView::CHANNEL => ev.with(|v: Option<&PhyPrrView>| match v {
+                Some(v) => self.on_prr(v),
+                None => self.rejected += 1,
+            }),
+            MacCbrView::CHANNEL => ev.with(|v: Option<&MacCbrView>| match v {
+                Some(v) => self.on_cbr(v),
+                None => self.rejected += 1,
+            }),
+            NodeRxView::CHANNEL => ev.with(|v: Option<&NodeRxView>| match v {
+                Some(v) => self.on_node_rx(v),
+                None => self.rejected += 1,
+            }),
+            NetBytesView::CHANNEL => ev.with(|v: Option<&NetBytesView>| match v {
+                Some(v) => self.on_bytes(v),
+                None => self.rejected += 1,
+            }),
+            ProtoMsgView::CHANNEL => ev.with(|v: Option<&ProtoMsgView>| match v {
+                Some(v) => self.on_proto_msg(v),
+                None => self.rejected += 1,
+            }),
             _ => {}
         }
     }
@@ -552,8 +712,51 @@ impl MetricProvider for CommsProvider {
         let mut out = Vec::new();
         let secs = self.window_secs(at);
 
-        // --- pdr, overall and by distance bin -------------------------------------------
-        let pdr_def = self.def("pdr");
+        // --- pdr: the 3GPP packet reception ratio, headline, ranges and 20 m curve -------
+        let prr_def = self.def("pdr");
+        let within = core::mem::replace(&mut self.prr_within, [Proportion::new(); 2]);
+        let headline = PDR_RANGES_M
+            .iter()
+            .position(|r| *r == PDR_HEADLINE_RANGE_M)
+            .map_or_else(Proportion::new, |k| within[k]);
+        out.push(MetricSample::new(
+            &prr_def,
+            at,
+            Dims::new(),
+            SampleValue::Ratio(headline.estimate(self.min_samples, self.level)),
+        ));
+        for (r, p) in PDR_RANGES_M.iter().zip(within) {
+            let mut dims = Dims::new();
+            dims.insert(Dim::Radius, DimValue::label(format!("{r}m")));
+            out.push(MetricSample::new(
+                &prr_def,
+                at,
+                dims,
+                SampleValue::Ratio(p.estimate(self.min_samples, self.level)),
+            ));
+        }
+        for (bin, p) in core::mem::take(&mut self.prr_by_bin) {
+            let mut dims = Dims::new();
+            dims.insert(Dim::DistBin, DimValue::label(self.prr_bins.label(bin)));
+            out.push(MetricSample::new(
+                &prr_def,
+                at,
+                dims,
+                SampleValue::Ratio(p.estimate(self.min_samples, self.level)),
+            ));
+        }
+        out.push(MetricSample::new(
+            &self.def("per"),
+            at,
+            Dims::new(),
+            SampleValue::Ratio(
+                Proportion::from_counts(headline.failures(), headline.trials())
+                    .estimate(self.min_samples, self.level),
+            ),
+        ));
+
+        // --- pdr_all_pairs, overall and by distance bin ---------------------------------
+        let pdr_def = self.def("pdr_all_pairs");
         out.push(MetricSample::new(
             &pdr_def,
             at,
@@ -582,15 +785,7 @@ impl MetricProvider for CommsProvider {
             ));
         }
 
-        // --- per -------------------------------------------------------------------------
-        let all = core::mem::replace(&mut self.pdr_all, Proportion::new());
-        let per = Proportion::from_counts(all.failures(), all.trials());
-        out.push(MetricSample::new(
-            &self.def("per"),
-            at,
-            Dims::new(),
-            SampleValue::Ratio(per.estimate(self.min_samples, self.level)),
-        ));
+        self.pdr_all = Proportion::new();
 
         // --- pdr_by_cause ----------------------------------------------------------------
         let causes = core::mem::take(&mut self.losses_by_cause);
@@ -814,13 +1009,15 @@ mod tests {
             p.on_event(&rx(3, 4, 30.0, ok, 1_000_000 * (i as u64 + 1)));
         }
         let s = p.flush(1_000_000_000);
-        assert_eq!(sample(&s, "pdr|dist_bin=0-25").value.point(), Some(0.75));
-        assert_eq!(sample(&s, "pdr|dist_bin=25-50").value.point(), Some(0.25));
+        assert_eq!(sample(&s, "pdr_all_pairs|dist_bin=0-25").value.point(), Some(0.75));
+        assert_eq!(sample(&s, "pdr_all_pairs|dist_bin=25-50").value.point(), Some(0.25));
         // Overall: 4 of 8.
-        assert_eq!(sample(&s, "pdr").value.point(), Some(0.5));
-        assert_eq!(sample(&s, "pdr").value.n(), 8);
-        // PER is the complement, over the same denominator.
-        assert_eq!(sample(&s, "per").value.point(), Some(0.5));
+        assert_eq!(sample(&s, "pdr_all_pairs").value.point(), Some(0.5));
+        assert_eq!(sample(&s, "pdr_all_pairs").value.n(), 8);
+        // The headline is the census's, and there was no census: evaluated pairs alone do
+        // not make a reception ratio.
+        assert!(sample(&s, "pdr").value.is_insufficient());
+        assert!(sample(&s, "per").value.is_insufficient());
         // All four losses had the one cause, so its share is 1.0.
         assert_eq!(
             sample(&s, "pdr_by_cause|cause=collision").value.point(),
@@ -833,7 +1030,7 @@ mod tests {
         let mut p = CommsProvider::new(0); // default min_samples = 30
         p.on_event(&rx(1, 2, 10.0, true, 1_000));
         let s = p.flush(1_000_000_000);
-        let bin = sample(&s, "pdr|dist_bin=0-25");
+        let bin = sample(&s, "pdr_all_pairs|dist_bin=0-25");
         assert!(bin.value.is_insufficient(), "{:?}", bin.value);
         assert_eq!(bin.value.n(), 1);
         assert_eq!(bin.value.point(), None);
@@ -861,8 +1058,8 @@ mod tests {
             json!({"t_start":0,"t_end":10,"tx":1,"rx":2,"outcome":"ok"}),
         ));
         let s = p.flush(1_000_000_000);
-        assert_eq!(sample(&s, "pdr|dist_bin=unbinned").value.point(), Some(1.0));
-        assert_eq!(sample(&s, "pdr").value.n(), 1);
+        assert_eq!(sample(&s, "pdr_all_pairs|dist_bin=unbinned").value.point(), Some(1.0));
+        assert_eq!(sample(&s, "pdr_all_pairs").value.n(), 1);
     }
 
     #[test]
@@ -1034,7 +1231,7 @@ mod tests {
                    "candidate":false}),
         ));
         let s = p.flush(1_000_000_000);
-        assert_eq!(sample(&s, "pdr").value.n(), 0);
+        assert_eq!(sample(&s, "pdr_all_pairs").value.n(), 0);
     }
 
     #[test]
@@ -1046,11 +1243,68 @@ mod tests {
             vec![
                 "node.tx",
                 "phy.rx",
+                "phy.prr",
                 "mac.cbr",
                 "node.rx",
                 "net.bytes",
                 "proto.msg"
             ]
         );
+    }
+
+    fn census(bins: serde_json::Value) -> OwnedRecord {
+        rec(
+            "phy.prr",
+            json!({"t": 1_000, "tx": 1, "msg": 7, "msg_type": "bsm", "bins": bins}),
+        )
+    }
+
+    /// The hand-computed census: 20 m bins 0 ([0,20)), 4 ([80,100)), 14 ([280,300)) and
+    /// 20 ([400,420)) hold 4, 2, 5 and 10 receivers, of which 3, 1, 0 and 1 decoded.
+    /// Within 100 m: bins 0 and 4, 4 of 6. Within 300 m: bins 0, 4 and 14, 4 of 11 — the
+    /// headline. Bin 20 is on the curve and in neither range.
+    #[test]
+    fn pdr_is_the_3gpp_reception_ratio_over_the_census() {
+        let mut p = CommsProvider::new(0).with_min_samples(1);
+        p.on_event(&census(json!([[0, 4, 3], [4, 2, 1], [14, 5, 0], [20, 10, 1]])));
+        let s = p.flush(1_000_000_000);
+        // Ratios are written on the 1e-4 grid (D9).
+        let headline = &sample(&s, "pdr").value;
+        assert_eq!(headline.point(), Some(0.3636)); // 4/11
+        assert_eq!(headline.n(), 11);
+        assert_eq!(sample(&s, "pdr|radius=300m").value, *headline);
+        assert_eq!(sample(&s, "pdr|radius=100m").value.point(), Some(0.6667)); // 4/6
+        assert_eq!(sample(&s, "pdr|dist_bin=0-20").value.point(), Some(0.75));
+        assert_eq!(sample(&s, "pdr|dist_bin=400-420").value.point(), Some(0.1));
+        assert_eq!(sample(&s, "per").value.point(), Some(0.6364)); // 7/11
+    }
+
+    /// A receiver in range that the radio never evaluated — no `phy.rx` record at all — is
+    /// still a trial of `pdr`, and a `phy.rx` record the census does not back adds nothing
+    /// to it. That is what makes the headline independent of the candidate range.
+    #[test]
+    fn pdr_does_not_depend_on_which_pairs_the_radio_evaluated() {
+        let mut p = CommsProvider::new(0).with_min_samples(1);
+        // Five receivers within 20 m, one decoded; only that one was ever evaluated.
+        p.on_event(&census(json!([[0, 5, 1]])));
+        p.on_event(&rx(1, 2, 10.0, true, 1_000));
+        // Twenty more evaluated pairs, far away and all lost, with no census behind them.
+        for i in 0..20 {
+            p.on_event(&rx(1, 10 + i, 900.0, false, 1_000));
+        }
+        let s = p.flush(1_000_000_000);
+        assert_eq!(sample(&s, "pdr").value.point(), Some(0.2));
+        assert_eq!(sample(&s, "pdr").value.n(), 5);
+        // The all-pairs figure is the one those evaluations move: 1 of 21.
+        assert_eq!(sample(&s, "pdr_all_pairs").value.n(), 21);
+    }
+
+    #[test]
+    fn a_census_claiming_more_decodes_than_receivers_is_refused() {
+        let mut p = CommsProvider::new(0).with_min_samples(1);
+        p.on_event(&census(json!([[0, 2, 3]])));
+        assert_eq!(p.rejected(), 1);
+        let s = p.flush(1_000_000_000);
+        assert!(sample(&s, "pdr").value.is_insufficient());
     }
 }

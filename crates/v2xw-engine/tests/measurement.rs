@@ -88,7 +88,7 @@ fn a_real_run_satisfies_every_measurement_invariant() {
     let samples = samples(&recorder);
     let checks = v2xw_metrics::check_all(&ledger, &samples);
     checks.assert_all().unwrap_or_else(|e| panic!("{e}"));
-    for id in ["M-RX1", "M-LAT1", "M-BYTE1", "M-BYTE2", "M-SHARE"] {
+    for id in ["M-RX1", "M-LAT1", "M-PRR", "M-BYTE1", "M-BYTE2", "M-SHARE"] {
         let o = checks
             .outcomes
             .iter()
@@ -222,6 +222,7 @@ fn every_metric_of_the_communication_families_is_sampled() {
     let samples = samples(&recorder);
     for name in [
         "pdr",
+        "pdr_all_pairs",
         "cbr",
         "e2e_latency",
         "latency_stage",

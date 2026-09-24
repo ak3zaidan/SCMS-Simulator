@@ -27,7 +27,7 @@ use v2xw_core::ctx::{OwnedRecord, Visibility};
 use crate::channels::{
     ChannelView, DetObservationView, GtAttackActionView, GtKinematicsView, MaDecisionView,
     MaReportView, MacCbrView, NetBytesView, NetFragView, NodeRxView, NodeTelemetryView, NodeTxView,
-    NodeVerifyView, PhyRxView, ProtoMsgView, ProtoRevocationView, SecCertView, decode,
+    NodeVerifyView, PhyPrrView, PhyRxView, ProtoMsgView, ProtoRevocationView, SecCertView, decode,
 };
 use crate::latency::LatencyTrace;
 
@@ -47,6 +47,8 @@ pub struct EventLedger {
     pub rx: Vec<PhyRxView>,
     /// `node.rx`, in arrival order.
     pub node_rx: Vec<NodeRxView>,
+    /// `phy.prr`, in arrival order.
+    pub prr: Vec<PhyPrrView>,
     /// `msg.latency`, in arrival order.
     pub latency: Vec<LatencyTrace>,
     /// `mac.cbr`, in arrival order.
@@ -147,6 +149,7 @@ impl EventLedger {
             NodeTxView::CHANNEL => take!(NodeTxView, tx),
             PhyRxView::CHANNEL => take!(PhyRxView, rx),
             NodeRxView::CHANNEL => take!(NodeRxView, node_rx),
+            PhyPrrView::CHANNEL => take!(PhyPrrView, prr),
             crate::latency::MSG_LATENCY => take!(LatencyTrace, latency),
             MacCbrView::CHANNEL => take!(MacCbrView, cbr),
             NetFragView::CHANNEL => take!(NetFragView, frag),

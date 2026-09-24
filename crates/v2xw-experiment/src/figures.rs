@@ -245,7 +245,9 @@ pub fn rq1() -> FigurePreset {
                 "pdr",
                 Axis::Dim("dist_bin"),
                 "pdr (ratio)",
-                "The 25 m bins are the metric provider's own. A bin whose pooled trial \
+                "`pdr` is the 3GPP packet reception ratio (TR 36.885 §A.2.1.4) over a \
+                 census of the receivers truly in range, in its 20 m bins; the evaluated-pairs \
+                 figure is `pdr_all_pairs`. A bin whose pooled trial \
                  count is below the metric's `min_samples` reports insufficient and is \
                  absent from this panel rather than plotted as a point estimate, so a \
                  gap in the curve is a thin bin and not a zero.",

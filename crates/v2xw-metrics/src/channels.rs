@@ -80,6 +80,8 @@ const CHANNEL_VISIBILITY: &[(&str, &[Visibility])] = &[
     ("node.telemetry", &[Visibility::Node]),
     ("node.tx", &[Visibility::Node]),
     ("node.verify", &[Visibility::Node]),
+    // The reception census: who was within range of a frame, which no node can know.
+    ("phy.prr", &[Visibility::Gt]),
     ("phy.rx", &[Visibility::Node, Visibility::NodeAndGt]),
     ("proto.msg", &[Visibility::Node]),
     ("proto.revocation", &[Visibility::Public]),
@@ -475,6 +477,51 @@ impl PhyRxView {
 
 impl ChannelView for PhyRxView {
     const CHANNEL: &'static str = "phy.rx";
+}
+
+/// The width of one packet-reception-ratio distance bin, metres: 3GPP TR 36.885 §A.2.1.4
+/// ("CDF of PRR with a bin of 20 meters should be evaluated").
+pub const PRR_BIN_M: f64 = 20.0;
+
+/// How far the per-frame reception census reaches, metres. Fifty 20 m bins.
+///
+/// A fixed constant, deliberately **not** the engine's candidate range: the census counts
+/// every equipped receiver within this distance whether or not the radio evaluated a link
+/// to it, so a delivery ratio built on it means the same thing however the candidate range
+/// is derived.
+pub const PRR_MAX_M: f64 = 1_000.0;
+
+/// `phy.prr` — the per-frame reception census behind the packet reception ratio (GT).
+///
+/// 3GPP TR 36.885 §A.2.1.4 defines the packet reception ratio of one transmitted packet as
+/// `X / Y`, where `Y` is the number of receivers located in the distance range `(a, b)` from
+/// the transmitter and `X` the number of those that received it successfully. This record is
+/// that pair, for every 20 m range out to [`PRR_MAX_M`], for one frame.
+///
+/// `Y` is a **census**: every equipped node truly within range at the frame's start,
+/// counted from ground truth whether or not the engine evaluated a link to it. A receiver
+/// the radio never evaluated (beyond the candidate range) is in `Y` and not in `X`, so the
+/// ratio does not depend on how many pairs the engine chose to evaluate, only on who was
+/// where. That is also why the record is ground truth whole: no node knows who failed to
+/// hear it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhyPrrView {
+    /// The instant the frame finished (its outcome was decided).
+    pub t: SimTime,
+    /// The transmitter.
+    pub tx: NodeId,
+    /// The message id, the one `node.tx` and `phy.rx` carry.
+    pub msg: u64,
+    /// The message type (`bsm`, `cam`, `spat`, …).
+    #[serde(default)]
+    pub msg_type: Option<String>,
+    /// One entry per non-empty 20 m range: `[bin index, receivers in range, receivers that
+    /// decoded]`. Bin `i` covers `[20·i, 20·(i+1))` metres.
+    pub bins: Vec<[u32; 3]>,
+}
+
+impl ChannelView for PhyPrrView {
+    const CHANNEL: &'static str = "phy.prr";
 }
 
 /// What finally happened to one reception attempt (`node.rx`).
