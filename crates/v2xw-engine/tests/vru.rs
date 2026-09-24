@@ -178,6 +178,18 @@ fn equipped_pedestrians_send_psms_that_other_nodes_hear() {
     assert!(tx.iter().any(|r| r["msg_type"] == "bsm"), "no BSM either: {report:?}");
     // Signed like a vehicle's: an envelope around the payload.
     assert!(psm.iter().all(|r| r["envelope_bytes"].as_u64().unwrap_or(0) > 0));
+    // A real J2735 PSM: its decoded content is on the record, with the pseudonym's first
+    // four octets as its temporary id, a position on the globe and the device's speed.
+    for r in &psm {
+        let p = r["pseudonym"].as_str().expect("a PSM names its pseudonym");
+        let c = &r["content"];
+        assert_eq!(c["temp_id"].as_str(), Some(&p[..8]), "{r}");
+        assert!(c["lat_deg"].as_f64().is_some_and(|l| l.abs() <= 90.0), "{r}");
+        assert!(c["speed_mps"].as_f64().is_some_and(|v| (0.0..3.0).contains(&v)), "{r}");
+        assert!(c["msg_count"].as_u64().is_some(), "{r}");
+        // 31 octets: the mandatory PSM in its MessageFrame.
+        assert_eq!(r["payload_bytes"].as_u64(), Some(31), "{r}");
+    }
     // Heard: a reception attempt of a PSM decoded somewhere.
     let rx = by_type(&recorder, "node.rx");
     let heard = rx
@@ -208,4 +220,12 @@ fn on_the_etsi_stack_equipped_pedestrians_send_vams() {
     let tx = by_type(&recorder, "node.tx");
     assert!(tx.iter().any(|r| r["msg_type"] == "vam"), "no VAM on node.tx");
     assert!(!tx.iter().any(|r| r["msg_type"] == "psm"));
+    // A real ETSI VAM, decoded on the record like a PSM.
+    for r in tx.iter().filter(|r| r["msg_type"] == "vam") {
+        let p = r["pseudonym"].as_str().expect("a VAM names its pseudonym");
+        let c = &r["content"];
+        assert_eq!(c["temp_id"].as_str(), Some(&p[..8]), "{r}");
+        assert!(c["lon_deg"].as_f64().is_some_and(|l| l.abs() <= 180.0), "{r}");
+        assert!(c["speed_mps"].as_f64().is_some(), "{r}");
+    }
 }

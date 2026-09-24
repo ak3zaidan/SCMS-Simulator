@@ -11,10 +11,10 @@
 //!
 //! | Tier | Messages | What [`codec::Encoded::bytes`] contains | `size_source` |
 //! |---|---|---|---|
-//! | **Real ASN.1, generated** | ETSI CAM, DENM (this crate); IEEE 1609.2 / TS 103 097 envelope and certificates (`v2xw-sec`, over [`sec_types`]) | the wire bytes, from `rasn` bindings generated at build time from the ETSI forge modules | [`codec::SizeSource::Uper`] / [`codec::SizeSource::Coer`] |
+//! | **Real ASN.1, generated** | ETSI CAM, DENM, VAM ([`vam`]) (this crate); IEEE 1609.2 / TS 103 097 envelope and certificates (`v2xw-sec`, over [`sec_types`]) | the wire bytes, from `rasn` bindings generated at build time from the ETSI forge modules | [`codec::SizeSource::Uper`] / [`codec::SizeSource::Coer`] |
 //! | **Hand-written, oracle-validated** | SAE J2735 BSM ([`j2735::bsm`]) | the wire bytes of the subset the simulator fills | [`codec::SizeSource::Uper`] |
-//! | **Hand-written, not yet validated** | SAE J2735 SPaT ([`j2735::spat`]) and MAP ([`j2735::map`]) | the wire bytes of the subset the simulator fills | [`codec::SizeSource::Uper`] |
-//! | **Size model** | J2735 PSM, SRM, SSM ([`size_model`]); ETSI CPM, VAM ([`etsi_size`]) | **a fill pattern of exactly the modelled length** | [`codec::SizeSource::SizeModel`] |
+//! | **Hand-written, not yet validated** | SAE J2735 SPaT ([`j2735::spat`]), MAP ([`j2735::map`]) and PSM ([`j2735::psm`]) | the wire bytes of the subset the simulator fills | [`codec::SizeSource::Uper`] |
+//! | **Size model** | J2735 PSM, SRM, SSM ([`size_model`]); ETSI CPM, VAM ([`etsi_size`]) — the PSM and VAM rows are what the generic codec seam (and [`evidence`]) still register; the VRU device sends the real [`j2735::psm`] and [`vam`] bytes | **a fill pattern of exactly the modelled length** | [`codec::SizeSource::SizeModel`] |
 //!
 //! [`evidence`] is the machine-readable form of that table — one row per
 //! [`codec::MsgType`], and the paragraph every model card's `limitations` starts with. A
@@ -47,10 +47,9 @@
 //!   is corroborated where an artefact in this repository corroborates it and recalled
 //!   where nothing does, every recalled choice is a named constant, and their card says
 //!   the bytes are unvalidated.
-//! * `CPM-PDU-Descriptions.asn` and `VAM-PDU-Descriptions.asn` are **not committed**, so
-//!   the two ETSI messages that should be generated are sized instead ([`etsi_size`], which
-//!   lists the four steps that fix it). Adding a missing file to `build.rs` would fail the
-//!   build, and hand-writing an ETSI PDU from memory would be worse than sizing it.
+//! * `CPM-PDU-Descriptions.asn` is **not committed**, so the CPM is sized instead
+//!   ([`etsi_size`], which lists the steps that fix it). `VAM-PDU-Descriptions.asn` was
+//!   committed on 2026-09-23 and the VAM is generated ([`vam`]).
 //!
 //! # Where to look
 //!
@@ -140,6 +139,7 @@ pub mod generator;
 pub mod j2735;
 pub mod sec_types;
 pub mod size_model;
+pub mod vam;
 pub mod units;
 
 pub use codec::{
@@ -225,11 +225,12 @@ pub mod provenance {
     /// and a size taken from them is a table lookup.
     pub const SIZE_MODELLED: &[&str] = &[
         "SAE J2735 PSM, SRM, SSM (codec/size-model/j2735) — the J2735 ASN.1 cannot be \
-         code-generated (build decision D2) and nothing in the simulator fills these three \
-         yet",
-        "ETSI CPM, VAM (codec/size-model/etsi) — generatable from the published forge \
-         modules, but CPM-PDU-Descriptions.asn and VAM-PDU-Descriptions.asn are not \
-         committed to third_party/asn1/etsi in this checkout",
+         code-generated (build decision D2). The VRU device does not use this row for its \
+         PSM: it sends crate::j2735::psm's hand-written UPER (not oracle-validated)",
+        "ETSI CPM (codec/size-model/etsi) — generatable from the published forge module, \
+         but CPM-PDU-Descriptions.asn is not committed to third_party/asn1/etsi in this \
+         checkout. The VAM row stays behind the generic codec seam; the VRU device sends \
+         crate::vam's bytes, generated from the committed TS 103 300-3 module",
     ];
 }
 

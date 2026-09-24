@@ -436,7 +436,7 @@ pub fn build_cam(input: &CamInput) -> Result<CAM, CodecError> {
     Ok(CAM::new(header, payload))
 }
 
-fn reference_position(
+pub(crate) fn reference_position(
     p: &PositionEstimate,
     origin: &GeoOrigin,
 ) -> Result<ReferencePositionWithConfidence, CodecError> {

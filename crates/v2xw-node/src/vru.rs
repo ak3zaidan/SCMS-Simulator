@@ -32,23 +32,21 @@
 //!
 //! # What is transmitted
 //!
-//! | Message | Cadence | Payload length | Status |
+//! | Message | Cadence | Payload | Status |
 //! |---|---|---|---|
-//! | PSM | [`PsmGenParams`], default 1 Hz | the validated J2735 size model of 04-models.md §8.4 | rate `TODO: calibrate`, size model `derived-no-anchor` |
-//! | VAM | [`vam_gen_params`], the TS 103 300-3 §6.2 triggers | the validated ETSI size model of `codec/size-model/etsi` | triggers VERIFIED, size `literature-checked` against four published figures |
+//! | PSM | [`PsmGenParams`], default 1 Hz | SAE J2735 UPER, `v2xw_msg::j2735::psm` (mandatory fields, `Position3D`, `MessageFrame`: 31 octets) | rate `TODO: calibrate`; bytes real, not yet oracle-validated |
+//! | VAM | [`vam_gen_params`], the TS 103 300-3 §6.2 triggers | ETSI UPER generated from TS 103 300-3 V2.2.1, `v2xw_msg::vam` (basic, high-frequency and — on the low-frequency cadence — low-frequency containers) | triggers VERIFIED; bytes generated from the module |
 //!
-//! Neither payload is real wire bytes, and [`PayloadProvenance`] says so on every frame —
-//! including, through `superseded_by`, whether a real encoder has since appeared that this
-//! runtime is not yet wired to. Both lengths come from a size model in `v2xw-msg` rather
-//! than from a constant here, so a row that is recalibrated or retired moves this device
-//! with it instead of leaving a stale number behind.
+//! Both payloads are real wire bytes built from the device's own belief, and
+//! [`PayloadProvenance::Encoded`] says so on every frame. [`modelled_payload`] keeps the
+//! size-model rows reachable for a study that wants them, and says which row it used.
 //!
 //! The **security envelope around the payload is real**: the SPDU is built and signed by
 //! [`crate::secure::NodeSecurity`] exactly as a vehicle's is, so the signing cost, the
-//! certificate-attachment cadence and the envelope overhead are the real ones even where
-//! the payload is not. That is also why the payload is the size model's *payload* figure
-//! and not the 235–350 B secured-message figures its rows are anchored against: the
-//! envelope those figures include is one this runtime really builds.
+//! certificate-attachment cadence and the envelope overhead are the real ones. The
+//! published 235–350 B VAM figures are *secured-message* sizes: the payload here is the
+//! bare facilities PDU, and the envelope those figures include is one this runtime really
+//! builds around it.
 //!
 //! # What it reads
 //!
@@ -197,8 +195,8 @@ pub enum PayloadProvenance {
         /// exists and this runtime is not yet wired to it.
         superseded_by: Option<&'static str>,
     },
-    /// A real encoder produced the bytes: the PSM, from `v2xw_msg::j2735::psm`. The VAM
-    /// moves here when its encoder lands.
+    /// A real encoder produced the bytes: the PSM (`v2xw_msg::j2735::psm`) and the VAM
+    /// (`v2xw_msg::vam`).
     Encoded {
         /// The codec's registry id.
         codec: &'static str,
@@ -1739,7 +1737,8 @@ impl VruDeviceRuntime {
         };
 
         for r in requests {
-            let Some((payload, provenance)) = self.encode_payload(r.msg_type, &cred, believed)
+            let Some((payload, provenance)) =
+                self.encode_payload(r.msg_type, &cred, believed, r.include_low_frequency)
             else {
                 self.suppress(ctx, believed, r.msg_type, 0, "no-payload", out);
                 continue;
@@ -1868,25 +1867,22 @@ impl VruDeviceRuntime {
 
     /// The payload for one message, with the provenance of its length.
     ///
-    /// `None` for a message type this device does not build. Neither payload is real wire
-    /// bytes and [`PayloadProvenance`] says which kind of not-real it is; the fill is
-    /// [`v2xw_msg::codec::PLACEHOLDER_FILL`], so a consumer that decoded one fails loudly
-    /// rather than reading a plausible all-zero message.
-    /// The payload for one message, with the provenance of its length.
+    /// Both messages are **really encoded** from the device's own belief, with the first
+    /// four octets of the active pseudonym's digest as the identifier — so the identifier
+    /// on the air changes exactly when the pseudonym does, as a vehicle's does:
     ///
-    /// The PSM is **really encoded**: SAE J2735 UPER from the device's own belief, by
-    /// [`v2xw_msg::j2735::psm`], inside its `MessageFrame`, with the first four octets of
-    /// the active pseudonym's digest as its temporary id — so the id on the air changes
-    /// exactly when the pseudonym does, as a vehicle's does. The VAM still comes from the
-    /// validated ETSI size model: its encoder needs the TS 103 300-3 module in the ETSI
-    /// build unit, which is not there yet. [`PayloadProvenance`] says which is which on
-    /// every frame; a placeholder is [`v2xw_msg::codec::PLACEHOLDER_FILL`] so a consumer
-    /// that decodes one fails loudly.
+    /// * the PSM as SAE J2735 UPER inside its `MessageFrame` ([`v2xw_msg::j2735::psm`]);
+    /// * the VAM as ETSI TS 103 300-3 V2.2.1 UPER ([`v2xw_msg::vam`]), with the
+    ///   low-frequency container when the schedule says this VAM carries it.
+    ///
+    /// The size model remains only for a message type neither encoder builds, which is
+    /// none of this device's; [`PayloadProvenance`] says which it was on every frame.
     fn encode_payload(
         &self,
         msg_type: MsgType,
         cred: &CredentialHandle,
         believed: SimTime,
+        include_low_frequency: bool,
     ) -> Option<(Vec<u8>, PayloadProvenance)> {
         let station_id = {
             let mut id = [0u8; 4];
@@ -1911,6 +1907,32 @@ impl VruDeviceRuntime {
                 encoded.bytes,
                 PayloadProvenance::Encoded {
                     codec: psm::PSM_CODEC_ID,
+                },
+            ));
+        }
+        if msg_type == MsgType::Vam {
+            use v2xw_msg::vam;
+            let generation_time = v2xw_msg::cam::timestamp_its(self.config.wall, believed).ok()?;
+            let input = vam::VamInput {
+                station_id: u32::from_be_bytes(station_id),
+                profile: match self.config.psm_user_type {
+                    v2xw_msg::j2735::psm::PersonalDeviceUserType::Pedalcyclist => {
+                        vam::VruProfile::Bicyclist
+                    }
+                    _ => vam::VruProfile::Pedestrian,
+                },
+                position: self.belief,
+                origin: self.config.origin,
+                generation_time,
+                longitudinal_acceleration_mps2: None,
+                include_low_frequency,
+            };
+            let message = vam::build_vam(&input).ok()?;
+            let encoded = vam::encode_vam(&message).ok()?;
+            return Some((
+                encoded.bytes,
+                PayloadProvenance::Encoded {
+                    codec: vam::VAM_CODEC_ID,
                 },
             ));
         }
@@ -2299,10 +2321,11 @@ fn card(profile: &HardwareProfile, config: &VruConfig) -> ModelCard {
          transmits at least as often as a conformant one: pessimistic for channel load and \
          for battery, optimistic for detectability."
             .into(),
-        "Neither payload is encoder output. The VAM's length is `codec/size-model/etsi`'s \
-         literature-checked row and the PSM's is `codec/size-model/j2735`'s \
-         derived-no-anchor row — 04-models.md §8.2 records 'PSM | none | | | UNVERIFIED' \
-         for the published PSM anchors, so there is nothing to check that row against."
+        "Both payloads are encoder output from the device's belief. The VAM is generated \
+         from the committed TS 103 300-3 V2.2.1 module; the PSM is a hand-written J2735 \
+         UPER codec of the mandatory fields that has not been through the pycrate oracle \
+         (the J2735 ASN.1 is not in this repository). Neither carries a path history, and \
+         the VAM carries no cluster or motion-prediction container."
             .into(),
         "The energy model charges the amplifier and an optional per-message term. It does \
          not model receive energy, the screen, or the rest of the phone, so a handset's \

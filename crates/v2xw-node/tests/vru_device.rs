@@ -303,9 +303,9 @@ fn a_device_with_a_battery_goes_quiet_when_it_is_spent() {
     assert_eq!(unlimited.power().remaining_j(), None);
 }
 
-/// Every frame carries the provenance of its payload: the PSM is real SAE J2735 UPER that
-/// decodes to the device's own claim, with the signing pseudonym's first four octets as its
-/// temporary id; the VAM is still the ETSI size model's length, and says so.
+/// Every frame carries the provenance of its payload, and both are real: the PSM is SAE
+/// J2735 UPER and the VAM ETSI TS 103 300-3 UPER, each decoding to the device's own claim
+/// with the signing pseudonym's first four octets as its identifier.
 #[test]
 fn every_frame_says_where_its_payload_came_from() {
     let rng = RngRegistry::new(36);
@@ -336,9 +336,15 @@ fn every_frame_says_where_its_payload_came_from() {
                     assert_eq!(m.speed, v2xw_msg::j2735::bsm::speed(1.4));
                     psms += 1;
                 }
-                (MsgType::Vam, PayloadProvenance::SizeModel { model, .. }) => {
-                    assert!(!model.is_empty());
-                    assert!(!p.is_real());
+                (MsgType::Vam, PayloadProvenance::Encoded { codec }) => {
+                    assert_eq!(*codec, v2xw_msg::vam::VAM_CODEC_ID);
+                    let payload = &tx.signed.as_ref().expect("signed").payload;
+                    let m = v2xw_msg::vam::decode_vam(payload).expect("a VAM that decodes");
+                    assert_eq!(
+                        m.header.0.station_id.0.to_be_bytes(),
+                        tx.signer.0[..4]
+                    );
+                    assert_eq!(m.vam.vam_parameters.basic_container.station_type.0, 1);
                     vams += 1;
                 }
                 other => panic!("unexpected payload provenance {other:?}"),

@@ -65,12 +65,14 @@ struct Unit {
 /// produce two incompatible spellings of every shared data element.
 const FACILITIES: Unit = Unit {
     out_file: "etsi_facilities.rs",
-    label: "ETSI facilities (CAM, DENM)",
+    label: "ETSI facilities (CAM, DENM, VAM)",
     sources: &[
         // D4: the CDD is CP1252 upstream; generate from the normalized copy.
         "normalized-utf8/cdd_ts102894_2/ETSI-ITS-CDD.asn",
         "cam_ts103900/CAM-PDU-Descriptions.asn",
         "denm_ts103831/DENM-PDU-Descriptions.asn",
+        // TS 103 300-3 V2.2.1, the VRU awareness message a pedestrian's device sends.
+        "vam_ts103300_3/VAM-PDU-Descriptions.asn",
     ],
 };
 

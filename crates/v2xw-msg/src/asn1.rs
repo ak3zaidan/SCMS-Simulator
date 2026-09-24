@@ -46,3 +46,4 @@ pub mod facilities {
 pub use facilities::cam_pdu_descriptions as cam_asn1;
 pub use facilities::denm_pdu_description as denm_asn1;
 pub use facilities::etsi_its_cdd as cdd;
+pub use facilities::vam_pdu_descriptions as vam_asn1;

@@ -3726,6 +3726,28 @@ fn message_content(
         c.heading_deg = (m.heading != bsm::HEADING_UNAVAILABLE)
             .then(|| quantize_to(f64::from(m.heading) * 0.0125, Q_DEG));
     }
+    // A VAM (ETSI TS 103 300-3), decoded the same way: the reference position, speed and
+    // heading its device encoded, in the CDD's units, with the CDD's `unavailable` values
+    // left out.
+    if msg_type == v2xw_msg::MsgType::Vam
+        && let Some(bytes) = payload
+        && let Ok(m) = v2xw_msg::vam::decode_vam(bytes)
+    {
+        let p = &m.vam.vam_parameters;
+        let r = &p.basic_container.reference_position;
+        c.temp_id = Some(hex_digest(&m.header.0.station_id.0.to_be_bytes()));
+        c.lat_deg = (r.latitude.0 != 900_000_001)
+            .then(|| quantize_to(f64::from(r.latitude.0) * 1e-7, Q_DEG));
+        c.lon_deg = (r.longitude.0 != 1_800_000_001)
+            .then(|| quantize_to(f64::from(r.longitude.0) * 1e-7, Q_DEG));
+        c.elev_m = (r.altitude.altitude_value.0 != 800_001)
+            .then(|| quantize_to(f64::from(r.altitude.altitude_value.0) * 0.01, Q_M));
+        let hf = &p.vru_high_frequency_container;
+        c.speed_mps = (hf.speed.speed_value.0 != 16_383)
+            .then(|| quantize_to(f64::from(hf.speed.speed_value.0) * 0.01, Q_M));
+        c.heading_deg = (hf.heading.value.0 != 3_601)
+            .then(|| quantize_to(f64::from(hf.heading.value.0) * 0.1, Q_DEG));
+    }
     c
 }
 
