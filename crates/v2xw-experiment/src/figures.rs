@@ -535,8 +535,9 @@ pub fn rq4() -> FigurePreset {
 /// RQ5 — the radio-technology comparison (08-measurement-and-data.md §7, "RQ5 is a sweep
 /// on `radio.rat` with identical traffic and security").
 ///
-/// Every panel is plottable *as a comparison*; what is not available is the axis. See
-/// `scenarios/rat-comparison.yaml`, whose header carries the evidence.
+/// The axis is `radio.rat`: `scenarios/rat-comparison.yaml` sweeps 802.11p, LTE-V2X
+/// Mode 4 and NR-V2X Mode 2 over identical traffic and security, and its header carries
+/// the measured curves and what they are compared against.
 #[must_use]
 pub fn rq5() -> FigurePreset {
     FigurePreset {
@@ -553,17 +554,16 @@ pub fn rq5() -> FigurePreset {
                 "pdr",
                 Axis::Dim("dist_bin"),
                 "pdr (ratio)",
-                "The comparison figure of RQ5. The series axis is whatever the scenario \
-                 swept: `radio.rat` once the engine reads it, and the propagation tier \
-                 until then — the same panel either way, which is why the preset does not \
-                 hard-code the series.",
+                "The comparison figure of RQ5: one series per radio technology, swept on \
+                 `radio.rat` with the world, traffic, seed and security stack held \
+                 identical.",
             )
-            .by(Axis::Param("radio.tiers.propagation")),
+            .by(Axis::Param("radio.rat")),
             PanelSpec::new(
                 "pir-by-rat",
                 "Packet inter-reception time, per radio",
                 "pir",
-                Axis::Param("radio.tiers.propagation"),
+                Axis::Param("radio.rat"),
                 "inter-reception time (s)",
                 "What a safety application feels, as opposed to what the link does: two \
                  radios with the same delivery ratio and different loss *clustering* are \
@@ -573,18 +573,19 @@ pub fn rq5() -> FigurePreset {
                 "cbr-by-rat",
                 "Channel busy ratio, per radio",
                 "cbr",
-                Axis::Param("radio.tiers.propagation"),
+                Axis::Param("radio.rat"),
                 "cbr (ratio)",
                 "Occupancy under an identical offered load. Note that the C-V2X \
-                 definition is not the 802.11p one — TS 38.215 §5.1.27 against a CCA \
-                 threshold — so this panel compares two differently defined quantities \
-                 the moment the RAT axis is live, and the figure has to say so.",
+                 definition is not the 802.11p one — TS 38.215 §5.1.27's sub-channel \
+                 S-RSSI ratio against a busy-time fraction over a CCA threshold — so this \
+                 panel compares two differently defined quantities, and the figure has to \
+                 say so.",
             ),
             PanelSpec::new(
                 "e2e-latency-by-rat",
                 "End-to-end latency, per radio",
                 "e2e_latency",
-                Axis::Param("radio.tiers.propagation"),
+                Axis::Param("radio.rat"),
                 "latency (ms)",
                 "Generation to application delivery, so it carries the queueing, the air \
                  time and the verification. A sidelink radio with semi-persistent \

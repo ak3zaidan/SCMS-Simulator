@@ -110,6 +110,9 @@ pub struct ProfileServiceModel {
     profile: HardwareProfile,
     /// Cost of the non-cryptographic classes, when a scenario supplies one.
     app_task: Option<Duration>,
+    /// The abstract compute tier: every operation the profile costs takes
+    /// [`ProfileServiceModel::UNLIMITED_COST`] instead of its profiled time.
+    unlimited: bool,
     card: ModelCard,
 }
 
@@ -126,8 +129,34 @@ impl ProfileServiceModel {
         ProfileServiceModel {
             profile,
             app_task: None,
+            unlimited: false,
             card,
         }
+    }
+
+    /// The service time of an operation at the abstract compute tier: one microsecond.
+    ///
+    /// Not zero, because a signature that completed at the instant the node decided to
+    /// send would put the frame's MAC timer at the instant of the node phase that produced
+    /// it, which the kernel refuses (02-architecture.md §5.1); one microsecond is the
+    /// smallest interval that keeps it strictly after, and is what the engine already
+    /// charges a frame whose profile publishes no signing rate.
+    pub const UNLIMITED_COST: Duration = Duration::from_micros(1);
+
+    /// The same model at the abstract compute tier (`nodes.compute_tier: abstract`):
+    /// cryptography costs [`ProfileServiceModel::UNLIMITED_COST`], so no node is ever
+    /// compute-bound and the verification queue never builds. An operation the profile
+    /// does not cost still has no service time — the tier removes the bottleneck, it does
+    /// not invent a primitive the device lacks.
+    #[must_use]
+    pub fn unlimited(mut self) -> Self {
+        self.unlimited = true;
+        self
+    }
+
+    /// Whether this model runs at the abstract compute tier.
+    pub fn is_unlimited(&self) -> bool {
+        self.unlimited
     }
 
     /// The same model with a scenario-supplied cost for application tasks.
@@ -151,11 +180,16 @@ impl Model for ProfileServiceModel {
 
 impl ServiceModel for ProfileServiceModel {
     fn service_time(&mut self, _ctx: &mut dyn NodeCtx, op: &OpDescriptor) -> Option<Duration> {
-        match op.class {
+        let cost = match op.class {
             OpClass::Sign | OpClass::Verify | OpClass::Hash => {
                 self.profile.op_cost(op.op).map(|(d, _)| d)
             }
             OpClass::Parse | OpClass::Application | OpClass::CrlProcessing => self.app_task,
+        };
+        if self.unlimited {
+            cost.map(|_| Self::UNLIMITED_COST)
+        } else {
+            cost
         }
     }
 
@@ -373,6 +407,24 @@ mod tests {
         assert_eq!(
             sm.runs_on(&OpDescriptor::verify("ecdsa-p256-verify", 300)),
             RunsOn::Accelerator
+        );
+    }
+
+    /// The abstract compute tier: everything the profile costs takes a microsecond, and
+    /// what it does not cost still has no service time.
+    #[test]
+    fn the_unlimited_tier_costs_a_microsecond_and_invents_nothing() {
+        let reg = RngRegistry::new(0);
+        let mut ctx = NodeRuntimeCtx::new(0, &reg);
+        let mut sm = ProfileServiceModel::new(profile(crate::profiles::REFERENCE_OBU)).unlimited();
+        assert!(sm.is_unlimited());
+        let sign = sm.service_time(&mut ctx, &OpDescriptor::sign("ecdsa-p256-sign", 64));
+        assert_eq!(sign, Some(ProfileServiceModel::UNLIMITED_COST));
+        let verify = sm.service_time(&mut ctx, &OpDescriptor::verify("ecdsa-p256-verify", 300));
+        assert_eq!(verify, Some(ProfileServiceModel::UNLIMITED_COST));
+        assert_eq!(
+            sm.service_time(&mut ctx, &OpDescriptor::sign("no-such-primitive", 64)),
+            None
         );
     }
 

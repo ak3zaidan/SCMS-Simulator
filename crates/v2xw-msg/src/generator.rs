@@ -934,10 +934,333 @@ where
     }
 }
 
+// =========================================================================================
+// Generation timing — where on the time axis a node's generator runs
+// =========================================================================================
+
+/// Model id of the generation-timing model.
+pub const GENERATION_TIMING_ID: &str = "generator/timing-phase-jitter";
+
+/// When, on the time axis, a node's periodic generator fires: its **phase** and its
+/// per-message **jitter**.
+///
+/// # The defect this exists to close
+///
+/// Both generators above measure every interval from the node's *own* last message
+/// ([`CamTriggerState::check`], [`BsmGenerator::check`]), so neither standard puts two
+/// stations on a common time grid: EN 302 637-2 V1.4.1 §6.1.3 checks the triggers every
+/// `T_CheckCamGen` from when the station's CA basic service was activated, and SAE J2945/1
+/// measures the inter-transmission time from the station's previous BSM. Nothing in either
+/// — nor in the TS 102 687 DCC gate between the facilities and the access layer, whose
+/// `T_off` is again measured from the station's own last transmission — aligns one
+/// station's generation instants with another's. A real fleet's phases are set by when
+/// each unit powered up, which is uncorrelated between vehicles.
+///
+/// The engine used to step every node at the mobility step's own instant, which put every
+/// vehicle's generation at phase 0 of one global 100 ms grid. Every node then finished
+/// signing within microseconds of every other and contended for the channel in the same
+/// few hundred microseconds; in a 17-vehicle, 60 s Manhattan run that synchronised
+/// contention lost 31 % of all reception attempts to collision at a channel load of a
+/// few per cent. That is an artefact of the simulator's clock, not of 802.11p.
+///
+/// # The model
+///
+/// * **Phase.** Each node's generation clock is offset from the engine's step grid by
+///   `φ ~ U[0, phase_window)`, drawn once per node from the keyed stream
+///   `(plugin("generator/timing-phase-jitter"), Node(id))`. With `phase_window` equal to
+///   the nominal period the phases of a fleet are independent and uniform over the
+///   period — the random start per UE of the 3GPP periodic traffic model
+///   (TR 37.885 via 04-models.md §5.5) and what Veins' `DemoBaseApplLayer` does at
+///   start-up.
+/// * **Jitter.** Each message is handed to the access layer `j ~ U[0, max_jitter]` after
+///   it was generated and signed, drawn from the single-use key
+///   `(plugin(id), LinkFrame{(node, node), generation instant})`. It stands for host
+///   scheduling and stack latency, and it is what stops two stations whose phases happen
+///   to coincide from colliding on every period for as long as they are in range. The
+///   default 10 ms is ns-3's `BsmApplication` `TxMaxDelay` default
+///   (`src/wave/model/bsm-application.cc`: `m_txMaxDelay (MilliSeconds (10))`, applied as
+///   `U[0, TxMaxDelay]` per packet on a grid that does not accumulate it). **It is a
+///   simulator convention, not a standard's number**: SAE J2945/1's text was not available
+///   to this build (04-models.md §8.1 records which J2945/1 numbers are verified), and
+///   whether J2945/1 itself specifies a per-message randomisation is UNVERIFIED here. The
+///   jitter is part of generation-to-air latency and a latency metric reads it as such.
+///
+/// [`GenerationTiming::SYNCHRONISED`] is the old behaviour — every node at phase 0, no
+/// jitter — kept so a study of synchronised contention can still ask for it and so a test
+/// can show the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GenerationTiming {
+    /// The window a node's phase is drawn from: `φ ~ U[0, phase_window)`. Zero puts every
+    /// node at phase 0.
+    pub phase_window: Duration,
+    /// The largest per-message hand-off jitter: `j ~ U[0, max_jitter]`. Zero is none.
+    pub max_jitter: Duration,
+}
+
+impl GenerationTiming {
+    /// ns-3 `BsmApplication`'s `TxMaxDelay` default, 10 ms.
+    pub const NS3_TX_MAX_DELAY: Duration = Duration::from_millis(10);
+
+    /// Every node at phase 0 of the engine's grid, and no jitter: the behaviour before
+    /// this model existed.
+    pub const SYNCHRONISED: GenerationTiming = GenerationTiming {
+        phase_window: Duration::ZERO,
+        max_jitter: Duration::ZERO,
+    };
+
+    /// Independent uniform phases over `period`, and ns-3's 10 ms hand-off jitter.
+    pub const fn desynchronised(period: Duration) -> Self {
+        GenerationTiming {
+            phase_window: period,
+            max_jitter: Self::NS3_TX_MAX_DELAY,
+        }
+    }
+
+    /// True when nothing is randomised, so every node generates on the common grid.
+    pub const fn is_synchronised(&self) -> bool {
+        self.phase_window.as_nanos() == 0 && self.max_jitter.as_nanos() == 0
+    }
+
+    /// The RNG domain both draws come from, derived from the model id.
+    pub fn domain() -> v2xw_core::rng::RngDomain {
+        v2xw_core::rng::RngDomain::plugin(GENERATION_TIMING_ID)
+    }
+
+    /// One node's phase: `U[0, phase_window)` in whole nanoseconds, keyed by the node.
+    ///
+    /// A pure function of `(seed, node)`: it does not depend on when the node was created
+    /// or on how many nodes were created before it.
+    pub fn phase(&self, rng: &v2xw_core::rng::RngRegistry, node: NodeId) -> Duration {
+        let w = self.phase_window.as_nanos();
+        if w == 0 {
+            return Duration::ZERO;
+        }
+        let mut s = rng.checkout(Self::domain(), v2xw_core::rng::EntityRef::Node(node));
+        Duration::from_nanos(s.below(w))
+    }
+
+    /// One message's hand-off jitter: `U[0, max_jitter]` in whole microseconds, keyed by
+    /// the node and the message's generation instant.
+    pub fn jitter(
+        &self,
+        rng: &v2xw_core::rng::RngRegistry,
+        node: NodeId,
+        generated_at: SimTime,
+    ) -> Duration {
+        let j = self.max_jitter.as_nanos() / 1_000;
+        if j == 0 {
+            return Duration::ZERO;
+        }
+        let mut s = rng.checkout(
+            Self::domain(),
+            v2xw_core::rng::EntityRef::LinkFrame {
+                link: v2xw_core::ids::LinkKey::new(node, node),
+                frame: generated_at,
+            },
+        );
+        Duration::from_micros(s.below(j + 1))
+    }
+
+    /// The model card for this timing.
+    pub fn card(&self) -> ModelCard {
+        timing_card(self)
+    }
+}
+
+impl Default for GenerationTiming {
+    fn default() -> Self {
+        Self::desynchronised(Duration::from_millis(100))
+    }
+}
+
+/// The generation-timing model as a registrable [`Model`].
+#[derive(Debug, Clone)]
+pub struct GenerationTimingModel {
+    card: ModelCard,
+    timing: GenerationTiming,
+}
+
+impl GenerationTimingModel {
+    /// The model for `timing`.
+    pub fn new(timing: GenerationTiming) -> Self {
+        Self {
+            card: timing_card(&timing),
+            timing,
+        }
+    }
+
+    /// The timing it carries.
+    pub const fn timing(&self) -> GenerationTiming {
+        self.timing
+    }
+}
+
+impl Model for GenerationTimingModel {
+    fn card(&self) -> &ModelCard {
+        &self.card
+    }
+}
+
+fn timing_card(t: &GenerationTiming) -> ModelCard {
+    let mut card = ModelCard::new(
+        GENERATION_TIMING_ID,
+        Family::Generator,
+        "1.0.0",
+        "Where a node's periodic generator sits on the time axis: an independent uniform \
+         phase per node over the nominal period, and a per-message hand-off jitter.",
+    );
+    card.tier = vec![Tier::Abstract, Tier::Medium, Tier::High];
+    card.equations = vec![
+        v2xw_core::card::Equation::new(
+            "phase",
+            "phi_n ~ U[0, phase_window), drawn once per node from (plugin(id), Node(n)); \
+             node n steps at k*T_step + phi_n",
+        ),
+        v2xw_core::card::Equation::new(
+            "hand-off jitter",
+            "j ~ U[0, max_jitter] per message, from (plugin(id), LinkFrame((n,n), t_gen)); \
+             t_access = t_signed + j",
+        ),
+    ];
+    let mut jitter = Parameter::new(
+        "max_jitter_ms",
+        "ms",
+        serde_json::json!(t.max_jitter.as_nanos() as f64 / 1e6),
+        Source::new(
+            SourceKind::Code,
+            "ns-3 src/wave/model/bsm-application.cc (Carpenter, NCSU 2014): \
+             m_txMaxDelay (MilliSeconds (10)), txDelay ~ U[0, TxMaxDelay] per BSM on a \
+             non-accumulating grid",
+        ),
+    );
+    jitter.calibration = Some(
+        "A simulator convention, not a standard's value. Replace it with a measured OBU \
+         generation-to-air delay distribution (a CAMP or Safety Pilot deployment timing \
+         log), or with SAE J2945/1's own randomisation clause if it has one; the J2945/1 \
+         text was not available to verify either way."
+            .to_string(),
+    );
+    card.parameters = vec![
+        Parameter::new(
+            "phase_window_ms",
+            "ms",
+            serde_json::json!(t.phase_window.as_nanos() as f64 / 1e6),
+            Source::new(
+                SourceKind::Standard,
+                "ETSI EN 302 637-2 V1.4.1 §6.1.3 and SAE J2945/1 measure the generation \
+                 interval from the station's own previous message and define no common \
+                 time grid; the 3GPP TR 37.885 periodic traffic model starts each UE at a \
+                 random offset (via 04-models.md §5.5)",
+            ),
+        ),
+        jitter,
+    ];
+    card.assumptions = vec![
+        "A fleet's generation phases are independent and uniform: units power up at \
+         unrelated instants and nothing in EN 302 637-2, SAE J2945/1 or TS 102 687 \
+         re-aligns them."
+            .to_string(),
+        "The jitter is host and stack latency between signing and the access layer, and it \
+         counts toward generation-to-air latency."
+            .to_string(),
+    ];
+    card.limitations = vec![
+        "A node's phase is fixed for its life: slow drift between free-running host clocks \
+         is represented only by the per-message jitter."
+            .to_string(),
+        "Whether SAE J2945/1 specifies its own per-message randomisation is UNVERIFIED in \
+         this build; the jitter magnitude is ns-3's convention."
+            .to_string(),
+    ];
+    card.sources = vec![
+        Source::new(
+            SourceKind::Standard,
+            "ETSI EN 302 637-2 V1.4.1 §6.1.3 (T_CheckCamGen, T_GenCam measured per station)",
+        ),
+        Source::new(
+            SourceKind::Standard,
+            "SAE J2945/1 — inter-transmission time measured from the station's own last BSM \
+             (04-models.md §8.1)",
+        ),
+        Source::new(
+            SourceKind::Standard,
+            "ETSI TS 102 687 V1.2.1 — T_off gating measured from the station's own last \
+             transmission",
+        ),
+        Source::new(SourceKind::Code, "ns-3 BsmApplication TxMaxDelay = 10 ms"),
+    ];
+    card.validation = Validation {
+        status: ValidationStatus::UnitTested,
+        references: Vec::new(),
+        tests: vec![
+            "generator::tests::phases_are_uniform_and_keyed_by_node".to_string(),
+            "generator::tests::jitter_is_bounded_and_keyed_by_message".to_string(),
+        ],
+    };
+    card.determinism = v2xw_core::card::Determinism {
+        uses_rng: true,
+        rng_domains: vec![format!("plugin({GENERATION_TIMING_ID})")],
+    };
+    card
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use v2xw_core::time::NS_PER_MS;
+
+    #[test]
+    fn phases_are_uniform_and_keyed_by_node() {
+        let rng = v2xw_core::rng::RngRegistry::new(7);
+        let t = GenerationTiming::default();
+        let n = 4_000u32;
+        let phases: Vec<u64> = (0..n)
+            .map(|i| t.phase(&rng, NodeId::new(i)).as_nanos())
+            .collect();
+        assert!(phases.iter().all(|p| *p < 100 * NS_PER_MS));
+        // Ten 10 ms bins, each expecting 400: a synchronised fleet puts all 4,000 in one.
+        let mut bins = [0u32; 10];
+        for p in &phases {
+            bins[(*p / (10 * NS_PER_MS)) as usize] += 1;
+        }
+        for (i, b) in bins.iter().enumerate() {
+            assert!((300..=500).contains(b), "bin {i} holds {b} of 4000 phases");
+        }
+        // Keyed by the node: asking again, in a different order, gives the same answer.
+        let rng2 = v2xw_core::rng::RngRegistry::new(7);
+        for i in (0..n).rev().step_by(97) {
+            assert_eq!(t.phase(&rng2, NodeId::new(i)).as_nanos(), phases[i as usize]);
+        }
+        // And the synchronised timing puts everyone at zero.
+        assert!((0..50).all(|i| GenerationTiming::SYNCHRONISED
+            .phase(&rng, NodeId::new(i))
+            .as_nanos()
+            == 0));
+    }
+
+    #[test]
+    fn jitter_is_bounded_and_keyed_by_message() {
+        let rng = v2xw_core::rng::RngRegistry::new(11);
+        let t = GenerationTiming::default();
+        let node = NodeId::new(3);
+        let js: Vec<u64> = (0..2_000u64)
+            .map(|k| t.jitter(&rng, node, k * 100 * NS_PER_MS).as_nanos())
+            .collect();
+        assert!(js.iter().all(|j| *j <= 10 * NS_PER_MS));
+        let mean = js.iter().sum::<u64>() as f64 / js.len() as f64 / NS_PER_MS as f64;
+        assert!((4.5..5.5).contains(&mean), "mean jitter {mean} ms, expected about 5");
+        // The same message asked twice gets the same jitter: the key is single-use and
+        // embeds the generation instant, so no stream position leaks between messages.
+        assert_eq!(
+            t.jitter(&rng, node, 500 * NS_PER_MS),
+            t.jitter(&rng, node, 500 * NS_PER_MS)
+        );
+        assert_eq!(
+            GenerationTiming::SYNCHRONISED.jitter(&rng, node, 0),
+            Duration::ZERO
+        );
+        t.card().validate().expect("the timing card validates");
+    }
 
     fn ms(n: u64) -> SimTime {
         n * NS_PER_MS

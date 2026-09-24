@@ -1028,13 +1028,46 @@ impl OfdmPhy {
     /// therefore cannot depend on — or perturb — any other arrival's evaluation, which is
     /// what makes the phase-parallel receiver map of 02-architecture.md §6.4 legitimate.
     fn evaluate<C: Ctx + ?Sized>(&self, ctx: &mut C, arrival: &Arrival) -> RxOutcome {
+        // One uniform draw per arrival, keyed by (link, frame): see the module docs on
+        // the plug-in domain. The key is single-use, so taking the draw before the early
+        // exits below consumes nothing another evaluation could see.
+        let draw = ctx.rng(*FRAME_ERROR_DOMAIN, Self::frame_key(arrival)).f64();
+        self.decide(arrival, self.tier == Tier::High, draw)
+    }
+
+    /// The key of an arrival's frame-error draw: `(link, frame start)`.
+    #[must_use]
+    pub fn frame_key(arrival: &Arrival) -> EntityRef {
+        EntityRef::LinkFrame {
+            link: arrival.link(),
+            frame: arrival.start,
+        }
+    }
+
+    /// The domain the frame-error draw comes from: `plugin("phy/80211p/ofdm-10mhz")`.
+    #[must_use]
+    pub fn frame_error_domain() -> RngDomain {
+        *FRAME_ERROR_DOMAIN
+    }
+
+    /// The decision of [`OfdmPhy`]'s `evaluate`, given the arrival's uniform draw from
+    /// ([`OfdmPhy::frame_error_domain`], [`OfdmPhy::frame_key`]).
+    ///
+    /// Public so that an engine evaluating receivers in parallel — where no `&mut Ctx`
+    /// can be shared — reaches the *same* decision, with the same jamming counterfactual
+    /// and the same loss-cause attribution, rather than a re-composition of the public
+    /// primitives that has to be kept in step by hand. `high` applies the high tier's
+    /// preamble-capture test to this one arrival: the PHY's own tier, or a focus region
+    /// the receiver sits in (02-architecture.md §7.3).
+    #[must_use]
+    pub fn decide(&self, arrival: &Arrival, high: bool, draw: f64) -> RxOutcome {
         if self.transmits_during(arrival.rx, arrival.start, arrival.end) {
             return RxOutcome::Lost(LossCause::HalfDuplex);
         }
         if arrival.power_dbm < self.sensitivity_dbm(arrival.frame.mcs) {
             return RxOutcome::Lost(LossCause::BelowSensitivity);
         }
-        if self.tier == Tier::High && !self.preamble_locked(arrival) {
+        if high && !self.preamble_locked(arrival) {
             return RxOutcome::Lost(LossCause::PreambleMissed);
         }
         let windows = self.sinr_windows(arrival);
@@ -1086,24 +1119,11 @@ impl OfdmPhy {
         }
 
         let psr = self.success_probability(arrival);
-        // One uniform draw per arrival, keyed by (link, frame): see the module docs on
-        // the plug-in domain. The domain is derived once (it is SHA-256 over a constant
-        // string) rather than per arrival per receiver.
-        //
-        // `f64()` and not `bool(1.0 - psr)`, and the two are the same draw:
+        // `draw` is a uniform and not `bool(1.0 - psr)`, and the two are the same draw:
         // `RngStream::bool(p)` *is* `self.f64() < p`, consuming exactly one 64-bit draw
         // whatever `p` is. Keeping the uniform is what lets the jamming counterfactual be
         // exact — the same realisation is compared against two probabilities — without
         // consuming a second draw and shifting every stream after it.
-        let draw = ctx
-            .rng(
-                *FRAME_ERROR_DOMAIN,
-                EntityRef::LinkFrame {
-                    link: arrival.link(),
-                    frame: arrival.start,
-                },
-            )
-            .f64();
         let error = draw < 1.0 - psr;
         if error {
             // Jamming attribution (04-models.md §12.3). The frame failed because the draw

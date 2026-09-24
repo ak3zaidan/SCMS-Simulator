@@ -357,19 +357,26 @@ impl SidelinkPhy {
     /// How one arrival's interference divides between co-channel power, emission leakage
     /// and noise.
     ///
-    /// The co-channel term is scaled by the *fraction of the victim's allocation* the
-    /// interferer overlaps: an interferer sharing one of a victim's three sub-channels
-    /// raises the noise floor over a third of the allocation, and the effective SINR the
-    /// LUT is evaluated at is the mean over the allocation (04-models.md §5.4: "EESM
+    /// The co-channel term is the part of the interferer's power that lands in the
+    /// victim's allocation: its received power is spread over *its own* `len_j`
+    /// sub-channels, so `shared` of them carry `P_j·shared/len_j`. Against the signal's
+    /// total power over the victim's allocation and the noise in that bandwidth, that is
+    /// the mean over the allocation the LUT is evaluated at (04-models.md §5.4: "EESM
     /// effective SINR is approximated by the mean over the allocation"). The emission term
     /// is the interferer's power attenuated by the mask at the sub-channel separation.
+    ///
+    /// The term used to divide by the *victim's* length instead. The two agree when both
+    /// allocations are the same size and disagree by the ratio of the sizes otherwise: a
+    /// one-sub-channel victim under a two-sub-channel interferer was charged the
+    /// interferer's whole power instead of half of it, and a two-sub-channel victim under
+    /// a one-sub-channel interferer half of it instead of all of it — which is exactly the
+    /// mix a BSM that attaches its certificate once a second produces.
     ///
     /// Sums go through [`numeric::sum_powers_mw`], so the result does not depend on the
     /// order the caller collected the interferers in.
     #[must_use]
     pub fn interference_split(&self, arrival: &SlArrival) -> InterferenceSplit {
         let victim = arrival.resource;
-        let len = f64::from(victim.len.max(1));
         let mut co: Vec<(NodeId, f64)> = Vec::new();
         let mut em: Vec<(NodeId, f64)> = Vec::new();
         let mut same_resource = false;
@@ -385,11 +392,13 @@ impl SidelinkPhy {
                 if i.resource == victim {
                     same_resource = true;
                 }
-                // Overlapping sub-channels, as a fraction of the victim's allocation.
+                // The interferer's power in the sub-channels the two share: its total
+                // spread over its own allocation, times the overlap.
                 let lo = victim.subch.max(i.resource.subch);
                 let hi = (victim.subch + victim.len).min(i.resource.subch + i.resource.len);
                 let shared = f64::from(hi.saturating_sub(lo));
-                co.push((i.node, power * shared / len));
+                let own = f64::from(i.resource.len.max(1));
+                co.push((i.node, power * shared / own));
             } else {
                 let att = self.pool.ibe.attenuation_db(sep);
                 if att.is_finite() {
@@ -631,13 +640,13 @@ fn card(tier: Tier, pool: &PoolConfig, error: &SidelinkErrorModel) -> ModelCard 
     c.equations = vec![
         Equation {
             name: "sub-channel SINR".to_string(),
-            latex_or_text: "SINR = P_rx / (N + Σ_co-channel P_j·(shared/len) + \
+            latex_or_text: "SINR = P_rx / (N + Σ_co-channel P_j·(shared/len_j) + \
                             Σ_other P_j·10^(−K_IBE(Δ)/10))"
                 .to_string(),
             notes: Some(
-                "The co-channel term is scaled by the fraction of the victim's allocation \
-                 the interferer overlaps, and the effective SINR is the mean over the \
-                 allocation (04-models.md §5.4)."
+                "P_j is the interferer's power over its own len_j sub-channels, so \
+                 shared/len_j of it lands in the victim's allocation; the effective SINR \
+                 is the mean over the allocation (04-models.md §5.4)."
                     .to_string(),
             ),
         },
@@ -906,9 +915,31 @@ mod tests {
         let ws = p.interference_split(&wide);
         assert!(!ws.same_resource);
         assert_eq!(ws.cause(), LossCause::Collision);
-        // Half the victim's allocation overlaps, so half the interferer's power lands.
-        let want = numeric::dbm_to_mw(-60.0) * 0.5;
+        // The interferer occupies one sub-channel and all of it lies inside the victim's
+        // two, so *all* of its power lands in the victim's allocation. (This assertion
+        // used to expect half: the term divided by the victim's length rather than the
+        // interferer's, which halved an interferer that sat wholly inside the victim.)
+        let want = numeric::dbm_to_mw(-60.0);
         assert!((ws.co_channel_mw - want).abs() / want < 1e-9);
+
+        // The converse: a one-sub-channel victim under a two-sub-channel interferer
+        // receives the half of the interferer's power that falls on the shared
+        // sub-channel, not all of it.
+        let mut narrow = SlArrival::new(
+            1,
+            NodeId::new(1),
+            NodeId::new(2),
+            -70.0,
+            SlResource::new(10, 1, 1),
+        );
+        narrow.interferers.push(SlInterferer {
+            node: NodeId::new(3),
+            power_dbm: -60.0,
+            resource: SlResource::new(10, 0, 2),
+        });
+        let ns = p.interference_split(&narrow);
+        let want = numeric::dbm_to_mw(-60.0) * 0.5;
+        assert!((ns.co_channel_mw - want).abs() / want < 1e-9);
     }
 
     #[test]

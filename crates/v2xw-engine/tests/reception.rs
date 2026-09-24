@@ -213,15 +213,35 @@ fn a_dense_fleet_loses_frames_to_interference_and_a_sparse_one_does_not() {
 /// The medium-access model delays frames, and it delays them more when the medium is busy.
 ///
 /// The counterexample is the sparse run, where the medium is idle and access costs an AIFS.
+///
+/// Both runs switch building obstruction off. What this test measures is the MAC under a
+/// shared medium, and in Midtown most pairs are behind a block of towers, so with buildings
+/// on a node's energy detector hears only the few vehicles on its own street and the
+/// "dense" fleet is not a busy medium at all. (It used to pass with buildings on for the
+/// wrong reason: every node generated at the same instant, so every frame waited behind
+/// every other one — the synchronised contention `v2xw_msg::GenerationTiming` removed.)
 #[test]
 fn the_mac_delays_a_frame_more_when_the_medium_is_busy() {
-    let (dense, _) = run(load("scale/100.yaml"));
-    let (sparse, _) = run(load("scale/2.yaml"));
+    let open = |mut s: Scenario| {
+        s.world.buildings.enabled = false;
+        s
+    };
+    let (dense, _) = run(open(load("scale/100.yaml")));
+    let (sparse, _) = run(open(load("scale/2.yaml")));
     assert!(dense.mac_grants > 0 && sparse.mac_grants > 0);
     let dense_delay = dense.mac_access_delay_ns as f64 / dense.mac_grants as f64;
     let sparse_delay = sparse.mac_access_delay_ns as f64 / sparse.mac_grants as f64;
+    // The expected mean access delay is about `ρ · (T/2 + AIFS + CW_min/2 · slot)` — the
+    // chance a frame finds the medium busy, times the residual frame, the AIFS and the
+    // mean AC_VO backoff it then waits (≈ 120 + 58 + 20 µs for a 240 µs BSM). A hundred
+    // unsynchronised vehicles on this map keep each node's medium busy for roughly a tenth
+    // of the time and two keep it busy for well under one per cent, so the ratio is of the
+    // order of ten. The bound was 10x while every node generated at the same instant,
+    // which inflated the dense delay with synchronised contention; 5x is what the load
+    // itself supports (measured 7.9x: 28.2 µs against 3.55 µs), and a MAC that did not
+    // defer to a busy medium would put the two within a few microseconds of each other.
     assert!(
-        dense_delay > 10.0 * sparse_delay,
+        dense_delay > 5.0 * sparse_delay,
         "the access delay did not grow with the load: dense {dense_delay:.0} ns, \
          sparse {sparse_delay:.0} ns"
     );

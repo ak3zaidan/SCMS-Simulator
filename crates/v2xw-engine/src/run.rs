@@ -102,7 +102,7 @@ use v2xw_node::{NodeConfig, ObuRuntime, RxFrame, StepOutcome, Transmission};
 use v2xw_record::{Cadence, Profile};
 use v2xw_radio::{
     AccessCategory, Arrival, ChannelId, Dcc, EdcaOcbMac, FrameDescriptor, FrameKind,
-    InterferenceSource, LosResult, LossCause, Mac, MacSdu, Mcs, OfdmPhy, Phy, RadioEndpoint,
+    InterferenceSource, LossCause, Mac, MacSdu, Mcs, OfdmPhy, Phy, RadioEndpoint,
     RxHandle, SaeJ2945Dcc, SduRef, TxHandle,
 };
 use v2xw_world::World;
@@ -114,6 +114,9 @@ use crate::event::{Event, Observe};
 use crate::records::{GtKinematics, NodeTx, PhyRx};
 use crate::scenario::Scenario;
 use crate::snapshot::{ActorState, SnapshotStream};
+
+pub mod jamming;
+pub mod sidelink;
 
 /// The 5.9 GHz safety channel, and the frequency the link budget is evaluated at.
 ///
@@ -243,6 +246,9 @@ pub struct RunReport {
     /// What the Phase 2 path did, when a scenario declared one
     /// ([`crate::phase2`]). All zeroes when it did not.
     pub phase2: crate::phase2::Phase2Report,
+    /// What the sidelink access layer did, when `radio.rat` selected LTE-V2X or NR-V2X.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sidelink: Option<sidelink::SidelinkReport>,
 }
 
 impl RunReport {
@@ -369,6 +375,14 @@ struct FrameState {
     payload_bytes: Option<u32>,
     /// The 1609.2 envelope's cost in octets: the SPDU less the payload.
     envelope_bytes: Option<u32>,
+    /// The sidelink resource the transport block was sent on, when the access layer is a
+    /// sidelink.
+    sl_resource: Option<v2xw_radio::SlResource>,
+    /// Co-slot sidelink transmissions at each receiver, declared as each one starts.
+    sl_interferers: BTreeMap<NodeId, Vec<v2xw_radio::SlInterferer>>,
+    /// Receivers inside a `high` focus region, whose reception the high-tier PHY rule
+    /// decides (preamble capture) whatever the surrounding tier is.
+    focus_high: std::collections::BTreeSet<NodeId>,
 }
 
 /// What a Phase 2 application message carries, beyond its length.
@@ -416,8 +430,6 @@ pub struct Engine {
     mac: Option<EdcaOcbMac>,
     /// Congestion control, at the medium and high tiers.
     dcc: Option<SaeJ2945Dcc>,
-    /// The PHY's frame-error stream domain, derived once from its model id.
-    rx_domain: RngDomain,
     weather: WeatherState,
     actors: BTreeMap<ActorId, ActorRecord>,
     nodes: BTreeMap<NodeId, ObuRuntime>,
@@ -457,6 +469,21 @@ pub struct Engine {
     providers: v2xw_metrics::ProviderSet,
     metric_period: Duration,
     reverse_node_walk: bool,
+    /// Where each node's generator sits on the time axis (`v2xw_msg::GenerationTiming`).
+    gen_timing: v2xw_msg::GenerationTiming,
+    /// Each node's generation phase, drawn once when the node is created.
+    node_phase: BTreeMap<NodeId, Duration>,
+    /// Each vehicle node's radio class, which sets its antenna height and gain.
+    node_class: BTreeMap<NodeId, v2xw_radio::ActorClass>,
+    /// What obstructs a link: buildings and terrain, as the scenario selected them.
+    obstacles: crate::wiring::ObstacleStack,
+    /// The LTE-V2X or NR-V2X sidelink access layer, when `radio.rat` selects one. `None`
+    /// runs 802.11p through `phy`, `mac` and `dcc`.
+    sidelink: Option<sidelink::SidelinkAccess>,
+    /// The focus region and its radio stack, when `radio.tiers.focus` declares one.
+    focus: Option<crate::wiring::FocusStack>,
+    /// The jammers `threats.jammers` declared.
+    jamming: jamming::Jamming,
     report: RunReport,
 }
 
@@ -512,6 +539,36 @@ impl Engine {
         mobility.set_weather(crate::wiring::initial_weather(&scenario));
         let gnss = crate::wiring::build_gnss(&scenario);
         let (propagation, fading) = crate::wiring::build_radio(&scenario, &world);
+        crate::wiring::register_radio(
+            &mut registry,
+            propagation.as_ref(),
+            fading.as_ref(),
+            &crate::wiring::build_phy(&scenario),
+        )?;
+        let obstacles = crate::wiring::build_obstacles(&scenario, &world);
+        obstacles.register(&mut registry)?;
+        let focus = crate::wiring::build_focus(&scenario, &world);
+        if let Some(f) = focus.as_ref() {
+            crate::wiring::register_radio(
+                &mut registry,
+                f.propagation.as_ref(),
+                f.fading.as_ref(),
+                &crate::wiring::build_phy(&scenario),
+            )?;
+        }
+        let sidelink = sidelink::SidelinkAccess::for_scenario(&scenario);
+        if let Some(sl) = sidelink.as_ref() {
+            sl.register(&mut registry)?;
+        }
+        let jammers = jamming::Jamming::for_scenario(
+            &scenario,
+            sidelink.as_ref().map_or(SAFETY_CHANNEL, |sl| sl.channel),
+        );
+        for card in jammers.cards() {
+            if !registry.contains(&card.id) {
+                registry.register(card)?;
+            }
+        }
 
         // The mobility provider reads the world through a context, so it needs one before
         // the engine exists. Everything it can reach at this point is immutable state the
@@ -535,6 +592,8 @@ impl Engine {
             mobility.init(&mut crate::adapters::mobility(&mut ctx), demand)?;
         }
 
+        let gen_timing = crate::wiring::generation_timing(&scenario);
+        crate::wiring::register_generation_timing(&mut registry, gen_timing)?;
         let providers = crate::wiring::build_metrics(&scenario, &mut registry)?;
         let manifest = crate::manifest::assemble(&scenario, &world, &registry, build_utc)?;
         // The snapshot stream's cadence is the scenario's mobility step and, by default,
@@ -570,9 +629,10 @@ impl Engine {
             propagation,
             fading,
             phy: crate::wiring::build_phy(&scenario_for_radio),
-            mac: crate::wiring::build_mac(&scenario_for_radio),
-            dcc: crate::wiring::build_dcc(&scenario_for_radio),
-            rx_domain: RngDomain::plugin(OfdmPhy::ID),
+            // 802.11p's EDCA and J2945/1 congestion control belong to the DSRC stack; a
+            // sidelink scenario runs the SPS engine in `sidelink` instead.
+            mac: if sidelink.is_some() { None } else { crate::wiring::build_mac(&scenario_for_radio) },
+            dcc: if sidelink.is_some() { None } else { crate::wiring::build_dcc(&scenario_for_radio) },
             actors: BTreeMap::new(),
             nodes: BTreeMap::new(),
             inboxes: BTreeMap::new(),
@@ -591,6 +651,13 @@ impl Engine {
             providers,
             metric_period: Duration::from_secs(1),
             reverse_node_walk: false,
+            gen_timing,
+            node_phase: BTreeMap::new(),
+            node_class: BTreeMap::new(),
+            obstacles,
+            sidelink,
+            focus,
+            jamming: jammers,
             report: RunReport::default(),
         };
         let phase2 = crate::phase2::Phase2::build(&engine.scenario, &engine.world)?;
@@ -729,6 +796,31 @@ impl Engine {
         self.actors.get(&actor).map(|a| a.last.extrapolate(t).pos)
     }
 
+    /// Moves a `follow` focus region onto its node's current position.
+    fn recentre_focus(&mut self, now: SimTime) {
+        let Some(node) = self.focus.as_ref().and_then(|f| f.plan.follows) else {
+            return;
+        };
+        let centre = self.node_pos(node, now).unwrap_or(crate::wiring::FOCUS_NOWHERE);
+        if let Some(f) = self.focus.as_mut() {
+            f.plan.recentre(centre);
+        }
+    }
+
+    /// Draws a new node's generation phase (`v2xw_msg::GenerationTiming::phase`).
+    ///
+    /// Keyed by the node id alone, so the phase does not depend on when the node was
+    /// created or how many were created before it.
+    fn note_node_created(&mut self, id: NodeId) {
+        let phase = self.gen_timing.phase(&self.rng, id);
+        self.node_phase.insert(id, phase);
+    }
+
+    /// One node's generation phase inside the mobility step, when it has one.
+    pub fn node_phase(&self, node: NodeId) -> Option<Duration> {
+        self.node_phase.get(&node).copied()
+    }
+
     /// True if `t` falls inside a declared time-dilation window.
     pub fn is_dilated(&self, t: SimTime) -> bool {
         self.manifest.is_dilated(t)
@@ -774,6 +866,7 @@ impl Engine {
             runtime.set_belief(belief.quantized());
             self.nodes.insert(id, runtime);
             self.inboxes.insert(id, Vec::new());
+            self.note_node_created(id);
             self.rsus.insert(id, spec.position);
             self.report.nodes_created += 1;
             if let Some(phase2) = self.phase2.as_mut() {
@@ -901,7 +994,11 @@ impl Engine {
                 Event::MobilityStep => {
                     self.on_mobility_step(recorder, step, horizon)?;
                 }
-                Event::NodePhase => self.on_node_phase(recorder, horizon),
+                Event::NodePhase => self.on_node_phase(recorder, horizon, None),
+                Event::NodeTask {
+                    node,
+                    task: crate::event::NodeTask::Step,
+                } => self.on_node_phase(recorder, horizon, Some(node)),
                 Event::MacTimer { node, channel } => {
                     self.on_mac_timer(node, ChannelId(channel), horizon);
                 }
@@ -931,6 +1028,7 @@ impl Engine {
         if let Some(phase2) = self.phase2.as_ref() {
             self.report.phase2 = phase2.report().clone();
         }
+        self.report.sidelink = self.sidelink_report();
         // What the *recorder* says it kept, asked once at the end and never inferred from
         // what the engine handed over. The two numbers sitting side by side is the point:
         // a run report that quoted only the emitted count could contradict the artefact
@@ -1045,15 +1143,45 @@ impl Engine {
         };
 
         self.absorb(&update, now);
+        self.recentre_focus(now);
         self.rebuild_snapshot(&update);
+        self.declare_jamming(now, step);
         self.update_beliefs(recorder, now);
 
         self.report.mobility_steps += 1;
 
-        // The node phase at the same instant, at priority 6 — after any PhyEnd at this
-        // instant (priority 3), which is the order 02-architecture.md §5.1 fixes.
-        self.scheduler
-            .schedule(now, EventClass::NodeTask, Event::NodePhase);
+        // The node phase. With a synchronised generation timing every node steps at this
+        // instant, at priority 6 — after any PhyEnd at this instant (priority 3), which is
+        // the order 02-architecture.md §5.1 fixes. Otherwise each node steps at its own
+        // phase inside the step (`v2xw_msg::GenerationTiming`): no standard puts two
+        // stations' generators on a common grid, and stepping them all at once made every
+        // vehicle contend for the channel in the same few hundred microseconds.
+        if self.gen_timing.is_synchronised() {
+            self.scheduler
+                .schedule(now, EventClass::NodeTask, Event::NodePhase);
+        } else {
+            let step_ns = step.as_nanos().max(1);
+            let due: Vec<(NodeId, SimTime)> = self
+                .nodes
+                .keys()
+                .map(|n| {
+                    let phase = self.node_phase.get(n).map_or(0, |d| d.as_nanos() % step_ns);
+                    (*n, now + phase)
+                })
+                .collect();
+            for (node, at) in due {
+                if at <= horizon {
+                    self.scheduler.schedule(
+                        at,
+                        EventClass::NodeTask,
+                        Event::NodeTask {
+                            node,
+                            task: crate::event::NodeTask::Step,
+                        },
+                    );
+                }
+            }
+        }
 
         let next = step.after(now);
         if next <= horizon {
@@ -1108,6 +1236,8 @@ impl Engine {
                 }
                 self.nodes.insert(id, runtime);
                 self.inboxes.insert(id, Vec::new());
+                self.note_node_created(id);
+                self.node_class.insert(id, radio_class(spawn.class));
                 self.report.nodes_created += 1;
                 if self.phase2.is_some() {
                     let Engine {
@@ -1153,6 +1283,8 @@ impl Engine {
             {
                 self.nodes.remove(&node);
                 self.inboxes.remove(&node);
+                self.node_phase.remove(&node);
+                self.node_class.remove(&node);
             }
         }
         for (actor, k) in &update.states {
@@ -1394,17 +1526,37 @@ impl Engine {
     /// around it would mean `unsafe`, which this crate forbids. The reception phase in
     /// [`Engine::on_phy_end`] *is* executed in parallel, so the structure is exercised by
     /// the run rather than only described by it.
-    fn on_node_phase(&mut self, recorder: &mut dyn RunRecorder, horizon: SimTime) {
+    ///
+    /// `only` restricts the phase to one node: the per-node step of a desynchronised
+    /// generation timing, where each node is woken at its own phase. `None` walks them all.
+    fn on_node_phase(
+        &mut self,
+        recorder: &mut dyn RunRecorder,
+        horizon: SimTime,
+        only: Option<NodeId>,
+    ) {
         let now = self.scheduler.now();
         let step_s = self.scenario.time.mobility_step().as_secs_f64();
+        // A node stepping at its own phase generates between two GNSS epochs. Its belief
+        // is the fix of the last mobility step, so the node dead-reckons it forward to the
+        // instant it is about to stamp on the message, from its *own* velocity estimate —
+        // never from ground truth (invariant I-C2). Without this every message would carry
+        // a position `v·φ` older than its generation time, which plausibility detectors
+        // read, correctly, as an inconsistent sender. An OBU does the same: the BSM's
+        // position is meant to be the position at `secMark`, and 04-models.md §8.1 records
+        // J2945/1's latency-compensation requirement as secondary-sourced.
+        if let Some(node) = only {
+            self.dead_reckon_belief(node, now);
+        }
         let mut inboxes = core::mem::take(&mut self.inboxes);
         let rng = &self.rng;
 
         let reverse = self.reverse_node_walk;
+        let selected = move |id: &NodeId| only.is_none_or(|o| o == *id);
         let walk: Box<dyn Iterator<Item = (&NodeId, &mut ObuRuntime)>> = if reverse {
-            Box::new(self.nodes.iter_mut().rev())
+            Box::new(self.nodes.iter_mut().rev().filter(move |(id, _)| selected(id)))
         } else {
-            Box::new(self.nodes.iter_mut())
+            Box::new(self.nodes.iter_mut().filter(move |(id, _)| selected(id)))
         };
         let mut results: Vec<(NodeId, StepOutcome, Vec<v2xw_core::ctx::OwnedRecord>, f64)> = walk
             .map(|(id, runtime)| {
@@ -1468,10 +1620,36 @@ impl Engine {
             }
         }
 
-        for inbox in inboxes.values_mut() {
-            inbox.clear();
+        for (id, inbox) in inboxes.iter_mut() {
+            if only.is_none_or(|o| o == *id) {
+                inbox.clear();
+            }
         }
         self.inboxes = inboxes;
+    }
+
+    /// Advances one node's position belief to `now` along its own believed velocity.
+    ///
+    /// Only the node's own estimate is read: position, velocity and the believed instant
+    /// the estimate is valid at. A belief with no fix, or one already at or past the
+    /// node's believed `now`, is left alone.
+    fn dead_reckon_belief(&mut self, node: NodeId, now: SimTime) {
+        let Some(runtime) = self.nodes.get_mut(&node) else {
+            return;
+        };
+        let believed_now = runtime.clock().believed_time(now);
+        let mut belief = *v2xw_core::NodeView::position(runtime);
+        if !belief.fix.has_position() || believed_now <= belief.time_ns {
+            return;
+        }
+        let dt = (believed_now - belief.time_ns) as f64 * 1e-9;
+        belief.pos = Vec3::new(
+            belief.pos.x + belief.vel.x * dt,
+            belief.pos.y + belief.vel.y * dt,
+            belief.pos.z + belief.vel.z * dt,
+        );
+        belief.time_ns = believed_now;
+        runtime.set_belief(belief.quantized());
     }
 
     /// Runs one node's detector suite and puts any report it filed on the air.
@@ -1569,8 +1747,21 @@ impl Engine {
     /// instant the signature completes, which is where [`Engine::on_mac_timer`] picks it
     /// up. At the abstract tier there is no MAC, and the frame is scheduled straight to
     /// the air one AIFS later.
+    ///
+    /// A message the node's own generator produced also waits its hand-off jitter
+    /// (`v2xw_msg::GenerationTiming::jitter`) between the signature and the access layer:
+    /// host and stack latency, and what keeps two stations whose phases coincide from
+    /// colliding on every period. The engine's own application frames (a misbehaviour
+    /// report, a CRL broadcast) go through [`Engine::hand_down_app`] directly and do not.
     fn hand_down(&mut self, node: NodeId, tx: &Transmission, now: SimTime, horizon: SimTime) {
-        self.hand_down_app(node, tx, now, horizon, None);
+        let jitter = self.gen_timing.jitter(&self.rng, node, tx.generation_time);
+        if jitter.as_nanos() == 0 {
+            self.hand_down_app(node, tx, now, horizon, None);
+            return;
+        }
+        let mut delayed = tx.clone();
+        delayed.ready_at = jitter.after(tx.ready_at);
+        self.hand_down_app(node, &delayed, now, horizon, None);
     }
 
     /// [`Engine::hand_down`] with an application payload attached.
@@ -1702,19 +1893,27 @@ impl Engine {
         // The transmit power is congestion control's, not the scenario's: J2945/1 controls
         // power as well as rate, and the SUPRA filter's output is what the link budget has
         // to be evaluated at. With no DCC model (the abstract tier) it is the profile's.
-        let tx_power_dbm = self.dcc_power_dbm(node);
+        let (tx_power_dbm, channel) = match self.sidelink.as_ref() {
+            Some(sl) => (sl.tx_power_dbm, sl.channel),
+            None => (self.dcc_power_dbm(node), SAFETY_CHANNEL),
+        };
         let descriptor = FrameDescriptor {
             bytes: tx.bytes,
             mcs: SAFETY_MCS,
             tx_power_dbm,
-            channel: SAFETY_CHANNEL,
+            channel,
             ac: SAFETY_AC,
             kind: FrameKind::Broadcast,
             // One SDU per frame: no fragmentation model is wired in, so the SDU id and
             // the frame number are the same counter seen from two layers.
             sdu_ref: SduRef::new(v2xw_core::ids::SduId::new(frame.index()), frame),
         };
-        let air = v2xw_radio::air_time(tx.bytes, SAFETY_MCS);
+        // A sidelink transport block occupies one slot whatever it carries; its size
+        // decides how many sub-channels it takes instead (04-models.md §5.1, §5.2).
+        let air = match self.sidelink.as_ref() {
+            Some(sl) => sl.slot(),
+            None => v2xw_radio::air_time(tx.bytes, SAFETY_MCS),
+        };
         self.frames.insert(
             frame,
             FrameState {
@@ -1746,16 +1945,19 @@ impl Engine {
                 // engine has no business having a second one.
                 payload_bytes: tx.payload_bytes(),
                 envelope_bytes: tx.envelope_bytes(),
+                sl_resource: None,
+                sl_interferers: BTreeMap::new(),
+                focus_high: std::collections::BTreeSet::new(),
             },
         );
-        if self.mac.is_some() {
+        if self.mac.is_some() || self.sidelink.is_some() {
             self.pending_tx.entry(node).or_default().push((ready, frame));
             self.scheduler.schedule(
                 ready,
                 EventClass::MacTimer,
                 Event::MacTimer {
                     node,
-                    channel: SAFETY_CHANNEL.0,
+                    channel: channel.0,
                 },
             );
         } else {
@@ -1815,6 +2017,10 @@ impl Engine {
     /// distinction is the high tier's, and the `audible_to_victim_tx` field the PHY takes
     /// for it is the seam.
     fn on_mac_timer(&mut self, node: NodeId, channel: ChannelId, horizon: SimTime) {
+        if self.sidelink.is_some() {
+            self.on_sidelink_timer(node, horizon);
+            return;
+        }
         if self.mac.is_none() {
             return;
         }
@@ -2050,6 +2256,13 @@ impl Engine {
                 clear = clear.max(state.end);
             }
         }
+        // A jammer above the energy-detection threshold holds the medium busy for as long
+        // as its window lasts: the denial of channel access a constant jammer causes.
+        for a in self.phy.jamming().at(node) {
+            if a.power_dbm >= threshold && a.window.from <= now && a.window.to > now {
+                clear = clear.max(a.window.to);
+            }
+        }
         clear
     }
 
@@ -2087,8 +2300,19 @@ impl Engine {
         state.end = state.air.after(now);
 
         // The PHY owns the air time, the transmit interval for the half-duplex test, and
-        // the transmitted half of the air-time ledger.
-        let handle = {
+        // the transmitted half of the air-time ledger. A sidelink transport block's
+        // handle is the slot it was granted, and its half-duplex and interference
+        // bookkeeping is `sidelink`'s.
+        let handle = if self.sidelink.is_some() {
+            Ok(v2xw_radio::TxHandle {
+                id: u64::from(frame.index()) + 1,
+                tx: state.tx,
+                channel: state.descriptor.channel,
+                start: now,
+                end: state.air.after(now),
+                air_time: state.air,
+            })
+        } else {
             let Engine {
                 scheduler,
                 rng,
@@ -2156,9 +2380,32 @@ impl Engine {
         // Stage 2: the link budgets, sequentially, because the models carry state — a
         // shadowing process is correlated along a trajectory, which is why it has state
         // at all.
-        for (rx, rx_pos) in candidates {
-            let (rssi, dist) = self.link_budget(&state, rx, rx_pos);
+        for &(rx, rx_pos) in &candidates {
+            let (rssi, dist, high) = self.link_budget(&state, rx, rx_pos);
             state.arrivals.insert(rx, (rssi, dist));
+            if high {
+                state.focus_high.insert(rx);
+            }
+        }
+        // A reactive jammer that hears this frame jams it at its receivers.
+        self.react_to_frame(
+            state.tx,
+            state.tx_pos,
+            state.descriptor.tx_power_dbm,
+            state.start,
+            state.end,
+            &candidates,
+        );
+
+        if self.sidelink.is_some() {
+            self.sidelink_register(frame, &mut state);
+            for &rx in state.arrivals.keys() {
+                self.live_at_rx.entry(rx).or_default().push(frame);
+            }
+            self.scheduler
+                .schedule(state.end, EventClass::PhyEnd, Event::PhyEnd { frame });
+            self.frames.insert(frame, state);
+            return;
         }
 
         // Stage 3: register the arrivals, and cross-declare interference with everything
@@ -2231,28 +2478,17 @@ impl Engine {
 
     /// The reception phase (ADR 0004 decision 5, invariant I-R2).
     ///
-    /// The arrival set and every received power were fixed at [`Engine::on_phy_start`];
-    /// what happens here is the **decision**, per receiver, in parallel. The order of the
-    /// tests is the order of the physics, and it is the order
-    /// [`v2xw_radio::OfdmPhy`]'s own `evaluate` applies:
+    /// The arrival set and every received power were fixed when the frame started; what
+    /// happens here is the **decision**, per receiver. For 802.11p it is
+    /// [`v2xw_radio::OfdmPhy::decide`] — the PHY's own evaluation, half duplex, then
+    /// sensitivity, then (at the high tier or inside a high focus region) preamble capture,
+    /// then the error model against the per-window SINR with the jamming counterfactual —
+    /// in parallel over receivers, each with its keyed `(link, frame)` draw. For a
+    /// sidelink it is `v2xw_radio::SidelinkPhy::evaluate` ([`sidelink`]).
     ///
-    /// 1. a radio that is transmitting hears nothing at all (802.11p is half duplex);
-    /// 2. a signal below the receiver's sensitivity for the frame's MCS is never detected;
-    /// 3. at the high tier, a preamble that cannot be captured is never decoded;
-    /// 4. and only then does the error model get a say, against the per-window SINR over
-    ///    the declared interferer set.
-    ///
-    /// # Why this is not one call to `Phy::finish_rx`
-    ///
-    /// It would be, but for one signature: `finish_rx` takes `&mut self`, because it
-    /// forgets the arrival and updates the air-time ledger, and `rayon` cannot hand `&mut
-    /// OfdmPhy` to a map over receivers. The *decision* inside it is `&self` — the PHY
-    /// says so and explains why — but it is private, so the engine composes the same
-    /// public primitives (`transmits_during`, `sensitivity_dbm`, `preamble_locked`,
-    /// `success_probability`) in the same order, and draws from the same stream the PHY
-    /// draws from: `(plugin(phy id), LinkFrame { link, frame: arrival.start })`. Making
-    /// `evaluate` public would replace this whole map with a `par_iter` over one call,
-    /// and is the one-line change `v2xw-radio` owns.
+    /// The 802.11p decision used to be re-composed here from the PHY's public primitives,
+    /// because the PHY's own was private. The re-composition had drifted: it never
+    /// attributed a loss to a jammer, so a jammed frame was reported as a collision.
     fn on_phy_end(&mut self, recorder: &mut dyn RunRecorder, frame: FrameSeq) {
         let Some(state) = self.frames.remove(&frame) else {
             return;
@@ -2260,14 +2496,28 @@ impl Engine {
         let now = self.scheduler.now();
         let frame_index = u64::from(frame.index());
 
+        let tx_id = state.tx_id();
+        let mut outcomes: Vec<LinkOutcome> = if self.sidelink.is_some() {
+            self.sidelink_outcomes(&state)
+        } else {
+            self.dsrc_outcomes(&state)
+        };
+
+        // The merge. `par_iter` over a `BTreeMap` is not an indexed parallel iterator, so
+        // the order the results arrive in is `rayon`'s business; the guarantee the run
+        // depends on is stated here rather than inherited from a library's iterator kind.
+        outcomes.sort_by_key(|o| o.rx);
+        self.finish_phy_end(recorder, frame, state, now, frame_index, tx_id, outcomes);
+    }
+
+    /// The 802.11p reception decisions for one frame, per receiver, in parallel.
+    fn dsrc_outcomes(&self, state: &FrameState) -> Vec<LinkOutcome> {
         let phy = &self.phy;
         let rng = &self.rng;
-        let domain = self.rx_domain;
+        let domain = OfdmPhy::frame_error_domain();
         let high = Phy::<EngineCtx<'_>>::tier(phy) == Tier::High;
-        let tx = state.tx;
         let tx_id = state.tx_id();
-        let mcs = state.descriptor.mcs;
-        let mut outcomes: Vec<LinkOutcome> = state
+        state
             .arrivals
             .par_iter()
             .map(|(&rx, &(power_dbm, distance_m))| {
@@ -2293,56 +2543,35 @@ impl Engine {
                         / windows.len() as f64
                 };
                 out.sinr_db = v2xw_radio::numeric::q_db(mean_sinr);
-                if phy.transmits_during(rx, arrival.start, arrival.end) {
-                    out.cause = Some(LossCause::HalfDuplex);
-                    return out;
-                }
-                if power_dbm < phy.sensitivity_dbm(mcs) {
-                    out.cause = Some(LossCause::BelowSensitivity);
-                    return out;
-                }
-                if high && !phy.preamble_locked(arrival) {
-                    out.cause = Some(LossCause::PreambleMissed);
-                    return out;
-                }
-                let psr = phy.success_probability(arrival);
                 // The draw is keyed by (link, frame), so a receiver's outcome depends on
                 // neither the thread that computed it nor how many frames the link has
                 // already carried.
-                let error = rng
-                    .checkout(
-                        domain,
-                        EntityRef::LinkFrame {
-                            link: LinkKey::new(tx, rx),
-                            frame: arrival.start,
-                        },
-                    )
-                    .bool(1.0 - psr);
-                let hidden = arrival
-                    .interferers
-                    .iter()
-                    .any(|i| i.audible_to_victim_tx == Some(false));
-                out.received = !error;
-                out.cause = error.then(|| {
-                    if arrival.interferers.is_empty() {
-                        // No interferer: thermal noise and the fading realisation are what
-                        // killed it, which is what `Fading` names.
-                        LossCause::Fading
-                    } else if hidden {
-                        LossCause::HiddenTerminal
-                    } else {
-                        LossCause::Collision
+                let draw = rng.checkout(domain, OfdmPhy::frame_key(arrival)).f64();
+                let decided_high = high || state.focus_high.contains(&rx);
+                match phy.decide(arrival, decided_high, draw) {
+                    v2xw_radio::RxOutcome::Received { .. } => {
+                        out.received = true;
+                        out.cause = None;
                     }
-                });
+                    v2xw_radio::RxOutcome::Lost(cause) => out.cause = Some(cause),
+                }
                 out
             })
-            .collect();
+            .collect()
+    }
 
-        // The merge. `par_iter` over a `BTreeMap` is not an indexed parallel iterator, so
-        // the order the results arrive in is `rayon`'s business; the guarantee the run
-        // depends on is stated here rather than inherited from a library's iterator kind.
-        outcomes.sort_by_key(|o| o.rx);
-
+    /// Records, delivers and retires one frame whose outcomes have been decided.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_phy_end(
+        &mut self,
+        recorder: &mut dyn RunRecorder,
+        frame: FrameSeq,
+        state: FrameState,
+        now: SimTime,
+        frame_index: u64,
+        tx_id: u64,
+        outcomes: Vec<LinkOutcome>,
+    ) {
         let mut received_any = false;
         // Which receivers decoded a frame carrying an application payload, so the payload
         // is acted on once per receiver after every outcome has been recorded.
@@ -2409,8 +2638,11 @@ impl Engine {
         // The bookkeeping, after every decision has been taken: nothing an evaluation read
         // may depend on how many other arrivals have already been retired (invariant
         // I-R2), which is why the forgetting is a second pass and not part of the map.
+        let dsrc = self.sidelink.is_none();
         for &rx in state.arrivals.keys() {
-            self.phy.forget_arrival(RxHandle { tx: tx_id, rx });
+            if dsrc {
+                self.phy.forget_arrival(RxHandle { tx: tx_id, rx });
+            }
             if let Some(live) = self.live_at_rx.get_mut(&rx) {
                 live.retain(|f| *f != frame);
                 if live.is_empty() {
@@ -2418,7 +2650,9 @@ impl Engine {
                 }
             }
         }
-        if let Some(handle) = state.tx_handle {
+        if let Some(handle) = state.tx_handle
+            && dsrc
+        {
             self.phy.end_tx(handle);
         }
 
@@ -2430,7 +2664,7 @@ impl Engine {
             u64::from(state.bytes),
             state.air.as_nanos() / 1000,
             state.descriptor.tx_power_dbm,
-            SAFETY_CHANNEL.0,
+            state.descriptor.channel.0,
             if state.full_certificate {
                 SignerId::Certificate
             } else {
@@ -2631,12 +2865,37 @@ impl Engine {
     /// Sequential by necessity: the shadowing process and the fading model are stateful
     /// per link. `rx_power = P_tx − total_loss + fading_gain`, summed with
     /// [`v2xw_core::math::sum_ordered`] so two builds cannot disagree about its last bit.
-    fn link_budget(&mut self, state: &FrameState, rx: NodeId, rx_pos: Vec3) -> (f64, f64) {
+    ///
+    /// The third value is whether a focus region puts this receiver under the high-tier
+    /// PHY rule. With a focus region the stack is chosen per link by
+    /// `v2xw_radio::FocusPlan::evaluate` (02-architecture.md §7.3): inside, the focus
+    /// stack; inbound, the surrounding propagation with no fading draw; otherwise the
+    /// surrounding stack.
+    fn link_budget(&mut self, state: &FrameState, rx: NodeId, rx_pos: Vec3) -> (f64, f64, bool) {
         let now = self.scheduler.now();
         let link = LinkKey::new(state.tx, rx);
         let distance_m = state.tx_pos.distance(rx_pos);
+        let freq_hz = self.carrier_hz();
 
-        let (loss, fade) = {
+        // The antennas, not the ground points: a vehicle's phase centre stands at its
+        // class's default height above the road (1.5 m for a car, TR 36.885), and a
+        // roadside unit's position already carries its mast height. The building test
+        // below is 2.5-D and compares roof heights against these.
+        let tx_end = self.endpoint(state.tx, state.tx_pos, now);
+        let rx_end = self.endpoint(rx, rx_pos, now);
+
+        // What obstructs the path (04-models.md §3.5): building footprints crossed
+        // (Sommer 2011) and terrain knife edges (ITU-R P.526), each only when the scenario
+        // turned it on and the world has it. A clear link costs nothing but the index
+        // query.
+        let los = self.obstacles.classify(&self.world, tx_end.pos, rx_end.pos);
+        let evaluation = self
+            .focus
+            .as_ref()
+            .map(|f| f.plan.evaluate(tx_end.pos, rx_end.pos));
+        let high = evaluation.is_some_and(|e| e.phy_tier == Tier::High);
+
+        let (loss, fade, obstacle_db) = {
             let Engine {
                 scheduler,
                 rng,
@@ -2647,31 +2906,68 @@ impl Engine {
                 propagation,
                 fading,
                 weather,
+                obstacles,
+                focus,
                 ..
             } = self;
             let mut null = crate::ctx::NullRecorder::new();
             let mut ctx = EngineCtx::new(
                 scheduler, rng, world, snapshot, provenance, params, &mut null,
             );
-            let tx_end =
-                RadioEndpoint::isotropic(state.tx, state.tx_pos, v2xw_radio::ActorClass::Car, now);
-            let rx_end = RadioEndpoint::isotropic(rx, rx_pos, v2xw_radio::ActorClass::Car, now);
-            // Line of sight is `clear` because no obstacle model is composed in this
-            // build; `v2xw-radio`'s `BuildingShadowing` is the model that fills it, and
-            // the seam is the `los` argument rather than a flag.
-            let los = LosResult::clear();
-            let loss =
-                propagation.loss_db(&mut ctx, &tx_end, &rx_end, SAFETY_FREQ_HZ, &los, weather);
-            let fade = fading.sample_db(&mut ctx, link, distance_m, now);
-            (loss, fade)
+            use v2xw_radio::LinkPlacement;
+            let (prop, fad, draw_fading): (
+                &mut Box<dyn BoxedPropagation>,
+                &mut Box<dyn BoxedFading>,
+                bool,
+            ) = match (focus.as_mut(), evaluation.map(|e| e.placement)) {
+                (Some(f), Some(LinkPlacement::Inside)) => {
+                    (&mut f.propagation, &mut f.fading, true)
+                }
+                (_, Some(LinkPlacement::Inbound)) => (propagation, fading, false),
+                _ => (propagation, fading, true),
+            };
+            let loss = prop.loss_db(&mut ctx, &tx_end, &rx_end, freq_hz, &los, weather);
+            let obstacle_db =
+                obstacles.loss_db(&mut ctx, &tx_end, &rx_end, &los, freq_hz, loss.path_db);
+            let fade = if draw_fading {
+                fad.sample_db(&mut ctx, link, distance_m, now)
+            } else {
+                0.0
+            };
+            (loss, fade, obstacle_db)
         };
 
         let rssi_dbm = v2xw_core::math::sum_ordered([
             state.descriptor.tx_power_dbm,
             -loss.total_db,
+            -obstacle_db,
             fade,
         ]);
-        (rssi_dbm, distance_m)
+        (rssi_dbm, distance_m, high)
+    }
+
+    /// The carrier the link budget is evaluated at, hertz.
+    fn carrier_hz(&self) -> f64 {
+        self.sidelink.as_ref().map_or(SAFETY_FREQ_HZ, |sl| sl.freq_hz)
+    }
+
+    /// One node's radio endpoint at an instant: its antenna position and class.
+    fn endpoint(&self, node: NodeId, ground: Vec3, now: SimTime) -> RadioEndpoint {
+        if node.index() >= jamming::JAMMER_ID_BASE {
+            // A jammer's declared position is its antenna's.
+            return RadioEndpoint::isotropic(node, ground, v2xw_radio::ActorClass::Car, now);
+        }
+        if self.rsus.contains_key(&node) {
+            // A mast's position is its antenna's (`crate::phase2`'s mast height).
+            return RadioEndpoint::isotropic(node, ground, v2xw_radio::ActorClass::Rsu, now);
+        }
+        let class = self
+            .node_class
+            .get(&node)
+            .copied()
+            .unwrap_or(v2xw_radio::ActorClass::Car);
+        let pos = Vec3::new(ground.x, ground.y, ground.z + class.default_antenna_height_m());
+        RadioEndpoint::isotropic(node, pos, class, now)
     }
 
     /// The metric phase: every provider flushes its window, and the samples are recorded
@@ -2798,6 +3094,21 @@ struct LinkOutcome {
     /// Exactly one loss cause when the frame did not decode, and `None` when it did
     /// (invariant I-R3).
     cause: Option<LossCause>,
+}
+
+/// The radio actor class a vehicle class transmits as: what sets its antenna height and
+/// gain (04-models.md §3.7).
+fn radio_class(class: VehicleClass) -> v2xw_radio::ActorClass {
+    match class {
+        VehicleClass::Truck | VehicleClass::Trailer | VehicleClass::Bus | VehicleClass::Coach => {
+            v2xw_radio::ActorClass::Truck
+        }
+        VehicleClass::Delivery => v2xw_radio::ActorClass::Van,
+        VehicleClass::Motorcycle | VehicleClass::Moped => v2xw_radio::ActorClass::Motorcycle,
+        VehicleClass::Bicycle | VehicleClass::Scooter => v2xw_radio::ActorClass::Bicycle,
+        VehicleClass::Pedestrian => v2xw_radio::ActorClass::Pedestrian,
+        VehicleClass::Passenger | VehicleClass::Emergency => v2xw_radio::ActorClass::Car,
+    }
 }
 
 /// The lower-case name a `node.tx` record carries for a message type.

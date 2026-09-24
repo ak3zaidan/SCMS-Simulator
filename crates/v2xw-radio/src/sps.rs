@@ -398,6 +398,14 @@ pub enum SelectionReason {
     Reevaluation,
     /// Rel-16 pre-emption freed the booked resource for a higher-priority UE.
     Preemption,
+    /// The transport block needs more sub-channels than the reservation holds: the
+    /// "configured sidelink grant cannot accommodate the RLC SDU" trigger of TS 36.321
+    /// §5.14.1.1 (Rel-14), which a BSM that attaches its certificate once a second fires
+    /// on every certificate-bearing message.
+    SizeChange,
+    /// The booked resource lies beyond the transport block's latency budget: the
+    /// "grant cannot meet the latency requirement" trigger of TS 36.321 §5.14.1.1.
+    LatencyBudget,
 }
 
 /// What one selection did, for the record channel and for the occupancy statistic.
@@ -433,10 +441,14 @@ struct UeState {
     retransmission_slot: u64,
     /// The last selection, for inspection.
     last_selection: Option<SelectionOutcome>,
-    /// Frames dropped because the latency deadline passed before a grant.
+    /// Frames dropped because the latency deadline passed before a grant, or because
+    /// the queue was full.
     dropped: u64,
     /// Grants issued.
     granted: u64,
+    /// SDUs dropped for their latency budget and not yet handed back to the caller, which
+    /// owns whatever the SDU refers to and has to release it.
+    expired: Vec<MacSdu>,
 }
 
 /// `mac/lte-v2x/sps-sensing` and `mac/nr-v2x/sps-sensing`: the shared engine.
@@ -449,6 +461,7 @@ pub struct SpsEngine {
     queue_depth: usize,
     ues: BTreeMap<u32, UeState>,
     selections: u64,
+    by_reason: BTreeMap<SelectionReason, u64>,
 }
 
 impl SpsEngine {
@@ -468,6 +481,7 @@ impl SpsEngine {
             queue_depth: 8,
             ues: BTreeMap::new(),
             selections: 0,
+            by_reason: BTreeMap::new(),
         }
     }
 
@@ -510,7 +524,35 @@ impl SpsEngine {
             last_selection: None,
             dropped: 0,
             granted: 0,
+            expired: Vec::new(),
         })
+    }
+
+    /// The latency budget of a transport block, in slots: the reservation period when
+    /// there is one — a periodic message must leave before its successor arrives, which
+    /// for a 10 Hz BSM or CAM is the 100 ms maximum latency of 3GPP TR 37.885 Table
+    /// 5.1-1's periodic safety traffic — and `T2` for one-shot traffic.
+    #[must_use]
+    pub fn latency_budget_slots(&self) -> u64 {
+        let rri = self.params.rri.slots(self.pool.mu);
+        if rri > 0 { rri } else { self.params.t2_slots.max(1) }
+    }
+
+    /// The SDUs dropped for their latency budget since the last call, oldest first.
+    ///
+    /// The caller owns whatever an SDU refers to (the engine's frame table), so a MAC
+    /// that dropped one silently would leak it; this is how the drop reaches the owner.
+    pub fn take_expired(&mut self, node: NodeId) -> Vec<MacSdu> {
+        self.ues
+            .get_mut(&node.index())
+            .map(|s| core::mem::take(&mut s.expired))
+            .unwrap_or_default()
+    }
+
+    /// How many selections have run for each reason, over all UEs.
+    #[must_use]
+    pub fn selections_by_reason(&self) -> BTreeMap<SelectionReason, u64> {
+        self.by_reason.clone()
     }
 
     /// Feeds one decoded SCI into a UE's sensing window.
@@ -854,6 +896,7 @@ impl SpsEngine {
         });
         st.last_selection = Some(outcome);
         self.selections += 1;
+        *self.by_reason.entry(reason).or_insert(0) += 1;
         Some(outcome)
     }
 
@@ -1128,40 +1171,71 @@ impl<C: Ctx + ?Sized> Mac<C> for SpsEngine {
             }
         }
 
+        // Transport blocks whose latency budget has passed are dropped, oldest first, and
+        // handed back through `take_expired`: transmitting a BSM older than its own
+        // successor is worse than not transmitting it.
+        let budget = self.latency_budget_slots();
+        {
+            let pool_slot = |t: SimTime| self.pool.slot_of(t);
+            let expired_heads = self
+                .ues
+                .get(&node.index())
+                .map_or(0, |s| {
+                    s.queue
+                        .iter()
+                        .take_while(|q| pool_slot(q.enqueued_at) + budget < now_slot)
+                        .count()
+                });
+            if expired_heads > 0 {
+                let st = self.state(node);
+                let gone: Vec<MacSdu> = st.queue.drain(..expired_heads).collect();
+                st.dropped += gone.len() as u64;
+                st.expired.extend(gone);
+            }
+        }
+
         let sdu = self
             .ues
             .get(&node.index())
             .and_then(|s| s.queue.first().copied())?;
         let len = self.pool.subchannels_for(sdu.frame.bytes)?;
 
-        // Rel-16 re-evaluation and pre-emption run before the reservation is honoured.
-        let reason = if self.reservation(node).is_none() {
-            Some(SelectionReason::NoReservation)
-        } else if self.is_preempted(node, now_slot) {
-            Some(SelectionReason::Preemption)
-        } else if self.needs_reevaluation(node, now_slot) {
-            Some(SelectionReason::Reevaluation)
-        } else {
-            None
+        // A reservation whose slot is in the past is stale: the engine was not polled in
+        // time, or no transport block was waiting when it came round. Roll it forward
+        // rather than transmitting in a slot that has gone, which would put a frame on the
+        // air at an instant the pool never granted.
+        {
+            let st = self.state(node);
+            if let Some(res) = st.reservation.as_mut()
+                && res.rri_slots > 0
+            {
+                while res.next_slot < now_slot {
+                    res.next_slot += res.rri_slots;
+                }
+            }
+        }
+
+        // Rel-16 re-evaluation and pre-emption run before the reservation is honoured, and
+        // the two Rel-14 MAC triggers of TS 36.321 §5.14.1.1 before either: a grant too
+        // small for the transport block, or one beyond its latency budget.
+        let arrival_slot = self.pool.slot_of(sdu.enqueued_at);
+        let reason = match self.reservation(node) {
+            None => Some(SelectionReason::NoReservation),
+            Some(r) if r.len < len => Some(SelectionReason::SizeChange),
+            Some(r) if r.next_slot > arrival_slot + budget => {
+                Some(SelectionReason::LatencyBudget)
+            }
+            Some(_) if self.is_preempted(node, now_slot) => Some(SelectionReason::Preemption),
+            Some(_) if self.needs_reevaluation(node, now_slot) => {
+                Some(SelectionReason::Reevaluation)
+            }
+            Some(_) => None,
         };
         if let Some(reason) = reason {
             self.state(node).reservation = None;
             self.select(ctx, node, now_slot, len, reason)?;
         }
 
-        // A reservation whose slot is in the past is stale: the engine was not polled in
-        // time. Roll it forward rather than transmitting in a slot that has gone, which
-        // would put a frame on the air at an instant the pool never granted.
-        {
-            let st = self.state(node);
-            if let Some(res) = st.reservation.as_mut() {
-                if res.rri_slots > 0 {
-                    while res.next_slot < now_slot {
-                        res.next_slot += res.rri_slots;
-                    }
-                }
-            }
-        }
         let res = self.reservation(node)?;
         if res.next_slot != now_slot {
             return None;
@@ -1657,6 +1731,59 @@ mod tests {
         assert_eq!(grant.attempt, 1);
         assert_eq!(grant.at, e.pool().slot_start(res.next_slot));
         assert_eq!(grant.backoff_slots, 0, "sidelink has no backoff");
+    }
+
+    /// Polls a UE slot by slot from `from` until it is granted, and returns the slot.
+    fn grant_slot(e: &mut SpsEngine, ctx: &mut TestCtx, node: NodeId, from: u64) -> u64 {
+        for slot in from..from + 200 {
+            ctx.set_now(e.pool().slot_start(slot));
+            if Mac::poll(e, ctx, node, ChannelId::CCH).is_some() {
+                return slot;
+            }
+        }
+        panic!("no grant within 200 slots of {from}");
+    }
+
+    /// A transport block bigger than the reservation triggers a reselection
+    /// (TS 36.321 §5.14.1.1): a certificate-bearing BSM does not fit the one sub-channel a
+    /// digest-signed one booked, and transmitting it in that sub-channel would be a
+    /// transport block the pool never granted.
+    #[test]
+    fn a_transport_block_larger_than_the_reservation_reselects() {
+        let mut e = engine(SpsParams::molina_masegosa(10));
+        let mut ctx = TestCtx::new(9);
+        let node = NodeId::new(1);
+        Mac::enqueue(&mut e, &mut ctx, node, sdu(150, 0), AccessCategory::Vo).expect("fits");
+        let first = grant_slot(&mut e, &mut ctx, node, 0);
+        assert_eq!(e.reservation(node).map(|r| r.len), Some(1));
+        // The next message carries a certificate: 250 B needs two sub-channels.
+        let t = e.pool().slot_start(first + 1);
+        Mac::enqueue(&mut e, &mut ctx, node, sdu(250, t), AccessCategory::Vo).expect("fits");
+        grant_slot(&mut e, &mut ctx, node, first + 1);
+        assert_eq!(
+            e.last_selection(node).map(|s| s.reason),
+            Some(SelectionReason::SizeChange)
+        );
+        assert_eq!(e.last_selection(node).map(|s| s.resource.len), Some(2));
+        assert_eq!(e.selections_by_reason().get(&SelectionReason::SizeChange), Some(&1));
+    }
+
+    /// A transport block still queued when its latency budget has passed is dropped and
+    /// handed back, not transmitted late and not leaked.
+    #[test]
+    fn a_transport_block_past_its_latency_budget_is_dropped_and_handed_back() {
+        let mut e = engine(SpsParams::molina_masegosa(10));
+        let mut ctx = TestCtx::new(3);
+        let node = NodeId::new(1);
+        assert_eq!(e.latency_budget_slots(), 100);
+        Mac::enqueue(&mut e, &mut ctx, node, sdu(150, 0), AccessCategory::Vo).expect("fits");
+        // Nobody polls until well after the budget.
+        ctx.set_now(e.pool().slot_start(150));
+        assert!(Mac::poll(&mut e, &mut ctx, node, ChannelId::CCH).is_none());
+        let expired = e.take_expired(node);
+        assert_eq!(expired.len(), 1, "the late transport block must come back");
+        assert_eq!(e.dropped(node), 1);
+        assert!(e.take_expired(node).is_empty(), "handed back exactly once");
     }
 
     #[test]
