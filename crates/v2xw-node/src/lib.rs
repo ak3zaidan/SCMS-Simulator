@@ -88,6 +88,7 @@
 pub mod clock;
 pub mod ctx;
 pub mod error;
+pub mod events;
 pub mod firewall;
 pub mod generate;
 pub mod policy;

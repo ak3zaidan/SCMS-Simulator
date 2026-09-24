@@ -193,6 +193,16 @@ struct Waiting {
     depth: u64,
 }
 
+/// A frame whose signature check has started and not yet finished: it reaches the
+/// applications at `finish`, not before.
+#[derive(Debug, Clone)]
+struct Verifying {
+    /// The message as the applications will receive it, with the node's conclusion.
+    message: VerifiedMessage,
+    /// The report the engine joins to the reception attempt.
+    report: RxReport,
+}
+
 /// One message this node wants transmitted.
 ///
 /// # The bytes, not a count
@@ -338,6 +348,9 @@ pub struct NodeConfig {
     pub bsm_params: v2xw_msg::generator::BsmGenParams,
     /// The CAM generator's triggering rules (EN 302 637-2; `messages.generator`).
     pub cam_params: v2xw_msg::generator::CamGenParams,
+    /// Whether the node's facilities layer is ETSI's (the GeoNetworking/BTP stack): an
+    /// SRM or SSM then goes out as a SREM or SSEM, with the ETSI `ItsPduHeader` in front.
+    pub etsi_facilities: bool,
 }
 
 impl Default for NodeConfig {
@@ -365,6 +378,7 @@ impl Default for NodeConfig {
             psid: PSID_SAFETY,
             bsm_params: v2xw_msg::generator::BsmGenParams::j2945_1(),
             cam_params: v2xw_msg::generator::CamGenParams::en302637_2(),
+            etsi_facilities: false,
         }
     }
 }
@@ -393,6 +407,13 @@ pub struct ObuRuntime {
     /// Beside every frame in the verification queue (`queues[1]`), in the same order: the
     /// token and the instants its report needs.
     verify_meta: VecDeque<Waiting>,
+    /// Checks in progress, keyed by (finish instant, start order): what the applications
+    /// receive once each finishes. A check that has started has been charged to its server
+    /// and its verdict is fixed, but the message is not the applications' until the server
+    /// is done with it.
+    verifying: BTreeMap<(SimTime, u64), Verifying>,
+    /// The start-order tie-break for [`ObuRuntime::verifying`].
+    verify_seq: u64,
     /// When each frame still waiting to be parsed will start its parse, on the node's
     /// clock — the receive queue's occupancy, when parsing has a cost.
     parse_starts: VecDeque<SimTime>,
@@ -402,6 +423,8 @@ pub struct ObuRuntime {
     stores: Stores,
     policy: Box<dyn VerificationPolicy>,
     schedule: MessageSchedule,
+    /// The event-driven and infrastructure services (DENM, SPaT, MAP, SRM, SSM).
+    events: crate::events::EventServices,
     state: NodeState,
     received: Vec<VerifiedMessage>,
     evidence_capacity: usize,
@@ -477,6 +500,8 @@ impl ObuRuntime {
                 NodeQueue::new(QueueKind::Crl, config.queue_capacity[4]),
             ],
             verify_meta: VecDeque::new(),
+            verifying: BTreeMap::new(),
+            verify_seq: 0,
             parse_starts: VecDeque::new(),
             drops: DropLedger::new(),
             clock: ClockModel::new(0.0),
@@ -485,6 +510,7 @@ impl ObuRuntime {
             policy,
             schedule: MessageSchedule::new(config.services)
                 .with_params(config.cam_params, config.bsm_params),
+            events: crate::events::EventServices::default(),
             state: NodeState::Active,
             received: Vec::new(),
             evidence_capacity: 256,
@@ -597,6 +623,24 @@ impl ObuRuntime {
         self.dcc_state_code = state_code;
     }
 
+    /// Installs the SPaT or MAP payload a roadside unit's controller feed produced; the
+    /// unit's schedule signs and sends it at the standard's rate ([`crate::events`]).
+    pub fn set_infra_payload(&mut self, msg_type: MsgType, bytes: Vec<u8>) {
+        self.events.set_infra_payload(msg_type, bytes);
+    }
+
+    /// The vehicle's own longitudinal acceleration, m/s², from its own accelerometer —
+    /// the input the hard-braking DENM trigger reads ([`crate::events`]). Like the
+    /// position belief it is the vehicle's own sensor, handed in from outside.
+    pub fn set_own_acceleration(&mut self, a_mps2: f64) {
+        self.events.set_own_acceleration(a_mps2);
+    }
+
+    /// The event and infrastructure services' state, for a test or a report.
+    pub fn events(&self) -> &crate::events::EventServices {
+        &self.events
+    }
+
     /// Installs the relevance scores a safety application published
     /// ([`crate::safety::SafetyAppSet::relevance`]).
     ///
@@ -658,11 +702,11 @@ impl ObuRuntime {
     ///
     /// What is still waiting stays in the queue across steps, so a node that cannot keep up
     /// carries a real backlog, its queue-overflow drops happen at the instant the queue was
-    /// full, and a verification's wait is the wait it would have had. A check that has
-    /// *started* by the end of the step is delivered to the applications at this step; its
-    /// report carries the instant it truly finishes, which may be up to one service time
-    /// after the step. The applications run at the tick, so that is the one approximation,
-    /// and it is bounded by a single verification's cost.
+    /// full, and a verification's wait is the wait it would have had. A message reaches the
+    /// applications when its check *finishes*: a check still running at the end of the step
+    /// is held, [`ObuRuntime::next_completion`] says when it finishes, and the engine wakes
+    /// the node then ([`ObuRuntime::wake_timed`]). Until 2026-09-24 it was delivered when
+    /// it started, up to one verification service time early.
     pub fn step_timed(
         &mut self,
         ctx: &mut dyn NodeCtx,
@@ -675,21 +719,7 @@ impl ObuRuntime {
 
         let mut out = StepOutcome::default();
         if self.state == NodeState::Off {
-            // A switched-off radio hears nothing; the frames it was handed are reported as
-            // such rather than vanishing.
-            for (_, stamp) in inbox {
-                let at = stamp
-                    .arrived_at
-                    .map_or(believed, |t| self.clock.believed_time(t));
-                out.rx_reports.push(RxReport {
-                    token: stamp.token,
-                    disposition: RxDisposition::NodeOff,
-                    arrived: at,
-                    parsed: at,
-                    verify_start: None,
-                    verify_done: None,
-                });
-            }
+            self.switched_off(believed, inbox, &mut out);
             return out;
         }
 
@@ -707,6 +737,80 @@ impl ObuRuntime {
             out.telemetry = Some(self.close_window(ctx, now));
         }
         out
+    }
+
+    /// Wakes the node between its periodic steps, to hand over what has finished.
+    ///
+    /// A signature check that started during a step usually finishes after it, and its
+    /// message is not the applications' until it does. The engine calls this at
+    /// [`ObuRuntime::next_completion`]: the frames that have arrived by now are received
+    /// in continuous time exactly as [`ObuRuntime::step_timed`] receives them, every check
+    /// that has finished is delivered, and nothing else happens — no generation, no
+    /// pseudonym rotation, no telemetry window, which are the periodic step's.
+    pub fn wake_timed(
+        &mut self,
+        ctx: &mut dyn NodeCtx,
+        inbox: Vec<(RxFrame, RxStamp)>,
+    ) -> StepOutcome {
+        let now = ctx.now();
+        self.clock.advance(now, self.belief.fix.has_position());
+        let believed = self.clock.believed_time(now);
+        let mut out = StepOutcome::default();
+        if self.state == NodeState::Off {
+            self.switched_off(believed, inbox, &mut out);
+            return out;
+        }
+        self.receive(ctx, believed, inbox, &mut out);
+        out
+    }
+
+    /// When the next signature check in progress finishes, on this node's own clock — the
+    /// instant the engine must wake it for ([`ObuRuntime::wake_timed`]). `None` when no
+    /// check is running.
+    #[must_use]
+    pub fn next_completion(&self) -> Option<SimTime> {
+        self.verifying.keys().next().map(|(finish, _)| *finish)
+    }
+
+    /// [`ObuRuntime::next_completion`] on the simulation's timeline, seen from `now`: the
+    /// node's clock stands a fixed offset from the truth between two of its steps, so the
+    /// interval to the finish is the same on both. Never before `now`.
+    #[must_use]
+    pub fn next_completion_after(&self, now: SimTime) -> Option<SimTime> {
+        let finish = self.next_completion()?;
+        let believed = self.clock.believed_time(now);
+        Some(now.saturating_add(finish.saturating_sub(believed)))
+    }
+
+    /// Everything a switched-off node was handed, and every check it had in progress, is
+    /// reported as reaching a node that was off, rather than vanishing.
+    fn switched_off(
+        &mut self,
+        believed: SimTime,
+        inbox: Vec<(RxFrame, RxStamp)>,
+        out: &mut StepOutcome,
+    ) {
+        for (_, v) in core::mem::take(&mut self.verifying) {
+            out.rx_reports.push(RxReport {
+                disposition: RxDisposition::NodeOff,
+                ..v.report
+            });
+        }
+        {
+            for (_, stamp) in inbox {
+                let at = stamp
+                    .arrived_at
+                    .map_or(believed, |t| self.clock.believed_time(t));
+                out.rx_reports.push(RxReport {
+                    token: stamp.token,
+                    disposition: RxDisposition::NodeOff,
+                    arrived: at,
+                    parsed: at,
+                    verify_start: None,
+                    verify_done: None,
+                });
+            }
+        }
     }
 
     fn receive(
@@ -767,8 +871,11 @@ impl ObuRuntime {
                 }
             };
 
-            // 2. Everything the verifier would have started by the time the policy looks.
-            self.advance_verifications(ctx, parsed, out);
+            // 2. Everything the verifier would have started by the time the policy looks, and
+            //    every check that has finished by then handed to the applications — so the
+            //    neighbour table the policy reads is the one it would really read.
+            self.advance_verifications(ctx, parsed);
+            self.complete_verifications(parsed, out);
 
             // 3. The policy, over the queue as it is at this instant.
             self.learn_or_request(&frame);
@@ -870,7 +977,26 @@ impl ObuRuntime {
             }
         }
 
-        self.advance_verifications(ctx, believed, out);
+        self.advance_verifications(ctx, believed);
+        self.complete_verifications(believed, out);
+    }
+
+    /// Hands every check that has finished by `until` to the applications, in the order
+    /// they finished, with its report.
+    ///
+    /// This is the one place a verified message is delivered. It used to happen when the
+    /// check *started*, up to one verification service time before the signature was
+    /// actually known to be good; now it happens when it finishes, and a check still
+    /// running at the end of a step waits for [`ObuRuntime::wake_timed`] or the next step.
+    fn complete_verifications(&mut self, until: SimTime, out: &mut StepOutcome) {
+        while let Some(entry) = self.verifying.first_entry() {
+            if entry.key().0 > until {
+                break;
+            }
+            let done = entry.remove();
+            self.deliver(done.message, out);
+            out.rx_reports.push(done.report);
+        }
     }
 
     /// Reports one frame the verification queue refused or evicted.
@@ -921,14 +1047,9 @@ impl ObuRuntime {
     ///
     /// The head of the line starts at `max(when it was queued, when a server frees up)`;
     /// if that is after `until` it is still waiting and so is everything behind it. A check
-    /// that starts is charged to its server, classified, delivered, and reported with the
-    /// instants it really started and finished.
-    fn advance_verifications(
-        &mut self,
-        ctx: &mut dyn NodeCtx,
-        until: SimTime,
-        out: &mut StepOutcome,
-    ) {
+    /// that starts is charged to its server and classified, and waits in `verifying` until
+    /// the instant it finishes ([`ObuRuntime::complete_verifications`] hands it over).
+    fn advance_verifications(&mut self, ctx: &mut dyn NodeCtx, until: SimTime) {
         let probe = OpDescriptor::verify(self.config.verify_op, 0);
         if self.service.service_time(ctx, &probe).is_none() {
             // The profile costs no verification. Nothing is verified and nothing is
@@ -989,16 +1110,25 @@ impl ObuRuntime {
                 },
                 meta.depth,
             ));
-            let m = self.to_message(&frame, meta.arrived, verdict);
-            self.deliver(m, out);
-            out.rx_reports.push(RxReport {
-                token: meta.token,
-                disposition: RxDisposition::Delivered(verdict),
-                arrived: meta.arrived,
-                parsed: meta.parsed,
-                verify_start: Some(sched.start),
-                verify_done: Some(sched.finish),
-            });
+            // The verdict is fixed now, but the applications have it only when the server
+            // is done: the message waits in `verifying` until `sched.finish`.
+            let message = self.to_message(&frame, meta.arrived, verdict);
+            let seq = self.verify_seq;
+            self.verify_seq += 1;
+            self.verifying.insert(
+                (sched.finish, seq),
+                Verifying {
+                    message,
+                    report: RxReport {
+                        token: meta.token,
+                        disposition: RxDisposition::Delivered(verdict),
+                        arrived: meta.arrived,
+                        parsed: meta.parsed,
+                        verify_start: Some(sched.start),
+                        verify_done: Some(sched.finish),
+                    },
+                },
+            );
         }
     }
 
@@ -1145,7 +1275,17 @@ impl ObuRuntime {
     fn deliver(&mut self, m: VerifiedMessage, out: &mut StepOutcome) {
         self.window
             .delivered(m.verification == VerificationState::Verified);
+        self.events.on_delivered(&m);
+        // The neighbour table is a table of *stations moving around this one*, and what
+        // fills it is their awareness messages. A SPaT, a MAP or a signal request says
+        // where a junction is, not where its sender is going, and a DENM describes an
+        // event rather than a station; none of them makes its sender a neighbour.
+        let describes_a_station = !matches!(
+            m.msg_type,
+            MsgType::Spat | MsgType::Map | MsgType::Srm | MsgType::Ssm | MsgType::Denm
+        );
         if m.verification != VerificationState::Invalid
+            && describes_a_station
             && let Some(signer) = m.signer.clone()
         {
             self.stores.neighbors.observe(Neighbor {
@@ -1187,14 +1327,20 @@ impl ObuRuntime {
         // The two arguments are the node's own clock and the node's own belief. Nothing
         // else is in scope, and `crate::firewall` checks that this stays true.
         let requests = self.schedule.due(believed, &self.belief, &self.dcc);
-        if requests.is_empty() {
+        let station_id = self.stores.certs.active().map(|c| {
+            u32::from_be_bytes([c.digest.0[0], c.digest.0[1], c.digest.0[2], c.digest.0[3]])
+        });
+        let events = self
+            .events
+            .due(believed, &self.belief, self.schedule.services(), station_id);
+        if requests.is_empty() && events.is_empty() {
             return;
         }
+        let wanted = (requests.len() + events.len()) as u32;
         let Some(cred) = self.stores.certs.active().cloned() else {
             // No usable credential: a node on the CRL, or one whose pool has run out.
             // [CAMP-EE §2.2.10.2] — it stops transmitting rather than sending unsigned.
-            self.drops
-                .record_n(DropCause::TxOverflow, requests.len() as u32);
+            self.drops.record_n(DropCause::TxOverflow, wanted);
             return;
         };
         // The credential protocol's stand-in: a real key and a real certificate for every
@@ -1207,31 +1353,47 @@ impl ObuRuntime {
         // certificate that only came into existence at the moment the node rotated onto it
         // would let a revoked node walk away from its revocation by rotating.
         if !self.provision_all(ctx, believed) {
-            self.drops
-                .record_n(DropCause::TxOverflow, requests.len() as u32);
+            self.drops.record_n(DropCause::TxOverflow, wanted);
             return;
         }
         if !self.security.set_active(cred.i_period, cred.j_index) {
-            self.drops
-                .record_n(DropCause::TxOverflow, requests.len() as u32);
+            self.drops.record_n(DropCause::TxOverflow, wanted);
             return;
         }
         let Some(cred) = self.stores.certs.active().cloned() else {
-            self.drops
-                .record_n(DropCause::TxOverflow, requests.len() as u32);
+            self.drops.record_n(DropCause::TxOverflow, wanted);
             return;
         };
 
+        let mut built: Vec<(MsgType, SimTime, Option<Vec<u8>>)> =
+            Vec::with_capacity(wanted as usize);
         for r in requests {
-            let Some(payload) = self.encode_payload(r.msg_type, believed, &cred) else {
+            built.push((
+                r.msg_type,
+                r.at,
+                self.encode_payload(r.msg_type, believed, &cred),
+            ));
+        }
+        for e in events {
+            let ty = e.msg_type();
+            let payload = self.events.encode(&e, believed, &cred, &self.config);
+            built.push((ty, believed, payload));
+        }
+        for (msg_type, at, payload) in built {
+            let Some(payload) = payload else {
                 // The node could not build a conformant message — a belief with no fix, a
                 // position outside the ASN.1's range, a clock before the 1609.2 epoch. It
                 // transmits nothing rather than a payload that would not decode.
                 self.drops.record(DropCause::TxOverflow);
                 continue;
             };
-            let sid = self.security.signer_id_for(r.msg_type, believed);
-            let Ok((frame, pdu)) = self.security.sign(ctx, r.msg_type, &payload, sid, None) else {
+            let r = (msg_type, at);
+            let sid = self.security.signer_id_for(r.0, believed);
+            // TS 103 097 §7.1.2: a DENM's envelope carries its generation location, and the
+            // ETSI profile refuses to sign one without it. The node's own belief.
+            let location = (r.0 == MsgType::Denm)
+                .then(|| generation_location(&self.belief, self.config.origin));
+            let Ok((frame, pdu)) = self.security.sign(ctx, r.0, &payload, sid, location) else {
                 self.drops.record(DropCause::TxOverflow);
                 continue;
             };
@@ -1252,24 +1414,24 @@ impl ObuRuntime {
             let full_certificate = pdu.signer_id == v2xw_sec::SignerIdChoice::Certificate;
             let bytes = frame.bytes_on_wire();
             let tx = Transmission {
-                msg_type: r.msg_type,
+                msg_type: r.0,
                 bytes,
                 signer: cred.digest.clone(),
                 full_certificate,
                 ready_at: sched.finish,
-                generation_time: r.at,
+                generation_time: r.1,
                 sign_start: sched.start,
                 signed: Some(frame),
             };
             if let Admission::Refused(_) = self.queues[3].push(Queued {
                 item: RxFrame {
                     signer: Some(cred.digest.clone()),
-                    msg_type: r.msg_type,
+                    msg_type: r.0,
                     bytes,
                     claimed_pos: Some(self.belief.pos),
                     claimed_speed_mps: self.belief.ground_speed_mps(),
                     claimed_heading_rad: self.belief.heading_rad,
-                    claimed_generation_time: r.at,
+                    claimed_generation_time: r.1,
                     full_certificate,
                     signature_valid: true,
                     claimed_cert_period: cred.i_period,
@@ -1283,8 +1445,7 @@ impl ObuRuntime {
             }
             let _ = self.queues[3].pop();
             if full_certificate {
-                self.security
-                    .note_certificate_attached(r.msg_type, believed);
+                self.security.note_certificate_attached(r.0, believed);
             }
             // Air time is the PHY's to compute; until a scenario wires one in, the node
             // reports the byte count and leaves `airtime_ms_per_s` at zero contribution
@@ -1389,8 +1550,12 @@ impl ObuRuntime {
                 debug_assert!(encoded.is_real(), "the J2735 encoder produces real bytes");
                 Some(encoded.bytes)
             }
-            // Nothing else is generated here. A DENM is an application's decision and a
-            // CRL or a report is the engine's; none of them arrives through the schedule.
+            // A roadside unit's intersection messages: what its controller feed installed,
+            // signed as it stands. A unit with no feed sends nothing rather than an empty
+            // message.
+            MsgType::Spat | MsgType::Map => self.events.infra_payload(msg_type).map(<[u8]>::to_vec),
+            // Nothing else is generated here. A DENM, an SRM and an SSM are the event
+            // services' (`crate::events`), and a CRL or a report is the engine's.
             _ => None,
         }
     }
@@ -1483,6 +1648,26 @@ impl ObuRuntime {
     }
 }
 
+/// The 1609.2 `ThreeDLocation` a DENM's envelope carries, from the node's own belief.
+///
+/// Latitude and longitude in tenths of a microdegree (1609.2 `NinetyDegreeInt`,
+/// `OneEightyDegreeInt`). The 16-bit `Elevation` is decimetres with an offset of 4 096 so
+/// that 0 is −409.6 m — **recalled, UNVERIFIED** against 1609.2 §6.4; it is clamped into
+/// the range rather than wrapped.
+fn generation_location(
+    belief: &PositionEstimate,
+    origin: v2xw_core::geo::GeoOrigin,
+) -> v2xw_sec::envelope::GenerationLocation {
+    let (lat, lon, alt) = origin.to_geodetic(belief.pos);
+    let tenth_micro = |deg: f64, lim: f64| (deg.clamp(-lim, lim) * 1e7).round() as i32;
+    let elevation = ((alt * 10.0).round() + 4_096.0).clamp(0.0, 61_439.0) as u16;
+    v2xw_sec::envelope::GenerationLocation {
+        lat_tenth_microdeg: tenth_micro(lat, 90.0),
+        lon_tenth_microdeg: tenth_micro(lon, 180.0),
+        elevation,
+    }
+}
+
 fn policy_id(code: u8) -> &'static str {
     match code {
         0 => crate::policy::VERIFY_ALL_ID,
@@ -1496,6 +1681,14 @@ fn msg_type_name(t: MsgType) -> &'static str {
         MsgType::Cam => "cam",
         MsgType::Bsm => "bsm",
         MsgType::Denm => "denm",
+        MsgType::Spat => "spat",
+        MsgType::Map => "map",
+        MsgType::Srm => "srm",
+        MsgType::Ssm => "ssm",
+        MsgType::Psm => "psm",
+        MsgType::Vam => "vam",
+        MsgType::Mbr => "mbr",
+        MsgType::Crl => "crl",
         _ => "other",
     }
 }

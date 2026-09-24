@@ -42,7 +42,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::gn::{GN_BTP_NET_LAYER_ID, GnBtpNetLayer};
-use crate::netlayer::{LLC_SNAP_BYTES, NetMeta};
+use crate::netlayer::{BtpKind, BtpPort, GnTransport, LLC_SNAP_BYTES, NetMeta, Psid};
 use crate::wsmp::{WSMP_NET_LAYER_ID, WsmpNetLayer};
 
 /// The 802.11 MAC header of a QoS Data frame, octets: frame control 2, duration 2, three
@@ -118,10 +118,33 @@ impl NetStack {
     /// like.
     pub const fn meta(&self, msg: FrameMsg, sdu_bytes: u32) -> NetMeta {
         match self {
-            NetStack::Wsmp(_) => NetMeta::for_bsm(sdu_bytes).with_llc_snap(false),
+            NetStack::Wsmp(_) => match msg {
+                FrameMsg::Safety | FrameMsg::Denm => {
+                    NetMeta::for_bsm(sdu_bytes).with_llc_snap(false)
+                }
+                FrameMsg::Spat | FrameMsg::Map | FrameMsg::Srm | FrameMsg::Ssm => {
+                    NetMeta::wsmp(sdu_bytes, Psid::INTERSECTION).with_llc_snap(false)
+                }
+            },
             NetStack::GnBtp(_) => match msg {
                 FrameMsg::Denm => NetMeta::for_denm(sdu_bytes).with_llc_snap(false),
                 FrameMsg::Safety => NetMeta::for_cam(sdu_bytes).with_llc_snap(false),
+                FrameMsg::Spat => {
+                    NetMeta::gn(sdu_bytes, GnTransport::Shb, BtpKind::B, BtpPort::SPATEM)
+                        .with_llc_snap(false)
+                }
+                FrameMsg::Map => {
+                    NetMeta::gn(sdu_bytes, GnTransport::Shb, BtpKind::B, BtpPort::MAPEM)
+                        .with_llc_snap(false)
+                }
+                FrameMsg::Srm => {
+                    NetMeta::gn(sdu_bytes, GnTransport::Shb, BtpKind::B, BtpPort::SREM)
+                        .with_llc_snap(false)
+                }
+                FrameMsg::Ssm => {
+                    NetMeta::gn(sdu_bytes, GnTransport::Shb, BtpKind::B, BtpPort::SSEM)
+                        .with_llc_snap(false)
+                }
             },
         }
     }
@@ -137,14 +160,38 @@ impl NetStack {
     }
 }
 
-/// The two shapes of message the network layer distinguishes: a DENM is geo-broadcast,
-/// everything else a safety message's single-hop broadcast.
+/// The shapes of message the network layer distinguishes: which PSID a WSM carries, and
+/// which BTP port and GeoNetworking transport a GN packet takes.
+///
+/// | Message | WSMP PSID | GN transport, BTP-B port |
+/// |---|---|---|
+/// | BSM / CAM ([`FrameMsg::Safety`]) | `0x20` | SHB, 2001 |
+/// | DENM | `0x20` | GBC, 2002 |
+/// | SPaT / SPATEM | `0x82` | SHB, 2004 |
+/// | MAP / MAPEM | `0x82` | SHB, 2003 |
+/// | SRM / SREM | `0x82` | SHB, 2007 |
+/// | SSM / SSEM | `0x82` | SHB, 2008 |
+///
+/// The BTP ports are TS 103 301's `CSP_PortNo` (VERIFIED for 2003, 2004 and 2007; 2008
+/// through 04-models.md §7.2, UNVERIFIED). The WSMP PSID of the intersection messages is
+/// [`Psid::INTERSECTION`], recalled and unverified — see there. That the intersection
+/// messages go single-hop is the common deployment (an RSU broadcasting to its own
+/// approaches) and is this build's choice for all four; a GeoBroadcast SPATEM would add
+/// the GBC header's extra octets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameMsg {
     /// A periodic safety message (BSM, CAM) or anything else sent single-hop.
     Safety,
     /// A DENM, which GeoNetworking sends as GeoBroadcast.
     Denm,
+    /// Signal phase and timing (J2735 SPaT, or the ETSI SPATEM that wraps it).
+    Spat,
+    /// Intersection geometry (J2735 MapData, or the ETSI MAPEM that wraps it).
+    Map,
+    /// A signal request (J2735 SRM, ETSI SREM).
+    Srm,
+    /// A signal request's status (J2735 SSM, ETSI SSEM).
+    Ssm,
 }
 
 /// Every octet of one frame's PSDU, by the layer it belongs to.

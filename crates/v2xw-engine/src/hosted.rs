@@ -211,6 +211,32 @@ impl HostedNode {
     }
 }
 
+impl HostedNode {
+    /// Wakes the node between its periodic steps to hand over finished signature checks
+    /// ([`ObuRuntime::wake_timed`]). A VRU device verifies within its own step and has no
+    /// deferred checks, so a wake does nothing for it; the engine leaves its inbox for its
+    /// next periodic step.
+    pub fn wake_timed(
+        &mut self,
+        ctx: &mut dyn NodeCtx,
+        inbox: Vec<(RxFrame, RxStamp)>,
+    ) -> StepOutcome {
+        match self {
+            HostedNode::Obu(o) => o.wake_timed(ctx, inbox),
+            HostedNode::Vru(_) => {
+                debug_assert!(inbox.is_empty(), "a VRU device's inbox waits for its step");
+                StepOutcome::default()
+            }
+        }
+    }
+
+    /// When the engine must wake this node for its next finished signature check
+    /// ([`ObuRuntime::next_completion_after`]); `None` for a VRU device, which has none.
+    pub fn next_completion_after(&self, now: SimTime) -> Option<SimTime> {
+        self.as_obu().and_then(|o| o.next_completion_after(now))
+    }
+}
+
 impl NodeView for HostedNode {
     type Neighbors = NeighborTable;
     type Credential = CredentialHandle;

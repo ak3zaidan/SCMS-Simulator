@@ -118,7 +118,25 @@ fn run_from(
     for k in first..first + steps {
         let now = k * dt;
         let mut ctx = NodeRuntimeCtx::new(now, &reg);
-        out.push(rt.step(&mut ctx, inbox(k), 0.0));
+        let mut o = rt.step(&mut ctx, inbox(k), 0.0);
+        // A check that finishes before the next tick is handed over when it finishes, as
+        // the engine does it: it wakes the node at `next_completion_after`. The last tick's
+        // checks are woken for too, so a run's last message is not left in the verifier.
+        let next_tick = (k + 1) * dt;
+        let mut cursor = now;
+        let mut guard = 0;
+        while let Some(at) = rt.next_completion_after(cursor) {
+            if (k + 1 < first + steps && at >= next_tick) || guard > 1_000 {
+                break;
+            }
+            guard += 1;
+            let mut wctx = NodeRuntimeCtx::new(at, &reg);
+            let w = rt.wake_timed(&mut wctx, Vec::new());
+            o.delivered.extend(w.delivered);
+            o.rx_reports.extend(w.rx_reports);
+            cursor = at;
+        }
+        out.push(o);
     }
     out
 }
@@ -189,6 +207,58 @@ fn a_node_generates_receives_verifies_and_reports() {
 
 /// A bad signature is never delivered as a neighbour: the node learns the message was
 /// invalid and the table stays empty.
+/// A message reaches the applications when its signature check finishes, not when it
+/// starts. The frame arrives at the step's own instant, so its check starts then and ends
+/// one verification service time later: the step hands over nothing, the node says when
+/// the check will finish, and a wake at that instant hands the message over with a report
+/// whose `verify_done` is that instant.
+#[test]
+fn a_message_is_handed_over_when_its_verification_finishes() {
+    let mut rt = node_on(v2xw_node::profiles::REFERENCE_OBU, ServiceSet::SAE);
+    let reg = RngRegistry::new(7);
+    let t0 = 1_000 * NS_PER_MS;
+    let mut ctx = NodeRuntimeCtx::new(t0, &reg);
+    let stamped = vec![(
+        frame(9, Vec3::new(50.0, 0.0, 0.0), t0, true),
+        RxStamp {
+            token: 42,
+            arrived_at: Some(t0),
+        },
+    )];
+    let step = rt.step_timed(&mut ctx, stamped, 0.0);
+    assert!(
+        step.delivered.is_empty(),
+        "delivered before its check finished: {:?}",
+        step.delivered
+    );
+    assert!(step.rx_reports.iter().all(|r| r.token != 42));
+    assert!(
+        rt.neighbors().is_empty(),
+        "the neighbour table learned it early"
+    );
+
+    let done = rt
+        .next_completion_after(t0)
+        .expect("a check is running and says when it ends");
+    assert!(done > t0, "a signature check takes time");
+    let mut wctx = NodeRuntimeCtx::new(done, &reg);
+    let woken = rt.wake_timed(&mut wctx, Vec::new());
+    assert_eq!(woken.delivered.len(), 1);
+    let report = woken
+        .rx_reports
+        .iter()
+        .find(|r| r.token == 42)
+        .expect("the report comes with the hand-over");
+    assert_eq!(report.verify_start, Some(t0));
+    assert_eq!(report.verify_done, Some(done));
+    assert_eq!(rt.neighbors().len(), 1);
+    assert_eq!(rt.next_completion(), None);
+    // A wake with nothing finished hands over nothing and generates nothing.
+    let mut again = NodeRuntimeCtx::new(done + 1, &reg);
+    let idle = rt.wake_timed(&mut again, Vec::new());
+    assert!(idle.delivered.is_empty() && idle.transmissions.is_empty());
+}
+
 #[test]
 fn an_invalid_signature_never_reaches_the_neighbour_table() {
     let mut rt = node_on(v2xw_node::profiles::REFERENCE_OBU, ServiceSet::SAE);
@@ -830,4 +900,100 @@ fn an_unknown_signer_costs_a_p2pcd_request_and_a_full_certificate_stops_it() {
         "one attachment served the whole second"
     );
     assert_eq!(tb.peer_cache_entries, 1);
+}
+
+// -------------------------------------------------------------------------------------
+// The event and infrastructure services
+// -------------------------------------------------------------------------------------
+
+/// A roadside unit signs and sends the SPaT and the MAP its controller feed installed, at
+/// 10 Hz and 1 Hz, and nothing when no feed installed one.
+#[test]
+fn a_roadside_unit_sends_what_its_controller_gave_it_at_the_standard_rates() {
+    let services = ServiceSet {
+        spat: true,
+        map: true,
+        ..ServiceSet::NONE
+    };
+    let mut rt = node_on("rsu/commsignia-its-rs4", services);
+    let silent = run(&mut rt, 5, 100 * NS_PER_MS, |_| Vec::new());
+    assert_eq!(
+        silent.iter().map(|o| o.transmissions.len()).sum::<usize>(),
+        0,
+        "no feed, nothing to send"
+    );
+    rt.set_infra_payload(MsgType::Spat, vec![0x00, 0x13, 0x05, 1, 2, 3, 4, 5]);
+    rt.set_infra_payload(
+        MsgType::Map,
+        vec![0x00, 0x12, 0x09, 9, 8, 7, 6, 5, 4, 3, 2, 1],
+    );
+    let out = run_from(&mut rt, 5, 20, 100 * NS_PER_MS, |_| Vec::new());
+    let count = |ty: MsgType| {
+        out.iter()
+            .flat_map(|o| o.transmissions.iter())
+            .filter(|t| t.msg_type == ty)
+            .count()
+    };
+    assert_eq!(count(MsgType::Spat), 20, "10 Hz over two seconds");
+    assert_eq!(count(MsgType::Map), 2, "1 Hz over two seconds");
+    assert_eq!(
+        count(MsgType::Bsm) + count(MsgType::Cam),
+        0,
+        "a mast is not a vehicle"
+    );
+    // The payload on the air is the one the feed installed, byte for byte.
+    let spat = out
+        .iter()
+        .flat_map(|o| o.transmissions.iter())
+        .find(|t| t.msg_type == MsgType::Spat)
+        .unwrap();
+    assert_eq!(
+        spat.signed.as_ref().unwrap().payload,
+        vec![0x00, 0x13, 0x05, 1, 2, 3, 4, 5]
+    );
+}
+
+/// Hard braking raises one DENM event per episode, repeated every 100 ms for 2 s, and the
+/// DENM decodes as a dangerous situation at the position the vehicle braked at.
+#[test]
+fn hard_braking_raises_a_dangerous_situation_denm() {
+    let services = ServiceSet {
+        cam: true,
+        denm: true,
+        ..ServiceSet::NONE
+    };
+    let mut rt = node_on(v2xw_node::profiles::REFERENCE_OBU, services);
+    // Cruising, then braking at 5 m/s² for half a second, then cruising: one episode.
+    rt.set_own_acceleration(0.0);
+    let mut outs = run(&mut rt, 10, 100 * NS_PER_MS, |_| Vec::new());
+    rt.set_own_acceleration(-5.0);
+    outs.extend(run_from(&mut rt, 10, 5, 100 * NS_PER_MS, |_| Vec::new()));
+    rt.set_own_acceleration(-1.0);
+    outs.extend(run_from(&mut rt, 15, 30, 100 * NS_PER_MS, |_| Vec::new()));
+    let denms: Vec<&v2xw_node::Transmission> = outs
+        .iter()
+        .flat_map(|o| o.transmissions.iter())
+        .filter(|t| t.msg_type == MsgType::Denm)
+        .collect();
+    assert_eq!(rt.events().denm_raised(), 1, "one episode, one event");
+    assert!(
+        (19..=21).contains(&denms.len()),
+        "every 100 ms for 2 s: {} frames",
+        denms.len()
+    );
+    let decoded = v2xw_msg::denm::decode_denm(&denms[0].signed.as_ref().unwrap().payload)
+        .expect("a real DENM");
+    let cause = format!("{:?}", decoded.denm.situation.as_ref().unwrap().event_type);
+    assert!(cause.contains("dangerousSituation"), "{cause}");
+    // Gentle braking raises nothing.
+    let mut calm = node_on(v2xw_node::profiles::REFERENCE_OBU, services);
+    calm.set_own_acceleration(-3.0);
+    let quiet = run(&mut calm, 30, 100 * NS_PER_MS, |_| Vec::new());
+    assert_eq!(calm.events().denm_raised(), 0);
+    assert!(
+        quiet
+            .iter()
+            .flat_map(|o| o.transmissions.iter())
+            .all(|t| t.msg_type != MsgType::Denm)
+    );
 }

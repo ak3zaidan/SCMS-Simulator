@@ -262,6 +262,19 @@ pub struct RunReport {
     /// How many frames were *not* generated because the instant fell in a time-dilation
     /// window (02-architecture.md §5.4).
     pub suppressed_frames: u64,
+    /// How many times a roadside unit's SPaT failed to encode, so the unit sent its last
+    /// good one. Zero in a healthy run; anything else is an encoder defect.
+    pub infra_encode_failures: u64,
+    /// How many SDUs a splitting fragmenter sent as more than one frame
+    /// (`net.fragmenter`, `crate::frag`).
+    pub sdus_fragmented: u64,
+    /// How many fragment frames they went out as.
+    pub fragments_sent: u64,
+    /// Reassembly groups — one fragmented SDU (or certificate) at one receiver that had
+    /// any of its fragments in range — resolved with every fragment decoded.
+    pub reassembly_complete: u64,
+    /// Reassembly groups resolved with some fragment missing.
+    pub reassembly_lost: u64,
     /// How many records the engine **emitted**.
     ///
     /// Not what was stored: a recorder can refuse a record the engine handed it (an
@@ -481,6 +494,16 @@ struct FrameState {
     mac_backoff_ns: u64,
     /// What the message said, for the `node.tx` record ([`message_content`]).
     content: Option<v2xw_metrics::channels::MsgContentView>,
+    /// The reception census taken when the frame went on the air: how many equipped
+    /// receivers were truly within each 20 m range of the transmitter, by bin index
+    /// (`phy.prr`, 3GPP TR 36.885 §A.2.1.4). Independent of the candidate set.
+    census: BTreeMap<u32, u32>,
+    /// For a fragment of a split SDU (a generic piece or a facilities segment): which
+    /// fragment of which SDU it is ([`crate::frag`]).
+    frag: Option<crate::frag::FragMeta>,
+    /// For an SPDU of a certificate cycle that carries a fragment of the hybrid
+    /// certificate: which fragment of which cycle.
+    cert_frag: Option<crate::frag::FragMeta>,
 }
 
 /// What a Phase 2 application message carries, beyond its length.
@@ -544,6 +567,17 @@ pub struct Engine {
     rx_pending: BTreeMap<(NodeId, u64), NodeRx>,
     /// The next reception-attempt token.
     next_rx_token: u64,
+    /// The scenario's fragmentation (`net.fragmenter`, [`crate::frag`]).
+    frag_plan: crate::frag::FragPlan,
+    /// Per receiver, the reassembly state of the strategy in force.
+    reassemblers: BTreeMap<NodeId, crate::frag::Strategy>,
+    /// Every fragmented SDU in progress at a receiver, by (receiver, SDU).
+    frag_groups: BTreeMap<(NodeId, v2xw_core::ids::SduId), crate::frag::FragGroup>,
+    /// Groups already resolved, until one more timeout has passed, so a fragment arriving
+    /// after its group's fate cannot open the group again.
+    frag_resolved: BTreeMap<(NodeId, v2xw_core::ids::SduId), SimTime>,
+    /// Per sender, its certificate cycle: SPDUs sent, and the cycle's SDU.
+    cert_cycles: BTreeMap<NodeId, (u64, v2xw_core::ids::SduId)>,
     /// Per-node MAC counters since the last `mac.cbr` report.
     mac_window: BTreeMap<NodeId, MacWindow>,
     /// `node.rx` fates settled where no recorder is in hand (a receiver retired), written
@@ -627,6 +661,13 @@ pub struct Engine {
     /// The scenario timeline's state: which lanes are closed and by whom, which demand
     /// multipliers are in force. See [`crate::timeline`].
     timeline: TimelineState,
+    /// The 20 m bins of the reception census (`phy.prr`), the very bins the metric reads.
+    prr_bins: v2xw_metrics::bins::Bins,
+    /// When each node is next woken to hand over a finished signature check
+    /// ([`crate::event::NodeTask::Deliver`]): at most one pending wake per node.
+    node_wake: BTreeMap<NodeId, SimTime>,
+    /// The junction each SPaT- or MAP-broadcasting roadside unit is wired to.
+    infra_feeds: BTreeMap<NodeId, crate::infra::IntersectionFeed>,
     report: RunReport,
 }
 
@@ -824,6 +865,12 @@ impl Engine {
         // The radio stack is selected from the scenario, which the struct literal below
         // moves; the clone is one `Scenario` per run, not per anything.
         let scenario_for_radio = scenario.clone();
+        let frag_plan = match scenario_for_radio.net.fragmenter.as_ref() {
+            None => crate::frag::FragPlan::none(),
+            Some(choice) => crate::frag::FragPlan::from_choice(choice).map_err(|why| {
+                EngineError::Scenario(crate::error::ScenarioError::conflict("net.fragmenter", why))
+            })?,
+        };
         let mut engine = Engine {
             snapshot: ActorSnapshot::new(0, MAX_RANGE_M),
             weather: crate::wiring::initial_weather(&scenario),
@@ -862,6 +909,11 @@ impl Engine {
                 .unwrap_or(v2xw_net::NetStack::Wsmp(v2xw_net::WsmpNetLayer::default())),
             rx_pending: BTreeMap::new(),
             next_rx_token: 0,
+            frag_plan,
+            reassemblers: BTreeMap::new(),
+            frag_groups: BTreeMap::new(),
+            frag_resolved: BTreeMap::new(),
+            cert_cycles: BTreeMap::new(),
             mac_window: BTreeMap::new(),
             orphaned_rx: Vec::new(),
             frames: BTreeMap::new(),
@@ -892,6 +944,9 @@ impl Engine {
             focus,
             jamming: jammers,
             timeline: TimelineState::default(),
+            prr_bins: v2xw_metrics::comms::prr_bins(),
+            node_wake: BTreeMap::new(),
+            infra_feeds: BTreeMap::new(),
             report: RunReport::default(),
         };
         engine.timeline = TimelineState {
@@ -904,6 +959,7 @@ impl Engine {
         let phase2 = crate::phase2::Phase2::build(&engine.scenario, &engine.world)?;
         engine.phase2 = phase2;
         engine.create_rsus();
+        engine.attach_intersection_feeds()?;
         engine.seed_timeline();
         Ok(engine)
     }
@@ -1119,6 +1175,128 @@ impl Engine {
         }
     }
 
+    /// Connects every roadside unit that broadcasts SPaT or MAP to its junction's
+    /// controller and survey ([`crate::infra`]), and installs its MAP.
+    ///
+    /// A unit with the role and no signalised junction within
+    /// [`crate::infra::SERVICE_RADIUS_M`] is refused here, by index, rather than left to
+    /// broadcast nothing: a scenario that asked for SPaT and got silence would look like a
+    /// radio problem.
+    ///
+    /// # Errors
+    /// [`EngineError::Scenario`] naming the unit and what it lacks.
+    fn attach_intersection_feeds(&mut self) -> Result<()> {
+        let Some(phase2) = self.phase2.as_ref() else {
+            return Ok(());
+        };
+        let units: Vec<(usize, NodeId, Vec3, Vec<String>)> = phase2
+            .rsu_specs()
+            .iter()
+            .zip(phase2.rsu_nodes())
+            .enumerate()
+            .map(|(i, (spec, node))| (i, *node, spec.position, spec.roles.clone()))
+            .collect();
+        let origin: v2xw_core::geo::GeoOrigin = self.world.origin.into();
+        for (i, node, mast, roles) in units {
+            let services = crate::wiring::rsu_services(&self.scenario, &roles);
+            if !(services.spat || services.map) {
+                continue;
+            }
+            let conflict = |why: String| {
+                EngineError::Scenario(crate::error::ScenarioError::conflict(
+                    &format!("actors.rsus[{i}]"),
+                    why,
+                ))
+            };
+            // A unit signs every SPaT and MAP on its own hardware, and a profile that
+            // publishes no signing cost signs nothing (`ObuRuntime` never signs for free).
+            // Refused here by name rather than left to broadcast silence.
+            let signs = self
+                .nodes
+                .get(&node)
+                .is_some_and(|n| n.profile().op_cost(NodeConfig::default().sign_op).is_some());
+            if !signs {
+                let profile = self
+                    .nodes
+                    .get(&node)
+                    .map_or_else(String::new, |n| n.profile().id.clone());
+                return Err(conflict(format!(
+                    "broadcasts SPaT or MAP, and its hardware profile '{profile}' publishes no \
+                     ECDSA signing cost, so it cannot sign what it would broadcast; choose a \
+                     roadside profile with one, such as rsu/commsignia-its-rs4"
+                )));
+            }
+            let plan = crate::infra::IntersectionFeed::nearest_plan(&self.world, mast).ok_or_else(
+                || {
+                    conflict(format!(
+                        "broadcasts SPaT or MAP, and no signalised junction stands within {} m of \
+                     its mast: a roadside unit is wired to the controller of the junction it \
+                     stands at. Move it onto a junction or drop the role",
+                        crate::infra::SERVICE_RADIUS_M
+                    ))
+                },
+            )?;
+            let feed = crate::infra::IntersectionFeed::build(&self.world, plan, origin)
+                .map_err(|why| conflict(format!("cannot describe its junction: {why}")))?;
+            if services.map {
+                let framing = self.infra_framing(node);
+                let bytes = feed
+                    .map_bytes(framing)
+                    .map_err(|why| conflict(format!("its MAP does not encode: {why}")))?;
+                if let Some(runtime) = self.nodes.get_mut(&node).and_then(|n| n.as_obu_mut()) {
+                    runtime.set_infra_payload(v2xw_msg::MsgType::Map, bytes);
+                }
+            }
+            self.infra_feeds.insert(node, feed);
+        }
+        Ok(())
+    }
+
+    /// How `node`'s intersection messages are framed: J2735 on the WSMP stack, ETSI on the
+    /// GeoNetworking one, with the station id its active pseudonym gives it.
+    fn infra_framing(&self, node: NodeId) -> crate::infra::InfraFraming {
+        if !crate::wiring::etsi_facilities(&self.scenario) {
+            return crate::infra::InfraFraming::J2735;
+        }
+        let station_id = self
+            .nodes
+            .get(&node)
+            .and_then(|n| n.stores().certs.active())
+            .map_or(0, |c| {
+                u32::from_be_bytes([c.digest.0[0], c.digest.0[1], c.digest.0[2], c.digest.0[3]])
+            });
+        crate::infra::InfraFraming::Etsi { station_id }
+    }
+
+    /// Hands each selected roadside unit its controller's state at `now`: the SPaT its
+    /// schedule signs if a broadcast is due at this step.
+    fn feed_controllers(&mut self, only: Option<NodeId>, now: SimTime) {
+        let units: Vec<NodeId> = self
+            .infra_feeds
+            .keys()
+            .copied()
+            .filter(|n| only.is_none_or(|o| o == *n))
+            .collect();
+        for node in units {
+            let framing = self.infra_framing(node);
+            let Some(feed) = self.infra_feeds.get(&node) else {
+                continue;
+            };
+            // A SPaT that does not encode is a defect in the encoder, not in the run; the
+            // unit keeps the last good one rather than sending a truncated message, and the
+            // count is in the run report.
+            match feed.spat_bytes(now, self.wall, framing) {
+                Ok(bytes) => {
+                    if let Some(runtime) = self.nodes.get_mut(&node).and_then(|n| n.as_obu_mut())
+                    {
+                        runtime.set_infra_payload(v2xw_msg::MsgType::Spat, bytes);
+                    }
+                }
+                Err(_) => self.report.infra_encode_failures += 1,
+            }
+        }
+    }
+
     /// What one signature costs this node, on its own hardware.
     ///
     /// The engine needs this for the two application messages it puts on the air itself —
@@ -1243,6 +1421,14 @@ impl Engine {
                     node,
                     task: crate::event::NodeTask::Step,
                 } => self.on_node_phase(recorder, horizon, Some(node)),
+                Event::NodeTask {
+                    node,
+                    task: crate::event::NodeTask::Deliver,
+                } => self.on_node_wake(recorder, horizon, node),
+                Event::NodeTask {
+                    node,
+                    task: crate::event::NodeTask::Reassembly,
+                } => self.on_reassembly_timer(recorder, node),
                 Event::MacTimer { node, channel } => {
                     self.on_mac_timer(node, ChannelId(channel), horizon);
                     if self
@@ -1752,6 +1938,7 @@ impl Engine {
                 self.node_phase.remove(&node);
                 self.node_class.remove(&node);
                 self.mac_window.remove(&node);
+                self.node_wake.remove(&node);
                 // Frames the retired node had been handed and not yet processed never
                 // reach an application: each attempt is settled here rather than left
                 // without a fate.
@@ -1920,9 +2107,25 @@ impl Engine {
             // the firewall leaves open, from the engine, which knows both numbers.
             let error =
                 v2xw_core::math::hypot(belief.pos.x - truth.pos.x, belief.pos.y - truth.pos.y);
+            // The vehicle's own accelerometer: its longitudinal acceleration along its
+            // heading, which is what a hard-braking trigger reads (`v2xw_node::events`).
+            // The vehicle's own sensor about itself, like the position fix — no view of
+            // anyone else — and without a noise model: a MEMS accelerometer's error is
+            // hundredths of a m/s² against a 3.92 m/s² threshold.
+            // The same quantity, to the bit, that `gt.kinematics` records as `acc_mps2`.
+            let q = truth.quantized();
+            let a_long = v2xw_core::math::q3(crate::records::longitudinal(
+                q.acc.x,
+                q.acc.y,
+                q.heading_rad,
+            ));
             if let Some(runtime) = self.nodes.get_mut(&node) {
                 runtime.set_belief(belief.quantized());
                 runtime.observe_truth(error as f32);
+                // A VRU device sends no hard-braking DENM, so only an OBU reads it.
+                if let Some(obu) = runtime.as_obu_mut() {
+                    obu.set_own_acceleration(a_long);
+                }
             }
             self.update_dcc(node, now);
         }
@@ -2016,6 +2219,75 @@ impl Engine {
         horizon: SimTime,
         only: Option<NodeId>,
     ) {
+        self.run_nodes(recorder, horizon, only, false);
+    }
+
+    /// One node is woken because a signature check it started has finished: it receives
+    /// what has arrived and hands every finished check to its applications, and nothing
+    /// else — no generation, which is the periodic step's (`ObuRuntime::wake_timed`).
+    fn on_node_wake(&mut self, recorder: &mut dyn RunRecorder, horizon: SimTime, node: NodeId) {
+        let now = self.scheduler.now();
+        if self.node_wake.get(&node) == Some(&now) {
+            self.node_wake.remove(&node);
+        }
+        if !self.nodes.contains_key(&node) {
+            return;
+        }
+        self.run_nodes(recorder, horizon, Some(node), true);
+    }
+
+    /// Schedules a node's wake for the instant its next signature check finishes, unless
+    /// one is already scheduled at or before it.
+    ///
+    /// One pending wake per node, at the earliest instant anything finishes: a wake hands
+    /// over everything finished by then and schedules the next, so the heap holds one
+    /// entry per node with a check running, not one per check.
+    fn schedule_wake(&mut self, node: NodeId, now: SimTime, horizon: SimTime) {
+        let Some(at) = self
+            .nodes
+            .get(&node)
+            .and_then(|n| n.next_completion_after(now))
+        else {
+            return;
+        };
+        // Strictly after `now`: a wake at this instant would dispatch again before the
+        // loop advances, and anything finished by `now` has been handed over already.
+        self.request_wake(node, at.max(now + 1), horizon);
+    }
+
+    /// Wakes `node` at `at` unless a wake is already pending at or before it.
+    ///
+    /// Called for a signature check's finish ([`Engine::schedule_wake`]) and for a decoded
+    /// frame's arrival, so a receiver takes each frame into its verifier the instant it
+    /// arrives and hands it to its applications the instant the check finishes — rather
+    /// than at its next periodic step, up to a mobility step later.
+    fn request_wake(&mut self, node: NodeId, at: SimTime, horizon: SimTime) {
+        if at > horizon {
+            return;
+        }
+        if self.node_wake.get(&node).is_some_and(|&t| t <= at) {
+            return;
+        }
+        self.node_wake.insert(node, at);
+        self.scheduler.schedule(
+            at,
+            EventClass::NodeTask,
+            Event::NodeTask {
+                node,
+                task: crate::event::NodeTask::Deliver,
+            },
+        );
+    }
+
+    /// The node phase's map and merge, over one node or all of them, as a periodic step or
+    /// as a wake.
+    fn run_nodes(
+        &mut self,
+        recorder: &mut dyn RunRecorder,
+        horizon: SimTime,
+        only: Option<NodeId>,
+        wake: bool,
+    ) {
         let now = self.scheduler.now();
         let step_s = self.scenario.time.mobility_step().as_secs_f64();
         // A node stepping at its own phase generates between two GNSS epochs. Its belief
@@ -2026,8 +2298,13 @@ impl Engine {
         // read, correctly, as an inconsistent sender. An OBU does the same: the BSM's
         // position is meant to be the position at `secMark`, and 04-models.md §8.1 records
         // J2945/1's latency-compensation requirement as secondary-sourced.
-        if let Some(node) = only {
+        if let Some(node) = only
+            && !wake
+        {
             self.dead_reckon_belief(node, now);
+        }
+        if !wake {
+            self.feed_controllers(only, now);
         }
         let mut inboxes = core::mem::take(&mut self.inboxes);
         let rng = &self.rng;
@@ -2051,14 +2328,14 @@ impl Engine {
                 // symbol (plus its propagation delay) lands after this instant waits for
                 // the next step, so a node never processes a frame before it arrived.
                 let inbox: Vec<(RxFrame, RxStamp)> = match inboxes.get_mut(id) {
-                    Some(q) => {
+                    Some(q) if !(wake && runtime.is_vru()) => {
                         let (ready, later): (Vec<_>, Vec<_>) = core::mem::take(q)
                             .into_iter()
                             .partition(|(_, st)| st.arrived_at.is_none_or(|t| t <= now));
                         *q = later;
                         ready
                     }
-                    None => Vec::new(),
+                    _ => Vec::new(),
                 };
                 let mut local = v2xw_node::NodeRuntimeCtx::new(now, rng);
                 // Distance travelled since the last step drives distance-based pseudonym
@@ -2068,8 +2345,15 @@ impl Engine {
                     .state()
                     .transmits()
                     .then(|| v2xw_core::NodeView::position(runtime).ground_speed_mps() * step_s);
-                let (outcome, suppressed) =
-                    runtime.step_timed(&mut local, inbox, travelled.unwrap_or(0.0));
+                // A periodic step, or a wake that hands over finished signature checks. A
+                // VRU device has no deferred checks, so it is never woken for one
+                // (`HostedNode::next_completion_after`); on a frame-arrival wake its inbox
+                // waits for its periodic step, as the device takes frames there.
+                let (outcome, suppressed) = if wake {
+                    (runtime.wake_timed(&mut local, inbox), 0)
+                } else {
+                    runtime.step_timed(&mut local, inbox, travelled.unwrap_or(0.0))
+                };
                 suppressed_by_vru += suppressed;
                 // A VRU device's suppression records ride `node.tx` in the device's own
                 // shape, which is not the `NodeTx` a recording's `node.tx` holds; they are
@@ -2161,6 +2445,22 @@ impl Engine {
         }
 
         self.inboxes = inboxes;
+
+        // A check still running hands its message over when it finishes, not at the next
+        // periodic step: each node that has one is woken then — and so is a node with a
+        // frame still on its way, at the instant the frame arrives.
+        for (id, ..) in &results {
+            self.schedule_wake(*id, now, horizon);
+            let next_arrival = self.inboxes.get(id).and_then(|q| {
+                q.iter()
+                    .filter_map(|(_, st)| st.arrived_at)
+                    .filter(|t| *t > now)
+                    .min()
+            });
+            if let Some(at) = next_arrival {
+                self.request_wake(*id, at, horizon);
+            }
+        }
     }
 
     /// Advances one node's position belief to `now` along its own believed velocity.
@@ -2338,11 +2638,52 @@ impl Engine {
             self.report.suppressed_frames += 1;
             return;
         }
-        // `fragmenter/none` (04-models.md §7.3): neither WSMP nor GeoNetworking can split an
-        // SDU, so a signed message above the network layer's MTU is refused here, before
-        // the MAC, and counted, rather than handed down to be refused by the PHY's MSDU cap
-        // with its headers already counted as offered load.
-        if tx.bytes > self.net.sdu_mtu() {
+        // Neither WSMP nor GeoNetworking can split an SDU, so everything that splits one
+        // happens here, above the network layer (04-models.md §7.3, `crate::frag`). The
+        // SDU the fragmenter sees is the signed message plus the scenario's padding, which
+        // stands in for a post-quantum signature or certificate and counts as payload.
+        //
+        // The engine's own application frames (a misbehaviour report, a CRL broadcast) are
+        // sized from a protocol table and acted on per frame at the receiver, so they are
+        // neither padded nor split: they keep `fragmenter/none`'s rule.
+        let node_message = app.is_none();
+        let padding = if node_message {
+            self.frag_plan.padding
+        } else {
+            0
+        };
+        let sdu_bytes = tx.bytes.saturating_add(padding);
+        let mtu = self.net.sdu_mtu();
+        // Named by the frame index its first frame will take, so an SDU's id and its first
+        // frame's are the same number, as they always were for a whole frame.
+        let sdu = v2xw_core::ids::SduId::new(self.next_frame);
+        let split_plan = if node_message {
+            self.frag_plan.split(sdu, sdu_bytes, mtu)
+        } else {
+            None
+        };
+        let pieces = match split_plan {
+            Some(Ok(p)) if p.len() > 1 => Some(p),
+            Some(Ok(_)) => None,
+            Some(Err(_)) => {
+                self.report.net_mtu_refusals += 1;
+                return;
+            }
+            None => None,
+        };
+        // The certificate cycle's fragment, if this SPDU carries one: credential octets
+        // inside the envelope, in addition to the signer field the node chose.
+        let cert_piece = if node_message {
+            self.cert_cycle_piece(node, sdu, mtu)
+        } else {
+            None
+        };
+        let cert_extra = cert_piece.map_or(0, |d| d.payload_bytes);
+        let whole_bytes = sdu_bytes.saturating_add(cert_extra);
+        // `fragmenter/none`: a signed message above the network layer's MTU is refused
+        // here, before the MAC, and counted, rather than handed down to be refused by the
+        // PHY's MSDU cap with its headers already counted as offered load.
+        if pieces.is_none() && whole_bytes > mtu {
             self.report.net_mtu_refusals += 1;
             return;
         }
@@ -2462,25 +2803,38 @@ impl Engine {
         // The frame on the air is the SPDU inside a network and transport header, LLC/SNAP,
         // the 802.11 MAC header and the FCS (`v2xw_net::frame`); the PHY's air time and the
         // MSDU cap are over all of it, not over the SPDU alone.
-        let mut layers = v2xw_net::FrameLayers::compose(
-            &self.net,
-            if tx.msg_type == v2xw_msg::MsgType::Denm {
-                v2xw_net::FrameMsg::Denm
-            } else {
-                v2xw_net::FrameMsg::Safety
-            },
-            tx.payload_bytes().zip(tx.envelope_bytes()),
-            tx.bytes,
-        );
-        if self.sidelink.is_some() {
-            // A PC5 transport block carries the network PDU with no LLC/SNAP, no 802.11
-            // MAC header and no FCS. Its own layer-2 headers (PDCP, RLC, MAC) and the CRC
-            // are not modelled, so the link layer's share is zero rather than borrowed
-            // from 802.11, and the overhead metrics say so by counting none.
-            layers.llc_snap = 0;
-            layers.mac_header = 0;
-            layers.fcs = 0;
+        // A SPaT or a MAP claims the junction it describes, not the mast that sends it:
+        // that is the position its payload carries (the MAP's reference point), and the one
+        // a receiver files the junction under.
+        if matches!(
+            tx.msg_type,
+            v2xw_msg::MsgType::Spat | v2xw_msg::MsgType::Map
+        ) && let Some(feed) = self.infra_feeds.get(&node)
+        {
+            claim = (feed.position, 0.0, 0.0);
         }
+        // The payload/envelope split the node's security stack produced, with the padding
+        // on the payload side and a certificate-cycle fragment on the envelope side.
+        let split = tx
+            .payload_bytes()
+            .zip(tx.envelope_bytes())
+            .map(|(p, e)| (p.saturating_add(padding), e.saturating_add(cert_extra)));
+        let sidelink = self.sidelink.is_some();
+        let frame_layers = |layers: &mut v2xw_net::FrameLayers| {
+            if sidelink {
+                // A PC5 transport block carries the network PDU with no LLC/SNAP, no
+                // 802.11 MAC header and no FCS. Its own layer-2 headers (PDCP, RLC, MAC)
+                // and the CRC are not modelled, so the link layer's share is zero rather
+                // than borrowed from 802.11, and the overhead metrics say so by counting
+                // none.
+                layers.llc_snap = 0;
+                layers.mac_header = 0;
+                layers.fcs = 0;
+            }
+        };
+        let mut layers =
+            v2xw_net::FrameLayers::compose(&self.net, frame_msg(tx.msg_type), split, whole_bytes);
+        frame_layers(&mut layers);
         let psdu = layers.psdu_bytes();
         let descriptor = FrameDescriptor {
             bytes: psdu,
@@ -2489,75 +2843,158 @@ impl Engine {
             channel,
             ac: SAFETY_AC,
             kind: FrameKind::Broadcast,
-            // One SDU per frame: no fragmentation model is wired in, so the SDU id and
-            // the frame number are the same counter seen from two layers.
-            sdu_ref: SduRef::new(v2xw_core::ids::SduId::new(frame.index()), frame),
+            // A whole SDU: its id and the frame number are the same counter seen from two
+            // layers. A split one's fragments share the SDU id below.
+            sdu_ref: SduRef::new(sdu, frame),
         };
         // A sidelink transport block occupies one slot whatever it carries; its size
         // decides how many sub-channels it takes instead (04-models.md §5.1, §5.2).
-        let air = match self.sidelink.as_ref() {
-            Some(sl) => sl.slot(),
-            None => v2xw_radio::air_time(psdu, SAFETY_MCS),
+        let slot = self.sidelink.as_ref().map(|sl| sl.slot());
+        let air_of =
+            move |psdu: u32| slot.unwrap_or_else(|| v2xw_radio::air_time(psdu, SAFETY_MCS));
+        let air = air_of(psdu);
+        let sdu_payload = split.map_or(sdu_bytes, |(p, _)| p);
+        let cert_frag = cert_piece.map(|desc| crate::frag::FragMeta {
+            desc,
+            kind: crate::frag::GroupKind::Certificate,
+            sdu_msg: u64::from(desc.sdu.index()),
+            sdu_bytes: self
+                .frag_plan
+                .cert_cycle()
+                .map_or(0, |c| c.params().hybrid_cert_bytes),
+            sdu_payload: self
+                .frag_plan
+                .cert_cycle()
+                .map_or(0, |c| c.params().hybrid_cert_bytes),
+            psdu_total: psdu,
+            air_total_us: air.as_nanos() / 1_000,
+        });
+        let base = FrameState {
+            tx: node,
+            // Filled in when the grant fixes the transmit instant; a frame that is
+            // still queued has no position on the air yet.
+            tx_pos: Vec3::ZERO,
+            bytes: whole_bytes,
+            msg_type: tx.msg_type,
+            signer: tx.signer.clone(),
+            full_certificate: tx.full_certificate,
+            generation_time: tx.generation_time,
+            claimed_pos: claim.0,
+            claimed_speed_mps: claim.1,
+            claimed_heading_rad: claim.2,
+            ready_at: ready,
+            start: ready,
+            end: air.after(ready),
+            air,
+            descriptor,
+            tx_handle: None,
+            arrivals: BTreeMap::new(),
+            faint: BTreeMap::new(),
+            tx_heading: None,
+            claimed_cert_period,
+            claimed_linkage,
+            app,
+            spdu: tx.signed.as_ref().map(|f| f.spdu.clone()),
+            // Read from the node's own `SignedFrame`, not recomputed here: the split
+            // between payload and envelope is the security stack's answer and the
+            // engine has no business having a second one.
+            payload_bytes: split.map(|(p, _)| p),
+            envelope_bytes: split.map(|(_, e)| e),
+            sl_resource: None,
+            sl_interferers: BTreeMap::new(),
+            focus_high: std::collections::BTreeSet::new(),
+            focus_placement: BTreeMap::new(),
+            sl: sidelink::SlFrame::default(),
+            layers,
+            cert_bytes: tx
+                .cert_bytes()
+                .map(|c| c.saturating_add(cert_extra))
+                .or((cert_extra > 0).then_some(cert_extra)),
+            t_generated,
+            t_sign_start,
+            // The abstract tier's frame waits exactly one AIFS and counts no backoff;
+            // the MAC's grant overwrites both at the medium and high tiers.
+            mac_aifs_ns: AIFS.as_nanos(),
+            mac_backoff_ns: 0,
+            content: Some(message_content(
+                tx.msg_type,
+                tx.signed.as_ref().map(|f| f.payload.as_slice()),
+                &tx.signer,
+                claim,
+            )),
+            census: BTreeMap::new(),
+            frag: None,
+            cert_frag,
         };
-        self.frames.insert(
-            frame,
-            FrameState {
-                tx: node,
-                // Filled in when the grant fixes the transmit instant; a frame that is
-                // still queued has no position on the air yet.
-                tx_pos: Vec3::ZERO,
-                bytes: tx.bytes,
-                msg_type: tx.msg_type,
-                signer: tx.signer.clone(),
-                full_certificate: tx.full_certificate,
-                generation_time: tx.generation_time,
-                claimed_pos: claim.0,
-                claimed_speed_mps: claim.1,
-                claimed_heading_rad: claim.2,
-                ready_at: ready,
-                start: ready,
-                end: air.after(ready),
-                air,
-                descriptor,
-                tx_handle: None,
-                arrivals: BTreeMap::new(),
-                faint: BTreeMap::new(),
-                tx_heading: None,
-                claimed_cert_period,
-                claimed_linkage,
-                app,
-                spdu: tx.signed.as_ref().map(|f| f.spdu.clone()),
-                // Read from the node's own `SignedFrame`, not recomputed here: the split
-                // between payload and envelope is the security stack's answer and the
-                // engine has no business having a second one.
-                payload_bytes: tx.payload_bytes(),
-                envelope_bytes: tx.envelope_bytes(),
-                sl_resource: None,
-                sl_interferers: BTreeMap::new(),
-                focus_high: std::collections::BTreeSet::new(),
-                focus_placement: BTreeMap::new(),
-                sl: sidelink::SlFrame::default(),
-                layers,
-                cert_bytes: tx.cert_bytes(),
-                t_generated,
-                t_sign_start,
-                // The abstract tier's frame waits exactly one AIFS and counts no backoff;
-                // the MAC's grant overwrites both at the medium and high tiers.
-                mac_aifs_ns: AIFS.as_nanos(),
-                mac_backoff_ns: 0,
-                content: Some(message_content(
-                    tx.msg_type,
-                    tx.signed.as_ref().map(|f| f.payload.as_slice()),
-                    &tx.signer,
-                    claim,
-                )),
-            },
-        );
-        if self.mac.is_some() || self.sidelink.is_some() {
-            self.pending_tx
-                .entry(node)
-                .or_default()
-                .push((ready, frame));
+        // The frames that go down: the whole SDU, or one per fragment, each with its own
+        // frame number and the SDU's id, its own layers and its own air time.
+        let mut frames: Vec<(FrameSeq, FrameState)> = Vec::new();
+        match pieces {
+            None => frames.push((frame, base)),
+            Some(pieces) => {
+                let kind = self
+                    .frag_plan
+                    .kind()
+                    .unwrap_or(crate::frag::GroupKind::Message);
+                let layered: Vec<v2xw_net::FrameLayers> = pieces
+                    .iter()
+                    .map(|d| {
+                        let mut l = v2xw_net::FrameLayers::fragment(
+                            &self.net,
+                            frame_msg(tx.msg_type),
+                            split,
+                            sdu_bytes,
+                            d.payload_bytes,
+                            d.header_bytes,
+                        );
+                        frame_layers(&mut l);
+                        l
+                    })
+                    .collect();
+                let psdu_total: u32 = layered.iter().map(v2xw_net::FrameLayers::psdu_bytes).sum();
+                let air_total_us: u64 = layered
+                    .iter()
+                    .map(|l| air_of(l.psdu_bytes()).as_nanos() / 1_000)
+                    .sum();
+                self.report.sdus_fragmented += 1;
+                for (k, (desc, layers)) in pieces.into_iter().zip(layered).enumerate() {
+                    let seq = if k == 0 {
+                        frame
+                    } else {
+                        let f = FrameSeq::new(self.next_frame);
+                        self.next_frame += 1;
+                        f
+                    };
+                    let psdu = layers.psdu_bytes();
+                    let air = air_of(psdu);
+                    let mut state = base.clone();
+                    state.bytes = desc.total_bytes();
+                    state.descriptor.bytes = psdu;
+                    state.descriptor.sdu_ref = SduRef::new(sdu, seq);
+                    state.air = air;
+                    state.end = air.after(ready);
+                    state.payload_bytes = split.map(|_| layers.payload);
+                    state.envelope_bytes = split.map(|_| layers.security);
+                    state.layers = layers;
+                    state.frag = Some(crate::frag::FragMeta {
+                        desc,
+                        kind,
+                        sdu_msg: u64::from(sdu.index()),
+                        sdu_bytes,
+                        sdu_payload,
+                        psdu_total,
+                        air_total_us,
+                    });
+                    self.report.fragments_sent += 1;
+                    frames.push((seq, state));
+                }
+            }
+        }
+        // At the abstract tier there is no MAC to queue the fragments of one SDU behind
+        // each other, so each one waits for the one before it to leave the air.
+        let mut on_air_until = ready;
+        let queued = self.mac.is_some() || self.sidelink.is_some();
+        if queued {
             self.scheduler.schedule(
                 ready,
                 EventClass::MacTimer,
@@ -2566,22 +3003,61 @@ impl Engine {
                     channel: channel.0,
                 },
             );
-        } else {
-            let at = AIFS.after(ready);
-            if at > horizon {
-                self.frames.remove(&frame);
-                return;
-            }
-            if let Some(state) = self.frames.get_mut(&frame) {
-                state.start = at;
-                state.end = state.air.after(at);
-            }
-            self.scheduler.schedule(
-                at,
-                EventClass::PhyStart,
-                Event::PhyStart { frame, tx: node },
-            );
         }
+        for (seq, state) in frames {
+            let air = state.air;
+            self.frames.insert(seq, state);
+            if queued {
+                self.pending_tx.entry(node).or_default().push((ready, seq));
+            } else {
+                let at = AIFS.after(on_air_until);
+                if at > horizon {
+                    self.frames.remove(&seq);
+                    return;
+                }
+                if let Some(state) = self.frames.get_mut(&seq) {
+                    state.start = at;
+                    state.end = state.air.after(at);
+                }
+                on_air_until = air.after(at);
+                self.scheduler.schedule(
+                    at,
+                    EventClass::PhyStart,
+                    Event::PhyStart {
+                        frame: seq,
+                        tx: node,
+                    },
+                );
+            }
+        }
+    }
+
+    /// The certificate-cycle fragment this node's next SPDU carries, if any, advancing its
+    /// cycle (`fragmenter/cert-cycle-partial-hybrid`, NDSS 2024 §IV): the first α SPDUs of
+    /// each τ-SPDU cycle carry one fragment each of the hybrid certificate, the rest its
+    /// digest. `sdu` names a new cycle's certificate.
+    fn cert_cycle_piece(
+        &mut self,
+        node: NodeId,
+        sdu: v2xw_core::ids::SduId,
+        mtu: u32,
+    ) -> Option<v2xw_net::frag::FragmentDesc> {
+        let cycle = self.frag_plan.cert_cycle()?;
+        let tau = u64::from(cycle.params().tau_spdus.max(1));
+        let entry = self.cert_cycles.entry(node).or_insert((0, sdu));
+        let position = entry.0 % tau;
+        if position == 0 {
+            entry.1 = sdu;
+        }
+        entry.0 += 1;
+        let cycle_sdu = entry.1;
+        // The fragments fill what the network layer's MTU leaves after the cycle's base
+        // frame; a certificate the cap cannot carry in τ fragments is refused by the model,
+        // and the SPDU then carries only its digest.
+        let parts = cycle
+            .split(cycle_sdu, cycle.params().hybrid_cert_bytes, mtu)
+            .ok()?;
+        parts.get(usize::try_from(position).ok()?).copied()
     }
 
     /// The conducted transmit power this node puts on a frame, dBm.
@@ -3069,6 +3545,7 @@ impl Engine {
         }
         candidates.sort_by_key(|(n, _)| *n);
         beyond.sort_by_key(|(n, _)| *n);
+        state.census = self.reception_census(state.tx, state.tx_pos, now);
 
         // Stage 2: the link budgets, sequentially, because the models carry state — a
         // shadowing process is correlated along a trajectory, which is why it has state
@@ -3216,6 +3693,43 @@ impl Engine {
             .schedule(state.end, EventClass::PhyEnd, Event::PhyEnd { frame });
         self.frames.insert(frame, state);
     }
+
+    /// How many equipped receivers are truly within each 20 m range of a transmitter at
+    /// `now`, out to [`v2xw_metrics::channels::PRR_MAX_M`] — the `Y` of 3GPP TR 36.885
+    /// §A.2.1.4's packet reception ratio.
+    ///
+    /// A census, not the candidate set: it counts every equipped node in range from ground
+    /// truth whether or not the radio evaluates a link to it, so the delivery ratio built on
+    /// it does not move when the candidate range does. The distance is the one
+    /// [`Engine::link_budget`] reports for the same pair at the same instant (the ground
+    /// points' 3-D separation), so a decoded receiver lands in the bin it was counted in.
+    fn reception_census(&self, tx: NodeId, tx_pos: Vec3, now: SimTime) -> BTreeMap<u32, u32> {
+        let max = v2xw_metrics::channels::PRR_MAX_M;
+        let mut census: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut count = |d: f64| {
+            if d < max
+                && let Some(bin) = self.prr_bins.index_of(d)
+            {
+                *census.entry(bin as u32).or_insert(0) += 1;
+            }
+        };
+        for actor in self.snapshot.actors_within(tx_pos, max) {
+            let Some(rec) = self.actors.get(&actor) else {
+                continue;
+            };
+            match rec.node {
+                Some(node) if node != tx => count(tx_pos.distance(rec.last.extrapolate(now).pos)),
+                _ => {}
+            }
+        }
+        for (&rsu, &rsu_pos) in &self.rsus {
+            if rsu != tx {
+                count(tx_pos.distance(rsu_pos));
+            }
+        }
+        census
+    }
+
     /// The reception phase (ADR 0004 decision 5, invariant I-R2).
     ///
     /// The arrival set and every received power were fixed when the frame started; what
@@ -3257,6 +3771,9 @@ impl Engine {
         let domain = OfdmPhy::frame_error_domain();
         let high = Phy::<EngineCtx<'_>>::tier(phy) == Tier::High;
         let tx_id = state.tx_id();
+        // A fragment's success probability is what 04-models.md §7.4's prediction is built
+        // from; it costs one more pass over the SINR windows, so only fragments pay it.
+        let fragment = state.frag.is_some() || state.cert_frag.is_some();
         state
             .arrivals
             .par_iter()
@@ -3269,6 +3786,7 @@ impl Engine {
                     received: false,
                     cause: Some(LossCause::OutOfRange),
                     copies: None,
+                    psr: fragment.then_some(0.0),
                 };
                 let Some(arrival) = phy.arrival(RxHandle { tx: tx_id, rx }) else {
                     // Nothing was registered for this receiver, which the PHY reports as
@@ -3295,6 +3813,18 @@ impl Engine {
                         out.cause = None;
                     }
                     v2xw_radio::RxOutcome::Lost(cause) => out.cause = Some(cause),
+                }
+                if fragment {
+                    // The deterministic refusals decode with probability zero; everything
+                    // else is the error model's probability under the interference present.
+                    out.psr = Some(match out.cause {
+                        Some(
+                            LossCause::HalfDuplex
+                            | LossCause::BelowSensitivity
+                            | LossCause::PreambleMissed,
+                        ) => 0.0,
+                        _ => phy.success_probability(arrival),
+                    });
                 }
                 out
             })
@@ -3336,6 +3866,52 @@ impl Engine {
         let mut delivered_app: Vec<(NodeId, SimTime)> = Vec::new();
         let psdu = state.layers.psdu_bytes();
         let air_us = state.air.as_nanos() / 1_000;
+        // The census's `X`: receivers in range that decoded the frame, by the bin the census
+        // counted them in.
+        let mut decoded_by_bin: BTreeMap<u32, u32> = BTreeMap::new();
+        for outcome in &outcomes {
+            if outcome.received
+                && outcome.distance_m < v2xw_metrics::channels::PRR_MAX_M
+                && let Some(bin) = self.prr_bins.index_of(outcome.distance_m)
+            {
+                *decoded_by_bin.entry(bin as u32).or_insert(0) += 1;
+            }
+        }
+        if !state.census.is_empty() || !decoded_by_bin.is_empty() {
+            // Over the union of both maps and not clamped: a decode the census did not count
+            // would be a producer defect, and the metric refuses such a record rather than
+            // have it hidden here.
+            let keys: std::collections::BTreeSet<u32> = state
+                .census
+                .keys()
+                .chain(decoded_by_bin.keys())
+                .copied()
+                .collect();
+            let bins: Vec<[u32; 3]> = keys
+                .into_iter()
+                .map(|bin| {
+                    [
+                        bin,
+                        state.census.get(&bin).copied().unwrap_or(0),
+                        decoded_by_bin.get(&bin).copied().unwrap_or(0),
+                    ]
+                })
+                .collect();
+            let census = crate::records::PhyPrr(v2xw_metrics::channels::PhyPrrView {
+                t: now,
+                tx: state.tx,
+                msg: frame_index,
+                msg_type: Some(msg_type_name(state.msg_type).to_string()),
+                bins,
+            });
+            self.emit(recorder, &census);
+        }
+        // A generic piece is not a message the node can take: its fragments are one attempt
+        // at the SDU, followed on `node.rx` under the SDU's id and resolved when the SDU is
+        // reassembled or given up on (`crate::frag`).
+        let piece = state
+            .frag
+            .filter(|m| m.kind == crate::frag::GroupKind::Message);
         for outcome in outcomes {
             self.report.reception_attempts += 1;
             if let Some(cause) = outcome.cause {
@@ -3360,7 +3936,8 @@ impl Engine {
             .with_link_tags(
                 state.focus_placement.get(&outcome.rx).copied(),
                 outcome.copies,
-            );
+            )
+            .of_sdu(piece.map(|m| m.sdu_msg));
             self.emit(recorder, &record);
             // The same attempt, on `node.rx`, with the sender's side of the journey. A PHY
             // loss is its fate already; a decoded frame's fate is the receiving node's to
@@ -3388,6 +3965,27 @@ impl Engine {
                 state.end,
                 arrival,
             );
+            if let Some(meta) = piece {
+                if outcome.received {
+                    self.report.receptions_ok += 1;
+                    received_any = true;
+                }
+                self.on_fragment(
+                    recorder,
+                    &state,
+                    meta,
+                    &outcome,
+                    arrival,
+                    Some(attempt),
+                    now,
+                );
+                continue;
+            }
+            // A segment or a certificate-cycle SPDU is a message of its own; its group is
+            // followed beside it for the reassembly record.
+            if let Some(meta) = state.frag.or(state.cert_frag) {
+                self.on_fragment(recorder, &state, meta, &outcome, arrival, None, now);
+            }
             if !outcome.received {
                 let cause = outcome.cause.map_or("unknown", cause_name);
                 self.emit(recorder, &attempt.lost(now, cause));
@@ -3405,29 +4003,16 @@ impl Engine {
                 }
                 if let Some(inbox) = self.inboxes.get_mut(&outcome.rx) {
                     inbox.push((
-                        RxFrame {
-                            signer: Some(state.signer.clone()),
-                            msg_type: state.msg_type,
-                            bytes: state.bytes,
-                            claimed_pos: Some(state.claimed_pos),
-                            claimed_speed_mps: state.claimed_speed_mps,
-                            claimed_heading_rad: state.claimed_heading_rad,
-                            claimed_generation_time: state.generation_time,
-                            full_certificate: state.full_certificate,
-                            // Modelled crypto: the engine knows the sender's key is genuine,
-                            // so the signature is valid. The receiver only learns it by
-                            // *spending* the verification time, which `ObuRuntime::step`
-                            // charges against its servers.
-                            signature_valid: true,
-                            claimed_cert_period: state.claimed_cert_period,
-                            claimed_linkage: state.claimed_linkage,
-                            spdu: state.spdu.clone(),
-                        },
+                        rx_frame(&state, state.bytes),
                         RxStamp {
                             token,
                             arrived_at: Some(arrival),
                         },
                     ));
+                }
+                // The receiver takes the frame into its verifier the instant it arrives.
+                if handed {
+                    self.request_wake(outcome.rx, arrival, self.scenario.time.horizon_ns());
                 }
                 if state.app.is_some() {
                     delivered_app.push((outcome.rx, arrival));
@@ -4089,6 +4674,318 @@ impl Engine {
         for (_, attempt) in core::mem::take(&mut self.rx_pending) {
             self.emit(recorder, &attempt.in_flight(at));
         }
+        // A fragmented SDU still waiting at the horizon: lost already if the PHY lost one
+        // of its fragments (nothing retransmits a broadcast fragment), in flight if not.
+        let open: Vec<_> = self.frag_groups.keys().copied().collect();
+        for key in open {
+            let certain = self
+                .frag_groups
+                .get(&key)
+                .is_some_and(|g| g.first_cause.is_some());
+            if certain {
+                self.resolve_group(recorder, key, at, None);
+            } else if let Some(group) = self.frag_groups.remove(&key)
+                && let Some(attempt) = group.attempt
+            {
+                self.emit(recorder, &attempt.in_flight(at));
+            }
+        }
+    }
+
+    /// One fragment's reception outcome at one receiver, taken into its reassembly group
+    /// (`crate::frag`).
+    ///
+    /// The group is opened by the first of its fragments to reach the receiver's arrival
+    /// set, and resolved exactly once: when every fragment has decoded, when the
+    /// reassembler refuses the set, or at the strategy's timeout. `attempt` is the
+    /// `node.rx` attempt a generic piece stands for; `None` for a segment or a certificate
+    /// fragment, whose frame is a message of its own.
+    #[allow(clippy::too_many_arguments)]
+    fn on_fragment(
+        &mut self,
+        recorder: &mut dyn RunRecorder,
+        state: &FrameState,
+        meta: crate::frag::FragMeta,
+        outcome: &LinkOutcome,
+        arrival: SimTime,
+        attempt: Option<NodeRx>,
+        now: SimTime,
+    ) {
+        let rx = outcome.rx;
+        let key = (rx, meta.desc.sdu);
+        let horizon = self.scenario.time.horizon_ns();
+        let timeout = self.frag_plan.group_timeout();
+        let late = self.frag_resolved.contains_key(&key);
+        if !late && !self.frag_groups.contains_key(&key) {
+            let attempt = attempt.map(|mut a| {
+                // The attempt at the SDU: its size is every fragment's, and its journey
+                // starts with this fragment's access to the medium.
+                a.0.msg = Some(meta.sdu_msg);
+                a.0.bytes_on_wire = Some(u64::from(meta.psdu_total));
+                a.0.airtime_us = Some(meta.air_total_us);
+                a.0.payload_bytes = Some(u64::from(meta.sdu_payload));
+                a
+            });
+            let deadline = timeout.after(now);
+            self.frag_groups.insert(
+                key,
+                crate::frag::FragGroup {
+                    kind: meta.kind,
+                    tx: state.tx,
+                    sdu_msg: meta.sdu_msg,
+                    msg_type: msg_type_name(state.msg_type),
+                    fragments: meta.desc.count,
+                    payload_total: meta.sdu_bytes,
+                    seen: BTreeMap::new(),
+                    first_cause: None,
+                    deadline,
+                    opened: false,
+                    attempt,
+                },
+            );
+            self.schedule_reassembly(rx, deadline, horizon);
+        }
+        if let Some(group) = self.frag_groups.get_mut(&key) {
+            let psr = outcome
+                .psr
+                .unwrap_or(if outcome.received { 1.0 } else { 0.0 });
+            group.seen.insert(
+                meta.desc.index,
+                (psr, outcome.received, meta.desc.payload_bytes),
+            );
+            if outcome.received {
+                // The receiver finishes on the last fragment it decodes.
+                if let Some(a) = group.attempt.as_mut() {
+                    a.0.rssi_dbm = Some(v2xw_radio::numeric::q_db(outcome.rssi_dbm));
+                    a.0.sinr_db = Some(v2xw_radio::numeric::q_db(outcome.sinr_db));
+                    a.0.t_tx_end = Some(state.end);
+                    a.0.t_arrival = Some(arrival);
+                }
+            } else if group.first_cause.is_none() {
+                group.first_cause = Some(outcome.cause.map_or("unknown", cause_name));
+            }
+        }
+        if !outcome.received {
+            return;
+        }
+        // The reassembler sees every decoded fragment, a late one included, so its own
+        // state (and its `net.frag` record) is the model's and not a copy of this group's.
+        let mut collected = crate::ctx::MemoryRecorder::new();
+        let (reassembled, refused) = {
+            let Engine {
+                scheduler,
+                rng,
+                world,
+                snapshot,
+                provenance,
+                params,
+                reassemblers,
+                frag_plan,
+                ..
+            } = self;
+            if !reassemblers.contains_key(&rx)
+                && let Some(model) = frag_plan.reassembler()
+            {
+                reassemblers.insert(rx, model);
+            }
+            let Some(model) = reassemblers.get_mut(&rx) else {
+                return;
+            };
+            let mut ctx = EngineCtx::new(
+                scheduler,
+                rng,
+                world,
+                snapshot,
+                provenance,
+                params,
+                &mut collected,
+            );
+            let result = model.reassemble(&mut ctx, rx, &meta.desc, state.tx);
+            (result, ctx.refused())
+        };
+        self.report.records_refused += refused;
+        for (at, owned) in collected.records() {
+            self.write_owned(recorder, *at, owned);
+        }
+        if late {
+            return;
+        }
+        if let Some(group) = self.frag_groups.get_mut(&key)
+            && !group.opened
+        {
+            // The reassembler's timer starts at the first fragment it holds.
+            group.opened = true;
+            group.deadline = group.deadline.max(timeout.after(now));
+            let deadline = group.deadline;
+            self.schedule_reassembly(rx, deadline, horizon);
+        }
+        let done = self.frag_groups.get(&key).is_some_and(|g| g.complete());
+        match reassembled {
+            v2xw_net::frag::ReassemblyOutcome::Failed { .. } => {
+                self.resolve_group(recorder, key, now, None);
+            }
+            _ if done => self.resolve_group(recorder, key, now, Some((state, arrival))),
+            _ => {}
+        }
+    }
+
+    /// Schedules a receiver's reassembly timer.
+    fn schedule_reassembly(&mut self, rx: NodeId, at: SimTime, horizon: SimTime) {
+        if at > horizon {
+            return;
+        }
+        self.scheduler.schedule(
+            at,
+            EventClass::NodeTask,
+            Event::NodeTask {
+                node: rx,
+                task: crate::event::NodeTask::Reassembly,
+            },
+        );
+    }
+
+    /// A receiver's reassembly timer: the reassembler retires its stale sets, and every
+    /// group whose timeout has run out is resolved as it stands.
+    fn on_reassembly_timer(&mut self, recorder: &mut dyn RunRecorder, rx: NodeId) {
+        let now = self.scheduler.now();
+        let mut collected = crate::ctx::MemoryRecorder::new();
+        let refused = {
+            let Engine {
+                scheduler,
+                rng,
+                world,
+                snapshot,
+                provenance,
+                params,
+                reassemblers,
+                ..
+            } = self;
+            match reassemblers.get_mut(&rx) {
+                Some(model) => {
+                    let mut ctx = EngineCtx::new(
+                        scheduler,
+                        rng,
+                        world,
+                        snapshot,
+                        provenance,
+                        params,
+                        &mut collected,
+                    );
+                    let _ = model.expire(&mut ctx, rx, now);
+                    ctx.refused()
+                }
+                None => 0,
+            }
+        };
+        self.report.records_refused += refused;
+        for (at, owned) in collected.records() {
+            self.write_owned(recorder, *at, owned);
+        }
+        let lo = (rx, v2xw_core::ids::SduId::new(0));
+        let hi = (rx, v2xw_core::ids::SduId::new(u32::MAX));
+        let due: Vec<_> = self
+            .frag_groups
+            .range(lo..=hi)
+            .filter(|(_, g)| g.deadline <= now)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in due {
+            self.resolve_group(recorder, key, now, None);
+        }
+        self.frag_resolved
+            .retain(|(r, _), until| *r != rx || *until > now);
+    }
+
+    /// Resolves one reassembly group: its `net.reassembly` record, and for a generic
+    /// SDU its `node.rx` fate — handed to the node's receive queue when every piece
+    /// decoded (`completed`: the last piece's frame and arrival), lost otherwise.
+    fn resolve_group(
+        &mut self,
+        recorder: &mut dyn RunRecorder,
+        key: (NodeId, v2xw_core::ids::SduId),
+        now: SimTime,
+        completed: Option<(&FrameState, SimTime)>,
+    ) {
+        let Some(group) = self.frag_groups.remove(&key) else {
+            return;
+        };
+        let (rx, _) = key;
+        let timeout = self.frag_plan.group_timeout();
+        self.frag_resolved.insert(key, timeout.after(now));
+        let amplifies = self
+            .frag_plan
+            .strategy
+            .as_ref()
+            .is_none_or(crate::frag::Strategy::amplifies_loss);
+        let model = group.prediction(amplifies);
+        let complete = group.complete();
+        let cause = (!complete).then(|| group.first_cause.unwrap_or(rx_cause::REASSEMBLY_FAILED));
+        if complete {
+            self.report.reassembly_complete += 1;
+        } else {
+            self.report.reassembly_lost += 1;
+        }
+        let record = crate::records::NetReassembly(v2xw_metrics::channels::NetReassemblyView {
+            t: now,
+            rx,
+            tx: Some(group.tx),
+            sdu: group.sdu_msg,
+            strategy: self.frag_plan.id.clone(),
+            kind: group.kind.label().to_string(),
+            msg_type: Some(group.msg_type.to_string()),
+            fragments: u32::from(group.fragments),
+            received: u32::from(group.received()),
+            bytes: u64::from(group.payload_total),
+            bytes_received: u64::from(group.payload_received()),
+            predicted_loss: v2xw_core::math::quantize(model.p_any_fragment_lost, 6),
+            predicted_content_loss: v2xw_core::math::quantize(model.expected_content_lost, 6),
+            outcome: if complete { "complete" } else { "lost" }.to_string(),
+            cause: cause.map(str::to_string),
+        });
+        self.emit(recorder, &record);
+        let Some(attempt) = group.attempt else {
+            return;
+        };
+        match (cause, completed) {
+            (None, Some((state, arrival))) => {
+                let bytes = state.frag.map_or(state.bytes, |m| m.sdu_bytes);
+                if self.inboxes.contains_key(&rx) {
+                    let token = self.next_rx_token;
+                    self.next_rx_token += 1;
+                    self.rx_pending.insert((rx, token), attempt);
+                    if let Some(inbox) = self.inboxes.get_mut(&rx) {
+                        inbox.push((
+                            rx_frame(state, bytes),
+                            RxStamp {
+                                token,
+                                arrived_at: Some(arrival),
+                            },
+                        ));
+                    }
+                    self.request_wake(rx, arrival, self.scenario.time.horizon_ns());
+                } else {
+                    // Reassembled by a radio whose node no longer exists.
+                    self.emit(recorder, &attempt.lost(now, rx_cause::RECEIVER_OFF));
+                }
+            }
+            (cause, _) => {
+                let cause = cause.unwrap_or(rx_cause::REASSEMBLY_FAILED);
+                self.emit(recorder, &attempt.lost(now, cause));
+            }
+        }
+    }
+
+    /// Writes a record another context already admitted (its visibility checked), and
+    /// feeds it to the metric providers, as [`Engine::emit_at`] does.
+    fn write_owned(
+        &mut self,
+        recorder: &mut dyn RunRecorder,
+        at: SimTime,
+        owned: &v2xw_core::ctx::OwnedRecord,
+    ) {
+        self.providers.on_event(owned);
+        recorder.write(at, owned);
+        self.report.records += 1;
     }
 
     /// Emits a record through a context, so the visibility rule applies to it.
@@ -4184,6 +5081,27 @@ impl RunRecorder for Tee<'_> {
 /// The node's instants are on its own clock; each is moved onto the simulation's timeline
 /// by its distance from the frame's arrival, whose true instant the attempt carries. That
 /// keeps every duration the node measured exact whatever its clock offset.
+/// What a receiving node is handed for one decoded message of `bytes` octets.
+fn rx_frame(state: &FrameState, bytes: u32) -> RxFrame {
+    RxFrame {
+        signer: Some(state.signer.clone()),
+        msg_type: state.msg_type,
+        bytes,
+        claimed_pos: Some(state.claimed_pos),
+        claimed_speed_mps: state.claimed_speed_mps,
+        claimed_heading_rad: state.claimed_heading_rad,
+        claimed_generation_time: state.generation_time,
+        full_certificate: state.full_certificate,
+        // Modelled crypto: the engine knows the sender's key is genuine, so the signature
+        // is valid. The receiver only learns it by *spending* the verification time, which
+        // `ObuRuntime::step` charges against its servers.
+        signature_valid: true,
+        claimed_cert_period: state.claimed_cert_period,
+        claimed_linkage: state.claimed_linkage,
+        spdu: state.spdu.clone(),
+    }
+}
+
 fn resolve_rx(attempt: NodeRx, report: &RxReport, now: SimTime) -> NodeRx {
     let arrival = attempt.0.t_arrival.unwrap_or(now);
     let on_timeline = |x: SimTime| arrival.saturating_add(x.saturating_sub(report.arrived));
@@ -4237,6 +5155,10 @@ pub(crate) struct LinkOutcome {
     cause: Option<LossCause>,
     /// Sidelink with blind retransmissions: the copies this receiver combined.
     copies: Option<u32>,
+    /// For a fragment, the probability the PHY would decode it (04-models.md §7.4's
+    /// `1 − p_i`); `None` for a whole frame, and on a sidelink, whose error model this
+    /// build does not expose per transport block.
+    psr: Option<f64>,
 }
 
 /// The 802.11p rate's name as `node.tx` reports it: data rate, modulation, code rate.
@@ -4416,6 +5338,18 @@ fn message_content(
             .then(|| quantize_to(f64::from(hf.heading.value.0) * 0.1, Q_DEG));
     }
     c
+}
+
+/// The network layer's shape for a message type: which PSID or BTP port it goes under.
+const fn frame_msg(t: v2xw_msg::MsgType) -> v2xw_net::FrameMsg {
+    match t {
+        v2xw_msg::MsgType::Denm => v2xw_net::FrameMsg::Denm,
+        v2xw_msg::MsgType::Spat => v2xw_net::FrameMsg::Spat,
+        v2xw_msg::MsgType::Map => v2xw_net::FrameMsg::Map,
+        v2xw_msg::MsgType::Srm => v2xw_net::FrameMsg::Srm,
+        v2xw_msg::MsgType::Ssm => v2xw_net::FrameMsg::Ssm,
+        _ => v2xw_net::FrameMsg::Safety,
+    }
 }
 
 fn msg_type_name(t: v2xw_msg::MsgType) -> &'static str {

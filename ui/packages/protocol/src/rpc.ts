@@ -669,7 +669,29 @@ export interface MetricsQueryParams {
   t_from_ns?: SimTimeNs;
   t_to_ns?: SimTimeNs;
   bin_ns?: SimTimeNs;
-  group_by?: ("t" | "node" | "class" | "dist_bin" | "density_bin" | "region" | "protocol" | "rat" | "tier" | "run" | "cause")[];
+  /**
+   * One dimension other than `t` returns one row per value of it, each metric pooled over the window:
+   * `[value, metric, metric.lo, metric.hi, metric.n, …]`. The dimensions are the metric catalogue's own.
+   */
+  group_by?: (
+    | "t"
+    | "node"
+    | "class"
+    | "dist_bin"
+    | "density_bin"
+    | "region"
+    | "protocol"
+    | "rat"
+    | "tier"
+    | "run"
+    | "cause"
+    | "msg_type"
+    | "stage"
+    | "flow"
+    | "radius"
+    | "bucket"
+    | "channel"
+  )[];
   where?: Record<string, string | number | (string | number)[]>;
   runs?: RunId[];
   agg?: "sum" | "mean" | "p50" | "p95" | "p99" | "ratio" | "rate" | "max" | "min";

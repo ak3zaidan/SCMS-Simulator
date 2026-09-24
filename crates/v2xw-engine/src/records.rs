@@ -72,12 +72,28 @@ channel_record!(
     Visibility::NodeAndGt
 );
 channel_record!(
+    /// `phy.prr` — one frame's reception census: receivers truly within each 20 m range
+    /// and how many of them decoded it (3GPP TR 36.885 §A.2.1.4). Ground truth whole.
+    PhyPrr,
+    v2xw_metrics::channels::PhyPrrView,
+    "phy.prr",
+    Visibility::Gt
+);
+channel_record!(
     /// `node.rx` — one reception attempt followed from the PHY to its fate, with every
     /// stamp of the message's journey. Node-and-ground-truth, like `phy.rx`.
     NodeRx,
     NodeRxView,
     "node.rx",
     Visibility::NodeAndGt
+);
+channel_record!(
+    /// `net.reassembly` — one fragmented SDU followed to its fate at one receiver, with the
+    /// loss its fragments' PHY success probabilities predicted. Ground truth whole.
+    NetReassembly,
+    v2xw_metrics::channels::NetReassemblyView,
+    "net.reassembly",
+    Visibility::Gt
 );
 channel_record!(
     /// `net.bytes` — one transfer on an accounting bucket other than the air.
@@ -196,7 +212,7 @@ impl GtKinematics {
 }
 
 /// The component of a horizontal acceleration along `heading_rad`, m/s².
-fn longitudinal(ax: f64, ay: f64, heading_rad: f64) -> f64 {
+pub(crate) fn longitudinal(ax: f64, ay: f64, heading_rad: f64) -> f64 {
     let (s, c) = v2xw_core::math::sin_cos(heading_rad);
     ax * c + ay * s
 }
@@ -514,6 +530,7 @@ impl PhyRx {
             payload_bytes: None,
             focus: None,
             copies: None,
+            sdu: None,
         })
     }
 
@@ -523,6 +540,13 @@ impl PhyRx {
     pub fn with_link_tags(mut self, focus: Option<&str>, copies: Option<u32>) -> Self {
         self.0.focus = focus.map(str::to_string);
         self.0.copies = copies;
+        self
+    }
+
+    /// Marks the attempt as one fragment of the SDU followed on `node.rx` as `sdu`.
+    #[must_use]
+    pub fn of_sdu(mut self, sdu: Option<u64>) -> Self {
+        self.0.sdu = sdu;
         self
     }
 }

@@ -402,6 +402,8 @@ pub enum Query {
         bin_ns: u64,
         /// Grouping columns.
         group_by: Vec<String>,
+        /// `where`: the other dimensions a grouped sample must carry, exactly.
+        filter: std::collections::BTreeMap<String, String>,
         /// Row cap.
         limit: usize,
     },

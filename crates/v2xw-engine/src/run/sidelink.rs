@@ -844,6 +844,7 @@ impl Engine {
                 cause,
                 copies: (state.sl.total > 1)
                     .then(|| state.sl.copies.get(&rx).copied().unwrap_or(0)),
+                psr: None,
             });
         }
         out

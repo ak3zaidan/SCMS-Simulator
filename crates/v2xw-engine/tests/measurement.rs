@@ -88,7 +88,7 @@ fn a_real_run_satisfies_every_measurement_invariant() {
     let samples = samples(&recorder);
     let checks = v2xw_metrics::check_all(&ledger, &samples);
     checks.assert_all().unwrap_or_else(|e| panic!("{e}"));
-    for id in ["M-RX1", "M-LAT1", "M-BYTE1", "M-BYTE2", "M-SHARE"] {
+    for id in ["M-RX1", "M-LAT1", "M-PRR", "M-BYTE1", "M-BYTE2", "M-SHARE"] {
         let o = checks
             .outcomes
             .iter()
@@ -114,6 +114,46 @@ fn a_real_run_satisfies_every_measurement_invariant() {
         .filter(|v| v.outcome == RxFate::Delivered)
         .count();
     assert!(delivered > 0, "no message reached an application");
+}
+
+/// A message reaches a receiver's applications when its signature check finishes — not
+/// when the check starts, and not at the receiver's next periodic step. Every delivered
+/// attempt is resolved (`t`, the instant the node handed it over) at its own
+/// `t_delivered`, the instant its check finished, to within a microsecond of clock
+/// arithmetic; before 2026-09-24 it was handed over when the check started, up to one
+/// verification service time before `t_delivered`.
+#[test]
+fn a_message_is_handed_to_the_applications_when_its_verification_finishes() {
+    let (_, recorder, _) = run();
+    let mut ledger = EventLedger::new();
+    for (_, r) in recorder.records() {
+        ledger.ingest(r);
+    }
+    let mut checked = 0;
+    let mut early = 0;
+    let mut late = 0;
+    for v in &ledger.node_rx {
+        if v.outcome != RxFate::Delivered {
+            continue;
+        }
+        let d = v.t_delivered.expect("a delivery carries its instant");
+        checked += 1;
+        if v.t + 1_000 < d {
+            early += 1;
+        }
+        if v.t > d + 1_000 {
+            late += 1;
+        }
+    }
+    assert!(checked > 100, "only {checked} deliveries to check");
+    assert_eq!(
+        early, 0,
+        "{early} of {checked} handed over before their check finished"
+    );
+    assert_eq!(
+        late, 0,
+        "{late} of {checked} handed over after their check had finished (waiting for a step)"
+    );
 }
 
 #[test]
@@ -226,6 +266,7 @@ fn every_metric_of_the_communication_families_is_sampled() {
     let samples = samples(&recorder);
     for name in [
         "pdr",
+        "pdr_all_pairs",
         "cbr",
         "e2e_latency",
         "latency_stage",

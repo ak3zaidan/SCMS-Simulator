@@ -21,6 +21,7 @@ import uPlot from "uplot";
 import { engine } from "../state/engine.js";
 import { useStudio } from "../state/store.js";
 import { metricSubject } from "../lib/provenance.js";
+import { Breakdowns } from "./Breakdowns.js";
 
 const PLOT_W = 250;
 const PLOT_H = 86;
@@ -330,6 +331,7 @@ export function PlotsStrip(): React.JSX.Element {
   const [available, setAvailable] = useState<readonly string[]>([]);
   const [catalogue, setCatalogue] = useState<MetricDefinition[]>([]);
   const [open, setOpen] = useState(false);
+  const [showBreakdowns, setShowBreakdowns] = useState(true);
   const seenVersion = useRef(-1);
   // Once the user has chosen, the strip stops choosing for them.
   const userChose = useRef(false);
@@ -422,6 +424,16 @@ export function PlotsStrip(): React.JSX.Element {
         >
           {`Choose… (${selected.length} of ${measured})`}
         </button>
+        <button
+          type="button"
+          className={showBreakdowns ? "active" : ""}
+          onClick={() => setShowBreakdowns((v) => !v)}
+          data-testid="breakdowns-toggle"
+          title="Delivery against distance, the latency's stages and the per-node rankings, pooled over the run"
+          aria-pressed={showBreakdowns}
+        >
+          Breakdowns
+        </button>
         {selected.map((name) => (
           <span key={name} className="faint mono" style={{ whiteSpace: "nowrap" }}>
             {name}
@@ -458,6 +470,7 @@ export function PlotsStrip(): React.JSX.Element {
             onRemove={() => toggle(name)}
           />
         ))}
+        {showBreakdowns && available.length > 0 ? <Breakdowns /> : null}
       </div>
     </section>
   );

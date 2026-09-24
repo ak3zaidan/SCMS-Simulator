@@ -26,9 +26,9 @@ use v2xw_core::model::Model;
 use v2xw_core::time::{Duration, SimTime};
 
 use crate::cards;
-use crate::channels::{ChannelView, MacCbrView, NodeRxView, NodeTxView, RxFate, decode};
+use crate::channels::{ChannelView, MacCbrView, NodeRxView, NodeTxView, RxFate};
 use crate::def::{Agg, DEFAULT_LEVEL, Dim, DimValue, Dims, MetricDef, MetricSample, SampleValue};
-use crate::provider::MetricProvider;
+use crate::provider::{Decoded, MetricProvider};
 use crate::quant::Quantum;
 use crate::stats::{ConfidenceLevel, Distribution, Estimate, Proportion};
 
@@ -191,7 +191,7 @@ impl LoadProvider {
                  air time, over the window. One is a channel exactly full; above one, more \
                  is being offered than the channel can carry.",
             )
-            .with_dims([Dim::T])
+            .with_dims([Dim::T, Dim::Node])
             .with_source(cards::paper(
                 "Torrent-Moreno, Mittag, Santi, Hartenstein, IEEE Trans. Veh. Technol. \
                  58(7), 2009",
@@ -407,19 +407,23 @@ impl MetricProvider for LoadProvider {
     }
 
     fn on_event(&mut self, ev: &EventRecord) {
-        match ev.channel {
-            NodeTxView::CHANNEL => match decode::<NodeTxView>(ev) {
-                Ok(v) => self.on_tx(&v),
-                Err(_) => self.rejected += 1,
-            },
-            NodeRxView::CHANNEL => match decode::<NodeRxView>(ev) {
-                Ok(v) => self.on_rx(&v),
-                Err(_) => self.rejected += 1,
-            },
-            MacCbrView::CHANNEL => match decode::<MacCbrView>(ev) {
-                Ok(v) => self.on_mac(&v),
-                Err(_) => self.rejected += 1,
-            },
+        self.on_decoded(&Decoded::new(ev));
+    }
+
+    fn on_decoded(&mut self, ev: &Decoded<'_>) {
+        match ev.channel() {
+            NodeTxView::CHANNEL => ev.with(|v: Option<&NodeTxView>| match v {
+                Some(v) => self.on_tx(v),
+                None => self.rejected += 1,
+            }),
+            NodeRxView::CHANNEL => ev.with(|v: Option<&NodeRxView>| match v {
+                Some(v) => self.on_rx(v),
+                None => self.rejected += 1,
+            }),
+            MacCbrView::CHANNEL => ev.with(|v: Option<&MacCbrView>| match v {
+                Some(v) => self.on_mac(v),
+                None => self.rejected += 1,
+            }),
             _ => {}
         }
     }
@@ -449,6 +453,7 @@ impl MetricProvider for LoadProvider {
 
         // --- channel_load ----------------------------------------------------------------
         let mut load = Distribution::new();
+        let mut per_node: Vec<(NodeId, f64)> = Vec::new();
         if window_us > 0 {
             let nodes: std::collections::BTreeSet<NodeId> = own
                 .keys()
@@ -465,7 +470,9 @@ impl MetricProvider for LoadProvider {
                     .unwrap_or(0)
                     .max(offered.get(&n).copied().unwrap_or(0));
                 let total = sensed.get(&n).copied().unwrap_or(0) + own_demand;
-                load.observe((total as f64) / (window_us as f64));
+                let ratio = (total as f64) / (window_us as f64);
+                load.observe(ratio);
+                per_node.push((n, ratio));
             }
         }
         out.push(MetricSample::new(
@@ -474,6 +481,18 @@ impl MetricProvider for LoadProvider {
             Dims::new(),
             SampleValue::Distribution(load.summary(1)),
         ));
+        // Each node's own load, for a ranking: the distribution above is across nodes and
+        // cannot say which node is the loaded one.
+        for (n, ratio) in per_node {
+            let mut dims = Dims::new();
+            dims.insert(Dim::Node, DimValue::index(u64::from(n.index())));
+            out.push(MetricSample::new(
+                &self.def("channel_load"),
+                at,
+                dims,
+                SampleValue::Scalar(Estimate::Value { point: ratio, n: 1 }),
+            ));
+        }
 
         // --- offered and carried load ----------------------------------------------------
         let carried = core::mem::take(&mut self.carried_bits);
@@ -639,6 +658,18 @@ mod tests {
             Some(8000.0),
             "no MAC report: offered = carried"
         );
+        // And each node's own load, by node, so a page can rank them.
+        let by_node: Vec<(u64, f64)> = s
+            .iter()
+            .filter(|x| x.metric == "channel_load")
+            .filter_map(|x| {
+                let DimValue::Index(n) = x.dims.get(&Dim::Node)? else {
+                    return None;
+                };
+                Some((*n, x.value.point()?))
+            })
+            .collect();
+        assert_eq!(by_node, vec![(1, 0.1), (2, 0.3)]);
     }
 
     #[test]

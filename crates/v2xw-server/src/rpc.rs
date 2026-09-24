@@ -1479,6 +1479,36 @@ fn metrics_query(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcom
         t_to_ns: uint(p, "t_to_ns"),
         bin_ns,
         group_by: strings(p, "group_by"),
+        // §6.12 `where`: a dimension's value, string or number; an array (several values)
+        // is not supported by the grouped answer and is refused rather than half-applied.
+        filter: match p.get("where") {
+            None | Some(Value::Null) => std::collections::BTreeMap::new(),
+            Some(Value::Object(map)) => {
+                let mut out = std::collections::BTreeMap::new();
+                for (k, v) in map {
+                    let value = match v {
+                        Value::String(s) => s.clone(),
+                        Value::Number(n) => n.to_string(),
+                        _ => {
+                            return Err(ServerError::param(
+                                &format!("/where/{k}"),
+                                "must be one dimension value, a string or a number",
+                                "pass {\"where\": {\"msg_type\": \"bsm\"}}",
+                            ));
+                        }
+                    };
+                    out.insert(k.clone(), value);
+                }
+                out
+            }
+            Some(_) => {
+                return Err(ServerError::param(
+                    "/where",
+                    "must be an object of dimension values",
+                    "pass {\"where\": {\"msg_type\": \"bsm\"}}",
+                ));
+            }
+        },
         limit,
     })?))
 }

@@ -25,6 +25,59 @@ use crate::j2735::{map, spat};
 /// Model id of the hand-written J2735 SPaT and MAP codec.
 pub const J2735_INFRA_CODEC_ID: &str = "codec/uper/j2735-spat-map";
 
+/// ETSI `MessageId` of a SPATEM, `spatem(4)` (ETSI TS 102 894-2).
+pub const SPATEM_MESSAGE_ID: u8 = 4;
+/// ETSI `MessageId` of a MAPEM, `mapem(5)` (ETSI TS 102 894-2).
+pub const MAPEM_MESSAGE_ID: u8 = 5;
+/// The `protocolVersion` a SPATEM or MAPEM header carries.
+///
+/// **Recalled, UNVERIFIED**: 2, the Release 2 value the CAM and DENM of this crate carry
+/// from their own ASN.1. TS 103 301 is not in this repository to confirm the SPATEM and
+/// MAPEM value; the field is one octet either way, so only its content is uncertain.
+pub const INFRA_PROTOCOL_VERSION: u8 = 2;
+/// The octets of the ETSI `ItsPduHeader` at the front of a SPATEM or MAPEM: 8 + 8 + 32
+/// bits, octet-aligned.
+pub const ITS_PDU_HEADER_B: usize = 6;
+
+/// An ETSI SPATEM or MAPEM (TS 103 301): the `ItsPduHeader` — `protocolVersion`,
+/// `messageId`, `stationId` — followed by the SPAT or MAP of ISO TS 19091's DSRC module.
+///
+/// `body` is the bare J2735 PDU ([`spat::encode_spat`] or [`map::encode_map`], not the
+/// `MessageFrame`). The header is exactly 48 bits, so the SPATEM's UPER encoding is the two
+/// encodings back to back; `SPATEM ::= SEQUENCE { header, spat }` has no preamble bits of
+/// its own. That ISO TS 19091's SPAT and MAP are J2735's for the fields this crate fills is
+/// **recalled, not re-read**, and is on this codec's card with the protocol version.
+///
+/// # Errors
+/// The header encoder's error, which a station id in range cannot produce.
+pub fn its_wrap(
+    ty: MsgType,
+    message_id: u8,
+    station_id: u32,
+    body: &[u8],
+) -> Result<Vec<u8>, CodecError> {
+    use crate::asn1::cdd::{ItsPduHeader, MessageId, OrdinalNumber1B, StationId};
+    let header = ItsPduHeader::new(
+        OrdinalNumber1B(INFRA_PROTOCOL_VERSION),
+        MessageId(message_id),
+        StationId(station_id),
+    );
+    let mut out = crate::codec::uper_encode(ty, &header)?;
+    debug_assert_eq!(out.len(), ITS_PDU_HEADER_B);
+    out.extend_from_slice(body);
+    Ok(out)
+}
+
+/// The `(messageId, stationId, body)` of a SPATEM or MAPEM, or `None` when the bytes are
+/// too short to hold the header.
+pub fn its_unwrap(bytes: &[u8]) -> Option<(u8, u32, &[u8])> {
+    if bytes.len() < ITS_PDU_HEADER_B {
+        return None;
+    }
+    let station = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+    Some((bytes[1], station, &bytes[ITS_PDU_HEADER_B..]))
+}
+
 /// The hand-written J2735 SPaT and MAP codec.
 ///
 /// Stateless; one instance serves every RSU, and building the card is its only cost.

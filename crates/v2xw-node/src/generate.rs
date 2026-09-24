@@ -52,31 +52,65 @@ use v2xw_msg::generator::{
 };
 
 /// Which message services a node runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Each flag is a service the node *may* run; whether a message goes out is the service's
+/// own trigger. A roadside unit runs the intersection services (SPaT, MAP, SSM), a vehicle
+/// the awareness ones (CAM, BSM) and the event ones (DENM, and SRM for a vehicle entitled
+/// to signal priority) — the engine's wiring decides which node runs which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ServiceSet {
     /// Generate CAMs on the EN 302 637-2 triggers.
     pub cam: bool,
     /// Generate BSMs at the J2945/1 cadence.
     pub bsm: bool,
+    /// Raise DENMs on the triggers this crate implements ([`crate::runtime`]'s event
+    /// services): hard braking, as `dangerousSituation`.
+    pub denm: bool,
+    /// Broadcast SPaT (or SPATEM) at [`SPAT_INTERVAL`], from the payload the unit's
+    /// controller feed installed.
+    pub spat: bool,
+    /// Broadcast MAP (or MAPEM) at [`MAP_INTERVAL`], likewise.
+    pub map: bool,
+    /// Request signal priority (SRM) when approaching a junction whose MAP it heard.
+    pub srm: bool,
+    /// Answer a signal request with a status (SSM).
+    pub ssm: bool,
 }
 
 impl ServiceSet {
+    /// Nothing at all: a unit that only receives.
+    pub const NONE: ServiceSet = ServiceSet {
+        cam: false,
+        bsm: false,
+        denm: false,
+        spat: false,
+        map: false,
+        srm: false,
+        ssm: false,
+    };
     /// The ETSI stack: CAM only.
     pub const ETSI: ServiceSet = ServiceSet {
         cam: true,
-        bsm: false,
+        ..ServiceSet::NONE
     };
     /// The SAE stack: BSM only.
     pub const SAE: ServiceSet = ServiceSet {
-        cam: false,
         bsm: true,
+        ..ServiceSet::NONE
     };
     /// Both, for a dual-stack unit.
     pub const BOTH: ServiceSet = ServiceSet {
         cam: true,
         bsm: true,
+        ..ServiceSet::NONE
     };
 }
+
+/// The SPaT broadcast interval: 10 Hz (04-models.md §8.1's default, which cites CTI 4501).
+pub const SPAT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The MAP broadcast interval: 1 Hz (04-models.md §8.1's default, which cites CTI 4501).
+pub const MAP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The node's message-generation timers.
 #[derive(Debug, Clone)]
@@ -84,6 +118,9 @@ pub struct MessageSchedule {
     services: ServiceSet,
     cam: CamTriggerState,
     bsm: BsmGenerator,
+    /// When the last SPaT and MAP were asked for, on the node's clock.
+    last_spat: Option<SimTime>,
+    last_map: Option<SimTime>,
     generated: u32,
 }
 
@@ -94,8 +131,15 @@ impl MessageSchedule {
             services,
             cam: CamTriggerState::new(CamGenParams::en302637_2()),
             bsm: BsmGenerator::new(BsmGenParams::j2945_1()),
+            last_spat: None,
+            last_map: None,
             generated: 0,
         }
+    }
+
+    /// The services this schedule runs.
+    pub fn services(&self) -> ServiceSet {
+        self.services
     }
 
     /// The same schedule with non-default parameters.
@@ -170,6 +214,31 @@ impl MessageSchedule {
                 include_low_frequency: false,
                 at: believed_now,
             });
+        }
+        // The intersection broadcasts are periodic and nothing else: a controller's state
+        // changes on its own schedule, and CTI 4501's rates do not adapt to it. DCC does not
+        // gate them — J2945/1's rate control is the BSM's — which is stated on the card.
+        let periodic = |last: &mut Option<SimTime>, interval: Duration, ty: MsgType| {
+            let due = last.is_none_or(|t| believed_now.saturating_sub(t) >= interval.as_nanos());
+            if due {
+                *last = Some(believed_now);
+            }
+            due.then_some(GenRequest {
+                msg_type: ty,
+                reason: GenReason::Periodic,
+                include_low_frequency: false,
+                at: believed_now,
+            })
+        };
+        if self.services.spat
+            && let Some(r) = periodic(&mut self.last_spat, SPAT_INTERVAL, MsgType::Spat)
+        {
+            out.push(r);
+        }
+        if self.services.map
+            && let Some(r) = periodic(&mut self.last_map, MAP_INTERVAL, MsgType::Map)
+        {
+            out.push(r);
         }
         self.generated = self.generated.saturating_add(out.len() as u32);
         out

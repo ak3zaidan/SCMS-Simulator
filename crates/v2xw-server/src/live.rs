@@ -1305,6 +1305,13 @@ struct Projector {
     unmapped_nodes: BTreeSet<u32>,
     /// Metric names the stream carried that the symbol table does not hold.
     unnamed_metrics: BTreeSet<String>,
+    /// Every dimensioned metric sample the run produced, by metric, for a grouped
+    /// `metrics.query` (the delivery ratio per distance bin, the latency stage per message
+    /// type, a per-node figure). The §3.7 stream carries a metric's headline and its
+    /// declared breakdown as series; everything else a metric measures reaches a client
+    /// through this store. Each entry keeps the counts that let windows be *pooled*
+    /// ([`BreakdownEntry`]), and the store is bounded per metric.
+    breakdowns: BTreeMap<String, std::collections::VecDeque<BreakdownEntry>>,
     /// Per node, the most recent frames it put on the air and the most recent receptions
     /// it resolved, as the evidence `inspect.node`'s `messages` section shows for a
     /// followed vehicle. Bounded at [`MESSAGE_LOG`] each.
@@ -1390,6 +1397,7 @@ impl Projector {
             over_capacity: BTreeSet::new(),
             unmapped_nodes: BTreeSet::new(),
             unnamed_metrics: BTreeSet::new(),
+            breakdowns: BTreeMap::new(),
             messages: BTreeMap::new(),
             unprojected_channels: BTreeSet::new(),
             undecodable_channels: BTreeMap::new(),
@@ -1637,7 +1645,10 @@ impl Projector {
                         self.log_message(view.rx, false, received_json(&view));
                     }
                 }
-                "msg.latency" | "net.bytes" => {}
+                // `phy.prr` is one transmission's reception census (3GPP TR 36.885 PRR),
+                // ground truth for the `pdr` metric, which is what the stream carries; the
+                // two reassembly channels are what the fragmentation metrics measure.
+                "msg.latency" | "net.bytes" | "phy.prr" | "net.frag" | "net.reassembly" => {}
                 // A scenario timeline item firing: kept for `run.status` (`timeline`), which
                 // is how the page marks an event as having happened and says what it did.
                 "scenario.event" => match serde_json::from_slice::<Value>(&record.json) {
@@ -1896,6 +1907,51 @@ impl Projector {
         out
     }
 
+    /// Keeps one dimensioned sample for the grouped `metrics.query`, bounded per metric.
+    fn keep_breakdown(&mut self, sample: &MetricSample) {
+        let dims: BTreeMap<String, String> = sample
+            .dims
+            .iter()
+            .map(|(d, v)| (d.to_string(), v.to_string()))
+            .filter(|(d, _)| d != "t")
+            .collect();
+        if dims.is_empty() {
+            return;
+        }
+        let entry = BreakdownEntry::of(sample.t, dims, &sample.value);
+        let list = self.breakdowns.entry(sample.metric.clone()).or_default();
+        if list.len() >= BREAKDOWN_CAP {
+            list.pop_front();
+        }
+        list.push_back(entry);
+    }
+
+    /// One metric's kept breakdown, grouped by `dim` and pooled over `[from, to]`, among
+    /// the samples whose other dimensions are exactly `filter`.
+    fn breakdown_groups(
+        &self,
+        name: &str,
+        dim: &str,
+        filter: &BTreeMap<String, String>,
+        from: SimTime,
+        to: SimTime,
+    ) -> Vec<crate::introspect::GroupRow> {
+        let Some(list) = self.breakdowns.get(name) else {
+            return Vec::new();
+        };
+        let mut pools: BTreeMap<String, Pool> = BTreeMap::new();
+        for e in list.iter().filter(|e| e.t >= from && e.t <= to) {
+            let Some(key) = e.dims.get(dim) else { continue };
+            let others_match = e.dims.len() == filter.len() + 1
+                && filter.iter().all(|(k, v)| e.dims.get(k) == Some(v));
+            if !others_match {
+                continue;
+            }
+            pools.entry(key.clone()).or_default().add(e);
+        }
+        pools.into_iter().map(|(key, p)| p.row(key)).collect()
+    }
+
     /// Appends the §3.7 rows one metric sample produces.
     ///
     /// A sample is sent under the series its dimensions name (see `metric_series`): no
@@ -1907,6 +1963,7 @@ impl Projector {
     /// before this every dimensioned sample was sent under its bare name, so a metric's
     /// plot interleaved its distance bins, its causes and its nodes into one zig-zag line.
     fn push_metric(&mut self, sample: &MetricSample, out: &mut Vec<MetricRow>) {
+        self.keep_breakdown(sample);
         if sample.dims.iter().any(|(d, _)| d.to_string() == "node") {
             return;
         }
@@ -1962,6 +2019,160 @@ impl Projector {
         }
         out.sort_by_key(|r| (r.str_metric, r.node_id));
         out.dedup_by_key(|r| (r.str_metric, r.node_id));
+    }
+}
+
+/// How many dimensioned samples the breakdown store keeps per metric: an hour of a
+/// 20 m-binned delivery ratio (fifty bins a second), and the most recent windows of a
+/// per-node figure on a large fleet. The oldest go first.
+const BREAKDOWN_CAP: usize = 200_000;
+
+/// One dimensioned metric sample, with what it takes to pool it with others.
+#[derive(Debug, Clone)]
+struct BreakdownEntry {
+    t: SimTime,
+    dims: BTreeMap<String, String>,
+    /// The sample's own point, when it has one.
+    point: Option<f64>,
+    /// Its sample count.
+    n: u64,
+    /// A proportion's successes and trials, which pool exactly.
+    counts: Option<(u64, u64)>,
+    /// A ratio of sums' numerator and denominator, which pool exactly.
+    sums: Option<(f64, f64)>,
+    /// A distribution's sample sum, which pools exactly into a mean.
+    total: Option<f64>,
+    /// The samples the metric's definition asks for before it reports anything; the
+    /// pooled group is held to the same floor.
+    required: u64,
+}
+
+impl BreakdownEntry {
+    fn of(t: SimTime, dims: BTreeMap<String, String>, value: &v2xw_metrics::SampleValue) -> Self {
+        use v2xw_metrics::{DistributionSummary, RatioEstimate, SampleValue};
+        let (total, required) = match value {
+            SampleValue::Distribution(DistributionSummary::Insufficient {
+                required, sum, ..
+            }) => (*sum, *required),
+            SampleValue::Distribution(d) => (d.mean().map(|m| m * d.n() as f64), 1),
+            SampleValue::Ratio(RatioEstimate::Insufficient { required, .. }) => (None, *required),
+            _ => (None, 1),
+        };
+        let (counts, sums) = match value {
+            SampleValue::Ratio(RatioEstimate::Proportion {
+                successes, trials, ..
+            }) => (Some((*successes, *trials)), None),
+            // A proportion too thin to estimate in its own window still carries its counts,
+            // and pooled with the other windows it counts.
+            SampleValue::Ratio(RatioEstimate::Insufficient {
+                trials,
+                successes: Some(successes),
+                ..
+            }) => (Some((*successes, *trials)), None),
+            SampleValue::Ratio(RatioEstimate::RatioOfSums {
+                numerator,
+                denominator,
+                ..
+            }) => (None, Some((*numerator, *denominator))),
+            _ => (None, None),
+        };
+        BreakdownEntry {
+            t,
+            dims,
+            point: value.point(),
+            n: value.n(),
+            counts,
+            sums,
+            total,
+            required,
+        }
+    }
+}
+
+/// The running pool of one group of a grouped query.
+#[derive(Debug, Default)]
+struct Pool {
+    successes: u64,
+    trials: u64,
+    num: Vec<f64>,
+    den: Vec<f64>,
+    /// Distribution windows' sample sums, and the samples behind them.
+    totals: Vec<f64>,
+    total_n: u64,
+    /// `(point, n)` of the entries that carry neither counts nor sums.
+    points: Vec<(f64, u64)>,
+    n: u64,
+    /// The largest sample floor any pooled window declared.
+    required: u64,
+}
+
+impl Pool {
+    fn add(&mut self, e: &BreakdownEntry) {
+        self.required = self.required.max(e.required);
+        match (e.counts, e.sums, e.total) {
+            (Some((s, t)), _, _) => {
+                self.successes += s;
+                self.trials += t;
+                self.n += t;
+            }
+            (None, Some((num, den)), _) => {
+                self.num.push(num);
+                self.den.push(den);
+                self.n += e.n;
+            }
+            (None, None, Some(total)) => {
+                self.totals.push(total);
+                self.total_n += e.n;
+                self.n += e.n;
+            }
+            _ => {
+                if let Some(p) = e.point {
+                    self.points.push((p, e.n.max(1)));
+                }
+                self.n += e.n;
+            }
+        }
+    }
+
+    /// Proportions pool their counts and carry the pooled Wilson interval; ratios of sums
+    /// pool their sums; distributions pool their sample sums into a mean; anything else is
+    /// the sample-count-weighted mean of the points. A group still short of the metric's
+    /// own sample floor once pooled reports its count and no value.
+    fn row(self, key: String) -> crate::introspect::GroupRow {
+        use v2xw_core::math::sum_ordered;
+        let mut row = crate::introspect::GroupRow {
+            key,
+            value: None,
+            lo: None,
+            hi: None,
+            n: self.n,
+        };
+        if self.n < self.required {
+            return row;
+        }
+        if self.trials > 0 {
+            let p = (self.successes as f64) / (self.trials as f64);
+            let (lo, hi) = v2xw_metrics::stats::wilson_interval(
+                self.successes,
+                self.trials,
+                v2xw_metrics::ConfidenceLevel::P95,
+            );
+            row.value = Some(p);
+            row.lo = Some(lo);
+            row.hi = Some(hi);
+        } else if !self.den.is_empty() {
+            let den = sum_ordered(self.den);
+            if den != 0.0 && den.is_finite() {
+                row.value = Some(sum_ordered(self.num) / den);
+            }
+        } else if self.total_n > 0 {
+            row.value = Some(sum_ordered(self.totals) / (self.total_n as f64));
+        } else if !self.points.is_empty() {
+            let weight: u64 = self.points.iter().map(|(_, n)| *n).sum();
+            let total = sum_ordered(self.points.iter().map(|(p, n)| p * (*n as f64)));
+            row.value = Some(total / (weight as f64));
+        }
+        row
     }
 }
 
@@ -3745,6 +3956,20 @@ impl Engine for LiveEngine {
 impl Introspect for LiveEngine {
     fn node_list(&self) -> Vec<crate::engine::NodeFacts> {
         self.node_rows()
+    }
+
+    fn metric_groups(
+        &self,
+        name: &str,
+        dim: &str,
+        filter: &BTreeMap<String, String>,
+        from: u64,
+        to: u64,
+    ) -> Vec<crate::introspect::GroupRow> {
+        // Never past the stream, as for `metric_series`: the projector has already pooled
+        // windows the client's keyframe has not reached.
+        let to = to.min(self.sim_time());
+        self.projector.breakdown_groups(name, dim, filter, from, to)
     }
 
     fn telemetry_of(&self, node: u32) -> Option<NodeTelemetry> {
