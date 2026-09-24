@@ -752,6 +752,7 @@ impl NativeMobility {
                     route_next: a.route.lanes.get(a.route_index + 1).copied(),
                     pos: k.pos,
                     heading_rad: k.heading_rad,
+                    min_path_radius_m: a.class.min_path_radius_m(),
                 }
             })
             .collect()

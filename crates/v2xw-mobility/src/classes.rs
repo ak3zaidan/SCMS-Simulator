@@ -307,6 +307,46 @@ impl VehicleClass {
         self.spec().dims()
     }
 
+    /// The AASHTO design vehicle whose turning path stands for this class, with its
+    /// wheelbase and minimum centreline turning radius (the path of the front axle's
+    /// centre at full lock), metres — *A Policy on Geometric Design of Highways and
+    /// Streets* (AASHTO Green Book, 7th ed., 2018), Tables 2-1b and 2-2b.
+    ///
+    /// **Transcribed, not re-verified against the printed tables**: the values below are
+    /// the ones the Green Book is widely quoted with (P: 3.4 m wheelbase, 6.4 m (21 ft)
+    /// centreline radius; SU-9: 6.1 m, 11.6 m; CITY-BUS: 7.6 m, 11.5 m; WB-12: 3.8 m
+    /// tractor, 10.8 m; BUS-14: 8.1 m, 12.4 m) and the card says so. A van (SUMO's
+    /// `delivery`, `emergency`) is between P and SU-9 and takes P, the less demanding; a
+    /// two-wheeler has no design vehicle and takes this crate's 2.5 m.
+    pub const fn design_turn(self) -> (&'static str, f64, f64) {
+        match self {
+            VehicleClass::Passenger | VehicleClass::Emergency | VehicleClass::Delivery => {
+                ("P", 3.4, 6.4)
+            }
+            VehicleClass::Truck => ("SU-9", 6.1, 11.6),
+            VehicleClass::Trailer => ("WB-12", 3.8, 10.8),
+            VehicleClass::Bus => ("CITY-BUS", 7.6, 11.5),
+            VehicleClass::Coach => ("BUS-14", 8.1, 12.4),
+            VehicleClass::Motorcycle
+            | VehicleClass::Moped
+            | VehicleClass::Scooter
+            | VehicleClass::Bicycle
+            | VehicleClass::Pedestrian => ("none", 1.0, 2.5),
+        }
+    }
+
+    /// The tightest radius this class's *reference point* (the rear-axle centre) can
+    /// follow, metres: `sqrt(R_ctr² − L²)` from [`VehicleClass::design_turn`]'s
+    /// centreline radius `R_ctr` and wheelbase `L` — the kinematic bicycle model, in which
+    /// the rear axle turns about the same centre on the smaller circle. 5.42 m for P.
+    ///
+    /// The body's heading turns at `v / R` on a path of radius `R`, so this is the bound
+    /// on a vehicle's yaw rate at a given speed that the traffic auditor holds it to.
+    pub fn min_path_radius_m(self) -> f64 {
+        let (_, wheelbase, centreline) = self.design_turn();
+        v2xw_core::math::sqrt((centreline * centreline - wheelbase * wheelbase).max(0.25))
+    }
+
     /// Which lane-access bit this class occupies in the world's [`ClassMask`].
     ///
     /// The world's mask has eight bits (car, truck, bus, moto, bicycle, pedestrian,

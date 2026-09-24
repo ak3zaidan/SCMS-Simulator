@@ -102,6 +102,9 @@ pub struct AuditActor {
     pub route_next: Option<LaneId>,
     /// The published reference point (rear-axle centre).
     pub pos: Vec3,
+    /// The tightest radius this vehicle's reference point can follow, metres: its class's
+    /// AASHTO design vehicle ([`crate::VehicleClass::min_path_radius_m`]).
+    pub min_path_radius_m: f64,
     /// The published heading, radians.
     pub heading_rad: f64,
 }
@@ -240,12 +243,12 @@ pub struct AuditParams {
     /// builds 8-9 m/s² in 0.2-0.3 s). 30 m/s³ is therefore the physical ceiling, not a
     /// comfort target.
     pub max_jerk_mps3: f64,
-    /// The tightest path radius the published reference point may follow, metres.
-    ///
-    /// A passenger car's kerb-to-kerb turning radius is about 5-6 m (AASHTO 2018 Table 2-2,
-    /// design vehicle P: minimum centreline turning radius 7.3 m, minimum inside radius
-    /// 4.4 m). 4 m is the inside radius rounded down, so the check only fires on a heading
-    /// change no road vehicle can make.
+    /// A floor under every vehicle's own minimum path radius, metres: the heading check
+    /// holds each vehicle to the tighter of this and its class's AASHTO design-vehicle
+    /// radius ([`AuditActor::min_path_radius_m`] — 5.42 m for a passenger car, from a
+    /// 6.4 m centreline radius and a 3.4 m wheelbase). Zero by default, so the class's own
+    /// geometry is the bound; it exists for a caller that wants the looser bound this
+    /// check used to have (4 m, the P design vehicle's inside radius rounded down).
     pub min_turn_radius_m: f64,
     /// Slack on the teleport test, metres.
     pub teleport_slack_m: f64,
@@ -279,7 +282,7 @@ impl Default for AuditParams {
             gap_tolerance_m: 0.05,
             max_decel_mps2: 9.0,
             max_jerk_mps3: 30.0,
-            min_turn_radius_m: 4.0,
+            min_turn_radius_m: 0.0,
             teleport_slack_m: 0.25,
             no_change_zone_m: crate::engine::DEFAULT_NO_CHANGE_ZONE_M,
             standstill_limit_s: 180.0,
@@ -1106,7 +1109,12 @@ impl TrafficAuditor {
                 // A path of radius R turns at most `distance / R`; the lateral slide of a
                 // lane change adds its own heading swing, which the engine caps at 12°.
                 let travelled = 0.5 * (a.speed_mps + p.speed_mps) * dt;
-                let bound = travelled / self.params.min_turn_radius_m + 0.02;
+                let radius = if self.params.min_turn_radius_m > 0.0 {
+                    a.min_path_radius_m.min(self.params.min_turn_radius_m)
+                } else {
+                    a.min_path_radius_m
+                };
+                let bound = travelled / radius.max(0.5) + 0.02;
                 if turn
                     > bound
                         + if a.changing.is_some() || p.changing.is_some() {
@@ -1470,6 +1478,7 @@ mod tests {
             route_next: None,
             pos: l.point_at(rear),
             heading_rad: l.heading_at(rear),
+            min_path_radius_m: crate::VehicleClass::Passenger.min_path_radius_m(),
         }
     }
 

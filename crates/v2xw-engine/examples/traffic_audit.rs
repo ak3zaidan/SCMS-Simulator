@@ -145,6 +145,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(n) = value("--examples") {
         params.examples_per_check = n.parse()?;
     }
+    // `--turn-radius-floor R`: hold every vehicle to the looser of its class's AASHTO
+    // radius and R metres (4 reproduces the bound this check had before it was per class).
+    if let Some(r) = value("--turn-radius-floor") {
+        params.min_turn_radius_m = r.parse()?;
+    }
     let mut auditor = TrafficAuditor::new(&world, params);
     auditor.audit_world(&world);
     let trace: Option<Vec<u32>> =
