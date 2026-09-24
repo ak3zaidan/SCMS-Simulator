@@ -367,11 +367,19 @@ export function ScenarioPanel(): React.JSX.Element {
                     onClick={() =>
                       void runAction("Load", async () => {
                         const res = await engine.request("scenario.load", { path: item.id, validate: true });
+                        // Loading a scenario replaces the form. Unapplied edits are not rebased onto
+                        // it (as they are when the engine's copy is merely re-fetched): an edit left
+                        // over from before — a refused one included — would otherwise ride into the
+                        // loaded scenario unseen and be what the next Run applies.
+                        setDraft(null);
                         await engine.refreshScenario();
+                        setDraft((d) => d ?? ((useStudio.getState().scenario ?? null) as Record<string, unknown> | null));
                         if (!res.valid) {
                           useStudio.getState().setValidation({ valid: false, errors: res.errors ?? [], warnings: [] });
                           return `${item.name ?? item.id} does not load: see Check, below.`;
                         }
+                        // A previous edit's refusal was about the form this load replaced.
+                        useStudio.getState().setValidation(null);
                         return res.hash === extras.runningHash
                           ? "That is the scenario the engine is running now."
                           : `Loaded ${item.name ?? item.id}. Press Run to start it.`;
