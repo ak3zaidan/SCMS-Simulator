@@ -3567,13 +3567,20 @@ fn message_content(
     signer: &v2xw_msg::sec_types::HashedId8,
     claim: (Vec3, f64, f64),
 ) -> v2xw_metrics::channels::MsgContentView {
+    use v2xw_core::math::quantize_to;
     use v2xw_msg::j2735::bsm;
+    // Every float is put on its field's D9 grid (the recorder refuses an off-grid record):
+    // degrees 1e-7, metres and m/s 1e-3, and the heading in radians, which has no unit
+    // suffix, 1e-6.
+    const Q_DEG: f64 = 1e-7;
+    const Q_M: f64 = 1e-3;
+    const Q_RAD: f64 = 1e-6;
     let mut c = v2xw_metrics::channels::MsgContentView {
         temp_id: Some(hex_digest(&signer.0[..4])),
-        claimed_x_m: Some(claim.0.x),
-        claimed_y_m: Some(claim.0.y),
-        claimed_speed_mps: Some(claim.1),
-        claimed_heading_rad: Some(claim.2),
+        claimed_x_m: Some(quantize_to(claim.0.x, Q_M)),
+        claimed_y_m: Some(quantize_to(claim.0.y, Q_M)),
+        claimed_speed_mps: Some(quantize_to(claim.1, Q_M)),
+        claimed_heading_rad: Some(quantize_to(claim.2, Q_RAD)),
         ..Default::default()
     };
     if msg_type == v2xw_msg::MsgType::Bsm
@@ -3584,12 +3591,16 @@ fn message_content(
         c.msg_count = Some(k.msg_cnt);
         c.temp_id = Some(hex_digest(&k.id));
         c.sec_mark_ms = (k.sec_mark != bsm::D_SECOND_UNAVAILABLE).then_some(k.sec_mark);
-        c.lat_deg = (k.lat != bsm::LATITUDE_UNAVAILABLE).then(|| f64::from(k.lat) * 1e-7);
-        c.lon_deg = (k.lon != bsm::LONGITUDE_UNAVAILABLE).then(|| f64::from(k.lon) * 1e-7);
-        c.elev_m = (k.elev != bsm::ELEVATION_UNKNOWN).then(|| f64::from(k.elev) * 0.1);
-        c.speed_mps = (k.speed != bsm::SPEED_UNAVAILABLE).then(|| f64::from(k.speed) * 0.02);
-        c.heading_deg =
-            (k.heading != bsm::HEADING_UNAVAILABLE).then(|| f64::from(k.heading) * 0.0125);
+        c.lat_deg = (k.lat != bsm::LATITUDE_UNAVAILABLE)
+            .then(|| quantize_to(f64::from(k.lat) * 1e-7, Q_DEG));
+        c.lon_deg = (k.lon != bsm::LONGITUDE_UNAVAILABLE)
+            .then(|| quantize_to(f64::from(k.lon) * 1e-7, Q_DEG));
+        c.elev_m =
+            (k.elev != bsm::ELEVATION_UNKNOWN).then(|| quantize_to(f64::from(k.elev) * 0.1, Q_M));
+        c.speed_mps = (k.speed != bsm::SPEED_UNAVAILABLE)
+            .then(|| quantize_to(f64::from(k.speed) * 0.02, Q_M));
+        c.heading_deg = (k.heading != bsm::HEADING_UNAVAILABLE)
+            .then(|| quantize_to(f64::from(k.heading) * 0.0125, Q_DEG));
         c.part_ii = Some(u8::try_from(m.part_ii.len()).unwrap_or(u8::MAX));
     }
     c

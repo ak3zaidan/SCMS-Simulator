@@ -23,7 +23,14 @@ fn transmissions(s: Scenario) -> Vec<NodeTxView> {
         .records()
         .iter()
         .filter(|(_, r)| r.channel == "node.tx")
-        .map(|(_, r)| decode(r).expect("node.tx decodes"))
+        .map(|(_, r)| {
+            // Every float on its D9 grid, or the file recorder refuses the record: the first
+            // version of this content wrote raw degrees and metres, and a recorded run lost
+            // every node.tx.
+            v2xw_record::grid::scan_record("node.tx", &r.json)
+                .unwrap_or_else(|e| panic!("node.tx is off its grid: {e}"));
+            decode(r).expect("node.tx decodes")
+        })
         .collect()
 }
 
@@ -55,9 +62,9 @@ fn every_bsm_on_the_air_carries_its_pseudonym_and_its_decoded_content() {
         assert!((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon));
         let v = c.speed_mps.expect("a speed was encoded");
         let claimed = c.claimed_speed_mps.expect("the claim is recorded");
-        // J2735 speed has a 0.02 m/s LSB.
+        // J2735 speed has a 0.02 m/s LSB, and the recorded claim is on the 1 mm/s grid.
         assert!(
-            (v - claimed).abs() <= 0.02 + 1e-9,
+            (v - claimed).abs() <= 0.02 + 1e-3,
             "encoded {v} vs claimed {claimed}"
         );
         assert!(c.sec_mark_ms.is_some_and(|m| m < 60_000));
