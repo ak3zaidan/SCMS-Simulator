@@ -1034,6 +1034,7 @@ pub fn build_metrics(
         Box::new(v2xw_metrics::security::SecurityProvider::new(0)),
         Box::new(v2xw_metrics::detection::DetectionProvider::new()),
         Box::new(v2xw_metrics::safety::SafetyProvider::new(0)),
+        Box::new(crate::privacy_metrics::PrivacyProvider::new()),
     ];
     for provider in candidates {
         let wanted = all
@@ -1557,15 +1558,37 @@ pub fn install_provisioned(
         ..core::mem::take(runtime.stores_mut())
     };
     for cred in creds {
-        runtime.stores_mut().certs.insert(CredentialHandle {
-            digest: pseudo_signer(node, cred.j),
-            cert_coer: vec![0u8; 117],
-            key: v2xw_sec::KeyId(u64::from(node.index()) << 8 | u64::from(cred.j)),
-            i_period: cred.i,
-            j_index: cred.j,
-            valid_from: cred.valid_from,
-            valid_until: cred.valid_until,
-            state: CredState::Active,
-        });
+        runtime
+            .stores_mut()
+            .certs
+            .insert(provisioned_handle(node, cred));
+    }
+}
+
+/// The credential handle one provisioned certificate is installed as.
+///
+/// The key id and the stand-in digest are distinct per `(node, i, j)`: a pool that spans
+/// several i-periods holds a `j = 0` in each, and two handles sharing a key or a digest
+/// would be one pseudonym under two names — exactly the linkability a pool exists to
+/// prevent. The state follows the validity window, so a certificate for a later period
+/// is held `Preloaded` and becomes usable when its window opens.
+pub fn provisioned_handle(
+    node: NodeId,
+    cred: &crate::phase2::ProvisionedCred,
+) -> CredentialHandle {
+    let index = cred.i.wrapping_mul(64).wrapping_add(cred.j);
+    CredentialHandle {
+        digest: pseudo_signer(node, index),
+        cert_coer: vec![0u8; 117],
+        key: v2xw_sec::KeyId(u64::from(node.index()) << 24 | u64::from(index)),
+        i_period: cred.i,
+        j_index: cred.j,
+        valid_from: cred.valid_from,
+        valid_until: cred.valid_until,
+        state: if cred.valid_from > 0 {
+            CredState::Preloaded
+        } else {
+            CredState::Active
+        },
     }
 }

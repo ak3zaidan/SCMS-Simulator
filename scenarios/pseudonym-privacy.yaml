@@ -2,8 +2,8 @@
 # RQ: What does a pseudonym-change policy cost, and what does it buy?
 # ============================================================================
 #
-# Half of that question is answerable today and half is not, and the whole value of this
-# file is that it says which half is which before you spend a day on it.
+# Both halves are measured: what a pseudonym policy costs in bytes, verification and
+# detection, and what it buys against a passive observer.
 #
 #     v2xw experiment run scenarios/pseudonym-privacy.yaml --out runs/pseudonym
 #
@@ -16,39 +16,29 @@
 #     let spec = v2xw_experiment::preset("rq-pseudonym-privacy").unwrap();
 #     v2xw_experiment::render(&spec, &table).write(Path::new("runs/pseudonym/figures"))?;
 #
-# ## READ THIS FIRST: what this scenario cannot measure
+# ## The privacy side: what it measures, and against which adversary
 #
-# **A run of this file measures no privacy quantity.** It measures the *cost* of a
-# pseudonym policy, which is real and is below. The privacy side is half built, and the
-# halves are worth telling apart (state of the tree, 2026-09-22):
+# Every run of this file now measures privacy as well as cost:
 #
-# * **The observer model exists.** `v2xw_threat::privacy` is the passive adversary
-#   07-threats-and-detection.md §6 asks for: receivers by the road, a constant-velocity
-#   tracker with a covariance that grows over a silence, best-hypothesis association by
-#   the Wiedersheim method, and records carrying `anonymity_set_size`,
-#   `degree_of_anonymity`, a tracking duration and a link claim per pseudonym change —
-#   including the claims it *declines* to make, so a linkability denominator cannot
-#   silently become its own numerator.
-# * **Nothing installs it, and nothing reduces its records.**
-#   `v2xw_metrics::register_all` installs five providers — comms, security, detection,
-#   safety, runtime — and none of them reads a privacy record, so
-#   `linkability_rate`, `anonymity_set_size`, `degree_of_anonymity` and
-#   `tracking_duration` are not in this engine's metric catalog. The scenario schema has
-#   no key that places an observer either: `threats.attackers` takes the legacy attacker
-#   ids and `v2xw_engine::phase2::Phase2::build` resolves nothing else.
+# * **The observer is installed.** `v2xw_threat::PrivacyObserver`, the passive adversary
+#   07-threats-and-detection.md §6 asks for (a constant-velocity tracker whose covariance
+#   grows over a silence, best-hypothesis association by the Wiedersheim et al. WONS 2010
+#   method), hears every safety frame on the air. That is a *global* passive
+#   eavesdropper: the worst case, and the upper bound a roadside receiver network
+#   approaches as its density grows. A study of a sparse observer network is not this file.
+# * **The metrics are computed.** `metric/security/pseudonym-privacy` reduces the
+#   observer's `privacy.link` claims against the vehicles' own `sec.pseudonym` rows:
+#   `linkability` (changes the observer bridged correctly / changes),
+#   `pseudonym_change_rate` (per vehicle-hour), `cert_pool_valid` and
+#   `backend_link_up`. The run report carries `privacy_links_claimed` and
+#   `privacy_links_correct` beside `pseudonym_changes`.
+# * **Every identifier changes together.** A change moves the certificate, the BSM
+#   temporary ID and the link-layer address at once (`sec.pseudonym` records all three
+#   before and after), so the observer links by kinematics or not at all.
 #
-# So a figure from this run cannot say "changing pseudonym every 60 s instead of every
-# 300 s reduces tracking". Anyone who reads one that way has been misled, which is why
-# this block is at the top of the file rather than in a footnote.
-#
-# Three things are owed, and none of them needs an engine change — the observer is an
-# ordinary receiving node and a metric provider is an ordinary reduction of a channel:
-#   1. a scenario key that places observers (a count, or a receiver density);
-#   2. a metric provider over the observer's records computing the four §6 quantities;
-#   3. the ground-truth digest-to-actor declaration `linkability_rate`'s correctness join
-#      needs, in the shape `DetectionProvider::declare_subject` already has.
-#
-# When those land, the sweep below is the study: the axis is already the right one.
+# What it does not measure: anonymity-set size and tracking duration are on the
+# observer's records (`privacy.link`, `privacy.track`) and are not yet reduced by a
+# provider; a mix-zone strategy has no mix zones to act in (no world defines them).
 #
 # ## What it DOES measure: the cost side, which is real and worth having
 #
@@ -73,24 +63,24 @@
 #
 # Read together, the run answers "what does a short pseudonym period cost in bytes, in
 # verification and in detection" — which is exactly the trade-off a privacy policy is
-# chosen against, with one of its two sides missing and labelled.
+# chosen against, with the observer's linkability as the other side.
 #
 # ## Why 10 s is in the sweep at all
 #
 # Ten seconds is not a deployment policy; J2945/1's figure is five minutes. It is in the
-# sweep because it is the value at which the *mechanism* is visible in a one-minute run,
-# and because the SCMS resolution path needs two reports about two different pseudonyms
-# of one device before it can open a case — which is what `phase2-manhattan.yaml` uses it
-# for. Treat the 10 s cell as a mechanism check and the 300 s cell as the deployment.
+# sweep because it is the value at which the *mechanism* is visible in a short run: the
+# observer faces thirty changes per vehicle, and the linkability it reaches against them
+# is the Wiedersheim result (near-total tracking at short intervals). Treat the 10 s cell
+# as a mechanism check and the 300 s cell as the deployment.
 schema: v2xw/scenario/1
 
 meta:
   name: pseudonym-privacy
   description: >-
     The cost of the pseudonym-change period — certificate attachment, air time,
-    verification load and detector continuity — swept over four periods with one ConstPos
-    attacker present so the detection side has a positive class. Measures no privacy
-    quantity; see the header.
+    verification load and detector continuity — and what it buys against a global
+    passive observer (linkability), swept over four periods with one ConstPos attacker
+    present so the detection side has a positive class.
   authors: [v2xw]
   tags: [study, rq-pseudonym, privacy, manhattan, osm, scms, detection]
   created: "2026-09-22"
@@ -135,12 +125,9 @@ actors:
       rate_veh_per_h: 6000.0
 
   # One roadside unit on a mast in the middle of the D7 box, with the report-forwarding
-  # role. It is here for the detection half of the study and not for realism: a
-  # misbehaviour report reaches the Misbehaviour Authority over a roadside unit's
-  # backhaul, so without a unit the reports go nowhere, `det_recall` at `level=report`
-  # is zero in every cell, and the pseudonym period's effect on detection — the most
-  # interesting thing this file measures — would read as "no effect" for a reason that
-  # has nothing to do with pseudonyms.
+  # role, for a vehicle whose report cannot go over its modem (every vehicle here has one,
+  # `net.uu`, so reports reach the authority over cellular; the unit relays what a
+  # coverage gap holds back).
   #
   # `position_m` and not `site`, because an OSM extract carries no mast inventory. The
   # coordinates are world-local ENU metres from the bounding box's south-west corner
@@ -179,6 +166,12 @@ radio:
 
 net:
   layer: wsmp
+  # Every vehicle reaches the backend over a cellular modem, so a misbehaviour report is
+  # backend traffic and not a frame on the channel whose load this study measures.
+  uu:
+    id: cellular/uu/cell-capacity-mm1
+    params:
+      isd_m: 500
 
 messages:
   sets: [bsm]

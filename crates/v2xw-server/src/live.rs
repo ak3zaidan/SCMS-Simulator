@@ -1372,6 +1372,10 @@ struct Projector {
             std::collections::VecDeque<Value>,
         ),
     >,
+    /// Per node, its latest `node.security` row (certificate pool, current pseudonym,
+    /// backend link, CRL state) and its most recent `sec.pseudonym` changes, for
+    /// `inspect.node`'s `certs` and `crl` sections.
+    security: BTreeMap<NodeId, (Value, std::collections::VecDeque<Value>)>,
     /// Channels seen in the stream that this projector has no §3.6 payload for.
     unprojected_channels: BTreeSet<String>,
     /// Channels whose records the channel's own reader-side view could not decode.
@@ -1445,6 +1449,7 @@ impl Projector {
             unmapped_nodes: BTreeSet::new(),
             unnamed_metrics: BTreeSet::new(),
             messages: BTreeMap::new(),
+            security: BTreeMap::new(),
             unprojected_channels: BTreeSet::new(),
             undecodable_channels: BTreeMap::new(),
             links: BTreeMap::new(),
@@ -1690,7 +1695,30 @@ impl Projector {
                         self.log_message(view.rx, false, received_json(&view));
                     }
                 }
-                "msg.latency" | "net.bytes" => {}
+                // The security panel's rows: the newest `node.security` per node, and a
+                // short history of its pseudonym changes.
+                "node.security" | "sec.pseudonym" => {
+                    if let Ok(value) = serde_json::from_slice::<Value>(&record.json)
+                        && let Some(node) = value["node"].as_u64()
+                    {
+                        let node = NodeId::new(node as u32);
+                        let entry = self
+                            .security
+                            .entry(node)
+                            .or_insert_with(|| (Value::Null, std::collections::VecDeque::new()));
+                        if record.channel == "node.security" {
+                            entry.0 = value;
+                        } else {
+                            if entry.1.len() >= MESSAGE_LOG {
+                                entry.1.pop_front();
+                            }
+                            entry.1.push_back(value);
+                        }
+                    } else {
+                        self.undecodable(record.channel);
+                    }
+                }
+                "msg.latency" | "net.bytes" | "privacy.link" | "ma.report" | "ma.decision" => {}
                 "metric.sample" => match serde_json::from_slice::<MetricSample>(&record.json) {
                     Ok(sample) => self.push_metric(&sample, &mut metrics),
                     Err(_) => self.undecodable(record.channel),
@@ -3838,6 +3866,37 @@ impl Introspect for LiveEngine {
             };
             return Some(json!({ "sent": pick(sent), "received": pick(received) }));
         }
+        // `certs` and `crl`: the node's own security state, from its `node.security` row
+        // (published with each telemetry window) and its recent pseudonym changes.
+        if section == "certs" || section == "crl" {
+            let (row, changes) = self.projector.security.get(&NodeId::new(node))?;
+            if row.is_null() {
+                return None;
+            }
+            if section == "crl" {
+                return Some(json!({
+                    "entries": row["crl_entries"],
+                    "version": row["crl_version"],
+                    "self_revoked": row["self_revoked"],
+                }));
+            }
+            let now = self.sim_time();
+            let recent: Vec<Value> = changes
+                .iter()
+                .filter(|c| c["t"].as_u64().is_none_or(|t| t <= now))
+                .rev()
+                .take(limit)
+                .cloned()
+                .collect();
+            let mut out = row.clone();
+            if let Some(obj) = out.as_object_mut() {
+                obj.remove("crl_entries");
+                obj.remove("crl_version");
+                obj.remove("self_revoked");
+                obj.insert("changes_log".to_string(), Value::Array(recent));
+            }
+            return Some(out);
+        }
         let telemetry = self.last_telemetry.get(&node)?;
         match section {
             "queues" => {
@@ -4017,15 +4076,17 @@ mod tests {
 
         let phase2 =
             Scenario::load(scenario_path("phase2-manhattan.yaml")).expect("the phase 2 loads");
-        assert_eq!(
-            phase2.actors.rsus.len(),
-            1,
-            "phase2-manhattan declares the one mast this offset exists for"
+        // The Phase 2 scenario places a unit at every signalised intersection of two
+        // avenues (55 of them); what is pinned is that the offset is that count.
+        let units = phase2.actors.rsus.len();
+        assert!(
+            units > 1,
+            "phase2-manhattan declares its roadside deployment, which this offset exists for"
         );
         assert_eq!(
-            roadside_node_count(&phase2),
-            1,
-            "with one mast the first vehicle's node id is 1, not 0"
+            roadside_node_count(&phase2) as usize,
+            units,
+            "with {units} masts the first vehicle's node id is {units}, not 0"
         );
     }
 }
