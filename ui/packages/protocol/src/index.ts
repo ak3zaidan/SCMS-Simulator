@@ -22,8 +22,12 @@ export * from "./slots.js";
 export * from "./world.js";
 export * from "./encode.js";
 export * from "./rpc.js";
+export * from "./feed.js";
 export * from "./client.js";
 export * from "./worker.js";
 
-/** The protocol version this package implements. */
-export const VWP_PROTOCOL_VERSION = "1.0";
+/**
+ * The protocol version this package implements. v1.1 added `view.follow {feed}` and the
+ * `node.feed` notification (§8.4, additive).
+ */
+export const VWP_PROTOCOL_VERSION = "1.1";

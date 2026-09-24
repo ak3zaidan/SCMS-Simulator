@@ -16,6 +16,8 @@
 // §6.5 — shared schema definitions
 // ---------------------------------------------------------------------------
 
+import type { FeedOptions, FeedSubscription, NodeFeedNotification } from "./feed.js";
+
 /** §6.5 — nanoseconds since `t0`. */
 export type SimTimeNs = number;
 /** §6.5 — 36-character UUID string. */
@@ -263,12 +265,16 @@ export interface ViewFollowParams {
   clear?: boolean;
   telemetry?: boolean;
   radius_m?: number;
+  /** v1.1 — push the followed node's messages and queues as `node.feed`; `false` drops it. */
+  feed?: boolean | FeedOptions;
 }
 /** §6.7 `view.follow` result. */
 export interface ViewFollowResult {
   following: number | null;
   camera?: CameraMode;
   subscribed_nodes: NodeId[];
+  /** v1.1 — present when the call carried `feed`. */
+  feed?: FeedSubscription;
 }
 /** §6.7 `view.camera` params. */
 export interface ViewCameraParams {
@@ -926,7 +932,7 @@ export interface ExperimentProgressNotification {
   eta_s?: number;
 }
 
-/** §6.14 — the eight server→client notifications. */
+/** §6.14 — the nine server→client notifications (`node.feed` since v1.1). */
 export interface VwpNotifications {
   "run.state": RunStateNotification;
   "stream.drop": StreamDropNotification;
@@ -936,14 +942,16 @@ export interface VwpNotifications {
   log: LogNotification;
   validation: ValidationNotification;
   "experiment.progress": ExperimentProgressNotification;
+  "node.feed": NodeFeedNotification;
 }
 
 /** Every notification name of §6.14. */
 export type VwpNotificationName = keyof VwpNotifications;
 
-/** §6.14 — the notification names as a runtime array (8 entries). */
+/** §6.14 — the notification names as a runtime array (9 entries; `node.feed` since v1.1). */
 export const VWP_NOTIFICATIONS: readonly VwpNotificationName[] = [
   "run.state", "stream.drop", "job.progress", "job.done", "view.changed", "log", "validation", "experiment.progress",
+  "node.feed",
 ] as const;
 
 // ---------------------------------------------------------------------------

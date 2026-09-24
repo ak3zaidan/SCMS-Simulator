@@ -335,13 +335,14 @@ describe("§6 — the JSON-RPC client", () => {
     await expect(p2).rejects.toThrow(/socket closed/);
   });
 
-  it("§6.15 — exactly 32 methods and §6.14 — exactly 8 notifications", () => {
+  it("§6.15 — exactly 32 methods and §6.14 — exactly 9 notifications (node.feed since v1.1)", () => {
     expect(VWP_METHODS).toHaveLength(32);
     expect(new Set(VWP_METHODS).size).toBe(32);
     expect(VWP_METHODS).toContain("rpc.discover");
-    expect(VWP_NOTIFICATIONS).toHaveLength(8);
+    expect(VWP_NOTIFICATIONS).toHaveLength(9);
     expect(VWP_NOTIFICATIONS).toEqual([
       "run.state", "stream.drop", "job.progress", "job.done", "view.changed", "log", "validation", "experiment.progress",
+      "node.feed",
     ]);
   });
 });
