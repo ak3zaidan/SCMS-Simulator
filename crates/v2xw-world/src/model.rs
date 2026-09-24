@@ -2758,11 +2758,21 @@ impl World {
                 continue;
             }
             // Which head group each controlled movement lights: the group of the head over
-            // its approach lane.
+            // its approach lane. A pedestrian head faces the crossing lane it controls,
+            // which has no approach, so it is found by the controlled lane itself — the
+            // rule [`SignalPlan::group_timelines`] uses; without it every walk head
+            // streamed Off.
             let group_of: Vec<Option<u16>> = plan
                 .controlled
                 .iter()
                 .map(|l| {
+                    if let Some(h) = plan
+                        .heads
+                        .iter()
+                        .find(|h| h.lane == *l && h.kind == SignalHeadKind::Pedestrian)
+                    {
+                        return Some(h.group);
+                    }
                     let approach = approach_of.get(l)?;
                     plan.heads.iter().find(|h| h.lane == *approach).map(|h| h.group)
                 })

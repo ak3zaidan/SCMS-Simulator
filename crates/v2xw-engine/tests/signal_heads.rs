@@ -76,7 +76,12 @@ fn check(world: &World, times: &[f64]) -> (usize, usize) {
                     .controlled
                     .iter()
                     .filter(|l| {
-                        approach_of.get(l).is_some_and(|a| {
+                        // A pedestrian head faces the crossing lane it controls.
+                        plan.heads.iter().any(|h| {
+                            h.lane == **l
+                                && h.group == group
+                                && h.kind == v2xw_world::SignalHeadKind::Pedestrian
+                        }) || approach_of.get(l).is_some_and(|a| {
                             plan.heads.iter().any(|h| h.lane == *a && h.group == group)
                         })
                     })
