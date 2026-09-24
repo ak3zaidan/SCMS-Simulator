@@ -193,8 +193,8 @@ export class CameraController {
   #flyT = 0;
   #flyDuration = 0;
   #flyStart = new Vector3();
-  /** Extra height at the middle of the current flight, metres; see `#beginFlight`. */
-  #flyArch = 0;
+  /** Cruise height of a flight to street level, or NaN for a straight flight; see `#beginFlight`. */
+  #flyCruise = Number.NaN;
   /**
    * Set when the followed subject changes in a street-level mode: the next update flies to the new
    * subject instead of sliding there at street level through every building in between.
@@ -280,6 +280,11 @@ export class CameraController {
   /** Whether a mode-change flight is in progress. A snap during one is a visible cut. */
   get isFlying(): boolean {
     return this.#flyT < this.#flyDuration;
+  }
+
+  /** Whether a flight is in progress or will start on the next update (a change of subject). */
+  get inTransit(): boolean {
+    return this.#pendingFlight || this.#flyT < this.#flyDuration;
   }
 
   /** Whether the user has panned, orbited or zoomed. Automatic framing must not override them. */
@@ -678,56 +683,100 @@ export class CameraController {
     const dist = this.#flyStart.distanceTo(this.#desiredPosition);
     this.#flyDuration = MathUtils.clamp(0.35 + 0.055 * Math.sqrt(dist), 0.35, this.#flyMaxSeconds);
     this.#flyT = 0;
-    this.#flyArch = this.#archFor(this.#flyStart, this.#desiredPosition);
+    // A flight that ends at street level is planned, not lerped: to cruise height (clear of every
+    // roof on the way), across, and straight down onto the destination, which is in the street.
+    // The straight line from the plan view into a street canyon crossed the building beside the
+    // street, and the roof rule then parked the camera on that roof looking at it — the camera
+    // fuzz measured frames of one flat colour at the end of the fly-down and of every change of
+    // subject. A flight to anywhere else keeps the straight eased line.
+    this.#flyCruise = CameraController.needsFollowSubject(this.#mode)
+      ? this.#cruiseFor(this.#flyStart, this.#desiredPosition)
+      : Number.NaN;
   }
 
   /**
-   * How much to raise the middle of a flight so it passes over the roofs between its ends rather
-   * than through them. A straight line between two street-level poses goes through every building
-   * on the way, and the roof rule then yanks the camera onto each roof in turn. Zero for a flight
-   * that is already high (the plan view's fly-down).
+   * Cruise height for a flight to street level: fifteen metres over the tallest roof between the
+   * ends, and for a flight that starts low, a gentle arc besides (a quarter of the distance, at
+   * most 600 m). A flight that starts above that simply descends to it.
    */
-  #archFor(from: Vector3, to: Vector3): number {
+  #cruiseFor(from: Vector3, to: Vector3): number {
     const world = this.#world;
     const hd = Math.hypot(to.x - from.x, to.y - from.y);
-    if (!world || hd < 30) return 0;
-    let top = world.world ? world.world.bbox.minZM : Math.min(from.z, to.z);
-    const samples = Math.min(64, Math.max(8, Math.ceil(hd / 15)));
-    for (let i = 1; i < samples; i++) {
-      const t = i / samples;
-      const h = world.buildingTopAt(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
-      if (h > top) top = h;
+    let top = world?.world ? world.world.bbox.minZM : Math.min(from.z, to.z);
+    if (world) {
+      const samples = Math.min(64, Math.max(8, Math.ceil(hd / 15)));
+      for (let i = 0; i <= samples; i++) {
+        const t = i / samples;
+        const h = world.buildingTopAt(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
+        if (h > top) top = h;
+      }
     }
-    const high = Math.max(from.z, to.z);
-    const want = Math.max(top + 15, Math.min(from.z, to.z) + 0.25 * hd);
-    return Math.max(0, Math.min(600, want - high));
+    let cruise = Math.max(top + 15, to.z + 10);
+    if (from.z < cruise) cruise = Math.max(cruise, Math.min(Math.min(from.z, to.z) + 0.25 * hd, to.z + 600));
+    return cruise;
   }
 
   /** One step of the flight begun by {@link #beginFlight}. */
   #advanceFlight(step: number): void {
     this.#flyT += step;
     const u = MathUtils.clamp(this.#flyT / this.#flyDuration, 0, 1);
-    if (this.#flyArch <= 0) {
+    const p = this.camera.position;
+    const cruise = this.#flyCruise;
+    if (!Number.isFinite(cruise)) {
       // Smootherstep: zero velocity *and* zero acceleration at both ends.
       const e = smootherstep(u);
-      this.camera.position.lerpVectors(this.#flyStart, this.#desiredPosition, e);
+      p.lerpVectors(this.#flyStart, this.#desiredPosition, e);
       this.look.lerpVectors(this.#flyStartLook, this.#desiredLook, e);
       return;
     }
-    // An arched flight between two street-level poses goes up, across and down, in that order: a
-    // shared parameter moved the camera sideways while it was still below the roofs, straight into
-    // the building beside the street it started in (measured: lifted onto a 102 m roof and looking
-    // down at it, a frame of one flat colour, for seven frames).
-    const across = smootherstep(MathUtils.clamp((u - 0.2) / 0.6, 0, 1));
-    const lift = Math.min(smootherstep(MathUtils.clamp(u / 0.25, 0, 1)), smootherstep(MathUtils.clamp((1 - u) / 0.25, 0, 1)));
-    const ez = smootherstep(u);
-    const p = this.camera.position;
+    const startLow = this.#flyStart.z < cruise - 1;
+    // From a low start: climb to cruise, across, then straight down. From the plan view: the eased
+    // straight descent, but never below cruise until the camera is over its destination, then
+    // straight down.
+    const a0 = startLow ? 0.2 : 0;
+    const c2 = startLow ? 0.75 : 0.8;
+    const across = smootherstep(MathUtils.clamp((u - a0) / (c2 - a0), 0, 1));
+    let z: number;
+    if (startLow) {
+      if (u < 0.2) z = this.#flyStart.z + (cruise - this.#flyStart.z) * smootherstep(u / 0.2);
+      else if (u < c2) z = cruise;
+      else z = cruise + (this.#desiredPosition.z - cruise) * smootherstep((u - c2) / (1 - c2));
+    } else {
+      const straight = (v: number): number => this.#flyStart.z + (this.#desiredPosition.z - this.#flyStart.z) * smootherstep(v);
+      const atC2 = Math.max(straight(c2), cruise);
+      z = u < c2 ? Math.max(straight(u), cruise) : atC2 + (this.#desiredPosition.z - atC2) * smootherstep((u - c2) / (1 - c2));
+    }
     p.x = this.#flyStart.x + (this.#desiredPosition.x - this.#flyStart.x) * across;
     p.y = this.#flyStart.y + (this.#desiredPosition.y - this.#flyStart.y) * across;
-    const baseZ = this.#flyStart.z + (this.#desiredPosition.z - this.#flyStart.z) * ez;
-    const peak = Math.max(this.#flyStart.z, this.#desiredPosition.z) + this.#flyArch;
-    p.z = baseZ + (peak - baseZ) * lift;
+    p.z = z;
     this.look.lerpVectors(this.#flyStartLook, this.#desiredLook, across);
+    // While climbing out of a street, look ahead along the flight 30° below the horizon instead of
+    // straight down at a subject beside the building the camera is passing: straight down, the
+    // roof a few metres below filled the frame.
+    if (startLow && u < c2) {
+      const w = Math.min(smootherstep(MathUtils.clamp(u / 0.2, 0, 1)), smootherstep(MathUtils.clamp((c2 - u) / 0.15, 0, 1)));
+      let hx = this.#desiredPosition.x - this.#flyStart.x;
+      let hy = this.#desiredPosition.y - this.#flyStart.y;
+      const hl = Math.hypot(hx, hy);
+      if (hl > 1e-3 && w > 0) {
+        hx /= hl;
+        hy /= hl;
+        // Never past the destination (at the world's edge that was a view of the void beyond it).
+        const remaining = Math.hypot(this.#desiredPosition.x - p.x, this.#desiredPosition.y - p.y);
+        const ahead = Math.max(30, Math.min((p.z - this.#desiredPosition.z) * 1.5, remaining));
+        let ax = p.x + hx * ahead;
+        let ay = p.y + hy * ahead;
+        const b = this.#world?.world?.bbox;
+        if (b) {
+          ax = MathUtils.clamp(ax, b.minXM, b.maxXM);
+          ay = MathUtils.clamp(ay, b.minYM, b.maxYM);
+        }
+        const drop = Math.max(Math.hypot(ax - p.x, ay - p.y), 1) * Math.tan(30 * DEG);
+        this.look.x += (ax - this.look.x) * w;
+        this.look.y += (ay - this.look.y) * w;
+        this.look.z += (p.z - drop - this.look.z) * w;
+      }
+    }
   }
 
   /**
@@ -762,11 +811,17 @@ export class CameraController {
       dir.multiplyScalar(1 / dist);
       const steps = Math.min(48, Math.max(4, Math.ceil(dist)));
       let hitT = -1;
+      // A target inside a building (the smoothed look point trailing a vehicle out of a passage,
+      // or cutting a corner past a façade) is not a reason to pull the camera onto the target and
+      // lift it onto that roof — measured: a frame of that roof and nothing else. The march starts
+      // where the ray leaves the target's own building.
+      const own = world.buildingTopAt(lookAt.x, lookAt.y) > lookAt.z ? world.buildingIndexAt(lookAt.x, lookAt.y) : -1;
       for (let i = 1; i <= steps; i++) {
         const t = (dist * i) / steps;
         const x = lookAt.x + dir.x * t;
         const y = lookAt.y + dir.y * t;
         const z = lookAt.z + dir.z * t;
+        if (own >= 0 && world.buildingIndexAt(x, y) === own) continue;
         const top = world.buildingTopAt(x, y);
         if (top > -Infinity && z < top) {
           hitT = t;

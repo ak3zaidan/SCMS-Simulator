@@ -1068,16 +1068,41 @@ export class Viewer {
   #updateGhost(): void {
     const slot = this.#followSlot;
     const w = this.worldRenderer;
-    if (slot < 0 || this.cameras.mode === "map") {
-      if (w.ghostBuilding >= 0) w.setGhostBuilding(-1);
+    const mode = this.cameras.mode;
+    if (!CameraController.needsFollowSubject(mode)) {
+      if (w.ghostBuilding >= 0 || w.ghostBuilding2 >= 0) w.setGhostBuildings(-1, -1);
       return;
     }
-    const p = slot * 3;
-    const x = this.interpolator.outPosition[p];
-    const y = this.interpolator.outPosition[p + 1];
-    const z = this.interpolator.outPosition[p + 2];
-    const b = w.buildingIndexAt(x, y);
-    w.setGhostBuilding(b >= 0 && z < w.buildingTopOf(b) ? b : -1);
+    let vehicle = -1;
+    if (slot >= 0) {
+      const p = slot * 3;
+      const x = this.interpolator.outPosition[p];
+      const y = this.interpolator.outPosition[p + 1];
+      const z = this.interpolator.outPosition[p + 2];
+      const b = w.buildingIndexAt(x, y);
+      if (b >= 0 && z < w.buildingTopOf(b)) vehicle = b;
+    }
+    // The camera's own building, when it is below that roof: it followed a vehicle through a
+    // passage, and after a change of subject it is flying out of it. Hidden, not jumped over.
+    // The same for the smoothed look target, which trails the vehicle out of a passage: the car is
+    // out, the point the camera aims at is still inside, and the march from it met the wall.
+    const inside = (x: number, y: number, z: number): number => {
+      const b = w.buildingIndexAt(x, y);
+      return b >= 0 && z < w.buildingTopOf(b) ? b : -1;
+    };
+    const ghosted = (b: number): boolean => b >= 0 && (b === w.ghostBuilding || b === w.ghostBuilding2);
+    const c = this.camera.position;
+    const l = this.cameras.look;
+    const cb = inside(c.x, c.y, c.z);
+    const lb = inside(l.x, l.y, l.z);
+    let camera = ghosted(cb) ? cb : ghosted(lb) ? lb : -1;
+    // And for the whole of a flight out of it: the camera looks back at where it was until it is
+    // well on its way, and that roof then filled the frame (measured: σ 3.0, one flat colour).
+    if (camera < 0 && this.cameras.inTransit) {
+      if (w.ghostBuilding2 >= 0) camera = w.ghostBuilding2;
+      else if (w.ghostBuilding >= 0 && w.ghostBuilding !== vehicle) camera = w.ghostBuilding;
+    }
+    w.setGhostBuildings(vehicle, camera);
   }
 
   /**

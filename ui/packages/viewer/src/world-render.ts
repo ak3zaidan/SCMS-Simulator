@@ -247,6 +247,8 @@ export class WorldRenderer {
   #buildingCount = 0;
   /** Buildings hidden this frame because the followed vehicle is inside them; see {@link setGhostBuilding}. */
   #ghost = -1;
+  /** A second ghosted building: the one the camera itself is in; see {@link setGhostBuildings}. */
+  #ghost2 = -1;
   #buildingBackend: BuildingBackend = "none";
   #buildError: string | null = null;
 
@@ -1004,17 +1006,37 @@ export class WorldRenderer {
    * fallback this is a no-op and the old roof rule applies.
    */
   setGhostBuilding(index: number): void {
-    const i = index >= 0 && index < this.#buildingCount ? index : -1;
-    if (i === this.#ghost) return;
+    this.setGhostBuildings(index, -1);
+  }
+
+  /**
+   * Hide up to two buildings: the one the followed vehicle is inside and the one a street-level
+   * camera is inside (it followed that vehicle in, and a change of subject flies it out). Both are
+   * open space to the camera logic while hidden.
+   */
+  setGhostBuildings(first: number, second: number): void {
+    const norm = (i: number): number => (i >= 0 && i < this.#buildingCount && this.#buildingInstanceIds[i] >= 0 ? i : -1);
+    const a = norm(first);
+    let b = norm(second);
+    if (b === a) b = -1;
+    if (a === this.#ghost && b === this.#ghost2) return;
     const mesh = this.#buildings;
     if (!mesh) {
       this.#ghost = -1;
+      this.#ghost2 = -1;
       return;
     }
-    const prev = this.#ghost;
-    if (prev >= 0 && this.#buildingInstanceIds[prev] >= 0) mesh.setVisibleAt(this.#buildingInstanceIds[prev], true);
-    if (i >= 0 && this.#buildingInstanceIds[i] >= 0) mesh.setVisibleAt(this.#buildingInstanceIds[i], false);
-    this.#ghost = i >= 0 && this.#buildingInstanceIds[i] >= 0 ? i : -1;
+    for (const prev of [this.#ghost, this.#ghost2]) {
+      if (prev >= 0 && prev !== a && prev !== b) mesh.setVisibleAt(this.#buildingInstanceIds[prev], true);
+    }
+    for (const next of [a, b]) if (next >= 0) mesh.setVisibleAt(this.#buildingInstanceIds[next], false);
+    this.#ghost = a;
+    this.#ghost2 = b;
+  }
+
+  /** The second ghosted building, or −1. */
+  get ghostBuilding2(): number {
+    return this.#ghost2;
   }
 
   #buildingAt(x: number, y: number, skipGhost: boolean): number {
@@ -1032,7 +1054,7 @@ export class WorldRenderer {
     let best = -1;
     for (let k = start; k < end; k++) {
       const i = this.#gridItems[k];
-      if (skipGhost && i === this.#ghost) continue;
+      if (skipGhost && (i === this.#ghost || i === this.#ghost2)) continue;
       const dx = x - this.#buildingCentroid[i * 4];
       const dy = y - this.#buildingCentroid[i * 4 + 1];
       const r = this.#buildingCentroid[i * 4 + 3];
@@ -1171,6 +1193,7 @@ export class WorldRenderer {
     this.#disposables = [];
     this.#buildings = null;
     this.#ghost = -1;
+    this.#ghost2 = -1;
     this.#buildingCount = 0;
     this.#buildingBackend = "none";
     this.#buildError = null;
