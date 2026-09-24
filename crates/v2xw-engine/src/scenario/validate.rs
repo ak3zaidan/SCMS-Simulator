@@ -733,10 +733,11 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus {
         path: "radio.range",
         status: Status::Wired,
-        note: "How far each transmission is followed: to where, in line of sight, it \
-               would still arrive at no less than the noise floor minus the margin. \
-               Arrivals weaker than that are counted as interference, not reception \
-               attempts. An optional cap bounds the fully evaluated range; beyond it, \
+        note: "How far each transmission is followed: to where, in line of sight, a unit \
+               radiating the 33 dBm regulatory maximum would still arrive at no less than \
+               the noise floor minus the margin. A link too lossy for even that to clear \
+               it is counted as interference, not a reception attempt; the reference is \
+               fixed, so the links a run attempts do not move with the transmit power. An optional cap bounds the fully evaluated range; beyond it, \
                line-of-sight receivers still get the frame's energy as interference.",
     },
     // --- network -----------------------------------------------------------

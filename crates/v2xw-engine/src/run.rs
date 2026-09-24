@@ -2719,14 +2719,23 @@ impl Engine {
         // Stage 1: the candidate set — every equipped actor the transmission can reach, by
         // the grid query ADR 0004 decision 6 sizes for exactly this. How far that is comes
         // from the link budget (`radio.range`): the distance at which, in line of sight,
-        // this frame's EIRP would arrive at the noise floor less the margin. Within the
-        // full range every link gets its whole budget; between a `radio.range.max_m` cap
-        // and the reach, a receiver in line of sight still gets the frame's energy.
+        // a unit radiating the regulatory maximum would arrive at the noise floor less the
+        // margin. Within the full range every link gets its whole budget; between a
+        // `radio.range.max_m` cap and the reach, a receiver in line of sight still gets the
+        // frame's energy.
+        //
+        // The reach and the attempt test below are taken at that fixed reference EIRP, not
+        // at this frame's: the set of links a run attempts must not depend on the transmit
+        // power under study, or lowering the power drops the weakest links from the set
+        // and the mean received power over what is left goes *up*.
         let tx_device = self.device_of(state.tx);
         let eirp_dbm = state.descriptor.tx_power_dbm + tx_device.net_gain_db();
-        let reach_m = self.range.reach_m(eirp_dbm);
-        let full_m = self.range.full_m(eirp_dbm);
-        let floor_dbm = self.range.floor_dbm();
+        let reference = crate::wiring::CandidateRangePlan::REFERENCE_EIRP_DBM.max(eirp_dbm);
+        let reach_m = self.range.reach_m(reference);
+        let full_m = self.range.full_m(reference);
+        // An arrival is an attempt when it would clear `N − margin` from a transmitter at
+        // the reference EIRP: its link's loss is small enough, whatever this unit radiates.
+        let floor_dbm = self.range.floor_dbm() - (reference - eirp_dbm);
         let mut candidates: Vec<(NodeId, Vec3)> = Vec::new();
         let mut beyond: Vec<(NodeId, Vec3)> = Vec::new();
         // Each receiver's heading — its street's direction — for the corner tracer.

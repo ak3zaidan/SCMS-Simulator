@@ -84,22 +84,31 @@ fn pdr_between(rx: &[PhyRxView], lo: f64, hi: f64) -> Option<f64> {
 // radio.devices
 // -----------------------------------------------------------------------------------------
 
-/// Transmit power moves every received power by itself. Both powers are below what J2945/1
-/// congestion control would allow (its radiated power never falls under 10 dBm, so a unit
-/// with a 3 dBi antenna may conduct 7 dBm), so the configured power is what goes on the
-/// air in both runs, and the same links 5 dB apart in power arrive 5 dB apart.
+/// Transmit power moves every received power by itself, and not the set of links the run
+/// attempts. Both powers are below what J2945/1 congestion control would allow (its
+/// radiated power never falls under 10 dBm, so a unit with a 3 dBi antenna may conduct
+/// 7 dBm), so the configured power is what goes on the air in both runs, and with the
+/// grid's buildings in the way many links are near the floor. The counterexample is the
+/// defect the fixed reference EIRP removes: when the attempt test used each frame's own
+/// power, 5 dB less power dropped the weakest links from the set and the mean received
+/// power over what was left went *up* (−85.3 to −81.2 dBm, measured at 10 dBm).
 #[test]
 fn the_transmit_power_moves_every_received_power_by_itself() {
-    let base = open_air(with_model(grid_fleet(60, 4.0), "fading", "fading/none"));
+    let base = with_model(grid_fleet(60, 4.0), "fading", "fading/none");
     let mut loud = base.clone();
     loud.radio.devices.obu.tx_power_dbm = 5.0;
     let mut quiet = base;
     quiet.radio.devices.obu.tx_power_dbm = 0.0;
-    let (_, loud_rx, _) = run(loud);
-    let (_, quiet_rx, _) = run(quiet);
-    let (a, na) = mean_rssi(&loud_rx, 0.0, 150.0);
-    let (b, nb) = mean_rssi(&quiet_rx, 0.0, 150.0);
-    assert!(na > 40 && nb > 40, "{na} and {nb} attempts within 150 m");
+    let (loud_report, loud_rx, _) = run(loud);
+    let (quiet_report, quiet_rx, _) = run(quiet);
+    assert!(loud_report.faint_arrivals > 0, "no link was near the floor");
+    assert_eq!(
+        loud_report.reception_attempts, quiet_report.reception_attempts,
+        "the transmit power changed which links were attempted"
+    );
+    let (a, na) = mean_rssi(&loud_rx, 0.0, 10_000.0);
+    let (b, nb) = mean_rssi(&quiet_rx, 0.0, 10_000.0);
+    assert!(na > 40 && nb > 40, "{na} and {nb} attempts");
     assert!(
         (a - b - 5.0).abs() < 0.75,
         "5 dB less transmit power moved the mean received power by {:.2} dB",

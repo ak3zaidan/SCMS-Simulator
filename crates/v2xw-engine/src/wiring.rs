@@ -777,10 +777,13 @@ pub fn los_mean_loss_db(
 
 /// How far each transmission is followed (`radio.range`).
 ///
-/// A transmission is followed to every receiver at which, in line of sight, it would still
-/// arrive at no less than the noise floor minus `radio.range.margin_db`: the distance `R`
-/// solving `EIRP + G_rx − PL_LOS(R) = N − margin` for the run's own line-of-sight law, its
-/// best receive gain and its receiver's noise floor. Within `R` every link gets the full
+/// A transmission is followed to every receiver at which, in line of sight, a unit
+/// radiating the regulatory maximum ([`CandidateRangePlan::REFERENCE_EIRP_DBM`], 33 dBm)
+/// would still arrive at no less than the noise floor minus `radio.range.margin_db`: the
+/// distance `R` solving `EIRP_ref + G_rx − PL_LOS(R) = N − margin` for the run's own
+/// line-of-sight law, its best receive gain and its receiver's noise floor. A link is a
+/// reception attempt when its loss would let that reference clear `N − margin`; the
+/// reference is fixed so that neither set moves with the transmit power a study varies. Within `R` every link gets the full
 /// budget — geometry, shadowing, fading. The 10 dB default margin covers the shadowing
 /// upside (about 2.5 σ of the 4 dB laws) and puts a single arrival left out at most 0.4 dB
 /// of noise rise.
@@ -829,6 +832,13 @@ impl CandidateRangePlan {
             cache: std::collections::BTreeMap::new(),
         }
     }
+
+    /// The EIRP the reach and the attempt test are taken at, dBm: 33 dBm, the most any
+    /// V2X unit may radiate in the US (FCC 24-123: §95.3204(b) for a C-V2X on-board unit,
+    /// §90.391(a) for a roadside unit) and at or above the EU's ITS-G5A ceiling
+    /// (EN 302 571's 33 dBm total). Fixed, so the links a run follows and attempts are a
+    /// property of the geometry and not of the transmit power a study varies.
+    pub const REFERENCE_EIRP_DBM: f64 = 33.0;
 
     /// The weakest arrival worth following, dBm: `N − margin`.
     pub fn floor_dbm(&self) -> f64 {
