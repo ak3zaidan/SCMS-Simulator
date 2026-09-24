@@ -41,7 +41,9 @@ const POLICIES: [&str; 3] = ["verify-all", "on-demand", "prioritized"];
 /// The codec tiers build decision D2 settled.
 const CODEC_TIERS: [&str; 2] = ["uper", "size-model"];
 /// The message sets `v2xw-msg` can generate or size.
-const MESSAGE_SETS: [&str; 8] = ["bsm", "cam", "denm", "spat", "map", "psm", "vam", "cpm"];
+const MESSAGE_SETS: [&str; 10] = [
+    "bsm", "cam", "denm", "spat", "map", "srm", "ssm", "psm", "vam", "cpm",
+];
 /// The signature primitives that exist in `real` crypto mode.
 ///
 /// `modeled` mode costs any primitive the profile prices; `real` mode has to do the
@@ -500,7 +502,9 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     KeyStatus {
         path: "actors.rsus",
         status: Status::Wired,
-        note: "Roadside units. Placed, given a profile and a role set, and they transmit.",
+        note: "Roadside units. Placed, given a profile and a role set, and they transmit. \
+               A unit with the 'spat' or 'map' role must stand within 60 m of a signalised \
+               junction: it broadcasts that junction's SPaT and MAP.",
     },
     KeyStatus {
         path: "actors.rsus[].backhaul",
@@ -644,9 +648,17 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     // --- messages ----------------------------------------------------------
     KeyStatus {
         path: "messages.sets",
-        status: Status::Refused,
-        note: "Which message sets the nodes generate. Only the BSM and the CAM have a \
-               generator, so anything else is refused rather than silently unsent.",
+        status: Status::Partial,
+        note: "Which message sets are generated, each by the station that sends it in a \
+               deployment. bsm and cam: every equipped vehicle. denm (needs gn-btp): a \
+               vehicle braking at 0.4 g or harder raises a dangerous-situation DENM, \
+               repeated every 100 ms for 2 s. spat and map: roadside units with that role, \
+               from the signal plan the drivers obey and the junction's own lanes, at 10 Hz \
+               and 1 Hz (J2735 MessageFrame on wsmp, SPATEM and MAPEM on gn-btp). srm and \
+               ssm (need codec_tier size-model): emergency vehicles ask the junction whose \
+               MAP they heard for priority and its unit answers; no controller grants it. \
+               cpm is refused: there is no perception model to fill one. psm and vam are \
+               refused until a VRU device is hosted.",
     },
     KeyStatus {
         path: "messages.generator",
@@ -663,11 +675,13 @@ pub static KEY_STATUS: &[KeyStatus] = &[
     },
     KeyStatus {
         path: "messages.codec_tier",
-        status: Status::Refused,
-        note: "Only 'uper' loads, and it is what runs: every BSM and CAM is encoded for \
-               real. The size-model tier (build decision D2) covers SPaT, MAP, PSM, SRM, \
-               SSM, CPM and VAM — messages no node in this build generates — so selecting \
-               it would change no frame and is refused rather than ignored.",
+        status: Status::Wired,
+        note: "'uper': every message is encoded for real — BSM, SPaT and MAP by the \
+               hand-written J2735 encoders (SPaT and MAP not yet checked against an \
+               independent decoder), CAM and DENM by the generated ETSI ones — and a set \
+               with no real encoder (srm, ssm) is refused. 'size-model': those sets are \
+               carried as payloads of the validated modelled length (build decision D2), \
+               and every message that has a real encoder is still encoded for real.",
     },
     // --- security ----------------------------------------------------------
     KeyStatus {
@@ -964,31 +978,83 @@ fn unreachable_keys(s: &Scenario, e: &mut Vec<ScenarioError>) {
         ));
     }
 
-    // Message generators. `v2xw-node::ServiceSet` has exactly two flags, so a set outside
-    // those two names a generator that does not exist. This is a different rule from the
-    // codec check in `messages`: that one is about encoding a message, this one is about
-    // deciding to send it.
+    // Message generators: which node decides to send each set (`v2xw_node::ServiceSet` and
+    // `crate::wiring`'s vehicle_services / rsu_services), and what that decision needs from
+    // the rest of the scenario.
+    let has = |name: &str| s.messages.sets.iter().any(|x| x == name);
+    let role = |name: &str| {
+        s.actors
+            .rsus
+            .iter()
+            .any(|r| r.roles.iter().any(|x| x == name || x == "spat-map"))
+    };
     for (i, set) in s.messages.sets.iter().enumerate() {
-        if !matches!(set.as_str(), "bsm" | "cam") {
-            e.push(conflict(
-                &format!("messages.sets[{i}]"),
+        let field = format!("messages.sets[{i}]");
+        match set.as_str() {
+            "bsm" | "cam" => {}
+            "denm" if s.net.layer != "gn-btp" => e.push(conflict(
+                &field,
+                "'denm' is the ETSI stack's event message (EN 302 637-3) and goes out over \
+                 GeoNetworking/BTP; with net.layer 'wsmp' it would be a DENM on a US channel \
+                 under the BSM's PSID. Set net.layer to 'gn-btp' (the US stack's hard-braking \
+                 signal is the BSM's event flag, not a separate message)"
+                    .to_string(),
+            )),
+            "denm" => {}
+            "spat" | "map" if !role(set) => e.push(conflict(
+                &field,
                 format!(
-                    "'{set}' has no generator: `v2xw_node::ServiceSet` carries a flag for                      the CAM and a flag for the BSM and nothing else, so a node would never                      decide to send one. 06-node-models.md §2.1's application layer is the                      seam; until it ships, only 'bsm' and 'cam' reach the air"
+                    "'{set}' is broadcast by a roadside unit wired to a signal controller, \
+                     and no actors.rsus entry has the '{set}' role; add one standing at a \
+                     signalised junction"
                 ),
-            ));
+            )),
+            "spat" | "map" => {}
+            "srm" if !has("map") => e.push(conflict(
+                &field,
+                "'srm' is a vehicle's request to the junction whose MAP it heard; without \
+                 'map' in messages.sets no vehicle knows a junction to ask"
+                    .to_string(),
+            )),
+            "srm"
+                if !s
+                    .actors
+                    .vehicles
+                    .classes
+                    .get("emergency")
+                    .is_some_and(|c| c.fraction > 0.0) =>
+            {
+                e.push(conflict(
+                    &field,
+                    "'srm' is sent by vehicles entitled to signal priority, which in this build \
+                     is the 'emergency' class, and actors.vehicles.classes gives it no share"
+                        .to_string(),
+                ));
+            }
+            "srm" => {}
+            "ssm" if !(has("srm") && role("spat")) => e.push(conflict(
+                &field,
+                "'ssm' is a signal controller's answer to a request: it needs 'srm' in \
+                 messages.sets and a roadside unit with the 'spat' role to answer from"
+                    .to_string(),
+            )),
+            "ssm" => {}
+            "cpm" => e.push(conflict(
+                &field,
+                "'cpm' (ETSI TS 103 324) reports the objects a station's sensors perceive, \
+                 and no perception model exists in this build to fill one: a CPM here would \
+                 be an empty container of the right size, which is not a collective \
+                 perception message"
+                    .to_string(),
+            )),
+            _ => e.push(conflict(
+                &field,
+                format!(
+                    "'{set}' has no generator in this build: a node would never decide to \
+                     send one"
+                ),
+            )),
         }
-    }
-
-    // The codec tier. `ObuRuntime` constructs an `EtsiUperCodec` and calls the J2735 BSM
-    // encoder directly; `v2xw_msg::J2735SizeCodec` exists and nothing selects it.
-    if s.messages.codec_tier != "uper" {
-        e.push(conflict(
-            "messages.codec_tier",
-            format!(
-                "is '{}', and the node runtime encodes real UPER unconditionally: it holds                  an `EtsiUperCodec` and calls the J2735 BSM encoder directly, and nothing                  reads this field to choose `v2xw_msg::J2735SizeCodec` instead. Build                  decision D2's size model is reachable through `v2xw-msg` and not through a                  scenario, so 'size-model' here would select nothing",
-                s.messages.codec_tier
-            ),
-        ));
     }
 }
 
@@ -1481,11 +1547,12 @@ fn messages(s: &Scenario, e: &mut Vec<ScenarioError>) {
             ));
         }
     }
-    // D2: the hand-written J2735 codec covers the BSM. SPaT, MAP, PSM, SRM and SSM have a
-    // validated size model and no real encoder, so `uper` cannot be honoured for them.
+    // D2: the BSM, SPaT and MAP have hand-written J2735 encoders and the CAM and DENM
+    // generated ETSI ones; PSM, SRM and SSM have a validated size model and no real
+    // encoder, so `uper` cannot be honoured for them.
     if s.messages.codec_tier == "uper" {
         for (i, set) in s.messages.sets.iter().enumerate() {
-            if matches!(set.as_str(), "spat" | "map" | "psm") {
+            if matches!(set.as_str(), "srm" | "ssm" | "psm") {
                 e.push(conflict(
                     &format!("messages.sets[{i}]"),
                     format!(

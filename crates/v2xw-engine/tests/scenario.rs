@@ -310,9 +310,12 @@ fn a_key_the_engine_cannot_act_on_is_refused_and_names_itself() {
             "messages.sets[0]",
             Box::new(|s: &mut Scenario| s.messages.sets = vec!["denm".to_string()]),
         ),
+        // `messages.codec_tier: size-model` is acted on now (the generator sizes the
+        // message instead of encoding it), so it left this list. A collective perception
+        // message has no perception model to fill it and is refused by name.
         (
-            "messages.codec_tier",
-            Box::new(|s: &mut Scenario| s.messages.codec_tier = "size-model".to_string()),
+            "messages.sets[0]",
+            Box::new(|s: &mut Scenario| s.messages.sets = vec!["cpm".to_string()]),
         ),
     ];
 

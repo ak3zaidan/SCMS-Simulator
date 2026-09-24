@@ -232,7 +232,10 @@ fn a_message_is_handed_over_when_its_verification_finishes() {
         step.delivered
     );
     assert!(step.rx_reports.iter().all(|r| r.token != 42));
-    assert!(rt.neighbors().is_empty(), "the neighbour table learned it early");
+    assert!(
+        rt.neighbors().is_empty(),
+        "the neighbour table learned it early"
+    );
 
     let done = rt
         .next_completion_after(t0)
@@ -897,4 +900,100 @@ fn an_unknown_signer_costs_a_p2pcd_request_and_a_full_certificate_stops_it() {
         "one attachment served the whole second"
     );
     assert_eq!(tb.peer_cache_entries, 1);
+}
+
+// -------------------------------------------------------------------------------------
+// The event and infrastructure services
+// -------------------------------------------------------------------------------------
+
+/// A roadside unit signs and sends the SPaT and the MAP its controller feed installed, at
+/// 10 Hz and 1 Hz, and nothing when no feed installed one.
+#[test]
+fn a_roadside_unit_sends_what_its_controller_gave_it_at_the_standard_rates() {
+    let services = ServiceSet {
+        spat: true,
+        map: true,
+        ..ServiceSet::NONE
+    };
+    let mut rt = node_on("rsu/commsignia-its-rs4", services);
+    let silent = run(&mut rt, 5, 100 * NS_PER_MS, |_| Vec::new());
+    assert_eq!(
+        silent.iter().map(|o| o.transmissions.len()).sum::<usize>(),
+        0,
+        "no feed, nothing to send"
+    );
+    rt.set_infra_payload(MsgType::Spat, vec![0x00, 0x13, 0x05, 1, 2, 3, 4, 5]);
+    rt.set_infra_payload(
+        MsgType::Map,
+        vec![0x00, 0x12, 0x09, 9, 8, 7, 6, 5, 4, 3, 2, 1],
+    );
+    let out = run_from(&mut rt, 5, 20, 100 * NS_PER_MS, |_| Vec::new());
+    let count = |ty: MsgType| {
+        out.iter()
+            .flat_map(|o| o.transmissions.iter())
+            .filter(|t| t.msg_type == ty)
+            .count()
+    };
+    assert_eq!(count(MsgType::Spat), 20, "10 Hz over two seconds");
+    assert_eq!(count(MsgType::Map), 2, "1 Hz over two seconds");
+    assert_eq!(
+        count(MsgType::Bsm) + count(MsgType::Cam),
+        0,
+        "a mast is not a vehicle"
+    );
+    // The payload on the air is the one the feed installed, byte for byte.
+    let spat = out
+        .iter()
+        .flat_map(|o| o.transmissions.iter())
+        .find(|t| t.msg_type == MsgType::Spat)
+        .unwrap();
+    assert_eq!(
+        spat.signed.as_ref().unwrap().payload,
+        vec![0x00, 0x13, 0x05, 1, 2, 3, 4, 5]
+    );
+}
+
+/// Hard braking raises one DENM event per episode, repeated every 100 ms for 2 s, and the
+/// DENM decodes as a dangerous situation at the position the vehicle braked at.
+#[test]
+fn hard_braking_raises_a_dangerous_situation_denm() {
+    let services = ServiceSet {
+        cam: true,
+        denm: true,
+        ..ServiceSet::NONE
+    };
+    let mut rt = node_on(v2xw_node::profiles::REFERENCE_OBU, services);
+    // Cruising, then braking at 5 m/s² for half a second, then cruising: one episode.
+    rt.set_own_acceleration(0.0);
+    let mut outs = run(&mut rt, 10, 100 * NS_PER_MS, |_| Vec::new());
+    rt.set_own_acceleration(-5.0);
+    outs.extend(run_from(&mut rt, 10, 5, 100 * NS_PER_MS, |_| Vec::new()));
+    rt.set_own_acceleration(-1.0);
+    outs.extend(run_from(&mut rt, 15, 30, 100 * NS_PER_MS, |_| Vec::new()));
+    let denms: Vec<&v2xw_node::Transmission> = outs
+        .iter()
+        .flat_map(|o| o.transmissions.iter())
+        .filter(|t| t.msg_type == MsgType::Denm)
+        .collect();
+    assert_eq!(rt.events().denm_raised(), 1, "one episode, one event");
+    assert!(
+        (19..=21).contains(&denms.len()),
+        "every 100 ms for 2 s: {} frames",
+        denms.len()
+    );
+    let decoded = v2xw_msg::denm::decode_denm(&denms[0].signed.as_ref().unwrap().payload)
+        .expect("a real DENM");
+    let cause = format!("{:?}", decoded.denm.situation.as_ref().unwrap().event_type);
+    assert!(cause.contains("dangerousSituation"), "{cause}");
+    // Gentle braking raises nothing.
+    let mut calm = node_on(v2xw_node::profiles::REFERENCE_OBU, services);
+    calm.set_own_acceleration(-3.0);
+    let quiet = run(&mut calm, 30, 100 * NS_PER_MS, |_| Vec::new());
+    assert_eq!(calm.events().denm_raised(), 0);
+    assert!(
+        quiet
+            .iter()
+            .flat_map(|o| o.transmissions.iter())
+            .all(|t| t.msg_type != MsgType::Denm)
+    );
 }

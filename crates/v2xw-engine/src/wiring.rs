@@ -1103,10 +1103,52 @@ pub fn obu_profile_id(scenario: &Scenario, class: VehicleClass) -> &str {
 /// them. `validate` refuses a set this build has no generator for, so anything that
 /// reaches here is one of the two or is deliberately absent.
 pub fn service_set(scenario: &Scenario) -> ServiceSet {
+    let has = |name: &str| scenario.messages.sets.iter().any(|s| s == name);
     ServiceSet {
-        cam: scenario.messages.sets.iter().any(|s| s == "cam"),
-        bsm: scenario.messages.sets.iter().any(|s| s == "bsm"),
+        cam: has("cam"),
+        bsm: has("bsm"),
+        denm: has("denm"),
+        ..ServiceSet::NONE
     }
+}
+
+/// The services a vehicle of `class` runs: [`service_set`], plus the signal request when
+/// the scenario asks for `srm` and the vehicle is one entitled to priority.
+///
+/// J2735's `SignalRequestMessage` is sent by a vehicle with a priority or pre-emption
+/// entitlement, and the fleet class that has one is [`VehicleClass::Emergency`]. Transit
+/// priority (a bus asking for an extended green) is the same message and would be a second
+/// class here; this build does not model it, and says so on the key's status.
+pub fn vehicle_services(scenario: &Scenario, class: VehicleClass) -> ServiceSet {
+    let has = |name: &str| scenario.messages.sets.iter().any(|s| s == name);
+    ServiceSet {
+        srm: has("srm") && class == VehicleClass::Emergency,
+        ..service_set(scenario)
+    }
+}
+
+/// The services a roadside unit runs: the intersection broadcasts its roles name and the
+/// scenario's `messages.sets` turns on. A unit with the `spat` role answers signal
+/// requests (SSM) when `ssm` is on, because the unit wired to the controller is the one
+/// that can say what became of a request.
+pub fn rsu_services(scenario: &Scenario, roles: &[String]) -> ServiceSet {
+    let has = |name: &str| scenario.messages.sets.iter().any(|s| s == name);
+    let role = |name: &str| {
+        roles
+            .iter()
+            .any(|r| r == name || r == "spat-map" && (name == "spat" || name == "map"))
+    };
+    ServiceSet {
+        spat: has("spat") && role("spat"),
+        map: has("map") && role("map"),
+        ssm: has("ssm") && role("spat"),
+        ..ServiceSet::NONE
+    }
+}
+
+/// Whether the node's facilities layer is ETSI's: the GeoNetworking/BTP stack.
+pub fn etsi_facilities(scenario: &Scenario) -> bool {
+    scenario.net.layer == "gn-btp"
 }
 
 /// The envelope profile `security.envelope` names.
@@ -1211,7 +1253,8 @@ pub fn build_node(
     let (bsm_params, cam_params) = generator_params(scenario);
     let config = NodeConfig {
         tx_power_dbm: TX_POWER_DBM,
-        services: service_set(scenario),
+        services: vehicle_services(scenario, class),
+        etsi_facilities: etsi_facilities(scenario),
         crypto_mode: crypto_mode(scenario),
         wall: env.wall,
         origin: env.origin,
@@ -1508,10 +1551,10 @@ pub fn build_rsu(
         });
     let config = NodeConfig {
         tx_power_dbm: TX_POWER_DBM,
-        services: v2xw_node::ServiceSet {
-            cam: false,
-            bsm: false,
-        },
+        // No awareness messages — a mast is not a vehicle — and the intersection
+        // broadcasts its roles name ([`rsu_services`]).
+        services: rsu_services(scenario, &spec.roles),
+        etsi_facilities: etsi_facilities(scenario),
         crypto_mode: crypto_mode(scenario),
         wall: env.wall,
         origin: env.origin,

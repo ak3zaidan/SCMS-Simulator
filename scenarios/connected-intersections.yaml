@@ -1,0 +1,136 @@
+# Connected intersections: roadside units broadcasting SPaT and MAP, and emergency vehicles
+# asking them for priority.
+#
+# A procedural Midtown-shaped block — six avenues by six streets, signalised — with a roadside
+# unit on the controller of four junctions along the middle avenue. Each unit broadcasts its
+# junction's SPaT at 10 Hz and its MAP at 1 Hz (CTI 4501, via 04-models.md §8.1), built from
+# the very signal plan the drivers obey, so a receiver's view of a light is the light. One
+# vehicle in ten is an emergency vehicle; when it has heard a junction's MAP and the
+# junction is within 300 m ahead, it sends a signal request (SRM) once a second, and the
+# junction's unit answers with a signal status (SSM). No controller in this build grants
+# the priority — it is acknowledged, not given — and the SRM and SSM are sized by the
+# validated size model because no real encoder for them exists (build decision D2), which is
+# why `codec_tier` is `size-model` here. The BSM, SPaT and MAP are still encoded for real.
+#
+# Open it on the page, follow an emergency vehicle, and its broadcasts list the SRMs; follow
+# any car near one of the four junctions and its receptions list the SPaT and MAP.
+schema: v2xw/scenario/1
+meta:
+  name: connected-intersections
+  description: >-
+    Four roadside units broadcasting SPaT and MAP from the engine's own signal plans, with
+    emergency vehicles requesting signal priority (SRM) and the units answering (SSM).
+  authors: [v2xw]
+  tags: [spat, map, srm, ssm, rsu, procedural, dsrc]
+  created: "2026-09-24"
+
+seed: "0xC0FFEE_5EED"
+
+time:
+  t0: "2027-03-04T08:00:00Z"
+  duration_s: 60.0
+  mobility_step_ms: 100
+  des_resolution: 1us
+
+world:
+  source:
+    kind: procedural
+    generator: world/source/procedural-grid
+    params:
+      cols: 6
+      rows: 6
+      block_x_m: 274.0
+      block_y_m: 80.0
+      lanes_per_direction: 2
+      lane_width_m: 3.5
+      sidewalk_m: 2.0
+      speed_limit_mps: 11.176
+      signalised: true
+      cycle_s: 60.0
+      amber_s: 3.0
+      crossings: true
+      block_buildings: true
+      building_height_m: 30.0
+      # One infrastructure site per junction, at its centre. Site k is junction k, row by
+      # row: site = row * cols + col.
+      rsu_at_junctions: true
+      corner_radius_m: 4.5
+  imported_at: "2026-09-18T00:00:00Z"
+  buildings:
+    enabled: true
+    keep_holes: true
+  terrain:
+    dem: null
+
+actors:
+  vehicles:
+    equipped_fraction: 1.0
+    demand:
+      kind: mobility/demand/poisson
+      rate_veh_per_h: 3000.0
+    classes:
+      passenger:
+        fraction: 0.9
+      emergency:
+        fraction: 0.1
+  # Four units on the middle avenue (column 2), rows 1 to 4. `spat` puts the junction's SPaT
+  # on the air and answers signal requests; `map` its geometry.
+  #
+  # The Commsignia ITS-RS4 profile, because a unit signs every SPaT and MAP on its own HSM
+  # and the RS4 is the roadside profile that publishes a signing cost. Its figure — 50 ms
+  # per ECDSA signature — is the flagged upper bound from its brief (the profile says why);
+  # at 11 signatures a second it keeps the unit's HSM about half busy. The Cohda MK5 RSU
+  # profile publishes none, and the engine refuses to build a SPaT unit on it rather than
+  # let it sign for free.
+  rsus:
+    - site: 8
+      roles: [spat, map]
+      profile: rsu/commsignia-its-rs4
+    - site: 14
+      roles: [spat, map]
+      profile: rsu/commsignia-its-rs4
+    - site: 20
+      roles: [spat, map]
+      profile: rsu/commsignia-its-rs4
+    - site: 26
+      roles: [spat, map]
+      profile: rsu/commsignia-its-rs4
+
+weather:
+  initial: clear
+  intensity: 0.0
+
+radio:
+  rat: dsrc-80211p
+  tiers:
+    propagation: medium
+    phy: medium
+    mac: medium
+
+net:
+  layer: wsmp
+
+messages:
+  sets: [bsm, spat, map, srm, ssm]
+  codec_tier: size-model
+
+security:
+  envelope: ieee1609.2
+  signature: ecdsa-p256
+  crypto_mode: modeled
+  verification_policy: prioritized
+  signer_id_policy:
+    full_cert_every_ms: 1000
+    digest_otherwise: true
+  pseudonym_change:
+    strategy: time
+    period_s: 300.0
+
+nodes:
+  default_obu: obu/unex-obu-301-craton2
+  compute_tier: medium
+  backend_tier: medium
+
+metrics: [all]
+
+exporters: []

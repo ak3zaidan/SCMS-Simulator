@@ -254,6 +254,9 @@ pub struct RunReport {
     /// How many frames were *not* generated because the instant fell in a time-dilation
     /// window (02-architecture.md §5.4).
     pub suppressed_frames: u64,
+    /// How many times a roadside unit's SPaT failed to encode, so the unit sent its last
+    /// good one. Zero in a healthy run; anything else is an encoder defect.
+    pub infra_encode_failures: u64,
     /// How many records the engine **emitted**.
     ///
     /// Not what was stored: a recorder can refuse a record the engine handed it (an
@@ -572,6 +575,8 @@ pub struct Engine {
     /// When each node is next woken to hand over a finished signature check
     /// ([`crate::event::NodeTask::Deliver`]): at most one pending wake per node.
     node_wake: BTreeMap<NodeId, SimTime>,
+    /// The junction each SPaT- or MAP-broadcasting roadside unit is wired to.
+    infra_feeds: BTreeMap<NodeId, crate::infra::IntersectionFeed>,
     report: RunReport,
 }
 
@@ -764,11 +769,13 @@ impl Engine {
             jamming: jammers,
             prr_bins: v2xw_metrics::comms::prr_bins(),
             node_wake: BTreeMap::new(),
+            infra_feeds: BTreeMap::new(),
             report: RunReport::default(),
         };
         let phase2 = crate::phase2::Phase2::build(&engine.scenario, &engine.world)?;
         engine.phase2 = phase2;
         engine.create_rsus();
+        engine.attach_intersection_feeds()?;
         engine.seed_timeline();
         Ok(engine)
     }
@@ -979,6 +986,127 @@ impl Engine {
             self.report.nodes_created += 1;
             if let Some(phase2) = self.phase2.as_mut() {
                 phase2.note_rsu(id);
+            }
+        }
+    }
+
+    /// Connects every roadside unit that broadcasts SPaT or MAP to its junction's
+    /// controller and survey ([`crate::infra`]), and installs its MAP.
+    ///
+    /// A unit with the role and no signalised junction within
+    /// [`crate::infra::SERVICE_RADIUS_M`] is refused here, by index, rather than left to
+    /// broadcast nothing: a scenario that asked for SPaT and got silence would look like a
+    /// radio problem.
+    ///
+    /// # Errors
+    /// [`EngineError::Scenario`] naming the unit and what it lacks.
+    fn attach_intersection_feeds(&mut self) -> Result<()> {
+        let Some(phase2) = self.phase2.as_ref() else {
+            return Ok(());
+        };
+        let units: Vec<(usize, NodeId, Vec3, Vec<String>)> = phase2
+            .rsu_specs()
+            .iter()
+            .zip(phase2.rsu_nodes())
+            .enumerate()
+            .map(|(i, (spec, node))| (i, *node, spec.position, spec.roles.clone()))
+            .collect();
+        let origin: v2xw_core::geo::GeoOrigin = self.world.origin.into();
+        for (i, node, mast, roles) in units {
+            let services = crate::wiring::rsu_services(&self.scenario, &roles);
+            if !(services.spat || services.map) {
+                continue;
+            }
+            let conflict = |why: String| {
+                EngineError::Scenario(crate::error::ScenarioError::conflict(
+                    &format!("actors.rsus[{i}]"),
+                    why,
+                ))
+            };
+            // A unit signs every SPaT and MAP on its own hardware, and a profile that
+            // publishes no signing cost signs nothing (`ObuRuntime` never signs for free).
+            // Refused here by name rather than left to broadcast silence.
+            let signs = self
+                .nodes
+                .get(&node)
+                .is_some_and(|n| n.profile().op_cost(NodeConfig::default().sign_op).is_some());
+            if !signs {
+                let profile = self
+                    .nodes
+                    .get(&node)
+                    .map_or_else(String::new, |n| n.profile().id.clone());
+                return Err(conflict(format!(
+                    "broadcasts SPaT or MAP, and its hardware profile '{profile}' publishes no \
+                     ECDSA signing cost, so it cannot sign what it would broadcast; choose a \
+                     roadside profile with one, such as rsu/commsignia-its-rs4"
+                )));
+            }
+            let plan = crate::infra::IntersectionFeed::nearest_plan(&self.world, mast).ok_or_else(
+                || {
+                    conflict(format!(
+                        "broadcasts SPaT or MAP, and no signalised junction stands within {} m of \
+                     its mast: a roadside unit is wired to the controller of the junction it \
+                     stands at. Move it onto a junction or drop the role",
+                        crate::infra::SERVICE_RADIUS_M
+                    ))
+                },
+            )?;
+            let feed = crate::infra::IntersectionFeed::build(&self.world, plan, origin)
+                .map_err(|why| conflict(format!("cannot describe its junction: {why}")))?;
+            if services.map {
+                let framing = self.infra_framing(node);
+                let bytes = feed
+                    .map_bytes(framing)
+                    .map_err(|why| conflict(format!("its MAP does not encode: {why}")))?;
+                if let Some(runtime) = self.nodes.get_mut(&node) {
+                    runtime.set_infra_payload(v2xw_msg::MsgType::Map, bytes);
+                }
+            }
+            self.infra_feeds.insert(node, feed);
+        }
+        Ok(())
+    }
+
+    /// How `node`'s intersection messages are framed: J2735 on the WSMP stack, ETSI on the
+    /// GeoNetworking one, with the station id its active pseudonym gives it.
+    fn infra_framing(&self, node: NodeId) -> crate::infra::InfraFraming {
+        if !crate::wiring::etsi_facilities(&self.scenario) {
+            return crate::infra::InfraFraming::J2735;
+        }
+        let station_id = self
+            .nodes
+            .get(&node)
+            .and_then(|n| n.stores().certs.active())
+            .map_or(0, |c| {
+                u32::from_be_bytes([c.digest.0[0], c.digest.0[1], c.digest.0[2], c.digest.0[3]])
+            });
+        crate::infra::InfraFraming::Etsi { station_id }
+    }
+
+    /// Hands each selected roadside unit its controller's state at `now`: the SPaT its
+    /// schedule signs if a broadcast is due at this step.
+    fn feed_controllers(&mut self, only: Option<NodeId>, now: SimTime) {
+        let units: Vec<NodeId> = self
+            .infra_feeds
+            .keys()
+            .copied()
+            .filter(|n| only.is_none_or(|o| o == *n))
+            .collect();
+        for node in units {
+            let framing = self.infra_framing(node);
+            let Some(feed) = self.infra_feeds.get(&node) else {
+                continue;
+            };
+            // A SPaT that does not encode is a defect in the encoder, not in the run; the
+            // unit keeps the last good one rather than sending a truncated message, and the
+            // count is in the run report.
+            match feed.spat_bytes(now, self.wall, framing) {
+                Ok(bytes) => {
+                    if let Some(runtime) = self.nodes.get_mut(&node) {
+                        runtime.set_infra_payload(v2xw_msg::MsgType::Spat, bytes);
+                    }
+                }
+                Err(_) => self.report.infra_encode_failures += 1,
             }
         }
     }
@@ -1574,9 +1702,22 @@ impl Engine {
             // the firewall leaves open, from the engine, which knows both numbers.
             let error =
                 v2xw_core::math::hypot(belief.pos.x - truth.pos.x, belief.pos.y - truth.pos.y);
+            // The vehicle's own accelerometer: its longitudinal acceleration along its
+            // heading, which is what a hard-braking trigger reads (`v2xw_node::events`).
+            // The vehicle's own sensor about itself, like the position fix — no view of
+            // anyone else — and without a noise model: a MEMS accelerometer's error is
+            // hundredths of a m/s² against a 3.92 m/s² threshold.
+            // The same quantity, to the bit, that `gt.kinematics` records as `acc_mps2`.
+            let q = truth.quantized();
+            let a_long = v2xw_core::math::q3(crate::records::longitudinal(
+                q.acc.x,
+                q.acc.y,
+                q.heading_rad,
+            ));
             if let Some(runtime) = self.nodes.get_mut(&node) {
                 runtime.set_belief(belief.quantized());
                 runtime.observe_truth(error as f32);
+                runtime.set_own_acceleration(a_long);
             }
             self.update_dcc(node, now);
         }
@@ -1753,6 +1894,9 @@ impl Engine {
             && !wake
         {
             self.dead_reckon_belief(node, now);
+        }
+        if !wake {
+            self.feed_controllers(only, now);
         }
         let mut inboxes = core::mem::take(&mut self.inboxes);
         let rng = &self.rng;
@@ -2195,13 +2339,19 @@ impl Engine {
         // The frame on the air is the SPDU inside a network and transport header, LLC/SNAP,
         // the 802.11 MAC header and the FCS (`v2xw_net::frame`); the PHY's air time and the
         // MSDU cap are over all of it, not over the SPDU alone.
+        // A SPaT or a MAP claims the junction it describes, not the mast that sends it:
+        // that is the position its payload carries (the MAP's reference point), and the one
+        // a receiver files the junction under.
+        if matches!(
+            tx.msg_type,
+            v2xw_msg::MsgType::Spat | v2xw_msg::MsgType::Map
+        ) && let Some(feed) = self.infra_feeds.get(&node)
+        {
+            claim = (feed.position, 0.0, 0.0);
+        }
         let mut layers = v2xw_net::FrameLayers::compose(
             &self.net,
-            if tx.msg_type == v2xw_msg::MsgType::Denm {
-                v2xw_net::FrameMsg::Denm
-            } else {
-                v2xw_net::FrameMsg::Safety
-            },
+            frame_msg(tx.msg_type),
             tx.payload_bytes().zip(tx.envelope_bytes()),
             tx.bytes,
         );
@@ -3849,6 +3999,18 @@ fn message_content(
         c.part_ii = Some(u8::try_from(m.part_ii.len()).unwrap_or(u8::MAX));
     }
     c
+}
+
+/// The network layer's shape for a message type: which PSID or BTP port it goes under.
+const fn frame_msg(t: v2xw_msg::MsgType) -> v2xw_net::FrameMsg {
+    match t {
+        v2xw_msg::MsgType::Denm => v2xw_net::FrameMsg::Denm,
+        v2xw_msg::MsgType::Spat => v2xw_net::FrameMsg::Spat,
+        v2xw_msg::MsgType::Map => v2xw_net::FrameMsg::Map,
+        v2xw_msg::MsgType::Srm => v2xw_net::FrameMsg::Srm,
+        v2xw_msg::MsgType::Ssm => v2xw_net::FrameMsg::Ssm,
+        _ => v2xw_net::FrameMsg::Safety,
+    }
 }
 
 fn msg_type_name(t: v2xw_msg::MsgType) -> &'static str {

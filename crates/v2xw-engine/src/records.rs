@@ -141,7 +141,7 @@ impl GtKinematics {
 }
 
 /// The component of a horizontal acceleration along `heading_rad`, m/s².
-fn longitudinal(ax: f64, ay: f64, heading_rad: f64) -> f64 {
+pub(crate) fn longitudinal(ax: f64, ay: f64, heading_rad: f64) -> f64 {
     let (s, c) = v2xw_core::math::sin_cos(heading_rad);
     ax * c + ay * s
 }

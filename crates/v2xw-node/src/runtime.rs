@@ -348,6 +348,9 @@ pub struct NodeConfig {
     pub bsm_params: v2xw_msg::generator::BsmGenParams,
     /// The CAM generator's triggering rules (EN 302 637-2; `messages.generator`).
     pub cam_params: v2xw_msg::generator::CamGenParams,
+    /// Whether the node's facilities layer is ETSI's (the GeoNetworking/BTP stack): an
+    /// SRM or SSM then goes out as a SREM or SSEM, with the ETSI `ItsPduHeader` in front.
+    pub etsi_facilities: bool,
 }
 
 impl Default for NodeConfig {
@@ -375,6 +378,7 @@ impl Default for NodeConfig {
             psid: PSID_SAFETY,
             bsm_params: v2xw_msg::generator::BsmGenParams::j2945_1(),
             cam_params: v2xw_msg::generator::CamGenParams::en302637_2(),
+            etsi_facilities: false,
         }
     }
 }
@@ -419,6 +423,8 @@ pub struct ObuRuntime {
     stores: Stores,
     policy: Box<dyn VerificationPolicy>,
     schedule: MessageSchedule,
+    /// The event-driven and infrastructure services (DENM, SPaT, MAP, SRM, SSM).
+    events: crate::events::EventServices,
     state: NodeState,
     received: Vec<VerifiedMessage>,
     evidence_capacity: usize,
@@ -504,6 +510,7 @@ impl ObuRuntime {
             policy,
             schedule: MessageSchedule::new(config.services)
                 .with_params(config.cam_params, config.bsm_params),
+            events: crate::events::EventServices::default(),
             state: NodeState::Active,
             received: Vec::new(),
             evidence_capacity: 256,
@@ -600,6 +607,24 @@ impl ObuRuntime {
     pub fn set_dcc(&mut self, dcc: DccState, state_code: u16) {
         self.dcc = dcc;
         self.dcc_state_code = state_code;
+    }
+
+    /// Installs the SPaT or MAP payload a roadside unit's controller feed produced; the
+    /// unit's schedule signs and sends it at the standard's rate ([`crate::events`]).
+    pub fn set_infra_payload(&mut self, msg_type: MsgType, bytes: Vec<u8>) {
+        self.events.set_infra_payload(msg_type, bytes);
+    }
+
+    /// The vehicle's own longitudinal acceleration, m/s², from its own accelerometer —
+    /// the input the hard-braking DENM trigger reads ([`crate::events`]). Like the
+    /// position belief it is the vehicle's own sensor, handed in from outside.
+    pub fn set_own_acceleration(&mut self, a_mps2: f64) {
+        self.events.set_own_acceleration(a_mps2);
+    }
+
+    /// The event and infrastructure services' state, for a test or a report.
+    pub fn events(&self) -> &crate::events::EventServices {
+        &self.events
     }
 
     /// Installs the relevance scores a safety application published
@@ -1236,7 +1261,17 @@ impl ObuRuntime {
     fn deliver(&mut self, m: VerifiedMessage, out: &mut StepOutcome) {
         self.window
             .delivered(m.verification == VerificationState::Verified);
+        self.events.on_delivered(&m);
+        // The neighbour table is a table of *stations moving around this one*, and what
+        // fills it is their awareness messages. A SPaT, a MAP or a signal request says
+        // where a junction is, not where its sender is going, and a DENM describes an
+        // event rather than a station; none of them makes its sender a neighbour.
+        let describes_a_station = !matches!(
+            m.msg_type,
+            MsgType::Spat | MsgType::Map | MsgType::Srm | MsgType::Ssm | MsgType::Denm
+        );
         if m.verification != VerificationState::Invalid
+            && describes_a_station
             && let Some(signer) = m.signer.clone()
         {
             self.stores.neighbors.observe(Neighbor {
@@ -1278,14 +1313,20 @@ impl ObuRuntime {
         // The two arguments are the node's own clock and the node's own belief. Nothing
         // else is in scope, and `crate::firewall` checks that this stays true.
         let requests = self.schedule.due(believed, &self.belief, &self.dcc);
-        if requests.is_empty() {
+        let station_id = self.stores.certs.active().map(|c| {
+            u32::from_be_bytes([c.digest.0[0], c.digest.0[1], c.digest.0[2], c.digest.0[3]])
+        });
+        let events = self
+            .events
+            .due(believed, &self.belief, self.schedule.services(), station_id);
+        if requests.is_empty() && events.is_empty() {
             return;
         }
+        let wanted = (requests.len() + events.len()) as u32;
         let Some(cred) = self.stores.certs.active().cloned() else {
             // No usable credential: a node on the CRL, or one whose pool has run out.
             // [CAMP-EE §2.2.10.2] — it stops transmitting rather than sending unsigned.
-            self.drops
-                .record_n(DropCause::TxOverflow, requests.len() as u32);
+            self.drops.record_n(DropCause::TxOverflow, wanted);
             return;
         };
         // The credential protocol's stand-in: a real key and a real certificate for every
@@ -1298,31 +1339,47 @@ impl ObuRuntime {
         // certificate that only came into existence at the moment the node rotated onto it
         // would let a revoked node walk away from its revocation by rotating.
         if !self.provision_all(ctx, believed) {
-            self.drops
-                .record_n(DropCause::TxOverflow, requests.len() as u32);
+            self.drops.record_n(DropCause::TxOverflow, wanted);
             return;
         }
         if !self.security.set_active(cred.i_period, cred.j_index) {
-            self.drops
-                .record_n(DropCause::TxOverflow, requests.len() as u32);
+            self.drops.record_n(DropCause::TxOverflow, wanted);
             return;
         }
         let Some(cred) = self.stores.certs.active().cloned() else {
-            self.drops
-                .record_n(DropCause::TxOverflow, requests.len() as u32);
+            self.drops.record_n(DropCause::TxOverflow, wanted);
             return;
         };
 
+        let mut built: Vec<(MsgType, SimTime, Option<Vec<u8>>)> =
+            Vec::with_capacity(wanted as usize);
         for r in requests {
-            let Some(payload) = self.encode_payload(r.msg_type, believed, &cred) else {
+            built.push((
+                r.msg_type,
+                r.at,
+                self.encode_payload(r.msg_type, believed, &cred),
+            ));
+        }
+        for e in events {
+            let ty = e.msg_type();
+            let payload = self.events.encode(&e, believed, &cred, &self.config);
+            built.push((ty, believed, payload));
+        }
+        for (msg_type, at, payload) in built {
+            let Some(payload) = payload else {
                 // The node could not build a conformant message — a belief with no fix, a
                 // position outside the ASN.1's range, a clock before the 1609.2 epoch. It
                 // transmits nothing rather than a payload that would not decode.
                 self.drops.record(DropCause::TxOverflow);
                 continue;
             };
-            let sid = self.security.signer_id_for(r.msg_type, believed);
-            let Ok((frame, pdu)) = self.security.sign(ctx, r.msg_type, &payload, sid, None) else {
+            let r = (msg_type, at);
+            let sid = self.security.signer_id_for(r.0, believed);
+            // TS 103 097 §7.1.2: a DENM's envelope carries its generation location, and the
+            // ETSI profile refuses to sign one without it. The node's own belief.
+            let location = (r.0 == MsgType::Denm)
+                .then(|| generation_location(&self.belief, self.config.origin));
+            let Ok((frame, pdu)) = self.security.sign(ctx, r.0, &payload, sid, location) else {
                 self.drops.record(DropCause::TxOverflow);
                 continue;
             };
@@ -1343,24 +1400,24 @@ impl ObuRuntime {
             let full_certificate = pdu.signer_id == v2xw_sec::SignerIdChoice::Certificate;
             let bytes = frame.bytes_on_wire();
             let tx = Transmission {
-                msg_type: r.msg_type,
+                msg_type: r.0,
                 bytes,
                 signer: cred.digest.clone(),
                 full_certificate,
                 ready_at: sched.finish,
-                generation_time: r.at,
+                generation_time: r.1,
                 sign_start: sched.start,
                 signed: Some(frame),
             };
             if let Admission::Refused(_) = self.queues[3].push(Queued {
                 item: RxFrame {
                     signer: Some(cred.digest.clone()),
-                    msg_type: r.msg_type,
+                    msg_type: r.0,
                     bytes,
                     claimed_pos: Some(self.belief.pos),
                     claimed_speed_mps: self.belief.ground_speed_mps(),
                     claimed_heading_rad: self.belief.heading_rad,
-                    claimed_generation_time: r.at,
+                    claimed_generation_time: r.1,
                     full_certificate,
                     signature_valid: true,
                     claimed_cert_period: cred.i_period,
@@ -1374,8 +1431,7 @@ impl ObuRuntime {
             }
             let _ = self.queues[3].pop();
             if full_certificate {
-                self.security
-                    .note_certificate_attached(r.msg_type, believed);
+                self.security.note_certificate_attached(r.0, believed);
             }
             // Air time is the PHY's to compute; until a scenario wires one in, the node
             // reports the byte count and leaves `airtime_ms_per_s` at zero contribution
@@ -1480,8 +1536,12 @@ impl ObuRuntime {
                 debug_assert!(encoded.is_real(), "the J2735 encoder produces real bytes");
                 Some(encoded.bytes)
             }
-            // Nothing else is generated here. A DENM is an application's decision and a
-            // CRL or a report is the engine's; none of them arrives through the schedule.
+            // A roadside unit's intersection messages: what its controller feed installed,
+            // signed as it stands. A unit with no feed sends nothing rather than an empty
+            // message.
+            MsgType::Spat | MsgType::Map => self.events.infra_payload(msg_type).map(<[u8]>::to_vec),
+            // Nothing else is generated here. A DENM, an SRM and an SSM are the event
+            // services' (`crate::events`), and a CRL or a report is the engine's.
             _ => None,
         }
     }
@@ -1574,6 +1634,26 @@ impl ObuRuntime {
     }
 }
 
+/// The 1609.2 `ThreeDLocation` a DENM's envelope carries, from the node's own belief.
+///
+/// Latitude and longitude in tenths of a microdegree (1609.2 `NinetyDegreeInt`,
+/// `OneEightyDegreeInt`). The 16-bit `Elevation` is decimetres with an offset of 4 096 so
+/// that 0 is −409.6 m — **recalled, UNVERIFIED** against 1609.2 §6.4; it is clamped into
+/// the range rather than wrapped.
+fn generation_location(
+    belief: &PositionEstimate,
+    origin: v2xw_core::geo::GeoOrigin,
+) -> v2xw_sec::envelope::GenerationLocation {
+    let (lat, lon, alt) = origin.to_geodetic(belief.pos);
+    let tenth_micro = |deg: f64, lim: f64| (deg.clamp(-lim, lim) * 1e7).round() as i32;
+    let elevation = ((alt * 10.0).round() + 4_096.0).clamp(0.0, 61_439.0) as u16;
+    v2xw_sec::envelope::GenerationLocation {
+        lat_tenth_microdeg: tenth_micro(lat, 90.0),
+        lon_tenth_microdeg: tenth_micro(lon, 180.0),
+        elevation,
+    }
+}
+
 fn policy_id(code: u8) -> &'static str {
     match code {
         0 => crate::policy::VERIFY_ALL_ID,
@@ -1587,6 +1667,14 @@ fn msg_type_name(t: MsgType) -> &'static str {
         MsgType::Cam => "cam",
         MsgType::Bsm => "bsm",
         MsgType::Denm => "denm",
+        MsgType::Spat => "spat",
+        MsgType::Map => "map",
+        MsgType::Srm => "srm",
+        MsgType::Ssm => "ssm",
+        MsgType::Psm => "psm",
+        MsgType::Vam => "vam",
+        MsgType::Mbr => "mbr",
+        MsgType::Crl => "crl",
         _ => "other",
     }
 }

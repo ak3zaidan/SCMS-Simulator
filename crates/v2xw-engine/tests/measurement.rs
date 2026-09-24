@@ -146,7 +146,10 @@ fn a_message_is_handed_to_the_applications_when_its_verification_finishes() {
         }
     }
     assert!(checked > 100, "only {checked} deliveries to check");
-    assert_eq!(early, 0, "{early} of {checked} handed over before their check finished");
+    assert_eq!(
+        early, 0,
+        "{early} of {checked} handed over before their check finished"
+    );
     assert_eq!(
         late, 0,
         "{late} of {checked} handed over after their check had finished (waiting for a step)"
