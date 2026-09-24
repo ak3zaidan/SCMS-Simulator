@@ -298,8 +298,9 @@ pub enum Control {
     Start {
         /// Start paused at `t = 0`.
         paused: bool,
-        /// Multiple of real time; `0` is unthrottled.
-        speed: f64,
+        /// Multiple of real time; `0` is unthrottled. `None` keeps the speed the run
+        /// has now, so a rewind of a server started with `--speed 0` stays unthrottled.
+        speed: Option<f64>,
         /// Seed override.
         seed: Option<u64>,
         /// The scenario to run instead of the staged or current one.

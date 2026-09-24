@@ -91,7 +91,10 @@ async fn main() -> std::process::ExitCode {
                 .ok_or("--lookahead needs a number"),
             "--speed" => next()
                 .and_then(|v| v.parse().ok())
-                .map(|v| live.speed = v)
+                .map(|v| {
+                    live.speed = v;
+                    stub.speed = v;
+                })
                 .ok_or("--speed needs a number"),
             "--label" => next()
                 .map(|v| {

@@ -31,7 +31,7 @@ fn fixture() -> Arc<Run> {
 fn start(run: &Run) {
     run.control(Control::Start {
         paused: true,
-        speed: 0.0,
+        speed: Some(0.0),
         seed: None,
         scenario: None,
     })

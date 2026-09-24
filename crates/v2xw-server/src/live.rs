@@ -3395,7 +3395,9 @@ impl Engine for LiveEngine {
                 // Staged edits are consumed by the run that runs them; the form then shows
                 // the running scenario, which is now the edited one.
                 self.staged = None;
-                self.speed = speed;
+                if let Some(speed) = speed {
+                    self.speed = speed;
+                }
                 self.state = if paused {
                     RunState::Paused
                 } else {

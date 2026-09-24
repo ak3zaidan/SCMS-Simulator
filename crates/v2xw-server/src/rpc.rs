@@ -316,7 +316,14 @@ pub fn dispatch(ctx: &mut Context<'_>, request: &Request) -> Result<Outcome> {
 }
 
 fn run_start(ctx: &mut Context<'_>, p: &Map<String, Value>) -> Result<Outcome> {
-    let speed = bounded(p, "speed", 0.0, 100.0, 1.0)?;
+    // Absent means "the speed the run has now", not 1: a rewind of a server started with
+    // `--speed 0` used to come back at real time, because the default stood in for a
+    // parameter nobody passed.
+    let speed = if p.contains_key("speed") {
+        Some(bounded(p, "speed", 0.0, 100.0, 1.0)?)
+    } else {
+        None
+    };
     let paused = flag(p, "paused", false);
     let seed = seed_param(p)?;
     let scenario = match p.get("scenario") {

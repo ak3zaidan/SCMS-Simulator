@@ -179,7 +179,9 @@ impl Engine for ReplayEngine {
             Control::Start { paused, speed, .. } => {
                 // A replay started again plays from its first step.
                 self.cursor = 0;
-                self.speed = speed;
+                if let Some(speed) = speed {
+                    self.speed = speed;
+                }
                 self.state = if paused {
                     RunState::Paused
                 } else {
