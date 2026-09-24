@@ -45,7 +45,8 @@ use crate::numeric;
 use crate::prop::SommerCoefficients;
 use crate::traits::ObstacleModel;
 use crate::types::{
-    ActorObstacle, ActorSet, EdgeSource, KnifeEdge, LosClass, LosResult, RadioEndpoint,
+    ActorObstacle, ActorSet, CornerGeometry, EdgeSource, KnifeEdge, LosClass, LosResult,
+    RadioEndpoint,
 };
 
 // =========================================================================================
@@ -126,6 +127,278 @@ impl BuildingIndex {
         ids.sort_unstable();
         ids.into_iter().map(BuildingId::new).collect()
     }
+
+    /// Every building whose envelope touches the segment's own corridor, in id order.
+    ///
+    /// The same answer [`BuildingIndex::candidates`] gives for every building the segment
+    /// actually crosses, found faster on a long diagonal: the segment is walked in pieces
+    /// of at most [`BuildingIndex::WALK_STEP_M`] and each piece queries its own bounding
+    /// box, so the candidates are the buildings near the line rather than every building
+    /// in the rectangle the line spans. A 2 km diagonal across Midtown spans a rectangle
+    /// holding most of the island's footprints; its corridor holds the few dozen the line
+    /// passes. Any building the segment crosses has an envelope that meets the piece of
+    /// the segment inside it, so nothing the ring test would find is dropped.
+    #[must_use]
+    pub fn candidates_along(&self, a: Vec3, b: Vec3) -> Vec<BuildingId> {
+        let len = a.distance_2d(b);
+        let pieces = (len / Self::WALK_STEP_M).ceil().max(1.0) as usize;
+        let mut ids: Vec<u32> = Vec::new();
+        for i in 0..pieces {
+            let p = a.lerp(b, i as f64 / pieces as f64);
+            let q = a.lerp(b, (i + 1) as f64 / pieces as f64);
+            let query =
+                AABB::from_corners([p.x.min(q.x), p.y.min(q.y)], [p.x.max(q.x), p.y.max(q.y)]);
+            ids.extend(
+                self.tree
+                    .locate_in_envelope_intersecting(&query)
+                    .map(|e| e.id),
+            );
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter().map(BuildingId::new).collect()
+    }
+
+    /// The length of one piece of [`BuildingIndex::candidates_along`]'s walk, metres:
+    /// shorter than a Manhattan side-street block (80 m), long enough that a 1 km link is
+    /// a few dozen tree queries.
+    pub const WALK_STEP_M: f64 = 32.0;
+}
+
+// =========================================================================================
+// Street geometry: rays, clear paths and corners
+// =========================================================================================
+
+/// Whether a building stands in the way of the path `a → b` at all: the any-hit form of
+/// [`BuildingShadowing`]'s classification, which stops at the first wall.
+///
+/// The same 2.5-D rule applies: a roof below both ends does not block.
+#[must_use]
+pub fn segment_blocked(world: &World, index: &BuildingIndex, a: Vec3, b: Vec3) -> bool {
+    let floor = a.z.min(b.z);
+    for id in index.candidates_along(a, b) {
+        let Some(building) = world.building(id) else {
+            continue;
+        };
+        if building.base_z_m + building.height_m <= floor {
+            continue;
+        }
+        let ring = &building.footprint;
+        if point_in_ring(ring, a) || point_in_ring(ring, b) {
+            return true;
+        }
+        if ring
+            .windows(2)
+            .any(|w| segment_intersection_t(a, b, w[0], w[1]).is_some())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The distance from `origin` along the horizontal unit direction `dir` to the first
+/// building wall, metres, looking no further than `max_m`; `None` when no wall is within
+/// reach. Zero when `origin` stands inside a footprint.
+///
+/// Buildings whose roof is at or below `origin.z` are transparent, as everywhere else in
+/// this module.
+#[must_use]
+pub fn first_wall_m(
+    world: &World,
+    index: &BuildingIndex,
+    origin: Vec3,
+    dir: (f64, f64),
+    max_m: f64,
+) -> Option<f64> {
+    let end = Vec3::new(
+        origin.x + dir.0 * max_m,
+        origin.y + dir.1 * max_m,
+        origin.z,
+    );
+    let mut best: Option<f64> = None;
+    for id in index.candidates_along(origin, end) {
+        let Some(building) = world.building(id) else {
+            continue;
+        };
+        if building.base_z_m + building.height_m <= origin.z {
+            continue;
+        }
+        let ring = &building.footprint;
+        if point_in_ring(ring, origin) {
+            return Some(0.0);
+        }
+        for w in ring.windows(2) {
+            if let Some(t) = segment_intersection_t(origin, end, w[0], w[1]) {
+                let d = t * max_m;
+                if best.is_none_or(|b| d < b) {
+                    best = Some(d);
+                }
+            }
+        }
+    }
+    best
+}
+
+/// One junction centre in the corner tracer's point index.
+#[derive(Debug, Clone, Copy)]
+struct JunctionPoint {
+    id: u32,
+    at: [f64; 2],
+}
+
+impl RTreeObject for JunctionPoint {
+    type Envelope = AABB<[f64; 2]>;
+
+    fn envelope(&self) -> Self::Envelope {
+        AABB::from_point(self.at)
+    }
+}
+
+/// Finds the street corner a building-blocked link turns round, and measures the
+/// geometry the Mangel, Klemp and Hartenstein (2011) urban-intersection model is written
+/// in ([`CornerGeometry`]).
+///
+/// # How the corner is found
+///
+/// A receiver in a street that meets the transmitter's street hears it round the corner of
+/// their junction. So the tracer looks for a junction **both ends can see**: every
+/// junction centre inside the ellipse `|T − J| + |J − R| ≤ k·|T − R|` is a candidate
+/// (`k` = [`CornerTracer::DETOUR_RATIO`]: a right-angled corner anywhere between the two
+/// ends is at most `√2·|T − R|` away, and 1.6 admits the obtuse and acute corners of a
+/// city that is not a perfect grid), and the candidates are tried shortest detour first,
+/// up to [`CornerTracer::MAX_CANDIDATES`], with an any-hit clear-path test on each leg
+/// ([`segment_blocked`]) at the height of the antennas. The first junction with two clear
+/// legs is the corner. A link with no such junction — two parallel streets, or a path
+/// needing two turns — has no single corner, and the tracer says so with `None` rather
+/// than inventing one: Mangel's model is fitted to, and defined for, transmitter and
+/// receiver "in intersecting streets" [Abbas 2015 §IV, on Mangel 2011].
+///
+/// # How the model's four quantities are measured
+///
+/// * `d_t`, `d_r`: the two ends' horizontal distances to the junction centre.
+/// * `x_t`: from the transmitter, perpendicular to its street (the direction to the
+///   corner), towards the side the receiver's street leaves on, the distance to the first
+///   building wall ([`first_wall_m`]), capped at [`CornerTracer::MAX_WALL_M`].
+/// * `w_r`: from the receiver, perpendicular to its street on both sides, the distance
+///   between the two first walls, each side capped at [`CornerTracer::MAX_WALL_M`].
+///
+/// Each is clamped to at least one metre so the closed form stays finite at the corner
+/// itself.
+#[derive(Debug)]
+pub struct CornerTracer {
+    junctions: RTree<JunctionPoint>,
+    buildings: BuildingIndex,
+}
+
+impl CornerTracer {
+    /// The detour bound: candidates have `|T − J| + |J − R| ≤ 1.6·|T − R|`.
+    pub const DETOUR_RATIO: f64 = 1.6;
+    /// How many candidate junctions are tried, nearest detour first.
+    pub const MAX_CANDIDATES: usize = 12;
+    /// How far a wall is looked for, metres; an open side further than this counts as this.
+    pub const MAX_WALL_M: f64 = 60.0;
+
+    /// Builds the tracer for a world: an index of its junction centres and of its
+    /// building footprints. Pure: the same world gives the same tracer.
+    #[must_use]
+    pub fn build(world: &World) -> Self {
+        let points: Vec<JunctionPoint> = world
+            .roads
+            .junctions()
+            .iter()
+            .map(|j| JunctionPoint {
+                id: j.id.index(),
+                at: [j.position.x, j.position.y],
+            })
+            .collect();
+        Self {
+            junctions: RTree::bulk_load(points),
+            buildings: BuildingIndex::build(world),
+        }
+    }
+
+    /// The hash of the world this tracer was built for.
+    #[must_use]
+    pub const fn world_hash(&self) -> [u8; 32] {
+        self.buildings.world_hash()
+    }
+
+    /// The building index the tracer walks, for callers that need the same geometry.
+    #[must_use]
+    pub const fn buildings(&self) -> &BuildingIndex {
+        &self.buildings
+    }
+
+    /// The corner a link from `tx` to `rx` (antenna phase centres) turns round, or `None`.
+    #[must_use]
+    pub fn trace(&self, world: &World, tx: Vec3, rx: Vec3) -> Option<CornerGeometry> {
+        let d = tx.distance_2d(rx);
+        if d <= 0.0 {
+            return None;
+        }
+        let reach = Self::DETOUR_RATIO * d;
+        let mid = [0.5 * (tx.x + rx.x), 0.5 * (tx.y + rx.y)];
+        let radius = 0.5 * reach;
+        let window = AABB::from_corners(
+            [mid[0] - radius, mid[1] - radius],
+            [mid[0] + radius, mid[1] + radius],
+        );
+        let mut candidates: Vec<(f64, u32, [f64; 2])> = self
+            .junctions
+            .locate_in_envelope(&window)
+            .filter_map(|j| {
+                let p = Vec3::new(j.at[0], j.at[1], 0.0);
+                let detour = tx.distance_2d(p) + p.distance_2d(rx);
+                (detour <= reach).then_some((detour, j.id, j.at))
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let corner_z = 0.5 * (tx.z + rx.z);
+        for &(_, _, at) in candidates.iter().take(Self::MAX_CANDIDATES) {
+            let j = Vec3::new(at[0], at[1], corner_z);
+            if segment_blocked(world, &self.buildings, tx, j)
+                || segment_blocked(world, &self.buildings, j, rx)
+            {
+                continue;
+            }
+            return Some(self.measure(world, tx, rx, j));
+        }
+        None
+    }
+
+    /// The four quantities of the corner at `j`.
+    fn measure(&self, world: &World, tx: Vec3, rx: Vec3, j: Vec3) -> CornerGeometry {
+        let d_t = tx.distance_2d(j).max(1.0);
+        let d_r = rx.distance_2d(j).max(1.0);
+        // The transmitter's street runs towards the corner; the receiver's leaves it.
+        let u = unit(j.x - tx.x, j.y - tx.y).unwrap_or((1.0, 0.0));
+        let v = unit(rx.x - j.x, rx.y - j.y).unwrap_or((0.0, 1.0));
+        // Which side of the transmitter's street the receiver's street leaves on.
+        let side = if u.0 * v.1 - u.1 * v.0 >= 0.0 { 1.0 } else { -1.0 };
+        let n_t = (-u.1 * side, u.0 * side);
+        let x_t = first_wall_m(world, &self.buildings, tx, n_t, Self::MAX_WALL_M)
+            .unwrap_or(Self::MAX_WALL_M)
+            .max(1.0);
+        let n_r = (-v.1, v.0);
+        let left = first_wall_m(world, &self.buildings, rx, n_r, Self::MAX_WALL_M)
+            .unwrap_or(Self::MAX_WALL_M);
+        let right = first_wall_m(world, &self.buildings, rx, (-n_r.0, -n_r.1), Self::MAX_WALL_M)
+            .unwrap_or(Self::MAX_WALL_M);
+        CornerGeometry {
+            corner: j,
+            d_t_m: d_t,
+            d_r_m: d_r,
+            x_t_m: x_t,
+            w_r_m: (left + right).max(1.0),
+        }
+    }
+}
+
+/// The unit vector of `(x, y)`, or `None` for the zero vector.
+fn unit(x: f64, y: f64) -> Option<(f64, f64)> {
+    let n = math::sqrt(x * x + y * y);
+    (n > 0.0).then(|| (x / n, y / n))
 }
 
 /// Where a segment enters and leaves one polygon, and how many of its edges it crossed.
@@ -513,7 +786,7 @@ impl BuildingShadowing {
     /// map). A caller that wants the index cached calls this; `los` falls back to a
     /// linear scan over the world's buildings, which is what a one-off query costs.
     pub fn los_cached(&mut self, world: &World, a: Vec3, b: Vec3) -> LosResult {
-        let candidates = self.index_for(world).candidates(a, b);
+        let candidates = self.index_for(world).candidates_along(a, b);
         self.classify(world, a, b, candidates.into_iter())
     }
 
@@ -568,6 +841,7 @@ impl BuildingShadowing {
             walls_crossed: walls,
             obstructed_len_m: inside,
             knife_edges: edges,
+            corner: None,
         }
     }
 
@@ -1022,6 +1296,7 @@ impl<C: Ctx + ?Sized> ObstacleModel<C> for VehicleBlockage {
             walls_crossed: 0,
             obstructed_len_m: 0.0,
             knife_edges: edges,
+            corner: None,
         }
     }
 
@@ -1366,6 +1641,7 @@ impl<C: Ctx + ?Sized> ObstacleModel<C> for TerrainDiffraction {
             walls_crossed: 0,
             obstructed_len_m: 0.0,
             knife_edges: edges,
+            corner: None,
         }
     }
 
@@ -1588,6 +1864,7 @@ mod tests {
             walls_crossed: 20,
             obstructed_len_m: 250.0,
             knife_edges: Vec::new(),
+            corner: None,
         };
         let through = m.loss_for(&blocked);
         assert!((through - (20.0 * 9.0 + 250.0 * 0.4)).abs() < 1e-9);
@@ -2060,5 +2337,111 @@ mod tests {
             model.coefficients_for(building).beta_db_per_wall,
             SommerCoefficients::DEFAULT.beta_db_per_wall
         );
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Street geometry
+    // ------------------------------------------------------------------------------------
+
+    /// The TR 36.885 urban grid, 3 × 3 junctions: 433 × 250 m blocks, 20 m wall to wall
+    /// (two 3.5 m lanes each way and 3 m sidewalks), one 20 m building per block.
+    /// Junction (c, r) is at (7 + 433·c, 7 + 250·r).
+    fn city() -> World {
+        v2xw_world::procedural::grid(
+            &v2xw_world::procedural::GridParams::tr36885_urban().with_size(3, 3),
+            &v2xw_world::ImportOptions::default().imported_at("1970-01-01T00:00:00Z"),
+        )
+        .expect("the grid builds")
+    }
+
+    fn at(x: f64, y: f64) -> Vec3 {
+        Vec3::new(x, y, 1.5)
+    }
+
+    /// Walking the segment finds exactly the buildings the ring test needs, and the
+    /// classification through either candidate list is the same answer.
+    #[test]
+    fn the_corridor_walk_finds_what_the_bounding_box_finds() {
+        let world = city();
+        let index = BuildingIndex::build(&world);
+        let mut model = BuildingShadowing::new(Tier::Medium);
+        for (a, b) in [
+            (at(10.0, 10.0), at(860.0, 500.0)),
+            (at(390.0, 257.0), at(440.0, 307.0)),
+            (at(7.0, 7.0), at(866.0, 7.0)),
+            (at(100.0, 400.0), at(800.0, 100.0)),
+        ] {
+            let along = index.candidates_along(a, b);
+            let boxed = index.candidates(a, b);
+            assert!(along.iter().all(|id| boxed.contains(id)));
+            let crossed: Vec<_> = boxed
+                .iter()
+                .filter(|id| {
+                    let r = ring_crossing(&world.building(**id).unwrap().footprint, a, b);
+                    r.walls > 0 || r.inside_len_m > 0.0
+                })
+                .collect();
+            assert!(crossed.iter().all(|id| along.contains(id)), "{a:?} → {b:?}");
+            let scanned = ObstacleModel::<TestCtx>::los(&model, &world, a, b, None);
+            assert_eq!(scanned, model.los_cached(&world, a, b));
+            assert_eq!(
+                segment_blocked(&world, &index, a, b),
+                scanned.class.has_building(),
+                "{a:?} → {b:?}"
+            );
+        }
+    }
+
+    /// A ray finds the first wall, and a ray down an open street finds none.
+    #[test]
+    fn a_ray_stops_at_the_first_wall() {
+        let world = city();
+        let index = BuildingIndex::build(&world);
+        // From the centreline of the east-west street at y = 257, walls are 10 m either side.
+        let d = first_wall_m(&world, &index, at(200.0, 257.0), (0.0, 1.0), 60.0).unwrap();
+        assert!((d - 10.0).abs() < 1e-9, "{d}");
+        let d = first_wall_m(&world, &index, at(200.0, 257.0), (0.0, -1.0), 60.0).unwrap();
+        assert!((d - 10.0).abs() < 1e-9, "{d}");
+        // Along the street there is nothing within reach.
+        assert!(first_wall_m(&world, &index, at(200.0, 257.0), (1.0, 0.0), 60.0).is_none());
+        // A roof below the antenna is transparent.
+        let low = first_wall_m(&world, &index, Vec3::new(200.0, 257.0, 25.0), (0.0, 1.0), 60.0);
+        assert!(low.is_none());
+    }
+
+    /// A car 50 m west of a junction and a car 50 m north of it, the corner tower between
+    /// them: the tracer finds the junction, and measures `d_t`, `d_r` from its centre,
+    /// `x_t` to the tower's wall and `w_r` across the receiver's street.
+    #[test]
+    fn the_tracer_finds_the_corner_and_measures_it() {
+        let world = city();
+        let tracer = CornerTracer::build(&world);
+        let tx = at(390.0, 257.0);
+        let rx = at(440.0, 307.0);
+        let index = BuildingIndex::build(&world);
+        assert!(segment_blocked(&world, &index, tx, rx), "the corner tower blocks");
+        let c = tracer.trace(&world, tx, rx).expect("one corner connects them");
+        assert!((c.corner.x - 440.0).abs() < 1e-9 && (c.corner.y - 257.0).abs() < 1e-9);
+        assert!((c.d_t_m - 50.0).abs() < 1e-9, "{c:?}");
+        assert!((c.d_r_m - 50.0).abs() < 1e-9, "{c:?}");
+        assert!((c.x_t_m - 10.0).abs() < 1e-9, "{c:?}");
+        assert!((c.w_r_m - 20.0).abs() < 1e-9, "{c:?}");
+        // The receiver hugging the east kerb: its street is measured across the line from
+        // the corner, which leans 8° off north here, so 20 m reads as 20.2 m.
+        let c = tracer.trace(&world, tx, at(447.0, 307.0)).unwrap();
+        assert!((c.w_r_m - 20.0).abs() < 0.5, "{c:?}");
+        // Reversed, the other end is the transmitter.
+        let back = tracer.trace(&world, rx, tx).unwrap();
+        assert!((back.d_t_m - 50.0).abs() < 1e-9 && (back.corner.x - 440.0).abs() < 1e-9);
+    }
+
+    /// Two cars in parallel streets are joined by no single corner, and the tracer says
+    /// so instead of inventing one.
+    #[test]
+    fn parallel_streets_have_no_single_corner() {
+        let world = city();
+        let tracer = CornerTracer::build(&world);
+        assert!(tracer.trace(&world, at(390.0, 257.0), at(390.0, 507.0)).is_none());
+        assert!(tracer.trace(&world, at(200.0, 257.0), at(300.0, 7.0)).is_none());
     }
 }

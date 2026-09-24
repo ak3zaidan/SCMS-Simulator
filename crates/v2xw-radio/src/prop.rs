@@ -63,7 +63,7 @@ use v2xw_world::model::EnvClass;
 
 use crate::numeric;
 use crate::traits::Propagation;
-use crate::types::{LosResult, LossBreakdown, RadioEndpoint};
+use crate::types::{CornerGeometry, LosResult, LossBreakdown, RadioEndpoint};
 
 /// The reference distance `d0` of the log-distance law, 10 m [Karedal 2011 Eq. 5;
 /// Abbas 2015 Eq. 4].
@@ -587,6 +587,290 @@ pub fn weather_attenuation_db(
     rain_specific_attenuation_db_km(rain_mm_h, pol) * (d_m / 1_000.0)
 }
 
+/// One Gaussian term `a·exp(−((log10 f − b)/c)²)` of the ITU-R P.838-3 regression.
+type P838Term = (f64, f64, f64);
+
+/// ITU-R P.838-3 Table 1: the coefficients for `k_H`.
+const P838_K_H: [P838Term; 4] = [
+    (-5.339_80, -0.100_08, 1.130_98),
+    (-0.353_51, 1.269_70, 0.454_00),
+    (-0.237_89, 0.860_36, 0.153_54),
+    (-0.941_58, 0.645_52, 0.168_17),
+];
+/// ITU-R P.838-3 Table 1: `m_k`, `c_k` for `k_H`.
+const P838_K_H_MC: (f64, f64) = (-0.189_61, 0.711_47);
+/// ITU-R P.838-3 Table 2: the coefficients for `k_V`.
+const P838_K_V: [P838Term; 4] = [
+    (-3.805_95, 0.569_34, 0.810_61),
+    (-3.449_65, -0.229_11, 0.510_59),
+    (-0.399_02, 0.730_42, 0.118_99),
+    (0.501_67, 1.073_19, 0.271_95),
+];
+/// ITU-R P.838-3 Table 2: `m_k`, `c_k` for `k_V`.
+const P838_K_V_MC: (f64, f64) = (-0.163_98, 0.632_97);
+/// ITU-R P.838-3 Table 3: the coefficients for `α_H`.
+const P838_A_H: [P838Term; 5] = [
+    (-0.143_18, 1.824_42, -0.551_87),
+    (0.295_91, 0.775_64, 0.198_22),
+    (0.321_77, 0.637_73, 0.131_64),
+    (-5.376_10, -0.962_30, 1.478_28),
+    (16.172_1, -3.299_80, 3.439_90),
+];
+/// ITU-R P.838-3 Table 3: `m_α`, `c_α` for `α_H`.
+const P838_A_H_MC: (f64, f64) = (0.678_49, -1.955_37);
+/// ITU-R P.838-3 Table 4: the coefficients for `α_V`.
+const P838_A_V: [P838Term; 5] = [
+    (-0.077_71, 2.338_40, -0.762_84),
+    (0.567_27, 0.955_45, 0.540_39),
+    (-0.202_38, 1.145_20, 0.268_09),
+    (-48.299_1, 0.791_669, 0.116_226),
+    (48.583_3, 0.791_459, 0.116_479),
+];
+/// ITU-R P.838-3 Table 4: `m_α`, `c_α` for `α_V`.
+const P838_A_V_MC: (f64, f64) = (-0.053_739, 0.834_33);
+
+fn p838_sum(terms: &[P838Term], mc: (f64, f64), log_f: f64) -> f64 {
+    let gauss = terms.iter().map(|&(a, b, c)| {
+        let z = (log_f - b) / c;
+        a * math::exp(-(z * z))
+    });
+    math::sum_ordered(gauss) + mc.0 * log_f + mc.1
+}
+
+/// The ITU-R P.838-3 rain coefficients `(k, α)` at any carrier from 1 to 1000 GHz,
+/// from the recommendation's own regression [ITU-R P.838-3 Eqs. 2-3, Tables 1-4]:
+///
+/// `log10 k = Σ_j a_j·exp(−((log10 f − b_j)/c_j)²) + m_k·log10 f + c_k`,
+/// `α = Σ_j a_j·exp(−((log10 f − b_j)/c_j)²) + m_α·log10 f + c_α`, `f` in GHz.
+///
+/// At 5.9 GHz this gives `k_V = 0.000441`, `α_V = 1.5797` (`k_H = 0.000629`,
+/// `α_H = 1.6021`), where the 6 GHz table row the model used before is 11 % high on
+/// `k_V`. The regression reproduces the recommendation's Table 5 at 5.5, 6 and 10 GHz to
+/// every printed digit (`p838_regression_reproduces_table_5`).
+#[must_use]
+pub fn p838_coefficients(f_hz: f64, pol: Polarization) -> (f64, f64) {
+    let log_f = math::log10((f_hz / 1e9).max(1.0));
+    let (k_terms, k_mc, a_terms, a_mc) = match pol {
+        Polarization::Horizontal => (&P838_K_H[..], P838_K_H_MC, &P838_A_H[..], P838_A_H_MC),
+        Polarization::Vertical => (&P838_K_V[..], P838_K_V_MC, &P838_A_V[..], P838_A_V_MC),
+    };
+    (
+        math::pow(10.0, p838_sum(k_terms, k_mc, log_f)),
+        p838_sum(a_terms, a_mc, log_f),
+    )
+}
+
+/// Specific rain attenuation at the carrier, `γ_R = k(f)·R^α(f)`, dB/km
+/// [ITU-R P.838-3 Eq. 1 with [`p838_coefficients`]].
+#[must_use]
+pub fn rain_specific_attenuation_at_db_km(rain_mm_h: f64, f_hz: f64, pol: Polarization) -> f64 {
+    if rain_mm_h <= 0.0 {
+        return 0.0;
+    }
+    let (k, alpha) = p838_coefficients(f_hz, pol);
+    k * math::pow(rain_mm_h, alpha)
+}
+
+/// The rain rate a [`WeatherState`] stands for, mm/h: `intensity × rain_rate_max_mm_h`
+/// for rain and sleet, zero for every other kind.
+#[must_use]
+pub fn rain_rate_mm_h(w: &WeatherState, rain_rate_max_mm_h: f64) -> f64 {
+    match w.kind {
+        WeatherKind::Rain | WeatherKind::Sleet => {
+            w.intensity.clamp(0.0, 1.0) * rain_rate_max_mm_h.max(0.0)
+        }
+        // Snow, fog, wind and clear: nothing at 5.9 GHz this crate can cite. Dry snow's
+        // specific attenuation is far below rain's at the same rate, fog's needs P.840's
+        // K_l(5.9 GHz), which is UNVERIFIED, and gases are a hundredth of a dB per km.
+        _ => 0.0,
+    }
+}
+
+/// `weather/attenuation/itu-r-p838` — rain attenuation over the link, the only weather
+/// effect on a 5.9 GHz link the physics supports at a magnitude worth a term
+/// (04-models.md §3.6).
+///
+/// `A = γ_R(f, R)·d`: the specific attenuation of ITU-R P.838-3 at the carrier, over the
+/// whole link length, with the rain uniform along it (V2X links are a kilometre at most,
+/// well inside the few-kilometre rain cells for which P.530's path-reduction factor
+/// exists, so no reduction is applied).
+///
+/// **Its size, stated plainly.** At 5.9 GHz, vertical polarisation, a 50 mm/h downpour
+/// (the rate `intensity = 1` stands for) costs 0.21 dB/km: 0.02 dB on a 100 m link, 0.06 dB
+/// on 300 m, 0.21 dB at 1 km. Moderate rain (5 mm/h) costs 0.007 dB/km. That is a
+/// hundredth of the 4-6 dB shadowing σ and of one obstructing truck, and it moves a
+/// delivery ratio by nothing measurable — which is the correct result, and the one the
+/// Safety Pilot Model Deployment data show: in Ann Arbor, rain and snow did not change
+/// DSRC's maximum range (Kolmogorov-Smirnov test, 2,581 clear, 114 rain, 227 snow
+/// approaches; Bai et al., arXiv:1606.08365 §IV.B). Fog adds nothing here: P.840 fog
+/// attenuation matters above 100 GHz and its 5.9 GHz coefficient is not cited, so no
+/// number is invented for it.
+#[derive(Debug, Clone)]
+pub struct RainAttenuation {
+    card: ModelCard,
+    polarization: Polarization,
+    rain_rate_max_mm_h: f64,
+}
+
+impl RainAttenuation {
+    /// The model's id.
+    pub const ID: &'static str = "weather/attenuation/itu-r-p838";
+
+    /// The rain rate `intensity = 1` stands for, mm/h: the 50 mm/h downpour of
+    /// 04-models.md §3.6's worked example.
+    pub const RAIN_RATE_MAX_MM_H: f64 = 50.0;
+
+    /// The model with vertical polarisation (an ITS antenna is a vertical monopole or
+    /// shark-fin) and the 50 mm/h mapping.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            card: rain_card(),
+            polarization: Polarization::Vertical,
+            rain_rate_max_mm_h: Self::RAIN_RATE_MAX_MM_H,
+        }
+    }
+
+    /// The attenuation over a link of `d_m` metres at `f_hz` in weather `w`, dB.
+    #[must_use]
+    pub fn attenuation_db(&self, w: &WeatherState, d_m: f64, f_hz: f64) -> f64 {
+        let rate = rain_rate_mm_h(w, self.rain_rate_max_mm_h);
+        if rate <= 0.0 {
+            return 0.0;
+        }
+        rain_specific_attenuation_at_db_km(rate, f_hz, self.polarization) * (d_m.max(0.0) / 1_000.0)
+    }
+}
+
+/// [`RainAttenuation`] with its defaults (vertical polarisation, 50 mm/h at intensity 1):
+/// the rain loss of a `d_m`-metre link at `f_hz` in weather `w`, dB.
+#[must_use]
+pub fn rain_attenuation_db(w: &WeatherState, d_m: f64, f_hz: f64) -> f64 {
+    let rate = rain_rate_mm_h(w, RainAttenuation::RAIN_RATE_MAX_MM_H);
+    if rate <= 0.0 {
+        return 0.0;
+    }
+    rain_specific_attenuation_at_db_km(rate, f_hz, Polarization::Vertical) * (d_m.max(0.0) / 1_000.0)
+}
+
+impl Default for RainAttenuation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Model for RainAttenuation {
+    fn card(&self) -> &ModelCard {
+        &self.card
+    }
+}
+
+fn rain_card() -> ModelCard {
+    let p838 = Source::new(
+        SourceKind::Standard,
+        "ITU-R P.838-3 (03/2005), Specific attenuation model for rain for use in \
+         prediction methods: Eqs. 1-3 and Tables 1-4",
+    );
+    let mut card = ModelCard::new(
+        RainAttenuation::ID,
+        Family::Propagation,
+        "1.0.0",
+        "Rain attenuation over the link, ITU-R P.838-3 at the carrier. At 5.9 GHz a \
+         50 mm/h downpour costs 0.21 dB per km — 0.06 dB on a 300 m link — so rain changes \
+         received power by a few hundredths of a decibel and no delivery ratio measurably. \
+         Fog and snow add nothing: nothing at 5.9 GHz can be cited for them.",
+    );
+    card.tier = vec![Tier::Medium, Tier::High];
+    card.equations = vec![
+        Equation::new("attenuation", "A[dB] = k(f)·R^α(f)·d_km"),
+        Equation::new(
+            "coefficients",
+            "log10 k = Σ a_j·exp(−((log10 f_GHz − b_j)/c_j)²) + m_k·log10 f_GHz + c_k; \
+             α = Σ a_j·exp(−((log10 f_GHz − b_j)/c_j)²) + m_α·log10 f_GHz + c_α; at 5.9 GHz \
+             vertical k = 0.000441, α = 1.5797",
+        ),
+        Equation::new("rain rate", "R = intensity × 50 mm/h for rain and sleet, else 0"),
+    ];
+    card.parameters = vec![
+        Parameter::new(
+            "polarization",
+            "-",
+            serde_json::json!("vertical"),
+            Source::new(
+                SourceKind::Standard,
+                "An ITS antenna is vertically polarised (a roof monopole or shark-fin); \
+                 04-models.md §3.6",
+            ),
+        ),
+        Parameter {
+            name: "rain_rate_max_mm_h".to_string(),
+            unit: "mm/h".to_string(),
+            default: serde_json::json!(RainAttenuation::RAIN_RATE_MAX_MM_H),
+            range: Some(vec![serde_json::json!(0.0), serde_json::json!(200.0)]),
+            source: Source {
+                kind: SourceKind::TodoCalibrate,
+                reference: "the rain rate weather.intensity = 1 stands for; 04-models.md \
+                            §3.6's worked example is a 50 mm/h downpour"
+                    .to_string(),
+                accessed: None,
+                note: Some(
+                    "The scenario states rain as an intensity from 0 to 1, not in mm/h, and \
+                     nothing cited maps one onto the other; the mapping is linear. Even at \
+                     twice the rate the term stays below half a decibel per kilometre."
+                        .to_string(),
+                ),
+            },
+            calibration: Some(
+                "Carry a rain rate in mm/h in the scenario's weather (the AMS categories: \
+                 light below 2.5, moderate to 7.6, heavy above) and drop the mapping."
+                    .to_string(),
+            ),
+        },
+    ];
+    card.assumptions = vec![
+        "Rain is uniform along the link: V2X links are far shorter than a rain cell."
+            .to_string(),
+        "Applied at the medium and high propagation tiers, whatever the path-loss law. \
+         04-models.md §3's tier table leaves it to high alone because it is negligible; it \
+         costs one multiplication, and applying it everywhere means a rain setting does \
+         what it says at every tier."
+            .to_string(),
+    ];
+    card.ignores = vec![
+        "Fog and cloud (ITU-R P.840): significant only above 100 GHz, and K_l at 5.9 GHz is \
+         not cited, so no number is invented."
+            .to_string(),
+        "Snow: dry snow attenuates far less than rain at the same rate, and no 5.9 GHz \
+         figure is cited."
+            .to_string(),
+        "Gaseous absorption (ITU-R P.676): about a hundredth of a dB per km at 5.9 GHz, \
+         indicative only."
+            .to_string(),
+        "Wet antennas and radomes: a real but installation-specific loss with no cited \
+         5.9 GHz figure."
+            .to_string(),
+    ];
+    card.sources = vec![
+        p838.clone(),
+        Source::new(
+            SourceKind::Paper,
+            "S. Bai et al., Empirical study of DSRC performance based on Safety Pilot Model \
+             Deployment data, arXiv:1606.08365, §IV.B: no significant difference in DSRC \
+             maximum range between clear, rain and snow (Kolmogorov-Smirnov)",
+        ),
+    ];
+    card.validation = Validation {
+        status: ValidationStatus::LiteratureChecked,
+        references: vec![p838],
+        tests: vec![
+            "p838_regression_reproduces_table_5".to_string(),
+            "rain_costs_hundredths_of_a_decibel_on_a_v2x_link".to_string(),
+        ],
+    };
+    card.determinism = Determinism::default();
+    card
+}
+
 // =========================================================================================
 // `propagation/free-space`
 // =========================================================================================
@@ -899,8 +1183,6 @@ pub struct LogDistanceShadowing {
     env: EnvClass,
     d_corr_m: f64,
     sommer: Option<SommerCoefficients>,
-    polarization: Polarization,
-    rain_rate_max_mm_h: f64,
     shadows: BTreeMap<(u32, u32), ShadowProcess>,
 }
 
@@ -922,8 +1204,6 @@ impl LogDistanceShadowing {
             // what every tier of 04-models.md §3 composes. See the type's own
             // documentation and [`crate::budget::evaluate`].
             sommer: None,
-            polarization: Polarization::Vertical,
-            rain_rate_max_mm_h: 50.0,
             shadows: BTreeMap::new(),
         }
     }
@@ -1058,13 +1338,11 @@ impl<C: Ctx + ?Sized> Propagation<C> for LogDistanceShadowing {
             (Some(c), true) => c.loss_db(los.walls_crossed, los.obstructed_len_m),
             _ => 0.0,
         };
-        let weather = if self.tier == Tier::High {
-            weather_attenuation_db(w, d, self.polarization, self.rain_rate_max_mm_h)
-        } else {
-            // 04-models.md §3 tier table: medium ignores weather attenuation.
-            0.0
-        };
-        LossBreakdown::new(path, shadow, obstacle, weather, tx.gain_dbi + rx.gain_dbi)
+        // Rain is not this law's term: the composition applies
+        // `weather/attenuation/itu-r-p838` once, whatever the law ([`RainAttenuation`]),
+        // so a law that also charged it would count the rain twice.
+        let _ = w;
+        LossBreakdown::new(path, shadow, obstacle, 0.0, tx.gain_dbi + rx.gain_dbi)
     }
 }
 
@@ -1386,29 +1664,6 @@ fn log_distance_card(preset: LogDistancePreset, auto: bool, building_term: bool)
             },
             calibration: None,
         },
-        Parameter {
-            name: "rain_rate_max_mm_h".to_string(),
-            unit: "mm/h".to_string(),
-            default: serde_json::json!(50.0),
-            range: Some(vec![serde_json::json!(0.0), serde_json::json!(200.0)]),
-            source: Source {
-                kind: SourceKind::TodoCalibrate,
-                reference: "the rain rate WeatherState::intensity = 1 stands for; \
-                            04-models.md §3.6's worked example is a 50 mm/h downpour"
-                    .to_string(),
-                accessed: None,
-                note: Some(
-                    "Nothing cited maps the abstract intensity onto mm/h; the mapping here \
-                     is linear. The whole term is a fraction of a dB at 5.9 GHz."
-                        .to_string(),
-                ),
-            },
-            calibration: Some(
-                "Define the intensity-to-rain-rate mapping with the weather family \
-                 (04-models.md §2.6) and take the rate from the scenario's weather series."
-                    .to_string(),
-            ),
-        },
     ];
     card.assumptions = vec![
         "One shadowing process per directed link, updated on every evaluation.".to_string(),
@@ -1457,8 +1712,8 @@ fn log_distance_card(preset: LogDistancePreset, auto: bool, building_term: bool)
         },
     ];
     card.ignores = vec![
-        "Fast fading (the Fading family), terrain diffraction, antenna patterns; at the \
-         medium tier also weather attenuation (04-models.md §3 tier table)."
+        "Fast fading (the Fading family), terrain diffraction and antenna patterns. Rain is \
+         applied by the composition (weather/attenuation/itu-r-p838), not by this law."
             .to_string(),
     ];
     card.sources = vec![
@@ -1468,10 +1723,6 @@ fn log_distance_card(preset: LogDistancePreset, auto: bool, building_term: bool)
             SourceKind::Paper,
             "J. Karedal et al., \"Path loss modeling for vehicle-to-vehicle \
              communications\", IEEE TVT 60(1), 2011, Eq. 5 (R3 §A.4)",
-        ),
-        Source::new(
-            SourceKind::Standard,
-            "ITU-R P.838-3 Table 5 (rain coefficients, 6 GHz row), via 04-models.md §3.6",
         ),
     ];
     card.validation = Validation {
@@ -1863,6 +2114,448 @@ fn tr37885_card() -> ModelCard {
     card
 }
 
+
+// =========================================================================================
+// The Mangel, Klemp and Hartenstein (2011) urban-intersection NLOS model
+// =========================================================================================
+
+/// The NLOS path-loss exponent of the Mangel model, 2.69 [Mangel 2011, as printed in
+/// Abbas 2015 Eq. 6 and quoted in 04-models.md §3.2's `abbas-nlos-intersection` row].
+pub const MANGEL_N_NLOS: f64 = 2.69;
+/// The fitted offset of the Mangel model, 3.75 dB [same].
+pub const MANGEL_OFFSET_DB: f64 = 3.75;
+/// The suburban offset `i_s·2.94 dB` of the Mangel model (`i_s` = 1 suburban, 0 urban)
+/// [same].
+pub const MANGEL_SUBURBAN_DB: f64 = 2.94;
+/// The exponent on the transmitter's distance to the intersection, 0.957 [same].
+pub const MANGEL_DT_EXPONENT: f64 = 0.957;
+/// The exponent on `x_t·w_r`, 0.81 [same].
+pub const MANGEL_XW_EXPONENT: f64 = 0.81;
+/// The Gaussian (log-normal) fading σ of the Mangel model, 4.1 dB [same].
+pub const MANGEL_SIGMA_DB: f64 = 4.1;
+
+/// The breakpoint distance of the Mangel model's receiver-street term, metres:
+/// `d_b = 4·h_t·h_r/λ`, the first-Fresnel-zone breakpoint of the two-ray model Abbas
+/// 2015 Eq. 5 uses with the same `d_b` symbol (177 m for two 1.5 m antennas at
+/// 5.9 GHz). The Mangel paper's own definition of `d_b` was not retrievable (the
+/// publisher's PDF is behind a bot wall), so this is the reading of the symbol in the
+/// paper that reprints the equation, and the card says so.
+#[must_use]
+pub fn mangel_breakpoint_m(h_t_m: f64, h_r_m: f64, f_hz: f64) -> f64 {
+    4.0 * h_t_m.max(0.1) * h_r_m.max(0.1) / numeric::wavelength_m(f_hz)
+}
+
+/// The Mangel, Klemp and Hartenstein (2011) path loss of a link round an urban
+/// intersection, dB — the "VirtualSource11p" model, fitted to 5.9 GHz 802.11p
+/// measurements at Munich intersections and independently validated in Lund:
+///
+/// ```text
+/// PL = 3.75 + i_s·2.94 + 10·log10( ( d_t^0.957 / (x_t·w_r)^0.81 · 4π·d_r/λ )^2.69 )          d_r ≤ d_b
+/// PL = 3.75 + i_s·2.94 + 10·log10( ( d_t^0.957 / (x_t·w_r)^0.81 · 4π·d_r²/(λ·d_b) )^2.69 )  d_r > d_b
+/// ```
+///
+/// with `d_t`, `d_r` the transmitter's and receiver's distances to the intersection
+/// centre, `w_r` the width of the receiver's street, `x_t` the transmitter's distance to
+/// the wall and `i_s` 1 suburban, 0 urban [Abbas et al. 2015, Eq. 6, reprinting Mangel
+/// et al. 2011, EURASIP JWCN 2011:182]. The two branches meet at `d_r = d_b`.
+#[must_use]
+pub fn mangel_nlos_db(
+    corner: &CornerGeometry,
+    f_hz: f64,
+    h_t_m: f64,
+    h_r_m: f64,
+    suburban: bool,
+) -> f64 {
+    let lambda = numeric::wavelength_m(f_hz);
+    let d_t = corner.d_t_m.max(1.0);
+    let d_r = corner.d_r_m.max(1.0);
+    let xw = (corner.x_t_m.max(1.0) * corner.w_r_m.max(1.0)).max(1.0);
+    let d_b = mangel_breakpoint_m(h_t_m, h_r_m, f_hz);
+    let geometry = math::pow(d_t, MANGEL_DT_EXPONENT) / math::pow(xw, MANGEL_XW_EXPONENT);
+    let street = if d_r <= d_b {
+        4.0 * core::f64::consts::PI * d_r / lambda
+    } else {
+        4.0 * core::f64::consts::PI * d_r * d_r / (lambda * d_b)
+    };
+    let offset = MANGEL_OFFSET_DB + if suburban { MANGEL_SUBURBAN_DB } else { 0.0 };
+    offset + 10.0 * MANGEL_N_NLOS * math::log10(geometry * street)
+}
+
+// =========================================================================================
+// `propagation/v2v-urban-geometric`
+// =========================================================================================
+
+/// Which of its four laws [`GeometricUrbanV2v`] priced a link with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GeometricState {
+    /// No building and no vehicle on the path: TR 37.885 LOS.
+    Los,
+    /// A vehicle on the path, no building: TR 37.885 LOS, the vehicle's blockage loss
+    /// charged by `obstacle/vehicle/tr37885-nlosv`.
+    Nlosv,
+    /// Buildings on the path and one street corner both ends see: Mangel 2011.
+    NlosCorner,
+    /// Buildings on the path and no single corner: TR 37.885's NLOS law.
+    NlosStreet,
+    /// Buildings on the path, but the straight path through them is the stronger one
+    /// (a thin or low building): TR 37.885 LOS plus the Sommer through-building loss.
+    NlosThrough,
+}
+
+impl GeometricState {
+    /// The state's spelling in reports.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            GeometricState::Los => "los",
+            GeometricState::Nlosv => "nlos-v",
+            GeometricState::NlosCorner => "nlos-corner",
+            GeometricState::NlosStreet => "nlos-street",
+            GeometricState::NlosThrough => "nlos-through",
+        }
+    }
+
+    /// The log-normal shadowing σ of the state, dB: 3 dB LOS and NLOSv, 4 dB for the TR
+    /// 37.885 NLOS law [TR 37.885 Table 6.2.1-1], 4.1 dB round a traced corner
+    /// [Mangel 2011 via Abbas 2015 Eq. 6], and 4 dB through buildings (the TR's NLOS
+    /// figure: the Sommer fit reports no σ of its own).
+    #[must_use]
+    pub const fn sigma_db(self) -> f64 {
+        match self {
+            GeometricState::Los | GeometricState::Nlosv => 3.0,
+            GeometricState::NlosCorner => MANGEL_SIGMA_DB,
+            GeometricState::NlosStreet | GeometricState::NlosThrough => 4.0,
+        }
+    }
+}
+
+/// `propagation/v2v-urban-geometric` — the high tier's city-street propagation: every
+/// link priced from the world's geometry rather than drawn.
+///
+/// * **Line of sight** — no building and no vehicle on the path: TR 37.885's urban LOS
+///   law (its highway law outside the city), σ 3 dB [TR 37.885 Table 6.2.1-1].
+/// * **NLOSv** — a vehicle on the path: the same LOS law, with the blocker's
+///   `obstacle/vehicle/tr37885-nlosv` loss charged by the obstacle stack from the actual
+///   vehicle and antenna heights. The TR's *random* NLOSv state (`1 − P(LOS)`) is not
+///   drawn: it stands in for vehicles the TR's system simulation does not place, and this
+///   engine places every one.
+/// * **Round a corner** — buildings on the path and a street corner both ends see
+///   ([`crate::obstacle::CornerTracer`]): Mangel, Klemp and Hartenstein 2011, from the
+///   corner's measured `d_t`, `d_r`, `x_t` and `w_r` ([`mangel_nlos_db`]), σ 4.1 dB.
+/// * **No single corner** — two parallel streets, or a path needing two turns: TR
+///   37.885's NLOS law, σ 4 dB. Mangel's model is not defined there, and nothing cited
+///   gives a validated two-corner law; the TR law is what 3GPP applies to every
+///   building-blocked V2V link.
+///
+/// Whichever NLOS law applies, the link also has the straight path *through* the
+/// buildings, `PL_LOS + β·n + γ·d_in` (Sommer 2011), and the receiver hears the stronger:
+/// the loss is the smaller of the two, and never less than line of sight at the same
+/// distance. The building excess is reported in the breakdown's `obstacle_db`, so the
+/// inspector shows how much the buildings cost, and the obstacle stack does not charge
+/// buildings again under this model.
+#[derive(Debug, Clone)]
+pub struct GeometricUrbanV2v {
+    card: ModelCard,
+    tier: Tier,
+    env: EnvClass,
+    d_corr_m: f64,
+    sommer: SommerCoefficients,
+    shadows: BTreeMap<(u32, u32), ShadowProcess>,
+}
+
+impl GeometricUrbanV2v {
+    /// The model's id.
+    pub const ID: &'static str = "propagation/v2v-urban-geometric";
+
+    /// The model at `tier` for the world's environment class.
+    #[must_use]
+    pub fn new(tier: Tier, env: EnvClass) -> Self {
+        Self {
+            card: geometric_card(),
+            tier,
+            env,
+            d_corr_m: decorrelation_distance_m(env),
+            sommer: SommerCoefficients::DEFAULT,
+            shadows: BTreeMap::new(),
+        }
+    }
+
+    /// The model with another Sommer row for the through-building path.
+    #[must_use]
+    pub fn with_building_coefficients(mut self, c: SommerCoefficients) -> Self {
+        self.sommer = c;
+        self
+    }
+
+    /// Whether the world is a city (urban or suburban), where the TR's urban LOS law and
+    /// the Mangel corner model apply.
+    #[must_use]
+    pub const fn is_urban(&self) -> bool {
+        matches!(self.env, EnvClass::Urban | EnvClass::Suburban)
+    }
+
+    /// The line-of-sight law at a 3-D distance, dB.
+    #[must_use]
+    pub fn los_db(&self, d3d_m: f64, f_hz: f64) -> f64 {
+        let fc = f_hz / 1e9;
+        if self.is_urban() {
+            tr37885_urban_los_db(d3d_m, fc)
+        } else {
+            tr37885_highway_los_db(d3d_m, fc)
+        }
+    }
+
+    /// The deterministic loss of a classified link and the law that priced it, dB —
+    /// everything but the shadowing.
+    #[must_use]
+    pub fn mean_loss_db(
+        &self,
+        tx: &RadioEndpoint,
+        rx: &RadioEndpoint,
+        f_hz: f64,
+        los: &LosResult,
+    ) -> (f64, GeometricState) {
+        let d3d = tx.pos.distance(rx.pos);
+        let los_db = self.los_db(d3d, f_hz);
+        if !los.class.has_building() {
+            let state = if los.class.has_vehicle() {
+                GeometricState::Nlosv
+            } else {
+                GeometricState::Los
+            };
+            return (los_db, state);
+        }
+        let (around, state) = match &los.corner {
+            Some(c) => (
+                // Heights above a flat datum: the breakpoint needs antenna heights, and
+                // the endpoints carry the phase-centre z.
+                mangel_nlos_db(
+                    c,
+                    f_hz,
+                    tx.pos.z.clamp(0.5, 30.0),
+                    rx.pos.z.clamp(0.5, 30.0),
+                    self.env == EnvClass::Suburban,
+                ),
+                GeometricState::NlosCorner,
+            ),
+            None => (
+                tr37885_nlos_db(d3d, f_hz / 1e9),
+                GeometricState::NlosStreet,
+            ),
+        };
+        let around = around.max(los_db);
+        let through = los_db + self.sommer.loss_db(los.walls_crossed, los.obstructed_len_m);
+        if through < around {
+            (through, GeometricState::NlosThrough)
+        } else {
+            (around, state)
+        }
+    }
+}
+
+impl Model for GeometricUrbanV2v {
+    fn card(&self) -> &ModelCard {
+        &self.card
+    }
+}
+
+impl<C: Ctx + ?Sized> Propagation<C> for GeometricUrbanV2v {
+    fn tier(&self) -> Tier {
+        self.tier
+    }
+
+    fn loss_db(
+        &mut self,
+        ctx: &mut C,
+        tx: &RadioEndpoint,
+        rx: &RadioEndpoint,
+        f_hz: f64,
+        los: &LosResult,
+        _w: &WeatherState,
+    ) -> LossBreakdown {
+        let d3d = tx.pos.distance(rx.pos);
+        let los_db = self.los_db(d3d, f_hz);
+        let (total, state) = self.mean_loss_db(tx, rx, f_hz, los);
+        let link = LinkKey(tx.node, rx.node);
+        let draw = ctx
+            .rng(RngDomain::Shadow, EntityRef::Link(link))
+            .normal(0.0, 1.0);
+        let shadow = self
+            .shadows
+            .entry((tx.node.index(), rx.node.index()))
+            .or_default()
+            .update(tx.pos, rx.pos, state.sigma_db(), self.d_corr_m, draw);
+        LossBreakdown::new(
+            los_db,
+            shadow,
+            total - los_db,
+            0.0,
+            tx.gain_dbi + rx.gain_dbi,
+        )
+    }
+}
+
+fn mangel_source() -> Source {
+    Source {
+        kind: SourceKind::Paper,
+        reference: "T. Mangel, O. Klemp, H. Hartenstein, \"5.9 GHz inter-vehicle \
+                    communication at intersections: a validated non-line-of-sight path-loss \
+                    and fading model\", EURASIP J. Wireless Commun. Netw. 2011:182; equation \
+                    as reprinted in T. Abbas et al., \"A measurement based shadow fading \
+                    model for vehicle-to-vehicle network simulations\", Int. J. Antennas \
+                    Propag. 2015 (arXiv:1203.3370), Eq. 6"
+            .to_string(),
+        accessed: Some("2026-09-23".to_string()),
+        note: Some(
+            "Fitted to 5.9 GHz 802.11p measurements at Munich intersections; Abbas 2015 \
+             cites an independent validation on Lund measurements. Abbas also reports that \
+             links between parallel streets lose more than 120 dB."
+                .to_string(),
+        ),
+    }
+}
+
+fn geometric_card() -> ModelCard {
+    let tr = Source::new(
+        SourceKind::Standard,
+        "3GPP TR 37.885 V15.3.0 §6.2 and Table 6.2.1-1: urban and highway LOS, NLOS \
+         (blocked by buildings), σ_SF 3 dB LOS/NLOSv and 4 dB NLOS",
+    );
+    let mut card = ModelCard::new(
+        GeometricUrbanV2v::ID,
+        Family::Propagation,
+        "1.0.0",
+        "City-street V2V propagation priced from the world's geometry: TR 37.885 line of \
+         sight, the Mangel 2011 intersection model round a traced street corner, TR \
+         37.885's NLOS law where no single corner connects the two ends, and the Sommer \
+         through-building path when it is stronger.",
+    );
+    card.tier = vec![Tier::High];
+    card.equations = vec![
+        Equation::new(
+            "line of sight",
+            "urban: 38.77 + 16.7·log10(d3D) + 18.2·log10(fc_GHz); highway: 32.4 + \
+             20·log10(d3D) + 20·log10(fc_GHz); σ 3 dB",
+        ),
+        Equation::new(
+            "round a corner (Mangel 2011)",
+            "3.75 + i_s·2.94 + 10·log10((d_t^0.957/(x_t·w_r)^0.81 · 4π·d_r/λ)^2.69) for \
+             d_r ≤ d_b, 4π·d_r²/(λ·d_b) in place of 4π·d_r/λ above; d_b = 4·h_t·h_r/λ; \
+             σ 4.1 dB",
+        ),
+        Equation::new(
+            "no single corner",
+            "36.85 + 30·log10(d3D) + 18.9·log10(fc_GHz); σ 4 dB",
+        ),
+        Equation::new(
+            "through the buildings",
+            "PL_LOS + 9·n_walls + 0.4·d_in (Sommer 2011 default row)",
+        ),
+        Equation::new(
+            "composition",
+            "PL = max(PL_LOS, min(PL_around, PL_through)) + shadowing; obstacle_db = PL − \
+             PL_LOS",
+        ),
+    ];
+    card.parameters = vec![
+        Parameter::new("mangel_n_nlos", "-", serde_json::json!(MANGEL_N_NLOS), mangel_source()),
+        Parameter::new(
+            "mangel_offset_db",
+            "dB",
+            serde_json::json!(MANGEL_OFFSET_DB),
+            mangel_source(),
+        ),
+        Parameter::new(
+            "mangel_suburban_db",
+            "dB",
+            serde_json::json!(MANGEL_SUBURBAN_DB),
+            mangel_source(),
+        ),
+        Parameter::new(
+            "mangel_sigma_db",
+            "dB",
+            serde_json::json!(MANGEL_SIGMA_DB),
+            mangel_source(),
+        ),
+        Parameter::new("sigma_los_db", "dB", serde_json::json!(3.0), tr.clone()),
+        Parameter::new("sigma_nlos_db", "dB", serde_json::json!(4.0), tr.clone()),
+        Parameter::new(
+            "d_corr_m",
+            "m",
+            serde_json::json!(10.0),
+            Source::new(
+                SourceKind::Standard,
+                "3GPP TR 36.885 Annex A.1.4 (10 m urban, 25 m freeway), via 04-models.md \
+                 §3.2",
+            ),
+        ),
+    ];
+    card.assumptions = vec![
+        "A link's state is decided by the world: buildings from the footprints, vehicles \
+         from the actors actually on the path, the corner from the junction both ends \
+         see. Nothing is drawn but the shadowing."
+            .to_string(),
+        "d_b is read as the two-ray first-Fresnel-zone breakpoint 4·h_t·h_r/λ, the meaning \
+         Abbas 2015 gives the same symbol in the paper that reprints the equation; the \
+         Mangel paper itself was not retrievable to confirm it."
+            .to_string(),
+        "x_t and w_r are measured by casting rays to the nearest building wall, 60 m at \
+         most each way; an open side counts as 60 m."
+            .to_string(),
+        "The receiver hears the stronger of the around-the-corner and through-the-buildings \
+         paths; their powers are not summed."
+            .to_string(),
+        "One shadowing process per link, whose σ follows the state the link is in.".to_string(),
+    ];
+    card.limitations = vec![
+        "Mangel's model was fitted for d_t and d_r up to roughly 150 m at Munich \
+         intersections; longer legs are extrapolated."
+            .to_string(),
+        "It is a V2V model (both antennas about 1.5 m); a roadside unit on a mast uses it \
+         unchanged."
+            .to_string(),
+        "Two-corner paths have no cited validated law; they get TR 37.885's NLOS law."
+            .to_string(),
+        "Heights in the breakpoint are the phase-centre z, clamped to 0.5-30 m: on a world \
+         with terrain that is above the datum, not above the local ground."
+            .to_string(),
+    ];
+    card.ignores = vec![
+        "Fast fading (the Fading family) and rain (weather/attenuation/itu-r-p838), which \
+         the composition applies."
+            .to_string(),
+    ];
+    card.sources = vec![
+        tr.clone(),
+        mangel_source(),
+        sommer_source_for_prop(),
+    ];
+    card.validation = Validation {
+        status: ValidationStatus::LiteratureChecked,
+        references: vec![tr, mangel_source()],
+        tests: vec![
+            "mangel_reproduces_the_printed_equation".to_string(),
+            "mangel_is_continuous_at_the_breakpoint_and_orders_its_geometry".to_string(),
+            "mangel_predicts_the_measured_reception_50_m_from_the_corner".to_string(),
+            "the_geometric_model_picks_the_law_the_geometry_calls_for".to_string(),
+        ],
+    };
+    card.determinism = Determinism {
+        uses_rng: true,
+        rng_domains: vec!["shadow".to_string()],
+    };
+    card
+}
+
+fn sommer_source_for_prop() -> Source {
+    Source::new(
+        SourceKind::Paper,
+        "C. Sommer, D. Eckhoff, R. German, F. Dressler, \"A Computationally Inexpensive \
+         Empirical Model of IEEE 802.11p Radio Shadowing in Urban Environments\", WONS 2011: \
+         β 9 dB per wall, γ 0.4 dB/m",
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2491,5 +3184,264 @@ mod tests {
         );
         assert!((b.total_db - friis_loss_db(100.0, 5.9e9)).abs() < 1e-12);
         assert_eq!(model.id(), FreeSpace::ID);
+    }
+
+    // ------------------------------------------------------------------------------------
+    // ITU-R P.838-3 at the carrier
+    // ------------------------------------------------------------------------------------
+
+    /// The regression of P.838-3 Eqs. 2-3 must reproduce the recommendation's own Table 5.
+    /// The 5.5 and 6 GHz rows are the ones 04-models.md §3.6 transcribed (R3 §E.1); the
+    /// 10 GHz row is P.838-3 Table 5's as printed. Four significant figures on `k`, four
+    /// decimals on `α`: the table's own precision.
+    #[test]
+    fn p838_regression_reproduces_table_5() {
+        let rows = [
+            (5.5e9, 0.000_390_9, 1.6499, 0.000_311_5, 1.5882),
+            (6.0e9, 0.000_705_6, 1.5900, 0.000_487_8, 1.5728),
+            (10.0e9, 0.012_17, 1.2571, 0.011_29, 1.2156),
+        ];
+        for (f, kh, ah, kv, av) in rows {
+            let (k, a) = p838_coefficients(f, Polarization::Horizontal);
+            assert!((k / kh - 1.0).abs() < 5e-4, "k_H at {f}: {k} vs {kh}");
+            assert!((a - ah).abs() < 5e-5, "α_H at {f}: {a} vs {ah}");
+            let (k, a) = p838_coefficients(f, Polarization::Vertical);
+            assert!((k / kv - 1.0).abs() < 5e-4, "k_V at {f}: {k} vs {kv}");
+            assert!((a - av).abs() < 5e-5, "α_V at {f}: {a} vs {av}");
+        }
+        // And the 6 GHz row the crate carries as constants agrees with the regression.
+        let (k6, a6) = p838_coefficients(6.0e9, Polarization::Vertical);
+        let (k6t, a6t) = Polarization::Vertical.rain_coefficients_6ghz();
+        assert!((k6 / k6t - 1.0).abs() < 5e-4 && (a6 - a6t).abs() < 5e-5);
+    }
+
+    /// The model card's statement of the magnitude, checked: at 5.9 GHz a 50 mm/h
+    /// downpour costs about 0.21 dB/km, so a few hundredths of a dB on a V2X link, and
+    /// nothing but rain and sleet costs anything.
+    #[test]
+    fn rain_costs_hundredths_of_a_decibel_on_a_v2x_link() {
+        let gamma = rain_specific_attenuation_at_db_km(50.0, 5.9e9, Polarization::Vertical);
+        assert!((gamma - 0.212).abs() < 0.002, "{gamma} dB/km");
+        let rain = |kind, intensity| {
+            WeatherState::new(
+                kind,
+                intensity,
+                1_000.0,
+                v2xw_core::weather::SurfaceCondition::Wet,
+            )
+        };
+        let downpour = rain(WeatherKind::Rain, 1.0);
+        let a300 = rain_attenuation_db(&downpour, 300.0, 5.9e9);
+        assert!((a300 - 0.0636).abs() < 0.001, "{a300} dB on 300 m");
+        let a1k = rain_attenuation_db(&downpour, 1_000.0, 5.9e9);
+        assert!(a1k < 0.25, "{a1k} dB on 1 km");
+        // Linear in length, and moderate rain (intensity 0.1, 5 mm/h) is a hundredth of a
+        // dB per km.
+        assert!((a1k / a300 - 1_000.0 / 300.0).abs() < 1e-9);
+        let moderate = rain_attenuation_db(&rain(WeatherKind::Rain, 0.1), 1_000.0, 5.9e9);
+        assert!(moderate < 0.01, "{moderate}");
+        // Sleet is rain at this carrier; fog, snow and clear cost nothing.
+        assert!(rain_attenuation_db(&rain(WeatherKind::Sleet, 1.0), 300.0, 5.9e9) > 0.0);
+        for kind in [WeatherKind::Fog, WeatherKind::Snow, WeatherKind::Clear] {
+            assert_eq!(rain_attenuation_db(&rain(kind, 1.0), 300.0, 5.9e9), 0.0, "{kind:?}");
+        }
+        // The model object agrees with the free function.
+        let m = RainAttenuation::new();
+        assert_eq!(m.attenuation_db(&downpour, 300.0, 5.9e9), a300);
+        assert_eq!(m.id(), RainAttenuation::ID);
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Mangel, Klemp and Hartenstein 2011
+    // ------------------------------------------------------------------------------------
+
+    fn corner(d_t: f64, d_r: f64, x_t: f64, w_r: f64) -> CornerGeometry {
+        CornerGeometry {
+            corner: Vec3::ZERO,
+            d_t_m: d_t,
+            d_r_m: d_r,
+            x_t_m: x_t,
+            w_r_m: w_r,
+        }
+    }
+
+    /// The equation as Abbas 2015 Eq. 6 prints it, evaluated here in its expanded
+    /// logarithmic form — `3.75 + 26.9·(0.957·log10 d_t − 0.81·log10(x_t·w_r) +
+    /// log10(4π·d_r/λ))` — so the test does not share the implementation's arithmetic.
+    /// The reference values were computed independently from the printed equation.
+    #[test]
+    fn mangel_reproduces_the_printed_equation() {
+        let f = 5.9e9;
+        let lambda = numeric::SPEED_OF_LIGHT_M_S / f;
+        let expanded = |d_t: f64, d_r: f64, xw: f64| {
+            3.75 + 26.9
+                * (0.957 * math::log10(d_t) - 0.81 * math::log10(xw)
+                    + math::log10(4.0 * core::f64::consts::PI * d_r / lambda))
+        };
+        for (d_t, d_r, x_t, w_r, printed) in [
+            (50.0, 50.0, 10.0, 20.0, 107.430),
+            (50.0, 50.0, 5.0, 20.0, 113.990),
+            (10.0, 150.0, 10.0, 20.0, 102.271),
+            (150.0, 150.0, 10.0, 20.0, 132.548),
+        ] {
+            let pl = mangel_nlos_db(&corner(d_t, d_r, x_t, w_r), f, 1.5, 1.5, false);
+            assert!((pl - printed).abs() < 1e-3, "{d_t}/{d_r}/{x_t}/{w_r}: {pl}");
+            assert!((pl - expanded(d_t, d_r, x_t * w_r)).abs() < 1e-9);
+        }
+        // Beyond the breakpoint (177 m for two 1.5 m antennas): 4π·d_r²/(λ·d_b).
+        let far = mangel_nlos_db(&corner(50.0, 300.0, 10.0, 20.0), f, 1.5, 1.5, false);
+        assert!((far - 134.519).abs() < 1e-3, "{far}");
+        assert!((mangel_breakpoint_m(1.5, 1.5, f) - 177.123).abs() < 1e-3);
+        // The suburban offset is exactly 2.94 dB.
+        let urban = mangel_nlos_db(&corner(50.0, 50.0, 10.0, 20.0), f, 1.5, 1.5, false);
+        let suburban = mangel_nlos_db(&corner(50.0, 50.0, 10.0, 20.0), f, 1.5, 1.5, true);
+        assert!((suburban - urban - 2.94).abs() < 1e-12);
+    }
+
+    /// The two branches meet at the breakpoint, and the loss moves the way the geometry
+    /// says it must: further from the corner costs more, a wider receiving street and a
+    /// transmitter further from the wall cost less.
+    #[test]
+    fn mangel_is_continuous_at_the_breakpoint_and_orders_its_geometry() {
+        let f = 5.9e9;
+        let d_b = mangel_breakpoint_m(1.5, 1.5, f);
+        let below = mangel_nlos_db(&corner(40.0, d_b * (1.0 - 1e-12), 8.0, 18.0), f, 1.5, 1.5, false);
+        let above = mangel_nlos_db(&corner(40.0, d_b * (1.0 + 1e-12), 8.0, 18.0), f, 1.5, 1.5, false);
+        assert!((below - above).abs() < 1e-6, "{below} vs {above}");
+        // Beyond the breakpoint the receiver-street slope doubles: 2·26.9 dB per decade.
+        let a = mangel_nlos_db(&corner(40.0, 200.0, 8.0, 18.0), f, 1.5, 1.5, false);
+        let b = mangel_nlos_db(&corner(40.0, 2_000.0, 8.0, 18.0), f, 1.5, 1.5, false);
+        assert!((b - a - 2.0 * 26.9).abs() < 1e-9, "{}", b - a);
+        let base = mangel_nlos_db(&corner(40.0, 60.0, 8.0, 18.0), f, 1.5, 1.5, false);
+        assert!(mangel_nlos_db(&corner(80.0, 60.0, 8.0, 18.0), f, 1.5, 1.5, false) > base);
+        assert!(mangel_nlos_db(&corner(40.0, 120.0, 8.0, 18.0), f, 1.5, 1.5, false) > base);
+        assert!(mangel_nlos_db(&corner(40.0, 60.0, 16.0, 18.0), f, 1.5, 1.5, false) < base);
+        assert!(mangel_nlos_db(&corner(40.0, 60.0, 8.0, 36.0), f, 1.5, 1.5, false) < base);
+        // Nearly reciprocal: swapping the two legs changes only the 0.957 exponent on
+        // d_t against the implicit 1 on d_r, 26.9·0.043·log10(150/10) = 1.36 dB here.
+        let near_tx = mangel_nlos_db(&corner(10.0, 150.0, 10.0, 20.0), f, 1.5, 1.5, false);
+        let far_tx = mangel_nlos_db(&corner(150.0, 10.0, 10.0, 20.0), f, 1.5, 1.5, false);
+        let expected = 26.9 * (1.0 - 0.957) * math::log10(15.0);
+        assert!((near_tx - far_tx - expected).abs() < 1e-9, "{near_tx} vs {far_tx}");
+    }
+
+    /// Mangel, Michl, Klemp and Hartenstein measured 802.11p at Munich intersections with
+    /// the line of sight blocked and report "reception rates staying mostly well above
+    /// 50 % for distances of 50 m to intersection center" (Nets4Cars 2011, LNCS 6596,
+    /// pp. 189-202; the abstract's own words). The fitted model has to agree: with both
+    /// cars 50 m from the centre of a crossing of 20 m streets, the transmitter mid-street
+    /// (x_t = 10 m), a J2945/1 radiated power of 20 dBm, the TR 36.885 3 dBi receive
+    /// antenna and the engine's default receiver (EN 302 663 static sensitivity, −88 dBm
+    /// at 6 Mbit/s), the probability the received power clears the sensitivity under the
+    /// model's own 4.1 dB log-normal fading is well above one half. With the transmitter
+    /// hugging the wall (x_t = 5 m) the same geometry falls below it, which is the
+    /// model's point: the corner geometry, not the distance, decides.
+    #[test]
+    fn mangel_predicts_the_measured_reception_50_m_from_the_corner() {
+        let f = 5.9e9;
+        let sensitivity = crate::types::Mcs::R6Qpsk12.sensitivity_static_dbm();
+        let p_above = |x_t: f64| {
+            let pl = mangel_nlos_db(&corner(50.0, 50.0, x_t, 20.0), f, 1.5, 1.5, false);
+            let mean = 20.0 + 3.0 - pl;
+            // P(N(mean, σ) ≥ sensitivity) = Φ((mean − s)/σ).
+            let z = (mean - sensitivity) / MANGEL_SIGMA_DB;
+            0.5 * (1.0 + numeric::erf(z / core::f64::consts::SQRT_2))
+        };
+        let mid_street = p_above(10.0);
+        assert!(mid_street > 0.75, "{mid_street}");
+        let at_the_wall = p_above(5.0);
+        assert!(at_the_wall < 0.5, "{at_the_wall}");
+    }
+
+    fn ep(id: u32, x: f64, y: f64) -> RadioEndpoint {
+        let mut e = endpoint(id, x, y, 1.5);
+        e.gain_dbi = 3.0;
+        e
+    }
+
+    /// Each state gets its own law, from the geometry and nothing else: LOS and NLOSv
+    /// take TR 37.885's urban LOS law, a traced corner Mangel's, no corner TR 37.885's NLOS
+    /// law, and a thin building the Sommer path through it. The building excess is the
+    /// breakdown's `obstacle_db`, and no NLOS law ever beats line of sight.
+    #[test]
+    fn the_geometric_model_picks_the_law_the_geometry_calls_for() {
+        let f = 5.9e9;
+        let model = GeometricUrbanV2v::new(Tier::High, EnvClass::Urban);
+        let tx = ep(0, 0.0, 0.0);
+        let rx = ep(1, 50.0, 50.0);
+        let d = tx.pos.distance(rx.pos);
+        let los_law = tr37885_urban_los_db(d, 5.9);
+
+        let (clear, s) = model.mean_loss_db(&tx, &rx, f, &LosResult::clear());
+        assert_eq!(s, GeometricState::Los);
+        assert!((clear - los_law).abs() < 1e-12);
+        let vehicle = LosResult {
+            class: crate::types::LosClass::NlosV,
+            ..LosResult::clear()
+        };
+        let (v, s) = model.mean_loss_db(&tx, &rx, f, &vehicle);
+        assert_eq!(s, GeometricState::Nlosv);
+        assert!((v - los_law).abs() < 1e-12, "the blockage is the obstacle stack's term");
+
+        // A tower block on the corner: 2 walls, 30 m inside — the Sommer path costs 33 dB.
+        let mut blocked = LosResult::blocked_by_buildings(2, 30.0);
+        let (street, s) = model.mean_loss_db(&tx, &rx, f, &blocked);
+        assert_eq!(s, GeometricState::NlosStreet);
+        assert!((street - tr37885_nlos_db(d, 5.9)).abs() < 1e-12);
+        blocked.corner = Some(corner(50.0, 50.0, 10.0, 20.0));
+        let (round, s) = model.mean_loss_db(&tx, &rx, f, &blocked);
+        assert_eq!(s, GeometricState::NlosCorner);
+        let mangel = mangel_nlos_db(&corner(50.0, 50.0, 10.0, 20.0), f, 1.5, 1.5, false);
+        assert!((round - mangel).abs() < 1e-12);
+
+        // A garden wall: one wall, 1 m inside — through it is the stronger path.
+        let mut thin = LosResult::blocked_by_buildings(1, 1.0);
+        thin.corner = Some(corner(50.0, 50.0, 10.0, 20.0));
+        let (through, s) = model.mean_loss_db(&tx, &rx, f, &thin);
+        assert_eq!(s, GeometricState::NlosThrough);
+        assert!((through - (los_law + 9.4)).abs() < 1e-9);
+
+        // A corner hugged so closely the fit would beat line of sight is held at it.
+        let mut hug = LosResult::blocked_by_buildings(4, 200.0);
+        hug.corner = Some(corner(1.0, 1.0, 60.0, 60.0));
+        let (held, _) = model.mean_loss_db(&tx, &rx, f, &hug);
+        assert!((held - los_law).abs() < 1e-12, "{held} vs {los_law}");
+
+        // The breakdown carries the building excess as obstacle loss, the gains as
+        // antenna gain, and the shadowing with the state's σ.
+        let mut ctx = TestCtx::new(9);
+        let mut m = GeometricUrbanV2v::new(Tier::High, EnvClass::Urban);
+        let b = Propagation::<TestCtx>::loss_db(&mut m, &mut ctx, &tx, &rx, f, &blocked, &WeatherState::CLEAR);
+        assert!((b.path_db - los_law).abs() < 1e-12);
+        assert!((b.obstacle_db - (mangel - los_law)).abs() < 1e-9);
+        assert_eq!(b.antenna_db, 6.0);
+        assert_eq!(b.weather_db, 0.0, "rain is the composition's term");
+        assert!(b.shadow_db.abs() < 5.0 * MANGEL_SIGMA_DB);
+        assert_eq!(GeometricState::NlosCorner.sigma_db(), 4.1);
+        assert_eq!(GeometricState::Los.sigma_db(), 3.0);
+        assert_eq!(GeometricState::NlosStreet.sigma_db(), 4.0);
+    }
+
+    /// The shadowing of the geometric model is stationary with its state's σ, like
+    /// every other law's: many independent links in the corner state spread 4.1 dB.
+    #[test]
+    fn the_geometric_models_shadowing_has_its_states_sigma() {
+        let f = 5.9e9;
+        let mut ctx = TestCtx::new(10);
+        let mut m = GeometricUrbanV2v::new(Tier::High, EnvClass::Urban);
+        let mut blocked = LosResult::blocked_by_buildings(2, 30.0);
+        blocked.corner = Some(corner(50.0, 50.0, 10.0, 20.0));
+        let mut xs = Vec::new();
+        for i in 0..4_000u32 {
+            let tx = ep(2 * i, 0.0, 0.0);
+            let rx = ep(2 * i + 1, 50.0, 50.0);
+            let b = Propagation::<TestCtx>::loss_db(&mut m, &mut ctx, &tx, &rx, f, &blocked, &WeatherState::CLEAR);
+            xs.push(b.shadow_db);
+        }
+        let n = xs.len() as f64;
+        let mean = xs.iter().sum::<f64>() / n;
+        let sd = math::sqrt(xs.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n);
+        assert!(mean.abs() < 0.2, "{mean}");
+        assert!((sd - 4.1).abs() < 0.2, "{sd}");
     }
 }

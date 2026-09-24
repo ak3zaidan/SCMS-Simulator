@@ -1032,6 +1032,32 @@ pub struct LosResult {
     pub obstructed_len_m: f64,
     /// Diffracting edges, for the vehicle and terrain knife-edge models.
     pub knife_edges: Vec<KnifeEdge>,
+    /// The street corner a building-blocked link turns round, when one was traced
+    /// ([`crate::obstacle::CornerTracer`]). `None` for a clear link, for a blocked link no
+    /// single corner connects, and for every link of a stack that does not trace corners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corner: Option<CornerGeometry>,
+}
+
+/// The geometry of an L-shaped street-canyon path: transmitter and receiver in two
+/// intersecting streets, the corner between them, and the four quantities the Mangel,
+/// Klemp and Hartenstein (2011) urban-intersection NLOS model is written in.
+///
+/// Every distance is measured on the ground plane, in metres, from the world's own lane
+/// and building geometry (see [`crate::obstacle::CornerTracer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CornerGeometry {
+    /// The corner the path turns round: the centre of the junction both ends see.
+    pub corner: Vec3,
+    /// `d_t`: the transmitter's distance to the corner.
+    pub d_t_m: f64,
+    /// `d_r`: the receiver's distance to the corner.
+    pub d_r_m: f64,
+    /// `x_t`: the transmitter's distance to the building wall on the side of its street
+    /// the path turns towards.
+    pub x_t_m: f64,
+    /// `w_r`: the width of the receiver's street, wall to wall, across the receiver.
+    pub w_r_m: f64,
 }
 
 impl LosResult {
@@ -1049,6 +1075,7 @@ impl LosResult {
             walls_crossed: walls,
             obstructed_len_m: len_m,
             knife_edges: Vec::new(),
+            corner: None,
         }
     }
 }
