@@ -1316,25 +1316,52 @@ fn apply_security_profile(runtime: &mut ObuRuntime, scenario: &Scenario, env: No
     *runtime.security_mut() = configured;
 }
 
-/// Which reading of the pseudonym-rotation rule the scenario selected.
+/// The pseudonym-rotation rule the scenario states (`security.pseudonym_change`).
 ///
-/// 05-protocols.md §2.4 admits two, and the period is what picks between them: 300 s is
-/// the J2945/1 rule, anything else the NYC pilot's. It is a function rather than two
-/// copies of the same `if`, because the credential store's policy has to be the same one
-/// whether the credentials came from the bootstrap stand-in or from the SCMS provisioning.
+/// The strategy's semantics are `v2xw_proto::pseudonym::PseudonymStrategy`'s, the one place
+/// the scenario spelling is mapped, expressed as the node store's [`RotationPolicy`]:
+///
+/// * `time` — change when the active pseudonym is `period_s` old (default 300 s, the
+///   J2945/1 `CERTCHG` interval), however far the vehicle drove.
+/// * `distance` — change after `distance_m` of travel (default 2 km, the NYC-pilot rule).
+/// * `mix-zone` — change only on leaving a mix zone. No world in this build has mix zones,
+///   so no scheduled change happens; forced changes (expiry, revocation) still do.
+/// * `silent` — no scheduled change; forced changes still happen.
+///
+/// This used to ignore the numbers: a period of exactly 300 s selected "5 min *and* 2 km"
+/// and any other period "5 min *or* 2 km", so `period_s: 10` in phase2-manhattan.yaml still
+/// rotated at five minutes, and the store held a single pseudonym to rotate to anyway.
 pub fn rotation_policy(scenario: &Scenario) -> RotationPolicy {
-    let period = scenario
-        .security
-        .pseudonym_change
-        .period_s
-        .map(Duration::from_secs_f64)
-        .unwrap_or(Duration::from_secs(300));
-    if (period.as_secs_f64() - 300.0).abs() < 1e-9 {
-        RotationPolicy::J2945_1
-    } else {
-        RotationPolicy::NYC_PILOT
+    use v2xw_proto::pseudonym::PseudonymStrategy;
+    let p = &scenario.security.pseudonym_change;
+    let never = RotationPolicy {
+        min_age: Duration::MAX,
+        min_distance_m: f64::INFINITY,
+        require_both: false,
+    };
+    match PseudonymStrategy::from_scenario(&p.strategy, p.period_s, p.distance_m) {
+        Some(PseudonymStrategy::Time { period }) => RotationPolicy {
+            min_age: period,
+            ..never
+        },
+        Some(PseudonymStrategy::Distance { distance_cm }) => RotationPolicy {
+            min_distance_m: distance_cm as f64 / 100.0,
+            ..never
+        },
+        // `from_scenario` is non-exhaustive and the validator refuses unknown names; a name
+        // that still reaches here gets the schema's default rule.
+        None => RotationPolicy {
+            min_age: v2xw_proto::pseudonym::CERTCHG_INTERVAL,
+            ..never
+        },
+        Some(_) => never,
     }
 }
+
+/// How many pseudonym certificates the bootstrap stand-in installs: the SCMS's batch of 20
+/// concurrently valid pseudonyms per week (USDOT SCMS Technical Primer, FHWA-JPO-19-775,
+/// pp. 7-8; 05-protocols.md §2.4), so a rotation has somewhere to go.
+pub const BOOTSTRAP_PSEUDONYMS: u32 = 20;
 
 /// Installs the pseudonym a node starts with. See the module documentation: this stands in
 /// for the credential protocol and does not model it.
@@ -1350,22 +1377,26 @@ pub fn bootstrap_credentials(
         certs: core::mem::take(&mut store.certs).with_policy(policy),
         ..core::mem::take(store)
     };
-    // One pseudonym, valid for the whole run. A pool and a rotation schedule are the
-    // protocol's job; the store rotates within what it holds.
-    runtime.stores_mut().certs.insert(CredentialHandle {
-        digest: pseudo_signer(node, 0),
-        // The encoded certificate's *size* is what the envelope overhead depends on, and
-        // 04-models.md §9.1 derives 117 bytes for an implicit 1609.2 pseudonym
-        // certificate. The bytes themselves are not a real certificate and nothing reads
-        // them; a scenario in `real` crypto mode needs the protocol.
-        cert_coer: vec![0u8; 117],
-        key: v2xw_sec::KeyId(u64::from(node.index())),
-        i_period: 0,
-        j_index: 0,
-        valid_from: at,
-        valid_until: SimTime::MAX,
-        state: CredState::Active,
-    });
+    // One week's batch of pseudonyms, all valid for the whole run; the store rotates
+    // within it by the scenario's rule. Provisioning them over the air is the credential
+    // protocol's job (`install_provisioned` when the SCMS runs).
+    for j in 0..BOOTSTRAP_PSEUDONYMS {
+        runtime.stores_mut().certs.insert(CredentialHandle {
+            digest: pseudo_signer(node, j),
+            // The encoded certificate's *size* is what the envelope overhead depends on,
+            // and 04-models.md §9.1 derives 117 bytes for an implicit 1609.2 pseudonym
+            // certificate. The bytes themselves are not a real certificate and nothing
+            // reads them; a scenario in `real` crypto mode needs the protocol.
+            cert_coer: vec![0u8; 117],
+            // The handle scheme `install_provisioned` uses: one key per (node, j).
+            key: v2xw_sec::KeyId(u64::from(node.index()) << 8 | u64::from(j)),
+            i_period: 0,
+            j_index: j,
+            valid_from: at,
+            valid_until: SimTime::MAX,
+            state: CredState::Active,
+        });
+    }
 }
 
 /// The physical layer the scenario names.

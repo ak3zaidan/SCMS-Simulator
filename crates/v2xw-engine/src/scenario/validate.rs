@@ -465,17 +465,19 @@ pub static KEY_STATUS: &[KeyStatus] = &[
                range." },
     KeyStatus { path: "security.signer_id_policy", status: Status::Wired,
         note: "How often a full certificate is attached instead of an eight-byte digest." },
-    KeyStatus { path: "security.pseudonym_change.strategy", status: Status::NotImplemented,
-        note: "The engine's rotation rule is built from the period and the distance below; \
-               the strategy name is validated and then not read, so 'silent' still \
-               rotates." },
-    KeyStatus { path: "security.pseudonym_change.period_s", status: Status::Partial,
-        note: "Sets the minimum age before a node may change pseudonym. A change also \
-               needs a credential to change to, and without a backend protocol each node \
-               holds exactly one." },
-    KeyStatus { path: "security.pseudonym_change.distance_m", status: Status::Partial,
-        note: "Sets the minimum distance before a node may change pseudonym, with the \
-               same caveat about the credential pool." },
+    KeyStatus { path: "security.pseudonym_change.strategy", status: Status::Partial,
+        note: "time changes pseudonym at period_s of age and distance after distance_m of \
+               travel (v2xw_proto::pseudonym); silent makes no scheduled change. \
+               mix-zone changes only on leaving a mix zone, and no world has mix zones yet, \
+               so it behaves as silent. Expiry and revocation force a change under every \
+               strategy." },
+    KeyStatus { path: "security.pseudonym_change.period_s", status: Status::Wired,
+        note: "The age at which the time strategy changes pseudonym (default 300 s, the \
+               J2945/1 CERTCHG interval). Each vehicle holds a batch of 20 pseudonyms and \
+               uses every one before reusing any." },
+    KeyStatus { path: "security.pseudonym_change.distance_m", status: Status::Wired,
+        note: "The travel after which the distance strategy changes pseudonym (default \
+               2 km, the NYC pilot's rule)." },
     // --- nodes -------------------------------------------------------------
     KeyStatus { path: "nodes.default_obu", status: Status::Wired,
         note: "The hardware profile every equipped vehicle runs on: its compute, its \

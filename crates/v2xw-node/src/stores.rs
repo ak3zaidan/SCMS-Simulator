@@ -164,6 +164,9 @@ pub struct CertStore {
     distance_since_change_m: f64,
     changes: u32,
     policy: Option<RotationPolicy>,
+    /// How many times each credential, keyed by `(i_period, j_index, valid_from)`, has been
+    /// the active one. Rotation picks the least used, so a pool is used round-robin.
+    activations: BTreeMap<(u32, u32, SimTime), u32>,
 }
 
 impl CertStore {
@@ -269,17 +272,34 @@ impl CertStore {
     /// [`CertStore::active`] still `None`.
     pub fn rotate(&mut self, now: SimTime) -> Option<ChangeReason> {
         let reason = self.change_due(now)?;
-        // The next credential is the oldest usable one, which keeps the pool draining in
-        // issue order rather than by whatever order downloads arrived in.
+        let key = |c: &CredentialHandle| (c.i_period, c.j_index, c.valid_from);
+        // The credential being left counts as used once, however it became active.
+        if let Some(current) = self.creds.first() {
+            let used = self.activations.entry(key(current)).or_insert(0);
+            *used = (*used).max(1);
+        }
+        // The next credential is the least used usable one, and among those the oldest,
+        // which drains the pool in issue order and then goes round it again. Picking the
+        // oldest alone went back to the lowest-numbered credential every second change, so
+        // a node alternated between two pseudonyms and never used the rest of its pool:
+        // exactly the reuse that makes two pseudonyms linkable.
         let pick = self
             .creds
             .iter()
             .enumerate()
             .filter(|(i, c)| *i != 0 && c.is_valid_at(now))
-            .min_by_key(|(_, c)| (c.i_period, c.j_index, c.valid_from))
+            .min_by_key(|(_, c)| {
+                (
+                    self.activations.get(&key(c)).copied().unwrap_or(0),
+                    c.i_period,
+                    c.j_index,
+                    c.valid_from,
+                )
+            })
             .map(|(i, _)| i);
         if let Some(i) = pick {
             self.creds.swap(0, i);
+            *self.activations.entry(key(&self.creds[0])).or_insert(0) += 1;
         }
         self.last_change = Some(now);
         self.distance_since_change_m = 0.0;
@@ -1009,6 +1029,28 @@ mod tests {
         s.travelled(2500.0);
         assert_eq!(s.rotate(800 * NS_PER_S), Some(ChangeReason::Age));
         assert_eq!(s.active().unwrap().j_index, 3);
+    }
+
+    /// Every credential of the pool is used once before any is used again. The rule
+    /// before this picked the lowest-numbered usable credential, so from the third change
+    /// on a node alternated between two pseudonyms and never touched the others.
+    #[test]
+    fn rotation_goes_round_the_whole_pool_before_reusing_a_pseudonym() {
+        let policy = RotationPolicy {
+            min_age: Duration::from_secs(10),
+            min_distance_m: f64::INFINITY,
+            require_both: false,
+        };
+        let mut s = CertStore::new().with_policy(policy);
+        for j in 0..5 {
+            s.insert(cred(10, j, 0, 1000 * NS_PER_S));
+        }
+        let mut seen = vec![s.active().unwrap().j_index];
+        for k in 1..=9u64 {
+            assert_eq!(s.rotate(k * 10 * NS_PER_S), Some(ChangeReason::Age));
+            seen.push(s.active().unwrap().j_index);
+        }
+        assert_eq!(seen, vec![0, 1, 2, 3, 4, 0, 1, 2, 3, 4]);
     }
 
     /// A node whose own certificate is revoked has no active credential, which is what
