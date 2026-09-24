@@ -392,3 +392,62 @@ fn the_etsi_pki_revokes_passively_and_the_scms_actively() {
     }
     assert!(b.topups_completed > 0, "honest ETSI vehicles must top their tickets up");
 }
+
+/// A vehicle with no modem reaches the backend through a roadside unit: the report goes on
+/// the air to the unit, crosses its backhaul, and the bytes land in the backhaul bucket and
+/// not in a cellular one. The same fleet with the unit's backhaul cut reaches nothing.
+#[test]
+fn a_vehicle_without_a_modem_relays_through_a_roadside_unit() {
+    let base = |backhaul: Option<&str>| {
+        let mut s = grid(60.0, 900.0);
+        s.security.verification_policy = "verify-all".to_string();
+        s.detection.local = vec![ModelChoice::new(v2xw_engine::phase2::LEGACY_12)];
+        s.threats.attackers = vec![v2xw_engine::scenario::schema::Attacker {
+            id: "threat/attacker/legacy/ConstPos".to_string(),
+            count: Some(1),
+            schedule: Some(v2xw_engine::scenario::schema::DilationWindow {
+                from_s: 5.0,
+                to_s: 60.0,
+            }),
+            ..Default::default()
+        }];
+        lifecycle(&mut s, json!({"report_shuffle_window_s": 1}));
+        // Units on a 300 m lattice over the grid, so most of it is within relay range.
+        for x in [150.0, 450.0, 750.0, 1050.0] {
+            for y in [150.0, 450.0] {
+                s.actors.rsus.push(v2xw_engine::scenario::Rsu {
+                    site: None,
+                    position_m: Some([x, y, 0.0]),
+                    roles: vec!["report-forward".to_string()],
+                    profile: None,
+                    backhaul: backhaul.map(str::to_string),
+                });
+            }
+        }
+        s
+    };
+    let (connected, rec) = run(base(None));
+    let p = &connected.phase2;
+    println!(
+        "relay: {} reports, {} relayed, {} at the proxy, {} backhaul bytes, {} held",
+        p.reports_sent,
+        p.reports_uploaded_relay,
+        p.reports_received,
+        p.access.backhaul_bytes,
+        p.reports_unsent
+    );
+    assert_eq!(p.access.cellular_vehicles, 0);
+    assert!(p.reports_uploaded_relay > 0, "no report was relayed");
+    assert!(p.reports_received > 0, "no relayed report reached the proxy");
+    assert!(p.access.backhaul_bytes > 0, "the backhaul carried nothing");
+    assert_eq!(p.access.uu_ul_bytes, 0, "a vehicle with no modem used the uplink");
+    assert!(
+        records(&rec, "node.tx").iter().any(|r| r["msg_type"] == "mbr"),
+        "a relayed report is a frame on the air"
+    );
+
+    let (cut, _) = run(base(Some("backhaul/none")));
+    let q = &cut.phase2;
+    assert_eq!(q.reports_received, 0, "a report crossed a backhaul that is not there");
+    assert!(q.reports_sent > 0, "the detectors must still fire, or this proves nothing");
+}
