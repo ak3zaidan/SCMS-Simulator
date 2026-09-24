@@ -1650,6 +1650,197 @@ mod tests {
     }
 
     #[test]
+    fn an_offset_without_a_lane_change_and_a_body_outside_its_junction_are_flagged() {
+        let world = grid();
+        let lane = straight_lane(&world).id;
+        let mut audit = TrafficAuditor::new(&world, AuditParams::default());
+        let mut a = at(&world, 0, lane, 10.0, 5.0);
+        audit.observe(&world, 0, 100_000_000, &[a], &[]);
+        assert_eq!(audit.report().count(Check::LateralOffset), 0);
+        a.lateral_m = 1.0; // no transition under way
+        audit.observe(&world, 100_000_000, 200_000_000, &[a], &[]);
+        assert_eq!(audit.report().count(Check::LateralOffset), 1);
+        // A vehicle on a junction connector, placed 50 m away from the junction.
+        let internal = world
+            .roads
+            .lanes()
+            .iter()
+            .find(|l| l.kind == LaneKind::Internal)
+            .expect("a connector")
+            .id;
+        let mut b = at(&world, 1, internal, 4.6, 0.0);
+        audit.observe(&world, 200_000_000, 300_000_000, &[b], &[]);
+        assert_eq!(audit.report().count(Check::OutsideJunction), 0);
+        b.pos = Vec3::new(b.pos.x + 50.0, b.pos.y, 0.0);
+        audit.observe(&world, 300_000_000, 400_000_000, &[b], &[]);
+        assert_eq!(audit.report().count(Check::OutsideJunction), 1);
+    }
+
+    #[test]
+    fn acceleration_and_jerk_beyond_the_bounds_are_flagged() {
+        let world = grid();
+        let lane = straight_lane(&world).id;
+        let mut audit = TrafficAuditor::new(&world, AuditParams::default());
+        let mut a = at(&world, 0, lane, 10.0, 5.0);
+        a.accel_mps2 = -2.0;
+        audit.observe(&world, 0, 100_000_000, &[a], &[]);
+        let mut b = at(&world, 0, lane, 10.5, 4.8);
+        b.accel_mps2 = -2.5;
+        audit.observe(&world, 100_000_000, 200_000_000, &[b], &[]);
+        assert_eq!(audit.report().count(Check::Jerk), 0, "5 m/s³ is within the bound");
+        assert_eq!(audit.report().count(Check::AccelBound), 0);
+        let mut c = at(&world, 0, lane, 11.0, 4.0);
+        c.accel_mps2 = -9.5; // beyond the tyre-road limit, and 70 m/s³ of jerk
+        audit.observe(&world, 200_000_000, 300_000_000, &[c], &[]);
+        let r = audit.report();
+        assert_eq!(r.count(Check::AccelBound), 1);
+        assert_eq!(r.count(Check::Jerk), 1);
+    }
+
+    #[test]
+    fn an_amber_the_vehicle_could_have_stopped_for_is_flagged() {
+        let world = grid();
+        let plan = world.signals.first().expect("signalised");
+        let internal = plan.controlled[0];
+        let approach = world
+            .roads
+            .connections()
+            .iter()
+            .find(|c| c.via == Some(internal))
+            .expect("an approach")
+            .from_lane;
+        let len = world.lane(approach).length_m;
+        // The first 0.1 s-aligned instant the movement shows amber.
+        let amber = (0..1200u64)
+            .map(|k| k * 100_000_000)
+            .find(|t| movement_state(&world, internal, *t) == Some(SignalState::Amber))
+            .expect("an amber");
+        let entry = |gap_at_onset: f64, speed: f64| {
+            let mut audit = TrafficAuditor::new(&world, AuditParams::default());
+            let mut a = at(&world, 0, approach, len - gap_at_onset, speed);
+            a.route_next = Some(internal);
+            // Seen approaching at the onset of amber...
+            audit.observe(&world, amber - 100_000_000, amber, &[a], &[]);
+            let mut b = a;
+            b.s_m = len - 0.1;
+            audit.observe(&world, amber, amber + 100_000_000, &[b], &[]);
+            // ...and inside the junction a step later, still on amber.
+            let mut c = at(&world, 0, internal, 0.3, speed);
+            c.prev_lane = Some(approach);
+            audit.observe(&world, amber + 100_000_000, amber + 200_000_000, &[c], &[]);
+            audit.report().count(Check::AmberEntry)
+        };
+        // 10 m/s needs 16.7 m at 3 m/s²: from 40 m out it could have stopped.
+        assert_eq!(entry(40.0, 10.0), 1);
+        // From 10 m out it could not: the dilemma zone, and going is right.
+        assert_eq!(entry(10.0, 10.0), 0);
+    }
+
+    #[test]
+    fn a_lane_change_at_the_stop_line_round_a_standing_queue_is_flagged() {
+        let world = v2xw_world::procedural::grid(
+            &GridParams {
+                lanes_per_direction: 2,
+                ..GridParams::legacy().with_signals(true)
+            },
+            &ImportOptions::default(),
+        )
+        .expect("grid");
+        // A lane with a neighbour on the same edge.
+        let (from, to) = world
+            .roads
+            .lanes()
+            .iter()
+            .filter(|l| l.kind == LaneKind::Driving && l.length_m > 60.0)
+            .find_map(|l| {
+                world.edge(l.edge).lanes.iter().copied().find(|o| {
+                    let o = world.lane(*o);
+                    o.id != l.id && (i32::from(o.index) - i32::from(l.index)).abs() == 1
+                })
+                .map(|o| (l.id, o))
+            })
+            .expect("a two-lane edge");
+        let len = world.lane(from).length_m;
+        let change = |start_s: f64| {
+            let mut audit = TrafficAuditor::new(&world, AuditParams::default());
+            let queued = at(&world, 1, from, len - 4.0, 0.0);
+            let ego = at(&world, 0, from, start_s, 5.0);
+            audit.observe(&world, 0, 100_000_000, &[ego, queued], &[]);
+            let mut moved = at(&world, 0, to, start_s + 0.5, 5.0);
+            moved.changing = Some((from, to));
+            moved.lateral_m = -3.4;
+            audit.observe(&world, 100_000_000, 200_000_000, &[moved, queued], &[]);
+            let r = audit.report();
+            (r.count(Check::LaneChangeNearJunction), r.count(Check::QueueJump))
+        };
+        // 20 m before the end, beside a queue at the line: both.
+        assert_eq!(change(len - 20.0), (1, 1));
+        // 50 m back: moving to the shorter queue, which is lawful.
+        assert_eq!(change(len - 50.0), (0, 0));
+    }
+
+    #[test]
+    fn the_world_checks_see_a_conflicting_green_and_a_lane_through_a_building() {
+        let world = grid();
+        // Give every movement of a four-way junction's plan a protected green in every
+        // phase.
+        let four_way = world
+            .signals
+            .iter()
+            .position(|p| world.junction(p.junction).incoming.len() >= 4)
+            .expect("a four-way signalised junction");
+        let rebuilt = crate::worlds::rebuild_with(&world, |parts| {
+            for phase in &mut parts.signals[four_way].phases {
+                for s in &mut phase.states {
+                    *s = SignalState::Green;
+                }
+            }
+        })
+        .expect("a world");
+        assert!(
+            audit_world(&rebuilt)
+                .iter()
+                .any(|(c, _)| *c == Check::WorldConflictingGreens)
+        );
+        // And put a building on a lane.
+        let lane = straight_lane(&world).clone();
+        let mid = lane.point_at(0.5 * lane.length_m);
+        let ring = vec![
+            Vec3::new(mid.x - 3.0, mid.y - 3.0, 0.0),
+            Vec3::new(mid.x + 3.0, mid.y - 3.0, 0.0),
+            Vec3::new(mid.x + 3.0, mid.y + 3.0, 0.0),
+            Vec3::new(mid.x - 3.0, mid.y + 3.0, 0.0),
+        ];
+        let building = v2xw_world::model::Building::new(
+            v2xw_core::ids::BuildingId::new(0),
+            ring,
+            Vec::<Vec<Vec3>>::new(),
+            10.0,
+            0.0,
+            v2xw_world::model::MaterialClass::default(),
+            v2xw_world::model::HeightSource::default(),
+        )
+        .expect("a building");
+        let with_building = World::builder(world.origin)
+            .roads(world.roads.clone())
+            .signals(world.signals.clone())
+            .buildings(vec![building])
+            .provenance(world.provenance.clone())
+            .build()
+            .expect("a world");
+        assert!(
+            audit_world(&with_building)
+                .iter()
+                .any(|(c, _)| *c == Check::WorldLaneInBuilding)
+        );
+        assert!(
+            !audit_world(&world)
+                .iter()
+                .any(|(c, _)| *c == Check::WorldLaneInBuilding)
+        );
+    }
+
+    #[test]
     fn the_grid_world_passes_its_static_checks() {
         let world = grid();
         let found = audit_world(&world);
