@@ -243,6 +243,234 @@ built from `main` and driven in a browser.
     (`e2e_latency.p95` axis 50–125 s on a 20 s run). Not investigated.
   - Forward seeking now reaches only as far as the kernel's bounded lead, 12.8 s by default.
 
+### Wave B — eight more tracks, merged 2026-09-24
+
+Eight engineers worked in isolated worktrees; the integrator merged them into `main` in
+this order: session `e6548f9`, geometry `26a0dcb`, vru `8d3ccfc`, radioprop `96703ca`,
+radioaccess `724e92c`, messages `2d306c7`, security `58aa4df`, inspector `e3983cf`. The
+crates each merge touched were built and tested before the next one, and every seam found
+was fixed in a commit of its own. Every number below comes from a command run on this
+machine. The integrator deleted the shared debug target first, because worktrees sharing one
+`CARGO_TARGET_DIR` had silently linked each other's crates; every result here was built from
+the merged tree alone.
+
+#### What each track delivered
+
+- **Session.**
+  - A session outlives its socket: a reconnect resumes the stream with nothing missed
+    (`HELLO_RESUMED`) instead of resyncing.
+  - A seek past the kernel's lead runs the kernel there, reporting progress, and lands.
+    Before, the scrub bar could reach only 12.8 s ahead.
+  - A rewind keeps the run's speed, and every per-run view resets on a new run.
+  - Every scenario-timeline kind now acts and writes a `scenario.event` record: closures
+    with re-routing, demand multipliers, `param.change` for the live parameters, and attack
+    waves. The page edits the events and draws them on the time bar.
+  - Tests: server resume 7, rewind 3, seek_ahead 1, pacing 1, timeline 1; engine
+    `timeline.rs` 9 and `attack_wave.rs` 1.
+- **Geometry.** Junction turns are AASHTO arcs, forks share their lanes out in order,
+  change intervals follow ITE, roads through buildings are passages, and every producer
+  streams one signal row per head group. Its own section above (2026-09-24, junction track)
+  has the before/after audit counts.
+- **VRU.**
+  - Crosswalk lanes and MUTCD pedestrian signal intervals, from OSM `footway=crossing` and
+    on the grid.
+  - Vehicles yield at crosswalks, and pedestrians obey walk signals.
+  - Pedestrians and cyclists can carry VRU devices hosted in the node phase. They send real
+    SAE J2735 PSMs and ETSI VAMs, the VAM generated from TS 103 300-3 V2.2.1.
+  - Cyclists are drawn as riders, and VRUs have their own aerial mark.
+  - Three new audit checks (`Check::ALL` is 26 after the merge);
+    `pedestrian_invariants` 4/4.
+- **Radioprop.**
+  - The Mangel 2011 street-corner model, a geometric city-street law (the new default
+    `high` tier) and ITU-R P.838-3 rain at the carrier.
+  - `radio.devices` and `radio.range` reach every link. The candidate range comes from the
+    link budget, not a fixed 1 km, and arrivals below the noise floor count as energy only.
+  - Engine `propagation.rs` 9/9.
+- **Radioaccess.**
+  - SAE J3161/1 is the default LTE-V2X profile.
+  - Sidelink congestion control (ETSI TS 103 574 / J3161 CR limits), blind HARQ
+    retransmissions with chase combining, and SCI decoding drawn against the control BLER.
+  - An honest 802.11p AIFS.
+  - Jammers can ride a vehicle or drive a path.
+  - `node.tx` carries a radio view: the MCS by name and, on a sidelink, the slot,
+    sub-channels, HARQ attempt and CBR/CR.
+  - Engine `radio_access_layers.rs` 10 pass, 1 ignored measurement.
+- **Messages.**
+  - Roadside units broadcast SPaT and MAP, and vehicles send DENM, SRM and SSM.
+  - Every fragmentation strategy runs, with reassembly, timeouts and the loss it amplifies.
+  - The headline `pdr` is the 3GPP TR 36.885 packet reception ratio within a stated range.
+  - A message reaches the applications when its verification finishes, not at the next
+    periodic step.
+  - Breakdowns reach the page: delivery by distance, latency by stage, and per-node
+    rankings.
+  - Engine `message_sets.rs` 5/5 and `fragmentation.rs` 7/7.
+- **Security.**
+  - The SCMS runs in lockstep with the engine: a pre-run pool, pseudonym top-up over a
+    backend link, proxy hand-off, single-certificate revocation and a CRL on its cadence.
+  - Vehicles reach the backend over cellular Uu (`net.uu`), or relay through a roadside unit
+    with a backhaul.
+  - The ETSI ITS PKI runs as a second credential protocol, with passive revocation.
+  - Rotation is overlap-aware, and there are no phantom pseudonym changes.
+  - GNSS burst and outlier probabilities are per-second hazards.
+  - Roadside units detect and report.
+  - The two `phase2.rs` tests that failed on `main` now pass: phase2 8/8 (1 ignored
+    diagnostic) and `security_lifecycle.rs` 8/8.
+- **Inspector.**
+  - `node.feed` streams the followed vehicle's sent and received messages, decoded from
+    their own octets: the 1609.2 spans, signer, HashedId8 and J2735 fields. It also streams
+    the vehicle's queues (receive, verification, application, transmit, CRL) with waits and
+    drops.
+  - The Studio has a message panel with Sent, Received and Queues tabs. The `frame_tap`
+    test shows the tap changes no record digest.
+  - Server `feed.rs` 6/6, and a shared vector (`node-feed-v1.json`) checked from Rust and
+    TypeScript.
+
+#### Seams fixed at integration, each in its own commit
+
+- **`run.seek` over HTTP** (`49c93b6`). The kernel runs ahead on its own clock, so an HTTP
+  seek got -32003 or -32009 depending on a race. The transport refusal now comes first. A
+  new assertion is red on the old order.
+- **Pedestrian heads streamed Off** (`6abb260`). Geometry's `World::group_signals` found a
+  head group only through an approach lane, but vru's walk heads face their crosswalk.
+  `signal_heads.rs` is red without the fix (plan sg1 group 100: Off against Red). With it,
+  1,930,684 Manhattan samples agree with the engine.
+- **SPaT reference** (`d97bf80`). The test's reference got the same pedestrian rule (junction
+  7 group 100 read Dark against StopAndRemain).
+- **Focus-region sidelink test** (`06364dc`). Radioprop's high tier is line of sight on a
+  building-free extract, so the region compared two path-loss laws: 5,803 receptions
+  against 5,426. Both runs now use one law. It is 5,422 against 5,426, and red (5,426
+  against 5,426) with the high sidelink PHY disabled.
+- **The messages merge.**
+  - The node phase is a step or a wake over `HostedNode`; a VRU device has no deferred
+    checks and is never woken for one.
+  - MAP/SPaT payloads and the hard-braking acceleration go to OBUs only.
+  - The fragmenting hand-down carries radioprop's and radioaccess's new frame fields.
+- **The security merge.** The `security.signature` resize is applied before padding,
+  fragmentation and the MTU check, so all three see the resized SPDU.
+- **The inspector merge.**
+  - The feed push in the session track's connection loop returns `Exit::Park`.
+  - The projector keeps the metric breakdowns and the security panel's store beside the
+    feed.
+  - A resumed Hello keeps the session handling and still re-asks `view.follow`, which is
+    idempotent.
+- **Radio view in the chase panel** (`6e55ed0`). Radioaccess's radio view reached no client
+  after the feed replaced the old message log. It is now `radio.access` on each sent frame,
+  shown as an "access" line (live: `dsrc-80211p 6mbps-qpsk-1/2`). The feed vector was
+  re-blessed.
+- **Breakdown cards** (`8dbda63`). The cards polled metrics the run does not measure, which
+  left 27 "unknown metric" page errors in `resume.spec.ts`. They now ask only for what the
+  run's catalogue lists, and quietly.
+- **E2E tests the merges made wrong, with no assertion weakened.**
+  - `lifecycle.spec.ts` (`a3efa9d`): `nodes.backend_tier` is now partly applied, and the
+    test asserts that the engine publishes no unclassified or not-implemented leaf.
+  - `studio.spec.ts` (`e16f15d`): the legend's five state glyphs are counted apart from
+    vru's road-user key.
+- **Goldens.** `grid-traffic` was re-blessed after radioprop (`27dc00c`), radioaccess
+  (`83eca76`), messages (`1d6b7d0`) and security (`50338d1`). Each merged change equals
+  what that track's own branch moved. Before each blessing, the digest was identical
+  twice at `RAYON_NUM_THREADS` = 1, 4 and 8. The golden is now 15,914 records, digest
+  `2d37766a5fb69289…`.
+- `cargo fmt --all` (`d1a4d17`).
+
+#### Evidence
+
+- **Rust**, at `d1a4d17`, all 20 crates one at a time, debug: 2,904 pass, 0 fail, 14
+  ignored.
+  - core 215, world 223 (4 ignored), mobility 228, msg 210 (1 ignored), net 113, sec 99,
+    radio 287 (6 ignored), node 191, metrics 251, record 239, proto 104, threat 210.
+  - engine 174 (2 ignored), experiment 80, server 106 (1 ignored), cli 15, copilot 68,
+    py 16, wasm 6, conformance 69.
+- **UI:**
+  - Typecheck is clean for protocol, viewer, mock-server and studio.
+  - vitest: protocol 191, viewer 139, mock-server 45, studio 165.
+- **Studio e2e against the release server:** 9 of 9 (controls, events, 4 × lifecycle,
+  messages, resume, seek-and-plots).
+- **Studio e2e against the mock:** 23 of 25 on the first run. The legend test was then
+  fixed and passed 2 of 2. The aerial frustum test is still flaky (below).
+- **Release build:** `cargo build --release -p v2xw-server -p v2xw-cli` succeeds (8 m 28 s).
+- **Live check.** The owner's `run.txt` commands ran on ports 8787 and 5173, driven by
+  Playwright, and the screenshots were read.
+  - Setting 40 pedestrians and 10 cyclists and pressing Apply said "Applied 2 changes".
+    Run started the run.
+  - About 18 s later: 84 live actors (34 passenger, 40 pedestrian, 10 bicycle), 55 of which
+    moved in 3 s; the run reached 2:06 of 5:00.
+  - A real mouse click on a car switched to chase view on node 6.
+  - The message panel listed 60 sent BSMs with decoded position, speed and heading. The
+    first row opened to: pseudonym `3a66801336da2bd9`, 40 + 93 + 5 + 38 = 176 B, 17.0 dBm
+    on channel 172, the access line, and 10.9 ms signing.
+  - It also showed 60 received rows and a transmit queue with 2 messages passed through.
+  - No page errors and no page exceptions.
+
+#### Closed from the 2026-09-23 list
+
+These items were open above and wave B closed them, each by the track named:
+
+- The two `phase2.rs` failures (security).
+- The backend over cellular Uu, and relaying through a roadside unit (security).
+- 19 conflicting protected greens, 64 unmarked lanes in buildings, and the missing
+  all-red interval (geometry).
+- No VRU device (vru).
+- No sidelink congestion control or blind retransmissions (radioaccess).
+- The fixed 1 km candidate range (radioprop).
+- Only `fragmenter/none`, the refused size-model tier, and per-node breakdowns only in the
+  recording (messages).
+- Inert timeline events, a reconnect that resynced instead of resuming, and forward seeking
+  limited to the kernel's lead (session).
+- The mock e2e radio-count failure (inspector).
+
+#### Still open
+
+- **Flaky tests.**
+  - The mock aerial test "draws one mark per live vehicle" sees 1 of 200 vehicles outside
+    the opening frustum in 2 of 3 runs at the merged `HEAD`. Centring the
+    world when the traffic needs all of it made this worse (3 of 4 runs failed), so that
+    change was reverted.
+  - The first engine e2e run once opened on the built-in settings list (a cold start); it
+    passed on the two runs after that.
+- **The chase view with fragmentation on.** The frame tap hands the whole SPDU for every
+  fragment, so the feed shows each fragment as a full message. Fragmentation is off by
+  default.
+- **SPaT.** It is built from `SignalPlan::group_timelines`, which merges phases. The
+  geometry track moved the live signal block to per-phase evaluation because merged phases
+  round differently at a boundary. The SPaT test samples at 0.35 s offsets and has not been
+  checked at a boundary.
+- **Chase HUD.** It shows `n/a` for CPU, RAM, stored certificates, CRL entries and report
+  outbox on `manhattan-5min`, which has no security path. The HUD header still says "OBU"
+  for a node spawned after the Hello.
+- **Settings.** No setting is left that the engine reads nothing from.
+  `nodes.backend_tier` became Partial.
+- **From the tracks' own reports:**
+  - Geometry: 39 / 177 heading jumps, jerk 38 and 12 in-building steps on dense Manhattan
+    (see its section). Viaduct ramps are about 38°.
+  - VRU: the PSM codec is not oracle-validated. No mid-block jaywalking. VRU devices
+    transmit at 20 dBm, not 23.
+  - Radioprop: Mangel is read from a reprint. The 25 m side cap is a design choice. Rain
+    has no two-run test. The medium tier has no vehicle blockage.
+  - Radioaccess: the NR BLER is still a fit. The J3161 values are second-hand. The compute
+    tier `high` is partial. Hybrid is refused. The Studio has no widget for
+    `radio.models.sidelink`.
+  - Messages: no vehicle acts on SPaT (no GLOSA or red-light warning), and SRM priority is
+    never granted. CPM is refused. The SPaT/MAP encoders are not independently decoded.
+    PSID 0x82 is unverified.
+  - Security:
+    - ETSI butterfly authorization and ECTL are not driven.
+    - Post-quantum sign/verify time is not charged.
+    - Several backend-access figures are uncited defaults with no model card.
+    - The 55-unit Phase 2 scenario and the Manhattan pseudonym-privacy study were not run
+      end to end.
+    - `compromised_rsus` is refused.
+  - Session:
+    - A vehicle that cannot avoid a closed lane leaves as RouteBlocked.
+    - Radio and model parameters are refused by `param.change`.
+    - An attack wave has a single window.
+    - Sessions live in memory, so a resume across an engine restart is a fresh Hello.
+  - Inspector:
+    - TX-overflow and CRL-backlog drops are on no record channel.
+    - "Depth now" can read low when the kernel is slower than real time.
+    - No feed from a recording.
+    - Roadside units are missing from a live Hello's node table.
+
+
 ## Crates
 
 | Crate | Lines | State | Evidence |
